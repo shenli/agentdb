@@ -60,6 +60,7 @@ pub fn append_event(
 /// Convenience: open the session (creating if absent), hold the box's write
 /// lock, append. Used from tests to exercise the hot path; production call
 /// sites sequence these steps via T10's `append_and_fetch`.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_and_append(
     kv: Arc<dyn KvStore>,
     sessions: &SessionRegistry,
@@ -109,6 +110,7 @@ pub struct AppendFetchOutput {
     pub session: Session,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn append_and_fetch(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
