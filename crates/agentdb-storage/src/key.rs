@@ -235,4 +235,51 @@ mod tests {
         let prefix = prefix_for_box(Namespace::Events, 42);
         assert!(!other.starts_with(&prefix));
     }
+
+    #[test]
+    fn events_in_same_session_sort_by_seq() {
+        let a = encode_key(Namespace::Events, 1, 10, 100, 1, 1);
+        let b = encode_key(Namespace::Events, 1, 10, 100, 1, 2);
+        let c = encode_key(Namespace::Events, 1, 10, 100, 1, 100);
+        assert!(a < b && b < c);
+    }
+
+    #[test]
+    fn sessions_in_same_tenant_are_contiguous_and_ordered() {
+        let s1_last = encode_key(Namespace::Events, 1, 10, 1, 0, u64::MAX);
+        let s2_first = encode_key(Namespace::Events, 1, 10, 2, 0, 0);
+        let s3_first = encode_key(Namespace::Events, 1, 10, 3, 0, 0);
+        assert!(s1_last < s2_first);
+        assert!(s2_first < s3_first);
+    }
+
+    #[test]
+    fn tenants_in_same_box_are_contiguous_and_ordered() {
+        let t1_last = encode_key(Namespace::Events, 1, 10, u64::MAX, u32::MAX, u64::MAX);
+        let t2_first = encode_key(Namespace::Events, 1, 11, 0, 0, 0);
+        let t3_first = encode_key(Namespace::Events, 1, 12, 0, 0, 0);
+        assert!(t1_last < t2_first);
+        assert!(t2_first < t3_first);
+    }
+
+    #[test]
+    fn namespaces_do_not_interleave() {
+        let events_max = encode_key(
+            Namespace::Events,
+            u16::MAX,
+            u64::MAX,
+            u64::MAX,
+            u32::MAX,
+            u64::MAX,
+        );
+        let state_min = encode_key(Namespace::State, 0, 0, 0, 0, 0);
+        assert!(events_max < state_min);
+    }
+
+    #[test]
+    fn boxes_do_not_interleave_within_namespace() {
+        let box1_max = encode_key(Namespace::Events, 1, u64::MAX, u64::MAX, u32::MAX, u64::MAX);
+        let box2_min = encode_key(Namespace::Events, 2, 0, 0, 0, 0);
+        assert!(box1_max < box2_min);
+    }
 }
