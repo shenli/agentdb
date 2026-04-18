@@ -99,9 +99,46 @@ pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Resul
     Ok(all.split_off(start))
 }
 
+use crate::box_runtime::BoxRegistry;
+use crate::registry::TenantRegistry;
+
+#[derive(Debug)]
+pub struct AppendFetchOutput {
+    pub new_seq: u64,
+    pub recent: Vec<Event>,
+    pub session: Session,
+}
+
+pub async fn append_and_fetch(
+    registry: &BoxRegistry,
+    tenants: &TenantRegistry,
+    sessions: &SessionRegistry,
+    tenant_external: &str,
+    session_external: &str,
+    payload: crate::types::Document,
+    fetch_last_n_: usize,
+    now_millis: u64,
+) -> Result<AppendFetchOutput> {
+    let box_ = registry.route_tenant(tenant_external);
+    let guard = box_.write_lock.lock().await;
+    let kv = registry.kv().clone();
+    let tenant = tenants.get_or_mint(box_.id, tenant_external, now_millis)?;
+    let mut session =
+        sessions.get_or_mint(box_.id, tenant.internal_id, session_external, now_millis)?;
+    let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+    drop(guard);
+    let recent = fetch_last_n(&kv, &session, fetch_last_n_)?;
+    Ok(AppendFetchOutput {
+        new_seq: event.seq,
+        recent,
+        session,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::box_runtime::BoxRegistry;
     use crate::registry::{SessionRegistry, TenantRegistry};
     use agentdb_storage::RocksKvStore;
     use serde_json::json;
@@ -114,6 +151,15 @@ mod tests {
         let tenants = TenantRegistry::new(kv.clone());
         let sessions = SessionRegistry::new(kv.clone());
         (dir, kv, tenants, sessions)
+    }
+
+    fn context() -> (TempDir, BoxRegistry, TenantRegistry, SessionRegistry) {
+        let dir = TempDir::new().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let registry = BoxRegistry::new(kv.clone(), 4).unwrap();
+        let tenants = TenantRegistry::new(kv.clone());
+        let sessions = SessionRegistry::new(kv);
+        (dir, registry, tenants, sessions)
     }
 
     #[tokio::test]
@@ -256,5 +302,108 @@ mod tests {
         };
         let out = fetch_last_n(&kv, &session, 0).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_and_fetch_returns_new_seq_and_recent_events() {
+        let (_dir, registry, tenants, sessions) = context();
+        let out = append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"a": 1}),
+            5,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.new_seq, 1);
+        assert_eq!(out.recent.len(), 1);
+        assert_eq!(out.recent[0].payload, json!({"a": 1}));
+
+        let out2 = append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"a": 2}),
+            5,
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out2.new_seq, 2);
+        assert_eq!(out2.recent.len(), 2);
+        assert_eq!(out2.recent[1].payload, json!({"a": 2}));
+    }
+
+    #[tokio::test]
+    async fn append_and_fetch_limits_recent_to_n() {
+        let (_dir, registry, tenants, sessions) = context();
+        for i in 1..=5u64 {
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"i": i}),
+                2,
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let out = append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"final": true}),
+            2,
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.new_seq, 6);
+        assert_eq!(out.recent.len(), 2);
+        assert_eq!(out.recent[0].seq, 5);
+        assert_eq!(out.recent[1].seq, 6);
+    }
+
+    #[tokio::test]
+    async fn different_tenants_do_not_interfere() {
+        let (_dir, registry, tenants, sessions) = context();
+        let a = append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-A",
+            "s-1",
+            json!({"owner": "A"}),
+            5,
+            10,
+        )
+        .await
+        .unwrap();
+        let b = append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-B",
+            "s-1",
+            json!({"owner": "B"}),
+            5,
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.new_seq, 1);
+        assert_eq!(b.new_seq, 1);
+        assert_ne!(a.recent, b.recent);
     }
 }

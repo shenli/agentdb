@@ -13,7 +13,9 @@ pub use meta::{
     key_next_session_id, key_next_tenant_id, key_session_by_external, key_session_record,
     key_tenant_by_external, key_tenant_record,
 };
-pub use primitives::{append_event, fetch_last_n, DEFAULT_BRANCH_ID};
+pub use primitives::{
+    append_and_fetch, append_event, fetch_last_n, AppendFetchOutput, DEFAULT_BRANCH_ID,
+};
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use types::{Document, Event, Session, Tenant, Tier};
 // Other re-exports added as types land.
