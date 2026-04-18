@@ -68,6 +68,43 @@ impl KvStore for RocksKvStore {
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
-        unimplemented!("snapshot — Task 12")
+        Ok(Box::new(RocksSnapshotHandle {
+            snap: self.db.snapshot(),
+        }))
+    }
+}
+
+/// Borrows from a `RocksKvStore`; caller keeps the store alive via its own reference.
+struct RocksSnapshotHandle<'a> {
+    snap: rocksdb::Snapshot<'a>,
+}
+
+impl<'a> KvSnapshot for RocksSnapshotHandle<'a> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.snap.get(key)?)
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let prefix_vec = prefix.to_vec();
+        // Eagerly collect so the returned iterator is 'static w.r.t. lifetimes.
+        let mut out: Vec<std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>> = Vec::new();
+        let iter = self
+            .snap
+            .iterator(IteratorMode::From(&prefix_vec, Direction::Forward));
+        for res in iter {
+            match res {
+                Ok((k, v)) => {
+                    if !k.starts_with(&prefix_vec) {
+                        break;
+                    }
+                    out.push(Ok((k.to_vec(), v.to_vec())));
+                }
+                Err(e) => {
+                    out.push(Err(crate::error::Error::from(e)));
+                    break;
+                }
+            }
+        }
+        Ok(Box::new(out.into_iter()))
     }
 }

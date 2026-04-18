@@ -138,3 +138,44 @@ fn empty_write_batch_is_a_noop() {
     let store = RocksKvStore::open(dir.path()).unwrap();
     store.write_batch(Vec::new()).unwrap();
 }
+
+#[test]
+fn snapshot_does_not_observe_writes_that_happened_after_it() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+    let k = encode_key(Namespace::Events, 1, 10, 1, 0, 1);
+    store.put(&k, b"v1").unwrap();
+
+    let snap = store.snapshot().unwrap();
+    store.put(&k, b"v2").unwrap();
+
+    assert_eq!(snap.get(&k).unwrap().as_deref(), Some(b"v1".as_ref()));
+    assert_eq!(store.get(&k).unwrap().as_deref(), Some(b"v2".as_ref()));
+}
+
+#[test]
+fn snapshot_scan_prefix_is_consistent() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+    for seq in 1..=3 {
+        let k = encode_key(Namespace::Events, 1, 10, 1, 0, seq);
+        store.put(&k, format!("v{seq}").as_bytes()).unwrap();
+    }
+
+    let snap = store.snapshot().unwrap();
+    // write a new one after snapshot
+    let k4 = encode_key(Namespace::Events, 1, 10, 1, 0, 4);
+    store.put(&k4, b"v4").unwrap();
+
+    let prefix = prefix_for_session(Namespace::Events, 1, 10, 1);
+    let snap_values: Vec<_> = snap
+        .scan_prefix(&prefix)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(
+        snap_values,
+        vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()],
+        "snapshot should not see the key written after it"
+    );
+}
