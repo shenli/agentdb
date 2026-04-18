@@ -30,8 +30,9 @@ impl KvStore for RocksKvStore {
         Ok(())
     }
 
-    fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!("delete — Task 9")
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        self.db.delete(key)?;
+        Ok(())
     }
 
     fn scan_prefix(&self, _prefix: &[u8]) -> Result<KvIter> {
