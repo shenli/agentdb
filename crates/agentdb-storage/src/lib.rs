@@ -10,7 +10,9 @@ pub mod kv;
 pub mod rocks;
 
 pub use error::{Error, Result};
-pub use key::{BoxId, BranchId, Namespace, Seq, SessionId, TenantId};
+pub use key::{
+    decode_key, encode_key, BoxId, BranchId, DecodedKey, Namespace, Seq, SessionId, TenantId,
+};
 
 /*
 pub use key::{
