@@ -22,6 +22,4 @@ pub use key::{
 };
 */
 pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
-/*
 pub use rocks::RocksKvStore;
-*/
