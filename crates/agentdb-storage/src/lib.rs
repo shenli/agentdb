@@ -11,7 +11,8 @@ pub mod rocks;
 
 pub use error::{Error, Result};
 pub use key::{
-    decode_key, encode_key, BoxId, BranchId, DecodedKey, Namespace, Seq, SessionId, TenantId,
+    decode_key, encode_key, prefix_for_box, prefix_for_session, prefix_for_session_branch,
+    prefix_for_tenant, BoxId, BranchId, DecodedKey, Namespace, Seq, SessionId, TenantId,
 };
 
 /*

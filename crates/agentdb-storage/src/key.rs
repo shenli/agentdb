@@ -94,6 +94,51 @@ pub fn decode_key(key: &[u8]) -> Result<DecodedKey> {
     })
 }
 
+pub fn prefix_for_box(ns: Namespace, box_id: BoxId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3);
+    out.push(ns.as_byte());
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out
+}
+
+pub fn prefix_for_tenant(ns: Namespace, box_id: BoxId, tenant_id: TenantId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11);
+    out.push(ns.as_byte());
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out.extend_from_slice(&tenant_id.to_be_bytes());
+    out
+}
+
+pub fn prefix_for_session(
+    ns: Namespace,
+    box_id: BoxId,
+    tenant_id: TenantId,
+    session_id: SessionId,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(19);
+    out.push(ns.as_byte());
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out.extend_from_slice(&tenant_id.to_be_bytes());
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out
+}
+
+pub fn prefix_for_session_branch(
+    ns: Namespace,
+    box_id: BoxId,
+    tenant_id: TenantId,
+    session_id: SessionId,
+    branch_id: BranchId,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(23);
+    out.push(ns.as_byte());
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out.extend_from_slice(&tenant_id.to_be_bytes());
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.extend_from_slice(&branch_id.to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +195,44 @@ mod tests {
         key[0] = 0x77;
         let err = decode_key(&key).unwrap_err();
         assert!(err.to_string().contains("namespace"));
+    }
+
+    #[test]
+    fn prefix_for_box_is_prefix_of_full_key() {
+        let full = encode_key(Namespace::Events, 42, 1, 2, 3, 4);
+        let prefix = prefix_for_box(Namespace::Events, 42);
+        assert_eq!(prefix.len(), 3);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn prefix_for_tenant_is_prefix_of_full_key() {
+        let full = encode_key(Namespace::State, 17, 99, 2, 3, 4);
+        let prefix = prefix_for_tenant(Namespace::State, 17, 99);
+        assert_eq!(prefix.len(), 11);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn prefix_for_session_is_prefix_of_full_key() {
+        let full = encode_key(Namespace::Meta, 1, 2, 333, 4, 5);
+        let prefix = prefix_for_session(Namespace::Meta, 1, 2, 333);
+        assert_eq!(prefix.len(), 19);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn prefix_for_session_branch_is_prefix_of_full_key() {
+        let full = encode_key(Namespace::Events, 1, 2, 3, 77, 5);
+        let prefix = prefix_for_session_branch(Namespace::Events, 1, 2, 3, 77);
+        assert_eq!(prefix.len(), 23);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn prefix_for_box_does_not_match_different_box() {
+        let other = encode_key(Namespace::Events, 43, 1, 2, 3, 4);
+        let prefix = prefix_for_box(Namespace::Events, 42);
+        assert!(!other.starts_with(&prefix));
     }
 }
