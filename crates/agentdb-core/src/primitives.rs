@@ -76,6 +76,29 @@ pub async fn open_and_append(
     Ok((event, session))
 }
 
+/// Fetch the last `n` events of `session`'s default branch in seq order
+/// (oldest-to-newest within the returned slice).
+pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Result<Vec<Event>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let prefix = agentdb_storage::prefix_for_session_branch(
+        Namespace::Events,
+        session.box_id,
+        session.tenant_internal_id,
+        session.internal_id,
+        DEFAULT_BRANCH_ID,
+    );
+    let mut all: Vec<Event> = Vec::new();
+    for res in kv.scan_prefix(&prefix)? {
+        let (_k, v) = res?;
+        let ev: Event = serde_json::from_slice(&v)?;
+        all.push(ev);
+    }
+    let start = all.len().saturating_sub(n);
+    Ok(all.split_off(start))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +185,76 @@ mod tests {
         let ev: Event = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(ev.seq, 1);
         assert_eq!(ev.payload, json!({"hello": "world"}));
+    }
+
+    #[tokio::test]
+    async fn fetch_last_n_returns_tail_in_order() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Mutex::new(());
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=5u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                &lock,
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+
+        let last_3 = fetch_last_n(&kv, &session, 3).unwrap();
+        assert_eq!(last_3.len(), 3);
+        assert_eq!(last_3[0].seq, 3);
+        assert_eq!(last_3[1].seq, 4);
+        assert_eq!(last_3[2].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn fetch_last_n_larger_than_size_returns_all_in_order() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Mutex::new(());
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=2u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                &lock,
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+        let all = fetch_last_n(&kv, &session, 100).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[1].seq, 2);
+    }
+
+    #[test]
+    fn fetch_last_n_zero_returns_empty() {
+        let (_dir, kv, _tenants, _sessions) = setup();
+        let session = Session {
+            internal_id: 1,
+            external_id: "s".into(),
+            tenant_internal_id: 1,
+            box_id: 0,
+            created_at: 0,
+            last_active_at: 0,
+            tier: crate::types::Tier::Warm,
+            next_seq: 1,
+        };
+        let out = fetch_last_n(&kv, &session, 0).unwrap();
+        assert!(out.is_empty());
     }
 }
