@@ -1,5 +1,5 @@
 use agentdb_storage::{encode_key, BoxId, KvStore, Namespace, RocksKvStore, TenantId};
-use agentdb_storage::{prefix_for_session, prefix_for_tenant};
+use agentdb_storage::{prefix_for_session, prefix_for_tenant, WriteOp};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -95,4 +95,46 @@ fn scan_prefix_on_empty_store_returns_no_rows() {
     let store = RocksKvStore::open(dir.path()).unwrap();
     let prefix = prefix_for_tenant(Namespace::Events, 1, 10);
     assert_eq!(store.scan_prefix(&prefix).unwrap().count(), 0);
+}
+
+#[test]
+fn write_batch_applies_mixed_put_and_delete_atomically() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+
+    let k_keep = encode_key(Namespace::Events, 1, 10, 1, 0, 1);
+    let k_drop = encode_key(Namespace::Events, 1, 10, 1, 0, 2);
+    store.put(&k_keep, b"pre-keep").unwrap();
+    store.put(&k_drop, b"pre-drop").unwrap();
+
+    let k_new = encode_key(Namespace::Events, 1, 10, 1, 0, 3);
+    store
+        .write_batch(vec![
+            WriteOp::Put {
+                key: k_keep.clone(),
+                value: b"post-keep".to_vec(),
+            },
+            WriteOp::Delete {
+                key: k_drop.clone(),
+            },
+            WriteOp::Put {
+                key: k_new.clone(),
+                value: b"new".to_vec(),
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(
+        store.get(&k_keep).unwrap().as_deref(),
+        Some(b"post-keep".as_ref())
+    );
+    assert_eq!(store.get(&k_drop).unwrap(), None);
+    assert_eq!(store.get(&k_new).unwrap().as_deref(), Some(b"new".as_ref()));
+}
+
+#[test]
+fn empty_write_batch_is_a_noop() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+    store.write_batch(Vec::new()).unwrap();
 }

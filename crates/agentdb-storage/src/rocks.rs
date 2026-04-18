@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Direction, IteratorMode, Options, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 
 use crate::error::{Error, Result};
 use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
@@ -55,8 +55,16 @@ impl KvStore for RocksKvStore {
         Ok(Box::new(results.into_iter()))
     }
 
-    fn write_batch(&self, _ops: Vec<WriteOp>) -> Result<()> {
-        unimplemented!("write_batch — Task 11")
+    fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for op in ops {
+            match op {
+                WriteOp::Put { key, value } => batch.put(&key, &value),
+                WriteOp::Delete { key } => batch.delete(&key),
+            }
+        }
+        self.db.write(batch)?;
+        Ok(())
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
