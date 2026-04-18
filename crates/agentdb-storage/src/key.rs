@@ -23,7 +23,10 @@ impl Namespace {
             0x02 => Ok(Self::State),
             0x03 => Ok(Self::Secondary),
             0x04 => Ok(Self::Meta),
-            other => Err(Error::Other(format!("unknown namespace tag 0x{:02x}", other))),
+            other => Err(Error::Other(format!(
+                "unknown namespace tag 0x{:02x}",
+                other
+            ))),
         }
     }
 
