@@ -12,5 +12,6 @@ pub use meta::{
     key_next_session_id, key_next_tenant_id, key_session_by_external, key_session_record,
     key_tenant_by_external, key_tenant_record,
 };
+pub use registry::TenantRegistry;
 pub use types::{Document, Event, Session, Tenant, Tier};
 // Other re-exports added as types land.
