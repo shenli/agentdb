@@ -7,6 +7,7 @@ pub mod primitives;
 pub mod registry;
 pub mod types;
 
+pub use box_runtime::{BoxRegistry, Box_};
 pub use error::{Error, Result};
 pub use meta::{
     key_next_session_id, key_next_tenant_id, key_session_by_external, key_session_record,
