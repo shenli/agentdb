@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Options, DB};
+use rocksdb::{Direction, IteratorMode, Options, DB};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 
 /// RocksDB-backed `KvStore`.
@@ -35,8 +35,24 @@ impl KvStore for RocksKvStore {
         Ok(())
     }
 
-    fn scan_prefix(&self, _prefix: &[u8]) -> Result<KvIter> {
-        unimplemented!("scan_prefix — Task 10")
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let prefix_vec = prefix.to_vec();
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(&prefix_vec, Direction::Forward));
+
+        let results: Vec<Result<(Vec<u8>, Vec<u8>)>> = iter
+            .take_while(|res| match res {
+                Ok((k, _)) => k.starts_with(&prefix_vec),
+                Err(_) => true,
+            })
+            .map(|res| {
+                res.map(|(k, v)| (k.to_vec(), v.to_vec()))
+                    .map_err(Error::from)
+            })
+            .collect();
+
+        Ok(Box::new(results.into_iter()))
     }
 
     fn write_batch(&self, _ops: Vec<WriteOp>) -> Result<()> {

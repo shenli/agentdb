@@ -1,4 +1,5 @@
 use agentdb_storage::{encode_key, BoxId, KvStore, Namespace, RocksKvStore, TenantId};
+use agentdb_storage::{prefix_for_session, prefix_for_tenant};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -39,4 +40,59 @@ fn delete_of_missing_key_is_ok() {
     let store = RocksKvStore::open(dir.path()).unwrap();
     let k = encode_key(Namespace::Events, 1, 2, 3, 0, 1);
     store.delete(&k).unwrap(); // must not error
+}
+
+#[test]
+fn scan_prefix_returns_only_session_keys_in_order() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+
+    // Three sessions for the same tenant; session 2 is the one we query.
+    for seq in 1..=3 {
+        let k = encode_key(Namespace::Events, 1, 10, 1, 0, seq);
+        store.put(&k, format!("s1-{seq}").as_bytes()).unwrap();
+    }
+    for seq in 1..=3 {
+        let k = encode_key(Namespace::Events, 1, 10, 2, 0, seq);
+        store.put(&k, format!("s2-{seq}").as_bytes()).unwrap();
+    }
+    for seq in 1..=3 {
+        let k = encode_key(Namespace::Events, 1, 10, 3, 0, seq);
+        store.put(&k, format!("s3-{seq}").as_bytes()).unwrap();
+    }
+
+    let prefix = prefix_for_session(Namespace::Events, 1, 10, 2);
+    let mut iter = store.scan_prefix(&prefix).unwrap();
+    let got: Vec<_> = iter.by_ref().map(|r| r.unwrap().1).collect();
+    assert_eq!(
+        got,
+        vec![b"s2-1".to_vec(), b"s2-2".to_vec(), b"s2-3".to_vec()],
+    );
+}
+
+#[test]
+fn scan_prefix_does_not_leak_across_namespaces() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+
+    let k_event = encode_key(Namespace::Events, 1, 10, 1, 0, 1);
+    let k_state = encode_key(Namespace::State, 1, 10, 1, 0, 1);
+    store.put(&k_event, b"event").unwrap();
+    store.put(&k_state, b"state").unwrap();
+
+    let prefix = prefix_for_tenant(Namespace::Events, 1, 10);
+    let got: Vec<_> = store
+        .scan_prefix(&prefix)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(got, vec![b"event".to_vec()]);
+}
+
+#[test]
+fn scan_prefix_on_empty_store_returns_no_rows() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+    let prefix = prefix_for_tenant(Namespace::Events, 1, 10);
+    assert_eq!(store.scan_prefix(&prefix).unwrap().count(), 0);
 }
