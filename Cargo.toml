@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/agentdb-storage"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
+tempfile = "3"
