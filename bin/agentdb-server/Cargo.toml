@@ -1,0 +1,19 @@
+[package]
+name = "agentdb-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentdb-server"
+path = "src/main.rs"
+
+[dependencies]
+agentdb-api = { path = "../../crates/agentdb-api" }
+agentdb-core = { path = "../../crates/agentdb-core" }
+agentdb-storage = { path = "../../crates/agentdb-storage" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
