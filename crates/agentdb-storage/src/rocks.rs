@@ -39,22 +39,29 @@ impl KvStore for RocksKvStore {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        // Eagerly collect so the returned iterator is 'static w.r.t. lifetimes:
+        // RocksDB's DBIterator borrows from &DB and cannot be returned as a
+        // Box<dyn Iterator + 'static>. Stop on the first error (do not continue
+        // past it) so callers don't silently skip a corrupt read.
         let prefix_vec = prefix.to_vec();
         let iter = self
             .db
             .iterator(IteratorMode::From(&prefix_vec, Direction::Forward));
-
-        let results: Vec<Result<(Vec<u8>, Vec<u8>)>> = iter
-            .take_while(|res| match res {
-                Ok((k, _)) => k.starts_with(&prefix_vec),
-                Err(_) => true,
-            })
-            .map(|res| {
-                res.map(|(k, v)| (k.to_vec(), v.to_vec()))
-                    .map_err(Error::from)
-            })
-            .collect();
-
+        let mut results: Vec<Result<(Vec<u8>, Vec<u8>)>> = Vec::new();
+        for res in iter {
+            match res {
+                Ok((k, v)) => {
+                    if !k.starts_with(&prefix_vec) {
+                        break;
+                    }
+                    results.push(Ok((k.to_vec(), v.to_vec())));
+                }
+                Err(e) => {
+                    results.push(Err(Error::from(e)));
+                    break;
+                }
+            }
+        }
         Ok(Box::new(results.into_iter()))
     }
 

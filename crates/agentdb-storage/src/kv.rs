@@ -31,5 +31,11 @@ pub trait KvStore: Send + Sync {
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()>;
     /// Snapshot borrows from the store, so callers keep the store alive
     /// (e.g. `Arc<dyn KvStore>`) for the snapshot's lifetime.
+    ///
+    /// The returned handle is **not safe to hold across an async `.await`
+    /// point**: its lifetime borrows from `&self`, so await-yielding while
+    /// the handle is live will fail the borrow checker. Inside async code,
+    /// resolve the snapshot into owned data (e.g. collect a `scan_prefix`
+    /// into a `Vec`) before yielding.
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>>;
 }
