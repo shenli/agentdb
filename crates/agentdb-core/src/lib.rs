@@ -8,4 +8,5 @@ pub mod registry;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use types::{Document, Event};
 // Other re-exports added as types land.
