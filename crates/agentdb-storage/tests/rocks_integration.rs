@@ -1,5 +1,5 @@
 use agentdb_storage::{encode_key, BoxId, KvStore, Namespace, RocksKvStore, TenantId};
-use agentdb_storage::{prefix_for_session, prefix_for_tenant, WriteOp};
+use agentdb_storage::{prefix_for_box, prefix_for_session, prefix_for_tenant, WriteOp};
 use tempfile::TempDir;
 
 fn tmp() -> TempDir {
@@ -178,4 +178,71 @@ fn snapshot_scan_prefix_is_consistent() {
         vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()],
         "snapshot should not see the key written after it"
     );
+}
+
+#[test]
+fn end_to_end_locality_slices_line_up() {
+    let dir = tmp();
+    let store = RocksKvStore::open(dir.path()).unwrap();
+
+    let box_id: BoxId = 7;
+    let tenant_a: TenantId = 100;
+    let tenant_b: TenantId = 200;
+
+    // Write events for (tenant_a, session 1), (tenant_a, session 2), (tenant_b, session 1)
+    let plan = [(tenant_a, 1u64), (tenant_a, 2u64), (tenant_b, 1u64)];
+    for (tenant, session) in plan {
+        for seq in 1..=10u64 {
+            let k = encode_key(Namespace::Events, box_id, tenant, session, 0, seq);
+            let v = format!("t{tenant}-s{session}-e{seq}");
+            store.put(&k, v.as_bytes()).unwrap();
+        }
+        // also one state doc per session
+        let sk = encode_key(Namespace::State, box_id, tenant, session, 0, 0);
+        store
+            .put(&sk, format!("state-t{tenant}-s{session}").as_bytes())
+            .unwrap();
+    }
+
+    // Session-level event scan returns exactly those 10 events in order.
+    let p = prefix_for_session(Namespace::Events, box_id, tenant_a, 1);
+    let rows: Vec<_> = store
+        .scan_prefix(&p)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0], b"t100-s1-e1".to_vec());
+    assert_eq!(rows[9], b"t100-s1-e10".to_vec());
+
+    // Tenant-level event scan returns 20 events: all of t_a's two sessions.
+    let p = prefix_for_tenant(Namespace::Events, box_id, tenant_a);
+    let rows: Vec<_> = store
+        .scan_prefix(&p)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(rows.len(), 20);
+
+    // Box-level event scan returns 30 events across all tenants.
+    let p = prefix_for_box(Namespace::Events, box_id);
+    let rows: Vec<_> = store
+        .scan_prefix(&p)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(rows.len(), 30);
+
+    // Box-level STATE scan returns exactly 3 state docs, does not leak events.
+    let p = prefix_for_box(Namespace::State, box_id);
+    let rows: Vec<_> = store
+        .scan_prefix(&p)
+        .unwrap()
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        let s = std::str::from_utf8(row).unwrap();
+        assert!(s.starts_with("state-"));
+    }
 }

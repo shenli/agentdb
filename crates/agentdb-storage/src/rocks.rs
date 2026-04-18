@@ -6,6 +6,9 @@ use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use crate::error::{Error, Result};
 use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 
+/// Result type for KV operations.
+type KvResult = std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>;
+
 /// RocksDB-backed `KvStore`.
 pub struct RocksKvStore {
     db: Arc<DB>,
@@ -87,7 +90,7 @@ impl<'a> KvSnapshot for RocksSnapshotHandle<'a> {
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
         let prefix_vec = prefix.to_vec();
         // Eagerly collect so the returned iterator is 'static w.r.t. lifetimes.
-        let mut out: Vec<std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>> = Vec::new();
+        let mut out: Vec<KvResult> = Vec::new();
         let iter = self
             .snap
             .iterator(IteratorMode::From(&prefix_vec, Direction::Forward));
