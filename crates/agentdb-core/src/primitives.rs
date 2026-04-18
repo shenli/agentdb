@@ -57,28 +57,12 @@ pub fn append_event(
     Ok(event)
 }
 
-/// Convenience: open the session (creating if absent), hold the box's write
-/// lock, append. Used from tests to exercise the hot path; production call
-/// sites sequence these steps via T10's `append_and_fetch`.
-#[allow(clippy::too_many_arguments)]
-pub async fn open_and_append(
-    kv: Arc<dyn KvStore>,
-    sessions: &SessionRegistry,
-    box_lock: &tokio::sync::Mutex<()>,
-    box_id: agentdb_storage::BoxId,
-    tenant_id: agentdb_storage::TenantId,
-    session_external: &str,
-    payload: crate::types::Document,
-    now_millis: u64,
-) -> Result<(Event, Session)> {
-    let guard = box_lock.lock().await;
-    let mut session = sessions.get_or_mint(box_id, tenant_id, session_external, now_millis)?;
-    let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
-    Ok((event, session))
-}
-
 /// Fetch the last `n` events of `session`'s default branch in seq order
 /// (oldest-to-newest within the returned slice).
+///
+/// Streams through the prefix scan with a bounded ring buffer so memory is
+/// O(n), not O(session size). Events arrive in ascending seq order because
+/// the key layout sorts by seq last.
 pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Result<Vec<Event>> {
     if n == 0 {
         return Ok(Vec::new());
@@ -90,14 +74,16 @@ pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Resul
         session.internal_id,
         DEFAULT_BRANCH_ID,
     );
-    let mut all: Vec<Event> = Vec::new();
+    let mut ring: std::collections::VecDeque<Event> = std::collections::VecDeque::with_capacity(n);
     for res in kv.scan_prefix(&prefix)? {
         let (_k, v) = res?;
         let ev: Event = serde_json::from_slice(&v)?;
-        all.push(ev);
+        if ring.len() == n {
+            ring.pop_front();
+        }
+        ring.push_back(ev);
     }
-    let start = all.len().saturating_sub(n);
-    Ok(all.split_off(start))
+    Ok(ring.into())
 }
 
 use crate::box_runtime::BoxRegistry;
@@ -153,6 +139,24 @@ mod tests {
         let tenants = TenantRegistry::new(kv.clone());
         let sessions = SessionRegistry::new(kv.clone());
         (dir, kv, tenants, sessions)
+    }
+
+    // Test-only helper replacing the former `open_and_append` free function.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_and_append(
+        kv: Arc<dyn KvStore>,
+        sessions: &SessionRegistry,
+        box_lock: &tokio::sync::Mutex<()>,
+        box_id: agentdb_storage::BoxId,
+        tenant_id: agentdb_storage::TenantId,
+        session_external: &str,
+        payload: crate::types::Document,
+        now_millis: u64,
+    ) -> Result<(Event, Session)> {
+        let guard = box_lock.lock().await;
+        let mut session = sessions.get_or_mint(box_id, tenant_id, session_external, now_millis)?;
+        let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+        Ok((event, session))
     }
 
     fn context() -> (TempDir, BoxRegistry, TenantRegistry, SessionRegistry) {

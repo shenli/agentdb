@@ -17,14 +17,16 @@ async fn main() -> anyhow::Result<()> {
     let data_dir: PathBuf = std::env::var_os("AGENTDB_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./data/rocksdb"));
-    let num_boxes: u16 = std::env::var("AGENTDB_BOXES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let addr: SocketAddr = std::env::var("AGENTDB_ADDR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| "127.0.0.1:7878".parse().unwrap());
+    let num_boxes: u16 = match std::env::var("AGENTDB_BOXES") {
+        Ok(v) => v.parse().context("AGENTDB_BOXES must be a valid u16")?,
+        Err(_) => 4,
+    };
+    let addr: SocketAddr = match std::env::var("AGENTDB_ADDR") {
+        Ok(v) => v
+            .parse()
+            .context("AGENTDB_ADDR must be a valid socket address")?,
+        Err(_) => "127.0.0.1:7878".parse().unwrap(),
+    };
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?);
