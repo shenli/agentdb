@@ -18,6 +18,10 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
-    // Routes added in Task 12.
-    Router::new().with_state(state)
+    Router::new()
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
+            axum::routing::post(handlers::append_and_fetch),
+        )
+        .with_state(state)
 }
