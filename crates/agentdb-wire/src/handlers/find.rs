@@ -68,7 +68,7 @@ pub fn find_response(
         }
         other => {
             return Err(WireError::Protocol(format!(
-                "unknown collection {other}; only 'events' and 'sessions' exist in M3"
+                "unknown collection {other}; only 'events' and 'sessions' exist"
             )));
         }
     }

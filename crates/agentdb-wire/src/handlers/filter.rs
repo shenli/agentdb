@@ -31,7 +31,7 @@ impl Filter {
         for (k, v) in doc.iter() {
             if k.starts_with('$') {
                 return Err(WireError::Protocol(format!(
-                    "top-level operator {k} not supported in M3 filter"
+                    "top-level operator {k} not supported in filter"
                 )));
             }
             let path: Vec<String> = k.split('.').map(|s| s.to_string()).collect();
@@ -48,7 +48,7 @@ impl Filter {
                             "$lte" => Condition::Lte(bson_to_json(opval.clone())),
                             other => {
                                 return Err(WireError::Protocol(format!(
-                                    "filter operator {other} not supported in M3"
+                                    "filter operator {other} not supported"
                                 )))
                             }
                         };

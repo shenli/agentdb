@@ -25,6 +25,7 @@ dependencies = [
 name = "agentdb-core"
 version = "0.1.0"
 dependencies = [
+ "agentdb-index",
  "agentdb-storage",
  "anyhow",
  "serde",
@@ -33,6 +34,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "agentdb-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -65,6 +76,7 @@ name = "agentdb-wire"
 version = "0.1.0"
 dependencies = [
  "agentdb-core",
+ "agentdb-index",
  "agentdb-storage",
  "anyhow",
  "bson",

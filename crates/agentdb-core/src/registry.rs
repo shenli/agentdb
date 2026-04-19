@@ -195,6 +195,22 @@ impl SessionRegistry {
         Ok(out)
     }
 
+    /// Lookup a session by its internal id (not its external string). Used by
+    /// the planner when resolving DocIds that came back from an index.
+    pub fn lookup_by_internal(
+        &self,
+        box_id: BoxId,
+        tenant_id: TenantId,
+        internal_id: SessionId,
+    ) -> Result<Option<Session>> {
+        let key = crate::meta::key_session_record(box_id, tenant_id, internal_id);
+        let Some(bytes) = self.kv.get(&key)? else {
+            return Ok(None);
+        };
+        let s: Session = serde_json::from_slice(&bytes)?;
+        Ok(Some(s))
+    }
+
     /// Overwrite the persisted session record. Does NOT rewrite the lookup
     /// entry — that mapping is immutable once created.
     pub fn save(&self, session: &Session) -> Result<()> {

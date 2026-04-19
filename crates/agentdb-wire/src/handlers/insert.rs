@@ -16,7 +16,7 @@ pub async fn insert_response(
 ) -> WireResult<Document> {
     if collection != "events" {
         return Err(WireError::Protocol(format!(
-            "insert into {collection} not supported in M3; only 'events' accepts writes"
+            "insert into {collection} not supported; only 'events' accepts writes"
         )));
     }
 
