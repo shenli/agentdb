@@ -4,6 +4,7 @@ members = [
     "crates/agentdb-storage",
     "crates/agentdb-core",
     "crates/agentdb-api",
+    "crates/agentdb-index",
     "crates/agentdb-wire",
     "bin/agentdb-server",
 ]
