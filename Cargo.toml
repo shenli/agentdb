@@ -15,10 +15,10 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
-bson = "2"
+bson = { version = "3", features = ["serde"] }
 bytes = "1"
 byteorder = "1"
-mongodb = { version = "2", default-features = false, features = ["tokio-runtime"] }
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-3", "compat-3-3-0"] }
 thiserror = "1"
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 tempfile = "3"

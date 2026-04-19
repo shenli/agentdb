@@ -5,9 +5,7 @@ pub enum WireError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("bson error: {0}")]
-    Bson(#[from] bson::de::Error),
-    #[error("bson ser error: {0}")]
-    BsonSer(#[from] bson::ser::Error),
+    Bson(#[from] bson::error::Error),
     #[error("core error: {0}")]
     Core(#[from] agentdb_core::Error),
     #[error("json error: {0}")]

@@ -40,7 +40,7 @@ async fn hello_over_real_driver() {
     let (_dir, port) = spawn().await;
     let cli = client(port).await;
     let admin = cli.database("admin");
-    let reply = admin.run_command(doc! { "ping": 1 }, None).await.unwrap();
+    let reply = admin.run_command(doc! { "ping": 1 }).await.unwrap();
     assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
 }
 
@@ -52,18 +52,15 @@ async fn insert_then_find_round_trip() {
     let events = db.collection::<bson::Document>("events");
 
     events
-        .insert_one(doc! { "session_id": "s-1", "kind": "hello" }, None)
+        .insert_one(doc! { "session_id": "s-1", "kind": "hello" })
         .await
         .unwrap();
     events
-        .insert_one(doc! { "session_id": "s-1", "kind": "world" }, None)
+        .insert_one(doc! { "session_id": "s-1", "kind": "world" })
         .await
         .unwrap();
 
-    let cursor = events
-        .find(doc! { "session_id": "s-1" }, None)
-        .await
-        .unwrap();
+    let cursor = events.find(doc! { "session_id": "s-1" }).await.unwrap();
     use futures_util::StreamExt;
     let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
     assert_eq!(docs.len(), 2);
@@ -81,10 +78,10 @@ async fn list_databases_sees_tenant_after_write() {
     let cli = client(port).await;
     let events = cli.database("t-abc").collection::<bson::Document>("events");
     events
-        .insert_one(doc! { "session_id": "s-1", "x": 1 }, None)
+        .insert_one(doc! { "session_id": "s-1", "x": 1 })
         .await
         .unwrap();
 
-    let dbs = cli.list_database_names(None, None).await.unwrap();
+    let dbs = cli.list_database_names().await.unwrap();
     assert!(dbs.contains(&"t-abc".to_string()));
 }

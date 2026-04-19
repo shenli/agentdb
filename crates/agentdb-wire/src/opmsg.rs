@@ -86,7 +86,7 @@ pub fn decode(buf: &[u8]) -> WireResult<OpMsg> {
                             buf.len()
                         ))
                     })?;
-                let doc: bson::Document = bson::from_slice(&buf[pos..end])?;
+                let doc: bson::Document = bson::deserialize_from_slice(&buf[pos..end])?;
                 rdr.set_position(end as u64);
                 sections.push(Section::Body(doc));
             }
@@ -140,7 +140,7 @@ pub fn decode(buf: &[u8]) -> WireResult<OpMsg> {
                                 "doc extends past sequence: pos={pos} doc_len={doc_len} seq_end={seq_end}"
                             ))
                         })?;
-                    let doc: bson::Document = bson::from_slice(&buf[pos..end])?;
+                    let doc: bson::Document = bson::deserialize_from_slice(&buf[pos..end])?;
                     rdr.set_position(end as u64);
                     docs.push(doc);
                 }
@@ -175,7 +175,7 @@ pub fn encode_body_response(
     response_to: i32,
     body: &bson::Document,
 ) -> WireResult<()> {
-    let body_bytes = bson::to_vec(body)?;
+    let body_bytes = bson::serialize_to_vec(body)?;
     let payload_len = 4 /* flag_bits */ + 1 /* kind */ + body_bytes.len();
     let total_len: i32 = (HEADER_LEN + payload_len) as i32;
     to.reserve(total_len as usize);
