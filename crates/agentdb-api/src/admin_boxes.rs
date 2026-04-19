@@ -6,6 +6,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -118,6 +119,12 @@ pub async fn inject_fault(
     let expires_at = Instant::now() + Duration::from_secs(body.duration_s);
     *b.fault.write() = Some(InjectedFault { kind, expires_at });
     b.metrics.record_fault();
+    state.stream.emit(StreamEvent::FaultInjected {
+        ts_ms: now_ms(),
+        box_id: id,
+        kind: body.kind.to_ascii_lowercase(),
+        duration_s: body.duration_s,
+    });
     Ok(Json(InjectFaultResponse {
         ok: true,
         expires_in_s: body.duration_s,

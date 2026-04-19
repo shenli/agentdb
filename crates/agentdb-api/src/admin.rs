@@ -5,6 +5,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -46,6 +47,7 @@ pub async fn force_tier(
         .ok_or_else(|| ApiError::BadRequest(format!("session {} not found", body.session_id)))?;
 
     let guard = box_.write_lock.lock().await;
+    let mut transition: Option<(&'static str, &'static str)> = None;
     match target.as_str() {
         "cold" if session.tier == Tier::Warm => {
             cold_transition(
@@ -59,6 +61,7 @@ pub async fn force_tier(
             box_.metrics.record_tier_transition();
             box_.metrics.drop_tier(Tier::Warm);
             box_.metrics.bump_tier(Tier::Cold);
+            transition = Some(("warm", "cold"));
         }
         "cold" => { /* already cold — no-op */ }
         "warm" if session.tier == Tier::Cold => {
@@ -73,11 +76,22 @@ pub async fn force_tier(
             box_.metrics.record_tier_transition();
             box_.metrics.drop_tier(Tier::Cold);
             box_.metrics.bump_tier(Tier::Warm);
+            transition = Some(("cold", "warm"));
         }
         "warm" => { /* already warm — no-op */ }
         _ => unreachable!(),
     }
     drop(guard);
+
+    if let Some((from, to)) = transition {
+        state.stream.emit(StreamEvent::TierChange {
+            ts_ms: now_ms(),
+            box_id: box_.id,
+            session_id: body.session_id.clone(),
+            from: from.into(),
+            to: to.into(),
+        });
+    }
 
     let tier_str = match session.tier {
         Tier::Warm => "warm",

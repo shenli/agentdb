@@ -6,6 +6,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::stream::StreamEvent;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -42,6 +43,12 @@ pub async fn fork_handler(
     let fork = child
         .forked_from
         .expect("fork_session always sets forked_from");
+    state.stream.emit(StreamEvent::ForkCreated {
+        ts_ms: now_millis(),
+        box_id: box_.id,
+        parent: parent_session_id.clone(),
+        child: child.external_id.clone(),
+    });
     Ok(Json(ForkResponse {
         new_session_id: child.external_id,
         parent_session_id,

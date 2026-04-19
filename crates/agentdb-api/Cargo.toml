@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 agentdb-core = { path = "../agentdb-core" }
+async-broadcast = { workspace = true }
 axum = { workspace = true }
+futures-util = "0.3"
 tokio = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }

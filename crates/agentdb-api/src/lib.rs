@@ -11,14 +11,17 @@ pub mod dto;
 pub mod error;
 pub mod fork;
 pub mod handlers;
+pub mod stream;
 
 pub use error::ApiError;
+pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<agentdb_core::BoxRegistry>,
     pub tenants: Arc<agentdb_core::TenantRegistry>,
     pub sessions: Arc<agentdb_core::SessionRegistry>,
+    pub stream: StreamBus,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -55,5 +58,6 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/sessions/:session_id",
             axum::routing::get(admin_sessions::get_session),
         )
+        .route("/api/stream", axum::routing::get(stream::sse_handler))
         .with_state(state)
 }
