@@ -18,10 +18,13 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+agentdb-api = { path = "../agentdb-api" }
 agentdb-storage = { path = "../agentdb-storage" }
 anyhow = { workspace = true }
+axum = { workspace = true }
 futures-util = "0.3"
 mongodb = { workspace = true }
 object_store = { workspace = true }
+reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

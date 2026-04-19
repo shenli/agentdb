@@ -6,6 +6,7 @@ use agentdb_wire::{serve, WireState};
 use bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::Client;
+use object_store::ObjectStore;
 use tempfile::TempDir;
 
 async fn spawn() -> (TempDir, TempDir, u16) {
@@ -30,6 +31,44 @@ async fn spawn() -> (TempDir, TempDir, u16) {
         let _ = serve(listener, state).await;
     });
     (dir, obj_dir, port)
+}
+
+async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
+    use object_store::local::LocalFileSystem;
+    let kv_dir = TempDir::new().unwrap();
+    let obj_dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).unwrap());
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+    let registry = Arc::new(BoxRegistry::new(kv.clone(), store.clone(), 4).unwrap());
+    let tenants = Arc::new(TenantRegistry::new(kv.clone()));
+    let sessions = Arc::new(SessionRegistry::new(kv));
+
+    let mongo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mongo_port = mongo_listener.local_addr().unwrap().port();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = http_listener.local_addr().unwrap().port();
+
+    let wire_state = WireState {
+        registry: registry.clone(),
+        tenants: tenants.clone(),
+        sessions: sessions.clone(),
+    };
+    let http_state = agentdb_api::AppState {
+        registry: registry.clone(),
+        tenants: tenants.clone(),
+        sessions: sessions.clone(),
+    };
+
+    tokio::spawn(async move {
+        let _ = serve(mongo_listener, wire_state).await;
+    });
+    let app = agentdb_api::router(http_state);
+    tokio::spawn(async move {
+        let _ = axum::serve(http_listener, app).await;
+    });
+
+    (kv_dir, obj_dir, mongo_port, http_port)
 }
 
 async fn client(port: u16) -> Client {
@@ -159,4 +198,66 @@ async fn vector_search_aggregation_returns_top_hit() {
     let emb = first_payload.get_array("embedding").unwrap();
     let as_vec: Vec<f64> = emb.iter().filter_map(|b| b.as_f64()).collect();
     assert_eq!(as_vec, vec![1.0, 0.0, 0.0]);
+}
+
+#[tokio::test]
+async fn cold_session_is_still_queryable_via_search() {
+    let (_kv, _obj, port, http_port) = spawn_with_http().await;
+    let cli = client(port).await;
+    let db = cli.database("t-cold");
+    let events = db.collection::<bson::Document>("events");
+
+    events
+        .insert_one(doc! { "session_id": "s-1", "text": "refund policy" })
+        .await
+        .unwrap();
+
+    // Force the session cold via HTTP admin.
+    let rest = reqwest::Client::new();
+    let resp: serde_json::Value = rest
+        .post(format!("http://127.0.0.1:{http_port}/api/admin/tier/force"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-cold",
+            "session_id": "s-1",
+            "target": "Cold"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["tier"], "cold");
+
+    // $search should still find the event via index + cold resolve fallback.
+    let pipeline = vec![doc! {
+        "$search": {
+            "text": { "query": "refund", "path": "payload.text" },
+            "limit": 10_i64,
+        }
+    }];
+    let cursor = events.aggregate(pipeline).await.unwrap();
+    use futures_util::StreamExt;
+    let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
+    assert_eq!(docs.len(), 1);
+
+    // Reactivate.
+    let warm: serde_json::Value = rest
+        .post(format!("http://127.0.0.1:{http_port}/api/admin/tier/force"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-cold",
+            "session_id": "s-1",
+            "target": "Warm"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["tier"], "warm");
 }
