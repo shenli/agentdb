@@ -5,6 +5,8 @@ use std::sync::Arc;
 use axum::Router;
 
 pub mod admin;
+pub mod admin_boxes;
+pub mod admin_sessions;
 pub mod dto;
 pub mod error;
 pub mod fork;
@@ -32,6 +34,26 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),
+        )
+        .route(
+            "/api/admin/boxes",
+            axum::routing::get(admin_boxes::list_boxes),
+        )
+        .route(
+            "/api/admin/boxes/:id",
+            axum::routing::get(admin_boxes::get_box),
+        )
+        .route(
+            "/api/admin/boxes/:id/inject_fault",
+            axum::routing::post(admin_boxes::inject_fault),
+        )
+        .route(
+            "/api/admin/boxes/:id/quota",
+            axum::routing::post(admin_boxes::set_quota),
+        )
+        .route(
+            "/api/admin/sessions/:session_id",
+            axum::routing::get(admin_sessions::get_session),
         )
         .with_state(state)
 }
