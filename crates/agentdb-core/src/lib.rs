@@ -2,6 +2,7 @@
 
 pub mod box_runtime;
 pub mod error;
+pub mod fork;
 pub mod indexes;
 pub mod lifecycle;
 pub(crate) mod meta;
@@ -14,6 +15,7 @@ pub mod types;
 
 pub use box_runtime::{BoxRegistry, Box_};
 pub use error::{Error, Result};
+pub use fork::fork_session;
 pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
