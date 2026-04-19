@@ -4,6 +4,7 @@ members = [
     "crates/agentdb-storage",
     "crates/agentdb-core",
     "crates/agentdb-api",
+    "crates/agentdb-dashboard",
     "crates/agentdb-index",
     "crates/agentdb-wire",
     "bin/agentdb-server",
@@ -30,6 +31,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time"] }
 axum = "0.7"
 tower = "0.4"
+tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

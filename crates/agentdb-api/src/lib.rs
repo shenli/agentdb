@@ -59,5 +59,6 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(admin_sessions::get_session),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
+        .nest_service("/dashboard", agentdb_dashboard::router())
         .with_state(state)
 }
