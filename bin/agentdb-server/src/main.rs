@@ -1,9 +1,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentdb_api::{router, AppState};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_core::{
+    BoxRegistry, LifecycleConfig, LifecycleEngine, SessionRegistry, TenantRegistry,
+};
 use agentdb_storage::{KvStore, RocksKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
@@ -20,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
     let data_dir: PathBuf = std::env::var_os("AGENTDB_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./data/rocksdb"));
+    let objects_dir: PathBuf = std::env::var_os("AGENTDB_OBJECTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./data/objects"));
     let num_boxes: u16 = match std::env::var("AGENTDB_BOXES") {
         Ok(v) => v.parse().context("AGENTDB_BOXES must be a valid u16")?,
         Err(_) => 4,
@@ -36,17 +42,46 @@ async fn main() -> anyhow::Result<()> {
             .context("AGENTDB_MONGO_ADDR must be a valid socket address")?,
         Err(_) => "127.0.0.1:7879".parse().unwrap(),
     };
+    let lifecycle_cfg = LifecycleConfig {
+        tick: Duration::from_secs(
+            std::env::var("AGENTDB_TICK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        ),
+        t_cold: Duration::from_secs(
+            std::env::var("AGENTDB_T_COLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        ),
+    };
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
+    std::fs::create_dir_all(&objects_dir).context("create objects dir")?;
+
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?);
-    // TODO(T8): replace with a properly configured object store (M5 Task 8).
-    let object_store: Arc<dyn ObjectStore> = Arc::new(
-        LocalFileSystem::new_with_prefix("/tmp/agentdb-objects-m5-stub")
-            .context("open object store stub")?,
-    );
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), object_store, num_boxes)?);
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(&objects_dir).context("open object store")?);
+    let registry = Arc::new(BoxRegistry::new(kv.clone(), store.clone(), num_boxes)?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
-    let sessions = Arc::new(SessionRegistry::new(kv));
+    let sessions = Arc::new(SessionRegistry::new(kv.clone()));
+
+    // Spin up one lifecycle engine per box. Engine handles are intentionally
+    // leaked for the life of the process — shutdown is process exit.
+    let mut engines: Vec<LifecycleEngine> = Vec::with_capacity(num_boxes as usize);
+    for i in 0..num_boxes {
+        let box_ = registry.box_by_id(i).expect("box id in range");
+        engines.push(LifecycleEngine::start(
+            kv.clone(),
+            store.clone(),
+            tenants.clone(),
+            sessions.clone(),
+            box_,
+            lifecycle_cfg,
+        ));
+    }
+    std::mem::forget(engines);
 
     let http_state = AppState {
         registry: registry.clone(),
@@ -66,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let mongo_listener = tokio::net::TcpListener::bind(mongo_addr)
         .await
         .context("bind mongo listener")?;
-    tracing::info!(%http_addr, %mongo_addr, "agentdb-server listening");
+    tracing::info!(%http_addr, %mongo_addr, objects = %objects_dir.display(), "agentdb-server listening");
 
     let http_task =
         tokio::spawn(async move { axum::serve(http_listener, app).await.context("http serve") });
