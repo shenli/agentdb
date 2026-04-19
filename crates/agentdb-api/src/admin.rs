@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use agentdb_core::tiering::{cold_transition, reactivate};
 use agentdb_core::types::Tier;
 use axum::extract::State;
@@ -36,9 +34,12 @@ pub async fn force_tier(
     }
 
     let box_ = state.registry.route_tenant(&body.tenant_id);
+    // Admin endpoint: do NOT silently mint unknown tenants. A typo should 400,
+    // not create a phantom tenant entry.
     let tenant = state
         .tenants
-        .get_or_mint(box_.id, &body.tenant_id, now_millis())?;
+        .lookup(box_.id, &body.tenant_id)?
+        .ok_or_else(|| ApiError::BadRequest(format!("tenant {} not found", body.tenant_id)))?;
     let mut session = state
         .sessions
         .lookup(box_.id, tenant.internal_id, &body.session_id)?
@@ -80,11 +81,4 @@ pub async fn force_tier(
     Ok(Json(ForceTierResponse {
         tier: tier_str.into(),
     }))
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }

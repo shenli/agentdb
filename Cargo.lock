@@ -79,16 +79,19 @@ dependencies = [
 name = "agentdb-wire"
 version = "0.1.0"
 dependencies = [
+ "agentdb-api",
  "agentdb-core",
  "agentdb-index",
  "agentdb-storage",
  "anyhow",
+ "axum",
  "bson",
  "byteorder",
  "bytes",
  "futures-util",
  "mongodb",
  "object_store",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

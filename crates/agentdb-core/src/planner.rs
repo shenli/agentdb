@@ -222,7 +222,13 @@ impl<'a> HybridPlanner<'a> {
         let Some(path) = session.segment_path.as_deref() else {
             return Ok(None);
         };
-        let seg = crate::segment::read_segment(self.store, path).await?;
+        // A concurrent `reactivate` could have deleted the segment between our
+        // KV read and this object-store read. Treat that as a miss rather than
+        // propagating an error to the client.
+        let seg = match crate::segment::read_segment(self.store, path).await {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
         Ok(seg.events.into_iter().find(|e| e.seq == doc_id.seq))
     }
 }
