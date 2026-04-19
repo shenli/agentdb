@@ -37,6 +37,85 @@ pub fn not_implemented(cmd: &str) -> Document {
     }
 }
 
+use bson::Bson;
+
+use crate::handlers::{browse, find as find_mod, hello as hello_mod, insert as insert_mod};
+use crate::state::WireState;
+
+pub async fn dispatch(body: &Document, state: &WireState, connection_id: i64) -> Document {
+    match inspect(body) {
+        Err(e) => error_reply(&e),
+        Ok(head) => match head.name {
+            "hello" | "isMaster" | "ismaster" => hello_mod::hello_response(connection_id),
+            "ping" => browse::ping_response(),
+            "buildInfo" | "buildinfo" => browse::build_info_response(),
+            "listDatabases" => {
+                match browse::list_databases_response(&state.registry, &state.tenants) {
+                    Ok(d) => d,
+                    Err(e) => error_reply(&e),
+                }
+            }
+            "listCollections" => browse::list_collections_response(head.db.unwrap_or("")),
+            "find" => {
+                let collection = match body.get_str("find") {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        return error_reply(&crate::error::WireError::Protocol(
+                            "find command missing collection name".into(),
+                        ))
+                    }
+                };
+                let filter = body.get_document("filter").cloned().unwrap_or_default();
+                let limit = body.get_i64("limit").ok();
+                match find_mod::find_response(
+                    &state.registry,
+                    &state.tenants,
+                    &state.sessions,
+                    head.db.unwrap_or(""),
+                    &collection,
+                    &filter,
+                    limit,
+                ) {
+                    Ok(d) => d,
+                    Err(e) => error_reply(&e),
+                }
+            }
+            "insert" => {
+                let collection = match body.get_str("insert") {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        return error_reply(&crate::error::WireError::Protocol(
+                            "insert command missing collection name".into(),
+                        ))
+                    }
+                };
+                let docs_bson = body.get_array("documents").cloned().unwrap_or_default();
+                let docs: Vec<Document> = docs_bson
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        Bson::Document(d) => Some(d),
+                        _ => None,
+                    })
+                    .collect();
+                match insert_mod::insert_response(
+                    &state.registry,
+                    &state.tenants,
+                    &state.sessions,
+                    head.db.unwrap_or(""),
+                    &collection,
+                    &docs,
+                )
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => error_reply(&e),
+                }
+            }
+            other => not_implemented(other),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +148,43 @@ mod tests {
     fn not_implemented_reply_carries_command_name() {
         let d = not_implemented("killCursors");
         assert!(d.get_str("errmsg").unwrap().contains("killCursors"));
+    }
+
+    use crate::state::WireState;
+    use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+    use agentdb_storage::{KvStore, RocksKvStore};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn state() -> (TempDir, WireState) {
+        let dir = TempDir::new().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let tenants = Arc::new(TenantRegistry::new(kv.clone()));
+        let sessions = Arc::new(SessionRegistry::new(kv));
+        (
+            dir,
+            WireState {
+                registry,
+                tenants,
+                sessions,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn dispatch_hello_returns_ok_one() {
+        let (_d, st) = state();
+        let r = dispatch(&doc! { "hello": 1 }, &st, 7).await;
+        assert_eq!(r.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(r.get_i64("connectionId").unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_command_returns_not_implemented() {
+        let (_d, st) = state();
+        let r = dispatch(&doc! { "killCursors": 1 }, &st, 1).await;
+        assert_eq!(r.get_f64("ok").unwrap(), 0.0);
+        assert!(r.get_str("errmsg").unwrap().contains("killCursors"));
     }
 }
