@@ -163,3 +163,60 @@ async fn admin_force_tier_cold_then_warm_round_trips() {
         .unwrap();
     assert_eq!(warm["tier"], "warm");
 }
+
+#[tokio::test]
+#[serial]
+async fn fork_endpoint_creates_child_and_fetch_last_n_merges_parent_tail() {
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Seed parent with 2 events.
+    for i in 1..=2u64 {
+        client
+            .post(format!(
+                "{base}/api/tenants/t-1/sessions/parent/append_and_fetch"
+            ))
+            .json(&json!({"event": {"i": i}, "fetch_last_n": 0}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    // Fork.
+    let fork: serde_json::Value = client
+        .post(format!("{base}/api/sessions/parent/fork"))
+        .json(&json!({
+            "tenant_id": "t-1",
+            "new_session_id": "child"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fork["new_session_id"], "child");
+    assert_eq!(fork["parent_session_id"], "parent");
+    assert_eq!(fork["parent_seq_at_fork"], 3);
+
+    // Append to child, request fetch_last_n=5 — should include parent tail + child event.
+    let resp: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-1/sessions/child/append_and_fetch"
+        ))
+        .json(&json!({"event": {"c": 1}, "fetch_last_n": 5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let recent = resp["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 3);
+}

@@ -7,6 +7,7 @@ use axum::Router;
 pub mod admin;
 pub mod dto;
 pub mod error;
+pub mod fork;
 pub mod handlers;
 
 pub use error::ApiError;
@@ -27,6 +28,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tier/force",
             axum::routing::post(admin::force_tier),
+        )
+        .route(
+            "/api/sessions/:session_id/fork",
+            axum::routing::post(fork::fork_handler),
         )
         .with_state(state)
 }
