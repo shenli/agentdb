@@ -52,7 +52,19 @@ async fn run_connection(
         let body = msg
             .body()
             .ok_or_else(|| WireError::Protocol("request has no body section".into()))?;
-        let response_doc = dispatch(body, &state, connection_id).await;
+        // Collect Type-1 document sequences (e.g. the "documents" sequence for insert).
+        let doc_seqs: Vec<(&str, &[bson::Document])> = msg
+            .sections
+            .iter()
+            .filter_map(|s| match s {
+                opmsg::Section::DocumentSequence {
+                    identifier,
+                    documents,
+                } => Some((identifier.as_str(), documents.as_slice())),
+                _ => None,
+            })
+            .collect();
+        let response_doc = dispatch(body, &doc_seqs, &state, connection_id).await;
         let mut reply = Vec::with_capacity(64 + response_doc.len() * 16);
         opmsg::encode_body_response(
             &mut reply,

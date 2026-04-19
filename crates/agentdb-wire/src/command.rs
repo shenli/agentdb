@@ -42,7 +42,12 @@ use bson::Bson;
 use crate::handlers::{browse, find as find_mod, hello as hello_mod, insert as insert_mod};
 use crate::state::WireState;
 
-pub async fn dispatch(body: &Document, state: &WireState, connection_id: i64) -> Document {
+pub async fn dispatch(
+    body: &Document,
+    doc_sequences: &[(&str, &[Document])],
+    state: &WireState,
+    connection_id: i64,
+) -> Document {
     match inspect(body) {
         Err(e) => error_reply(&e),
         Ok(head) => match head.name {
@@ -89,14 +94,27 @@ pub async fn dispatch(body: &Document, state: &WireState, connection_id: i64) ->
                         ))
                     }
                 };
-                let docs_bson = body.get_array("documents").cloned().unwrap_or_default();
-                let docs: Vec<Document> = docs_bson
-                    .into_iter()
-                    .filter_map(|b| match b {
-                        Bson::Document(d) => Some(d),
-                        _ => None,
-                    })
-                    .collect();
+                // Documents may arrive either in a Type-1 document sequence (identifier
+                // "documents", as the real driver sends) or as a BSON array in the body
+                // (as our raw test helper sends).
+                let seq_docs: Vec<Document> = doc_sequences
+                    .iter()
+                    .find(|(id, _)| *id == "documents")
+                    .map(|(_, docs)| docs.to_vec())
+                    .unwrap_or_default();
+                let docs = if !seq_docs.is_empty() {
+                    seq_docs
+                } else {
+                    body.get_array("documents")
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|b| match b {
+                            Bson::Document(d) => Some(d),
+                            _ => None,
+                        })
+                        .collect()
+                };
                 match insert_mod::insert_response(
                     &state.registry,
                     &state.tenants,
@@ -175,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_hello_returns_ok_one() {
         let (_d, st) = state();
-        let r = dispatch(&doc! { "hello": 1 }, &st, 7).await;
+        let r = dispatch(&doc! { "hello": 1 }, &[], &st, 7).await;
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
         assert_eq!(r.get_i64("connectionId").unwrap(), 7);
     }
@@ -183,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_unknown_command_returns_not_implemented() {
         let (_d, st) = state();
-        let r = dispatch(&doc! { "killCursors": 1 }, &st, 1).await;
+        let r = dispatch(&doc! { "killCursors": 1 }, &[], &st, 1).await;
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert!(r.get_str("errmsg").unwrap().contains("killCursors"));
     }

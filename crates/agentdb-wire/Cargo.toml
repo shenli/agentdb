@@ -19,6 +19,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 agentdb-storage = { path = "../agentdb-storage" }
 anyhow = { workspace = true }
+futures-util = "0.3"
 mongodb = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

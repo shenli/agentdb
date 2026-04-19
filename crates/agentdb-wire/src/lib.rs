@@ -9,4 +9,5 @@ pub mod server;
 pub mod state;
 
 pub use error::{WireError, WireResult};
+pub use server::serve;
 pub use state::WireState;
