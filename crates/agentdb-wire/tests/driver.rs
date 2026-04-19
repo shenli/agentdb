@@ -261,3 +261,84 @@ async fn cold_session_is_still_queryable_via_search() {
         .unwrap();
     assert_eq!(warm["tier"], "warm");
 }
+
+#[tokio::test]
+async fn fork_child_merges_parent_tail_via_http_append_and_fetch() {
+    let (_kv, _obj, mongo_port, http_port) = spawn_with_http().await;
+    let cli = client(mongo_port).await;
+    let db = cli.database("t-fork");
+    let events = db.collection::<bson::Document>("events");
+
+    // Seed the parent with 2 events via the driver.
+    events
+        .insert_one(doc! { "session_id": "parent", "i": 1 })
+        .await
+        .unwrap();
+    events
+        .insert_one(doc! { "session_id": "parent", "i": 2 })
+        .await
+        .unwrap();
+
+    // Fork via REST.
+    let rest = reqwest::Client::new();
+    let fork: serde_json::Value = rest
+        .post(format!(
+            "http://127.0.0.1:{http_port}/api/sessions/parent/fork"
+        ))
+        .json(&serde_json::json!({
+            "tenant_id": "t-fork",
+            "new_session_id": "child"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fork["parent_seq_at_fork"], 3);
+
+    // Child appends, requests fetch_last_n=5 via HTTP REST (the mongodb driver
+    // doesn't invoke append_and_fetch; we use the REST endpoint directly).
+    let resp: serde_json::Value = rest
+        .post(format!(
+            "http://127.0.0.1:{http_port}/api/tenants/t-fork/sessions/child/append_and_fetch"
+        ))
+        .json(&serde_json::json!({"event": {"c": 1}, "fetch_last_n": 5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["recent"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn transaction_wire_commands_are_rejected_with_not_implemented() {
+    // Multi-doc transactions are not supported in M6. The server responds
+    // with ok:0 so the driver surfaces the limitation as a client error
+    // rather than silently accepting a fake transaction that provides no
+    // atomicity. A real application should detect this error and fall back
+    // to single-doc writes rather than trusting cross-op atomicity.
+    let (_dir, _obj, port) = spawn().await;
+    let cli = client(port).await;
+    let admin = cli.database("admin");
+    let result = admin
+        .run_command(doc! {
+            "startTransaction": 1,
+            "lsid": { "id": bson::oid::ObjectId::new() },
+            "txnNumber": 1_i64,
+            "autocommit": false,
+        })
+        .await;
+    assert!(result.is_err(), "startTransaction should be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("not implemented") || msg.contains("CommandNotFound"),
+        "error should indicate command is not supported; got: {msg}"
+    );
+}

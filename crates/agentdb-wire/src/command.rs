@@ -166,6 +166,11 @@ pub async fn dispatch(
                     Err(e) => error_reply(&e),
                 }
             }
+            // Mongo transaction commands: the server does not provide
+            // multi-doc atomicity (see M6 plan). Falling through to
+            // `not_implemented` returns ok:0 so the client-side driver
+            // surfaces the limitation as an error rather than silently
+            // accepting a fake transaction.
             other => not_implemented(other),
         },
     }

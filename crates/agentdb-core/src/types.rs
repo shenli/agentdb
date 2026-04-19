@@ -33,6 +33,16 @@ pub struct Tenant {
     pub created_at: u64,
 }
 
+/// Reference to a parent session in a fork relationship.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForkRef {
+    /// Parent session's *internal* id (same tenant, same box as the child).
+    pub parent_session_internal_id: u64,
+    /// Parent's `next_seq` at the moment of fork. The child sees parent events
+    /// with `seq < parent_seq_at_fork`.
+    pub parent_seq_at_fork: u64,
+}
+
 /// Persisted session record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -47,6 +57,8 @@ pub struct Session {
     /// When `tier == Cold`, the `object_store` path where events live. None for warm sessions.
     #[serde(default)]
     pub segment_path: Option<String>,
+    #[serde(default)]
+    pub forked_from: Option<ForkRef>,
 }
 
 #[cfg(test)]
@@ -85,6 +97,7 @@ mod tests {
             tier: Tier::Warm,
             next_seq: 5,
             segment_path: None,
+            forked_from: None,
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -109,5 +122,44 @@ mod tests {
         let text = serde_json::to_string(&t).unwrap();
         let back: Tenant = serde_json::from_str(&text).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn session_with_forked_from_roundtrips_through_json() {
+        let s = Session {
+            internal_id: 10,
+            external_id: "s-child".into(),
+            tenant_internal_id: 3,
+            box_id: 1,
+            created_at: 100,
+            last_active_at: 150,
+            tier: Tier::Warm,
+            next_seq: 1,
+            segment_path: None,
+            forked_from: Some(ForkRef {
+                parent_session_internal_id: 9,
+                parent_seq_at_fork: 42,
+            }),
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn session_without_forked_from_deserializes_from_old_record() {
+        let text = r#"{
+            "internal_id": 5,
+            "external_id": "s-1",
+            "tenant_internal_id": 1,
+            "box_id": 1,
+            "created_at": 0,
+            "last_active_at": 0,
+            "tier": "warm",
+            "next_seq": 1,
+            "segment_path": null
+        }"#;
+        let s: Session = serde_json::from_str(text).unwrap();
+        assert!(s.forked_from.is_none());
     }
 }

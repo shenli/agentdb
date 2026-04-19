@@ -106,8 +106,64 @@ pub fn scan_session_events(kv: &Arc<dyn KvStore>, session: &Session) -> Result<V
     Ok(all)
 }
 
+use object_store::ObjectStore;
+
 use crate::box_runtime::BoxRegistry;
 use crate::registry::TenantRegistry;
+
+/// Fork+tier-aware version of `fetch_last_n`.
+///
+/// Non-forked session: returns the last N events of the session itself.
+/// Forked session: merges parent events (with `seq < parent_seq_at_fork`)
+/// read from the parent's tier-appropriate source — warm reads from
+/// `cf_events`, cold reads the segment via `object_store`, archive is treated
+/// as empty. The merged set is sorted by `ts` and truncated to the last N.
+pub async fn fetch_last_n_merged(
+    kv: &Arc<dyn KvStore>,
+    store: &Arc<dyn ObjectStore>,
+    sessions: &SessionRegistry,
+    session: &Session,
+    n: usize,
+) -> Result<Vec<Event>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let own = fetch_last_n(kv, session, n)?;
+    let Some(fork) = session.forked_from.as_ref() else {
+        return Ok(own);
+    };
+    let Some(parent) = sessions.lookup_by_internal(
+        session.box_id,
+        session.tenant_internal_id,
+        fork.parent_session_internal_id,
+    )?
+    else {
+        return Ok(own); // parent disappeared — degrade to child-only
+    };
+    let parent_events: Vec<Event> = match parent.tier {
+        crate::types::Tier::Warm => scan_session_events(kv, &parent)?,
+        crate::types::Tier::Cold => {
+            if let Some(path) = parent.segment_path.as_deref() {
+                match crate::segment::read_segment(store, path).await {
+                    Ok(seg) => seg.events,
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        }
+        crate::types::Tier::Archive => Vec::new(),
+    };
+    let mut all: Vec<Event> = own;
+    all.extend(
+        parent_events
+            .into_iter()
+            .filter(|e| e.seq < fork.parent_seq_at_fork),
+    );
+    all.sort_by_key(|e| e.ts);
+    let start = all.len().saturating_sub(n);
+    Ok(all.split_off(start))
+}
 
 #[derive(Debug)]
 pub struct AppendFetchOutput {
@@ -135,7 +191,14 @@ pub async fn append_and_fetch(
         sessions.get_or_mint(box_.id, tenant.internal_id, session_external, now_millis)?;
     let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
     drop(guard);
-    let recent = fetch_last_n(&kv, &session, fetch_last_n_)?;
+    let recent = fetch_last_n_merged(
+        &kv,
+        registry.object_store(),
+        sessions,
+        &session,
+        fetch_last_n_,
+    )
+    .await?;
     Ok(AppendFetchOutput {
         new_seq: event.seq,
         recent,
@@ -336,6 +399,7 @@ mod tests {
             tier: crate::types::Tier::Warm,
             next_seq: 1,
             segment_path: None,
+            forked_from: None,
         };
         let out = fetch_last_n(&kv, &session, 0).unwrap();
         assert!(out.is_empty());
@@ -410,6 +474,84 @@ mod tests {
         assert_eq!(out.recent.len(), 2);
         assert_eq!(out.recent[0].seq, 5);
         assert_eq!(out.recent[1].seq, 6);
+    }
+
+    #[tokio::test]
+    async fn fetch_last_n_merged_on_forked_session_pulls_parent_tail() {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
+
+        let (_dir, kv, tenants, sessions) = setup();
+        let obj_dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let lock = tokio::sync::Mutex::new(());
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+
+        // Parent: 3 events with ts 10, 20, 30.
+        for i in 1..=3u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                &lock,
+                0,
+                t.internal_id,
+                "parent",
+                json!({"i": i}),
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Fork: child with parent_seq_at_fork = 4.
+        let fork_ref = crate::types::ForkRef {
+            parent_session_internal_id: sessions
+                .lookup(0, t.internal_id, "parent")
+                .unwrap()
+                .unwrap()
+                .internal_id,
+            parent_seq_at_fork: 4,
+        };
+        let _child = sessions
+            .get_or_mint_with_fork(0, t.internal_id, "child", 1000, Some(fork_ref))
+            .unwrap();
+
+        // Child: 2 events with ts 100, 110.
+        open_and_append(
+            kv.clone(),
+            &sessions,
+            &lock,
+            0,
+            t.internal_id,
+            "child",
+            json!({"c": 1}),
+            100,
+        )
+        .await
+        .unwrap();
+        open_and_append(
+            kv.clone(),
+            &sessions,
+            &lock,
+            0,
+            t.internal_id,
+            "child",
+            json!({"c": 2}),
+            110,
+        )
+        .await
+        .unwrap();
+
+        // Events by ts: parent [10, 20, 30] + child [100, 110]. Last 4 → [20, 30, 100, 110].
+        let reloaded = sessions.lookup(0, t.internal_id, "child").unwrap().unwrap();
+        let got = fetch_last_n_merged(&kv, &store, &sessions, &reloaded, 4)
+            .await
+            .unwrap();
+        let tss: Vec<u64> = got.iter().map(|e| e.ts).collect();
+        assert_eq!(tss, vec![20, 30, 100, 110]);
+
+        let _ = obj_dir;
     }
 
     #[tokio::test]
