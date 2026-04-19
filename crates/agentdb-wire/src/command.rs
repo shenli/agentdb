@@ -166,6 +166,9 @@ pub async fn dispatch(
                     Err(e) => error_reply(&e),
                 }
             }
+            "startTransaction" => crate::handlers::txn::start_transaction_response(),
+            "commitTransaction" => crate::handlers::txn::commit_transaction_response(),
+            "abortTransaction" => crate::handlers::txn::abort_transaction_response(),
             other => not_implemented(other),
         },
     }
