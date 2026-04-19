@@ -336,6 +336,7 @@ mod tests {
             tier: crate::types::Tier::Warm,
             next_seq: 1,
             segment_path: None,
+            forked_from: None,
         };
         let out = fetch_last_n(&kv, &session, 0).unwrap();
         assert!(out.is_empty());

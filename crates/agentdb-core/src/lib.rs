@@ -24,4 +24,4 @@ pub use primitives::{
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1};
 pub use tiering::{cold_transition, reactivate};
-pub use types::{Document, Event, Session, Tenant, Tier};
+pub use types::{Document, Event, ForkRef, Session, Tenant, Tier};
