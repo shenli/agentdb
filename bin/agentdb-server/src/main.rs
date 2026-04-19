@@ -5,6 +5,7 @@ use std::sync::Arc;
 use agentdb_api::{router, AppState};
 use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
+use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
@@ -21,11 +22,17 @@ async fn main() -> anyhow::Result<()> {
         Ok(v) => v.parse().context("AGENTDB_BOXES must be a valid u16")?,
         Err(_) => 4,
     };
-    let addr: SocketAddr = match std::env::var("AGENTDB_ADDR") {
+    let http_addr: SocketAddr = match std::env::var("AGENTDB_ADDR") {
         Ok(v) => v
             .parse()
             .context("AGENTDB_ADDR must be a valid socket address")?,
         Err(_) => "127.0.0.1:7878".parse().unwrap(),
+    };
+    let mongo_addr: SocketAddr = match std::env::var("AGENTDB_MONGO_ADDR") {
+        Ok(v) => v
+            .parse()
+            .context("AGENTDB_MONGO_ADDR must be a valid socket address")?,
+        Err(_) => "127.0.0.1:7879".parse().unwrap(),
     };
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
@@ -33,17 +40,38 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(BoxRegistry::new(kv.clone(), num_boxes)?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv));
-    let state = AppState {
+
+    let http_state = AppState {
+        registry: registry.clone(),
+        tenants: tenants.clone(),
+        sessions: sessions.clone(),
+    };
+    let wire_state = WireState {
         registry,
         tenants,
         sessions,
     };
 
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind(addr)
+    let app = router(http_state);
+    let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
-        .context("bind listener")?;
-    tracing::info!(%addr, "agentdb-server listening");
-    axum::serve(listener, app).await.context("serve")?;
+        .context("bind http listener")?;
+    let mongo_listener = tokio::net::TcpListener::bind(mongo_addr)
+        .await
+        .context("bind mongo listener")?;
+    tracing::info!(%http_addr, %mongo_addr, "agentdb-server listening");
+
+    let http_task =
+        tokio::spawn(async move { axum::serve(http_listener, app).await.context("http serve") });
+    let mongo_task = tokio::spawn(async move {
+        serve_mongo(mongo_listener, wire_state)
+            .await
+            .map_err(|e| anyhow::anyhow!("mongo serve: {e}"))
+    });
+
+    tokio::select! {
+        r = http_task => r.context("http task join")??,
+        r = mongo_task => r.context("mongo task join")??,
+    };
     Ok(())
 }

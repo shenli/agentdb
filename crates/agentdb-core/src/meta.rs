@@ -64,6 +64,23 @@ pub fn key_next_session_id(box_id: BoxId, tenant_id: TenantId) -> Vec<u8> {
     out
 }
 
+pub(crate) fn prefix_tenant_by_external_for_box(box_id: BoxId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4);
+    out.push(NS_META);
+    out.push(TAG_TENANT_BY_EXT);
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out
+}
+
+pub(crate) fn prefix_session_by_external_for_tenant(box_id: BoxId, tenant_id: TenantId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.push(NS_META);
+    out.push(TAG_SESSION_BY_EXT);
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out.extend_from_slice(&tenant_id.to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +126,14 @@ mod tests {
         let a = key_tenant_by_external(1, "foo");
         let b = key_tenant_by_external(1, "bar");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn prefix_tenant_by_external_matches_concrete_tenant_keys() {
+        let prefix = prefix_tenant_by_external_for_box(5);
+        let concrete = key_tenant_by_external(5, "t-a");
+        assert!(concrete.starts_with(&prefix));
+        let other = key_tenant_by_external(6, "t-a");
+        assert!(!other.starts_with(&prefix));
     }
 }

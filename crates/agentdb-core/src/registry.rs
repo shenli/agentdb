@@ -3,7 +3,10 @@ use std::sync::Arc;
 use agentdb_storage::{BoxId, KvStore, TenantId, WriteOp};
 
 use crate::error::Result;
-use crate::meta::{key_next_tenant_id, key_tenant_by_external, key_tenant_record};
+use crate::meta::{
+    key_next_tenant_id, key_tenant_by_external, key_tenant_record,
+    prefix_tenant_by_external_for_box,
+};
 use crate::types::Tenant;
 
 pub struct TenantRegistry {
@@ -69,9 +72,30 @@ impl TenantRegistry {
         ])?;
         Ok(tenant)
     }
+
+    /// Enumerate all external tenant ids minted under this box.
+    pub fn list_in_box(&self, box_id: BoxId) -> Result<Vec<String>> {
+        let prefix = prefix_tenant_by_external_for_box(box_id);
+        let mut out = Vec::new();
+        for res in self.kv.scan_prefix(&prefix)? {
+            let (k, _v) = res?;
+            // key = Meta(1) | TAG(1) | box(2) | external-bytes
+            if k.len() <= 4 {
+                continue;
+            }
+            let name = std::str::from_utf8(&k[4..])
+                .map_err(|e| crate::error::Error::Invalid(format!("bad tenant name utf-8: {e}")))?
+                .to_string();
+            out.push(name);
+        }
+        Ok(out)
+    }
 }
 
-use crate::meta::{key_next_session_id, key_session_by_external, key_session_record};
+use crate::meta::{
+    key_next_session_id, key_session_by_external, key_session_record,
+    prefix_session_by_external_for_tenant,
+};
 use crate::types::{Session, Tier};
 use agentdb_storage::SessionId;
 
@@ -152,6 +176,23 @@ impl SessionRegistry {
             },
         ])?;
         Ok(session)
+    }
+
+    /// Enumerate all external session ids minted under this tenant.
+    pub fn list_in_tenant(&self, box_id: BoxId, tenant_id: TenantId) -> Result<Vec<String>> {
+        let prefix = prefix_session_by_external_for_tenant(box_id, tenant_id);
+        let mut out = Vec::new();
+        for res in self.kv.scan_prefix(&prefix)? {
+            let (k, _v) = res?;
+            if k.len() <= 12 {
+                continue;
+            }
+            let name = std::str::from_utf8(&k[12..])
+                .map_err(|e| crate::error::Error::Invalid(format!("bad session name utf-8: {e}")))?
+                .to_string();
+            out.push(name);
+        }
+        Ok(out)
     }
 
     /// Overwrite the persisted session record. Does NOT rewrite the lookup
@@ -274,5 +315,34 @@ mod tests {
         let reloaded = reg.lookup(1, 10, "s-1").unwrap().unwrap();
         assert_eq!(reloaded.next_seq, 99);
         assert_eq!(reloaded.last_active_at, 999);
+    }
+
+    #[test]
+    fn session_list_in_tenant_returns_all_externals() {
+        let (_dir, kv) = store();
+        let reg = SessionRegistry::new(kv);
+        reg.get_or_mint(0, 10, "s-a", 0).unwrap();
+        reg.get_or_mint(0, 10, "s-b", 0).unwrap();
+        reg.get_or_mint(0, 11, "elsewhere", 0).unwrap();
+        let mut got = reg.list_in_tenant(0, 10).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["s-a".to_string(), "s-b".to_string()]);
+    }
+
+    #[test]
+    fn list_in_box_returns_all_minted_externals_sorted() {
+        let (_dir, kv) = store();
+        let reg = TenantRegistry::new(kv);
+        reg.get_or_mint(1, "t-c", 0).unwrap();
+        reg.get_or_mint(1, "t-a", 0).unwrap();
+        reg.get_or_mint(1, "t-b", 0).unwrap();
+        reg.get_or_mint(2, "t-elsewhere", 0).unwrap();
+
+        let mut got = reg.list_in_box(1).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["t-a".to_string(), "t-b".to_string(), "t-c".to_string()]
+        );
     }
 }
