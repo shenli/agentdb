@@ -71,7 +71,13 @@ pub async fn dispatch(
                     }
                 };
                 let filter = body.get_document("filter").cloned().unwrap_or_default();
-                let limit = body.get_i64("limit").ok();
+                // Drivers encode small integers as BSON Int32 and larger ones as Int64;
+                // accept both. A limit of 0 means "no limit" per the MongoDB spec.
+                let limit = match body.get("limit") {
+                    Some(Bson::Int64(n)) if *n > 0 => Some(*n),
+                    Some(Bson::Int32(n)) if *n > 0 => Some(*n as i64),
+                    _ => None,
+                };
                 match find_mod::find_response(
                     &state.registry,
                     &state.tenants,

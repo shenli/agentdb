@@ -74,18 +74,47 @@ pub fn decode(buf: &[u8]) -> WireResult<OpMsg> {
             0 => {
                 let pos = rdr.position() as usize;
                 let doc_len = (&buf[pos..]).read_i32::<LittleEndian>()?;
-                let end = pos + doc_len as usize;
+                if doc_len < 5 {
+                    return Err(WireError::Protocol(format!("bad doc_len: {doc_len}")));
+                }
+                let end = pos
+                    .checked_add(doc_len as usize)
+                    .filter(|e| *e <= buf.len())
+                    .ok_or_else(|| {
+                        WireError::Protocol(format!(
+                            "doc extends past buffer: pos={pos} doc_len={doc_len} buf={}",
+                            buf.len()
+                        ))
+                    })?;
                 let doc: bson::Document = bson::from_slice(&buf[pos..end])?;
                 rdr.set_position(end as u64);
                 sections.push(Section::Body(doc));
             }
             1 => {
                 let seq_size = rdr.read_i32::<LittleEndian>()?;
+                if seq_size < 4 {
+                    return Err(WireError::Protocol(format!(
+                        "bad doc-sequence size: {seq_size}"
+                    )));
+                }
                 let seq_start = rdr.position() as usize;
-                let seq_end = seq_start + (seq_size as usize) - 4; // size is inclusive of its own 4 bytes
-                                                                   // cstring identifier
+                let seq_end = seq_start
+                    .checked_add(seq_size as usize - 4) // size is inclusive of its own 4 bytes
+                    .filter(|e| *e <= buf.len())
+                    .ok_or_else(|| {
+                        WireError::Protocol(format!(
+                            "doc-sequence extends past buffer: start={seq_start} size={seq_size} buf={}",
+                            buf.len()
+                        ))
+                    })?;
+                // cstring identifier
                 let mut ident = Vec::new();
                 loop {
+                    if (rdr.position() as usize) >= seq_end {
+                        return Err(WireError::Protocol(
+                            "unterminated doc-sequence identifier".into(),
+                        ));
+                    }
                     let b = rdr.read_u8()?;
                     if b == 0 {
                         break;
@@ -98,7 +127,19 @@ pub fn decode(buf: &[u8]) -> WireResult<OpMsg> {
                 while (rdr.position() as usize) < seq_end {
                     let pos = rdr.position() as usize;
                     let doc_len = (&buf[pos..]).read_i32::<LittleEndian>()?;
-                    let end = pos + doc_len as usize;
+                    if doc_len < 5 {
+                        return Err(WireError::Protocol(format!(
+                            "bad doc_len in sequence: {doc_len}"
+                        )));
+                    }
+                    let end = pos
+                        .checked_add(doc_len as usize)
+                        .filter(|e| *e <= seq_end)
+                        .ok_or_else(|| {
+                            WireError::Protocol(format!(
+                                "doc extends past sequence: pos={pos} doc_len={doc_len} seq_end={seq_end}"
+                            ))
+                        })?;
                     let doc: bson::Document = bson::from_slice(&buf[pos..end])?;
                     rdr.set_position(end as u64);
                     docs.push(doc);
@@ -191,5 +232,38 @@ mod tests {
         buf.write_i32::<LittleEndian>(OP_MSG).unwrap();
         let err = decode(&buf).unwrap_err();
         assert!(err.to_string().contains("messageLength"));
+    }
+
+    #[test]
+    fn decode_rejects_negative_body_doc_len() {
+        // Craft a well-formed OP_MSG frame whose single body section carries a
+        // negative BSON doc_len. Without explicit bounds checking, the subsequent
+        // `pos + doc_len as usize` would wrap to ~usize::MAX and panic the slice.
+        let mut buf = Vec::new();
+        buf.write_i32::<LittleEndian>(25).unwrap(); // message length: 16 header + 4 flags + 1 kind + 4 doc_len
+        buf.write_i32::<LittleEndian>(1).unwrap();
+        buf.write_i32::<LittleEndian>(0).unwrap();
+        buf.write_i32::<LittleEndian>(OP_MSG).unwrap();
+        buf.write_u32::<LittleEndian>(0).unwrap();
+        buf.write_u8(0).unwrap(); // section kind = Body
+        buf.write_i32::<LittleEndian>(-1).unwrap(); // malicious doc_len
+        let err = decode(&buf).unwrap_err();
+        assert!(err.to_string().contains("doc_len"));
+    }
+
+    #[test]
+    fn decode_rejects_underflow_doc_sequence_size() {
+        // Doc-sequence size must be >= 4 (inclusive of its own 4 bytes). A
+        // malformed value of 2 would wrap in the `size - 4` subtraction.
+        let mut buf = Vec::new();
+        buf.write_i32::<LittleEndian>(25).unwrap();
+        buf.write_i32::<LittleEndian>(1).unwrap();
+        buf.write_i32::<LittleEndian>(0).unwrap();
+        buf.write_i32::<LittleEndian>(OP_MSG).unwrap();
+        buf.write_u32::<LittleEndian>(0).unwrap();
+        buf.write_u8(1).unwrap(); // section kind = DocumentSequence
+        buf.write_i32::<LittleEndian>(2).unwrap(); // undersized seq_size
+        let err = decode(&buf).unwrap_err();
+        assert!(err.to_string().contains("doc-sequence size"));
     }
 }

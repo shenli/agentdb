@@ -39,11 +39,18 @@ async fn run_connection(
             }
             return Err(err.into());
         }
-        let msg_len =
-            ReadBytesExt::read_i32::<LittleEndian>(&mut Cursor::new(&len_buf[..]))? as usize;
-        if msg_len < opmsg::HEADER_LEN {
-            return Err(WireError::Protocol(format!("short frame: {msg_len}")));
+        let msg_len_i32 = ReadBytesExt::read_i32::<LittleEndian>(&mut Cursor::new(&len_buf[..]))?;
+        if msg_len_i32 < opmsg::HEADER_LEN as i32 {
+            return Err(WireError::Protocol(format!("short frame: {msg_len_i32}")));
         }
+        // Matches hello's advertised maxMessageSizeBytes; rejects adversarial huge frames.
+        const MAX_MSG: i32 = 48_000_000;
+        if msg_len_i32 > MAX_MSG {
+            return Err(WireError::Protocol(format!(
+                "frame too large: {msg_len_i32}"
+            )));
+        }
+        let msg_len = msg_len_i32 as usize;
         let mut buf = vec![0u8; msg_len];
         buf[..4].copy_from_slice(&len_buf);
         socket.read_exact(&mut buf[4..]).await?;
