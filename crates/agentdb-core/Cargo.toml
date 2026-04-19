@@ -13,8 +13,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+object_store = { workspace = true }
+bson = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["test-util", "macros", "time"] }
