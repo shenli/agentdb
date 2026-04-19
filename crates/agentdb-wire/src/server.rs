@@ -93,10 +93,15 @@ mod tests {
     async fn spawn_server() -> (String, WireState) {
         use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
         use agentdb_storage::{KvStore, RocksKvStore};
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         use std::sync::Arc;
         let dir = tempfile::TempDir::new().unwrap();
+        let obj_dir = tempfile::TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
         let state = WireState {
@@ -110,9 +115,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve(listener, st).await;
         });
-        // Leak the tempdir so it lives past this fn — real integration tests
+        // Leak the tempdirs so they live past this fn — real integration tests
         // use a separate fixture.
         std::mem::forget(dir);
+        std::mem::forget(obj_dir);
         (format!("127.0.0.1:{}", addr.port()), state)
     }
 

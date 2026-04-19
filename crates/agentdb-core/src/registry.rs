@@ -157,6 +157,7 @@ impl SessionRegistry {
             last_active_at: now_millis,
             tier: Tier::Warm,
             next_seq: 1,
+            segment_path: None,
         };
         let session_bytes = serde_json::to_vec(&session)?;
         let lookup_bytes = serde_json::to_vec(&session.internal_id)?;

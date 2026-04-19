@@ -7,11 +7,16 @@ use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
 
-async fn spawn() -> (TempDir, String) {
+async fn spawn() -> (TempDir, TempDir, String) {
+    use object_store::local::LocalFileSystem;
+    use object_store::ObjectStore;
     let dir = TempDir::new().unwrap();
+    let obj_dir = TempDir::new().unwrap();
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
     let state = AppState {
-        registry: Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap()),
+        registry: Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap()),
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
         sessions: Arc::new(SessionRegistry::new(kv)),
     };
@@ -21,13 +26,13 @@ async fn spawn() -> (TempDir, String) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (dir, format!("http://{addr}"))
+    (dir, obj_dir, format!("http://{addr}"))
 }
 
 #[tokio::test]
 #[serial]
 async fn append_and_fetch_endpoint_round_trip() {
-    let (_dir, base) = spawn().await;
+    let (_dir, _obj_dir, base) = spawn().await;
     let client = reqwest::Client::new();
 
     let resp1: serde_json::Value = client
@@ -70,7 +75,7 @@ async fn append_and_fetch_endpoint_round_trip() {
 #[tokio::test]
 #[serial]
 async fn fetch_last_n_respects_bound() {
-    let (_dir, base) = spawn().await;
+    let (_dir, _obj_dir, base) = spawn().await;
     let client = reqwest::Client::new();
 
     for i in 1..=4 {
@@ -104,4 +109,57 @@ async fn fetch_last_n_respects_bound() {
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0]["payload"]["i"], 4);
     assert_eq!(recent[1]["payload"]["i"], 5);
+}
+
+#[tokio::test]
+#[serial]
+async fn admin_force_tier_cold_then_warm_round_trips() {
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Seed an event so the session exists.
+    client
+        .post(format!(
+            "{base}/api/tenants/t-1/sessions/s-1/append_and_fetch"
+        ))
+        .json(&json!({"event": {"text": "hi"}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let cold: serde_json::Value = client
+        .post(format!("{base}/api/admin/tier/force"))
+        .json(&json!({
+            "tenant_id": "t-1",
+            "session_id": "s-1",
+            "target": "Cold"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cold["tier"], "cold");
+
+    let warm: serde_json::Value = client
+        .post(format!("{base}/api/admin/tier/force"))
+        .json(&json!({
+            "tenant_id": "t-1",
+            "session_id": "s-1",
+            "target": "Warm"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["tier"], "warm");
 }

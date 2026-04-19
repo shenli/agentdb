@@ -68,7 +68,9 @@ pub async fn aggregate_response(
     };
 
     // Build indexes lazily.
-    let indexes_guard = box_.indexes_built(registry.kv(), tenants, sessions).await?;
+    let indexes_guard = box_
+        .indexes_built(registry.kv(), registry.object_store(), tenants, sessions)
+        .await?;
     let indexes = indexes_guard.as_ref().expect("built by indexes_built");
 
     // Session hint — either from the source-stage `filter.session_id` or
@@ -111,13 +113,16 @@ pub async fn aggregate_response(
 
     let planner = HybridPlanner {
         kv: registry.kv(),
+        store: registry.object_store(),
         indexes,
         sessions,
         box_id: tenant.box_id,
         tenant_internal_id: tenant.internal_id,
     };
 
-    let out = planner.plan(&source, predicate, session_hint.as_deref())?;
+    let out = planner
+        .plan(&source, predicate, session_hint.as_deref())
+        .await?;
     let mut hits = out.hits;
 
     if let Some(limit) = post_limit {
@@ -253,16 +258,22 @@ mod tests {
 
     async fn setup() -> (
         TempDir,
+        TempDir,
         Arc<BoxRegistry>,
         Arc<TenantRegistry>,
         Arc<SessionRegistry>,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
-        (dir, registry, tenants, sessions)
+        (dir, obj_dir, registry, tenants, sessions)
     }
 
     async fn seed_text(
@@ -288,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_search_returns_hits() {
-        let (_d, r, t, s) = setup().await;
+        let (_d, _od, r, t, s) = setup().await;
         seed_text(&r, &t, &s).await;
         let reply = aggregate_response(
             &r,
@@ -315,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_search_with_trailing_limit_truncates() {
-        let (_d, r, t, s) = setup().await;
+        let (_d, _od, r, t, s) = setup().await;
         seed_text(&r, &t, &s).await;
         let reply = aggregate_response(
             &r,
@@ -345,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_vector_search_returns_top_hit() {
-        let (_d, r, t, s) = setup().await;
+        let (_d, _od, r, t, s) = setup().await;
         agentdb_core::append_and_fetch(
             &r,
             &t,
@@ -385,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_first_stage_must_be_source() {
-        let (_d, r, t, s) = setup().await;
+        let (_d, _od, r, t, s) = setup().await;
         seed_text(&r, &t, &s).await;
         let err = aggregate_response(&r, &t, &s, "t-1", "events", &[doc! { "$match": {} }])
             .await

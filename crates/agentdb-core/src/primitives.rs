@@ -179,13 +179,23 @@ mod tests {
         Ok((event, session))
     }
 
-    fn context() -> (TempDir, BoxRegistry, TenantRegistry, SessionRegistry) {
+    fn context() -> (
+        TempDir,
+        TempDir,
+        BoxRegistry,
+        TenantRegistry,
+        SessionRegistry,
+    ) {
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = BoxRegistry::new(kv.clone(), 4).unwrap();
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap(),
+        );
+        let registry = BoxRegistry::new(kv.clone(), store, 4).unwrap();
         let tenants = TenantRegistry::new(kv.clone());
         let sessions = SessionRegistry::new(kv);
-        (dir, registry, tenants, sessions)
+        (dir, obj_dir, registry, tenants, sessions)
     }
 
     #[tokio::test]
@@ -325,6 +335,7 @@ mod tests {
             last_active_at: 0,
             tier: crate::types::Tier::Warm,
             next_seq: 1,
+            segment_path: None,
         };
         let out = fetch_last_n(&kv, &session, 0).unwrap();
         assert!(out.is_empty());
@@ -332,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_and_fetch_returns_new_seq_and_recent_events() {
-        let (_dir, registry, tenants, sessions) = context();
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
         let out = append_and_fetch(
             &registry,
             &tenants,
@@ -368,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_and_fetch_limits_recent_to_n() {
-        let (_dir, registry, tenants, sessions) = context();
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
         for i in 1..=5u64 {
             append_and_fetch(
                 &registry,
@@ -403,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn different_tenants_do_not_interfere() {
-        let (_dir, registry, tenants, sessions) = context();
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
         let a = append_and_fetch(
             &registry,
             &tenants,

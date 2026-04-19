@@ -4,11 +4,13 @@ use agentdb_index::text::{InMemoryInverted, TextIndex};
 use agentdb_index::vector::{InMemoryFlatVec, VectorIndex};
 use agentdb_index::DocId;
 use agentdb_storage::{BoxId, KvStore};
+use object_store::ObjectStore;
 
 use crate::error::Result;
 use crate::primitives::scan_session_events;
 use crate::registry::{SessionRegistry, TenantRegistry};
-use crate::types::Event;
+use crate::segment::read_segment;
+use crate::types::{Event, Tier};
 
 /// Per-box index state: one text index + one vector index, both in-memory.
 pub struct PerBoxIndexes {
@@ -34,9 +36,10 @@ impl PerBoxIndexes {
     }
 
     /// Scan every session in `box_id`, pull all events, index them.
-    pub fn build(
+    pub async fn build(
         &mut self,
         kv: &Arc<dyn KvStore>,
+        store: &Arc<dyn ObjectStore>,
         tenants: &TenantRegistry,
         sessions: &SessionRegistry,
         box_id: BoxId,
@@ -52,7 +55,28 @@ impl PerBoxIndexes {
                 else {
                     continue;
                 };
-                for event in scan_session_events(kv, &session)? {
+                let events: Vec<Event> = match session.tier {
+                    Tier::Warm => scan_session_events(kv, &session)?,
+                    Tier::Cold => {
+                        if let Some(path) = &session.segment_path {
+                            match read_segment(store, path).await {
+                                Ok(seg) => seg.events,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        session = %session.external_id,
+                                        "skipping cold session with unreadable segment"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Tier::Archive => continue,
+                };
+                for event in events {
                     self.index_event(session.internal_id, &event);
                 }
             }
@@ -108,22 +132,28 @@ mod tests {
 
     async fn setup_with_events() -> (
         TempDir,
+        TempDir,
         Arc<dyn KvStore>,
         Arc<crate::BoxRegistry>,
         TenantRegistry,
         SessionRegistry,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(crate::BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(crate::BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = TenantRegistry::new(kv.clone());
         let sessions = SessionRegistry::new(kv.clone());
-        (dir, kv, registry, tenants, sessions)
+        (dir, obj_dir, kv, registry, tenants, sessions)
     }
 
     #[tokio::test]
     async fn build_indexes_text_from_payload_text_field() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         crate::primitives::append_and_fetch(
             &registry,
             &tenants,
@@ -137,15 +167,18 @@ mod tests {
         .await
         .unwrap();
         let box_id = registry.route_tenant("t-1").id;
+        let store = registry.object_store().clone();
         let mut idx = PerBoxIndexes::new();
-        idx.build(&kv, &tenants, &sessions, box_id).unwrap();
+        idx.build(&kv, &store, &tenants, &sessions, box_id)
+            .await
+            .unwrap();
         let hits = idx.text.search("payload.text", "refund", 10);
         assert_eq!(hits.len(), 1);
     }
 
     #[tokio::test]
     async fn build_indexes_vector_from_payload_embedding_array() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         crate::primitives::append_and_fetch(
             &registry,
             &tenants,
@@ -159,8 +192,11 @@ mod tests {
         .await
         .unwrap();
         let box_id = registry.route_tenant("t-1").id;
+        let store = registry.object_store().clone();
         let mut idx = PerBoxIndexes::new();
-        idx.build(&kv, &tenants, &sessions, box_id).unwrap();
+        idx.build(&kv, &store, &tenants, &sessions, box_id)
+            .await
+            .unwrap();
         let hits = idx
             .vector
             .knn("payload.embedding", &[1.0, 0.0, 0.0, 0.0], 10);
@@ -170,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_indexes_counts_across_sessions_and_tenants() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         for i in 0..3 {
             crate::primitives::append_and_fetch(
                 &registry,
@@ -186,8 +222,11 @@ mod tests {
             .unwrap();
         }
         let box_id = registry.route_tenant("t-1").id;
+        let store = registry.object_store().clone();
         let mut idx = PerBoxIndexes::new();
-        idx.build(&kv, &tenants, &sessions, box_id).unwrap();
+        idx.build(&kv, &store, &tenants, &sessions, box_id)
+            .await
+            .unwrap();
         assert_eq!(idx.indexed, 3);
     }
 }
