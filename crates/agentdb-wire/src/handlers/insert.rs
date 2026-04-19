@@ -14,6 +14,7 @@ pub async fn insert_response(
     collection: &str,
     docs: &[Document],
 ) -> WireResult<Document> {
+    registry.route_tenant(db).metrics.record_insert();
     if collection != "events" {
         return Err(WireError::Protocol(format!(
             "insert into {collection} not supported; only 'events' accepts writes"

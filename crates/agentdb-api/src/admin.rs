@@ -56,6 +56,9 @@ pub async fn force_tier(
                 &mut session,
             )
             .await?;
+            box_.metrics.record_tier_transition();
+            box_.metrics.drop_tier(Tier::Warm);
+            box_.metrics.bump_tier(Tier::Cold);
         }
         "cold" => { /* already cold — no-op */ }
         "warm" if session.tier == Tier::Cold => {
@@ -67,6 +70,9 @@ pub async fn force_tier(
                 &mut session,
             )
             .await?;
+            box_.metrics.record_tier_transition();
+            box_.metrics.drop_tier(Tier::Cold);
+            box_.metrics.bump_tier(Tier::Warm);
         }
         "warm" => { /* already warm — no-op */ }
         _ => unreachable!(),
