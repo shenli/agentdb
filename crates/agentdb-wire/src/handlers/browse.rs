@@ -24,14 +24,30 @@ pub fn ping_response() -> Document {
     doc! { "ok": 1.0 }
 }
 
-/// Enumerate tenants as databases. Stubbed in T5; Task 6 restores the real body.
+/// Enumerate tenants as databases.
 pub fn list_databases_response(
-    _registry: &BoxRegistry,
-    _tenants: &TenantRegistry,
+    registry: &BoxRegistry,
+    tenants: &TenantRegistry,
 ) -> WireResult<Document> {
-    // Real enumeration lands in Task 6.
+    let mut names: Vec<String> = Vec::new();
+    for box_id in 0..registry.num_boxes() {
+        let mut per_box = tenants.list_in_box(box_id)?;
+        names.append(&mut per_box);
+    }
+    names.sort();
+    names.dedup();
+    let dbs: Vec<Bson> = names
+        .into_iter()
+        .map(|name| {
+            Bson::Document(doc! {
+                "name": name,
+                "sizeOnDisk": 0_i64,
+                "empty": false,
+            })
+        })
+        .collect();
     Ok(doc! {
-        "databases": Bson::Array(vec![]),
+        "databases": Bson::Array(dbs),
         "totalSize": 0_i64,
         "ok": 1.0,
     })
