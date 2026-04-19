@@ -140,6 +140,17 @@ impl SessionRegistry {
         external: &str,
         now_millis: u64,
     ) -> Result<Session> {
+        self.get_or_mint_with_fork(box_id, tenant_id, external, now_millis, None)
+    }
+
+    pub fn get_or_mint_with_fork(
+        &self,
+        box_id: BoxId,
+        tenant_id: TenantId,
+        external: &str,
+        now_millis: u64,
+        forked_from: Option<crate::types::ForkRef>,
+    ) -> Result<Session> {
         if let Some(s) = self.lookup(box_id, tenant_id, external)? {
             return Ok(s);
         }
@@ -158,7 +169,7 @@ impl SessionRegistry {
             tier: Tier::Warm,
             next_seq: 1,
             segment_path: None,
-            forked_from: None,
+            forked_from,
         };
         let session_bytes = serde_json::to_vec(&session)?;
         let lookup_bytes = serde_json::to_vec(&session.internal_id)?;
@@ -362,5 +373,27 @@ mod tests {
             got,
             vec!["t-a".to_string(), "t-b".to_string(), "t-c".to_string()]
         );
+    }
+
+    #[test]
+    fn get_or_mint_with_fork_stores_parent_pointer() {
+        let (_dir, kv) = store();
+        let reg = SessionRegistry::new(kv);
+        let fork_ref = crate::types::ForkRef {
+            parent_session_internal_id: 7,
+            parent_seq_at_fork: 42,
+        };
+        let s = reg
+            .get_or_mint_with_fork(1, 10, "child", 100, Some(fork_ref.clone()))
+            .unwrap();
+        assert_eq!(s.forked_from, Some(fork_ref));
+    }
+
+    #[test]
+    fn get_or_mint_is_unchanged_for_non_forked_session() {
+        let (_dir, kv) = store();
+        let reg = SessionRegistry::new(kv);
+        let s = reg.get_or_mint(1, 10, "plain", 100).unwrap();
+        assert!(s.forked_from.is_none());
     }
 }
