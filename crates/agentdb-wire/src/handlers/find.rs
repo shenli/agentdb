@@ -118,13 +118,19 @@ mod tests {
 
     async fn setup_with_events() -> (
         TempDir,
+        TempDir,
         Arc<BoxRegistry>,
         Arc<TenantRegistry>,
         Arc<SessionRegistry>,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
         for seq in 1..=3u64 {
@@ -141,12 +147,12 @@ mod tests {
             .await
             .unwrap();
         }
-        (dir, registry, tenants, sessions)
+        (dir, obj_dir, registry, tenants, sessions)
     }
 
     #[tokio::test]
     async fn find_events_returns_all_for_tenant() {
-        let (_dir, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
         let resp = find_response(
             &registry,
             &tenants,
@@ -167,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_events_with_session_id_filter_scans_only_that_session() {
-        let (_dir, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
         // create a second session
         for _ in 0..2 {
             agentdb_core::append_and_fetch(
@@ -203,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_respects_limit() {
-        let (_dir, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
         let resp = find_response(
             &registry,
             &tenants,
@@ -224,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_unknown_tenant_returns_empty() {
-        let (_dir, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
         let resp = find_response(
             &registry,
             &tenants,
@@ -245,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_on_sessions_collection_returns_session_records() {
-        let (_dir, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
         let resp = find_response(
             &registry,
             &tenants,

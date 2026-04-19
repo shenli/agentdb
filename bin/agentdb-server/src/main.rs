@@ -7,6 +7,8 @@ use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -37,7 +39,12 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?);
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), num_boxes)?);
+    // TODO(T8): replace with a properly configured object store (M5 Task 8).
+    let object_store: Arc<dyn ObjectStore> = Arc::new(
+        LocalFileSystem::new_with_prefix("/tmp/agentdb-objects-m5-stub")
+            .context("open object store stub")?,
+    );
+    let registry = Arc::new(BoxRegistry::new(kv.clone(), object_store, num_boxes)?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv));
 

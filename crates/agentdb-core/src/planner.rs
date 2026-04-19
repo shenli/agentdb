@@ -280,22 +280,28 @@ mod tests {
 
     async fn setup() -> (
         TempDir,
+        TempDir,
         Arc<dyn KvStore>,
         Arc<BoxRegistry>,
         Arc<TenantRegistry>,
         Arc<SessionRegistry>,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let reg = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let reg = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv.clone()));
-        (dir, kv, reg, tenants, sessions)
+        (dir, obj_dir, kv, reg, tenants, sessions)
     }
 
     #[tokio::test]
     async fn locality_bound_strategy_is_picked_when_session_hint_present() {
-        let (_d, kv, reg, tenants, sessions) = setup().await;
+        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
         append_and_fetch(
             &reg,
             &tenants,
@@ -340,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_fetch_strategy_uses_text_index() {
-        let (_d, kv, reg, tenants, sessions) = setup().await;
+        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
         for i in 0..3 {
             append_and_fetch(
                 &reg,
@@ -386,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_fetch_strategy_uses_vector_index() {
-        let (_d, kv, reg, tenants, sessions) = setup().await;
+        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
         append_and_fetch(
             &reg,
             &tenants,

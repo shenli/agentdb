@@ -8,10 +8,15 @@ use mongodb::options::ClientOptions;
 use mongodb::Client;
 use tempfile::TempDir;
 
-async fn spawn() -> (TempDir, u16) {
+async fn spawn() -> (TempDir, TempDir, u16) {
+    use object_store::local::LocalFileSystem;
+    use object_store::ObjectStore;
     let dir = TempDir::new().unwrap();
+    let obj_dir = TempDir::new().unwrap();
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv));
     let state = WireState {
@@ -24,7 +29,7 @@ async fn spawn() -> (TempDir, u16) {
     tokio::spawn(async move {
         let _ = serve(listener, state).await;
     });
-    (dir, port)
+    (dir, obj_dir, port)
 }
 
 async fn client(port: u16) -> Client {
@@ -37,7 +42,7 @@ async fn client(port: u16) -> Client {
 
 #[tokio::test]
 async fn hello_over_real_driver() {
-    let (_dir, port) = spawn().await;
+    let (_dir, _obj_dir, port) = spawn().await;
     let cli = client(port).await;
     let admin = cli.database("admin");
     let reply = admin.run_command(doc! { "ping": 1 }).await.unwrap();
@@ -46,7 +51,7 @@ async fn hello_over_real_driver() {
 
 #[tokio::test]
 async fn insert_then_find_round_trip() {
-    let (_dir, port) = spawn().await;
+    let (_dir, _obj_dir, port) = spawn().await;
     let cli = client(port).await;
     let db = cli.database("t-42");
     let events = db.collection::<bson::Document>("events");
@@ -74,7 +79,7 @@ async fn insert_then_find_round_trip() {
 
 #[tokio::test]
 async fn list_databases_sees_tenant_after_write() {
-    let (_dir, port) = spawn().await;
+    let (_dir, _obj_dir, port) = spawn().await;
     let cli = client(port).await;
     let events = cli.database("t-abc").collection::<bson::Document>("events");
     events
@@ -88,7 +93,7 @@ async fn list_databases_sees_tenant_after_write() {
 
 #[tokio::test]
 async fn text_search_aggregation_returns_hits() {
-    let (_dir, port) = spawn().await;
+    let (_dir, _obj_dir, port) = spawn().await;
     let cli = client(port).await;
     let db = cli.database("t-search");
     let events = db.collection::<bson::Document>("events");
@@ -124,7 +129,7 @@ async fn text_search_aggregation_returns_hits() {
 
 #[tokio::test]
 async fn vector_search_aggregation_returns_top_hit() {
-    let (_dir, port) = spawn().await;
+    let (_dir, _obj_dir, port) = spawn().await;
     let cli = client(port).await;
     let db = cli.database("t-vector");
     let events = db.collection::<bson::Document>("events");

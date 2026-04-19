@@ -73,21 +73,27 @@ mod tests {
 
     fn context() -> (
         TempDir,
+        TempDir,
         Arc<BoxRegistry>,
         Arc<TenantRegistry>,
         Arc<SessionRegistry>,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
-        (dir, registry, tenants, sessions)
+        (dir, obj_dir, registry, tenants, sessions)
     }
 
     #[tokio::test]
     async fn insert_one_event_succeeds_and_n_is_one() {
-        let (_d, r, t, s) = context();
+        let (_d, _od, r, t, s) = context();
         let resp = insert_response(
             &r,
             &t,
@@ -104,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_document_missing_session_id_reports_write_error() {
-        let (_d, r, t, s) = context();
+        let (_d, _od, r, t, s) = context();
         let resp = insert_response(
             &r,
             &t,
@@ -128,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_into_unknown_collection_errors_out() {
-        let (_d, r, t, s) = context();
+        let (_d, _od, r, t, s) = context();
         let err = insert_response(&r, &t, &s, "t-1", "widgets", &[doc! {}])
             .await
             .unwrap_err();

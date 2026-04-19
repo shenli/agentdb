@@ -211,14 +211,20 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn state() -> (TempDir, WireState) {
+    fn state() -> (TempDir, TempDir, WireState) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
         (
             dir,
+            obj_dir,
             WireState {
                 registry,
                 tenants,
@@ -229,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_hello_returns_ok_one() {
-        let (_d, st) = state();
+        let (_d, _od, st) = state();
         let r = dispatch(&doc! { "hello": 1 }, &[], &st, 7).await;
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
         assert_eq!(r.get_i64("connectionId").unwrap(), 7);
@@ -237,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_command_returns_not_implemented() {
-        let (_d, st) = state();
+        let (_d, _od, st) = state();
         let r = dispatch(&doc! { "killCursors": 1 }, &[], &st, 1).await;
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert!(r.get_str("errmsg").unwrap().contains("killCursors"));

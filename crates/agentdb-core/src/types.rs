@@ -44,6 +44,9 @@ pub struct Session {
     pub last_active_at: u64,
     pub tier: Tier,
     pub next_seq: u64,
+    /// When `tier == Cold`, the `object_store` path where events live. None for warm sessions.
+    #[serde(default)]
+    pub segment_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -81,6 +84,7 @@ mod tests {
             last_active_at: 150,
             tier: Tier::Warm,
             next_seq: 5,
+            segment_path: None,
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();

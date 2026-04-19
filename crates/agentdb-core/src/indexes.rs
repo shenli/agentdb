@@ -108,22 +108,28 @@ mod tests {
 
     async fn setup_with_events() -> (
         TempDir,
+        TempDir,
         Arc<dyn KvStore>,
         Arc<crate::BoxRegistry>,
         TenantRegistry,
         SessionRegistry,
     ) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
         let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
-        let registry = Arc::new(crate::BoxRegistry::new(kv.clone(), 4).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let registry = Arc::new(crate::BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = TenantRegistry::new(kv.clone());
         let sessions = SessionRegistry::new(kv.clone());
-        (dir, kv, registry, tenants, sessions)
+        (dir, obj_dir, kv, registry, tenants, sessions)
     }
 
     #[tokio::test]
     async fn build_indexes_text_from_payload_text_field() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         crate::primitives::append_and_fetch(
             &registry,
             &tenants,
@@ -145,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_indexes_vector_from_payload_embedding_array() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         crate::primitives::append_and_fetch(
             &registry,
             &tenants,
@@ -170,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_indexes_counts_across_sessions_and_tenants() {
-        let (_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
         for i in 0..3 {
             crate::primitives::append_and_fetch(
                 &registry,
