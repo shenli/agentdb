@@ -6,6 +6,16 @@ use crate::bsonx::json_to_bson;
 use crate::error::{WireError, WireResult};
 use crate::handlers::filter::Filter;
 
+/// Cap incoming limit/candidate values to prevent `limit * over_fetch`
+/// overflow in the planner. 100K is far beyond realistic demand at prototype
+/// scale and leaves room for over-fetch multipliers.
+const MAX_STAGE_LIMIT: usize = 100_000;
+
+fn clamp_limit(raw: i64) -> usize {
+    let x = raw.max(1) as usize;
+    x.min(MAX_STAGE_LIMIT)
+}
+
 pub async fn aggregate_response(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
@@ -16,7 +26,7 @@ pub async fn aggregate_response(
 ) -> WireResult<Document> {
     if collection != "events" {
         return Err(WireError::Protocol(format!(
-            "aggregate on {collection} not supported in M4; only 'events' indexes exist"
+            "aggregate on {collection} not supported; only 'events' is indexed"
         )));
     }
     let Some(first) = pipeline.first() else {
@@ -168,8 +178,8 @@ fn parse_source(stage: &Document) -> WireResult<(Source, Filter)> {
             .get_str("path")
             .map_err(|_| WireError::Protocol("$vectorSearch missing path".into()))?
             .to_string();
-        let limit = vs.get_i64("limit").unwrap_or(10).max(1) as usize;
-        let num_candidates = vs.get_i64("numCandidates").unwrap_or(100).max(1) as usize;
+        let limit = clamp_limit(vs.get_i64("limit").unwrap_or(10));
+        let num_candidates = clamp_limit(vs.get_i64("numCandidates").unwrap_or(100));
         let filter = match vs.get_document("filter") {
             Ok(f) => Filter::parse(f)?,
             Err(_) => Filter::parse(&Document::new())?,
@@ -197,7 +207,7 @@ fn parse_source(stage: &Document) -> WireResult<(Source, Filter)> {
             .get_str("path")
             .map_err(|_| WireError::Protocol("$search.text missing path".into()))?
             .to_string();
-        let limit = s.get_i64("limit").unwrap_or(10).max(1) as usize;
+        let limit = clamp_limit(s.get_i64("limit").unwrap_or(10));
         let filter = match s.get_document("filter") {
             Ok(f) => Filter::parse(f)?,
             Err(_) => Filter::parse(&Document::new())?,
@@ -206,7 +216,7 @@ fn parse_source(stage: &Document) -> WireResult<(Source, Filter)> {
     }
 
     Err(WireError::Protocol(
-        "aggregate pipeline must start with $vectorSearch or $search in M4".into(),
+        "aggregate pipeline must start with $vectorSearch or $search".into(),
     ))
 }
 

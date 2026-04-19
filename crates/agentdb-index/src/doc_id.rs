@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 /// candidate set to a specific session via cheap field comparison, and
 /// so the caller can resolve a hit back to an `Event` through
 /// `agentdb-core::primitives::scan_session_events` or a prefix lookup.
+///
+/// **Known limitation (tracked for a later milestone):** session internal
+/// ids are tenant-local counters, so two tenants in the same box may
+/// collide in the indexes. `resolve()` in the planner drops cross-tenant
+/// hits via the `None` guard on `kv.get`, but IDF contamination and
+/// recall loss can silently degrade multi-tenant ranking quality. Either
+/// widen DocId to `(tenant_internal_id, session_internal_id, seq)` or
+/// scope the indexes per-tenant before any multi-tenant demo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DocId {
     pub session_internal_id: u64,

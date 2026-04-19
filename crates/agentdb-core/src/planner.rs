@@ -98,7 +98,11 @@ impl<'a> HybridPlanner<'a> {
                 continue;
             }
             let score = score_single(source, &event);
-            if score > f32::NEG_INFINITY {
+            // Exclude both missing-field (NEG_INFINITY) and zero-score (no
+            // query terms matched) cases. The OverFetchPostFilter strategy
+            // only considers events in the index postings so it naturally
+            // skips non-matches; LocalityBound needs this explicit guard.
+            if score > 0.0 {
                 scored.push(Hit {
                     doc_id: DocId::new(session.internal_id, event.seq),
                     score,

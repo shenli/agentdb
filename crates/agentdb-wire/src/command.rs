@@ -32,7 +32,7 @@ pub fn error_reply(err: &WireError) -> Document {
 pub fn not_implemented(cmd: &str) -> Document {
     doc! {
         "ok": 0.0,
-        "errmsg": format!("{cmd} not implemented in M3"),
+        "errmsg": format!("{cmd} not implemented"),
         "code": 59, // CommandNotFound
     }
 }
