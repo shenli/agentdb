@@ -8,5 +8,5 @@ pub mod error;
 pub mod text;
 pub mod vector;
 
-// pub use doc_id::DocId;   // Task 2
+pub use doc_id::DocId;
 pub use error::{IndexError, IndexResult};
