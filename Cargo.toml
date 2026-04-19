@@ -4,6 +4,7 @@ members = [
     "crates/agentdb-storage",
     "crates/agentdb-core",
     "crates/agentdb-api",
+    "crates/agentdb-wire",
     "bin/agentdb-server",
 ]
 
@@ -14,6 +15,10 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+bson = "2"
+bytes = "1"
+byteorder = "1"
+mongodb = { version = "2", default-features = false, features = ["tokio-runtime"] }
 thiserror = "1"
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 tempfile = "3"
