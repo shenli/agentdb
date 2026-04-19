@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 pub struct Box_ {
     pub id: BoxId,
     pub write_lock: Mutex<()>,
+    indexes: tokio::sync::RwLock<Option<crate::indexes::PerBoxIndexes>>,
 }
 
 impl Box_ {
@@ -17,7 +18,35 @@ impl Box_ {
         Self {
             id,
             write_lock: Mutex::new(()),
+            indexes: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Build (on first call) and return a read guard over the box's indexes.
+    /// Rebuilds are skipped — subsequent calls reuse the existing instance.
+    pub async fn indexes_built<'a>(
+        &'a self,
+        kv: &Arc<dyn KvStore>,
+        tenants: &crate::registry::TenantRegistry,
+        sessions: &crate::registry::SessionRegistry,
+    ) -> Result<tokio::sync::RwLockReadGuard<'a, Option<crate::indexes::PerBoxIndexes>>> {
+        // Check fast path under a read lock.
+        {
+            let r = self.indexes.read().await;
+            if r.is_some() {
+                return Ok(r);
+            }
+        }
+        // Build under an exclusive lock. Double-check inside in case of races.
+        {
+            let mut w = self.indexes.write().await;
+            if w.is_none() {
+                let mut built = crate::indexes::PerBoxIndexes::new();
+                built.build(kv, tenants, sessions, self.id)?;
+                *w = Some(built);
+            }
+        }
+        Ok(self.indexes.read().await)
     }
 }
 
@@ -102,5 +131,42 @@ mod tests {
     fn num_boxes_reports_correct_count() {
         let (_dir, reg) = registry(5);
         assert_eq!(reg.num_boxes(), 5);
+    }
+
+    #[tokio::test]
+    async fn indexes_built_is_idempotent_and_reflects_events() {
+        use crate::primitives::append_and_fetch;
+        use crate::registry::{SessionRegistry, TenantRegistry};
+        use serde_json::json;
+
+        let dir = TempDir::new().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let reg = Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap());
+        let tenants = Arc::new(TenantRegistry::new(kv.clone()));
+        let sessions = Arc::new(SessionRegistry::new(kv));
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"text": "hybrid retrieval"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let box_ = reg.route_tenant("t-1");
+        let built1 = box_
+            .indexes_built(reg.kv(), &tenants, &sessions)
+            .await
+            .unwrap();
+        assert_eq!(built1.as_ref().expect("built").indexed, 1);
+        drop(built1);
+        let built2 = box_
+            .indexes_built(reg.kv(), &tenants, &sessions)
+            .await
+            .unwrap();
+        assert_eq!(built2.as_ref().expect("built").indexed, 1);
     }
 }
