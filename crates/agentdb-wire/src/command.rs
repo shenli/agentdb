@@ -135,6 +135,37 @@ pub async fn dispatch(
                     Err(e) => error_reply(&e),
                 }
             }
+            "aggregate" => {
+                let collection = match body.get_str("aggregate") {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        return error_reply(&crate::error::WireError::Protocol(
+                            "aggregate command missing collection name".into(),
+                        ));
+                    }
+                };
+                let pipeline_arr = body.get_array("pipeline").cloned().unwrap_or_default();
+                let pipeline: Vec<Document> = pipeline_arr
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        Bson::Document(d) => Some(d),
+                        _ => None,
+                    })
+                    .collect();
+                match crate::handlers::aggregate::aggregate_response(
+                    &state.registry,
+                    &state.tenants,
+                    &state.sessions,
+                    head.db.unwrap_or(""),
+                    &collection,
+                    &pipeline,
+                )
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => error_reply(&e),
+                }
+            }
             other => not_implemented(other),
         },
     }
