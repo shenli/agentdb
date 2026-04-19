@@ -166,9 +166,11 @@ pub async fn dispatch(
                     Err(e) => error_reply(&e),
                 }
             }
-            "startTransaction" => crate::handlers::txn::start_transaction_response(),
-            "commitTransaction" => crate::handlers::txn::commit_transaction_response(),
-            "abortTransaction" => crate::handlers::txn::abort_transaction_response(),
+            // Mongo transaction commands: the server does not provide
+            // multi-doc atomicity (see M6 plan). Falling through to
+            // `not_implemented` returns ok:0 so the client-side driver
+            // surfaces the limitation as an error rather than silently
+            // accepting a fake transaction.
             other => not_implemented(other),
         },
     }

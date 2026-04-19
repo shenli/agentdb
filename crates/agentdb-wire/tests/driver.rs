@@ -318,28 +318,27 @@ async fn fork_child_merges_parent_tail_via_http_append_and_fetch() {
 }
 
 #[tokio::test]
-async fn transaction_wire_commands_return_ok_one() {
+async fn transaction_wire_commands_are_rejected_with_not_implemented() {
+    // Multi-doc transactions are not supported in M6. The server responds
+    // with ok:0 so the driver surfaces the limitation as a client error
+    // rather than silently accepting a fake transaction that provides no
+    // atomicity. A real application should detect this error and fall back
+    // to single-doc writes rather than trusting cross-op atomicity.
     let (_dir, _obj, port) = spawn().await;
     let cli = client(port).await;
     let admin = cli.database("admin");
-    let started = admin
+    let result = admin
         .run_command(doc! {
             "startTransaction": 1,
             "lsid": { "id": bson::oid::ObjectId::new() },
             "txnNumber": 1_i64,
             "autocommit": false,
         })
-        .await
-        .unwrap();
-    assert_eq!(started.get_f64("ok").unwrap(), 1.0);
-
-    let committed = admin
-        .run_command(doc! {
-            "commitTransaction": 1,
-            "lsid": { "id": bson::oid::ObjectId::new() },
-            "txnNumber": 1_i64,
-        })
-        .await
-        .unwrap();
-    assert_eq!(committed.get_f64("ok").unwrap(), 1.0);
+        .await;
+    assert!(result.is_err(), "startTransaction should be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("not implemented") || msg.contains("CommandNotFound"),
+        "error should indicate command is not supported; got: {msg}"
+    );
 }
