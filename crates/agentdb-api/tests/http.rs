@@ -1,0 +1,107 @@
+use std::sync::Arc;
+
+use agentdb_api::{router, AppState};
+use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_storage::{KvStore, RocksKvStore};
+use serde_json::json;
+use serial_test::serial;
+use tempfile::TempDir;
+
+async fn spawn() -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+    let state = AppState {
+        registry: Arc::new(BoxRegistry::new(kv.clone(), 4).unwrap()),
+        tenants: Arc::new(TenantRegistry::new(kv.clone())),
+        sessions: Arc::new(SessionRegistry::new(kv)),
+    };
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (dir, format!("http://{addr}"))
+}
+
+#[tokio::test]
+#[serial]
+async fn append_and_fetch_endpoint_round_trip() {
+    let (_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    let resp1: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-1/sessions/s-1/append_and_fetch"
+        ))
+        .json(&json!({"event": {"kind": "hello"}, "fetch_last_n": 5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp1["seq"], 1);
+    assert_eq!(resp1["recent"].as_array().unwrap().len(), 1);
+    assert_eq!(resp1["recent"][0]["payload"]["kind"], "hello");
+
+    let resp2: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-1/sessions/s-1/append_and_fetch"
+        ))
+        .json(&json!({"event": {"kind": "followup"}, "fetch_last_n": 5}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp2["seq"], 2);
+    let recent = resp2["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["payload"]["kind"], "hello");
+    assert_eq!(recent[1]["payload"]["kind"], "followup");
+}
+
+#[tokio::test]
+#[serial]
+async fn fetch_last_n_respects_bound() {
+    let (_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    for i in 1..=4 {
+        client
+            .post(format!(
+                "{base}/api/tenants/t-1/sessions/s-bound/append_and_fetch"
+            ))
+            .json(&json!({"event": {"i": i}, "fetch_last_n": 0}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let resp: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-1/sessions/s-bound/append_and_fetch"
+        ))
+        .json(&json!({"event": {"i": 5}, "fetch_last_n": 2}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["seq"], 5);
+    let recent = resp["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["payload"]["i"], 4);
+    assert_eq!(recent[1]["payload"]["i"], 5);
+}
