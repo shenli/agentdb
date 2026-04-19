@@ -1,4 +1,5 @@
 pub mod browse;
 pub mod filter;
+pub mod find;
 pub mod hello;
-// find, insert filled in by Tasks 8-10.
+// insert filled in by Task 10.

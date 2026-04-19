@@ -10,6 +10,8 @@ pub enum WireError {
     BsonSer(#[from] bson::ser::Error),
     #[error("core error: {0}")]
     Core(#[from] agentdb_core::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
 }

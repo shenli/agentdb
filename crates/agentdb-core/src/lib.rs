@@ -10,7 +10,8 @@ pub mod types;
 pub use box_runtime::{BoxRegistry, Box_};
 pub use error::{Error, Result};
 pub use primitives::{
-    append_and_fetch, append_event, fetch_last_n, AppendFetchOutput, DEFAULT_BRANCH_ID,
+    append_and_fetch, append_event, fetch_last_n, scan_session_events, AppendFetchOutput,
+    DEFAULT_BRANCH_ID,
 };
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use types::{Document, Event, Session, Tenant, Tier};

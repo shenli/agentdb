@@ -92,7 +92,10 @@ impl TenantRegistry {
     }
 }
 
-use crate::meta::{key_next_session_id, key_session_by_external, key_session_record};
+use crate::meta::{
+    key_next_session_id, key_session_by_external, key_session_record,
+    prefix_session_by_external_for_tenant,
+};
 use crate::types::{Session, Tier};
 use agentdb_storage::SessionId;
 
@@ -173,6 +176,23 @@ impl SessionRegistry {
             },
         ])?;
         Ok(session)
+    }
+
+    /// Enumerate all external session ids minted under this tenant.
+    pub fn list_in_tenant(&self, box_id: BoxId, tenant_id: TenantId) -> Result<Vec<String>> {
+        let prefix = prefix_session_by_external_for_tenant(box_id, tenant_id);
+        let mut out = Vec::new();
+        for res in self.kv.scan_prefix(&prefix)? {
+            let (k, _v) = res?;
+            if k.len() <= 12 {
+                continue;
+            }
+            let name = std::str::from_utf8(&k[12..])
+                .map_err(|e| crate::error::Error::Invalid(format!("bad session name utf-8: {e}")))?
+                .to_string();
+            out.push(name);
+        }
+        Ok(out)
     }
 
     /// Overwrite the persisted session record. Does NOT rewrite the lookup
@@ -295,6 +315,18 @@ mod tests {
         let reloaded = reg.lookup(1, 10, "s-1").unwrap().unwrap();
         assert_eq!(reloaded.next_seq, 99);
         assert_eq!(reloaded.last_active_at, 999);
+    }
+
+    #[test]
+    fn session_list_in_tenant_returns_all_externals() {
+        let (_dir, kv) = store();
+        let reg = SessionRegistry::new(kv);
+        reg.get_or_mint(0, 10, "s-a", 0).unwrap();
+        reg.get_or_mint(0, 10, "s-b", 0).unwrap();
+        reg.get_or_mint(0, 11, "elsewhere", 0).unwrap();
+        let mut got = reg.list_in_tenant(0, 10).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["s-a".to_string(), "s-b".to_string()]);
     }
 
     #[test]

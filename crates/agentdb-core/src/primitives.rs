@@ -86,6 +86,26 @@ pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Resul
     Ok(ring.into())
 }
 
+/// Scan all events of a session in seq order (no bound). Used by wire-protocol
+/// `find`. Streams through RocksDB's prefix iterator; eager-collect because the
+/// caller typically applies a filter and limit.
+pub fn scan_session_events(kv: &Arc<dyn KvStore>, session: &Session) -> Result<Vec<Event>> {
+    let prefix = agentdb_storage::prefix_for_session_branch(
+        Namespace::Events,
+        session.box_id,
+        session.tenant_internal_id,
+        session.internal_id,
+        DEFAULT_BRANCH_ID,
+    );
+    let mut all: Vec<Event> = Vec::new();
+    for res in kv.scan_prefix(&prefix)? {
+        let (_k, v) = res?;
+        let ev: Event = serde_json::from_slice(&v)?;
+        all.push(ev);
+    }
+    Ok(all)
+}
+
 use crate::box_runtime::BoxRegistry;
 use crate::registry::TenantRegistry;
 

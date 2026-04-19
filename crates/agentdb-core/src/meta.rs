@@ -72,6 +72,15 @@ pub(crate) fn prefix_tenant_by_external_for_box(box_id: BoxId) -> Vec<u8> {
     out
 }
 
+pub(crate) fn prefix_session_by_external_for_tenant(box_id: BoxId, tenant_id: TenantId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.push(NS_META);
+    out.push(TAG_SESSION_BY_EXT);
+    out.extend_from_slice(&box_id.to_be_bytes());
+    out.extend_from_slice(&tenant_id.to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
