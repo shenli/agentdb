@@ -28,6 +28,7 @@ impl Box_ {
     pub async fn indexes_built<'a>(
         &'a self,
         kv: &Arc<dyn KvStore>,
+        store: &Arc<dyn ObjectStore>,
         tenants: &crate::registry::TenantRegistry,
         sessions: &crate::registry::SessionRegistry,
     ) -> Result<tokio::sync::RwLockReadGuard<'a, Option<crate::indexes::PerBoxIndexes>>> {
@@ -43,7 +44,7 @@ impl Box_ {
             let mut w = self.indexes.write().await;
             if w.is_none() {
                 let mut built = crate::indexes::PerBoxIndexes::new();
-                built.build(kv, tenants, sessions, self.id)?;
+                built.build(kv, store, tenants, sessions, self.id).await?;
                 *w = Some(built);
             }
         }
@@ -188,13 +189,13 @@ mod tests {
         .unwrap();
         let box_ = reg.route_tenant("t-1");
         let built1 = box_
-            .indexes_built(reg.kv(), &tenants, &sessions)
+            .indexes_built(reg.kv(), reg.object_store(), &tenants, &sessions)
             .await
             .unwrap();
         assert_eq!(built1.as_ref().expect("built").indexed, 1);
         drop(built1);
         let built2 = box_
-            .indexes_built(reg.kv(), &tenants, &sessions)
+            .indexes_built(reg.kv(), reg.object_store(), &tenants, &sessions)
             .await
             .unwrap();
         assert_eq!(built2.as_ref().expect("built").indexed, 1);

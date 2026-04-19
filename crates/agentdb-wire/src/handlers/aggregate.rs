@@ -68,7 +68,9 @@ pub async fn aggregate_response(
     };
 
     // Build indexes lazily.
-    let indexes_guard = box_.indexes_built(registry.kv(), tenants, sessions).await?;
+    let indexes_guard = box_
+        .indexes_built(registry.kv(), registry.object_store(), tenants, sessions)
+        .await?;
     let indexes = indexes_guard.as_ref().expect("built by indexes_built");
 
     // Session hint — either from the source-stage `filter.session_id` or

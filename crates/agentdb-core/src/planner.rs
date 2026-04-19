@@ -366,7 +366,8 @@ mod tests {
             .unwrap();
         let mut indexes = PerBoxIndexes::new();
         indexes
-            .build(&kv, &tenants, &sessions, tenant.box_id)
+            .build(&kv, reg.object_store(), &tenants, &sessions, tenant.box_id)
+            .await
             .unwrap();
         let p = HybridPlanner {
             kv: &kv,
@@ -410,7 +411,8 @@ mod tests {
             .unwrap();
         let mut indexes = PerBoxIndexes::new();
         indexes
-            .build(&kv, &tenants, &sessions, tenant.box_id)
+            .build(&kv, reg.object_store(), &tenants, &sessions, tenant.box_id)
+            .await
             .unwrap();
         let p = HybridPlanner {
             kv: &kv,
