@@ -113,13 +113,16 @@ pub async fn aggregate_response(
 
     let planner = HybridPlanner {
         kv: registry.kv(),
+        store: registry.object_store(),
         indexes,
         sessions,
         box_id: tenant.box_id,
         tenant_internal_id: tenant.internal_id,
     };
 
-    let out = planner.plan(&source, predicate, session_hint.as_deref())?;
+    let out = planner
+        .plan(&source, predicate, session_hint.as_deref())
+        .await?;
     let mut hits = out.hits;
 
     if let Some(limit) = post_limit {

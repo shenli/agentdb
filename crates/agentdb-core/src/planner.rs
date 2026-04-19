@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use agentdb_index::DocId;
 use agentdb_storage::{encode_key, BoxId, KvStore, Namespace};
+use object_store::ObjectStore;
 
 use crate::error::Result;
 use crate::indexes::PerBoxIndexes;
 use crate::primitives::{scan_session_events, DEFAULT_BRANCH_ID};
 use crate::registry::SessionRegistry;
-use crate::types::Event;
+use crate::types::{Event, Tier};
 
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -50,6 +51,7 @@ pub type FilterFn = Box<dyn Fn(&str, &Event) -> bool + Send + Sync>;
 
 pub struct HybridPlanner<'a> {
     pub kv: &'a Arc<dyn KvStore>,
+    pub store: &'a Arc<dyn ObjectStore>,
     pub indexes: &'a PerBoxIndexes,
     pub sessions: &'a SessionRegistry,
     pub box_id: BoxId,
@@ -58,20 +60,20 @@ pub struct HybridPlanner<'a> {
 
 impl<'a> HybridPlanner<'a> {
     /// Hint: if the filter pins the session by external id, use locality-bound.
-    pub fn plan(
+    pub async fn plan(
         &self,
         source: &Source,
         filter: FilterFn,
         session_id_hint: Option<&str>,
     ) -> Result<PlanOutput> {
         if let Some(session_ext) = session_id_hint {
-            self.plan_locality_bound(source, filter, session_ext)
+            self.plan_locality_bound(source, filter, session_ext).await
         } else {
-            self.plan_over_fetch(source, filter)
+            self.plan_over_fetch(source, filter).await
         }
     }
 
-    fn plan_locality_bound(
+    async fn plan_locality_bound(
         &self,
         source: &Source,
         filter: FilterFn,
@@ -91,7 +93,21 @@ impl<'a> HybridPlanner<'a> {
                 }
             };
 
-        let all = scan_session_events(self.kv, &session)?;
+        let all: Vec<Event> = match session.tier {
+            Tier::Warm => scan_session_events(self.kv, &session)?,
+            Tier::Cold => {
+                let Some(path) = session.segment_path.as_deref() else {
+                    return Ok(PlanOutput {
+                        strategy: Strategy::LocalityBound,
+                        hits: Vec::new(),
+                    });
+                };
+                let seg = crate::segment::read_segment(self.store, path).await?;
+                seg.events
+            }
+            Tier::Archive => Vec::new(),
+        };
+
         let mut scored: Vec<Hit> = Vec::new();
         for event in all {
             if !filter(&session.external_id, &event) {
@@ -126,7 +142,7 @@ impl<'a> HybridPlanner<'a> {
         })
     }
 
-    fn plan_over_fetch(&self, source: &Source, filter: FilterFn) -> Result<PlanOutput> {
+    async fn plan_over_fetch(&self, source: &Source, filter: FilterFn) -> Result<PlanOutput> {
         let candidates: Vec<(DocId, f32)> = match source {
             Source::Text { path, query, limit } => {
                 use agentdb_index::text::TextIndex;
@@ -152,7 +168,7 @@ impl<'a> HybridPlanner<'a> {
         };
         let mut hits: Vec<Hit> = Vec::new();
         for (doc_id, score) in candidates {
-            let Some(event) = self.resolve(doc_id)? else {
+            let Some(event) = self.resolve(doc_id).await? else {
                 continue;
             };
             let Some(session) = self.sessions.lookup_by_internal(
@@ -182,8 +198,7 @@ impl<'a> HybridPlanner<'a> {
         })
     }
 
-    fn resolve(&self, doc_id: DocId) -> Result<Option<Event>> {
-        // (box, tenant, session, branch=0, seq)
+    async fn resolve(&self, doc_id: DocId) -> Result<Option<Event>> {
         let key = encode_key(
             Namespace::Events,
             self.box_id,
@@ -192,10 +207,23 @@ impl<'a> HybridPlanner<'a> {
             DEFAULT_BRANCH_ID,
             doc_id.seq,
         );
-        let Some(bytes) = self.kv.get(&key)? else {
+        if let Some(bytes) = self.kv.get(&key)? {
+            return Ok(Some(serde_json::from_slice(&bytes)?));
+        }
+        // Warm miss — if the session is cold, read from its segment.
+        let session = match self.sessions.lookup_by_internal(
+            self.box_id,
+            self.tenant_internal_id,
+            doc_id.session_internal_id,
+        )? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let Some(path) = session.segment_path.as_deref() else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        let seg = crate::segment::read_segment(self.store, path).await?;
+        Ok(seg.events.into_iter().find(|e| e.seq == doc_id.seq))
     }
 }
 
@@ -278,30 +306,30 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    async fn setup() -> (
+    async fn setup_with_store() -> (
         TempDir,
         TempDir,
         Arc<dyn KvStore>,
+        Arc<dyn ObjectStore>,
         Arc<BoxRegistry>,
         Arc<TenantRegistry>,
         Arc<SessionRegistry>,
     ) {
         use object_store::local::LocalFileSystem;
-        use object_store::ObjectStore;
-        let dir = TempDir::new().unwrap();
+        let kv_dir = TempDir::new().unwrap();
         let obj_dir = TempDir::new().unwrap();
-        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).unwrap());
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-        let reg = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
+        let reg = Arc::new(BoxRegistry::new(kv.clone(), store.clone(), 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv.clone()));
-        (dir, obj_dir, kv, reg, tenants, sessions)
+        (kv_dir, obj_dir, kv, store, reg, tenants, sessions)
     }
 
     #[tokio::test]
     async fn locality_bound_strategy_is_picked_when_session_hint_present() {
-        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
         append_and_fetch(
             &reg,
             &tenants,
@@ -324,6 +352,7 @@ mod tests {
         let indexes = PerBoxIndexes::new();
         let p = HybridPlanner {
             kv: &kv,
+            store: &store,
             indexes: &indexes,
             sessions: &sessions,
             box_id,
@@ -339,6 +368,7 @@ mod tests {
                 Box::new(|_, _| true),
                 Some("s-1"),
             )
+            .await
             .unwrap();
         assert_eq!(out.strategy, Strategy::LocalityBound);
         assert_eq!(out.hits.len(), 1);
@@ -346,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_fetch_strategy_uses_text_index() {
-        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
         for i in 0..3 {
             append_and_fetch(
                 &reg,
@@ -366,11 +396,12 @@ mod tests {
             .unwrap();
         let mut indexes = PerBoxIndexes::new();
         indexes
-            .build(&kv, reg.object_store(), &tenants, &sessions, tenant.box_id)
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
             .await
             .unwrap();
         let p = HybridPlanner {
             kv: &kv,
+            store: &store,
             indexes: &indexes,
             sessions: &sessions,
             box_id: tenant.box_id,
@@ -386,6 +417,7 @@ mod tests {
                 Box::new(|_, _| true),
                 None,
             )
+            .await
             .unwrap();
         assert_eq!(out.strategy, Strategy::OverFetchPostFilter);
         assert_eq!(out.hits.len(), 3);
@@ -393,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn over_fetch_strategy_uses_vector_index() {
-        let (_d, _obj_dir, kv, reg, tenants, sessions) = setup().await;
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
         append_and_fetch(
             &reg,
             &tenants,
@@ -411,11 +443,12 @@ mod tests {
             .unwrap();
         let mut indexes = PerBoxIndexes::new();
         indexes
-            .build(&kv, reg.object_store(), &tenants, &sessions, tenant.box_id)
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
             .await
             .unwrap();
         let p = HybridPlanner {
             kv: &kv,
+            store: &store,
             indexes: &indexes,
             sessions: &sessions,
             box_id: tenant.box_id,
@@ -432,8 +465,71 @@ mod tests {
                 Box::new(|_, _| true),
                 None,
             )
+            .await
             .unwrap();
         assert_eq!(out.strategy, Strategy::OverFetchPostFilter);
+        assert_eq!(out.hits.len(), 1);
+        assert!(out.hits[0].score > 0.99);
+    }
+
+    #[tokio::test]
+    async fn vector_search_over_fetch_strategy_finds_cold_session_event() {
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"embedding": [1.0, 0.0, 0.0]}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let tenant = tenants
+            .get_or_mint(reg.route_tenant("t-1").id, "t-1", 0)
+            .unwrap();
+        let mut session = sessions
+            .lookup(tenant.box_id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+        let box_ = reg.route_tenant("t-1");
+        {
+            let guard = box_.write_lock.lock().await;
+            crate::tiering::cold_transition(&kv, &store, &sessions, &guard, &mut session)
+                .await
+                .unwrap();
+        }
+
+        let mut indexes = PerBoxIndexes::new();
+        indexes
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
+            .await
+            .unwrap();
+
+        let p = HybridPlanner {
+            kv: &kv,
+            store: &store,
+            indexes: &indexes,
+            sessions: &sessions,
+            box_id: tenant.box_id,
+            tenant_internal_id: tenant.internal_id,
+        };
+        let out = p
+            .plan(
+                &Source::Vector {
+                    path: "payload.embedding".into(),
+                    query: vec![1.0, 0.0, 0.0],
+                    limit: 5,
+                    num_candidates: 10,
+                },
+                Box::new(|_, _| true),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(out.hits.len(), 1);
         assert!(out.hits[0].score > 0.99);
     }
