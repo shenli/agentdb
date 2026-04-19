@@ -85,3 +85,73 @@ async fn list_databases_sees_tenant_after_write() {
     let dbs = cli.list_database_names().await.unwrap();
     assert!(dbs.contains(&"t-abc".to_string()));
 }
+
+#[tokio::test]
+async fn text_search_aggregation_returns_hits() {
+    let (_dir, port) = spawn().await;
+    let cli = client(port).await;
+    let db = cli.database("t-search");
+    let events = db.collection::<bson::Document>("events");
+
+    events
+        .insert_one(doc! { "session_id": "s-1", "text": "refund policy" })
+        .await
+        .unwrap();
+    events
+        .insert_one(doc! { "session_id": "s-1", "text": "shipping update" })
+        .await
+        .unwrap();
+
+    let pipeline = vec![doc! {
+        "$search": {
+            "text": { "query": "refund", "path": "payload.text" },
+            "limit": 10_i64,
+        }
+    }];
+    let cursor = events.aggregate(pipeline).await.unwrap();
+    use futures_util::StreamExt;
+    let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
+    assert_eq!(docs.len(), 1);
+    assert_eq!(
+        docs[0]
+            .get_document("payload")
+            .unwrap()
+            .get_str("text")
+            .unwrap(),
+        "refund policy"
+    );
+}
+
+#[tokio::test]
+async fn vector_search_aggregation_returns_top_hit() {
+    let (_dir, port) = spawn().await;
+    let cli = client(port).await;
+    let db = cli.database("t-vector");
+    let events = db.collection::<bson::Document>("events");
+
+    events
+        .insert_one(doc! { "session_id": "s-1", "embedding": [1.0, 0.0, 0.0] })
+        .await
+        .unwrap();
+    events
+        .insert_one(doc! { "session_id": "s-1", "embedding": [0.0, 1.0, 0.0] })
+        .await
+        .unwrap();
+
+    let pipeline = vec![doc! {
+        "$vectorSearch": {
+            "queryVector": [1.0, 0.0, 0.0],
+            "path": "payload.embedding",
+            "limit": 5_i64,
+            "numCandidates": 10_i64,
+        }
+    }];
+    let cursor = events.aggregate(pipeline).await.unwrap();
+    use futures_util::StreamExt;
+    let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
+    assert!(!docs.is_empty());
+    let first_payload = docs[0].get_document("payload").unwrap();
+    let emb = first_payload.get_array("embedding").unwrap();
+    let as_vec: Vec<f64> = emb.iter().filter_map(|b| b.as_f64()).collect();
+    assert_eq!(as_vec, vec![1.0, 0.0, 0.0]);
+}
