@@ -20,8 +20,8 @@ pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
 pub use primitives::{
-    append_and_fetch, append_event, fetch_last_n, scan_session_events, AppendFetchOutput,
-    DEFAULT_BRANCH_ID,
+    append_and_fetch, append_event, fetch_last_n, fetch_last_n_merged, scan_session_events,
+    AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1};
