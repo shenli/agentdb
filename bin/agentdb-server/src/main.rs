@@ -8,7 +8,7 @@ use agentdb_core::{
     BoxRegistry, GcRunReporter, LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig,
     SessionRegistry, TenantRegistry,
 };
-use agentdb_storage::{KvStore, RocksKvStore};
+use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
 use object_store::aws::AmazonS3Builder;
@@ -137,10 +137,32 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
 
-    std::fs::create_dir_all(&data_dir).context("create data dir")?;
-
-    let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?);
     let object_store: Arc<dyn ObjectStore> = build_object_store(&objects_dir).await?;
+    let kv: Arc<dyn KvStore> = match std::env::var("AGENTDB_KV_BACKEND").as_deref() {
+        Ok("slatedb") => {
+            if std::env::var("AGENTDB_OBJECT_STORE").is_err() {
+                tracing::warn!(
+                    "AGENTDB_KV_BACKEND=slatedb but AGENTDB_OBJECT_STORE is unset; \
+                     defaulting to local filesystem. Set AGENTDB_OBJECT_STORE=s3 \
+                     for the production shape."
+                );
+            }
+            let slate_path = std::env::var("AGENTDB_SLATEDB_PATH")
+                .unwrap_or_else(|_| "agentdb/slate".to_string());
+            Arc::new(
+                SlateKvStore::open(object_store.clone(), &slate_path)
+                    .await
+                    .context("open slatedb")?,
+            )
+        }
+        Ok("rocksdb") | Err(_) => {
+            std::fs::create_dir_all(&data_dir).context("create data dir")?;
+            Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?)
+        }
+        Ok(other) => anyhow::bail!(
+            "unknown AGENTDB_KV_BACKEND={other}; expected rocksdb|slatedb"
+        ),
+    };
     let registry = Arc::new(BoxRegistry::new(kv.clone(), object_store.clone(), num_boxes)?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
