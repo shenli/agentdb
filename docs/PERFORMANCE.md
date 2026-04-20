@@ -154,6 +154,23 @@ itself; the snapshot setup is a single-digit microseconds overhead.
 At prototype scale this is well within the "agent workload tail-latency
 tolerance" budget described in the design doc §1.1.
 
+## Admission control overhead (M10)
+
+Per-request overhead on the `Box_::admit` hot path: two
+`parking_lot::Mutex` acquires (box bucket + tenant bucket map), refill
+math (`as_secs_f64` subtraction + multiply + min), and one `HashMap`
+entry lookup. Under `cargo test`, the 7 `admit_tests` complete in
+well under 1 ms wall time including sleep-based refill assertions —
+implying per-call overhead on the order of ~1 µs. At the c=64 /
+6.3k rps throughput numbers reported above, this is effectively
+free.
+
+No separate bench harness shipped — pathological contention would
+need thousands of concurrent tenants all within one box before the
+single-mutex tenant-map becomes a bottleneck, which is above this
+prototype's scale. A follow-up milestone could shard to `DashMap` or
+per-tenant atomics if that changes.
+
 ## Gotchas
 
 **HTTP keep-alive is not optional.** The Go probe originally closed

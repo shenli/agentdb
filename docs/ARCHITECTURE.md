@@ -227,8 +227,13 @@ intentionally cuts these:
   future work.
 - **No LLM hooks, no lifecycle webhooks, no derived-data pipeline.**
 - **No Percolator / 2PC.** Transactions are single-box, single-lock.
-- **No real admission control.** Quotas are advisory, checked at the
-  top of the append path.
+- **Admission control is token-bucket based and process-local.**
+  Per-box and per-tenant-in-box QPS + burst via `Quota.max_qps` /
+  `Quota.max_tenant_qps` / `Quota.burst`. Global process-wide ceiling
+  and distributed rate limiting are out of scope. Denials surface as
+  HTTP 429 (REST) or Mongo error code 82 (wire) and emit a `QuotaHit`
+  SSE event carrying `kind` = `"box"` or `"tenant"` plus the tenant
+  external id.
 
 The prototype exists to demonstrate that the agent-native primitives
 (append_and_fetch, fork, hybrid retrieval, box isolation, lifecycle,
