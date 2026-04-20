@@ -11,7 +11,7 @@ poke.
 bin/agentdb-server           the binary: wires everything together
 crates/agentdb-storage       KvStore trait + RocksDB implementation
 crates/agentdb-core          types, registries, primitives, lifecycle, fork
-crates/agentdb-index         per-box BM25 + brute-force vector indexes
+crates/agentdb-index         per-box BM25 + HNSW vector indexes
 crates/agentdb-wire          MongoDB wire protocol subset (OP_MSG)
 crates/agentdb-api           native REST: append_and_fetch, fork, admin
 crates/agentdb-dashboard     static HTML/CSS/JS served at /dashboard
@@ -79,9 +79,13 @@ session/{box_id}/{tenant_internal_id}/{external} -> Session
 session_by_internal/{box_id}/{tenant_internal_id}/{internal} -> external
 event/{box_id}/{tenant_internal}/{session_internal}/{branch}/{seq} -> Event
 segment/{box_id}/{tenant_internal}/{session_internal}/{branch} -> SegmentFile
-index_posting/{box_id}/{token}/...             -> posting lists
-index_vector/{box_id}/{session_internal}/{seq} -> embedding bytes
 ```
+
+Indexes are NOT stored in RocksDB. `PerBoxIndexes` is built lazily per
+box by walking all events (warm KV + cold segment files) on the first
+query and cached until server restart. New events appended after the
+build do not flow into the cached index — rebuilding incrementally is
+a known limitation carried forward from the prototype's lazy design.
 
 Keeping session events under `{tenant_internal}/{session_internal}`
 gives us O(1) session scans — the §4.1 "session clustering" property
@@ -150,16 +154,15 @@ indexes (`PerBoxIndexes` in agentdb-index). The planner is
 deliberately tiny — it supports three sources:
 
 - `Text(query)` → BM25 inverted-index lookup
-- `Vector(embedding, k)` → brute-force cosine similarity over all
-  embeddings in the box (the prototype skips ANN entirely; O(n) but
-  correct and obvious)
+- `Vector(embedding, k)` → cosine-similarity kNN via HNSW
+  (`instant-distance` backend), with a brute-force bypass below 64
+  vectors per path for deterministic small-N behavior
 - `Filter(tenant_id, session_id)` → KV scan
 
 A query can combine Text + Filter or Vector + Filter; the planner runs
 the filter first and intersects. This is the §4.4 "pre-filter"
-execution order — chosen because the prototype's index sizes are
-small enough that the vector brute force is cheap after the tenant
-filter.
+execution order — chosen because the tenant filter already prunes the
+candidate set before the ANN or brute-force scan.
 
 ## Observability (M7)
 
@@ -194,7 +197,10 @@ intentionally cuts these:
   but the prototype writes to a local directory.
 - **No MVCC or snapshot read API.** Fork is implemented with a parent
   pointer trick instead; other queries are read-committed.
-- **No ANN.** Vector search is O(n) brute force.
+- **ANN is in-memory and non-persistent.** HNSW via `instant-distance`
+  is built lazily per box on first query and rebuilt from scratch on
+  server restart. Incremental updates and persisted snapshots are
+  future work.
 - **No LLM hooks, no lifecycle webhooks, no derived-data pipeline.**
 - **No Percolator / 2PC.** Transactions are single-box, single-lock.
 - **No real admission control.** Quotas are advisory, checked at the
