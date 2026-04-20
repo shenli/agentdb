@@ -11,9 +11,55 @@ use agentdb_core::{
 use agentdb_storage::{KvStore, RocksKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
+use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tracing_subscriber::EnvFilter;
+
+/// Build the object store chosen by `AGENTDB_OBJECT_STORE` (`local` default,
+/// `s3` opt-in).
+///
+/// When `s3`, reads `AGENTDB_S3_BUCKET` (required), `AGENTDB_S3_REGION`
+/// (default `us-east-1`), and `AGENTDB_S3_ENDPOINT` (optional, used for
+/// MinIO/other S3-compatible hosts — turns on HTTP + path-style addressing).
+/// Standard AWS creds via the env chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+async fn build_object_store(
+    objects_dir: &std::path::Path,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    let kind = std::env::var("AGENTDB_OBJECT_STORE").unwrap_or_else(|_| "local".into());
+    let store: Arc<dyn ObjectStore> = match kind.as_str() {
+        "local" => {
+            std::fs::create_dir_all(objects_dir).context("create objects dir")?;
+            Arc::new(
+                LocalFileSystem::new_with_prefix(objects_dir)
+                    .context("open local object store")?,
+            )
+        }
+        "s3" => {
+            let bucket = std::env::var("AGENTDB_S3_BUCKET")
+                .context("AGENTDB_S3_BUCKET is required when AGENTDB_OBJECT_STORE=s3")?;
+            let region = std::env::var("AGENTDB_S3_REGION")
+                .unwrap_or_else(|_| "us-east-1".into());
+            let mut builder = AmazonS3Builder::from_env()
+                .with_bucket_name(&bucket)
+                .with_region(&region);
+            if let Ok(endpoint) = std::env::var("AGENTDB_S3_ENDPOINT") {
+                // MinIO and most S3-compatible deployments need path-style
+                // addressing. `allow_http` permits `http://localhost:9000`.
+                builder = builder
+                    .with_endpoint(&endpoint)
+                    .with_allow_http(true)
+                    .with_virtual_hosted_style_request(false);
+            }
+            Arc::new(builder.build().context("build AmazonS3")?)
+        }
+        other => anyhow::bail!(
+            "unknown AGENTDB_OBJECT_STORE={other}; expected local|s3"
+        ),
+    };
+
+    Ok(store)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,12 +119,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
-    std::fs::create_dir_all(&objects_dir).context("create objects dir")?;
 
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?);
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&objects_dir).context("open object store")?);
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store.clone(), num_boxes)?);
+    let object_store: Arc<dyn ObjectStore> = build_object_store(&objects_dir).await?;
+    let registry = Arc::new(BoxRegistry::new(kv.clone(), object_store.clone(), num_boxes)?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
 
@@ -89,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         let box_ = registry.box_by_id(i).expect("box id in range");
         engines.push(LifecycleEngine::start(
             kv.clone(),
-            store.clone(),
+            object_store.clone(),
             tenants.clone(),
             sessions.clone(),
             box_,
@@ -118,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
     for i in 0..num_boxes {
         let box_ = registry.box_by_id(i).expect("box id in range");
         gcs.push(SegmentGc::start(
-            store.clone(),
+            object_store.clone(),
             tenants.clone(),
             sessions.clone(),
             box_,
