@@ -76,6 +76,7 @@ dependencies = [
  "agentdb-wire",
  "anyhow",
  "axum",
+ "futures-util",
  "object_store",
  "tokio",
  "tracing",

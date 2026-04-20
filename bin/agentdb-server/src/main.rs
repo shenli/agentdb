@@ -58,6 +58,25 @@ async fn build_object_store(
         ),
     };
 
+    // Liveness probe: single list call under `agentdb/`. A local FS tempdir
+    // trivially succeeds; S3 catches bad creds, wrong region, unreachable
+    // endpoint, or a typo'd bucket name here — well before the server starts
+    // serving requests and streaming errors.
+    use futures_util::StreamExt;
+    let probe = object_store::path::Path::from("agentdb/");
+    let mut stream = store.list(Some(&probe));
+    match stream.next().await {
+        None => { /* empty prefix — legitimate, probe succeeded */ }
+        Some(Ok(_)) => { /* at least one entry; access works */ }
+        Some(Err(e)) => {
+            anyhow::bail!(
+                "object store liveness probe failed under prefix 'agentdb/': {e}. \
+                 Check AGENTDB_S3_BUCKET / AGENTDB_S3_REGION / AGENTDB_S3_ENDPOINT and creds."
+            );
+        }
+    }
+    drop(stream); // release the stream before returning the Arc
+
     Ok(store)
 }
 
