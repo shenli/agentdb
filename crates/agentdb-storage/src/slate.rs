@@ -172,8 +172,23 @@ impl KvStore for SlateKvStore {
         Ok(Box::new(collected.into_iter().map(Ok)))
     }
 
-    fn write_batch(&self, _ops: Vec<WriteOp>) -> Result<()> {
-        Err(Error::Other("write_batch: implemented in Task 6".into()))
+    fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let db = self.inner.clone();
+        self.bridge(async move {
+            let mut batch = slatedb::WriteBatch::new();
+            for op in ops {
+                match op {
+                    WriteOp::Put { key, value } => batch.put(&key, &value),
+                    WriteOp::Delete { key } => batch.delete(&key),
+                }
+            }
+            db.write(batch).await
+        })
+        .map_err(|e| Error::Other(format!("slatedb write_batch: {e}")))
+        .map(|_handle| ())
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
@@ -253,5 +268,29 @@ mod tests {
         let (_dir, kv) = open_test().await;
         kv.put(b"other/x", b"x").unwrap();
         assert_eq!(kv.scan_prefix(b"missing/").unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_batch_applies_mixed_put_and_delete() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"keep", b"pre-keep").unwrap();
+        kv.put(b"drop", b"pre-drop").unwrap();
+
+        kv.write_batch(vec![
+            WriteOp::Put { key: b"keep".to_vec(), value: b"post-keep".to_vec() },
+            WriteOp::Delete { key: b"drop".to_vec() },
+            WriteOp::Put { key: b"new".to_vec(), value: b"new".to_vec() },
+        ])
+        .unwrap();
+
+        assert_eq!(kv.get(b"keep").unwrap().as_deref(), Some(b"post-keep".as_ref()));
+        assert_eq!(kv.get(b"drop").unwrap(), None);
+        assert_eq!(kv.get(b"new").unwrap().as_deref(), Some(b"new".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn empty_write_batch_is_noop() {
+        let (_dir, kv) = open_test().await;
+        kv.write_batch(Vec::new()).unwrap();
     }
 }
