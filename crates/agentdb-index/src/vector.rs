@@ -318,10 +318,15 @@ mod tests {
         // First query builds.
         let _ = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
         // Insert a new extremely-close vector.
-        idx.insert("p", d(1, 999), &[1.0, 1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.insert("p", d(1, 999), &[1.0, 1.0, 0.0, 0.0, 0.0])
+            .unwrap();
         // Second query must see it.
         let hits = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
         let ids: Vec<DocId> = hits.iter().map(|(id, _)| *id).collect();
-        assert!(ids.contains(&d(1, 999)), "new insert not reflected: {:?}", ids);
+        assert!(
+            ids.contains(&d(1, 999)),
+            "new insert not reflected: {:?}",
+            ids
+        );
     }
 }

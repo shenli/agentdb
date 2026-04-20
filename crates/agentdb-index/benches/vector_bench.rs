@@ -21,7 +21,11 @@ fn pseudo_rand(seed: u64, i: u64) -> f32 {
 
 fn gen_vecs(n: usize, dim: usize, seed_base: u64) -> Vec<Vec<f32>> {
     (0..n as u64)
-        .map(|i| (0..dim as u64).map(|j| pseudo_rand(seed_base + i, j)).collect())
+        .map(|i| {
+            (0..dim as u64)
+                .map(|j| pseudo_rand(seed_base + i, j))
+                .collect()
+        })
         .collect()
 }
 
