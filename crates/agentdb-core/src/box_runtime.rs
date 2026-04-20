@@ -1,10 +1,37 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use agentdb_storage::{BoxId, KvStore};
 use object_store::ObjectStore;
+use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::metrics::BoxMetrics;
+
+#[derive(Debug, Clone, Copy)]
+pub enum FaultKind {
+    Latency { ms: u64 },
+    Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedFault {
+    pub kind: FaultKind,
+    pub expires_at: Instant,
+}
+
+impl InjectedFault {
+    pub fn is_active(&self) -> bool {
+        Instant::now() < self.expires_at
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Quota {
+    pub max_warm_sessions: Option<u64>,
+    pub max_qps: Option<u64>,
+}
 
 /// One logical box. Owns a mutex that serializes the hot-path writes
 /// (append, metadata updates) for tenants it hosts.
@@ -12,6 +39,9 @@ pub struct Box_ {
     pub id: BoxId,
     pub write_lock: Mutex<()>,
     indexes: tokio::sync::RwLock<Option<crate::indexes::PerBoxIndexes>>,
+    pub metrics: Arc<BoxMetrics>,
+    pub fault: RwLock<Option<InjectedFault>>,
+    pub quota: RwLock<Quota>,
 }
 
 impl Box_ {
@@ -20,6 +50,30 @@ impl Box_ {
             id,
             write_lock: Mutex::new(()),
             indexes: tokio::sync::RwLock::new(None),
+            metrics: Arc::new(BoxMetrics::new()),
+            fault: RwLock::new(None),
+            quota: RwLock::new(Quota::default()),
+        }
+    }
+
+    /// If a fault is active, apply its effect. For Latency, sleep. For
+    /// Error, return true so the caller can short-circuit.
+    pub async fn apply_fault(&self) -> bool {
+        let f = { *self.fault.read() };
+        if let Some(f) = f {
+            if f.is_active() {
+                match f.kind {
+                    FaultKind::Latency { ms } => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+                        false
+                    }
+                    FaultKind::Error => true,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
         }
     }
 

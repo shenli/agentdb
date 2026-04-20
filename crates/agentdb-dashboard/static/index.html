@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>AgentDB Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/styles.css" />
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.5/dist/cdn.min.js"></script>
+    <script defer src="/dashboard/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>AgentDB Dashboard</h1>
+      <div class="controls">
+        <button onclick="demoFork()">Fork demo-parent</button>
+        <button onclick="demoFault(0)">Inject fault box 0</button>
+        <button onclick="demoCold()">Cool demo session</button>
+      </div>
+    </header>
+    <main x-data="dashboard()" x-init="init()">
+      <section class="top-bar">
+        <div>Boxes: <span x-text="boxes.length"></span></div>
+        <div>Tenants: <span x-text="totalTenants"></span></div>
+        <div>Appends: <span x-text="totalAppends"></span></div>
+        <div>Forks: <span x-text="totalForks"></span></div>
+      </section>
+      <section class="box-grid">
+        <template x-for="b in boxes" :key="b.id">
+          <div class="box-tile" :class="{ fault: b.fault_active }">
+            <header>box #<span x-text="b.id"></span></header>
+            <div class="counts">
+              <span class="warm" x-text="b.warm_sessions || 0"></span> warm
+              /
+              <span class="cold" x-text="b.cold_sessions || 0"></span> cold
+            </div>
+            <div class="dots">
+              <template x-for="i in (b.warm_sessions || 0)">
+                <span class="dot warm"></span>
+              </template>
+              <template x-for="i in (b.cold_sessions || 0)">
+                <span class="dot cold"></span>
+              </template>
+            </div>
+          </div>
+        </template>
+      </section>
+      <section class="event-feed">
+        <h2>Events</h2>
+        <ul>
+          <template x-for="ev in events.slice(-20).reverse()" :key="ev._id">
+            <li>
+              <span class="ts" x-text="new Date(ev.ts_ms).toLocaleTimeString()"></span>
+              <span class="kind" x-text="ev.event"></span>
+              <span class="detail" x-text="describe(ev)"></span>
+            </li>
+          </template>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>

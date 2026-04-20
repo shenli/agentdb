@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentdb_api::{router, AppState};
+use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, LifecycleConfig, LifecycleEngine, SessionRegistry, TenantRegistry,
 };
@@ -83,16 +83,61 @@ async fn main() -> anyhow::Result<()> {
     }
     std::mem::forget(engines);
 
+    let stream = StreamBus::default();
     let http_state = AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),
         sessions: sessions.clone(),
+        stream: stream.clone(),
     };
     let wire_state = WireState {
-        registry,
+        registry: registry.clone(),
         tenants,
         sessions,
     };
+
+    // Periodic MetricsTick broadcaster for the dashboard SSE stream.
+    {
+        let registry = registry.clone();
+        let stream = stream.clone();
+        let period = Duration::from_millis(
+            std::env::var("AGENTDB_TICK_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            loop {
+                ticker.tick().await;
+                let mut boxes = Vec::with_capacity(registry.num_boxes() as usize);
+                for i in 0..registry.num_boxes() {
+                    let Some(b) = registry.box_by_id(i) else {
+                        continue;
+                    };
+                    let snap = b.metrics.snapshot();
+                    let fault_active = b
+                        .fault
+                        .read()
+                        .as_ref()
+                        .map(|f| f.is_active())
+                        .unwrap_or(false);
+                    boxes.push(TickBox {
+                        id: i,
+                        warm_sessions: snap.gauges.warm_sessions,
+                        cold_sessions: snap.gauges.cold_sessions,
+                        appends: snap.appends,
+                        forks: snap.forks,
+                        fault_active,
+                    });
+                }
+                stream.emit(StreamEvent::MetricsTick {
+                    ts_ms: now_ms(),
+                    boxes,
+                });
+            }
+        });
+    }
 
     let app = router(http_state);
     let http_listener = tokio::net::TcpListener::bind(http_addr)

@@ -15,6 +15,7 @@ pub fn find_response(
     filter_doc: &Document,
     limit: Option<i64>,
 ) -> WireResult<Document> {
+    registry.route_tenant(db).metrics.record_query_find();
     let filter = Filter::parse(filter_doc)?;
     let tenant = match tenants.lookup(routing_box(registry, db), db)? {
         Some(t) => t,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use agentdb_storage::{encode_key, KvStore, Namespace, WriteOp};
 use tokio::sync::MutexGuard;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::meta::key_session_record;
 use crate::registry::SessionRegistry;
 use crate::types::{Event, Session};
@@ -184,12 +184,41 @@ pub async fn append_and_fetch(
     now_millis: u64,
 ) -> Result<AppendFetchOutput> {
     let box_ = registry.route_tenant(tenant_external);
+    // Fault injection check — if an error fault is active, short-circuit.
+    if box_.apply_fault().await {
+        box_.metrics.record_fault();
+        return Err(Error::Invalid(format!(
+            "box {} has an injected error fault",
+            box_.id
+        )));
+    }
+    // Soft quota check on warm sessions.
+    {
+        let q = *box_.quota.read();
+        if let Some(max) = q.max_warm_sessions {
+            let g = box_.metrics.gauges.read().clone();
+            if g.warm_sessions >= max {
+                box_.metrics.record_quota_hit();
+                return Err(Error::Invalid(format!(
+                    "box {} warm_sessions quota {max} exceeded",
+                    box_.id
+                )));
+            }
+        }
+    }
     let guard = box_.write_lock.lock().await;
     let kv = registry.kv().clone();
     let tenant = tenants.get_or_mint(box_.id, tenant_external, now_millis)?;
+    let newly_minted = sessions
+        .lookup(box_.id, tenant.internal_id, session_external)?
+        .is_none();
     let mut session =
         sessions.get_or_mint(box_.id, tenant.internal_id, session_external, now_millis)?;
+    if newly_minted {
+        box_.metrics.bump_tier(session.tier);
+    }
     let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+    box_.metrics.record_append();
     drop(guard);
     let recent = fetch_last_n_merged(
         &kv,

@@ -52,6 +52,8 @@ pub fn fork_session(
         now_millis,
         Some(fork_ref),
     )?;
+    box_.metrics.record_fork();
+    box_.metrics.bump_tier(child.tier);
     let _ = registry.kv(); // reserved for future fork-lineage persistence
     Ok(child)
 }

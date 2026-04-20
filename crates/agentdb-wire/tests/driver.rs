@@ -58,6 +58,7 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
         registry: registry.clone(),
         tenants: tenants.clone(),
         sessions: sessions.clone(),
+        stream: agentdb_api::StreamBus::default(),
     };
 
     tokio::spawn(async move {

@@ -24,6 +24,7 @@ pub async fn aggregate_response(
     collection: &str,
     pipeline: &[Document],
 ) -> WireResult<Document> {
+    registry.route_tenant(db).metrics.record_query_aggregate();
     if collection != "events" {
         return Err(WireError::Protocol(format!(
             "aggregate on {collection} not supported; only 'events' is indexed"
