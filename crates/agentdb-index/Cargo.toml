@@ -14,3 +14,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "vector_bench"
+harness = false

@@ -104,6 +104,38 @@ Note: this is exercising the lifecycle sweep, not its efficiency —
 that the warm→cold transition count matches the workload's session
 count exactly (no dropped events, no double transitions).
 
+## Vector search (knn)
+
+`crates/agentdb-index/benches/vector_bench.rs` builds one index with
+10 000 pseudo-random 384-dimension points and runs 100 queries at
+top-k = 10. The HNSW index is built once outside the measured region
+(it's lazy — the "warming" call triggers the build). Brute-force
+numbers come from an inline reference implementation in the same
+bench.
+
+| impl                     | median latency | vs brute force |
+|--------------------------|---------------:|---------------:|
+| brute force (reference)  |       2.39 ms  |          1.00× |
+| HNSW (`instant-distance`)|       0.77 ms  |          3.1×  |
+
+Recall@10 (overlap between HNSW top-10 and brute-force top-10, averaged
+over 100 queries) at default `ef_construction=100`: **0.85**.
+
+**Caveat:** pseudo-random 384-dim vectors concentrate all cosine
+similarities near 0, so the "true" top-10 has tightly-bunched scores
+that are inherently hard for any ANN. Real embedding distributions
+(sentence transformers, CLIP, etc.) have much more cluster structure
+and typically recall ≥ 0.95 at the same settings. Setting `AGENTDB_HNSW_EF=400` before the bench gives roughly the same
+recall on this random workload — the improvement is small because the
+data itself has no structure to exploit.
+
+Reproduce:
+```bash
+cargo bench -p agentdb-index --bench vector_bench
+# Optional: tune ef_construction
+AGENTDB_HNSW_EF=400 cargo bench -p agentdb-index --bench vector_bench
+```
+
 ## Gotchas
 
 **HTTP keep-alive is not optional.** The Go probe originally closed
