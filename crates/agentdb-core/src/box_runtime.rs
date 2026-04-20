@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,6 +7,7 @@ use object_store::ObjectStore;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
+use crate::admission::{AdmissionDenied, Scope, TokenBucket};
 use crate::error::{Error, Result};
 use crate::metrics::BoxMetrics;
 use crate::segment_pin::SegmentPinRegistry;
@@ -32,6 +34,8 @@ impl InjectedFault {
 pub struct Quota {
     pub max_warm_sessions: Option<u64>,
     pub max_qps: Option<u64>,
+    pub max_tenant_qps: Option<u64>,
+    pub burst: Option<u64>,
 }
 
 /// One logical box. Owns a mutex that serializes the hot-path writes
@@ -44,6 +48,8 @@ pub struct Box_ {
     pub fault: RwLock<Option<InjectedFault>>,
     pub quota: RwLock<Quota>,
     pub segment_pins: Arc<SegmentPinRegistry>,
+    box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
+    tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
 }
 
 impl Box_ {
@@ -56,6 +62,8 @@ impl Box_ {
             fault: RwLock::new(None),
             quota: RwLock::new(Quota::default()),
             segment_pins: Arc::new(SegmentPinRegistry::new()),
+            box_bucket: parking_lot::Mutex::new(None),
+            tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -78,6 +86,61 @@ impl Box_ {
         } else {
             false
         }
+    }
+
+    /// Rebuild the box_bucket and drop any cached tenant_buckets so
+    /// the next `admit` call for each tenant constructs a fresh bucket
+    /// at the current `quota` settings. Called by the admin quota
+    /// endpoint after a live config change.
+    pub fn rebuild_buckets(&self) {
+        let q = *self.quota.read();
+        *self.box_bucket.lock() = q
+            .max_qps
+            .map(|qps| TokenBucket::new(qps, q.burst.unwrap_or(qps)));
+        self.tenant_buckets.lock().clear();
+    }
+
+    /// Returns `Ok(())` if both the per-box and per-tenant buckets
+    /// grant a token. Returns `AdmissionDenied` with the scope of the
+    /// first refusing gate. Records a `quota_hit` metric on denial.
+    ///
+    /// `tenant_internal_id == 0` is a sentinel meaning "tenant not
+    /// yet minted" (callers use it for the first-ever request from a
+    /// new tenant, where calling `get_or_mint` before the write_lock
+    /// would race). In that case the per-tenant gate is skipped; the
+    /// per-box gate still runs.
+    ///
+    /// Both buckets must grant. The per-box gate runs first so one
+    /// tenant can't repeatedly drain the per-tenant bucket check while
+    /// the per-box gate is already saturated.
+    pub fn admit(&self, tenant_internal_id: u64) -> std::result::Result<(), AdmissionDenied> {
+        {
+            let mut b = self.box_bucket.lock();
+            if let Some(bucket) = b.as_mut() {
+                if !bucket.admit() {
+                    self.metrics.record_quota_hit();
+                    return Err(AdmissionDenied { scope: Scope::Box });
+                }
+            }
+        }
+        if tenant_internal_id == 0 {
+            return Ok(());
+        }
+        let q = *self.quota.read();
+        if let Some(qps) = q.max_tenant_qps {
+            let burst = q.burst.unwrap_or(qps);
+            let mut map = self.tenant_buckets.lock();
+            let bucket = map
+                .entry(tenant_internal_id)
+                .or_insert_with(|| TokenBucket::new(qps, burst));
+            if !bucket.admit() {
+                self.metrics.record_quota_hit();
+                return Err(AdmissionDenied {
+                    scope: Scope::Tenant,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Build (on first call) and return a read guard over the box's indexes.
