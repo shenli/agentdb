@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shenli/agentdb/workload/internal/client"
+	"github.com/shenli/agentdb/workload/internal/control"
 	"github.com/shenli/agentdb/workload/internal/persona"
 
 	"gopkg.in/yaml.v3"
@@ -43,6 +44,13 @@ func main() {
 	if err != nil {
 		log.Printf("mongo connect: %v (continuing without search)", err)
 	}
+
+	ctrl := &control.Server{Addr: cfg.ControlAddr, REST: rest}
+	go func() {
+		if err := ctrl.Start(ctx); err != nil && err != http.ErrServerClosed {
+			log.Printf("control server: %v", err)
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for i := range cfg.Personas {
