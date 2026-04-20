@@ -248,4 +248,80 @@ mod tests {
         let hits = idx.knn("p", &[1.0], 10);
         assert!(hits.is_empty());
     }
+
+    /// Insert 256 random 128-dim points including a known target. A
+    /// query close to the target must put it in the top-5. Seeded for
+    /// reproducibility.
+    #[test]
+    fn knn_recall_on_256_vectors_returns_target_in_top_k() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn pseudo_rand(seed: u64, i: u64) -> f32 {
+            let mut h = DefaultHasher::new();
+            (seed, i).hash(&mut h);
+            // Map hash to [-1.0, 1.0]
+            ((h.finish() as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32
+        }
+
+        let mut idx = HnswVectorIndex::new();
+        let dim = 128;
+        // Target vector at seq=999.
+        let target: Vec<f32> = (0..dim).map(|j| pseudo_rand(42, j as u64)).collect();
+        idx.insert("emb", d(1, 999), &target).unwrap();
+
+        for i in 0..256u64 {
+            let v: Vec<f32> = (0..dim).map(|j| pseudo_rand(i + 1000, j as u64)).collect();
+            idx.insert("emb", d(1, i), &v).unwrap();
+        }
+
+        // Query = slight perturbation of target.
+        let query: Vec<f32> = target
+            .iter()
+            .enumerate()
+            .map(|(j, x)| x + pseudo_rand(99, j as u64) * 0.01)
+            .collect();
+        let hits = idx.knn("emb", &query, 5);
+        let top_ids: Vec<DocId> = hits.iter().map(|(id, _)| *id).collect();
+        assert!(
+            top_ids.contains(&d(1, 999)),
+            "target not in top-5: got {:?}",
+            top_ids
+        );
+    }
+
+    #[test]
+    fn dim_mismatch_across_paths_is_isolated() {
+        let mut idx = HnswVectorIndex::new();
+        idx.insert("p2", d(1, 1), &[1.0, 0.0]).unwrap();
+        idx.insert("p3", d(1, 2), &[1.0, 0.0, 0.0]).unwrap();
+        // Neither insert should interfere; both paths queryable with
+        // their own dims.
+        let a = idx.knn("p2", &[1.0, 0.0], 1);
+        let b = idx.knn("p3", &[1.0, 0.0, 0.0], 1);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        // A query with the wrong dim against a path returns empty, not
+        // a cross-path hit.
+        let wrong = idx.knn("p2", &[1.0, 0.0, 0.0], 1);
+        assert!(wrong.is_empty());
+    }
+
+    #[test]
+    fn insert_after_knn_invalidates_cached_hnsw() {
+        let mut idx = HnswVectorIndex::new();
+        // Seed above threshold so the HNSW branch fires.
+        for i in 0..80u64 {
+            let v: Vec<f32> = vec![i as f32, 1.0, 0.0, 0.0, 0.0];
+            idx.insert("p", d(1, i), &v).unwrap();
+        }
+        // First query builds.
+        let _ = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
+        // Insert a new extremely-close vector.
+        idx.insert("p", d(1, 999), &[1.0, 1.0, 0.0, 0.0, 0.0]).unwrap();
+        // Second query must see it.
+        let hits = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
+        let ids: Vec<DocId> = hits.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&d(1, 999)), "new insert not reflected: {:?}", ids);
+    }
 }
