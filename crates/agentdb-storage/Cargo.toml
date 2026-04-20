@@ -12,3 +12,4 @@ rocksdb = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
