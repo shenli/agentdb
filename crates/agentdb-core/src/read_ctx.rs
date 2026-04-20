@@ -23,7 +23,10 @@ pub struct ReadCtx {
     registry: Arc<SegmentPinRegistry>,
     metrics: Arc<crate::metrics::BoxMetrics>,
     pinned_segments: Mutex<BTreeSet<String>>,
+    // `box_id` is deliberately omitted from the key because a ReadCtx is
+    // bound to a single box (see `open`); all entries share that box.
     session_cache: Mutex<HashMap<(TenantId, u64), Session>>,
+    external_cache: Mutex<HashMap<(TenantId, String), u64>>,
 }
 
 impl ReadCtx {
@@ -38,6 +41,7 @@ impl ReadCtx {
             metrics: box_.metrics.clone(),
             pinned_segments: Mutex::new(BTreeSet::new()),
             session_cache: Mutex::new(HashMap::new()),
+            external_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -64,6 +68,13 @@ impl ReadCtx {
         tenant_internal_id: TenantId,
         session_external: &str,
     ) -> Result<Option<Session>> {
+        if let Some(&internal_id) = self
+            .external_cache
+            .lock()
+            .get(&(tenant_internal_id, session_external.to_string()))
+        {
+            return self.session_by_internal(sessions, tenant_internal_id, internal_id);
+        }
         let session = sessions.lookup_at(
             self.snapshot.as_ref(),
             self.box_id,
@@ -71,6 +82,9 @@ impl ReadCtx {
             session_external,
         )?;
         if let Some(ref s) = session {
+            self.external_cache
+                .lock()
+                .insert((tenant_internal_id, session_external.to_string()), s.internal_id);
             self.cache_and_pin(s.clone());
         }
         Ok(session)
@@ -100,6 +114,11 @@ impl ReadCtx {
     }
 
     fn cache_and_pin(&self, s: Session) {
+        debug_assert_eq!(s.box_id, self.box_id, "ReadCtx is bound to one box; session must match");
+        // Lock order (for future contributors): pinned_segments Mutex, THEN
+        // registry.counts Mutex. Never invert. `Drop` takes pinned_segments
+        // first and releases it (via mem::take) before calling registry.release,
+        // which keeps the order consistent there too.
         if s.tier == Tier::Cold {
             if let Some(path) = s.segment_path.as_deref() {
                 let mut pins = self.pinned_segments.lock();
@@ -205,5 +224,32 @@ mod tests {
         let b = ctx.session_by_internal(&sessions, tenant.internal_id, a.internal_id).unwrap().unwrap();
         assert_eq!(a.external_id, b.external_id);
         assert_eq!(a.next_seq, b.next_seq);
+    }
+
+    #[tokio::test]
+    async fn two_ctxs_pin_same_cold_segment_independently() {
+        let (_k, _o, kv, reg, tenants, sessions) = ctx_setup().await;
+        append_and_fetch(&reg, &tenants, &sessions, "t-1", "s-1",
+            json!({"x": 1}), 0, 100).await.unwrap();
+        let box_ = reg.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let mut session = sessions.lookup(box_.id, tenant.internal_id, "s-1").unwrap().unwrap();
+        {
+            let guard = box_.write_lock.lock().await;
+            crate::tiering::cold_transition(&kv, reg.object_store(), &sessions, &guard, &mut session)
+                .await.unwrap();
+        }
+
+        let ctx_a = ReadCtx::open(&box_, &kv).unwrap();
+        let ctx_b = ReadCtx::open(&box_, &kv).unwrap();
+        ctx_a.session(&sessions, tenant.internal_id, "s-1").unwrap();
+        ctx_b.session(&sessions, tenant.internal_id, "s-1").unwrap();
+        assert_eq!(box_.segment_pins.pinned_len(), 1, "same path, one distinct entry");
+
+        drop(ctx_a);
+        assert_eq!(box_.segment_pins.pinned_len(), 1, "ctx_b still holds pin");
+
+        drop(ctx_b);
+        assert_eq!(box_.segment_pins.pinned_len(), 0, "all dropped");
     }
 }
