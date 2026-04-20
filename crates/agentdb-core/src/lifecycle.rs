@@ -93,6 +93,9 @@ async fn sweep(
             match cold_transition(kv, store, sessions, &guard, &mut fresh).await {
                 Ok(()) => {
                     let _ = session; // unused stack-local; fresh reflects the new state
+                    box_.metrics.record_tier_transition();
+                    box_.metrics.drop_tier(Tier::Warm);
+                    box_.metrics.bump_tier(Tier::Cold);
                 }
                 Err(err) => {
                     tracing::warn!(
