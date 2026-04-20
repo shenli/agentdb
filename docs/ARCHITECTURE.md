@@ -79,9 +79,13 @@ session/{box_id}/{tenant_internal_id}/{external} -> Session
 session_by_internal/{box_id}/{tenant_internal_id}/{internal} -> external
 event/{box_id}/{tenant_internal}/{session_internal}/{branch}/{seq} -> Event
 segment/{box_id}/{tenant_internal}/{session_internal}/{branch} -> SegmentFile
-index_posting/{box_id}/{token}/...             -> posting lists
-index_vector/{box_id}/{session_internal}/{seq} -> embedding bytes
 ```
+
+Indexes are NOT stored in RocksDB. `PerBoxIndexes` is built lazily per
+box by walking all events (warm KV + cold segment files) on the first
+query and cached until server restart. New events appended after the
+build do not flow into the cached index — rebuilding incrementally is
+a known limitation carried forward from the prototype's lazy design.
 
 Keeping session events under `{tenant_internal}/{session_internal}`
 gives us O(1) session scans — the §4.1 "session clustering" property
