@@ -6,7 +6,7 @@ use object_store::ObjectStore;
 
 use crate::error::Result;
 use crate::indexes::PerBoxIndexes;
-use crate::primitives::{scan_session_events, DEFAULT_BRANCH_ID};
+use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::SessionRegistry;
 use crate::types::{Event, Tier};
 
@@ -94,7 +94,23 @@ impl<'a> HybridPlanner<'a> {
             };
 
         let all: Vec<Event> = match session.tier {
-            Tier::Warm => scan_session_events(self.kv, &session)?,
+            Tier::Warm => {
+                // Inlined pending T9 refactor to route through ReadCtx.
+                let prefix = agentdb_storage::prefix_for_session_branch(
+                    Namespace::Events,
+                    session.box_id,
+                    session.tenant_internal_id,
+                    session.internal_id,
+                    DEFAULT_BRANCH_ID,
+                );
+                let mut out: Vec<Event> = Vec::new();
+                for res in self.kv.scan_prefix(&prefix)? {
+                    let (_k, v) = res?;
+                    let ev: Event = serde_json::from_slice(&v)?;
+                    out.push(ev);
+                }
+                out
+            }
             Tier::Cold => {
                 let Some(path) = session.segment_path.as_deref() else {
                     return Ok(PlanOutput {

@@ -1,4 +1,4 @@
-use agentdb_core::{scan_session_events, BoxRegistry, Event, SessionRegistry, TenantRegistry};
+use agentdb_core::{BoxRegistry, Event, SessionRegistry, TenantRegistry};
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
@@ -37,7 +37,28 @@ pub fn find_response(
                     Some(s) => s,
                     None => continue,
                 };
-                for ev in scan_session_events(registry.kv(), &session)? {
+                // Inlined pending T13 refactor to route through ReadCtx.
+                let prefix = agentdb_storage::prefix_for_session_branch(
+                    agentdb_storage::Namespace::Events,
+                    session.box_id,
+                    session.tenant_internal_id,
+                    session.internal_id,
+                    agentdb_core::DEFAULT_BRANCH_ID,
+                );
+                let events_iter = registry
+                    .kv()
+                    .scan_prefix(&prefix)
+                    .map_err(agentdb_core::Error::from)?;
+                let events: Vec<Event> = {
+                    let mut out = Vec::new();
+                    for res in events_iter {
+                        let (_k, v) = res.map_err(agentdb_core::Error::from)?;
+                        let ev: Event = serde_json::from_slice(&v)?;
+                        out.push(ev);
+                    }
+                    out
+                };
+                for ev in events {
                     let row = project_event(&session.external_id, ev);
                     if filter.matches(&row) {
                         batch.push(row);

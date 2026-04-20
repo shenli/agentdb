@@ -6,7 +6,7 @@ use object_store::ObjectStore;
 use tokio::sync::MutexGuard;
 
 use crate::error::{Error, Result};
-use crate::primitives::{scan_session_events, DEFAULT_BRANCH_ID};
+use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::SessionRegistry;
 use crate::segment::{
     delete_segment, read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1,
@@ -38,7 +38,26 @@ pub async fn cold_transition(
             session.external_id, session.tier
         )));
     }
-    let events = scan_session_events(kv, session)?;
+    // Inlined pending T7 refactor to route through ReadCtx. cold_transition
+    // runs under the box's write_lock so there are no concurrent appends to
+    // this session's key space; reading directly from the live KV here is
+    // equivalent to reading from a snapshot opened at lock-acquire time.
+    let events: Vec<crate::types::Event> = {
+        let prefix = agentdb_storage::prefix_for_session_branch(
+            Namespace::Events,
+            session.box_id,
+            session.tenant_internal_id,
+            session.internal_id,
+            DEFAULT_BRANCH_ID,
+        );
+        let mut out = Vec::new();
+        for res in kv.scan_prefix(&prefix)? {
+            let (_k, v) = res?;
+            let ev: crate::types::Event = serde_json::from_slice(&v)?;
+            out.push(ev);
+        }
+        out
+    };
     let path = segment_path(
         session.box_id,
         session.tenant_internal_id,
@@ -227,7 +246,9 @@ mod tests {
         assert_eq!(session.tier, Tier::Cold);
         assert!(session.segment_path.is_some());
 
-        let warm = scan_session_events(ctx.registry.kv(), &session).unwrap();
+        let read_ctx =
+            crate::read_ctx::ReadCtx::open(&box_, ctx.registry.kv()).unwrap();
+        let warm = crate::primitives::scan_session_events(&read_ctx, &session).unwrap();
         assert!(warm.is_empty());
 
         let seg = read_segment(
@@ -295,7 +316,9 @@ mod tests {
         assert_eq!(session.tier, Tier::Warm);
         assert!(session.segment_path.is_none());
 
-        let warm = scan_session_events(ctx.registry.kv(), &session).unwrap();
+        let read_ctx =
+            crate::read_ctx::ReadCtx::open(&box_, ctx.registry.kv()).unwrap();
+        let warm = crate::primitives::scan_session_events(&read_ctx, &session).unwrap();
         assert_eq!(warm.len(), 1);
 
         assert!(read_segment(ctx.registry.object_store(), &path_before)

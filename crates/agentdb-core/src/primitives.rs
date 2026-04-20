@@ -63,7 +63,16 @@ pub fn append_event(
 /// Streams through the prefix scan with a bounded ring buffer so memory is
 /// O(n), not O(session size). Events arrive in ascending seq order because
 /// the key layout sorts by seq last.
-pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Result<Vec<Event>> {
+///
+/// Reads through the pinned snapshot held by `ctx`. Any writes committed
+/// after the ReadCtx opened are invisible. As a belt-and-suspenders guard
+/// we also drop events with `seq >= session.next_seq` in case a stale
+/// session record was passed in from outside the snapshot.
+pub fn fetch_last_n(
+    ctx: &crate::read_ctx::ReadCtx,
+    session: &Session,
+    n: usize,
+) -> Result<Vec<Event>> {
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -75,9 +84,12 @@ pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Resul
         DEFAULT_BRANCH_ID,
     );
     let mut ring: std::collections::VecDeque<Event> = std::collections::VecDeque::with_capacity(n);
-    for res in kv.scan_prefix(&prefix)? {
+    for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
         let ev: Event = serde_json::from_slice(&v)?;
+        if ev.seq >= session.next_seq {
+            continue;
+        }
         if ring.len() == n {
             ring.pop_front();
         }
@@ -87,9 +99,16 @@ pub fn fetch_last_n(kv: &Arc<dyn KvStore>, session: &Session, n: usize) -> Resul
 }
 
 /// Scan all events of a session in seq order (no bound). Used by wire-protocol
-/// `find`. Streams through RocksDB's prefix iterator; eager-collect because the
-/// caller typically applies a filter and limit.
-pub fn scan_session_events(kv: &Arc<dyn KvStore>, session: &Session) -> Result<Vec<Event>> {
+/// `find`. Streams through the pinned snapshot's prefix iterator; eager-collect
+/// because the caller typically applies a filter and limit.
+///
+/// The `seq < session.next_seq` guard protects against stale session records
+/// passed in from outside the snapshot. Under normal use the snapshot filters
+/// newer writes already.
+pub fn scan_session_events(
+    ctx: &crate::read_ctx::ReadCtx,
+    session: &Session,
+) -> Result<Vec<Event>> {
     let prefix = agentdb_storage::prefix_for_session_branch(
         Namespace::Events,
         session.box_id,
@@ -98,10 +117,15 @@ pub fn scan_session_events(kv: &Arc<dyn KvStore>, session: &Session) -> Result<V
         DEFAULT_BRANCH_ID,
     );
     let mut all: Vec<Event> = Vec::new();
-    for res in kv.scan_prefix(&prefix)? {
+    for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
         let ev: Event = serde_json::from_slice(&v)?;
-        all.push(ev);
+        // Belt-and-suspenders: guard against stale session records passed in
+        // from outside the snapshot. Under normal use the snapshot filters
+        // newer writes already.
+        if ev.seq < session.next_seq {
+            all.push(ev);
+        }
     }
     Ok(all)
 }
@@ -128,7 +152,30 @@ pub async fn fetch_last_n_merged(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let own = fetch_last_n(kv, session, n)?;
+    // Inlined pending T7 refactor to route through ReadCtx: we don't have a
+    // `&Box_` here, and constructing an ephemeral ReadCtx changes the ownership
+    // shape in a way T7 will correct (by taking &ReadCtx as a parameter). For
+    // now reproduce fetch_last_n's bounded-ring scan directly against `kv`.
+    let own: Vec<Event> = {
+        let prefix = agentdb_storage::prefix_for_session_branch(
+            Namespace::Events,
+            session.box_id,
+            session.tenant_internal_id,
+            session.internal_id,
+            DEFAULT_BRANCH_ID,
+        );
+        let mut ring: std::collections::VecDeque<Event> =
+            std::collections::VecDeque::with_capacity(n);
+        for res in kv.scan_prefix(&prefix)? {
+            let (_k, v) = res?;
+            let ev: Event = serde_json::from_slice(&v)?;
+            if ring.len() == n {
+                ring.pop_front();
+            }
+            ring.push_back(ev);
+        }
+        ring.into()
+    };
     let Some(fork) = session.forked_from.as_ref() else {
         return Ok(own);
     };
@@ -141,7 +188,23 @@ pub async fn fetch_last_n_merged(
         return Ok(own); // parent disappeared — degrade to child-only
     };
     let parent_events: Vec<Event> = match parent.tier {
-        crate::types::Tier::Warm => scan_session_events(kv, &parent)?,
+        crate::types::Tier::Warm => {
+            // Inlined pending T7 refactor.
+            let prefix = agentdb_storage::prefix_for_session_branch(
+                Namespace::Events,
+                parent.box_id,
+                parent.tenant_internal_id,
+                parent.internal_id,
+                DEFAULT_BRANCH_ID,
+            );
+            let mut out: Vec<Event> = Vec::new();
+            for res in kv.scan_prefix(&prefix)? {
+                let (_k, v) = res?;
+                let ev: Event = serde_json::from_slice(&v)?;
+                out.push(ev);
+            }
+            out
+        }
         crate::types::Tier::Cold => {
             if let Some(path) = parent.segment_path.as_deref() {
                 match crate::segment::read_segment(store, path).await {
@@ -361,6 +424,21 @@ mod tests {
         assert_eq!(ev.payload, json!({"hello": "world"}));
     }
 
+    // Minimal helper for low-level tests that only have a standalone `kv`
+    // and tenant/session registries: mints an ephemeral Box_ via a
+    // throwaway BoxRegistry so we can open a ReadCtx.
+    fn ephemeral_box_ctx(kv: &Arc<dyn KvStore>) -> (TempDir, crate::read_ctx::ReadCtx) {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
+        let obj_dir = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let reg = BoxRegistry::new(kv.clone(), store, 1).unwrap();
+        let box_ = reg.box_by_id(0).unwrap();
+        let ctx = crate::read_ctx::ReadCtx::open(&box_, kv).unwrap();
+        (obj_dir, ctx)
+    }
+
     #[tokio::test]
     async fn fetch_last_n_returns_tail_in_order() {
         let (_dir, kv, tenants, sessions) = setup();
@@ -382,7 +460,8 @@ mod tests {
         }
         let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
 
-        let last_3 = fetch_last_n(&kv, &session, 3).unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let last_3 = fetch_last_n(&ctx, &session, 3).unwrap();
         assert_eq!(last_3.len(), 3);
         assert_eq!(last_3[0].seq, 3);
         assert_eq!(last_3[1].seq, 4);
@@ -409,7 +488,8 @@ mod tests {
             .unwrap();
         }
         let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
-        let all = fetch_last_n(&kv, &session, 100).unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let all = fetch_last_n(&ctx, &session, 100).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].seq, 1);
         assert_eq!(all[1].seq, 2);
@@ -430,8 +510,69 @@ mod tests {
             segment_path: None,
             forked_from: None,
         };
-        let out = fetch_last_n(&kv, &session, 0).unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let out = fetch_last_n(&ctx, &session, 0).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_session_events_via_read_ctx_is_isolated_from_new_appends() {
+        use crate::read_ctx::ReadCtx;
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"i": 1}),
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let session_at_open = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+
+        let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
+
+        // Write more events after the ReadCtx opens.
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"i": 2}),
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"i": 3}),
+            0,
+            30,
+        )
+        .await
+        .unwrap();
+
+        let events = scan_session_events(&ctx, &session_at_open).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "snapshot should see only events visible at open"
+        );
+        assert_eq!(events[0].seq, 1);
     }
 
     #[tokio::test]
