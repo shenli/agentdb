@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
-    BoxRegistry, LifecycleConfig, LifecycleEngine, SessionRegistry, TenantRegistry,
+    BoxRegistry, LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig,
+    SessionRegistry, TenantRegistry,
 };
 use agentdb_storage::{KvStore, RocksKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
@@ -56,6 +57,20 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(60),
         ),
     };
+    let segment_gc_cfg = SegmentGcConfig {
+        tick: Duration::from_secs(
+            std::env::var("AGENTDB_SEGMENT_GC_TICK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+        ),
+        grace: Duration::from_secs(
+            std::env::var("AGENTDB_SEGMENT_GC_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        ),
+    };
 
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
     std::fs::create_dir_all(&objects_dir).context("create objects dir")?;
@@ -82,6 +97,21 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
     std::mem::forget(engines);
+
+    // M9: spawn one SegmentGc per box. Reporter hooks in Task 15.
+    let mut gcs: Vec<SegmentGc> = Vec::with_capacity(num_boxes as usize);
+    for i in 0..num_boxes {
+        let box_ = registry.box_by_id(i).expect("box id in range");
+        gcs.push(SegmentGc::start(
+            store.clone(),
+            tenants.clone(),
+            sessions.clone(),
+            box_,
+            segment_gc_cfg,
+            None, // reporter hooked up in Task 15
+        ));
+    }
+    std::mem::forget(gcs);
 
     let stream = StreamBus::default();
     let http_state = AppState {
