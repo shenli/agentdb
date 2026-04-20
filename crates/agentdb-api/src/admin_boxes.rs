@@ -22,6 +22,8 @@ pub struct BoxListItem {
 pub struct QuotaView {
     pub max_warm_sessions: Option<u64>,
     pub max_qps: Option<u64>,
+    pub max_tenant_qps: Option<u64>,
+    pub burst: Option<u64>,
 }
 
 pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxListItem>>, ApiError> {
@@ -46,6 +48,8 @@ pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxLis
             quota: QuotaView {
                 max_warm_sessions: q.max_warm_sessions,
                 max_qps: q.max_qps,
+                max_tenant_qps: q.max_tenant_qps,
+                burst: q.burst,
             },
             fault_active,
         });
@@ -77,6 +81,8 @@ pub async fn get_box(
         quota: QuotaView {
             max_warm_sessions: q.max_warm_sessions,
             max_qps: q.max_qps,
+            max_tenant_qps: q.max_tenant_qps,
+            burst: q.burst,
         },
         fault_active,
     }))
@@ -137,6 +143,10 @@ pub struct QuotaRequest {
     pub max_warm_sessions: Option<u64>,
     #[serde(default)]
     pub max_qps: Option<u64>,
+    #[serde(default)]
+    pub max_tenant_qps: Option<u64>,
+    #[serde(default)]
+    pub burst: Option<u64>,
 }
 
 pub async fn set_quota(
@@ -148,11 +158,19 @@ pub async fn set_quota(
         .registry
         .box_by_id(id)
         .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
-    let mut q = b.quota.write();
-    q.max_warm_sessions = body.max_warm_sessions;
-    q.max_qps = body.max_qps;
+    {
+        let mut q = b.quota.write();
+        q.max_warm_sessions = body.max_warm_sessions;
+        q.max_qps = body.max_qps;
+        q.max_tenant_qps = body.max_tenant_qps;
+        q.burst = body.burst;
+    }
+    b.rebuild_buckets();
+    let q = *b.quota.read();
     Ok(Json(QuotaView {
         max_warm_sessions: q.max_warm_sessions,
         max_qps: q.max_qps,
+        max_tenant_qps: q.max_tenant_qps,
+        burst: q.burst,
     }))
 }
