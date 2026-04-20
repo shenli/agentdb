@@ -2,3 +2,4 @@
 target/
 data/
 .worktrees/
+workload/agentdb-workload

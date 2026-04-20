@@ -1,0 +1,19 @@
+mongo_uri: mongodb://127.0.0.1:7879/?directConnection=true
+rest_base: http://127.0.0.1:7878
+control_addr: 127.0.0.1:9090
+
+personas:
+  - tenant_id: t-demo-a
+    ticket_rate_per_min: 6
+    concurrent_sessions_cap: 3
+    message_interval_ms: [500, 1500]
+    session_len: [3, 8]
+    escalation_prob: 0.3
+    memory_recall_prob: 0.2
+  - tenant_id: t-demo-b
+    ticket_rate_per_min: 3
+    concurrent_sessions_cap: 2
+    message_interval_ms: [1000, 3000]
+    session_len: [2, 5]
+    escalation_prob: 0.15
+    memory_recall_prob: 0.5
