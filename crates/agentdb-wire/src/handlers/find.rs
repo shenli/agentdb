@@ -1,4 +1,6 @@
-use agentdb_core::{scan_session_events, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry};
+use agentdb_core::{
+    scan_session_events, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry,
+};
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 

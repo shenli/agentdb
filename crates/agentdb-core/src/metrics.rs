@@ -16,10 +16,10 @@ pub struct BoxMetrics {
     pub quota_hits: AtomicU64,
     pub faults_injected: AtomicU64,
     // M9 additions:
-    pub open_snapshots: AtomicU64,                  // gauge
-    pub segments_pinned_by_snapshots: AtomicU64,    // gauge, sampled from pin registry
-    pub segment_gc_reclaimed: AtomicU64,            // counter
-    pub segment_gc_skipped_pinned: AtomicU64,       // counter
+    pub open_snapshots: AtomicU64,               // gauge
+    pub segments_pinned_by_snapshots: AtomicU64, // gauge, sampled from pin registry
+    pub segment_gc_reclaimed: AtomicU64,         // counter
+    pub segment_gc_skipped_pinned: AtomicU64,    // counter
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -73,13 +73,15 @@ impl BoxMetrics {
         }
     }
     pub fn set_segments_pinned(&self, n: u64) {
-        self.segments_pinned_by_snapshots.store(n, Ordering::Relaxed);
+        self.segments_pinned_by_snapshots
+            .store(n, Ordering::Relaxed);
     }
     pub fn record_segment_gc_reclaimed(&self) {
         self.segment_gc_reclaimed.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_segment_gc_skipped_pinned(&self) {
-        self.segment_gc_skipped_pinned.fetch_add(1, Ordering::Relaxed);
+        self.segment_gc_skipped_pinned
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn bump_tier(&self, tier: crate::types::Tier) {

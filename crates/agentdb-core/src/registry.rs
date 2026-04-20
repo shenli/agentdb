@@ -232,7 +232,8 @@ impl SessionRegistry {
         tenant_id: TenantId,
         external: &str,
     ) -> Result<Option<Session>> {
-        let Some(bytes) = snapshot.get(&key_session_by_external(box_id, tenant_id, external))? else {
+        let Some(bytes) = snapshot.get(&key_session_by_external(box_id, tenant_id, external))?
+        else {
             return Ok(None);
         };
         let internal_id: SessionId = serde_json::from_slice(&bytes)?;

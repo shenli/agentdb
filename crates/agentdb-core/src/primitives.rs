@@ -547,34 +547,82 @@ mod tests {
 
         // Parent: 3 events.
         for i in 1..=3u64 {
-            append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
-                json!({"i": i}), 0, i * 10).await.unwrap();
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-1",
+                "parent",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
         }
         let box_ = registry.route_tenant("t-1");
         let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
 
         // Fork child before snapshot.
-        let parent = sessions.lookup(box_.id, tenant.internal_id, "parent").unwrap().unwrap();
+        let parent = sessions
+            .lookup(box_.id, tenant.internal_id, "parent")
+            .unwrap()
+            .unwrap();
         let fork_ref = crate::types::ForkRef {
             parent_session_internal_id: parent.internal_id,
             parent_seq_at_fork: parent.next_seq,
         };
-        sessions.get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
+        sessions
+            .get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
             .unwrap();
-        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
-            json!({"c": 1}), 0, 100).await.unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "child",
+            json!({"c": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
 
         let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
 
         // After snapshot open: two more writes (parent + child) invisible to ctx.
-        append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
-            json!({"i": 99}), 0, 200).await.unwrap();
-        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
-            json!({"c": 2}), 0, 210).await.unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "parent",
+            json!({"i": 99}),
+            0,
+            200,
+        )
+        .await
+        .unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "child",
+            json!({"c": 2}),
+            0,
+            210,
+        )
+        .await
+        .unwrap();
 
-        let child_at_open = ctx.session(&sessions, tenant.internal_id, "child").unwrap().unwrap();
+        let child_at_open = ctx
+            .session(&sessions, tenant.internal_id, "child")
+            .unwrap()
+            .unwrap();
         let got = fetch_last_n_merged(&ctx, registry.object_store(), &sessions, &child_at_open, 10)
-            .await.unwrap();
+            .await
+            .unwrap();
         // Expect: 3 parent events (ts 10, 20, 30) + 1 child event (ts 100) = 4.
         // No post-snapshot writes: parent's seq 99 (ts 200) / child's seq 2 (ts 210).
         assert_eq!(got.len(), 4);
@@ -659,28 +707,66 @@ mod tests {
 
         let (_dir, _obj_dir, registry, tenants, sessions) = context();
         for i in 1..=3u64 {
-            append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
-                json!({"i": i}), 0, i * 10).await.unwrap();
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-1",
+                "parent",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
         }
         let box_ = registry.route_tenant("t-1");
         let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
-        let parent = sessions.lookup(box_.id, tenant.internal_id, "parent").unwrap().unwrap();
+        let parent = sessions
+            .lookup(box_.id, tenant.internal_id, "parent")
+            .unwrap()
+            .unwrap();
         let fork_ref = crate::types::ForkRef {
             parent_session_internal_id: parent.internal_id,
             parent_seq_at_fork: 4,
         };
-        sessions.get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
+        sessions
+            .get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
             .unwrap();
 
-        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
-            json!({"c": 1}), 0, 100).await.unwrap();
-        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
-            json!({"c": 2}), 0, 110).await.unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "child",
+            json!({"c": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "child",
+            json!({"c": 2}),
+            0,
+            110,
+        )
+        .await
+        .unwrap();
 
-        let child = sessions.lookup(box_.id, tenant.internal_id, "child").unwrap().unwrap();
+        let child = sessions
+            .lookup(box_.id, tenant.internal_id, "child")
+            .unwrap()
+            .unwrap();
         let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
         let got = fetch_last_n_merged(&ctx, registry.object_store(), &sessions, &child, 4)
-            .await.unwrap();
+            .await
+            .unwrap();
         let tss: Vec<u64> = got.iter().map(|e| e.ts).collect();
         assert_eq!(tss, vec![20, 30, 100, 110]);
     }

@@ -57,7 +57,9 @@ impl SegmentGc {
                 }
                 let after = box_.metrics.snapshot();
                 let reclaimed = after.segment_gc_reclaimed.saturating_sub(before_reclaimed);
-                let skipped = after.segment_gc_skipped_pinned.saturating_sub(before_skipped);
+                let skipped = after
+                    .segment_gc_skipped_pinned
+                    .saturating_sub(before_skipped);
                 if reclaimed > 0 {
                     if let Some(rep) = reporter.as_ref() {
                         rep(box_.id, reclaimed, skipped);
@@ -195,9 +197,15 @@ mod tests {
             .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            cold_transition(reg.kv(), reg.object_store(), &sessions, &guard, &mut session)
-                .await
-                .unwrap();
+            cold_transition(
+                reg.kv(),
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
         let path = session.segment_path.clone().unwrap();
 
@@ -241,9 +249,15 @@ mod tests {
             .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            cold_transition(reg.kv(), reg.object_store(), &sessions, &guard, &mut session)
-                .await
-                .unwrap();
+            cold_transition(
+                reg.kv(),
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
         // Open a ReadCtx that pins the segment.
         let ctx = ReadCtx::open(&box_, reg.kv()).unwrap();
@@ -305,9 +319,15 @@ mod tests {
             .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            cold_transition(reg.kv(), reg.object_store(), &sessions, &guard, &mut session)
-                .await
-                .unwrap();
+            cold_transition(
+                reg.kv(),
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
         // Reactivate, nobody pins the segment: orphan.
         {
@@ -363,9 +383,15 @@ mod tests {
             .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            cold_transition(reg.kv(), reg.object_store(), &sessions, &guard, &mut session)
-                .await
-                .unwrap();
+            cold_transition(
+                reg.kv(),
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
         {
             let guard = box_.write_lock.lock().await;

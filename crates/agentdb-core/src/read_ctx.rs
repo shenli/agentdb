@@ -82,9 +82,10 @@ impl ReadCtx {
             session_external,
         )?;
         if let Some(ref s) = session {
-            self.external_cache
-                .lock()
-                .insert((tenant_internal_id, session_external.to_string()), s.internal_id);
+            self.external_cache.lock().insert(
+                (tenant_internal_id, session_external.to_string()),
+                s.internal_id,
+            );
             self.cache_and_pin(s.clone());
         }
         Ok(session)
@@ -114,7 +115,10 @@ impl ReadCtx {
     }
 
     fn cache_and_pin(&self, s: Session) {
-        debug_assert_eq!(s.box_id, self.box_id, "ReadCtx is bound to one box; session must match");
+        debug_assert_eq!(
+            s.box_id, self.box_id,
+            "ReadCtx is bound to one box; session must match"
+        );
         // Lock order (for future contributors): pinned_segments Mutex, THEN
         // registry.counts Mutex. Never invert. `Drop` takes pinned_segments
         // first and releases it (via mem::take) before calling registry.release,
@@ -124,8 +128,7 @@ impl ReadCtx {
                 let mut pins = self.pinned_segments.lock();
                 if pins.insert(path.to_string()) {
                     self.registry.pin(path);
-                    self.metrics
-                        .set_segments_pinned(self.registry.pinned_len());
+                    self.metrics.set_segments_pinned(self.registry.pinned_len());
                 }
             }
         }
@@ -138,8 +141,7 @@ impl Drop for ReadCtx {
     fn drop(&mut self) {
         let pins = std::mem::take(&mut *self.pinned_segments.lock());
         self.registry.release(pins);
-        self.metrics
-            .set_segments_pinned(self.registry.pinned_len());
+        self.metrics.set_segments_pinned(self.registry.pinned_len());
         self.metrics.drop_open_snapshot();
     }
 }
@@ -192,15 +194,35 @@ mod tests {
     #[tokio::test]
     async fn session_lookup_pins_cold_segment() {
         let (_k, _o, kv, reg, tenants, sessions) = ctx_setup().await;
-        append_and_fetch(&reg, &tenants, &sessions, "t-1", "s-1",
-            json!({"x": 1}), 0, 100).await.unwrap();
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"x": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
         let box_ = reg.route_tenant("t-1");
         let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
-        let mut session = sessions.lookup(box_.id, tenant.internal_id, "s-1").unwrap().unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            crate::tiering::cold_transition(&kv, reg.object_store(), &sessions, &guard, &mut session)
-                .await.unwrap();
+            crate::tiering::cold_transition(
+                &kv,
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(session.tier, Tier::Cold);
 
@@ -215,13 +237,29 @@ mod tests {
     #[tokio::test]
     async fn session_cache_returns_same_value_on_second_call() {
         let (_k, _o, kv, reg, tenants, sessions) = ctx_setup().await;
-        append_and_fetch(&reg, &tenants, &sessions, "t-1", "s-1",
-            json!({"x": 1}), 0, 100).await.unwrap();
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"x": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
         let box_ = reg.route_tenant("t-1");
         let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
         let ctx = ReadCtx::open(&box_, &kv).unwrap();
-        let a = ctx.session(&sessions, tenant.internal_id, "s-1").unwrap().unwrap();
-        let b = ctx.session_by_internal(&sessions, tenant.internal_id, a.internal_id).unwrap().unwrap();
+        let a = ctx
+            .session(&sessions, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+        let b = ctx
+            .session_by_internal(&sessions, tenant.internal_id, a.internal_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(a.external_id, b.external_id);
         assert_eq!(a.next_seq, b.next_seq);
     }
@@ -229,22 +267,46 @@ mod tests {
     #[tokio::test]
     async fn two_ctxs_pin_same_cold_segment_independently() {
         let (_k, _o, kv, reg, tenants, sessions) = ctx_setup().await;
-        append_and_fetch(&reg, &tenants, &sessions, "t-1", "s-1",
-            json!({"x": 1}), 0, 100).await.unwrap();
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"x": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
         let box_ = reg.route_tenant("t-1");
         let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
-        let mut session = sessions.lookup(box_.id, tenant.internal_id, "s-1").unwrap().unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
         {
             let guard = box_.write_lock.lock().await;
-            crate::tiering::cold_transition(&kv, reg.object_store(), &sessions, &guard, &mut session)
-                .await.unwrap();
+            crate::tiering::cold_transition(
+                &kv,
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
         }
 
         let ctx_a = ReadCtx::open(&box_, &kv).unwrap();
         let ctx_b = ReadCtx::open(&box_, &kv).unwrap();
         ctx_a.session(&sessions, tenant.internal_id, "s-1").unwrap();
         ctx_b.session(&sessions, tenant.internal_id, "s-1").unwrap();
-        assert_eq!(box_.segment_pins.pinned_len(), 1, "same path, one distinct entry");
+        assert_eq!(
+            box_.segment_pins.pinned_len(),
+            1,
+            "same path, one distinct entry"
+        );
 
         drop(ctx_a);
         assert_eq!(box_.segment_pins.pinned_len(), 1, "ctx_b still holds pin");
