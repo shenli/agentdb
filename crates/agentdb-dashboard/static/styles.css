@@ -10,6 +10,7 @@ main { padding: 20px; }
 .box-tile.fault { background: #5a0d0d; border-color: #f38ba8; }
 .box-tile header { padding: 0; border: none; margin-bottom: 8px; font-size: 0.85rem; color: #89b4fa; }
 .counts { font-size: 0.8rem; margin-bottom: 8px; color: #a6adc8; }
+.counts.snapshots { margin-top: 8px; margin-bottom: 0; color: #cba6f7; }
 .warm { color: #a6e3a1; }
 .cold { color: #89dceb; }
 .dots { display: flex; flex-wrap: wrap; gap: 3px; }

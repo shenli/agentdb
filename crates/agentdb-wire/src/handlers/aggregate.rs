@@ -112,8 +112,12 @@ pub async fn aggregate_response(
         true
     });
 
+    // Open a single ReadCtx for the aggregate: the planner scans warm events
+    // through this snapshot and pins any cold segments it touches for the
+    // duration of the call.
+    let ctx = agentdb_core::ReadCtx::open(&box_, registry.kv())?;
     let planner = HybridPlanner {
-        kv: registry.kv(),
+        ctx: &ctx,
         store: registry.object_store(),
         indexes,
         sessions,

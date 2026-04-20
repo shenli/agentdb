@@ -6,7 +6,7 @@ use object_store::ObjectStore;
 use tokio::sync::MutexGuard;
 
 use crate::error::{Error, Result};
-use crate::primitives::{scan_session_events, DEFAULT_BRANCH_ID};
+use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::SessionRegistry;
 use crate::segment::{
     delete_segment, read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1,
@@ -38,7 +38,27 @@ pub async fn cold_transition(
             session.external_id, session.tier
         )));
     }
-    let events = scan_session_events(kv, session)?;
+    // `cold_transition` runs under the box `write_lock`, so a live-KV
+    // prefix scan here is equivalent to a snapshot taken at lock-acquire
+    // time — no concurrent writer can mutate this session's event range.
+    // Not routed through a ReadCtx because this is a writer path, not a
+    // reader, and the caller doesn't have one to hand down.
+    let events: Vec<crate::types::Event> = {
+        let prefix = agentdb_storage::prefix_for_session_branch(
+            Namespace::Events,
+            session.box_id,
+            session.tenant_internal_id,
+            session.internal_id,
+            DEFAULT_BRANCH_ID,
+        );
+        let mut out = Vec::new();
+        for res in kv.scan_prefix(&prefix)? {
+            let (_k, v) = res?;
+            let ev: crate::types::Event = serde_json::from_slice(&v)?;
+            out.push(ev);
+        }
+        out
+    };
     let path = segment_path(
         session.box_id,
         session.tenant_internal_id,
@@ -142,10 +162,9 @@ pub async fn reactivate(
     });
     kv.write_batch(ops)?;
     let _ = sessions; // signature retained for future archive transitions
-
-    if let Err(err) = delete_segment(store, &path).await {
-        tracing::warn!(?err, %path, "orphan segment delete failed (best-effort)");
-    }
+                      // M9: segment deletion deferred to SegmentGc. reactivate must not
+                      // delete inline because any open ReadCtx that captured this session
+                      // as Cold still needs to read from the segment path it saw.
     Ok(())
 }
 
@@ -227,7 +246,8 @@ mod tests {
         assert_eq!(session.tier, Tier::Cold);
         assert!(session.segment_path.is_some());
 
-        let warm = scan_session_events(ctx.registry.kv(), &session).unwrap();
+        let read_ctx = crate::read_ctx::ReadCtx::open(&box_, ctx.registry.kv()).unwrap();
+        let warm = crate::primitives::scan_session_events(&read_ctx, &session).unwrap();
         assert!(warm.is_empty());
 
         let seg = read_segment(
@@ -262,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactivate_restores_warm_events_and_deletes_segment() {
+    async fn reactivate_restores_warm_events_and_keeps_segment_for_gc() {
         let (ctx, mut session) = seed("round trip", "s-2").await;
         let box_ = ctx.registry.route_tenant("t-1");
         {
@@ -295,12 +315,52 @@ mod tests {
         assert_eq!(session.tier, Tier::Warm);
         assert!(session.segment_path.is_none());
 
-        let warm = scan_session_events(ctx.registry.kv(), &session).unwrap();
+        let read_ctx = crate::read_ctx::ReadCtx::open(&box_, ctx.registry.kv()).unwrap();
+        let warm = crate::primitives::scan_session_events(&read_ctx, &session).unwrap();
         assert_eq!(warm.len(), 1);
 
+        // After M9, reactivate no longer deletes the segment; GC handles it.
         assert!(read_segment(ctx.registry.object_store(), &path_before)
             .await
-            .is_err());
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn reactivate_leaves_segment_on_disk_for_gc() {
+        let (ctx, mut session) = seed("round trip", "s-2").await;
+        let box_ = ctx.registry.route_tenant("t-1");
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_transition(
+                ctx.registry.kv(),
+                ctx.registry.object_store(),
+                &ctx.sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        let path = session.segment_path.clone().unwrap();
+        {
+            let guard = box_.write_lock.lock().await;
+            reactivate(
+                ctx.registry.kv(),
+                ctx.registry.object_store(),
+                &ctx.sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        // After M9 change: segment is still on disk; GC will reap it later.
+        assert!(
+            read_segment(ctx.registry.object_store(), &path)
+                .await
+                .is_ok(),
+            "segment should still exist after reactivate"
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,11 @@ pub struct BoxMetrics {
     pub tier_transitions: AtomicU64,
     pub quota_hits: AtomicU64,
     pub faults_injected: AtomicU64,
+    // M9 additions:
+    pub open_snapshots: AtomicU64,               // gauge
+    pub segments_pinned_by_snapshots: AtomicU64, // gauge, sampled from pin registry
+    pub segment_gc_reclaimed: AtomicU64,         // counter
+    pub segment_gc_skipped_pinned: AtomicU64,    // counter
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -55,6 +60,34 @@ impl BoxMetrics {
         self.faults_injected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn bump_open_snapshots(&self) {
+        self.open_snapshots.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn drop_open_snapshot(&self) {
+        // Saturating: never decrement below zero. `fetch_update` loops on
+        // CAS failure so concurrent drops can't silently lose decrements.
+        let _ = self
+            .open_snapshots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v == 0 {
+                    None // stop: nothing to decrement
+                } else {
+                    Some(v - 1)
+                }
+            });
+    }
+    pub fn set_segments_pinned(&self, n: u64) {
+        self.segments_pinned_by_snapshots
+            .store(n, Ordering::Relaxed);
+    }
+    pub fn record_segment_gc_reclaimed(&self) {
+        self.segment_gc_reclaimed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_segment_gc_skipped_pinned(&self) {
+        self.segment_gc_skipped_pinned
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn bump_tier(&self, tier: crate::types::Tier) {
         let mut g = self.gauges.write();
         match tier {
@@ -84,6 +117,10 @@ impl BoxMetrics {
             tier_transitions: self.tier_transitions.load(Ordering::Relaxed),
             quota_hits: self.quota_hits.load(Ordering::Relaxed),
             faults_injected: self.faults_injected.load(Ordering::Relaxed),
+            open_snapshots: self.open_snapshots.load(Ordering::Relaxed),
+            segments_pinned_by_snapshots: self.segments_pinned_by_snapshots.load(Ordering::Relaxed),
+            segment_gc_reclaimed: self.segment_gc_reclaimed.load(Ordering::Relaxed),
+            segment_gc_skipped_pinned: self.segment_gc_skipped_pinned.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -99,6 +136,10 @@ pub struct MetricsSnapshot {
     pub tier_transitions: u64,
     pub quota_hits: u64,
     pub faults_injected: u64,
+    pub open_snapshots: u64,
+    pub segments_pinned_by_snapshots: u64,
+    pub segment_gc_reclaimed: u64,
+    pub segment_gc_skipped_pinned: u64,
     pub gauges: GaugeSnapshot,
 }
 
@@ -136,5 +177,69 @@ mod tests {
         let m = BoxMetrics::new();
         m.drop_tier(Tier::Warm);
         assert_eq!(m.snapshot().gauges.warm_sessions, 0);
+    }
+
+    #[test]
+    fn open_snapshots_gauge_bump_and_drop() {
+        let m = BoxMetrics::new();
+        m.bump_open_snapshots();
+        m.bump_open_snapshots();
+        m.drop_open_snapshot();
+        let s = m.snapshot();
+        assert_eq!(s.open_snapshots, 1);
+    }
+
+    #[test]
+    fn open_snapshots_saturates_at_zero() {
+        let m = BoxMetrics::new();
+        m.drop_open_snapshot();
+        assert_eq!(m.snapshot().open_snapshots, 0);
+    }
+
+    #[test]
+    fn segment_gc_counters_increment() {
+        let m = BoxMetrics::new();
+        m.record_segment_gc_reclaimed();
+        m.record_segment_gc_reclaimed();
+        m.record_segment_gc_skipped_pinned();
+        let s = m.snapshot();
+        assert_eq!(s.segment_gc_reclaimed, 2);
+        assert_eq!(s.segment_gc_skipped_pinned, 1);
+    }
+
+    #[test]
+    fn segments_pinned_snapshot_reads_back_whatever_was_set() {
+        let m = BoxMetrics::new();
+        m.set_segments_pinned(3);
+        assert_eq!(m.snapshot().segments_pinned_by_snapshots, 3);
+        m.set_segments_pinned(0);
+        assert_eq!(m.snapshot().segments_pinned_by_snapshots, 0);
+    }
+
+    #[test]
+    fn drop_open_snapshot_is_race_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let m = Arc::new(BoxMetrics::new());
+        // Bump 1000 times on the main thread.
+        for _ in 0..1000 {
+            m.bump_open_snapshots();
+        }
+        // Drop concurrently from 8 threads.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = m.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..125 {
+                    m.drop_open_snapshot();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 1000 bumps, 8 * 125 = 1000 drops — gauge must land exactly at 0.
+        assert_eq!(m.snapshot().open_snapshots, 0);
     }
 }

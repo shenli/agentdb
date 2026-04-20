@@ -33,6 +33,8 @@ dependencies = [
  "agentdb-storage",
  "anyhow",
  "bson",
+ "criterion",
+ "futures-util",
  "object_store",
  "parking_lot",
  "serde",
@@ -88,6 +90,7 @@ dependencies = [
  "rocksdb",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

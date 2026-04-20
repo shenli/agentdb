@@ -224,6 +224,37 @@ impl SessionRegistry {
         Ok(Some(s))
     }
 
+    /// Same as `lookup` but reads via `snapshot` instead of the live KV.
+    pub fn lookup_at(
+        &self,
+        snapshot: &dyn agentdb_storage::KvSnapshot,
+        box_id: BoxId,
+        tenant_id: TenantId,
+        external: &str,
+    ) -> Result<Option<Session>> {
+        let Some(bytes) = snapshot.get(&key_session_by_external(box_id, tenant_id, external))?
+        else {
+            return Ok(None);
+        };
+        let internal_id: SessionId = serde_json::from_slice(&bytes)?;
+        self.lookup_by_internal_at(snapshot, box_id, tenant_id, internal_id)
+    }
+
+    /// Same as `lookup_by_internal` but reads via `snapshot`.
+    pub fn lookup_by_internal_at(
+        &self,
+        snapshot: &dyn agentdb_storage::KvSnapshot,
+        box_id: BoxId,
+        tenant_id: TenantId,
+        internal_id: SessionId,
+    ) -> Result<Option<Session>> {
+        let key = key_session_record(box_id, tenant_id, internal_id);
+        let Some(bytes) = snapshot.get(&key)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
     /// Overwrite the persisted session record. Does NOT rewrite the lookup
     /// entry — that mapping is immutable once created.
     pub fn save(&self, session: &Session) -> Result<()> {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::error::Result;
 
 /// A single operation in a write batch.
@@ -38,4 +40,11 @@ pub trait KvStore: Send + Sync {
     /// resolve the snapshot into owned data (e.g. collect a `scan_prefix`
     /// into a `Vec`) before yielding.
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>>;
+
+    /// Like `snapshot`, but the returned handle owns its DB reference and
+    /// is therefore `'static`, so it is safe to hold across an `.await`
+    /// point. Intended for `ReadCtx` and other cross-await readers.
+    ///
+    /// Takes `Arc<Self>` to ensure the store outlives the snapshot.
+    fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>>;
 }

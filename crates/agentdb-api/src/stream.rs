@@ -40,6 +40,12 @@ pub enum StreamEvent {
         kind: String,
         duration_s: u64,
     },
+    SegmentGcRun {
+        ts_ms: u64,
+        box_id: u16,
+        reclaimed: u64,
+        skipped_pinned: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +56,8 @@ pub struct TickBox {
     pub appends: u64,
     pub forks: u64,
     pub fault_active: bool,
+    pub open_snapshots: u64,
+    pub segments_pinned_by_snapshots: u64,
 }
 
 pub fn now_ms() -> u64 {

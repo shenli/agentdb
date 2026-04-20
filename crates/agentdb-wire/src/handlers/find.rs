@@ -1,4 +1,6 @@
-use agentdb_core::{scan_session_events, BoxRegistry, Event, SessionRegistry, TenantRegistry};
+use agentdb_core::{
+    scan_session_events, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry,
+};
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
@@ -15,12 +17,14 @@ pub fn find_response(
     filter_doc: &Document,
     limit: Option<i64>,
 ) -> WireResult<Document> {
-    registry.route_tenant(db).metrics.record_query_find();
+    let box_ = registry.route_tenant(db);
+    box_.metrics.record_query_find();
     let filter = Filter::parse(filter_doc)?;
-    let tenant = match tenants.lookup(routing_box(registry, db), db)? {
+    let tenant = match tenants.lookup(box_.id, db)? {
         Some(t) => t,
         None => return Ok(empty_batch(db, collection)),
     };
+    let ctx = ReadCtx::open(&box_, registry.kv())?;
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;
 
@@ -33,11 +37,10 @@ pub fn find_response(
                 _ => session_externals,
             };
             for s_ext in scoped {
-                let session = match sessions.lookup(tenant.box_id, tenant.internal_id, &s_ext)? {
-                    Some(s) => s,
-                    None => continue,
+                let Some(session) = ctx.session(sessions, tenant.internal_id, &s_ext)? else {
+                    continue;
                 };
-                for ev in scan_session_events(registry.kv(), &session)? {
+                for ev in scan_session_events(&ctx, &session)? {
                     let row = project_event(&session.external_id, ev);
                     if filter.matches(&row) {
                         batch.push(row);
@@ -54,9 +57,8 @@ pub fn find_response(
         "sessions" => {
             let session_externals = sessions.list_in_tenant(tenant.box_id, tenant.internal_id)?;
             for s_ext in session_externals {
-                let session = match sessions.lookup(tenant.box_id, tenant.internal_id, &s_ext)? {
-                    Some(s) => s,
-                    None => continue,
+                let Some(session) = ctx.session(sessions, tenant.internal_id, &s_ext)? else {
+                    continue;
                 };
                 let row = serde_json::to_value(&session)?;
                 if filter.matches(&row) {
@@ -103,10 +105,6 @@ fn project_event(session_id: &str, ev: Event) -> Value {
         "ts": ev.ts,
         "payload": ev.payload,
     })
-}
-
-fn routing_box(registry: &BoxRegistry, tenant_external: &str) -> u16 {
-    registry.route_tenant(tenant_external).id
 }
 
 #[cfg(test)]

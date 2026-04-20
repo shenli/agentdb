@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use agentdb_index::DocId;
-use agentdb_storage::{encode_key, BoxId, KvStore, Namespace};
+use agentdb_storage::{encode_key, BoxId, Namespace};
 use object_store::ObjectStore;
 
 use crate::error::Result;
 use crate::indexes::PerBoxIndexes;
-use crate::primitives::{scan_session_events, DEFAULT_BRANCH_ID};
+use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::SessionRegistry;
 use crate::types::{Event, Tier};
 
@@ -50,7 +50,7 @@ const DEFAULT_OVER_FETCH: usize = 3;
 pub type FilterFn = Box<dyn Fn(&str, &Event) -> bool + Send + Sync>;
 
 pub struct HybridPlanner<'a> {
-    pub kv: &'a Arc<dyn KvStore>,
+    pub ctx: &'a crate::read_ctx::ReadCtx,
     pub store: &'a Arc<dyn ObjectStore>,
     pub indexes: &'a PerBoxIndexes,
     pub sessions: &'a SessionRegistry,
@@ -79,22 +79,21 @@ impl<'a> HybridPlanner<'a> {
         filter: FilterFn,
         session_ext: &str,
     ) -> Result<PlanOutput> {
-        let session =
-            match self
-                .sessions
-                .lookup(self.box_id, self.tenant_internal_id, session_ext)?
-            {
-                Some(s) => s,
-                None => {
-                    return Ok(PlanOutput {
-                        strategy: Strategy::LocalityBound,
-                        hits: Vec::new(),
-                    });
-                }
-            };
+        let session = match self
+            .ctx
+            .session(self.sessions, self.tenant_internal_id, session_ext)?
+        {
+            Some(s) => s,
+            None => {
+                return Ok(PlanOutput {
+                    strategy: Strategy::LocalityBound,
+                    hits: Vec::new(),
+                });
+            }
+        };
 
         let all: Vec<Event> = match session.tier {
-            Tier::Warm => scan_session_events(self.kv, &session)?,
+            Tier::Warm => crate::primitives::scan_session_events(self.ctx, &session)?,
             Tier::Cold => {
                 let Some(path) = session.segment_path.as_deref() else {
                     return Ok(PlanOutput {
@@ -104,6 +103,9 @@ impl<'a> HybridPlanner<'a> {
                 };
                 let seg = crate::segment::read_segment(self.store, path).await?;
                 seg.events
+                    .into_iter()
+                    .filter(|e| e.seq < session.next_seq)
+                    .collect()
             }
             Tier::Archive => Vec::new(),
         };
@@ -168,15 +170,19 @@ impl<'a> HybridPlanner<'a> {
         };
         let mut hits: Vec<Hit> = Vec::new();
         for (doc_id, score) in candidates {
-            let Some(event) = self.resolve(doc_id).await? else {
-                continue;
-            };
-            let Some(session) = self.sessions.lookup_by_internal(
-                self.box_id,
+            let Some(session) = self.ctx.session_by_internal(
+                self.sessions,
                 self.tenant_internal_id,
                 doc_id.session_internal_id,
             )?
             else {
+                continue;
+            };
+            // M9 visibility filter: drop candidates past the snapshot's next_seq.
+            if doc_id.seq >= session.next_seq {
+                continue;
+            }
+            let Some(event) = self.resolve(doc_id, &session).await? else {
                 continue;
             };
             if !filter(&session.external_id, &event) {
@@ -198,7 +204,11 @@ impl<'a> HybridPlanner<'a> {
         })
     }
 
-    async fn resolve(&self, doc_id: DocId) -> Result<Option<Event>> {
+    async fn resolve(
+        &self,
+        doc_id: DocId,
+        session: &crate::types::Session,
+    ) -> Result<Option<Event>> {
         let key = encode_key(
             Namespace::Events,
             self.box_id,
@@ -207,18 +217,10 @@ impl<'a> HybridPlanner<'a> {
             DEFAULT_BRANCH_ID,
             doc_id.seq,
         );
-        if let Some(bytes) = self.kv.get(&key)? {
+        if let Some(bytes) = self.ctx.get(&key)? {
             return Ok(Some(serde_json::from_slice(&bytes)?));
         }
         // Warm miss — if the session is cold, read from its segment.
-        let session = match self.sessions.lookup_by_internal(
-            self.box_id,
-            self.tenant_internal_id,
-            doc_id.session_internal_id,
-        )? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
         let Some(path) = session.segment_path.as_deref() else {
             return Ok(None);
         };
@@ -229,7 +231,10 @@ impl<'a> HybridPlanner<'a> {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        Ok(seg.events.into_iter().find(|e| e.seq == doc_id.seq))
+        Ok(seg
+            .events
+            .into_iter()
+            .find(|e| e.seq == doc_id.seq && e.seq < session.next_seq))
     }
 }
 
@@ -306,9 +311,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::primitives::append_and_fetch;
+    use crate::read_ctx::ReadCtx;
     use crate::registry::{SessionRegistry, TenantRegistry};
     use crate::BoxRegistry;
-    use agentdb_storage::RocksKvStore;
+    use agentdb_storage::{KvStore, RocksKvStore};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -356,8 +362,10 @@ mod tests {
 
         // Indexes empty (not built) but locality-bound shouldn't need them.
         let indexes = PerBoxIndexes::new();
+        let box_ = reg.route_tenant("t-1");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
         let p = HybridPlanner {
-            kv: &kv,
+            ctx: &ctx,
             store: &store,
             indexes: &indexes,
             sessions: &sessions,
@@ -405,8 +413,10 @@ mod tests {
             .build(&kv, &store, &tenants, &sessions, tenant.box_id)
             .await
             .unwrap();
+        let box_ = reg.route_tenant("t-1");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
         let p = HybridPlanner {
-            kv: &kv,
+            ctx: &ctx,
             store: &store,
             indexes: &indexes,
             sessions: &sessions,
@@ -452,8 +462,10 @@ mod tests {
             .build(&kv, &store, &tenants, &sessions, tenant.box_id)
             .await
             .unwrap();
+        let box_ = reg.route_tenant("t-1");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
         let p = HybridPlanner {
-            kv: &kv,
+            ctx: &ctx,
             store: &store,
             indexes: &indexes,
             sessions: &sessions,
@@ -515,8 +527,9 @@ mod tests {
             .await
             .unwrap();
 
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
         let p = HybridPlanner {
-            kv: &kv,
+            ctx: &ctx,
             store: &store,
             indexes: &indexes,
             sessions: &sessions,
@@ -538,5 +551,82 @@ mod tests {
             .unwrap();
         assert_eq!(out.hits.len(), 1);
         assert!(out.hits[0].score > 0.99);
+    }
+
+    #[tokio::test]
+    async fn planner_filters_out_candidates_beyond_snapshot_next_seq() {
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
+        for i in 1..=5u64 {
+            append_and_fetch(
+                &reg,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"text": format!("alpha {i}")}),
+                0,
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let tenant = tenants
+            .get_or_mint(reg.route_tenant("t-1").id, "t-1", 0)
+            .unwrap();
+        let mut indexes = PerBoxIndexes::new();
+        indexes
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
+            .await
+            .unwrap();
+
+        let box_ = reg.route_tenant("t-1");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+        // Post-snapshot append must NOT appear in planner results.
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"text": "alpha 6"}),
+            0,
+            6,
+        )
+        .await
+        .unwrap();
+        // Rebuild to simulate index seeing the newer event (planner visibility
+        // is the guard, not the index).
+        let mut indexes2 = PerBoxIndexes::new();
+        indexes2
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
+            .await
+            .unwrap();
+
+        let p = HybridPlanner {
+            ctx: &ctx,
+            store: &store,
+            indexes: &indexes2,
+            sessions: &sessions,
+            box_id: tenant.box_id,
+            tenant_internal_id: tenant.internal_id,
+        };
+        let out = p
+            .plan(
+                &Source::Text {
+                    path: "payload.text".into(),
+                    query: "alpha".into(),
+                    limit: 10,
+                },
+                Box::new(|_, _| true),
+                None,
+            )
+            .await
+            .unwrap();
+        // Original 5 events visible; the 6th is post-snapshot and filtered out.
+        assert_eq!(
+            out.hits.len(),
+            5,
+            "visibility filter must drop post-snapshot candidates"
+        );
     }
 }

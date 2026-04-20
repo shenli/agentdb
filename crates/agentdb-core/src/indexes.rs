@@ -3,11 +3,11 @@ use std::sync::Arc;
 use agentdb_index::text::{InMemoryInverted, TextIndex};
 use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_index::DocId;
-use agentdb_storage::{BoxId, KvStore};
+use agentdb_storage::{BoxId, KvStore, Namespace};
 use object_store::ObjectStore;
 
 use crate::error::Result;
-use crate::primitives::scan_session_events;
+use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::{SessionRegistry, TenantRegistry};
 use crate::segment::read_segment;
 use crate::types::{Event, Tier};
@@ -56,7 +56,27 @@ impl PerBoxIndexes {
                     continue;
                 };
                 let events: Vec<Event> = match session.tier {
-                    Tier::Warm => scan_session_events(kv, &session)?,
+                    Tier::Warm => {
+                        // `PerBoxIndexes::build` runs at lazy-init time under the box's
+                        // `indexes` write lock. It reads every event once to populate the
+                        // index and is not itself a per-request read path; routing it
+                        // through a ReadCtx would be meaningless because there's no snapshot
+                        // to anchor to — the build sees whatever KV state it finds.
+                        let prefix = agentdb_storage::prefix_for_session_branch(
+                            Namespace::Events,
+                            session.box_id,
+                            session.tenant_internal_id,
+                            session.internal_id,
+                            DEFAULT_BRANCH_ID,
+                        );
+                        let mut out: Vec<Event> = Vec::new();
+                        for res in kv.scan_prefix(&prefix)? {
+                            let (_k, v) = res?;
+                            let ev: Event = serde_json::from_slice(&v)?;
+                            out.push(ev);
+                        }
+                        out
+                    }
                     Tier::Cold => {
                         if let Some(path) = &session.segment_path {
                             match read_segment(store, path).await {
