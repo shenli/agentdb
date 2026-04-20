@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agentdb_index::text::{InMemoryInverted, TextIndex};
-use agentdb_index::vector::{InMemoryFlatVec, VectorIndex};
+use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_index::DocId;
 use agentdb_storage::{BoxId, KvStore};
 use object_store::ObjectStore;
@@ -15,7 +15,7 @@ use crate::types::{Event, Tier};
 /// Per-box index state: one text index + one vector index, both in-memory.
 pub struct PerBoxIndexes {
     pub text: InMemoryInverted,
-    pub vector: InMemoryFlatVec,
+    pub vector: HnswVectorIndex,
     /// Number of events indexed (for diagnostics).
     pub indexed: u64,
 }
@@ -30,7 +30,7 @@ impl PerBoxIndexes {
     pub fn new() -> Self {
         Self {
             text: InMemoryInverted::new(),
-            vector: InMemoryFlatVec::new(),
+            vector: HnswVectorIndex::from_env(),
             indexed: 0,
         }
     }
