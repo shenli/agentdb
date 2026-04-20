@@ -31,6 +31,16 @@ impl SlateKvStore {
             .as_ref()
             .expect("runtime present while SlateKvStore is alive")
     }
+
+    /// Clone of the owned runtime `Arc` — used when constructing a
+    /// `SlateSnapshot`, which needs its own owned handle so it can outlive
+    /// any particular borrow of `self`.
+    fn runtime_arc(&self) -> Arc<Runtime> {
+        self.runtime
+            .as_ref()
+            .expect("runtime present while SlateKvStore is alive")
+            .clone()
+    }
 }
 
 impl SlateKvStore {
@@ -192,11 +202,81 @@ impl KvStore for SlateKvStore {
     }
 
     fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
-        Err(Error::Other("snapshot: implemented in Task 7".into()))
+        let db = self.inner.clone();
+        let snap = self
+            .bridge(async move { db.snapshot().await })
+            .map_err(|e| Error::Other(format!("slatedb snapshot: {e}")))?;
+        Ok(Box::new(SlateSnapshot {
+            snap,
+            runtime: self.runtime_arc(),
+        }))
     }
 
     fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>> {
-        Err(Error::Other("snapshot_owned: implemented in Task 7".into()))
+        let db = self.inner.clone();
+        let snap = self
+            .bridge(async move { db.snapshot().await })
+            .map_err(|e| Error::Other(format!("slatedb snapshot_owned: {e}")))?;
+        Ok(Arc::new(SlateSnapshot {
+            snap,
+            runtime: self.runtime_arc(),
+        }))
+    }
+}
+
+/// `KvSnapshot` backed by a SlateDB `Arc<DbSnapshot>`. Since `DbSnapshot`
+/// itself is already an Arc-shaped owned handle from SlateDB, one type
+/// serves both `KvStore::snapshot` and `KvStore::snapshot_owned` — we
+/// don't need separate borrowed / owned variants.
+struct SlateSnapshot {
+    snap: Arc<slatedb::DbSnapshot>,
+    runtime: Arc<Runtime>,
+}
+
+impl SlateSnapshot {
+    /// Mirror of `SlateKvStore::bridge` — spawns a future on the owned
+    /// runtime and blocks the caller via an std channel. See
+    /// `SlateKvStore::bridge` for the rationale (avoids the
+    /// `Runtime::block_on` panic when called from inside another tokio
+    /// runtime, e.g. a `#[tokio::test]` function).
+    fn bridge<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        self.runtime.handle().spawn(async move {
+            let out = fut.await;
+            let _ = tx.send(out);
+        });
+        rx.recv()
+            .expect("slatedb snapshot bridge task dropped before sending")
+    }
+}
+
+impl KvSnapshot for SlateSnapshot {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let snap = self.snap.clone();
+        let key = key.to_vec();
+        self.bridge(async move { snap.get(&key).await })
+            .map_err(|e| Error::Other(format!("slatedb snapshot get: {e}")))
+            .map(|opt| opt.map(|bytes| bytes.to_vec()))
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let snap = self.snap.clone();
+        let prefix = prefix.to_vec();
+        let collected = self
+            .bridge(async move {
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut it = snap.scan_prefix(&prefix[..]).await?;
+                while let Some(kv) = it.next().await? {
+                    out.push((kv.key.to_vec(), kv.value.to_vec()));
+                }
+                Ok::<_, slatedb::Error>(out)
+            })
+            .map_err(|e| Error::Other(format!("slatedb snapshot scan_prefix: {e}")))?;
+        Ok(Box::new(collected.into_iter().map(Ok)))
     }
 }
 
@@ -292,5 +372,55 @@ mod tests {
     async fn empty_write_batch_is_noop() {
         let (_dir, kv) = open_test().await;
         kv.write_batch(Vec::new()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_see_writes_after_open() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"k1", b"v1").unwrap();
+        let snap = kv.snapshot().unwrap();
+
+        kv.put(b"k1", b"v2").unwrap();
+        kv.put(b"k2", b"v2").unwrap();
+
+        assert_eq!(snap.get(b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
+        assert!(snap.get(b"k2").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_scan_prefix_is_consistent() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"pre/a", b"v1").unwrap();
+        kv.put(b"pre/b", b"v2").unwrap();
+        kv.put(b"pre/c", b"v3").unwrap();
+
+        let snap = kv.snapshot().unwrap();
+        // Write a 4th AFTER snapshot opens.
+        kv.put(b"pre/d", b"v4").unwrap();
+
+        let got: Vec<Vec<u8>> = snap
+            .scan_prefix(b"pre/")
+            .unwrap()
+            .map(|r| r.unwrap().1)
+            .collect();
+        assert_eq!(
+            got,
+            vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()],
+            "snapshot must not see the post-open write"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_owned_crosses_await() {
+        let dir = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let kv: Arc<SlateKvStore> =
+            Arc::new(SlateKvStore::open(store, "agentdb/slate").await.unwrap());
+        kv.put(b"k1", b"v1").unwrap();
+
+        let snap = Arc::clone(&kv).snapshot_owned().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert_eq!(snap.get(b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
     }
 }
