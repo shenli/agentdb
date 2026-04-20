@@ -161,10 +161,9 @@ pub async fn reactivate(
     });
     kv.write_batch(ops)?;
     let _ = sessions; // signature retained for future archive transitions
-
-    if let Err(err) = delete_segment(store, &path).await {
-        tracing::warn!(?err, %path, "orphan segment delete failed (best-effort)");
-    }
+    // M9: segment deletion deferred to SegmentGc. reactivate must not
+    // delete inline because any open ReadCtx that captured this session
+    // as Cold still needs to read from the segment path it saw.
     Ok(())
 }
 
@@ -283,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactivate_restores_warm_events_and_deletes_segment() {
+    async fn reactivate_restores_warm_events_and_keeps_segment_for_gc() {
         let (ctx, mut session) = seed("round trip", "s-2").await;
         let box_ = ctx.registry.route_tenant("t-1");
         {
@@ -321,9 +320,32 @@ mod tests {
         let warm = crate::primitives::scan_session_events(&read_ctx, &session).unwrap();
         assert_eq!(warm.len(), 1);
 
+        // After M9, reactivate no longer deletes the segment; GC handles it.
         assert!(read_segment(ctx.registry.object_store(), &path_before)
             .await
-            .is_err());
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn reactivate_leaves_segment_on_disk_for_gc() {
+        let (ctx, mut session) = seed("round trip", "s-2").await;
+        let box_ = ctx.registry.route_tenant("t-1");
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_transition(ctx.registry.kv(), ctx.registry.object_store(),
+                &ctx.sessions, &guard, &mut session).await.unwrap();
+        }
+        let path = session.segment_path.clone().unwrap();
+        {
+            let guard = box_.write_lock.lock().await;
+            reactivate(ctx.registry.kv(), ctx.registry.object_store(),
+                &ctx.sessions, &guard, &mut session).await.unwrap();
+        }
+        // After M9 change: segment is still on disk; GC will reap it later.
+        assert!(
+            read_segment(ctx.registry.object_store(), &path).await.is_ok(),
+            "segment should still exist after reactivate"
+        );
     }
 
     #[tokio::test]
