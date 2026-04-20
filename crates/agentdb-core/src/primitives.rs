@@ -6,7 +6,7 @@ use tokio::sync::MutexGuard;
 use crate::error::{Error, Result};
 use crate::meta::key_session_record;
 use crate::registry::SessionRegistry;
-use crate::types::{Event, Session};
+use crate::types::{Event, Session, Tier};
 
 /// Default branch id for sessions that have never been forked. Fork arrives in M6.
 pub const DEFAULT_BRANCH_ID: u32 = 0;
@@ -143,7 +143,7 @@ use crate::registry::TenantRegistry;
 /// `cf_events`, cold reads the segment via `object_store`, archive is treated
 /// as empty. The merged set is sorted by `ts` and truncated to the last N.
 pub async fn fetch_last_n_merged(
-    kv: &Arc<dyn KvStore>,
+    ctx: &crate::read_ctx::ReadCtx,
     store: &Arc<dyn ObjectStore>,
     sessions: &SessionRegistry,
     session: &Session,
@@ -152,60 +152,21 @@ pub async fn fetch_last_n_merged(
     if n == 0 {
         return Ok(Vec::new());
     }
-    // Inlined pending T7 refactor to route through ReadCtx: we don't have a
-    // `&Box_` here, and constructing an ephemeral ReadCtx changes the ownership
-    // shape in a way T7 will correct (by taking &ReadCtx as a parameter). For
-    // now reproduce fetch_last_n's bounded-ring scan directly against `kv`.
-    let own: Vec<Event> = {
-        let prefix = agentdb_storage::prefix_for_session_branch(
-            Namespace::Events,
-            session.box_id,
-            session.tenant_internal_id,
-            session.internal_id,
-            DEFAULT_BRANCH_ID,
-        );
-        let mut ring: std::collections::VecDeque<Event> =
-            std::collections::VecDeque::with_capacity(n);
-        for res in kv.scan_prefix(&prefix)? {
-            let (_k, v) = res?;
-            let ev: Event = serde_json::from_slice(&v)?;
-            if ring.len() == n {
-                ring.pop_front();
-            }
-            ring.push_back(ev);
-        }
-        ring.into()
-    };
+    let own = fetch_last_n(ctx, session, n)?;
     let Some(fork) = session.forked_from.as_ref() else {
         return Ok(own);
     };
-    let Some(parent) = sessions.lookup_by_internal(
-        session.box_id,
+    let Some(parent) = ctx.session_by_internal(
+        sessions,
         session.tenant_internal_id,
         fork.parent_session_internal_id,
     )?
     else {
-        return Ok(own); // parent disappeared — degrade to child-only
+        return Ok(own);
     };
     let parent_events: Vec<Event> = match parent.tier {
-        crate::types::Tier::Warm => {
-            // Inlined pending T7 refactor.
-            let prefix = agentdb_storage::prefix_for_session_branch(
-                Namespace::Events,
-                parent.box_id,
-                parent.tenant_internal_id,
-                parent.internal_id,
-                DEFAULT_BRANCH_ID,
-            );
-            let mut out: Vec<Event> = Vec::new();
-            for res in kv.scan_prefix(&prefix)? {
-                let (_k, v) = res?;
-                let ev: Event = serde_json::from_slice(&v)?;
-                out.push(ev);
-            }
-            out
-        }
-        crate::types::Tier::Cold => {
+        Tier::Warm => scan_session_events(ctx, &parent)?,
+        Tier::Cold => {
             if let Some(path) = parent.segment_path.as_deref() {
                 match crate::segment::read_segment(store, path).await {
                     Ok(seg) => seg.events,
@@ -215,7 +176,7 @@ pub async fn fetch_last_n_merged(
                 Vec::new()
             }
         }
-        crate::types::Tier::Archive => Vec::new(),
+        Tier::Archive => Vec::new(),
     };
     let mut all: Vec<Event> = own;
     all.extend(
@@ -283,8 +244,12 @@ pub async fn append_and_fetch(
     let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
     box_.metrics.record_append();
     drop(guard);
+    // M9: read through a freshly opened ReadCtx so fetch sees a consistent
+    // snapshot including the write we just committed. The snapshot opens
+    // AFTER the box write lock is dropped, so RocksDB picks up our batch.
+    let ctx = crate::read_ctx::ReadCtx::open(&box_, registry.kv())?;
     let recent = fetch_last_n_merged(
-        &kv,
+        &ctx,
         registry.object_store(),
         sessions,
         &session,
@@ -576,6 +541,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_last_n_merged_via_read_ctx_isolates_post_snapshot_writes() {
+        use crate::read_ctx::ReadCtx;
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+
+        // Parent: 3 events.
+        for i in 1..=3u64 {
+            append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
+                json!({"i": i}), 0, i * 10).await.unwrap();
+        }
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+
+        // Fork child before snapshot.
+        let parent = sessions.lookup(box_.id, tenant.internal_id, "parent").unwrap().unwrap();
+        let fork_ref = crate::types::ForkRef {
+            parent_session_internal_id: parent.internal_id,
+            parent_seq_at_fork: parent.next_seq,
+        };
+        sessions.get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
+            .unwrap();
+        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
+            json!({"c": 1}), 0, 100).await.unwrap();
+
+        let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
+
+        // After snapshot open: two more writes (parent + child) invisible to ctx.
+        append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
+            json!({"i": 99}), 0, 200).await.unwrap();
+        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
+            json!({"c": 2}), 0, 210).await.unwrap();
+
+        let child_at_open = ctx.session(&sessions, tenant.internal_id, "child").unwrap().unwrap();
+        let got = fetch_last_n_merged(&ctx, registry.object_store(), &sessions, &child_at_open, 10)
+            .await.unwrap();
+        // Expect: 3 parent events (ts 10, 20, 30) + 1 child event (ts 100) = 4.
+        // No post-snapshot writes: parent's seq 99 (ts 200) / child's seq 2 (ts 210).
+        assert_eq!(got.len(), 4);
+        assert_eq!(got.iter().filter(|e| e.ts == 200).count(), 0);
+        assert_eq!(got.iter().filter(|e| e.ts == 210).count(), 0);
+    }
+
+    #[tokio::test]
     async fn append_and_fetch_returns_new_seq_and_recent_events() {
         let (_dir, _obj_dir, registry, tenants, sessions) = context();
         let out = append_and_fetch(
@@ -648,80 +655,34 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_last_n_merged_on_forked_session_pulls_parent_tail() {
-        use object_store::local::LocalFileSystem;
-        use object_store::ObjectStore;
+        use crate::read_ctx::ReadCtx;
 
-        let (_dir, kv, tenants, sessions) = setup();
-        let obj_dir = tempfile::TempDir::new().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-        let lock = tokio::sync::Mutex::new(());
-        let t = tenants.get_or_mint(0, "t", 0).unwrap();
-
-        // Parent: 3 events with ts 10, 20, 30.
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
         for i in 1..=3u64 {
-            open_and_append(
-                kv.clone(),
-                &sessions,
-                &lock,
-                0,
-                t.internal_id,
-                "parent",
-                json!({"i": i}),
-                i * 10,
-            )
-            .await
-            .unwrap();
+            append_and_fetch(&registry, &tenants, &sessions, "t-1", "parent",
+                json!({"i": i}), 0, i * 10).await.unwrap();
         }
-
-        // Fork: child with parent_seq_at_fork = 4.
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let parent = sessions.lookup(box_.id, tenant.internal_id, "parent").unwrap().unwrap();
         let fork_ref = crate::types::ForkRef {
-            parent_session_internal_id: sessions
-                .lookup(0, t.internal_id, "parent")
-                .unwrap()
-                .unwrap()
-                .internal_id,
+            parent_session_internal_id: parent.internal_id,
             parent_seq_at_fork: 4,
         };
-        let _child = sessions
-            .get_or_mint_with_fork(0, t.internal_id, "child", 1000, Some(fork_ref))
+        sessions.get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
             .unwrap();
 
-        // Child: 2 events with ts 100, 110.
-        open_and_append(
-            kv.clone(),
-            &sessions,
-            &lock,
-            0,
-            t.internal_id,
-            "child",
-            json!({"c": 1}),
-            100,
-        )
-        .await
-        .unwrap();
-        open_and_append(
-            kv.clone(),
-            &sessions,
-            &lock,
-            0,
-            t.internal_id,
-            "child",
-            json!({"c": 2}),
-            110,
-        )
-        .await
-        .unwrap();
+        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
+            json!({"c": 1}), 0, 100).await.unwrap();
+        append_and_fetch(&registry, &tenants, &sessions, "t-1", "child",
+            json!({"c": 2}), 0, 110).await.unwrap();
 
-        // Events by ts: parent [10, 20, 30] + child [100, 110]. Last 4 → [20, 30, 100, 110].
-        let reloaded = sessions.lookup(0, t.internal_id, "child").unwrap().unwrap();
-        let got = fetch_last_n_merged(&kv, &store, &sessions, &reloaded, 4)
-            .await
-            .unwrap();
+        let child = sessions.lookup(box_.id, tenant.internal_id, "child").unwrap().unwrap();
+        let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
+        let got = fetch_last_n_merged(&ctx, registry.object_store(), &sessions, &child, 4)
+            .await.unwrap();
         let tss: Vec<u64> = got.iter().map(|e| e.ts).collect();
         assert_eq!(tss, vec![20, 30, 100, 110]);
-
-        let _ = obj_dir;
     }
 
     #[tokio::test]
