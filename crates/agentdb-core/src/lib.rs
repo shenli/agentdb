@@ -1,5 +1,6 @@
 //! AgentDB core types, metadata registries, and box runtime.
 
+pub mod admission;
 pub mod box_runtime;
 pub mod error;
 pub mod fork;
@@ -17,6 +18,7 @@ pub mod segment_pin;
 pub mod tiering;
 pub mod types;
 
+pub use admission::{AdmissionDenied, Scope, TokenBucket};
 pub use box_runtime::{BoxRegistry, Box_, FaultKind, InjectedFault, Quota};
 pub use error::{Error, Result};
 pub use fork::fork_session;

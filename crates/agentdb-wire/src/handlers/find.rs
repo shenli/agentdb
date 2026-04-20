@@ -19,11 +19,20 @@ pub fn find_response(
 ) -> WireResult<Document> {
     let box_ = registry.route_tenant(db);
     box_.metrics.record_query_find();
-    let filter = Filter::parse(filter_doc)?;
-    let tenant = match tenants.lookup(box_.id, db)? {
+    let tenant_opt = tenants.lookup(box_.id, db)?;
+    // Admit unconditionally: unknown tenants still pay the per-box gate
+    // via sentinel 0 (skips the per-tenant gate). Prevents spam against
+    // random db names from bypassing rate limits.
+    let admit_id = tenant_opt.as_ref().map(|t| t.internal_id).unwrap_or(0);
+    box_.admit(admit_id)
+        .map_err(|d| agentdb_core::Error::TooManyRequests {
+            scope: d.scope.as_str().into(),
+        })?;
+    let tenant = match tenant_opt {
         Some(t) => t,
         None => return Ok(empty_batch(db, collection)),
     };
+    let filter = Filter::parse(filter_doc)?;
     let ctx = ReadCtx::open(&box_, registry.kv())?;
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;

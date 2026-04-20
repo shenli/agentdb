@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,6 +7,7 @@ use object_store::ObjectStore;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
+use crate::admission::{AdmissionDenied, Scope, TokenBucket};
 use crate::error::{Error, Result};
 use crate::metrics::BoxMetrics;
 use crate::segment_pin::SegmentPinRegistry;
@@ -32,6 +34,8 @@ impl InjectedFault {
 pub struct Quota {
     pub max_warm_sessions: Option<u64>,
     pub max_qps: Option<u64>,
+    pub max_tenant_qps: Option<u64>,
+    pub burst: Option<u64>,
 }
 
 /// One logical box. Owns a mutex that serializes the hot-path writes
@@ -44,6 +48,8 @@ pub struct Box_ {
     pub fault: RwLock<Option<InjectedFault>>,
     pub quota: RwLock<Quota>,
     pub segment_pins: Arc<SegmentPinRegistry>,
+    box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
+    tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
 }
 
 impl Box_ {
@@ -56,6 +62,8 @@ impl Box_ {
             fault: RwLock::new(None),
             quota: RwLock::new(Quota::default()),
             segment_pins: Arc::new(SegmentPinRegistry::new()),
+            box_bucket: parking_lot::Mutex::new(None),
+            tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -78,6 +86,61 @@ impl Box_ {
         } else {
             false
         }
+    }
+
+    /// Rebuild the box_bucket and drop any cached tenant_buckets so
+    /// the next `admit` call for each tenant constructs a fresh bucket
+    /// at the current `quota` settings. Called by the admin quota
+    /// endpoint after a live config change.
+    pub fn rebuild_buckets(&self) {
+        let q = *self.quota.read();
+        *self.box_bucket.lock() = q
+            .max_qps
+            .map(|qps| TokenBucket::new(qps, q.burst.unwrap_or(qps)));
+        self.tenant_buckets.lock().clear();
+    }
+
+    /// Returns `Ok(())` if both the per-box and per-tenant buckets
+    /// grant a token. Returns `AdmissionDenied` with the scope of the
+    /// first refusing gate. Records a `quota_hit` metric on denial.
+    ///
+    /// `tenant_internal_id == 0` is a sentinel meaning "tenant not
+    /// yet minted" (callers use it for the first-ever request from a
+    /// new tenant, where calling `get_or_mint` before the write_lock
+    /// would race). In that case the per-tenant gate is skipped; the
+    /// per-box gate still runs.
+    ///
+    /// Both buckets must grant. The per-box gate runs first so one
+    /// tenant can't repeatedly drain the per-tenant bucket check while
+    /// the per-box gate is already saturated.
+    pub fn admit(&self, tenant_internal_id: u64) -> std::result::Result<(), AdmissionDenied> {
+        {
+            let mut b = self.box_bucket.lock();
+            if let Some(bucket) = b.as_mut() {
+                if !bucket.admit() {
+                    self.metrics.record_quota_hit();
+                    return Err(AdmissionDenied { scope: Scope::Box });
+                }
+            }
+        }
+        if tenant_internal_id == 0 {
+            return Ok(());
+        }
+        let q = *self.quota.read();
+        if let Some(qps) = q.max_tenant_qps {
+            let burst = q.burst.unwrap_or(qps);
+            let mut map = self.tenant_buckets.lock();
+            let bucket = map
+                .entry(tenant_internal_id)
+                .or_insert_with(|| TokenBucket::new(qps, burst));
+            if !bucket.admit() {
+                self.metrics.record_quota_hit();
+                return Err(AdmissionDenied {
+                    scope: Scope::Tenant,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Build (on first call) and return a read guard over the box's indexes.
@@ -263,5 +326,122 @@ mod tests {
         let b = Box_::new(0);
         b.segment_pins.pin("seg1");
         assert_eq!(b.segment_pins.pinned_len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod admit_tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_box() -> Arc<Box_> {
+        Arc::new(Box_::new(0))
+    }
+
+    #[test]
+    fn admit_unlimited_when_no_quota_set() {
+        let b = make_box();
+        for _ in 0..1000 {
+            b.admit(42).expect("unlimited by default");
+        }
+    }
+
+    #[test]
+    fn admit_denies_per_box_when_bucket_drained() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_qps = Some(5);
+            q.burst = Some(5);
+        }
+        b.rebuild_buckets();
+        for _ in 0..5 {
+            b.admit(1).expect("first 5 admit");
+        }
+        let denied = b.admit(1).unwrap_err();
+        assert_eq!(denied.scope, Scope::Box);
+    }
+
+    #[test]
+    fn admit_denies_per_tenant_when_bucket_drained() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_qps = Some(100); // per-box generous
+            q.max_tenant_qps = Some(3);
+            // Do NOT set burst, so per-tenant bucket defaults to burst=qps=3
+        }
+        b.rebuild_buckets();
+        for _ in 0..3 {
+            b.admit(7).expect("first 3 admit");
+        }
+        let denied = b.admit(7).unwrap_err();
+        assert_eq!(denied.scope, Scope::Tenant);
+    }
+
+    #[test]
+    fn admit_refills_after_wait() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_qps = Some(100);
+            q.burst = Some(1);
+        }
+        b.rebuild_buckets();
+        b.admit(1).expect("first admit");
+        assert!(b.admit(1).is_err());
+        thread::sleep(Duration::from_millis(50));
+        b.admit(1).expect("refilled after wait");
+    }
+
+    #[test]
+    fn rebuild_buckets_resets_per_tenant_state() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_tenant_qps = Some(1);
+            q.burst = Some(1);
+        }
+        b.rebuild_buckets();
+        b.admit(1).expect("first admit");
+        assert!(b.admit(1).is_err());
+        b.rebuild_buckets(); // new config → fresh buckets
+        b.admit(1).expect("fresh bucket admits again");
+    }
+
+    #[test]
+    fn admit_with_sentinel_zero_skips_per_tenant_gate() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_qps = Some(1000);
+            q.max_tenant_qps = Some(1);
+            // Do NOT set burst, so per-tenant bucket defaults to burst=qps=1
+        }
+        b.rebuild_buckets();
+        // Real tenant gets rate-limited after 1.
+        b.admit(42).expect("real tenant: first admit");
+        assert!(b.admit(42).is_err());
+        // Sentinel 0 bypasses per-tenant; per-box has plenty left.
+        for _ in 0..5 {
+            b.admit(0).expect("sentinel bypasses per-tenant gate");
+        }
+    }
+
+    #[test]
+    fn quota_hit_counter_increments_on_denial() {
+        let b = make_box();
+        {
+            let mut q = b.quota.write();
+            q.max_qps = Some(1);
+            q.burst = Some(1);
+        }
+        b.rebuild_buckets();
+        b.admit(1).unwrap();
+        let before = b.metrics.snapshot().quota_hits;
+        let _ = b.admit(1);
+        let after = b.metrics.snapshot().quota_hits;
+        assert_eq!(after, before + 1);
     }
 }

@@ -24,7 +24,16 @@ pub async fn aggregate_response(
     collection: &str,
     pipeline: &[Document],
 ) -> WireResult<Document> {
-    registry.route_tenant(db).metrics.record_query_aggregate();
+    let box_ = registry.route_tenant(db);
+    box_.metrics.record_query_aggregate();
+    let tenant_opt = tenants.lookup(box_.id, db)?;
+    // Admit unconditionally: unknown tenants still pay the per-box gate
+    // via sentinel 0 (skips the per-tenant gate).
+    let admit_id = tenant_opt.as_ref().map(|t| t.internal_id).unwrap_or(0);
+    box_.admit(admit_id)
+        .map_err(|d| agentdb_core::Error::TooManyRequests {
+            scope: d.scope.as_str().into(),
+        })?;
     if collection != "events" {
         return Err(WireError::Protocol(format!(
             "aggregate on {collection} not supported; only 'events' is indexed"
@@ -63,8 +72,7 @@ pub async fn aggregate_response(
     }
 
     // Resolve tenant + box.
-    let box_ = registry.route_tenant(db);
-    let Some(tenant) = tenants.lookup(box_.id, db)? else {
+    let Some(tenant) = tenant_opt else {
         return Ok(empty_batch(db, collection));
     };
 

@@ -10,6 +10,8 @@ pub enum Error {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    #[error("rate limit exceeded ({scope})")]
+    TooManyRequests { scope: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -29,5 +31,13 @@ mod tests {
     fn not_found_formats_message() {
         let err = Error::NotFound("session s-9".into());
         assert_eq!(err.to_string(), "not found: session s-9");
+    }
+
+    #[test]
+    fn too_many_requests_formats_message() {
+        let err = Error::TooManyRequests {
+            scope: "tenant".into(),
+        };
+        assert_eq!(err.to_string(), "rate limit exceeded (tenant)");
     }
 }

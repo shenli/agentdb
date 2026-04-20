@@ -22,10 +22,14 @@ pub fn inspect(body: &Document) -> WireResult<CommandHead<'_>> {
 
 /// Turn any internal error into an `ok: 0` response document.
 pub fn error_reply(err: &WireError) -> Document {
+    let code = match err {
+        WireError::Core(agentdb_core::Error::TooManyRequests { .. }) => 82,
+        _ => 1,
+    };
     doc! {
         "ok": 0.0,
         "errmsg": err.to_string(),
-        "code": 1,
+        "code": code,
     }
 }
 
@@ -252,5 +256,15 @@ mod tests {
         let r = dispatch(&doc! { "killCursors": 1 }, &[], &st, 1).await;
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert!(r.get_str("errmsg").unwrap().contains("killCursors"));
+    }
+
+    #[test]
+    fn too_many_requests_maps_to_code_82() {
+        let err = WireError::Core(agentdb_core::Error::TooManyRequests {
+            scope: "tenant".into(),
+        });
+        let d = error_reply(&err);
+        assert_eq!(d.get_i32("code").unwrap(), 82);
+        assert!(d.get_str("errmsg").unwrap().contains("rate limit"));
     }
 }
