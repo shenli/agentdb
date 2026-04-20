@@ -134,7 +134,11 @@ impl<'a> KvSnapshot for RocksSnapshotHandle<'a> {
 /// The `unsafe` lives inside `new`. Outside this module, the handle is
 /// a safe abstraction.
 struct OwnedRocksSnapshotHandle {
-    // Drop order: snap drops first, then _db.
+    // !!! DO NOT REORDER THESE FIELDS !!!
+    // The `unsafe transmute` in `new()` is sound only because Rust drops fields in
+    // declaration order: `snap` (which holds a transmuted `'static` borrow into the
+    // DB) MUST drop before `_db` (the Arc that keeps the DB alive). Swapping these
+    // two fields turns the transmute into use-after-free UB.
     snap: rocksdb::Snapshot<'static>,
     _db: Arc<DB>,
 }
@@ -204,14 +208,19 @@ mod owned_snapshot_tests {
         assert!(snap.get(b"k2").unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn owned_snapshot_is_held_across_await() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_snapshot_is_send_across_await() {
         let dir = TempDir::new().unwrap();
         let store: Arc<RocksKvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
         store.put(b"k1", b"v1").unwrap();
         let snap = Arc::clone(&store).snapshot_owned().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        // Compiles + runs: proves handle is Send across await.
-        assert_eq!(snap.get(b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
+        // `tokio::spawn` requires the future to be `Send + 'static`. If `snap` were
+        // not `Send`, this would fail to compile — which is the whole point of
+        // keeping the snapshot across an `.await` in an async handler.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            snap.get(b"k1").unwrap()
+        });
+        assert_eq!(handle.await.unwrap().as_deref(), Some(b"v1".as_ref()));
     }
 }
