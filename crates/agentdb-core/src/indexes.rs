@@ -57,7 +57,11 @@ impl PerBoxIndexes {
                 };
                 let events: Vec<Event> = match session.tier {
                     Tier::Warm => {
-                        // Inlined pending T9 refactor to route through ReadCtx.
+                        // `PerBoxIndexes::build` runs at lazy-init time under the box's
+                        // `indexes` write lock. It reads every event once to populate the
+                        // index and is not itself a per-request read path; routing it
+                        // through a ReadCtx would be meaningless because there's no snapshot
+                        // to anchor to — the build sees whatever KV state it finds.
                         let prefix = agentdb_storage::prefix_for_session_branch(
                             Namespace::Events,
                             session.box_id,

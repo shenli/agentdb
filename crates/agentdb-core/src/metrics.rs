@@ -64,13 +64,17 @@ impl BoxMetrics {
         self.open_snapshots.fetch_add(1, Ordering::Relaxed);
     }
     pub fn drop_open_snapshot(&self) {
-        // Saturating: avoid underflow if drop races open.
-        let prev = self.open_snapshots.load(Ordering::Relaxed);
-        if prev > 0 {
-            self.open_snapshots
-                .compare_exchange(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .ok();
-        }
+        // Saturating: never decrement below zero. `fetch_update` loops on
+        // CAS failure so concurrent drops can't silently lose decrements.
+        let _ = self
+            .open_snapshots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v == 0 {
+                    None // stop: nothing to decrement
+                } else {
+                    Some(v - 1)
+                }
+            });
     }
     pub fn set_segments_pinned(&self, n: u64) {
         self.segments_pinned_by_snapshots
@@ -210,5 +214,32 @@ mod tests {
         assert_eq!(m.snapshot().segments_pinned_by_snapshots, 3);
         m.set_segments_pinned(0);
         assert_eq!(m.snapshot().segments_pinned_by_snapshots, 0);
+    }
+
+    #[test]
+    fn drop_open_snapshot_is_race_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let m = Arc::new(BoxMetrics::new());
+        // Bump 1000 times on the main thread.
+        for _ in 0..1000 {
+            m.bump_open_snapshots();
+        }
+        // Drop concurrently from 8 threads.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = m.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..125 {
+                    m.drop_open_snapshot();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 1000 bumps, 8 * 125 = 1000 drops — gauge must land exactly at 0.
+        assert_eq!(m.snapshot().open_snapshots, 0);
     }
 }

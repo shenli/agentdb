@@ -38,10 +38,11 @@ pub async fn cold_transition(
             session.external_id, session.tier
         )));
     }
-    // Inlined pending T7 refactor to route through ReadCtx. cold_transition
-    // runs under the box's write_lock so there are no concurrent appends to
-    // this session's key space; reading directly from the live KV here is
-    // equivalent to reading from a snapshot opened at lock-acquire time.
+    // `cold_transition` runs under the box `write_lock`, so a live-KV
+    // prefix scan here is equivalent to a snapshot taken at lock-acquire
+    // time — no concurrent writer can mutate this session's event range.
+    // Not routed through a ReadCtx because this is a writer path, not a
+    // reader, and the caller doesn't have one to hand down.
     let events: Vec<crate::types::Event> = {
         let prefix = agentdb_storage::prefix_for_session_branch(
             Namespace::Events,
