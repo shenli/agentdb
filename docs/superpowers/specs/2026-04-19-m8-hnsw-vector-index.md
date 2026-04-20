@@ -102,12 +102,12 @@ negation.
 
 None. `VectorIndex::insert` and `VectorIndex::knn` keep their current
 signatures. The one mechanical change: `knn` takes `&self` today and
-can't mutate — but building on first `knn` requires mutation. We add
-a `RefCell` (or `parking_lot::Mutex`) inside `HnswVectorIndex` so
-`knn` stays `&self`. Reasoning: the alternative is changing the trait
-to `&mut self`, which would ripple into every caller; the lock is
-uncontended in practice (a box has one index and queries go through
-the planner one at a time).
+can't mutate — but building on first `knn` requires mutation. We wrap
+each `PathHnsw` in a `parking_lot::Mutex` (the trait is already
+`Send + Sync`, which rules out `RefCell`) so `knn` stays `&self`.
+Reasoning: the alternative is changing the trait to `&mut self`, which
+would ripple into every caller; the lock is uncontended in practice
+(a box has one index and queries serialize through the planner anyway).
 
 ### Plumbing
 
