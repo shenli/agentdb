@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::metrics::BoxMetrics;
+use crate::segment_pin::SegmentPinRegistry;
 
 #[derive(Debug, Clone, Copy)]
 pub enum FaultKind {
@@ -42,6 +43,7 @@ pub struct Box_ {
     pub metrics: Arc<BoxMetrics>,
     pub fault: RwLock<Option<InjectedFault>>,
     pub quota: RwLock<Quota>,
+    pub segment_pins: Arc<SegmentPinRegistry>,
 }
 
 impl Box_ {
@@ -53,6 +55,7 @@ impl Box_ {
             metrics: Arc::new(BoxMetrics::new()),
             fault: RwLock::new(None),
             quota: RwLock::new(Quota::default()),
+            segment_pins: Arc::new(SegmentPinRegistry::new()),
         }
     }
 
@@ -253,5 +256,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(built2.as_ref().expect("built").indexed, 1);
+    }
+
+    #[test]
+    fn box_has_segment_pin_registry() {
+        let b = Box_::new(0);
+        b.segment_pins.pin("seg1");
+        assert_eq!(b.segment_pins.pinned_len(), 1);
     }
 }
