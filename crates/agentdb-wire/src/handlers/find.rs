@@ -23,11 +23,10 @@ pub fn find_response(
         Some(t) => t,
         None => return Ok(empty_batch(db, collection)),
     };
-    box_.admit(tenant.internal_id).map_err(|d| {
-        agentdb_core::Error::TooManyRequests {
+    box_.admit(tenant.internal_id)
+        .map_err(|d| agentdb_core::Error::TooManyRequests {
             scope: d.scope.as_str().into(),
-        }
-    })?;
+        })?;
     let filter = Filter::parse(filter_doc)?;
     let ctx = ReadCtx::open(&box_, registry.kv())?;
     let mut batch: Vec<Value> = Vec::new();

@@ -37,7 +37,9 @@ pub async fn append_and_fetch(
                 kind: scope.clone(),
                 tenant: Some(tenant.clone()),
             });
-            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests { scope }));
+            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
+                scope,
+            }));
         }
         Err(e) => return Err(e.into()),
     };

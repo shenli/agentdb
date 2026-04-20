@@ -74,12 +74,16 @@ async fn per_tenant_limit_emits_429_with_retry_after() {
     let ok_count = statuses.iter().filter(|&&s| s == 200).count();
     let throttled = statuses.iter().filter(|&&s| s == 429).count();
     assert!(
-        ok_count >= 2 && ok_count <= 3,
+        (2..=3).contains(&ok_count),
         "expected ~burst(=2)+sentinel(1)=3 admits, got {:?}",
         statuses
     );
     assert!(throttled >= 4, "expected throttles, got {:?}", statuses);
-    assert!(saw_retry_after, "no 429 carried Retry-After: {:?}", statuses);
+    assert!(
+        saw_retry_after,
+        "no 429 carried Retry-After: {:?}",
+        statuses
+    );
 }
 
 #[tokio::test]

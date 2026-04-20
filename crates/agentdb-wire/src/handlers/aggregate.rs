@@ -28,11 +28,10 @@ pub async fn aggregate_response(
     box_.metrics.record_query_aggregate();
     let tenant_opt = tenants.lookup(box_.id, db)?;
     if let Some(tenant) = &tenant_opt {
-        box_.admit(tenant.internal_id).map_err(|d| {
-            agentdb_core::Error::TooManyRequests {
+        box_.admit(tenant.internal_id)
+            .map_err(|d| agentdb_core::Error::TooManyRequests {
                 scope: d.scope.as_str().into(),
-            }
-        })?;
+            })?;
     }
     if collection != "events" {
         return Err(WireError::Protocol(format!(

@@ -48,7 +48,9 @@ pub async fn fork_handler(
                 kind: scope.clone(),
                 tenant: Some(body.tenant_id.clone()),
             });
-            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests { scope }));
+            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
+                scope,
+            }));
         }
         Err(e) => return Err(e.into()),
     };
