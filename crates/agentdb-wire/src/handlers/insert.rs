@@ -47,11 +47,17 @@ pub async fn insert_response(
         .await
         {
             Ok(_) => inserted += 1,
-            Err(e) => write_errors.push(bson::Bson::Document(doc! {
-                "index": idx as i32,
-                "code": 11_i32, // UserNotFound / generic
-                "errmsg": e.to_string(),
-            })),
+            Err(e) => {
+                let code: i32 = match &e {
+                    agentdb_core::Error::TooManyRequests { .. } => 82, // ExceededTimeLimit
+                    _ => 11,                                           // generic
+                };
+                write_errors.push(bson::Bson::Document(doc! {
+                    "index": idx as i32,
+                    "code": code,
+                    "errmsg": e.to_string(),
+                }));
+            }
         }
     }
 

@@ -27,12 +27,13 @@ pub async fn aggregate_response(
     let box_ = registry.route_tenant(db);
     box_.metrics.record_query_aggregate();
     let tenant_opt = tenants.lookup(box_.id, db)?;
-    if let Some(tenant) = &tenant_opt {
-        box_.admit(tenant.internal_id)
-            .map_err(|d| agentdb_core::Error::TooManyRequests {
-                scope: d.scope.as_str().into(),
-            })?;
-    }
+    // Admit unconditionally: unknown tenants still pay the per-box gate
+    // via sentinel 0 (skips the per-tenant gate).
+    let admit_id = tenant_opt.as_ref().map(|t| t.internal_id).unwrap_or(0);
+    box_.admit(admit_id)
+        .map_err(|d| agentdb_core::Error::TooManyRequests {
+            scope: d.scope.as_str().into(),
+        })?;
     if collection != "events" {
         return Err(WireError::Protocol(format!(
             "aggregate on {collection} not supported; only 'events' is indexed"
