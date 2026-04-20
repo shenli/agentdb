@@ -9,6 +9,7 @@ pub(crate) mod meta;
 pub mod metrics;
 pub mod planner;
 pub mod primitives;
+pub mod read_ctx;
 pub mod registry;
 pub mod segment;
 pub mod segment_pin;
@@ -26,6 +27,7 @@ pub use primitives::{
     append_and_fetch, append_event, fetch_last_n, fetch_last_n_merged, scan_session_events,
     AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
+pub use read_ctx::ReadCtx;
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1};
 pub use segment_pin::SegmentPinRegistry;
