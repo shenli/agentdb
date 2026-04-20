@@ -33,6 +33,8 @@ pub enum StreamEvent {
         ts_ms: u64,
         box_id: u16,
         kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
     },
     FaultInjected {
         ts_ms: u64,

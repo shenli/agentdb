@@ -16,7 +16,7 @@ pub async fn append_and_fetch(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let out = agentdb_core::append_and_fetch(
+    let out = match agentdb_core::append_and_fetch(
         &state.registry,
         &state.tenants,
         &state.sessions,
@@ -26,7 +26,21 @@ pub async fn append_and_fetch(
         body.fetch_last_n,
         now_millis,
     )
-    .await?;
+    .await
+    {
+        Ok(o) => o,
+        Err(agentdb_core::Error::TooManyRequests { scope }) => {
+            let box_id = state.registry.route_tenant(&tenant).id;
+            state.stream.emit(crate::stream::StreamEvent::QuotaHit {
+                ts_ms: crate::stream::now_ms(),
+                box_id,
+                kind: scope.clone(),
+                tenant: Some(tenant.clone()),
+            });
+            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests { scope }));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let recent = out.recent.into_iter().map(EventDto::from).collect();
     Ok(Json(AppendAndFetchResponse {
         seq: out.new_seq,

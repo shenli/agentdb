@@ -29,7 +29,7 @@ pub async fn fork_handler(
 ) -> Result<Json<ForkResponse>, ApiError> {
     let box_ = state.registry.route_tenant(&body.tenant_id);
     let guard = box_.write_lock.lock().await;
-    let child = fork_session(
+    let child = match fork_session(
         &state.registry,
         &state.tenants,
         &state.sessions,
@@ -38,7 +38,20 @@ pub async fn fork_handler(
         &parent_session_id,
         &body.new_session_id,
         now_millis(),
-    )?;
+    ) {
+        Ok(s) => s,
+        Err(agentdb_core::Error::TooManyRequests { scope }) => {
+            let box_id = state.registry.route_tenant(&body.tenant_id).id;
+            state.stream.emit(StreamEvent::QuotaHit {
+                ts_ms: crate::stream::now_ms(),
+                box_id,
+                kind: scope.clone(),
+                tenant: Some(body.tenant_id.clone()),
+            });
+            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests { scope }));
+        }
+        Err(e) => return Err(e.into()),
+    };
     drop(guard);
     let fork = child
         .forked_from

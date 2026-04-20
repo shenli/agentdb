@@ -70,7 +70,9 @@ function dashboard() {
         case 'TierChange': return `${ev.session_id} ${ev.from} → ${ev.to} (box ${ev.box_id})`;
         case 'ForkCreated': return `${ev.parent} → ${ev.child} (box ${ev.box_id})`;
         case 'FaultInjected': return `box ${ev.box_id} ${ev.kind} for ${ev.duration_s}s`;
-        case 'QuotaHit': return `box ${ev.box_id} quota ${ev.kind}`;
+        case 'QuotaHit': return ev.tenant
+          ? `box ${ev.box_id} quota ${ev.kind} (tenant ${ev.tenant})`
+          : `box ${ev.box_id} quota ${ev.kind}`;
         case 'MetricsTick': return `${ev.boxes.length} boxes`;
         case 'SegmentGcRun': return `box ${ev.box_id}: reclaimed ${ev.reclaimed}, skipped ${ev.skipped_pinned} pinned`;
         default: return JSON.stringify(ev);
