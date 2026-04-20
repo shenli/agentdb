@@ -136,6 +136,24 @@ cargo bench -p agentdb-index --bench vector_bench
 AGENTDB_HNSW_EF=400 cargo bench -p agentdb-index --bench vector_bench
 ```
 
+## Snapshot read overhead (M9)
+
+All read primitives now go through a `ReadCtx` that wraps a RocksDB
+snapshot. Cost per request is one `DB::snapshot()` call + a few
+atomic increments on `BoxMetrics`.
+
+Measured on the criterion bench `crates/agentdb-core/benches/mvcc_bench.rs`
+against a session with 1000 events:
+
+| operation                          | time     |
+|------------------------------------|---------:|
+| `ReadCtx::open` + scan 1000 events | ~193 µs  |
+
+Interpretation: the snapshot-open cost is dominated by the `scan_prefix`
+itself; the snapshot setup is a single-digit microseconds overhead.
+At prototype scale this is well within the "agent workload tail-latency
+tolerance" budget described in the design doc §1.1.
+
 ## Gotchas
 
 **HTTP keep-alive is not optional.** The Go probe originally closed
