@@ -154,8 +154,22 @@ impl KvStore for SlateKvStore {
             .map(|_handle| ())
     }
 
-    fn scan_prefix(&self, _prefix: &[u8]) -> Result<KvIter> {
-        Err(Error::Other("scan_prefix: implemented in Task 5".into()))
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let db = self.inner.clone();
+        let prefix = prefix.to_vec();
+        // Eagerly collect into an owned Vec so the returned KvIter is 'static
+        // and doesn't borrow from self or the runtime.
+        let collected = self
+            .bridge(async move {
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut it = db.scan_prefix(&prefix[..]).await?;
+                while let Some(kv) = it.next().await? {
+                    out.push((kv.key.to_vec(), kv.value.to_vec()));
+                }
+                Ok::<_, slatedb::Error>(out)
+            })
+            .map_err(|e| Error::Other(format!("slatedb scan_prefix: {e}")))?;
+        Ok(Box::new(collected.into_iter().map(Ok)))
     }
 
     fn write_batch(&self, _ops: Vec<WriteOp>) -> Result<()> {
@@ -206,5 +220,38 @@ mod tests {
     async fn get_missing_returns_none() {
         let (_dir, kv) = open_test().await;
         assert!(kv.get(b"nope").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_returns_only_matching_keys_in_order() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"pre1/a", b"v1a").unwrap();
+        kv.put(b"pre1/b", b"v1b").unwrap();
+        kv.put(b"pre1/c", b"v1c").unwrap();
+        kv.put(b"pre2/a", b"v2a").unwrap();
+        kv.put(b"pre2/b", b"v2b").unwrap();
+
+        let got: Vec<Vec<u8>> = kv
+            .scan_prefix(b"pre1/")
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            got,
+            vec![b"pre1/a".to_vec(), b"pre1/b".to_vec(), b"pre1/c".to_vec()],
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_on_empty_store_returns_no_rows() {
+        let (_dir, kv) = open_test().await;
+        assert_eq!(kv.scan_prefix(b"whatever/").unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_with_no_matches_returns_no_rows() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"other/x", b"x").unwrap();
+        assert_eq!(kv.scan_prefix(b"missing/").unwrap().count(), 0);
     }
 }
