@@ -16,46 +16,195 @@ use crate::error::{Error, Result};
 /// this was the chosen tradeoff over calling `block_on` on a shared
 /// runtime handle (which deadlocks from inside a live tokio task).
 pub struct SlateKvStore {
-    #[allow(dead_code)]
     pub(crate) inner: Arc<slatedb::Db>,
-    #[allow(dead_code)]
-    pub(crate) runtime: Arc<Runtime>,
+    /// Option so `Drop` can `take()` the `Arc<Runtime>` and hand it to a
+    /// plain OS thread for shutdown. `Runtime::drop` is a blocking join on
+    /// worker threads and panics if called from inside another async
+    /// context (e.g. a `#[tokio::test]`). Always `Some` while the store
+    /// is alive.
+    pub(crate) runtime: Option<Arc<Runtime>>,
+}
+
+impl SlateKvStore {
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime present while SlateKvStore is alive")
+    }
 }
 
 impl SlateKvStore {
     /// Open (or create) a SlateDB database rooted at `path` inside `object_store`.
     /// `path` is an object-store prefix like `"agentdb/slate"` (no leading slash).
+    ///
+    /// Builds the owned runtime FIRST, then spawns `Db::open` on it so all of
+    /// SlateDB's internal background tasks (flush, compaction) register on
+    /// our runtime rather than the caller's. This is load-bearing: if
+    /// `Db::open` runs on the caller's runtime and the caller then blocks
+    /// (e.g. via `KvStore::get`'s sync bridge), SlateDB's background tasks
+    /// starve and foreground ops hang.
     pub async fn open(object_store: Arc<dyn ObjectStore>, path: &str) -> Result<Self> {
-        let db = slatedb::Db::open(path, object_store)
-            .await
-            .map_err(|e| Error::Other(format!("slatedb open: {e}")))?;
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                // 2 workers: 1 for foreground, 1 for SlateDB compaction/flush.
+                // worker_threads(1) was insufficient and caused background
+                // task starvation during get-on-empty-db tests.
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("slatedb")
+                .build()
+                .map_err(|e| Error::Other(format!("slatedb runtime: {e}")))?,
+        );
 
-        // Dedicated multi-thread runtime. One worker is enough for the
-        // sync-over-async bridge plus SlateDB's background compaction.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .thread_name("slatedb")
-            .build()
-            .map_err(|e| Error::Other(format!("slatedb runtime: {e}")))?;
+        // `rt.spawn(...).await` returns a JoinHandle<T>; JoinHandles can be
+        // awaited from any runtime (they signal via a waker). Critically,
+        // the inner async block runs on OUR runtime, so every `tokio::spawn`
+        // inside `slatedb::Db::open` goes to OUR worker threads.
+        let path = path.to_string();
+        let db = runtime
+            .spawn(async move { slatedb::Db::open(path, object_store).await })
+            .await
+            .map_err(|e| Error::Other(format!("slatedb open join: {e}")))?
+            .map_err(|e| Error::Other(format!("slatedb open: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(db),
-            runtime: Arc::new(runtime),
+            runtime: Some(runtime),
         })
+    }
+}
+
+impl SlateKvStore {
+    /// Run `fut` on the owned SlateDB runtime and block the caller until it
+    /// completes, returning the future's output.
+    ///
+    /// Uses `Handle::spawn` + `std::sync::mpsc` rather than `Runtime::block_on`
+    /// so the caller may itself be inside a tokio runtime (e.g. a
+    /// `#[tokio::test]` function). `Runtime::block_on` panics in that case
+    /// ("Cannot start a runtime from within a runtime"); `Handle::spawn`
+    /// does not, and the std channel `recv` is a plain synchronous park.
+    fn bridge<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        self.runtime().handle().spawn(async move {
+            let out = fut.await;
+            let _ = tx.send(out);
+        });
+        rx.recv().expect("slatedb bridge task dropped before sending")
     }
 }
 
 impl Drop for SlateKvStore {
     fn drop(&mut self) {
-        // Owned runtime => no task of ours is live here, so block_on is safe.
         // Best-effort close: SlateDB's WAL+SSTs on object storage already
         // preserve committed writes, so a failed close only loses the final
         // in-memory batch.
+        //
+        // Drop may run from inside a caller's tokio runtime (e.g. a
+        // `#[tokio::test]` function), where calling `Runtime::block_on`
+        // would panic. Route through `bridge` instead, which uses
+        // `Handle::spawn` + an std channel.
         let db = self.inner.clone();
-        let rt = self.runtime.clone();
-        if let Err(err) = rt.block_on(async move { db.close().await }) {
+        if let Err(err) = self.bridge(async move { db.close().await }) {
             tracing::warn!(?err, "slatedb close failed during Drop");
         }
+
+        // If we own the last reference to the runtime, its `Drop` would block
+        // waiting for worker threads to join — which panics when `drop` runs
+        // inside an async context (e.g. a `#[tokio::test]` function):
+        //   "Cannot drop a runtime in a context where blocking is not allowed."
+        // Move the `Arc<Runtime>` onto a plain OS thread so the blocking
+        // shutdown happens off the async context. If this `Arc` is not the
+        // last reference, the drop on the other thread is cheap; if it is,
+        // the join happens there instead of here.
+        if let Some(runtime) = self.runtime.take() {
+            std::thread::spawn(move || drop(runtime));
+        }
+    }
+}
+
+use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
+
+impl KvStore for SlateKvStore {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let db = self.inner.clone();
+        let key = key.to_vec();
+        self.bridge(async move { db.get(&key).await })
+            .map_err(|e| Error::Other(format!("slatedb get: {e}")))
+            .map(|opt| opt.map(|bytes| bytes.to_vec()))
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let db = self.inner.clone();
+        let key = key.to_vec();
+        let value = value.to_vec();
+        self.bridge(async move { db.put(&key, &value).await })
+            .map_err(|e| Error::Other(format!("slatedb put: {e}")))
+            .map(|_handle| ())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        let db = self.inner.clone();
+        let key = key.to_vec();
+        self.bridge(async move { db.delete(&key).await })
+            .map_err(|e| Error::Other(format!("slatedb delete: {e}")))
+            .map(|_handle| ())
+    }
+
+    fn scan_prefix(&self, _prefix: &[u8]) -> Result<KvIter> {
+        Err(Error::Other("scan_prefix: implemented in Task 5".into()))
+    }
+
+    fn write_batch(&self, _ops: Vec<WriteOp>) -> Result<()> {
+        Err(Error::Other("write_batch: implemented in Task 6".into()))
+    }
+
+    fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
+        Err(Error::Other("snapshot: implemented in Task 7".into()))
+    }
+
+    fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>> {
+        Err(Error::Other("snapshot_owned: implemented in Task 7".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::KvStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn open_test() -> (TempDir, SlateKvStore) {
+        let dir = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let kv = SlateKvStore::open(store, "agentdb/slate").await.unwrap();
+        (dir, kv)
+    }
+
+    #[tokio::test]
+    async fn put_then_get_roundtrip() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"k1", b"v1").unwrap();
+        assert_eq!(kv.get(b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_key() {
+        let (_dir, kv) = open_test().await;
+        kv.put(b"k1", b"v1").unwrap();
+        kv.delete(b"k1").unwrap();
+        assert!(kv.get(b"k1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_missing_returns_none() {
+        let (_dir, kv) = open_test().await;
+        assert!(kv.get(b"nope").unwrap().is_none());
     }
 }
