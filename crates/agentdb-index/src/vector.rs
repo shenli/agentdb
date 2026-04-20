@@ -8,10 +8,10 @@ use crate::error::{IndexError, IndexResult};
 
 pub type Score = f32;
 
-/// Default HNSW `M` parameter (unused by `instant-distance` 0.6 — see
-/// note below — but kept in the surface for future library upgrades).
-pub const DEFAULT_M: usize = 16;
-/// Default `ef_construction` passed to `instant_distance::Builder`.
+/// Default `ef_construction` / `ef_search` passed to
+/// `instant_distance::Builder`. `instant-distance` 0.6 hardcodes `M`
+/// internally (= 32); we do not expose an `M` knob until the library
+/// does.
 pub const DEFAULT_EF: usize = 100;
 /// Below this N, we skip HNSW entirely and brute-force cosine. Keeps
 /// tiny-dataset tests deterministic and avoids HNSW graph-construction
@@ -28,7 +28,6 @@ pub trait VectorIndex: Send + Sync {
 /// marks the graph dirty and forces a rebuild on the next query).
 pub struct HnswVectorIndex {
     per_path: Mutex<HashMap<String, PathState>>,
-    m: usize,
     ef: usize,
 }
 
@@ -60,34 +59,25 @@ impl Default for HnswVectorIndex {
 
 impl HnswVectorIndex {
     pub fn new() -> Self {
-        Self {
-            per_path: Mutex::new(HashMap::new()),
-            m: DEFAULT_M,
-            ef: DEFAULT_EF,
-        }
+        Self::with_ef(DEFAULT_EF)
     }
 
-    pub fn with_params(m: usize, ef: usize) -> Self {
+    pub fn with_ef(ef: usize) -> Self {
         Self {
             per_path: Mutex::new(HashMap::new()),
-            m,
             ef,
         }
     }
 
-    /// Reads `AGENTDB_HNSW_M` and `AGENTDB_HNSW_EF` from the environment,
-    /// falling back to `DEFAULT_M` and `DEFAULT_EF` if missing or
-    /// unparseable.
+    /// Reads `AGENTDB_HNSW_EF` from the environment (applied to both
+    /// `ef_construction` and `ef_search`), falling back to `DEFAULT_EF`
+    /// if missing or unparseable.
     pub fn from_env() -> Self {
-        let m = std::env::var("AGENTDB_HNSW_M")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_M);
         let ef = std::env::var("AGENTDB_HNSW_EF")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_EF);
-        Self::with_params(m, ef)
+        Self::with_ef(ef)
     }
 }
 
@@ -151,13 +141,10 @@ impl VectorIndex for HnswVectorIndex {
         }
 
         // Large-N: build `HnswMap` lazily (attaches DocIds as values),
-        // then query it.
-        //
-        // Note: `instant-distance` 0.6 does not expose an `M` knob on
-        // `Builder` — only `ef_construction`. We keep `self.m` on the
-        // surface for future library upgrades but don't pass it here.
+        // then query it. `instant-distance` 0.6 exposes `ef_construction`
+        // and `ef_search`; we apply the same tuning knob to both so a
+        // single `AGENTDB_HNSW_EF` affects recall end-to-end.
         if state.dirty || state.built.is_none() {
-            let _ = self.m;
             let points: Vec<NormPoint> = state
                 .entries
                 .iter()
@@ -166,6 +153,7 @@ impl VectorIndex for HnswVectorIndex {
             let doc_ids: Vec<DocId> = state.entries.iter().map(|(id, _)| *id).collect();
             let built = Builder::default()
                 .ef_construction(self.ef)
+                .ef_search(self.ef)
                 .build(points, doc_ids);
             state.built = Some(built);
             state.dirty = false;
