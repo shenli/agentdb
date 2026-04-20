@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
-    BoxRegistry, LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig,
+    BoxRegistry, GcRunReporter, LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig,
     SessionRegistry, TenantRegistry,
 };
 use agentdb_storage::{KvStore, RocksKvStore};
@@ -98,7 +98,22 @@ async fn main() -> anyhow::Result<()> {
     }
     std::mem::forget(engines);
 
-    // M9: spawn one SegmentGc per box. Reporter hooks in Task 15.
+    let stream = StreamBus::default();
+
+    // M9: closure that emits SegmentGcRun on SSE when GC reclaims segments.
+    let reporter: GcRunReporter = {
+        let stream = stream.clone();
+        std::sync::Arc::new(move |box_id, reclaimed, skipped_pinned| {
+            stream.emit(StreamEvent::SegmentGcRun {
+                ts_ms: now_ms(),
+                box_id,
+                reclaimed,
+                skipped_pinned,
+            });
+        })
+    };
+
+    // M9: spawn one SegmentGc per box.
     let mut gcs: Vec<SegmentGc> = Vec::with_capacity(num_boxes as usize);
     for i in 0..num_boxes {
         let box_ = registry.box_by_id(i).expect("box id in range");
@@ -108,12 +123,11 @@ async fn main() -> anyhow::Result<()> {
             sessions.clone(),
             box_,
             segment_gc_cfg,
-            None, // reporter hooked up in Task 15
+            Some(reporter.clone()),
         ));
     }
     std::mem::forget(gcs);
 
-    let stream = StreamBus::default();
     let http_state = AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),

@@ -40,6 +40,12 @@ pub enum StreamEvent {
         kind: String,
         duration_s: u64,
     },
+    SegmentGcRun {
+        ts_ms: u64,
+        box_id: u16,
+        reclaimed: u64,
+        skipped_pinned: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
