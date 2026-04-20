@@ -56,6 +56,8 @@ pub struct TickBox {
     pub appends: u64,
     pub forks: u64,
     pub fault_active: bool,
+    pub open_snapshots: u64,
+    pub segments_pinned_by_snapshots: u64,
 }
 
 pub fn now_ms() -> u64 {

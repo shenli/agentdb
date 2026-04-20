@@ -25,6 +25,8 @@ function dashboard() {
           num_tenants: b.num_tenants,
           appends: (b.metrics && b.metrics.appends) || 0,
           forks: (b.metrics && b.metrics.forks) || 0,
+          open_snapshots: (b.metrics && b.metrics.open_snapshots) || 0,
+          segments_pinned_by_snapshots: (b.metrics && b.metrics.segments_pinned_by_snapshots) || 0,
         }));
         this.totalTenants = this.boxes.reduce((s, b) => s + b.num_tenants, 0);
         this.totalAppends = this.boxes.reduce((s, b) => s + b.appends, 0);
@@ -51,6 +53,8 @@ function dashboard() {
                 b.fault_active = tb.fault_active;
                 b.appends = tb.appends;
                 b.forks = tb.forks;
+                b.open_snapshots = tb.open_snapshots || 0;
+                b.segments_pinned_by_snapshots = tb.segments_pinned_by_snapshots || 0;
               }
             }
           }
@@ -68,8 +72,15 @@ function dashboard() {
         case 'FaultInjected': return `box ${ev.box_id} ${ev.kind} for ${ev.duration_s}s`;
         case 'QuotaHit': return `box ${ev.box_id} quota ${ev.kind}`;
         case 'MetricsTick': return `${ev.boxes.length} boxes`;
+        case 'SegmentGcRun': return `box ${ev.box_id}: reclaimed ${ev.reclaimed}, skipped ${ev.skipped_pinned} pinned`;
         default: return JSON.stringify(ev);
       }
+    },
+
+    snapsLine(b) {
+      const snaps = b.open_snapshots || 0;
+      const pins = b.segments_pinned_by_snapshots || 0;
+      return pins > 0 ? `snapshots: ${snaps} (${pins} seg pins)` : `snapshots: ${snaps}`;
     },
   };
 }

@@ -173,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
                         appends: snap.appends,
                         forks: snap.forks,
                         fault_active,
+                        open_snapshots: snap.open_snapshots,
+                        segments_pinned_by_snapshots: snap.segments_pinned_by_snapshots,
                     });
                 }
                 stream.emit(StreamEvent::MetricsTick {
