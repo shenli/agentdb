@@ -289,6 +289,7 @@ pub struct Box_ {
     pub metrics: Arc<BoxMetrics>,
     pub fault: RwLock<Option<InjectedFault>>,
     pub quota: RwLock<Quota>,
+    pub segment_pins: Arc<SegmentPinRegistry>,
 }
 ```
 
@@ -302,6 +303,7 @@ pub struct Box_ {
     pub metrics: Arc<BoxMetrics>,
     pub fault: RwLock<Option<InjectedFault>>,
     pub quota: RwLock<Quota>,
+    pub segment_pins: Arc<SegmentPinRegistry>,
     box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
     tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
 }
@@ -309,7 +311,7 @@ pub struct Box_ {
 
 - [ ] **Step 3: Initialize them in `Box_::new`**
 
-Change `fn new` to initialize the two new fields:
+Change `fn new` to initialize the two new fields (preserve the existing `segment_pins` init from M9):
 
 ```rust
 fn new(id: BoxId) -> Self {
@@ -320,6 +322,7 @@ fn new(id: BoxId) -> Self {
         metrics: Arc::new(BoxMetrics::new()),
         fault: RwLock::new(None),
         quota: RwLock::new(Quota::default()),
+        segment_pins: Arc::new(SegmentPinRegistry::new()),
         box_bucket: parking_lot::Mutex::new(None),
         tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
     }
@@ -664,18 +667,20 @@ git commit -m "feat(agentdb-core): enforce admission at append + fork"
 
 - [ ] **Step 1: Gate `find_response`**
 
-Open `crates/agentdb-wire/src/handlers/find.rs`. Find these lines at the top of `find_response`:
+Open `crates/agentdb-wire/src/handlers/find.rs`. M9 already refactored the top of this function to grab `box_` and look up the tenant by `box_.id`. The current head looks like:
 
 ```rust
-    registry.route_tenant(db).metrics.record_query_find();
+    let box_ = registry.route_tenant(db);
+    box_.metrics.record_query_find();
     let filter = Filter::parse(filter_doc)?;
-    let tenant = match tenants.lookup(routing_box(registry, db), db)? {
+    let tenant = match tenants.lookup(box_.id, db)? {
         Some(t) => t,
         None => return Ok(empty_batch(db, collection)),
     };
+    let ctx = ReadCtx::open(&box_, registry.kv())?;
 ```
 
-Change them to admit before the filter parse, but only after resolving the tenant id (so the admit is keyed by the real tenant):
+Insert the admit call after the tenant lookup and before `ReadCtx::open` — we don't want to open a read snapshot for a request we're about to deny. Reorder the filter-parse to after admit as well so we skip parse work on denial:
 
 ```rust
     let box_ = registry.route_tenant(db);
@@ -690,17 +695,12 @@ Change them to admit before the filter parse, but only after resolving the tenan
         }
     })?;
     let filter = Filter::parse(filter_doc)?;
+    let ctx = ReadCtx::open(&box_, registry.kv())?;
 ```
 
 (The return type of `find_response` is already `WireResult<Document>` which has `From<agentdb_core::Error>` via `WireError::Core`. The `?` chains automatically.)
 
-Inside the body of `find_response`, change any remaining `routing_box(registry, db)` calls to use `box_.id`. Run:
-
-```bash
-grep -n "routing_box" crates/agentdb-wire/src/handlers/find.rs
-```
-
-For each hit, replace `routing_box(registry, db)` with `box_.id`. If `routing_box` is defined in the same file and is now unused, delete its definition too (check with `cargo build -p agentdb-wire` after the edit).
+No `routing_box` calls remain to replace — M9's refactor already collapsed those.
 
 - [ ] **Step 2: Gate `aggregate_response`**
 
