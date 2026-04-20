@@ -164,6 +164,32 @@ the filter first and intersects. This is the §4.4 "pre-filter"
 execution order — chosen because the tenant filter already prunes the
 candidate set before the ANN or brute-force scan.
 
+## MVCC / snapshot reads
+
+Read primitives in the prototype are snapshot-consistent. A
+`ReadCtx` (in `crates/agentdb-core/src/read_ctx.rs`) pins a RocksDB
+snapshot + a set of segment paths referenced by any Cold sessions
+read through it. Handlers in `agentdb-api` and `agentdb-wire` open one
+`ReadCtx` per request; the HybridPlanner, `fetch_last_n_merged`, and
+`scan_session_events` all read through it.
+
+Writers are unchanged — they still serialize through each box's
+`write_lock`. MVCC in this prototype only provides **read-side**
+isolation; there is no multi-version write tracking or conflict
+detection.
+
+Segment files on the object store are not deleted inline by
+`reactivate`. A per-box `SegmentGc` task sweeps every 5s and deletes
+segments that (a) are not referenced by any current session record
+and (b) are not pinned by any open `ReadCtx` and (c) are older than a
+30s grace window. Configure via `AGENTDB_SEGMENT_GC_TICK_SECS` /
+`AGENTDB_SEGMENT_GC_GRACE_SECS`.
+
+Still out of scope: client-held snapshot handles (`openSnapshot` over
+the wire), cross-box transactional snapshots, write-side MVCC, and
+versioned indexes (the text/vector index is unversioned and the
+planner post-filters hits by snapshot-visible `next_seq`).
+
 ## Observability (M7)
 
 Every mutation path records to `BoxMetrics`:
@@ -195,8 +221,6 @@ intentionally cuts these:
   "box" is a logical partition, not a shard.
 - **No real object-store scaling.** The object_store crate abstracts it
   but the prototype writes to a local directory.
-- **No MVCC or snapshot read API.** Fork is implemented with a parent
-  pointer trick instead; other queries are read-committed.
 - **ANN is in-memory and non-persistent.** HNSW via `instant-distance`
   is built lazily per box on first query and rebuilt from scratch on
   server restart. Incremental updates and persisted snapshots are
