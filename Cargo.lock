@@ -33,6 +33,7 @@ dependencies = [
  "agentdb-storage",
  "anyhow",
  "bson",
+ "futures-util",
  "object_store",
  "parking_lot",
  "serde",

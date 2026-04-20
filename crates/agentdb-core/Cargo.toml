@@ -16,6 +16,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 object_store = { workspace = true }
 bson = { workspace = true }
+futures-util = "0.3"
 
 [dev-dependencies]
 anyhow = { workspace = true }
