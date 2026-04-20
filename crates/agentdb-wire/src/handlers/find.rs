@@ -19,11 +19,16 @@ pub fn find_response(
 ) -> WireResult<Document> {
     let box_ = registry.route_tenant(db);
     box_.metrics.record_query_find();
-    let filter = Filter::parse(filter_doc)?;
     let tenant = match tenants.lookup(box_.id, db)? {
         Some(t) => t,
         None => return Ok(empty_batch(db, collection)),
     };
+    box_.admit(tenant.internal_id).map_err(|d| {
+        agentdb_core::Error::TooManyRequests {
+            scope: d.scope.as_str().into(),
+        }
+    })?;
+    let filter = Filter::parse(filter_doc)?;
     let ctx = ReadCtx::open(&box_, registry.kv())?;
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;
