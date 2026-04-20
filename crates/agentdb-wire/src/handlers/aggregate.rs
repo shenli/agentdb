@@ -112,9 +112,9 @@ pub async fn aggregate_response(
         true
     });
 
-    // TODO T13/T14: plumb ReadCtx from handler entry so query + aggregate
-    // share a single snapshot and the cold segments it pins. For now we open
-    // one inline at the planner call site.
+    // Open a single ReadCtx for the aggregate: the planner scans warm events
+    // through this snapshot and pins any cold segments it touches for the
+    // duration of the call.
     let ctx = agentdb_core::ReadCtx::open(&box_, registry.kv())?;
     let planner = HybridPlanner {
         ctx: &ctx,
