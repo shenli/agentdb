@@ -8,6 +8,7 @@ pub mod error;
 pub mod key;
 pub mod kv;
 pub mod rocks;
+pub mod slate;
 
 pub use error::{Error, Result};
 pub use key::{
@@ -16,3 +17,4 @@ pub use key::{
 };
 pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 pub use rocks::RocksKvStore;
+pub use slate::SlateKvStore;
