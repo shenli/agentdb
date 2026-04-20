@@ -21,6 +21,7 @@ async-broadcast = "0.7"
 bson = { version = "3", features = ["serde"] }
 bytes = "1"
 byteorder = "1"
+instant-distance = "0.6"
 mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-3", "compat-3-3-0"] }
 parking_lot = "0.12"
 thiserror = "1"
