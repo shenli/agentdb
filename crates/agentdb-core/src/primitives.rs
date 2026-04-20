@@ -216,6 +216,20 @@ pub async fn append_and_fetch(
             box_.id
         )));
     }
+    // Admission control: per-box gate always, per-tenant gate only for
+    // already-minted tenants. `get_or_mint` is not safe to call outside
+    // the write_lock (it has a TOCTOU window on the "is this a new
+    // tenant?" check), so the first-ever request for a new tenant uses
+    // a sentinel id of 0 which skips the per-tenant gate. Subsequent
+    // requests for that tenant will hit both gates.
+    let admit_tenant_id = tenants
+        .lookup(box_.id, tenant_external)?
+        .map(|t| t.internal_id)
+        .unwrap_or(0);
+    box_.admit(admit_tenant_id)
+        .map_err(|d| Error::TooManyRequests {
+            scope: d.scope.as_str().into(),
+        })?;
     // Soft quota check on warm sessions.
     {
         let q = *box_.quota.read();

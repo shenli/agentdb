@@ -28,6 +28,9 @@ pub fn fork_session(
     let tenant = tenants
         .lookup(box_.id, tenant_external)?
         .ok_or_else(|| Error::NotFound(format!("tenant {tenant_external}")))?;
+    box_.admit(tenant.internal_id).map_err(|d| Error::TooManyRequests {
+        scope: d.scope.as_str().into(),
+    })?;
     let parent = sessions
         .lookup(box_.id, tenant.internal_id, parent_session_external)?
         .ok_or_else(|| Error::NotFound(format!("parent session {parent_session_external}")))?;
