@@ -216,6 +216,57 @@ the wire), cross-box transactional snapshots, write-side MVCC, and
 versioned indexes (the text/vector index is unversioned and the
 planner post-filters hits by snapshot-visible `next_seq`).
 
+## REST error taxonomy (M13)
+
+Every `/api/*` REST error returns a Stripe-style JSON body with
+stable machine-readable fields:
+
+```json
+{
+  "code": "quota_exceeded",
+  "type": "rate_limit_error",
+  "message": "rate limit exceeded (Tenant)",
+  "scope": "tenant",
+  "retry_after_ms": 1000
+}
+```
+
+Codes (with HTTP status + typed extras):
+
+| code | type | HTTP | Extras |
+|---|---|---|---|
+| `not_found` | `invalid_request_error` | 404 | `resource` (`tenant` / `session` / `box`), `id` |
+| `invalid_request` | `invalid_request_error` | 400 | `field?` |
+| `quota_exceeded` | `rate_limit_error` | 429 | `scope`, `retry_after_ms` (also `Retry-After: 1` header) |
+| `fault_injected` | `api_error` | 503 | `box_id`, `fault_kind` (`latency` / `error`) |
+| `storage_error` | `api_error` | 500 | — |
+| `serialization_error` | `api_error` | 500 | — |
+
+The `message` field is human-readable and may change between
+releases — callers should branch on `code`, not `message`. The
+authoritative schemas live at `/openapi.json`.
+
+The Mongo wire protocol returns errors in its own format
+(`{ok: 0, errmsg, code: N}` where `N` follows the Mongo error code
+table); the two surfaces do not share a taxonomy.
+
+## OpenAPI specification (M13)
+
+The REST surface is described by an OpenAPI 3.x document served
+unauthenticated at `GET /openapi.json`. The spec is generated from
+`#[utoipa::path(...)]` annotations on each handler plus
+`#[derive(ToSchema)]` on each request/response type, aggregated by
+`agentdb_api::ApiDoc`. A snapshot test
+(`crates/agentdb-api/tests/openapi_snapshot.rs`) locks the
+generated output against a checked-in file
+(`tests/snapshots/openapi.json`, ~1500 lines) so any surface change
+is visible in the PR diff.
+
+Not covered by OpenAPI: the Mongo wire protocol (not HTTP) and
+SSE event bodies (OpenAPI does not model event streams well — the
+endpoint is listed, but event shapes are defined only via the
+`StreamEvent` schema for SDK consumers).
+
 ## Observability (M7)
 
 Every mutation path records to `BoxMetrics`:
