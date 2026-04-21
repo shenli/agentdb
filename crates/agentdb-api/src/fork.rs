@@ -53,7 +53,10 @@ pub async fn fork_handler(
         now_millis(),
     ) {
         Ok(s) => s,
-        Err(agentdb_core::Error::TooManyRequests { scope, retry_after_ms }) => {
+        Err(agentdb_core::Error::TooManyRequests {
+            scope,
+            retry_after_ms,
+        }) => {
             let box_id = state.registry.route_tenant(&body.tenant_id).id;
             state.stream.emit(StreamEvent::QuotaHit {
                 ts_ms: crate::stream::now_ms(),

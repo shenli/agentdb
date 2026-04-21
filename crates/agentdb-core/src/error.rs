@@ -27,10 +27,7 @@ pub enum Error {
     },
 
     #[error("rate limit exceeded ({scope:?})")]
-    TooManyRequests {
-        scope: Scope,
-        retry_after_ms: u32,
-    },
+    TooManyRequests { scope: Scope, retry_after_ms: u32 },
 
     #[error("box {box_id}: fault '{fault_kind:?}' injected")]
     FaultInjected {

@@ -115,10 +115,7 @@ impl ApiError {
                     },
                 )
             }
-            agentdb_core::Error::FaultInjected {
-                box_id,
-                fault_kind,
-            } => (
+            agentdb_core::Error::FaultInjected { box_id, fault_kind } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 HeaderMap::new(),
                 ErrorResponse {

@@ -102,9 +102,7 @@ async fn quota_exceeded_emits_typed_body_and_retry_after_header() {
         let r = client.post(&url).json(&body).send().await.unwrap();
         if r.status() == 429 {
             assert_eq!(
-                r.headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok()),
+                r.headers().get("retry-after").and_then(|v| v.to_str().ok()),
                 Some("1")
             );
             let payload: serde_json::Value = r.json().await.unwrap();

@@ -27,7 +27,10 @@ pub fn fork_session(
     let box_ = registry.route_tenant(tenant_external);
     let tenant = tenants
         .lookup(box_.id, tenant_external)?
-        .ok_or_else(|| Error::NotFound { resource: crate::error::Resource::Tenant, id: tenant_external.into() })?;
+        .ok_or_else(|| Error::NotFound {
+            resource: crate::error::Resource::Tenant,
+            id: tenant_external.into(),
+        })?;
     box_.admit(tenant.internal_id)
         .map_err(|d| Error::TooManyRequests {
             scope: d.scope,
@@ -35,7 +38,10 @@ pub fn fork_session(
         })?;
     let parent = sessions
         .lookup(box_.id, tenant.internal_id, parent_session_external)?
-        .ok_or_else(|| Error::NotFound { resource: crate::error::Resource::Session, id: parent_session_external.into() })?;
+        .ok_or_else(|| Error::NotFound {
+            resource: crate::error::Resource::Session,
+            id: parent_session_external.into(),
+        })?;
 
     if sessions
         .lookup(box_.id, tenant.internal_id, new_session_external)?
@@ -136,7 +142,13 @@ mod tests {
             &registry, &tenants, &sessions, &guard, "t-1", "nope", "child", 0,
         )
         .unwrap_err();
-        assert!(matches!(err, Error::NotFound { resource: crate::error::Resource::Session, .. }));
+        assert!(matches!(
+            err,
+            Error::NotFound {
+                resource: crate::error::Resource::Session,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

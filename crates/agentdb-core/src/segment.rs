@@ -36,30 +36,43 @@ pub async fn write_segment(
     path: &str,
     segment: &SegmentFile,
 ) -> Result<()> {
-    let doc = bson::serialize_to_document(segment).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
-    let bytes = bson::serialize_to_vec(&doc).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
+    let doc = bson::serialize_to_document(segment).map_err(|e| Error::Invalid {
+        field: None,
+        message: e.to_string(),
+    })?;
+    let bytes = bson::serialize_to_vec(&doc).map_err(|e| Error::Invalid {
+        field: None,
+        message: e.to_string(),
+    })?;
     let p = ObjectPath::from(path);
     store
         .put(&p, bytes.into())
         .await
-        .map_err(|e| Error::Invalid { field: None, message: format!("object_store put: {e}") })?;
+        .map_err(|e| Error::Invalid {
+            field: None,
+            message: format!("object_store put: {e}"),
+        })?;
     Ok(())
 }
 
 pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<SegmentFile> {
     let p = ObjectPath::from(path);
-    let get = store
-        .get(&p)
-        .await
-        .map_err(|e| Error::Invalid { field: None, message: format!("object_store get: {e}") })?;
-    let bytes = get
-        .bytes()
-        .await
-        .map_err(|e| Error::Invalid { field: None, message: format!("object_store read: {e}") })?;
-    let doc: Document = bson::deserialize_from_slice(&bytes)
-        .map_err(|e| Error::Invalid { field: None, message: format!("bson decode: {e}") })?;
-    let seg: SegmentFile =
-        bson::deserialize_from_document(doc).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
+    let get = store.get(&p).await.map_err(|e| Error::Invalid {
+        field: None,
+        message: format!("object_store get: {e}"),
+    })?;
+    let bytes = get.bytes().await.map_err(|e| Error::Invalid {
+        field: None,
+        message: format!("object_store read: {e}"),
+    })?;
+    let doc: Document = bson::deserialize_from_slice(&bytes).map_err(|e| Error::Invalid {
+        field: None,
+        message: format!("bson decode: {e}"),
+    })?;
+    let seg: SegmentFile = bson::deserialize_from_document(doc).map_err(|e| Error::Invalid {
+        field: None,
+        message: e.to_string(),
+    })?;
     if seg.schema_version != SEGMENT_SCHEMA_V1 {
         return Err(Error::Invalid {
             field: None,
@@ -71,10 +84,10 @@ pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<Se
 
 pub async fn delete_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<()> {
     let p = ObjectPath::from(path);
-    store
-        .delete(&p)
-        .await
-        .map_err(|e| Error::Invalid { field: None, message: format!("object_store delete: {e}") })?;
+    store.delete(&p).await.map_err(|e| Error::Invalid {
+        field: None,
+        message: format!("object_store delete: {e}"),
+    })?;
     Ok(())
 }
 

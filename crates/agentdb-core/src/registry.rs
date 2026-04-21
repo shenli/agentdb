@@ -27,11 +27,9 @@ impl TenantRegistry {
         let record_bytes = self
             .kv
             .get(&key_tenant_record(box_id, internal_id))?
-            .ok_or_else(|| {
-                crate::error::Error::Invalid {
-                    field: None,
-                    message: format!("tenant record missing for box={box_id} tenant={internal_id}"),
-                }
+            .ok_or_else(|| crate::error::Error::Invalid {
+                field: None,
+                message: format!("tenant record missing for box={box_id} tenant={internal_id}"),
             })?;
         let t: Tenant = serde_json::from_slice(&record_bytes)?;
         Ok(Some(t))
@@ -100,7 +98,10 @@ impl TenantRegistry {
                 continue;
             }
             let name = std::str::from_utf8(&k[4..])
-                .map_err(|e| crate::error::Error::Invalid { field: Some("tenant_id".into()), message: format!("bad tenant name utf-8: {e}") })?
+                .map_err(|e| crate::error::Error::Invalid {
+                    field: Some("tenant_id".into()),
+                    message: format!("bad tenant name utf-8: {e}"),
+                })?
                 .to_string();
             out.push(name);
         }
@@ -218,7 +219,10 @@ impl SessionRegistry {
                 continue;
             }
             let name = std::str::from_utf8(&k[12..])
-                .map_err(|e| crate::error::Error::Invalid { field: Some("session_id".into()), message: format!("bad session name utf-8: {e}") })?
+                .map_err(|e| crate::error::Error::Invalid {
+                    field: Some("session_id".into()),
+                    message: format!("bad session name utf-8: {e}"),
+                })?
                 .to_string();
             out.push(name);
         }
