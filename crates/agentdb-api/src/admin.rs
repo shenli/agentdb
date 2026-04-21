@@ -27,9 +27,13 @@ pub async fn force_tier(
     match target.as_str() {
         "warm" | "cold" | "archive" => {}
         other => {
-            return Err(ApiError::BadRequest(format!(
-                "unsupported target tier {other}; expected 'warm' | 'cold' | 'archive'"
-            )));
+            return Err(agentdb_core::Error::Invalid {
+                field: Some("target".into()),
+                message: format!(
+                    "unsupported target tier '{other}'; expected 'warm' | 'cold' | 'archive'"
+                ),
+            }
+            .into());
         }
     }
 
@@ -37,11 +41,17 @@ pub async fn force_tier(
     let tenant = state
         .tenants
         .lookup(box_.id, &body.tenant_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("tenant {} not found", body.tenant_id)))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Tenant,
+            id: body.tenant_id.clone(),
+        })?;
     let mut session = state
         .sessions
         .lookup(box_.id, tenant.internal_id, &body.session_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("session {} not found", body.session_id)))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Session,
+            id: body.session_id.clone(),
+        })?;
 
     let guard = box_.write_lock.lock().await;
     // Walk one hop at a time until we reach the target tier. Each hop

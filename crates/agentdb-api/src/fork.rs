@@ -40,16 +40,17 @@ pub async fn fork_handler(
         now_millis(),
     ) {
         Ok(s) => s,
-        Err(agentdb_core::Error::TooManyRequests { scope }) => {
+        Err(agentdb_core::Error::TooManyRequests { scope, retry_after_ms }) => {
             let box_id = state.registry.route_tenant(&body.tenant_id).id;
             state.stream.emit(StreamEvent::QuotaHit {
                 ts_ms: crate::stream::now_ms(),
                 box_id,
-                kind: scope.clone(),
+                kind: scope.as_str().to_string(),
                 tenant: Some(body.tenant_id.clone()),
             });
             return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
                 scope,
+                retry_after_ms,
             }));
         }
         Err(e) => return Err(e.into()),

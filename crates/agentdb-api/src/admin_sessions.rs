@@ -26,11 +26,17 @@ pub async fn get_session(
     let tenant = state
         .tenants
         .lookup(box_.id, &q.tenant_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("tenant {} not found", q.tenant_id)))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Tenant,
+            id: q.tenant_id.clone(),
+        })?;
     let session = state
         .sessions
         .lookup(box_.id, tenant.internal_id, &session_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("session {session_id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Session,
+            id: session_id.clone(),
+        })?;
     let parent_external_id = match &session.forked_from {
         Some(fork) => state
             .sessions

@@ -67,7 +67,10 @@ pub async fn get_box(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     let tenants = state.tenants.list_in_box(id)?.len() as u64;
     let metrics = b.metrics.snapshot();
     let q = *b.quota.read();
@@ -115,16 +118,21 @@ pub async fn inject_fault(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     let kind = match body.kind.to_ascii_lowercase().as_str() {
         "latency" => FaultKind::Latency {
             ms: body.latency_ms.unwrap_or(200),
         },
         "error" => FaultKind::Error,
         other => {
-            return Err(ApiError::BadRequest(format!(
-                "unknown fault kind {other}; expected 'latency' or 'error'"
-            )));
+            return Err(agentdb_core::Error::Invalid {
+                field: Some("kind".into()),
+                message: format!("unknown fault kind '{other}'; expected 'latency' or 'error'"),
+            }
+            .into());
         }
     };
     let expires_at = Instant::now() + Duration::from_secs(body.duration_s);
@@ -162,7 +170,10 @@ pub async fn set_quota(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     {
         let mut q = b.quota.write();
         q.max_warm_sessions = body.max_warm_sessions;
@@ -199,12 +210,17 @@ pub async fn set_webhook(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     if let Some(ref u) = body.url {
         if !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err(ApiError::BadRequest(format!(
-                "webhook url must start with http:// or https:// (got {u})"
-            )));
+            return Err(agentdb_core::Error::Invalid {
+                field: Some("url".into()),
+                message: format!("webhook url must start with http:// or https:// (got {u})"),
+            }
+            .into());
         }
     }
     *b.webhook.write() = body.url.clone();

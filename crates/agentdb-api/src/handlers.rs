@@ -29,16 +29,17 @@ pub async fn append_and_fetch(
     .await
     {
         Ok(o) => o,
-        Err(agentdb_core::Error::TooManyRequests { scope }) => {
+        Err(agentdb_core::Error::TooManyRequests { scope, retry_after_ms }) => {
             let box_id = state.registry.route_tenant(&tenant).id;
             state.stream.emit(crate::stream::StreamEvent::QuotaHit {
                 ts_ms: crate::stream::now_ms(),
                 box_id,
-                kind: scope.clone(),
+                kind: scope.as_str().into(),
                 tenant: Some(tenant.clone()),
             });
             return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
                 scope,
+                retry_after_ms,
             }));
         }
         Err(e) => return Err(e.into()),
