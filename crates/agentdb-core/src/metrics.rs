@@ -20,6 +20,9 @@ pub struct BoxMetrics {
     pub segments_pinned_by_snapshots: AtomicU64, // gauge, sampled from pin registry
     pub segment_gc_reclaimed: AtomicU64,         // counter
     pub segment_gc_skipped_pinned: AtomicU64,    // counter
+    // M12 additions:
+    pub webhook_fires: AtomicU64,
+    pub webhook_failures: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -88,6 +91,13 @@ impl BoxMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_webhook_fire(&self) {
+        self.webhook_fires.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_webhook_failure(&self) {
+        self.webhook_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn bump_tier(&self, tier: crate::types::Tier) {
         let mut g = self.gauges.write();
         match tier {
@@ -121,6 +131,8 @@ impl BoxMetrics {
             segments_pinned_by_snapshots: self.segments_pinned_by_snapshots.load(Ordering::Relaxed),
             segment_gc_reclaimed: self.segment_gc_reclaimed.load(Ordering::Relaxed),
             segment_gc_skipped_pinned: self.segment_gc_skipped_pinned.load(Ordering::Relaxed),
+            webhook_fires: self.webhook_fires.load(Ordering::Relaxed),
+            webhook_failures: self.webhook_failures.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -140,6 +152,8 @@ pub struct MetricsSnapshot {
     pub segments_pinned_by_snapshots: u64,
     pub segment_gc_reclaimed: u64,
     pub segment_gc_skipped_pinned: u64,
+    pub webhook_fires: u64,
+    pub webhook_failures: u64,
     pub gauges: GaugeSnapshot,
 }
 
@@ -157,6 +171,17 @@ mod tests {
         let s = m.snapshot();
         assert_eq!(s.appends, 2);
         assert_eq!(s.forks, 1);
+    }
+
+    #[test]
+    fn webhook_counters_increment() {
+        let m = BoxMetrics::new();
+        m.record_webhook_fire();
+        m.record_webhook_fire();
+        m.record_webhook_failure();
+        let s = m.snapshot();
+        assert_eq!(s.webhook_fires, 2);
+        assert_eq!(s.webhook_failures, 1);
     }
 
     #[test]
