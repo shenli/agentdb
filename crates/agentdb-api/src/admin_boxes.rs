@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
@@ -27,6 +27,14 @@ pub struct QuotaView {
     pub burst: Option<u64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/boxes",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Per-box snapshot", body = Vec<BoxListItem>),
+    ),
+)]
 pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxListItem>>, ApiError> {
     let mut out = Vec::new();
     for i in 0..state.registry.num_boxes() {
@@ -60,6 +68,16 @@ pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxLis
     Ok(Json(out))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/boxes/{id}",
+    tag = "admin",
+    params(("id" = u16, Path, description = "Box id")),
+    responses(
+        (status = 200, body = BoxListItem),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn get_box(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -110,6 +128,18 @@ pub struct InjectFaultResponse {
     pub expires_in_s: u64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/inject_fault",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = InjectFaultRequest,
+    responses(
+        (status = 200, body = InjectFaultResponse),
+        (status = 400, description = "Unknown fault kind", body = ErrorResponse),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn inject_fault(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -162,6 +192,17 @@ pub struct QuotaRequest {
     pub burst: Option<u64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/quota",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = QuotaRequest,
+    responses(
+        (status = 200, body = QuotaView),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn set_quota(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -202,6 +243,18 @@ pub struct WebhookResponse {
     pub url: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/webhook",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = WebhookRequest,
+    responses(
+        (status = 200, body = WebhookResponse),
+        (status = 400, description = "Invalid URL", body = ErrorResponse),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn set_webhook(
     State(state): State<AppState>,
     Path(id): Path<u16>,

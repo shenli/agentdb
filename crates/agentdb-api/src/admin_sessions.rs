@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::AppState;
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -17,6 +17,19 @@ pub struct SessionDetail {
     pub parent_external_id: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/sessions/{session_id}",
+    tag = "admin",
+    params(
+        ("session_id" = String, Path, description = "External session id"),
+        ("tenant_id" = String, Query, description = "Tenant that owns the session"),
+    ),
+    responses(
+        (status = 200, body = SessionDetail),
+        (status = 404, description = "Tenant or session not found", body = ErrorResponse),
+    ),
+)]
 pub async fn get_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,

@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::stream::StreamEvent;
 use crate::AppState;
 
@@ -22,6 +22,19 @@ pub struct ForkResponse {
     pub parent_seq_at_fork: u64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{session_id}/fork",
+    tag = "primitives",
+    params(("session_id" = String, Path, description = "Parent session's external id")),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Child session created", body = ForkResponse),
+        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 404, description = "Parent tenant/session not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+    ),
+)]
 pub async fn fork_handler(
     State(state): State<AppState>,
     Path(parent_session_id): Path<String>,

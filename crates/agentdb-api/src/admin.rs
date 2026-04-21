@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
@@ -19,6 +19,17 @@ pub struct ForceTierResponse {
     pub tier: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/tier/force",
+    tag = "admin",
+    request_body = ForceTierRequest,
+    responses(
+        (status = 200, description = "Session transitioned to target tier", body = ForceTierResponse),
+        (status = 400, description = "Unsupported target tier or malformed body", body = ErrorResponse),
+        (status = 404, description = "Tenant or session not found", body = ErrorResponse),
+    ),
+)]
 pub async fn force_tier(
     State(state): State<AppState>,
     Json(body): Json<ForceTierRequest>,
