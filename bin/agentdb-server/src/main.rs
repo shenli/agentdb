@@ -115,6 +115,12 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
         ),
+        t_archive: Duration::from_secs(
+            std::env::var("AGENTDB_T_ARCHIVE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+        ),
     };
     let segment_gc_cfg = SegmentGcConfig {
         tick: Duration::from_secs(
@@ -175,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
             sessions.clone(),
             box_,
             lifecycle_cfg,
+            None, // hook wired by later task
         ));
     }
     std::mem::forget(engines);
