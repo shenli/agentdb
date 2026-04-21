@@ -36,6 +36,21 @@ impl TenantRegistry {
         Ok(Some(t))
     }
 
+    /// Reverse lookup: given an internal id, return the full tenant
+    /// record. Used by the lifecycle hook to resolve external ids for
+    /// webhook payloads.
+    pub fn lookup_by_internal(
+        &self,
+        box_id: BoxId,
+        internal_id: TenantId,
+    ) -> Result<Option<Tenant>> {
+        let Some(bytes) = self.kv.get(&key_tenant_record(box_id, internal_id))? else {
+            return Ok(None);
+        };
+        let t: Tenant = serde_json::from_slice(&bytes)?;
+        Ok(Some(t))
+    }
+
     /// Get an existing tenant or mint a new internal id. Persists both the
     /// lookup entry and the full tenant record atomically.
     pub fn get_or_mint(&self, box_id: BoxId, external: &str, now_millis: u64) -> Result<Tenant> {
@@ -301,6 +316,17 @@ mod tests {
         assert_eq!(a.box_id, 1);
         assert_eq!(a.external_id, "t-a");
         assert_eq!(a.created_at, 100);
+    }
+
+    #[test]
+    fn tenant_lookup_by_internal_round_trips() {
+        let (_dir, kv) = store();
+        let reg = TenantRegistry::new(kv);
+        let minted = reg.get_or_mint(1, "t-ext", 42).unwrap();
+        let found = reg.lookup_by_internal(1, minted.internal_id).unwrap();
+        assert_eq!(found.map(|t| t.external_id), Some("t-ext".to_string()));
+        let missing = reg.lookup_by_internal(1, 9999).unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]
