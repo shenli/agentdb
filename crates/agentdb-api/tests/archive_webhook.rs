@@ -22,12 +22,10 @@ async fn mock_webhook_server() -> (String, Rx) {
     let app = Router::new()
         .route(
             "/",
-            post(
-                |State(tx): State<Tx>, Json(body): Json<Value>| async move {
-                    let _ = tx.send(body);
-                    axum::http::StatusCode::NO_CONTENT
-                },
-            ),
+            post(|State(tx): State<Tx>, Json(body): Json<Value>| async move {
+                let _ = tx.send(body);
+                axum::http::StatusCode::NO_CONTENT
+            }),
         )
         .with_state(tx);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

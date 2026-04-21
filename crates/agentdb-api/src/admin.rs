@@ -48,7 +48,9 @@ pub async fn force_tier(
     // records metrics, emits SSE, and fires a webhook.
     let mut steps: Vec<(Tier, Tier)> = Vec::new();
     loop {
-        use agentdb_core::tiering::{archive_to_cold, cold_to_archive, cold_transition, reactivate};
+        use agentdb_core::tiering::{
+            archive_to_cold, cold_to_archive, cold_transition, reactivate,
+        };
         let from = session.tier;
         let done = match (from, target.as_str()) {
             (Tier::Warm, "cold") => {

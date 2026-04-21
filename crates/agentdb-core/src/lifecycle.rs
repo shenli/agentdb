@@ -51,8 +51,16 @@ impl LifecycleEngine {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                if let Err(err) =
-                    sweep(&kv, &store, &tenants, &sessions, &box_, config, hook.as_ref()).await
+                if let Err(err) = sweep(
+                    &kv,
+                    &store,
+                    &tenants,
+                    &sessions,
+                    &box_,
+                    config,
+                    hook.as_ref(),
+                )
+                .await
                 {
                     tracing::warn!(box_id = box_.id, ?err, "lifecycle sweep errored");
                 }
@@ -92,8 +100,7 @@ async fn sweep(
                 continue;
             }
             let guard = box_.write_lock.lock().await;
-            let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)?
-            else {
+            let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)? else {
                 continue;
             };
             if fresh.tier != Tier::Warm {
@@ -136,8 +143,7 @@ async fn sweep(
                 continue;
             }
             let guard = box_.write_lock.lock().await;
-            let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)?
-            else {
+            let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)? else {
                 continue;
             };
             if fresh.tier != Tier::Cold {
@@ -283,7 +289,11 @@ mod tests {
             .lookup(box_.id, tenant.internal_id, "s-warm")
             .unwrap()
             .unwrap();
-        assert_eq!(s.tier, Tier::Cold, "session should have been demoted to cold");
+        assert_eq!(
+            s.tier,
+            Tier::Cold,
+            "session should have been demoted to cold"
+        );
     }
 
     #[tokio::test]
@@ -321,15 +331,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let guard = box_.write_lock.lock().await;
-            crate::tiering::cold_transition(
-                &kv,
-                &store,
-                &sessions,
-                &guard,
-                &mut session,
-            )
-            .await
-            .unwrap();
+            crate::tiering::cold_transition(&kv, &store, &sessions, &guard, &mut session)
+                .await
+                .unwrap();
             // Override last_active_at to be ancient so archive threshold is met
             session.last_active_at = 1;
             sessions.save(&session).unwrap();
@@ -357,6 +361,10 @@ mod tests {
             .lookup(box_.id, tenant.internal_id, "s-arch")
             .unwrap()
             .unwrap();
-        assert_eq!(after.tier, Tier::Archive, "session should have been archived");
+        assert_eq!(
+            after.tier,
+            Tier::Archive,
+            "session should have been archived"
+        );
     }
 }
