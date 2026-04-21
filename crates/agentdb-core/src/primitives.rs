@@ -211,10 +211,12 @@ pub async fn append_and_fetch(
     // Fault injection check — if an error fault is active, short-circuit.
     if box_.apply_fault().await {
         box_.metrics.record_fault();
-        return Err(Error::Invalid(format!(
-            "box {} has an injected error fault",
-            box_.id
-        )));
+        return Err(Error::FaultInjected {
+            box_id: box_.id,
+            // Fault is active (apply_fault returned true); we know the
+            // kind is Error because only Error faults short-circuit.
+            fault_kind: crate::box_runtime::FaultKind::Error,
+        });
     }
     // Admission control: per-box gate always, per-tenant gate only for
     // already-minted tenants. `get_or_mint` is not safe to call outside
@@ -228,7 +230,8 @@ pub async fn append_and_fetch(
         .unwrap_or(0);
     box_.admit(admit_tenant_id)
         .map_err(|d| Error::TooManyRequests {
-            scope: d.scope.as_str().into(),
+            scope: d.scope,
+            retry_after_ms: 1000,
         })?;
     // Soft quota check on warm sessions.
     {
@@ -237,10 +240,10 @@ pub async fn append_and_fetch(
             let g = box_.metrics.gauges.read().clone();
             if g.warm_sessions >= max {
                 box_.metrics.record_quota_hit();
-                return Err(Error::Invalid(format!(
-                    "box {} warm_sessions quota {max} exceeded",
-                    box_.id
-                )));
+                return Err(Error::Invalid {
+                    field: Some("max_warm_sessions".into()),
+                    message: format!("warm_sessions cap {max} reached on box {}", box_.id),
+                });
             }
         }
     }

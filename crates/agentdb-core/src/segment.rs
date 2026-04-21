@@ -36,13 +36,13 @@ pub async fn write_segment(
     path: &str,
     segment: &SegmentFile,
 ) -> Result<()> {
-    let doc = bson::serialize_to_document(segment).map_err(|e| Error::Invalid(e.to_string()))?;
-    let bytes = bson::serialize_to_vec(&doc).map_err(|e| Error::Invalid(e.to_string()))?;
+    let doc = bson::serialize_to_document(segment).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
+    let bytes = bson::serialize_to_vec(&doc).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
     let p = ObjectPath::from(path);
     store
         .put(&p, bytes.into())
         .await
-        .map_err(|e| Error::Invalid(format!("object_store put: {e}")))?;
+        .map_err(|e| Error::Invalid { field: None, message: format!("object_store put: {e}") })?;
     Ok(())
 }
 
@@ -51,20 +51,20 @@ pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<Se
     let get = store
         .get(&p)
         .await
-        .map_err(|e| Error::Invalid(format!("object_store get: {e}")))?;
+        .map_err(|e| Error::Invalid { field: None, message: format!("object_store get: {e}") })?;
     let bytes = get
         .bytes()
         .await
-        .map_err(|e| Error::Invalid(format!("object_store read: {e}")))?;
+        .map_err(|e| Error::Invalid { field: None, message: format!("object_store read: {e}") })?;
     let doc: Document = bson::deserialize_from_slice(&bytes)
-        .map_err(|e| Error::Invalid(format!("bson decode: {e}")))?;
+        .map_err(|e| Error::Invalid { field: None, message: format!("bson decode: {e}") })?;
     let seg: SegmentFile =
-        bson::deserialize_from_document(doc).map_err(|e| Error::Invalid(e.to_string()))?;
+        bson::deserialize_from_document(doc).map_err(|e| Error::Invalid { field: None, message: e.to_string() })?;
     if seg.schema_version != SEGMENT_SCHEMA_V1 {
-        return Err(Error::Invalid(format!(
-            "unknown segment schema version {}",
-            seg.schema_version
-        )));
+        return Err(Error::Invalid {
+            field: None,
+            message: format!("unknown segment schema version {}", seg.schema_version),
+        });
     }
     Ok(seg)
 }
@@ -74,7 +74,7 @@ pub async fn delete_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<
     store
         .delete(&p)
         .await
-        .map_err(|e| Error::Invalid(format!("object_store delete: {e}")))?;
+        .map_err(|e| Error::Invalid { field: None, message: format!("object_store delete: {e}") })?;
     Ok(())
 }
 

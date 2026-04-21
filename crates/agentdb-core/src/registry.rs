@@ -28,9 +28,10 @@ impl TenantRegistry {
             .kv
             .get(&key_tenant_record(box_id, internal_id))?
             .ok_or_else(|| {
-                crate::error::Error::Invalid(format!(
-                    "tenant record missing for box={box_id} tenant={internal_id}"
-                ))
+                crate::error::Error::Invalid {
+                    field: None,
+                    message: format!("tenant record missing for box={box_id} tenant={internal_id}"),
+                }
             })?;
         let t: Tenant = serde_json::from_slice(&record_bytes)?;
         Ok(Some(t))
@@ -99,7 +100,7 @@ impl TenantRegistry {
                 continue;
             }
             let name = std::str::from_utf8(&k[4..])
-                .map_err(|e| crate::error::Error::Invalid(format!("bad tenant name utf-8: {e}")))?
+                .map_err(|e| crate::error::Error::Invalid { field: Some("tenant_id".into()), message: format!("bad tenant name utf-8: {e}") })?
                 .to_string();
             out.push(name);
         }
@@ -140,9 +141,10 @@ impl SessionRegistry {
             .kv
             .get(&key_session_record(box_id, tenant_id, internal_id))?
             .ok_or_else(|| {
-                crate::error::Error::Invalid(format!(
-                    "session record missing for box={box_id} tenant={tenant_id} session={internal_id}"
-                ))
+                crate::error::Error::Invalid {
+                    field: None,
+                    message: format!("session record missing for box={box_id} tenant={tenant_id} session={internal_id}"),
+                }
             })?;
         let s: Session = serde_json::from_slice(&record_bytes)?;
         Ok(Some(s))
@@ -216,7 +218,7 @@ impl SessionRegistry {
                 continue;
             }
             let name = std::str::from_utf8(&k[12..])
-                .map_err(|e| crate::error::Error::Invalid(format!("bad session name utf-8: {e}")))?
+                .map_err(|e| crate::error::Error::Invalid { field: Some("session_id".into()), message: format!("bad session name utf-8: {e}") })?
                 .to_string();
             out.push(name);
         }

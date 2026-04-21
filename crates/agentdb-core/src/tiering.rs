@@ -33,10 +33,13 @@ pub async fn cold_transition(
     session: &mut Session,
 ) -> Result<()> {
     if session.tier != Tier::Warm {
-        return Err(Error::Invalid(format!(
-            "cold_transition: session {} is not Warm (tier={:?})",
-            session.external_id, session.tier
-        )));
+        return Err(Error::Invalid {
+            field: Some("tier".into()),
+            message: format!(
+                "cold_transition: session {} is not Warm (tier={:?})",
+                session.external_id, session.tier
+            ),
+        });
     }
     // `cold_transition` runs under the box `write_lock`, so a live-KV
     // prefix scan here is equivalent to a snapshot taken at lock-acquire
@@ -122,16 +125,22 @@ pub async fn reactivate(
     session: &mut Session,
 ) -> Result<()> {
     if session.tier != Tier::Cold {
-        return Err(Error::Invalid(format!(
-            "reactivate: session {} is not Cold (tier={:?})",
-            session.external_id, session.tier
-        )));
+        return Err(Error::Invalid {
+            field: Some("tier".into()),
+            message: format!(
+                "reactivate: session {} is not Cold (tier={:?})",
+                session.external_id, session.tier
+            ),
+        });
     }
     let Some(path) = session.segment_path.clone() else {
-        return Err(Error::Invalid(format!(
-            "reactivate: cold session {} has no segment_path",
-            session.external_id
-        )));
+        return Err(Error::Invalid {
+            field: Some("tier".into()),
+            message: format!(
+                "reactivate: cold session {} has no segment_path",
+                session.external_id
+            ),
+        });
     };
     let seg = read_segment(store, &path).await?;
 
@@ -178,10 +187,13 @@ pub async fn cold_to_archive(
     session: &mut crate::types::Session,
 ) -> crate::error::Result<()> {
     if session.tier != crate::types::Tier::Cold {
-        return Err(crate::error::Error::Invalid(format!(
-            "session {} is not cold (is {:?}); cannot archive",
-            session.external_id, session.tier
-        )));
+        return Err(crate::error::Error::Invalid {
+            field: Some("tier".into()),
+            message: format!(
+                "session {} is not cold (is {:?}); cannot archive",
+                session.external_id, session.tier
+            ),
+        });
     }
     session.tier = crate::types::Tier::Archive;
     sessions.save(session)?;
@@ -197,10 +209,13 @@ pub async fn archive_to_cold(
     session: &mut crate::types::Session,
 ) -> crate::error::Result<()> {
     if session.tier != crate::types::Tier::Archive {
-        return Err(crate::error::Error::Invalid(format!(
-            "session {} is not archived (is {:?}); cannot un-archive",
-            session.external_id, session.tier
-        )));
+        return Err(crate::error::Error::Invalid {
+            field: Some("tier".into()),
+            message: format!(
+                "session {} is not archived (is {:?}); cannot un-archive",
+                session.external_id, session.tier
+            ),
+        });
     }
     session.tier = crate::types::Tier::Cold;
     sessions.save(session)?;
