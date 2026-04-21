@@ -16,6 +16,7 @@ agentdb-storage = { path = "../../crates/agentdb-storage" }
 agentdb-wire = { path = "../../crates/agentdb-wire" }
 anyhow = { workspace = true }
 axum = { workspace = true }
+futures-util = "0.3"
 object_store = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

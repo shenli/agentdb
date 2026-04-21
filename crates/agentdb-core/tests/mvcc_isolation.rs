@@ -286,3 +286,53 @@ async fn concurrent_writes_do_not_affect_snapshot_scan() {
     }
     writer.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_and_fetch_round_trips_over_slatedb() {
+    use agentdb_storage::SlateKvStore;
+
+    let obj_dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(
+        SlateKvStore::open(store.clone(), "agentdb/slate")
+            .await
+            .unwrap(),
+    );
+    let reg = Arc::new(BoxRegistry::new(kv.clone(), store, 1).unwrap());
+    let tenants = Arc::new(TenantRegistry::new(kv.clone()));
+    let sessions = Arc::new(SessionRegistry::new(kv));
+
+    for i in 1..=3u64 {
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-1",
+            "s-1",
+            json!({"i": i}),
+            0,
+            i,
+        )
+        .await
+        .unwrap();
+    }
+
+    let box_ = reg.route_tenant("t-1");
+    let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+    let session = sessions
+        .lookup(box_.id, tenant.internal_id, "s-1")
+        .unwrap()
+        .unwrap();
+
+    let ctx = ReadCtx::open(&box_, reg.kv()).unwrap();
+    let events = scan_session_events(&ctx, &session).unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "SlateKvStore backend must round-trip 3 appended events"
+    );
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev.seq, (i as u64) + 1);
+    }
+}
