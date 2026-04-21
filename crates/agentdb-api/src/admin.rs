@@ -7,14 +7,14 @@ use crate::error::ApiError;
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForceTierRequest {
     pub tenant_id: String,
     pub session_id: String,
     pub target: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ForceTierResponse {
     pub tier: String,
 }

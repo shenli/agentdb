@@ -9,13 +9,13 @@ use crate::error::ApiError;
 use crate::stream::StreamEvent;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForkRequest {
     pub tenant_id: String,
     pub new_session_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ForkResponse {
     pub new_session_id: String,
     pub parent_session_id: String,

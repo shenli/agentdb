@@ -9,7 +9,7 @@ use crate::error::ApiError;
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct BoxListItem {
     pub id: u16,
     pub num_tenants: u64,
@@ -19,7 +19,7 @@ pub struct BoxListItem {
     pub webhook_url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct QuotaView {
     pub max_warm_sessions: Option<u64>,
     pub max_qps: Option<u64>,
@@ -96,7 +96,7 @@ pub async fn get_box(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct InjectFaultRequest {
     pub kind: String,
     pub duration_s: u64,
@@ -104,7 +104,7 @@ pub struct InjectFaultRequest {
     pub latency_ms: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct InjectFaultResponse {
     pub ok: bool,
     pub expires_in_s: u64,
@@ -150,7 +150,7 @@ pub async fn inject_fault(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct QuotaRequest {
     #[serde(default)]
     pub max_warm_sessions: Option<u64>,
@@ -191,13 +191,13 @@ pub async fn set_quota(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct WebhookRequest {
     #[serde(default)]
     pub url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct WebhookResponse {
     pub url: Option<String>,
 }

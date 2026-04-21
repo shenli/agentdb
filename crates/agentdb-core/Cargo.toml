@@ -17,6 +17,7 @@ tracing = { workspace = true }
 object_store = { workspace = true }
 bson = { workspace = true }
 futures-util = "0.3"
+utoipa = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

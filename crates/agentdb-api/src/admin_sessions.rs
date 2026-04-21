@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SessionQuery {
     pub tenant_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SessionDetail {
     pub session: Session,
     pub parent_external_id: Option<String>,
