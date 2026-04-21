@@ -152,15 +152,21 @@ Each box runs a `LifecycleEngine` background task that ticks every
 **Pass 2 (cold→archive):** cold sessions idle an additional
 `AGENTDB_T_ARCHIVE_SECS` (default 600s) are flipped to `Tier::Archive`.
 The prototype implements this as a metadata-only flip on the `Session`
-record — the segment stays where it is, and archived sessions remain
-fully queryable via REST `fetch_last_n` and Mongo `find`/`aggregate`.
-A production deployment would use this hook to copy the segment to a
-cheaper object-storage class (S3 Intelligent-Tiering / Glacier
-Instant); that copy is explicitly out of prototype scope.
+record — the segment file stays where it is. A production deployment
+would use this hook to copy the segment to a cheaper object-storage
+class (S3 Intelligent-Tiering / Glacier Instant); that copy is
+explicitly out of prototype scope.
 
-Reads of a cold or archived session automatically go through the
-segment file, concatenated with any WAL events that arrived after the
-segment was written (the merge path).
+Reads of a cold session automatically go through the segment file,
+concatenated with any WAL events that arrived after the segment was
+written (the merge path). **Archive read paths are partial in M12**:
+the over-fetch hybrid-retrieval path (`planner::plan_over_fetch`) does
+resolve hits against the segment for archived sessions, so text and
+vector search that don't pin a single `session_id` still work. But
+`fetch_last_n` on a forked child whose parent is archived returns the
+child's own events only, locality-bound planner calls return empty,
+and Mongo wire `find` on `events` returns empty. Threading segment
+reads through those remaining paths is a follow-up.
 
 An admin endpoint `POST /api/admin/tier/force` can force any tier
 transition (warm↔cold↔archive). Multi-step transitions (warm→archive

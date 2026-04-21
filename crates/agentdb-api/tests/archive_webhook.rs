@@ -148,14 +148,21 @@ async fn archive_roundtrip_fires_webhooks_for_every_step() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    let ev1 = recv_with_timeout(&mut rx)
-        .await
-        .expect("archive→cold webhook");
-    let ev2 = recv_with_timeout(&mut rx).await.expect("cold→warm webhook");
-    assert_eq!(ev1["from"], "archive");
-    assert_eq!(ev1["to"], "cold");
-    assert_eq!(ev2["from"], "cold");
-    assert_eq!(ev2["to"], "warm");
+    // Two fire-and-forget POSTs race; collect both and match by
+    // from/to pair rather than by arrival order.
+    let a = recv_with_timeout(&mut rx).await.expect("step 1 webhook");
+    let b = recv_with_timeout(&mut rx).await.expect("step 2 webhook");
+    let pairs: std::collections::HashSet<(String, String)> = [&a, &b]
+        .iter()
+        .map(|ev| {
+            (
+                ev["from"].as_str().unwrap().to_string(),
+                ev["to"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(pairs.contains(&("archive".into(), "cold".into())));
+    assert!(pairs.contains(&("cold".into(), "warm".into())));
 }
 
 #[tokio::test]

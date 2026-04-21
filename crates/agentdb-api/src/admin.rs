@@ -46,6 +46,14 @@ pub async fn force_tier(
     let guard = box_.write_lock.lock().await;
     // Walk one hop at a time until we reach the target tier. Each hop
     // records metrics, emits SSE, and fires a webhook.
+    //
+    // TODO(m12-followup): if a multi-step transition fails on a later
+    // hop (e.g. warm→cold succeeds, cold→archive errors), the session's
+    // persisted tier has moved but no SSE/webhook fires for any step —
+    // emission happens after the loop. Either emit per-step before
+    // continuing, or roll back the committed hop. Low probability in
+    // practice (cold_to_archive only fails on externally-mutated rows)
+    // but the asymmetry with the sweep path is worth fixing.
     let mut steps: Vec<(Tier, Tier)> = Vec::new();
     loop {
         use agentdb_core::tiering::{
