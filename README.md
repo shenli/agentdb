@@ -1,96 +1,216 @@
 # AgentDB
 
-A prototype agent-native operational database. The premise and design
-motivation are in [docs/agent-db.md](docs/agent-db.md); this repo is
-the showcase-grade prototype of what the primitives look like when
-you actually build them.
+A prototype **agent-native operational database**. The premise and
+design rationale live in [`docs/agent-db.md`](docs/agent-db.md); this
+repo is the showcase-grade prototype of what the primitives look like
+when you actually build them.
 
-## What's here
+> AgentDB is a prototype. It's a single process with a pluggable
+> storage backend, not a distributed system. The goal is to prove the
+> agent-native primitives compose — not to replace your Postgres.
 
-- **Document storage** keyed by tenant + session, served over both
-  native REST and a subset of the MongoDB wire protocol
-- **`append_and_fetch`** — the one-round-trip write primitive that
-  appends an event and returns the last N in the same call
-- **Session fork** — cross-session parent pointer so children see a
-  frozen snapshot of the parent's events at fork time, without
-  copying
-- **Hybrid retrieval** — BM25 text + brute-force vector cosine,
-  planned together with a tenant/session filter
-- **Warm → cold tiering** — a lifecycle engine flushes idle sessions
-  out of KV into object-storage segments, transparent to readers
-- **Per-box isolation** — tenants are routed to boxes via FNV-1a;
-  each box has its own metrics, quota, and fault-injection knob
-- **Live dashboard** — Alpine.js page at `/dashboard` driven by
-  `/api/admin/boxes` + a Server-Sent Events stream of tier changes,
-  forks, fault injections, and per-second metric ticks
-- **Go workload generator** — goroutine-per-tenant persona simulator
-  that drives REST appends and Mongo `$search` aggregations
+---
+
+## What it does differently
+
+| | |
+|---|---|
+| **`append_and_fetch`** | Write one event and return the last N in the same round trip — the hot-path primitive for an agent scribbling context between tool calls. |
+| **Session fork** | Cross-session parent pointer so children see a frozen snapshot of the parent's events at fork time, without copying. MVCC-backed. |
+| **Hybrid retrieval** | BM25 text + HNSW cosine vector search, planned together with a tenant/session filter in one query. |
+| **3-tier lifecycle** | Warm → cold → archive, with a pluggable object store underneath. Tier transitions emit webhooks so you can fan out derived data (summaries, embeddings, archival copies). |
+| **Per-box isolation** | Tenants FNV-route to boxes. Each box has its own metrics, quota, token-bucket admission control, fault injection, webhook URL. |
+| **Pluggable KV** | RocksDB (local disk) or SlateDB (object store — S3 / MinIO). Swap via one env var. |
+| **Live dashboard** | Alpine.js page at `/dashboard`, driven by `/api/admin/boxes` + a Server-Sent Events stream of tier changes, forks, fault injections, rate-limit hits, and per-second metric ticks. |
+
+---
 
 ## Quickstart
 
 ```bash
-# 1. start the database (listens on 7878 REST / 7879 Mongo)
+# 1. Start the server (REST on :7878, Mongo wire on :7879)
 cargo run -p agentdb-server
 
-# 2. in a second terminal, open the dashboard
+# 2. Dashboard
 open http://127.0.0.1:7878/dashboard
 
-# 3. in a third terminal, drive some traffic
+# 3. Drive some synthetic traffic
 cd workload && go run ./cmd/agentdb-workload -config config.yaml
 ```
 
-The dashboard's three demo buttons talk directly to the REST API —
-fork a session, inject a latency fault on box 0, and force a session
-into the cold tier. For scripted traffic shaping, hit the workload's
-control server on `:9090` (`/demo/burst`, `/demo/fork`, `/demo/cold`).
+The dashboard has three demo buttons — fork a session, inject a
+latency fault on box 0, cool a session. For scripted load shaping, hit
+the Go workload's control server on `:9090` (`/demo/burst`,
+`/demo/fork`, `/demo/cold`).
 
-## Dashboard
+### Production shape (SlateDB + S3)
 
-<!-- screenshot placeholder: http://127.0.0.1:7878/dashboard with
-     workload running. The box grid shows warm/cold dots per box;
-     the event feed on the right shows live TierChange / ForkCreated
-     / FaultInjected entries. -->
+```bash
+# Prereqs: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY in env
+AGENTDB_OBJECT_STORE=s3 \
+AGENTDB_S3_BUCKET=my-bucket \
+AGENTDB_S3_REGION=us-east-1 \
+AGENTDB_KV_BACKEND=slatedb \
+AGENTDB_SLATEDB_PATH=agentdb/slate \
+cargo run --release -p agentdb-server
+```
 
-`docs/screenshots/dashboard.png` — not checked in yet; capture one
-with the workload running and drop it here.
+See [`docs/S3.md`](docs/S3.md) for the full MinIO / S3 recipe.
+
+---
+
+## API tour
+
+### REST (native)
+
+```
+POST /api/tenants/{tenant}/sessions/{session}/append_and_fetch
+POST /api/sessions/{session}/fork
+POST /api/admin/tier/force                # target: "warm"|"cold"|"archive"
+POST /api/admin/boxes/:id/inject_fault
+POST /api/admin/boxes/:id/quota           # max_qps, max_tenant_qps, burst, max_warm_sessions
+POST /api/admin/boxes/:id/webhook         # {"url": "..."} or {"url": null}
+GET  /api/admin/boxes                     # per-box snapshot
+GET  /api/admin/boxes/:id
+GET  /api/admin/sessions/:session_id?tenant_id=...
+GET  /api/stream                          # SSE live event feed
+```
+
+### MongoDB wire protocol (OP_MSG subset)
+
+Point an official Mongo driver at `mongodb://127.0.0.1:7879/` and
+use the tenant as your database name:
+
+```js
+// insert
+db.getSiblingDB("t-1").events.insertOne({ session_id: "s-1", kind: "message", text: "hi" })
+
+// find by session
+db.getSiblingDB("t-1").events.find({ session_id: "s-1" }).limit(50)
+
+// hybrid retrieval via $search
+db.getSiblingDB("t-1").events.aggregate([
+  { $search: { text: { path: "payload.text", query: "refund" } } },
+  { $limit: 10 }
+])
+```
+
+Supported commands: `hello`, `insert`, `find`, `aggregate` (with
+`$search`), `listDatabases`. Transactions, updates, and deletes
+return a standard "not implemented" error.
+
+---
+
+## Configuration (env vars)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AGENTDB_ADDR` | `127.0.0.1:7878` | REST bind address |
+| `AGENTDB_MONGO_ADDR` | `127.0.0.1:7879` | Mongo wire bind address |
+| `AGENTDB_BOXES` | `4` | Number of logical boxes (FNV-routed from tenant id) |
+| `AGENTDB_KV_BACKEND` | `rocksdb` | `rocksdb` (local) or `slatedb` (object-store-backed) |
+| `AGENTDB_DATA` | `./data/rocksdb` | RocksDB path (ignored when backend=slatedb) |
+| `AGENTDB_SLATEDB_PATH` | `agentdb/slate` | SlateDB prefix within the object store |
+| `AGENTDB_OBJECT_STORE` | `local` | `local` (filesystem) or `s3` |
+| `AGENTDB_OBJECTS` | `./data/objects` | Local object store root (ignored when `=s3`) |
+| `AGENTDB_S3_BUCKET` | — | Required when `AGENTDB_OBJECT_STORE=s3` |
+| `AGENTDB_S3_REGION` | `us-east-1` | S3 region |
+| `AGENTDB_S3_ENDPOINT` | — | MinIO / custom S3 endpoint (forces path-style) |
+| `AGENTDB_TICK_SECS` | `2` | Lifecycle sweep interval |
+| `AGENTDB_T_COLD_SECS` | `60` | Warm → cold idle threshold |
+| `AGENTDB_T_ARCHIVE_SECS` | `600` | Cold → archive idle threshold |
+| `AGENTDB_SEGMENT_GC_TICK_SECS` | `5` | Segment GC sweep interval |
+| `AGENTDB_SEGMENT_GC_GRACE_SECS` | `30` | Grace period before GC reclaims an unpinned segment |
+| `AGENTDB_TICK_MS` | `1000` | SSE `MetricsTick` broadcast interval |
+| `AGENTDB_HNSW_EF` | `100` | HNSW `ef_construction` + `ef_search` (vector recall knob) |
+
+AWS creds use the standard env chain (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+
+---
 
 ## Repo layout
 
 ```
-bin/agentdb-server           binary: serves HTTP (:7878) + Mongo (:7879)
-crates/agentdb-storage       KvStore trait + RocksDB impl
-crates/agentdb-core          types, primitives, lifecycle, fork, metrics
-crates/agentdb-index         per-box BM25 + cosine vector indexes
+bin/agentdb-server           main binary (serves REST + Mongo wire)
+crates/agentdb-storage       KvStore trait, RocksKvStore, SlateKvStore
+crates/agentdb-core          types, registries, primitives, lifecycle,
+                             fork, tiering, MVCC read contexts, admission
+crates/agentdb-index         per-box BM25 + HNSW vector indexes
 crates/agentdb-wire          MongoDB wire protocol subset (OP_MSG)
-crates/agentdb-api           native REST: append_and_fetch, fork, admin, SSE
+crates/agentdb-api           native REST, SSE, webhook delivery
 crates/agentdb-dashboard     static HTML/CSS/JS for /dashboard
 workload/                    Go workload generator + demo control server
-scripts/smoke.sh             end-to-end health check
-docs/                        design doc, architecture, perf
+scripts/                     smoke.sh, smoke-s3.sh, perf runners
+docs/                        design, architecture, performance, S3 guide
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces
-fit together, and [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for
-numbers from a run on the author's laptop.
+---
+
+## Reading order
+
+- **What the prototype is supposed to be**:
+  [`docs/agent-db.md`](docs/agent-db.md) — requirements, design
+  principles, architecture, implementation trade-offs
+- **What the code actually does today**:
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate layout,
+  request flow, storage layout, per-milestone additions
+- **How fast it runs**:
+  [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — laptop numbers
+  for throughput, vector search, tier transitions, admission
+  overhead, snapshot reads, KV backend comparison
+- **How to deploy against S3 / MinIO**:
+  [`docs/S3.md`](docs/S3.md) — SlateDB + MinIO / S3 walkthrough
+
+---
 
 ## Tests
 
 ```bash
-cargo test --workspace                  # 161 tests, all async-free
+cargo test --workspace                                # ~222 tests across 20 binaries
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-bash scripts/smoke.sh                   # end-to-end: serve, append, fetch dashboard
+bash scripts/smoke.sh                                 # boot server, append, fetch dashboard
+bash scripts/smoke-s3.sh                              # same, but against MinIO + SlateDB
 cd workload && go build ./... && go vet ./...
+cargo bench -p agentdb-index --bench vector_bench     # HNSW vs brute-force vector search
 ```
+
+---
+
+## Dashboard screenshot
+
+<!-- TODO: capture with server running + workload driving traffic.
+     Drop the PNG at docs/screenshots/dashboard.png and reference it
+     here. The box grid shows warm/cold/archive dots per box; the
+     right-side event feed streams TierChange / ForkCreated /
+     FaultInjected / QuotaHit / SegmentGcRun entries. -->
+
+![dashboard](docs/screenshots/dashboard.png)
+
+---
 
 ## Status
 
-Prototype. Every primitive in the design doc that touches a single
-box is implemented; anything that requires real distribution (cross-
-shard transactions, replication, real ANN, global admission control)
-is explicitly out of scope — see the "What the prototype does NOT do"
-section in `docs/ARCHITECTURE.md`.
+Prototype. Every agent-native primitive from the design doc is
+implemented within one box: append-and-fetch, fork, hybrid retrieval,
+three-tier lifecycle, box isolation, admission control, lifecycle
+webhooks, MVCC snapshot reads, and a choice of pluggable KV backend.
+
+**Explicitly out of scope for the prototype:**
+
+- Cross-box (distributed) transactions — design is single-box 2PC-free
+- Replication / HA — single process, no leader election
+- LLM / embedding generation — caller's responsibility, webhook signal only
+- Production-grade auth / quotas / billing — admin endpoints are open
+- Real ANN at 100M+ vectors — HNSW is single-node
+- Fine-grained observability beyond per-box counters + SSE
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §"What the prototype
+does NOT do" for the current limitation list.
+
+---
 
 ## License
 
-MIT OR Apache-2.0 (see [LICENSE](LICENSE)).
+MIT OR Apache-2.0 (see [`LICENSE`](LICENSE)).
