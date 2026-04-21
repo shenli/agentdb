@@ -1,0 +1,3 @@
+datasets>=2.18
+sentence-transformers>=2.6
+numpy>=1.26
