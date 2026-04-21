@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use agentdb_storage::{BoxId, SessionId, TenantId};
+use utoipa::ToSchema;
 
 /// A schema-free document. Backed by serde_json for M2 simplicity;
 /// will move to BSON when the Mongo wire protocol lands in M3.
 pub type Document = serde_json::Value;
 
 /// An append-only record inside a session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Event {
     pub seq: u64,
     /// Unix epoch millis at write time.
@@ -16,7 +17,7 @@ pub struct Event {
 }
 
 /// Lifecycle tier of a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Warm,
@@ -25,7 +26,7 @@ pub enum Tier {
 }
 
 /// Persisted tenant record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Tenant {
     pub internal_id: TenantId,
     pub external_id: String,
@@ -34,7 +35,7 @@ pub struct Tenant {
 }
 
 /// Reference to a parent session in a fork relationship.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ForkRef {
     /// Parent session's *internal* id (same tenant, same box as the child).
     pub parent_session_internal_id: u64,
@@ -44,7 +45,7 @@ pub struct ForkRef {
 }
 
 /// Persisted session record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Session {
     pub internal_id: SessionId,
     pub external_id: String,

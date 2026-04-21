@@ -5,23 +5,36 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::stream::StreamEvent;
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForkRequest {
     pub tenant_id: String,
     pub new_session_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct ForkResponse {
     pub new_session_id: String,
     pub parent_session_id: String,
     pub parent_seq_at_fork: u64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{session_id}/fork",
+    tag = "primitives",
+    params(("session_id" = String, Path, description = "Parent session's external id")),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Child session created", body = ForkResponse),
+        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 404, description = "Parent tenant/session not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+    ),
+)]
 pub async fn fork_handler(
     State(state): State<AppState>,
     Path(parent_session_id): Path<String>,
@@ -40,16 +53,20 @@ pub async fn fork_handler(
         now_millis(),
     ) {
         Ok(s) => s,
-        Err(agentdb_core::Error::TooManyRequests { scope }) => {
+        Err(agentdb_core::Error::TooManyRequests {
+            scope,
+            retry_after_ms,
+        }) => {
             let box_id = state.registry.route_tenant(&body.tenant_id).id;
             state.stream.emit(StreamEvent::QuotaHit {
                 ts_ms: crate::stream::now_ms(),
                 box_id,
-                kind: scope.clone(),
+                kind: scope.as_str().to_string(),
                 tenant: Some(body.tenant_id.clone()),
             });
             return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
                 scope,
+                retry_after_ms,
             }));
         }
         Err(e) => return Err(e.into()),

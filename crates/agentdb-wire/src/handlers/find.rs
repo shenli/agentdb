@@ -26,7 +26,8 @@ pub fn find_response(
     let admit_id = tenant_opt.as_ref().map(|t| t.internal_id).unwrap_or(0);
     box_.admit(admit_id)
         .map_err(|d| agentdb_core::Error::TooManyRequests {
-            scope: d.scope.as_str().into(),
+            scope: d.scope,
+            retry_after_ms: 1000,
         })?;
     let tenant = match tenant_opt {
         Some(t) => t,

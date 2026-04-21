@@ -189,7 +189,10 @@ impl BoxRegistry {
         num_boxes: u16,
     ) -> Result<Self> {
         if num_boxes == 0 {
-            return Err(Error::Invalid("num_boxes must be > 0".into()));
+            return Err(Error::Invalid {
+                field: Some("num_boxes".into()),
+                message: "num_boxes must be > 0".into(),
+            });
         }
         let boxes = (0..num_boxes).map(|i| Arc::new(Box_::new(i))).collect();
         Ok(Self {

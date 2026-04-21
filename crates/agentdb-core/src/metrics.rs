@@ -26,7 +26,7 @@ pub struct BoxMetrics {
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GaugeSnapshot {
     pub warm_sessions: u64,
     pub cold_sessions: u64,
@@ -138,7 +138,7 @@ impl BoxMetrics {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricsSnapshot {
     pub inserts: u64,
     pub queries_find: u64,

@@ -14,7 +14,7 @@ pub mod handlers;
 pub mod stream;
 pub mod webhook;
 
-pub use error::ApiError;
+pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
 #[derive(Clone)]
@@ -25,6 +25,64 @@ pub struct AppState {
     pub stream: StreamBus,
     pub http: reqwest::Client,
 }
+
+/// OpenAPI 3.x spec for the native REST surface. Mongo wire protocol
+/// and SSE event bodies are out of scope (see ARCHITECTURE.md).
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "AgentDB REST API",
+        description = "Agent-native operational database. See docs/agent-db.md for design and docs/ARCHITECTURE.md for implementation.",
+        version = "0.1.0",
+    ),
+    paths(
+        handlers::append_and_fetch,
+        fork::fork_handler,
+        admin::force_tier,
+        admin_boxes::list_boxes,
+        admin_boxes::get_box,
+        admin_boxes::inject_fault,
+        admin_boxes::set_quota,
+        admin_boxes::set_webhook,
+        admin_sessions::get_session,
+        stream::sse_handler,
+    ),
+    components(schemas(
+        dto::AppendAndFetchRequest,
+        dto::AppendAndFetchResponse,
+        dto::EventDto,
+        admin::ForceTierRequest,
+        admin::ForceTierResponse,
+        admin_boxes::BoxListItem,
+        admin_boxes::QuotaView,
+        admin_boxes::InjectFaultRequest,
+        admin_boxes::InjectFaultResponse,
+        admin_boxes::QuotaRequest,
+        admin_boxes::WebhookRequest,
+        admin_boxes::WebhookResponse,
+        admin_sessions::SessionQuery,
+        admin_sessions::SessionDetail,
+        fork::ForkRequest,
+        fork::ForkResponse,
+        stream::StreamEvent,
+        stream::TickBox,
+        error::ErrorResponse,
+        error::ErrorCode,
+        error::ErrorKind,
+        agentdb_core::MetricsSnapshot,
+        agentdb_core::GaugeSnapshot,
+        agentdb_core::Session,
+        agentdb_core::Event,
+        agentdb_core::ForkRef,
+        agentdb_core::Tier,
+    )),
+    tags(
+        (name = "primitives", description = "Agent-native write and read primitives"),
+        (name = "admin", description = "Operator-only endpoints (no agent exposure)"),
+        (name = "stream", description = "Server-Sent Events"),
+    ),
+)]
+pub struct ApiDoc;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -65,6 +123,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(admin_sessions::get_session),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
+        .route("/openapi.json", axum::routing::get(openapi_json))
         .nest_service("/dashboard", agentdb_dashboard::router())
         .with_state(state)
+}
+
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    use utoipa::OpenApi;
+    axum::Json(ApiDoc::openapi())
 }

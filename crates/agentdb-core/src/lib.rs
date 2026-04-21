@@ -20,7 +20,7 @@ pub mod types;
 
 pub use admission::{AdmissionDenied, Scope, TokenBucket};
 pub use box_runtime::{BoxRegistry, Box_, FaultKind, InjectedFault, Quota};
-pub use error::{Error, Result};
+pub use error::{Error, Resource, Result};
 pub use fork::fork_session;
 pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};

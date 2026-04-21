@@ -3,20 +3,33 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::AppState;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SessionQuery {
     pub tenant_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SessionDetail {
     pub session: Session,
     pub parent_external_id: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/sessions/{session_id}",
+    tag = "admin",
+    params(
+        ("session_id" = String, Path, description = "External session id"),
+        ("tenant_id" = String, Query, description = "Tenant that owns the session"),
+    ),
+    responses(
+        (status = 200, body = SessionDetail),
+        (status = 404, description = "Tenant or session not found", body = ErrorResponse),
+    ),
+)]
 pub async fn get_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -26,11 +39,17 @@ pub async fn get_session(
     let tenant = state
         .tenants
         .lookup(box_.id, &q.tenant_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("tenant {} not found", q.tenant_id)))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Tenant,
+            id: q.tenant_id.clone(),
+        })?;
     let session = state
         .sessions
         .lookup(box_.id, tenant.internal_id, &session_id)?
-        .ok_or_else(|| ApiError::BadRequest(format!("session {session_id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Session,
+            id: session_id.clone(),
+        })?;
     let parent_external_id = match &session.forked_from {
         Some(fork) => state
             .sessions

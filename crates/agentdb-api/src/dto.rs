@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct AppendAndFetchRequest {
     pub event: serde_json::Value,
     #[serde(default)]
     pub fetch_last_n: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct AppendAndFetchResponse {
     pub seq: u64,
     pub recent: Vec<EventDto>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct EventDto {
     pub seq: u64,
     pub ts: u64,

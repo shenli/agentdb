@@ -5,11 +5,11 @@ use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorResponse};
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct BoxListItem {
     pub id: u16,
     pub num_tenants: u64,
@@ -19,7 +19,7 @@ pub struct BoxListItem {
     pub webhook_url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct QuotaView {
     pub max_warm_sessions: Option<u64>,
     pub max_qps: Option<u64>,
@@ -27,6 +27,14 @@ pub struct QuotaView {
     pub burst: Option<u64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/boxes",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Per-box snapshot", body = Vec<BoxListItem>),
+    ),
+)]
 pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxListItem>>, ApiError> {
     let mut out = Vec::new();
     for i in 0..state.registry.num_boxes() {
@@ -60,6 +68,16 @@ pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxLis
     Ok(Json(out))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/boxes/{id}",
+    tag = "admin",
+    params(("id" = u16, Path, description = "Box id")),
+    responses(
+        (status = 200, body = BoxListItem),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn get_box(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -67,7 +85,10 @@ pub async fn get_box(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     let tenants = state.tenants.list_in_box(id)?.len() as u64;
     let metrics = b.metrics.snapshot();
     let q = *b.quota.read();
@@ -93,7 +114,7 @@ pub async fn get_box(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct InjectFaultRequest {
     pub kind: String,
     pub duration_s: u64,
@@ -101,12 +122,24 @@ pub struct InjectFaultRequest {
     pub latency_ms: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct InjectFaultResponse {
     pub ok: bool,
     pub expires_in_s: u64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/inject_fault",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = InjectFaultRequest,
+    responses(
+        (status = 200, body = InjectFaultResponse),
+        (status = 400, description = "Unknown fault kind", body = ErrorResponse),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn inject_fault(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -115,16 +148,21 @@ pub async fn inject_fault(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     let kind = match body.kind.to_ascii_lowercase().as_str() {
         "latency" => FaultKind::Latency {
             ms: body.latency_ms.unwrap_or(200),
         },
         "error" => FaultKind::Error,
         other => {
-            return Err(ApiError::BadRequest(format!(
-                "unknown fault kind {other}; expected 'latency' or 'error'"
-            )));
+            return Err(agentdb_core::Error::Invalid {
+                field: Some("kind".into()),
+                message: format!("unknown fault kind '{other}'; expected 'latency' or 'error'"),
+            }
+            .into());
         }
     };
     let expires_at = Instant::now() + Duration::from_secs(body.duration_s);
@@ -142,7 +180,7 @@ pub async fn inject_fault(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct QuotaRequest {
     #[serde(default)]
     pub max_warm_sessions: Option<u64>,
@@ -154,6 +192,17 @@ pub struct QuotaRequest {
     pub burst: Option<u64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/quota",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = QuotaRequest,
+    responses(
+        (status = 200, body = QuotaView),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn set_quota(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -162,7 +211,10 @@ pub async fn set_quota(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     {
         let mut q = b.quota.write();
         q.max_warm_sessions = body.max_warm_sessions;
@@ -180,17 +232,29 @@ pub async fn set_quota(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct WebhookRequest {
     #[serde(default)]
     pub url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct WebhookResponse {
     pub url: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/boxes/{id}/webhook",
+    tag = "admin",
+    params(("id" = u16, Path)),
+    request_body = WebhookRequest,
+    responses(
+        (status = 200, body = WebhookResponse),
+        (status = 400, description = "Invalid URL", body = ErrorResponse),
+        (status = 404, description = "Box not found", body = ErrorResponse),
+    ),
+)]
 pub async fn set_webhook(
     State(state): State<AppState>,
     Path(id): Path<u16>,
@@ -199,12 +263,17 @@ pub async fn set_webhook(
     let b = state
         .registry
         .box_by_id(id)
-        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
     if let Some(ref u) = body.url {
         if !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err(ApiError::BadRequest(format!(
-                "webhook url must start with http:// or https:// (got {u})"
-            )));
+            return Err(agentdb_core::Error::Invalid {
+                field: Some("url".into()),
+                message: format!("webhook url must start with http:// or https:// (got {u})"),
+            }
+            .into());
         }
     }
     *b.webhook.write() = body.url.clone();

@@ -261,7 +261,8 @@ mod tests {
     #[test]
     fn too_many_requests_maps_to_code_82() {
         let err = WireError::Core(agentdb_core::Error::TooManyRequests {
-            scope: "tenant".into(),
+            scope: agentdb_core::Scope::Tenant,
+            retry_after_ms: 1000,
         });
         let d = error_reply(&err);
         assert_eq!(d.get_i32("code").unwrap(), 82);

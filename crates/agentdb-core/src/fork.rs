@@ -27,22 +27,30 @@ pub fn fork_session(
     let box_ = registry.route_tenant(tenant_external);
     let tenant = tenants
         .lookup(box_.id, tenant_external)?
-        .ok_or_else(|| Error::NotFound(format!("tenant {tenant_external}")))?;
+        .ok_or_else(|| Error::NotFound {
+            resource: crate::error::Resource::Tenant,
+            id: tenant_external.into(),
+        })?;
     box_.admit(tenant.internal_id)
         .map_err(|d| Error::TooManyRequests {
-            scope: d.scope.as_str().into(),
+            scope: d.scope,
+            retry_after_ms: 1000,
         })?;
     let parent = sessions
         .lookup(box_.id, tenant.internal_id, parent_session_external)?
-        .ok_or_else(|| Error::NotFound(format!("parent session {parent_session_external}")))?;
+        .ok_or_else(|| Error::NotFound {
+            resource: crate::error::Resource::Session,
+            id: parent_session_external.into(),
+        })?;
 
     if sessions
         .lookup(box_.id, tenant.internal_id, new_session_external)?
         .is_some()
     {
-        return Err(Error::Invalid(format!(
-            "target session {new_session_external} already exists"
-        )));
+        return Err(Error::Invalid {
+            field: Some("new_session_id".into()),
+            message: format!("target session '{new_session_external}' already exists"),
+        });
     }
 
     let fork_ref = ForkRef {
@@ -134,7 +142,13 @@ mod tests {
             &registry, &tenants, &sessions, &guard, "t-1", "nope", "child", 0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("parent session"));
+        assert!(matches!(
+            err,
+            Error::NotFound {
+                resource: crate::error::Resource::Session,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

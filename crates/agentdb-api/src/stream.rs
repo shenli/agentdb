@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "event")]
 pub enum StreamEvent {
     MetricsTick {
@@ -50,7 +50,7 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TickBox {
     pub id: u16,
     pub warm_sessions: u64,
@@ -98,6 +98,16 @@ impl Default for StreamBus {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/stream",
+    tag = "stream",
+    responses(
+        (status = 200, description = "Server-Sent Events stream of StreamEvent payloads. \
+            OpenAPI does not model event streams well; see the StreamEvent schema \
+            for the shape of each emitted event."),
+    ),
+)]
 pub async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
