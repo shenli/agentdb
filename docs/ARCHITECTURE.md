@@ -81,6 +81,15 @@ event/{box_id}/{tenant_internal}/{session_internal}/{branch}/{seq} -> Event
 segment/{box_id}/{tenant_internal}/{session_internal}/{branch} -> SegmentFile
 ```
 
+## Pluggable KV backend
+
+The `KvStore` trait lives in `crates/agentdb-storage`. The default
+implementation is `RocksKvStore` (local disk). A second
+implementation, `SlateKvStore`, writes to an `object_store` backend
+and enables running AgentDB against S3. Pick via
+`AGENTDB_KV_BACKEND=rocksdb|slatedb`. See `docs/S3.md` for the S3
+deployment walkthrough.
+
 Indexes are NOT stored in RocksDB. `PerBoxIndexes` is built lazily per
 box by walking all events (warm KV + cold segment files) on the first
 query and cached until server restart. New events appended after the
@@ -219,8 +228,11 @@ intentionally cuts these:
 
 - **No real distributed KV.** RocksDB is a single-node store;
   "box" is a logical partition, not a shard.
-- **No real object-store scaling.** The object_store crate abstracts it
-  but the prototype writes to a local directory.
+- **Single-node writer model.** The `object_store` crate now supports
+  S3 end-to-end via the `SlateKvStore` backend
+  (`AGENTDB_KV_BACKEND=slatedb AGENTDB_OBJECT_STORE=s3`), but AgentDB
+  still assumes a single writer per box — multi-node coordination,
+  write fencing, and leader election are not implemented.
 - **ANN is in-memory and non-persistent.** HNSW via `instant-distance`
   is built lazily per box on first query and rebuilt from scratch on
   server restart. Incremental updates and persisted snapshots are

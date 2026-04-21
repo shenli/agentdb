@@ -171,6 +171,27 @@ single-mutex tenant-map becomes a bottleneck, which is above this
 prototype's scale. A follow-up milestone could shard to `DashMap` or
 per-tenant atomics if that changes.
 
+## Storage backend comparison (M11)
+
+Measured on the criterion benches in
+`crates/agentdb-core/benches/mvcc_bench.rs` with a session containing
+1000 events, both backends pointed at local disk (RocksDB on SSD,
+SlateDB on `object_store::local::LocalFileSystem`):
+
+| operation | RocksDB | SlateDB (LocalFileSystem) |
+|---|---|---|
+| `ReadCtx::open` + scan 1000 events | ~196 µs | ~527 µs (≈2.7×) |
+
+AWS S3 figures are not measured in CI; add ~10–30 ms per object-store
+round-trip to the SlateDB column as a rough production estimate.
+
+Interpretation: SlateDB on LocalFileSystem is about 2.7× slower than
+RocksDB — expected overhead for async-over-sync bridging plus the
+LSM layering. Both remain well within the agent-workload tail-latency
+budget from `docs/agent-db.md` §1.1. The throughput cost is mostly
+in the fixed per-call overhead of the sync→async bridge, not the
+scan itself, so larger scans close the gap.
+
 ## Gotchas
 
 **HTTP keep-alive is not optional.** The Go probe originally closed
