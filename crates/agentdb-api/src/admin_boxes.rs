@@ -174,3 +174,34 @@ pub async fn set_quota(
         burst: q.burst,
     }))
 }
+
+#[derive(Deserialize)]
+pub struct WebhookRequest {
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WebhookResponse {
+    pub url: Option<String>,
+}
+
+pub async fn set_webhook(
+    State(state): State<AppState>,
+    Path(id): Path<u16>,
+    Json(body): Json<WebhookRequest>,
+) -> Result<Json<WebhookResponse>, ApiError> {
+    let b = state
+        .registry
+        .box_by_id(id)
+        .ok_or_else(|| ApiError::BadRequest(format!("box {id} not found")))?;
+    if let Some(ref u) = body.url {
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err(ApiError::BadRequest(format!(
+                "webhook url must start with http:// or https:// (got {u})"
+            )));
+        }
+    }
+    *b.webhook.write() = body.url.clone();
+    Ok(Json(WebhookResponse { url: body.url }))
+}

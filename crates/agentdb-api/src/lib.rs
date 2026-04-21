@@ -57,6 +57,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(admin_boxes::set_quota),
         )
         .route(
+            "/api/admin/boxes/:id/webhook",
+            axum::routing::post(admin_boxes::set_webhook),
+        )
+        .route(
             "/api/admin/sessions/:session_id",
             axum::routing::get(admin_sessions::get_session),
         )

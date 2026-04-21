@@ -1,4 +1,3 @@
-use agentdb_core::tiering::{cold_transition, reactivate};
 use agentdb_core::types::Tier;
 use axum::extract::State;
 use axum::Json;
@@ -26,17 +25,15 @@ pub async fn force_tier(
 ) -> Result<Json<ForceTierResponse>, ApiError> {
     let target = body.target.to_ascii_lowercase();
     match target.as_str() {
-        "warm" | "cold" => {}
+        "warm" | "cold" | "archive" => {}
         other => {
             return Err(ApiError::BadRequest(format!(
-                "unsupported target tier {other}; expected 'warm' or 'cold'"
+                "unsupported target tier {other}; expected 'warm' | 'cold' | 'archive'"
             )));
         }
     }
 
     let box_ = state.registry.route_tenant(&body.tenant_id);
-    // Admin endpoint: do NOT silently mint unknown tenants. A typo should 400,
-    // not create a phantom tenant entry.
     let tenant = state
         .tenants
         .lookup(box_.id, &body.tenant_id)?
@@ -47,58 +44,102 @@ pub async fn force_tier(
         .ok_or_else(|| ApiError::BadRequest(format!("session {} not found", body.session_id)))?;
 
     let guard = box_.write_lock.lock().await;
-    let mut transition: Option<(&'static str, &'static str)> = None;
-    match target.as_str() {
-        "cold" if session.tier == Tier::Warm => {
-            cold_transition(
-                state.registry.kv(),
-                state.registry.object_store(),
-                &state.sessions,
-                &guard,
-                &mut session,
-            )
-            .await?;
-            box_.metrics.record_tier_transition();
-            box_.metrics.drop_tier(Tier::Warm);
-            box_.metrics.bump_tier(Tier::Cold);
-            transition = Some(("warm", "cold"));
+    // Walk one hop at a time until we reach the target tier. Each hop
+    // records metrics, emits SSE, and fires a webhook.
+    let mut steps: Vec<(Tier, Tier)> = Vec::new();
+    loop {
+        use agentdb_core::tiering::{archive_to_cold, cold_to_archive, cold_transition, reactivate};
+        let from = session.tier;
+        let done = match (from, target.as_str()) {
+            (Tier::Warm, "cold") => {
+                cold_transition(
+                    state.registry.kv(),
+                    state.registry.object_store(),
+                    &state.sessions,
+                    &guard,
+                    &mut session,
+                )
+                .await?;
+                steps.push((Tier::Warm, Tier::Cold));
+                true
+            }
+            (Tier::Warm, "archive") => {
+                cold_transition(
+                    state.registry.kv(),
+                    state.registry.object_store(),
+                    &state.sessions,
+                    &guard,
+                    &mut session,
+                )
+                .await?;
+                steps.push((Tier::Warm, Tier::Cold));
+                false
+            }
+            (Tier::Cold, "archive") => {
+                cold_to_archive(&state.sessions, &guard, &mut session).await?;
+                steps.push((Tier::Cold, Tier::Archive));
+                true
+            }
+            (Tier::Cold, "warm") => {
+                reactivate(
+                    state.registry.kv(),
+                    state.registry.object_store(),
+                    &state.sessions,
+                    &guard,
+                    &mut session,
+                )
+                .await?;
+                steps.push((Tier::Cold, Tier::Warm));
+                true
+            }
+            (Tier::Archive, "cold") => {
+                archive_to_cold(&state.sessions, &guard, &mut session).await?;
+                steps.push((Tier::Archive, Tier::Cold));
+                true
+            }
+            (Tier::Archive, "warm") => {
+                archive_to_cold(&state.sessions, &guard, &mut session).await?;
+                steps.push((Tier::Archive, Tier::Cold));
+                false
+            }
+            _ => true, // already at target — no-op
+        };
+        if done {
+            break;
         }
-        "cold" => { /* already cold — no-op */ }
-        "warm" if session.tier == Tier::Cold => {
-            reactivate(
-                state.registry.kv(),
-                state.registry.object_store(),
-                &state.sessions,
-                &guard,
-                &mut session,
-            )
-            .await?;
-            box_.metrics.record_tier_transition();
-            box_.metrics.drop_tier(Tier::Cold);
-            box_.metrics.bump_tier(Tier::Warm);
-            transition = Some(("cold", "warm"));
-        }
-        "warm" => { /* already warm — no-op */ }
-        _ => unreachable!(),
     }
     drop(guard);
 
-    if let Some((from, to)) = transition {
+    for &(from, to) in &steps {
+        box_.metrics.record_tier_transition();
+        box_.metrics.drop_tier(from);
+        box_.metrics.bump_tier(to);
         state.stream.emit(StreamEvent::TierChange {
             ts_ms: now_ms(),
             box_id: box_.id,
             session_id: body.session_id.clone(),
-            from: from.into(),
-            to: to.into(),
+            from: tier_str(from).into(),
+            to: tier_str(to).into(),
         });
+        crate::webhook::fire_tier_change(
+            &state.http,
+            &box_,
+            &body.tenant_id,
+            session.clone(),
+            from,
+            to,
+        );
     }
 
-    let tier_str = match session.tier {
+    Ok(Json(ForceTierResponse {
+        tier: tier_str(session.tier).into(),
+    }))
+}
+
+fn tier_str(t: Tier) -> &'static str {
+    match t {
         Tier::Warm => "warm",
         Tier::Cold => "cold",
         Tier::Archive => "archive",
-    };
-    Ok(Json(ForceTierResponse {
-        tier: tier_str.into(),
-    }))
+    }
 }
