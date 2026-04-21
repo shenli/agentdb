@@ -103,7 +103,8 @@ impl SlateKvStore {
             let out = fut.await;
             let _ = tx.send(out);
         });
-        rx.recv().expect("slatedb bridge task dropped before sending")
+        rx.recv()
+            .expect("slatedb bridge task dropped before sending")
     }
 }
 
@@ -357,13 +358,24 @@ mod tests {
         kv.put(b"drop", b"pre-drop").unwrap();
 
         kv.write_batch(vec![
-            WriteOp::Put { key: b"keep".to_vec(), value: b"post-keep".to_vec() },
-            WriteOp::Delete { key: b"drop".to_vec() },
-            WriteOp::Put { key: b"new".to_vec(), value: b"new".to_vec() },
+            WriteOp::Put {
+                key: b"keep".to_vec(),
+                value: b"post-keep".to_vec(),
+            },
+            WriteOp::Delete {
+                key: b"drop".to_vec(),
+            },
+            WriteOp::Put {
+                key: b"new".to_vec(),
+                value: b"new".to_vec(),
+            },
         ])
         .unwrap();
 
-        assert_eq!(kv.get(b"keep").unwrap().as_deref(), Some(b"post-keep".as_ref()));
+        assert_eq!(
+            kv.get(b"keep").unwrap().as_deref(),
+            Some(b"post-keep".as_ref())
+        );
         assert_eq!(kv.get(b"drop").unwrap(), None);
         assert_eq!(kv.get(b"new").unwrap().as_deref(), Some(b"new".as_ref()));
     }

@@ -23,23 +23,19 @@ use tracing_subscriber::EnvFilter;
 /// (default `us-east-1`), and `AGENTDB_S3_ENDPOINT` (optional, used for
 /// MinIO/other S3-compatible hosts — turns on HTTP + path-style addressing).
 /// Standard AWS creds via the env chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
-async fn build_object_store(
-    objects_dir: &std::path::Path,
-) -> anyhow::Result<Arc<dyn ObjectStore>> {
+async fn build_object_store(objects_dir: &std::path::Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
     let kind = std::env::var("AGENTDB_OBJECT_STORE").unwrap_or_else(|_| "local".into());
     let store: Arc<dyn ObjectStore> = match kind.as_str() {
         "local" => {
             std::fs::create_dir_all(objects_dir).context("create objects dir")?;
             Arc::new(
-                LocalFileSystem::new_with_prefix(objects_dir)
-                    .context("open local object store")?,
+                LocalFileSystem::new_with_prefix(objects_dir).context("open local object store")?,
             )
         }
         "s3" => {
             let bucket = std::env::var("AGENTDB_S3_BUCKET")
                 .context("AGENTDB_S3_BUCKET is required when AGENTDB_OBJECT_STORE=s3")?;
-            let region = std::env::var("AGENTDB_S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".into());
+            let region = std::env::var("AGENTDB_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
             let mut builder = AmazonS3Builder::from_env()
                 .with_bucket_name(&bucket)
                 .with_region(&region);
@@ -53,9 +49,7 @@ async fn build_object_store(
             }
             Arc::new(builder.build().context("build AmazonS3")?)
         }
-        other => anyhow::bail!(
-            "unknown AGENTDB_OBJECT_STORE={other}; expected local|s3"
-        ),
+        other => anyhow::bail!("unknown AGENTDB_OBJECT_STORE={other}; expected local|s3"),
     };
 
     // Liveness probe: single list call under `agentdb/`. A local FS tempdir
@@ -159,11 +153,13 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&data_dir).context("create data dir")?;
             Arc::new(RocksKvStore::open(&data_dir).context("open rocksdb")?)
         }
-        Ok(other) => anyhow::bail!(
-            "unknown AGENTDB_KV_BACKEND={other}; expected rocksdb|slatedb"
-        ),
+        Ok(other) => anyhow::bail!("unknown AGENTDB_KV_BACKEND={other}; expected rocksdb|slatedb"),
     };
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), object_store.clone(), num_boxes)?);
+    let registry = Arc::new(BoxRegistry::new(
+        kv.clone(),
+        object_store.clone(),
+        num_boxes,
+    )?);
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
 
