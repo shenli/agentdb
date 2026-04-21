@@ -74,6 +74,14 @@ async fn build_object_store(objects_dir: &std::path::Path) -> anyhow::Result<Arc
     Ok(store)
 }
 
+fn tier_name(t: agentdb_core::Tier) -> &'static str {
+    match t {
+        agentdb_core::Tier::Warm => "warm",
+        agentdb_core::Tier::Cold => "cold",
+        agentdb_core::Tier::Archive => "archive",
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -114,6 +122,12 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+        ),
+        t_archive: Duration::from_secs(
+            std::env::var("AGENTDB_T_ARCHIVE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
         ),
     };
     let segment_gc_cfg = SegmentGcConfig {
@@ -163,6 +177,41 @@ async fn main() -> anyhow::Result<()> {
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
 
+    let stream = StreamBus::default();
+
+    let http_client = agentdb_api::webhook::new_client();
+
+    let hook: agentdb_core::lifecycle::TierChangeHook = {
+        let http = http_client.clone();
+        let stream_for_hook = stream.clone();
+        let tenants_for_hook = tenants.clone();
+        std::sync::Arc::new(move |box_, session, from, to| {
+            let tenant_external = tenants_for_hook
+                .lookup_by_internal(box_.id, session.tenant_internal_id)
+                .ok()
+                .flatten()
+                .map(|t| t.external_id)
+                .unwrap_or_else(|| format!("tenant-{}", session.tenant_internal_id));
+
+            stream_for_hook.emit(StreamEvent::TierChange {
+                ts_ms: now_ms(),
+                box_id: box_.id,
+                session_id: session.external_id.clone(),
+                from: tier_name(from).into(),
+                to: tier_name(to).into(),
+            });
+
+            agentdb_api::webhook::fire_tier_change(
+                &http,
+                box_,
+                &tenant_external,
+                session,
+                from,
+                to,
+            );
+        })
+    };
+
     // Spin up one lifecycle engine per box. Engine handles are intentionally
     // leaked for the life of the process — shutdown is process exit.
     let mut engines: Vec<LifecycleEngine> = Vec::with_capacity(num_boxes as usize);
@@ -175,11 +224,10 @@ async fn main() -> anyhow::Result<()> {
             sessions.clone(),
             box_,
             lifecycle_cfg,
+            Some(hook.clone()),
         ));
     }
     std::mem::forget(engines);
-
-    let stream = StreamBus::default();
 
     // M9: closure that emits SegmentGcRun on SSE when GC reclaims segments.
     let reporter: GcRunReporter = {
@@ -214,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: stream.clone(),
+        http: http_client.clone(),
     };
     let wire_state = WireState {
         registry: registry.clone(),

@@ -168,6 +168,45 @@ pub async fn reactivate(
     Ok(())
 }
 
+/// Relabel a cold session as archived. Metadata-only: the segment
+/// stays where it is. The caller holds the box write lock.
+///
+/// Returns an error only if the session isn't currently `Cold`.
+pub async fn cold_to_archive(
+    sessions: &crate::registry::SessionRegistry,
+    _guard: &tokio::sync::MutexGuard<'_, ()>,
+    session: &mut crate::types::Session,
+) -> crate::error::Result<()> {
+    if session.tier != crate::types::Tier::Cold {
+        return Err(crate::error::Error::Invalid(format!(
+            "session {} is not cold (is {:?}); cannot archive",
+            session.external_id, session.tier
+        )));
+    }
+    session.tier = crate::types::Tier::Archive;
+    sessions.save(session)?;
+    Ok(())
+}
+
+/// Un-archive: relabel as cold. Metadata-only. Caller holds the box
+/// write lock. From cold, a subsequent `reactivate` call can pull
+/// events back to warm.
+pub async fn archive_to_cold(
+    sessions: &crate::registry::SessionRegistry,
+    _guard: &tokio::sync::MutexGuard<'_, ()>,
+    session: &mut crate::types::Session,
+) -> crate::error::Result<()> {
+    if session.tier != crate::types::Tier::Archive {
+        return Err(crate::error::Error::Invalid(format!(
+            "session {} is not archived (is {:?}); cannot un-archive",
+            session.external_id, session.tier
+        )));
+    }
+    session.tier = crate::types::Tier::Cold;
+    sessions.save(session)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +422,96 @@ mod tests {
     #[allow(dead_code)]
     fn _use_ctx(ctx: &Ctx) {
         let _ = (&ctx.registry, &ctx.tenants);
+    }
+
+    #[tokio::test]
+    async fn cold_to_archive_flips_tier_only() {
+        use crate::types::Tier;
+        let (ctx, mut session) = seed("archive me", "s-arch-1").await;
+        let box_ = ctx.registry.route_tenant("t-1");
+        // First transition to Cold
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_transition(
+                ctx.registry.kv(),
+                ctx.registry.object_store(),
+                &ctx.sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(session.tier, Tier::Cold);
+        let segment_path_before = session.segment_path.clone();
+        assert!(segment_path_before.is_some());
+
+        // Now archive
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_to_archive(&ctx.sessions, &guard, &mut session)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(session.tier, Tier::Archive);
+        // Segment path must be unchanged — metadata-only operation
+        assert_eq!(session.segment_path, segment_path_before);
+    }
+
+    #[tokio::test]
+    async fn archive_to_cold_flips_tier_only() {
+        use crate::types::Tier;
+        let (ctx, mut session) = seed("unarchive me", "s-arch-2").await;
+        let box_ = ctx.registry.route_tenant("t-1");
+        // Transition Warm -> Cold -> Archive
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_transition(
+                ctx.registry.kv(),
+                ctx.registry.object_store(),
+                &ctx.sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let guard = box_.write_lock.lock().await;
+            cold_to_archive(&ctx.sessions, &guard, &mut session)
+                .await
+                .unwrap();
+        }
+        assert_eq!(session.tier, Tier::Archive);
+        let segment_path_before = session.segment_path.clone();
+        assert!(segment_path_before.is_some());
+
+        // Un-archive back to Cold
+        {
+            let guard = box_.write_lock.lock().await;
+            archive_to_cold(&ctx.sessions, &guard, &mut session)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(session.tier, Tier::Cold);
+        // Segment path must be unchanged — metadata-only operation
+        assert_eq!(session.segment_path, segment_path_before);
+    }
+
+    #[tokio::test]
+    async fn cold_to_archive_rejects_non_cold() {
+        // A freshly seeded session is Warm; cold_to_archive should return Err
+        let (ctx, mut session) = seed("reject me", "s-arch-3").await;
+        let box_ = ctx.registry.route_tenant("t-1");
+        let guard = box_.write_lock.lock().await;
+        let err = cold_to_archive(&ctx.sessions, &guard, &mut session)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not cold"),
+            "unexpected error: {err}"
+        );
     }
 }

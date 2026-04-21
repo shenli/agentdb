@@ -12,6 +12,7 @@ pub mod error;
 pub mod fork;
 pub mod handlers;
 pub mod stream;
+pub mod webhook;
 
 pub use error::ApiError;
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
@@ -22,6 +23,7 @@ pub struct AppState {
     pub tenants: Arc<agentdb_core::TenantRegistry>,
     pub sessions: Arc<agentdb_core::SessionRegistry>,
     pub stream: StreamBus,
+    pub http: reqwest::Client,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -53,6 +55,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/boxes/:id/quota",
             axum::routing::post(admin_boxes::set_quota),
+        )
+        .route(
+            "/api/admin/boxes/:id/webhook",
+            axum::routing::post(admin_boxes::set_webhook),
         )
         .route(
             "/api/admin/sessions/:session_id",

@@ -134,12 +134,13 @@ range never change (the segment behind them is immutable). A write to
 the parent after fork never affects the child's view — the child's
 `parent_seq_at_fork` is frozen at fork time.
 
-## Lifecycle: warm → cold
+## Lifecycle: warm → cold → archive
 
 Each box runs a `LifecycleEngine` background task that ticks every
-`AGENTDB_TICK_SECS` (default 2s). On each tick it scans sessions in
-the box and demotes sessions whose `last_active_at` is older than
-`AGENTDB_T_COLD_SECS` (default 60s):
+`AGENTDB_TICK_SECS` (default 2s). Two sweep passes per tick:
+
+**Pass 1 (warm→cold):** sessions idle longer than `AGENTDB_T_COLD_SECS`
+(default 60s) are demoted:
 
 1. Collect all live events from KV into a `SegmentFile` (protobuf-ish
    binary with schema version tag).
@@ -148,13 +149,29 @@ the box and demotes sessions whose `last_active_at` is older than
 3. Delete the per-event KV entries.
 4. Update the session record: `tier = Cold`, `segment_path` set.
 
+**Pass 2 (cold→archive):** cold sessions idle an additional
+`AGENTDB_T_ARCHIVE_SECS` (default 600s) are flipped to `Tier::Archive`.
+The prototype implements this as a metadata-only flip on the `Session`
+record — the segment file stays where it is. A production deployment
+would use this hook to copy the segment to a cheaper object-storage
+class (S3 Intelligent-Tiering / Glacier Instant); that copy is
+explicitly out of prototype scope.
+
 Reads of a cold session automatically go through the segment file,
 concatenated with any WAL events that arrived after the segment was
-written (the merge path).
+written (the merge path). **Archive read paths are partial in M12**:
+the over-fetch hybrid-retrieval path (`planner::plan_over_fetch`) does
+resolve hits against the segment for archived sessions, so text and
+vector search that don't pin a single `session_id` still work. But
+`fetch_last_n` on a forked child whose parent is archived returns the
+child's own events only, locality-bound planner calls return empty,
+and Mongo wire `find` on `events` returns empty. Threading segment
+reads through those remaining paths is a follow-up.
 
-An admin endpoint `POST /api/admin/tier/force` can force either
-direction — used by the dashboard "Cool session" button and by tests
-that need deterministic tier timing.
+An admin endpoint `POST /api/admin/tier/force` can force any tier
+transition (warm↔cold↔archive). Multi-step transitions (warm→archive
+or archive→warm) walk one hop at a time and emit one SSE `TierChange`
+event + one webhook per hop.
 
 ## Hybrid retrieval
 
@@ -237,7 +254,11 @@ intentionally cuts these:
   is built lazily per box on first query and rebuilt from scratch on
   server restart. Incremental updates and persisted snapshots are
   future work.
-- **No LLM hooks, no lifecycle webhooks, no derived-data pipeline.**
+- **Lifecycle webhooks** fire fire-and-forget HTTP POSTs on every
+  tier transition (per-box URL via `POST /api/admin/boxes/:id/webhook`,
+  no retries, 5s timeout, no auth beyond HTTPS). LLM hooks and
+  derivative-data pipelines are out of scope — the integrator runs
+  them behind the webhook.
 - **No Percolator / 2PC.** Transactions are single-box, single-lock.
 - **Admission control is token-bucket based and process-local.**
   Per-box and per-tenant-in-box QPS + burst via `Quota.max_qps` /
