@@ -31,6 +31,8 @@
               <span class="warm" x-text="b.warm_sessions || 0"></span> warm
               /
               <span class="cold" x-text="b.cold_sessions || 0"></span> cold
+              /
+              <span class="archive" x-text="b.archive_sessions || 0"></span> archive
             </div>
             <div class="dots">
               <template x-for="i in (b.warm_sessions || 0)">
@@ -39,8 +41,12 @@
               <template x-for="i in (b.cold_sessions || 0)">
                 <span class="dot cold"></span>
               </template>
+              <template x-for="i in (b.archive_sessions || 0)">
+                <span class="dot archive"></span>
+              </template>
             </div>
             <div class="counts snapshots" x-text="snapsLine(b)"></div>
+            <div class="counts webhook" x-text="webhookLine(b)"></div>
           </div>
         </template>
       </section>

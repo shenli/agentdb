@@ -16,6 +16,7 @@ pub struct BoxListItem {
     pub metrics: agentdb_core::MetricsSnapshot,
     pub quota: QuotaView,
     pub fault_active: bool,
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +42,7 @@ pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxLis
             .as_ref()
             .map(|f| f.is_active())
             .unwrap_or(false);
+        let webhook_url = b.webhook.read().clone();
         out.push(BoxListItem {
             id: i,
             num_tenants: tenants,
@@ -52,6 +54,7 @@ pub async fn list_boxes(State(state): State<AppState>) -> Result<Json<Vec<BoxLis
                 burst: q.burst,
             },
             fault_active,
+            webhook_url,
         });
     }
     Ok(Json(out))
@@ -74,6 +77,7 @@ pub async fn get_box(
         .as_ref()
         .map(|f| f.is_active())
         .unwrap_or(false);
+    let webhook_url = b.webhook.read().clone();
     Ok(Json(BoxListItem {
         id,
         num_tenants: tenants,
@@ -85,6 +89,7 @@ pub async fn get_box(
             burst: q.burst,
         },
         fault_active,
+        webhook_url,
     }))
 }
 

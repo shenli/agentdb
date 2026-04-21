@@ -27,6 +27,10 @@ function dashboard() {
           forks: (b.metrics && b.metrics.forks) || 0,
           open_snapshots: (b.metrics && b.metrics.open_snapshots) || 0,
           segments_pinned_by_snapshots: (b.metrics && b.metrics.segments_pinned_by_snapshots) || 0,
+          archive_sessions: (b.metrics && b.metrics.gauges && b.metrics.gauges.archive_sessions) || 0,
+          webhook_url: b.webhook_url || null,
+          webhook_fires: (b.metrics && b.metrics.webhook_fires) || 0,
+          webhook_failures: (b.metrics && b.metrics.webhook_failures) || 0,
         }));
         this.totalTenants = this.boxes.reduce((s, b) => s + b.num_tenants, 0);
         this.totalAppends = this.boxes.reduce((s, b) => s + b.appends, 0);
@@ -83,6 +87,15 @@ function dashboard() {
       const snaps = b.open_snapshots || 0;
       const pins = b.segments_pinned_by_snapshots || 0;
       return pins > 0 ? `snapshots: ${snaps} (${pins} seg pins)` : `snapshots: ${snaps}`;
+    },
+
+    webhookLine(b) {
+      const fires = b.webhook_fires || 0;
+      const fails = b.webhook_failures || 0;
+      if (!b.webhook_url) return `webhook: none`;
+      let host;
+      try { host = new URL(b.webhook_url).host; } catch { host = '***'; }
+      return `webhook: ${host} (${fires} ok / ${fails} fail)`;
     },
   };
 }

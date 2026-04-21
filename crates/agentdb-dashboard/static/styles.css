@@ -11,12 +11,15 @@ main { padding: 20px; }
 .box-tile header { padding: 0; border: none; margin-bottom: 8px; font-size: 0.85rem; color: #89b4fa; }
 .counts { font-size: 0.8rem; margin-bottom: 8px; color: #a6adc8; }
 .counts.snapshots { margin-top: 8px; margin-bottom: 0; color: #cba6f7; }
+.counts.webhook { margin-top: 4px; margin-bottom: 0; color: #94e2d5; }
 .warm { color: #a6e3a1; }
 .cold { color: #89dceb; }
+.archive { color: #6c7086; }
 .dots { display: flex; flex-wrap: wrap; gap: 3px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; }
 .dot.warm { background: #a6e3a1; }
 .dot.cold { background: #89dceb; }
+.dot.archive { background: #6c7086; }
 .event-feed ul { list-style: none; padding: 0; font-size: 0.8rem; max-height: 300px; overflow-y: auto; background: #181825; border: 1px solid #313244; border-radius: 6px; }
 .event-feed li { padding: 4px 10px; border-bottom: 1px solid #313244; display: flex; gap: 12px; }
 .event-feed li:last-child { border-bottom: none; }
