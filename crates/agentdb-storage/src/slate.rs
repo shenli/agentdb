@@ -110,22 +110,21 @@ impl SlateKvStore {
 
 impl Drop for SlateKvStore {
     fn drop(&mut self) {
-        // Best-effort close: SlateDB's WAL+SSTs on object storage already
-        // preserve committed writes, so a failed close only loses the final
-        // in-memory batch.
+        // No inline `db.close().await`: SlateDB's WAL + SSTs on object
+        // storage already preserve committed writes, so close is only
+        // best-effort (flushing the final in-memory batch). Blocking the
+        // caller thread on it would stall tokio workers during normal
+        // async-context drops; the win is not worth the cost.
         //
-        // Drop may run from inside a caller's tokio runtime (e.g. a
-        // `#[tokio::test]` function), where calling `Runtime::block_on`
-        // would panic. Route through `bridge` instead, which uses
-        // `Handle::spawn` + an std channel.
-        let db = self.inner.clone();
-        if let Err(err) = self.bridge(async move { db.close().await }) {
-            tracing::warn!(?err, "slatedb close failed during Drop");
-        }
-
-        // If we own the last reference to the runtime, its `Drop` would block
-        // waiting for worker threads to join — which panics when `drop` runs
-        // inside an async context (e.g. a `#[tokio::test]` function):
+        // The `Arc<Db>` also goes away when the last reference drops — if
+        // that happens on the OS thread below (via the owned runtime's
+        // internal task cleanup), background flushes have a chance to
+        // complete. Anything in flight at process exit relies on SlateDB's
+        // own durability story, not ours.
+        //
+        // If we own the last reference to the runtime, its `Drop` would
+        // block waiting for worker threads to join — which panics when
+        // `drop` runs inside an async context:
         //   "Cannot drop a runtime in a context where blocking is not allowed."
         // Move the `Arc<Runtime>` onto a plain OS thread so the blocking
         // shutdown happens off the async context. If this `Arc` is not the
@@ -209,7 +208,7 @@ impl KvStore for SlateKvStore {
             .map_err(|e| Error::Other(format!("slatedb snapshot: {e}")))?;
         Ok(Box::new(SlateSnapshot {
             snap,
-            runtime: self.runtime_arc(),
+            runtime: Some(self.runtime_arc()),
         }))
     }
 
@@ -220,7 +219,7 @@ impl KvStore for SlateKvStore {
             .map_err(|e| Error::Other(format!("slatedb snapshot_owned: {e}")))?;
         Ok(Arc::new(SlateSnapshot {
             snap,
-            runtime: self.runtime_arc(),
+            runtime: Some(self.runtime_arc()),
         }))
     }
 }
@@ -231,7 +230,20 @@ impl KvStore for SlateKvStore {
 /// don't need separate borrowed / owned variants.
 struct SlateSnapshot {
     snap: Arc<slatedb::DbSnapshot>,
-    runtime: Arc<Runtime>,
+    runtime: Option<Arc<Runtime>>,
+}
+
+impl Drop for SlateSnapshot {
+    fn drop(&mut self) {
+        // Mirror `SlateKvStore::Drop`: `snapshot_owned` contracts that the
+        // snapshot is `'static` and may outlive the store, so this drop can
+        // land inside an async context with the last `Arc<Runtime>` in hand.
+        // Pushing the `Arc` to a plain OS thread avoids the "Cannot drop a
+        // runtime in a context where blocking is not allowed" panic.
+        if let Some(runtime) = self.runtime.take() {
+            std::thread::spawn(move || drop(runtime));
+        }
+    }
 }
 
 impl SlateSnapshot {
@@ -245,8 +257,12 @@ impl SlateSnapshot {
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("slate snapshot runtime accessed after Drop took it");
         let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
-        self.runtime.handle().spawn(async move {
+        runtime.handle().spawn(async move {
             let out = fut.await;
             let _ = tx.send(out);
         });
