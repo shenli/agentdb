@@ -250,6 +250,15 @@ The Mongo wire protocol returns errors in its own format
 (`{ok: 0, errmsg, code: N}` where `N` follows the Mongo error code
 table); the two surfaces do not share a taxonomy.
 
+One asymmetry: axum's built-in `Json<T>` extractor rejects a
+malformed request body with plain-text 400 before our
+`IntoResponse` is invoked. These responses carry an HTTP status
+but not a Stripe-style body. The `serialization_error` code only
+applies to server-side JSON failures (reading segments, decoding
+persisted state). Wiring a custom extractor rejection into
+`Error::Invalid` for request-body decode failures is a future
+improvement.
+
 ## OpenAPI specification (M13)
 
 The REST surface is described by an OpenAPI 3.x document served

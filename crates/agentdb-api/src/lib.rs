@@ -14,7 +14,7 @@ pub mod handlers;
 pub mod stream;
 pub mod webhook;
 
-pub use error::ApiError;
+pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
 #[derive(Clone)]
