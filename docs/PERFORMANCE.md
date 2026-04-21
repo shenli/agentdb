@@ -192,6 +192,27 @@ budget from `docs/agent-db.md` §1.1. The throughput cost is mostly
 in the fixed per-call overhead of the sync→async bridge, not the
 scan itself, so larger scans close the gap.
 
+## Lifecycle webhook overhead (M12)
+
+Each tier transition fires a `tokio::spawn`ed `reqwest` POST with a
+5s timeout. The caller returns immediately; the transition itself
+does not wait. Measured overhead in the spawn path: one
+`RwLock::read().clone()` to read the URL + one spawn + one JSON body
+build, all in the low-µs range.
+
+Failures (connection refused, timeout, non-2xx response) are counted
+on `BoxMetrics::webhook_failures` and surface via
+`/api/admin/boxes` and the dashboard. There is no retry and no
+durable outbox in the prototype — a real deployment should front the
+webhook with an internal queue or accept the at-most-once semantics.
+
+Archive tier transitions themselves (`Tier::Cold` → `Tier::Archive`)
+are metadata-only in the prototype — just a `session.tier` flip and
+a `SessionRegistry::save` call. Sub-millisecond per transition on a
+cold session of any size. Production cost would be dominated by
+whatever object-storage-class move the integrator wires up; the
+prototype itself pays nothing beyond the KV write.
+
 ## Gotchas
 
 **HTTP keep-alive is not optional.** The Go probe originally closed
