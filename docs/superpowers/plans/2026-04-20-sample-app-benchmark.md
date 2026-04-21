@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Scope change 2026-04-20 (mid-execution):** Bench 4 is **vector-only retrieval with a tenant filter**, not hybrid BM25+vector. AgentDB has no single-RPC hybrid surface: no REST endpoint, and the Mongo wire protocol keeps `$search` (text) and `$vectorSearch` (vector) as separate stages. Implementation details below have been edited in-place to reflect this: `Backend.HybridQuery` is renamed to `VectorQuery` with no `text` parameter; the AgentDB backend impl uses the Mongo wire `$vectorSearch` stage (via `go.mongodb.org/mongo-driver`, already a workload dependency) instead of a REST call; `pg_tuned` drops the `tsv @@` clause; the Python demo adds `pymongo` for its own vector call. Follow-up for a future milestone: add `/api/query/hybrid` and re-enable true hybrid as a fifth bench.
+
 **Goal:** Ship a scripted Python research-agent demo + a Go benchmark harness that compares AgentDB head-to-head against two Postgres schemas (jsonb-blob naive + row-per-event + pgvector/tsvector tuned) across four benches (hot-session append+fetch, fork cost scaling, append latency vs. payload size, hybrid retrieval), all driven by a committed corpus + embeddings fixture and visualised by a static HTML report served at `/benchmarks`.
 
 **Architecture:** Three phases executed in order. Phase 1 ships the fixture pipeline (Python) and commits the corpus JSONL files — both phases 2 and 3 consume these. Phase 2 ships the Go benchmark harness (extends `workload/`), the Postgres schemas + docker compose, the orchestrator script, the HTML report page, and `docs/BENCHMARKS.md`. Phase 3 ships the Python demo (`demo/`), `docs/DEMO.md`, and updates the top-level `README.md`. Each phase is independently testable; checkpoints at the end of each phase let the user review before continuing.
@@ -560,10 +562,11 @@ type Backend interface {
 	// FetchLastN returns the last N events of a session, oldest-to-newest.
 	FetchLastN(ctx context.Context, tenant, session string, n int) ([]Event, error)
 
-	// HybridQuery returns the top-K hits matching both the text query and
-	// the vector, scoped to one tenant. Optional session filter when
-	// session is non-empty.
-	HybridQuery(ctx context.Context, tenant, session, text string, vec []float32, k int) ([]Hit, error)
+	// VectorQuery returns the top-K hits by vector cosine similarity,
+	// scoped to one tenant. Optional session filter when session is
+	// non-empty. (Scope change 2026-04-20: hybrid BM25+vector dropped
+	// to vector-only; see the scope note at the top of the plan.)
+	VectorQuery(ctx context.Context, tenant, session string, vec []float32, k int) ([]Hit, error)
 
 	// Close releases underlying resources (HTTP client, pgxpool).
 	Close() error
@@ -887,58 +890,68 @@ func (a *AgentDBBackend) FetchLastN(ctx context.Context, tenant, session string,
 	return out, nil
 }
 
-type agentDBQueryReq struct {
-	Tenant    string    `json:"tenant_id"`
-	Session   string    `json:"session_id,omitempty"`
-	Text      string    `json:"text,omitempty"`
-	Embedding []float32 `json:"embedding,omitempty"`
-	K         int       `json:"k"`
-}
-
-type agentDBQueryResp struct {
-	Hits []struct {
-		SessionID string  `json:"session_id"`
-		Seq       int64   `json:"seq"`
-		Score     float32 `json:"score"`
-		DocID     string  `json:"doc_id"`
-	} `json:"hits"`
-}
-
-func (a *AgentDBBackend) HybridQuery(ctx context.Context, tenant, session, text string, vec []float32, k int) ([]Hit, error) {
-	body, _ := json.Marshal(agentDBQueryReq{
-		Tenant:    tenant,
-		Session:   session,
-		Text:      text,
-		Embedding: vec,
-		K:         k,
-	})
-	url := fmt.Sprintf("%s/api/query/hybrid", a.BaseURL)
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+// VectorQuery uses the Mongo wire protocol's $vectorSearch aggregation
+// stage. AgentDB has no REST endpoint for vector-only retrieval, so the
+// AgentDB backend keeps a Mongo client alongside its HTTP client — the
+// other Backend methods (Append, Fork, etc.) still go over REST.
+//
+// The Mongo collection is `{tenant_id}.events`; see existing
+// workload/internal/client/mongo.go for precedent.
+func (a *AgentDBBackend) VectorQuery(ctx context.Context, tenant, session string, vec []float32, k int) ([]Hit, error) {
+	if a.Mongo == nil {
+		return nil, fmt.Errorf("agentdb VectorQuery: Mongo client not configured (set MongoURI at construction)")
+	}
+	coll := a.Mongo.Database(tenant).Collection("events")
+	queryVec := make([]any, len(vec))
+	for i, v := range vec {
+		queryVec[i] = float64(v)
+	}
+	match := bson.D{}
+	if session != "" {
+		match = bson.D{{Key: "session_id", Value: session}}
+	}
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$vectorSearch", Value: bson.D{
+			{Key: "path", Value: "payload.embedding"},
+			{Key: "queryVector", Value: queryVec},
+			{Key: "limit", Value: int64(k)},
+			{Key: "numCandidates", Value: int64(max(100, k*4))},
+		}}},
+	}
+	if len(match) > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: match}})
+	}
+	cur, err := coll.Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("agentdb $vectorSearch: %w", err)
 	}
-	r.Header.Set("Content-Type", "application/json")
-	resp, err := a.HTTP.Do(r)
-	if err != nil {
-		return nil, err
+	defer cur.Close(ctx)
+	var hits []Hit
+	for cur.Next(ctx) {
+		var doc struct {
+			SessionID string  `bson:"session_id"`
+			Seq       int64   `bson:"seq"`
+			Score     float32 `bson:"score"`
+			Payload   struct {
+				DocID string `bson:"doc_id"`
+			} `bson:"payload"`
+		}
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		hits = append(hits, Hit{
+			SessionID: doc.SessionID, Seq: doc.Seq, Score: doc.Score, DocID: doc.Payload.DocID,
+		})
 	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("agentdb hybrid: %s: %s", resp.Status, b)
-	}
-	var out agentDBQueryResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	hits := make([]Hit, 0, len(out.Hits))
-	for _, h := range out.Hits {
-		hits = append(hits, Hit{SessionID: h.SessionID, Seq: h.Seq, Score: h.Score, DocID: h.DocID})
-	}
-	return hits, nil
+	return hits, cur.Err()
 }
 
-func (a *AgentDBBackend) Close() error { return nil }
+func (a *AgentDBBackend) Close() error {
+	if a.Mongo != nil {
+		_ = a.Mongo.Disconnect(context.Background())
+	}
+	return nil
+}
 
 // decodeEvent turns an AgentDB event JSON object into our Event.
 func decodeEvent(e map[string]any) Event {

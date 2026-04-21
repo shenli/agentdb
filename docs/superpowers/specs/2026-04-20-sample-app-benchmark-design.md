@@ -1,7 +1,16 @@
 # Sample App + Benchmark Harness — Design
 
 _Date: 2026-04-20_
-_Status: design, pre-implementation._
+_Status: design, implementation underway._
+
+> **Scope change 2026-04-20 (during implementation):** Bench 4 is
+> **vector-only retrieval with a tenant filter**, not hybrid BM25+vector.
+> AgentDB has no single-RPC hybrid endpoint — the `HybridPlanner` exists
+> in core but is not exposed over REST, and the Mongo wire protocol
+> handles text (`$search`) and vector (`$vectorSearch`) as separate
+> pipeline stages. Follow-up: add `/api/query/hybrid` and re-enable
+> hybrid as a second retrieval bench. Throughout the rest of this doc,
+> read "hybrid retrieval" as "vector retrieval with tenant filter."
 
 ## Purpose
 
