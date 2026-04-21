@@ -1,0 +1,1463 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AgentDB REST API",
+    "description": "Agent-native operational database. See docs/agent-db.md for design and docs/ARCHITECTURE.md for implementation.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/admin/boxes": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_boxes",
+        "responses": {
+          "200": {
+            "description": "Per-box snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BoxListItem"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/boxes/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_box",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Box id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BoxListItem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Box not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/boxes/{id}/inject_fault": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "inject_fault",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InjectFaultRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InjectFaultResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown fault kind",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Box not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/boxes/{id}/quota": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "set_quota",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuotaView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Box not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/boxes/{id}/webhook": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "set_webhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Box not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/sessions/{session_id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "External session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "Tenant that owns the session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/tier/force": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "force_tier",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForceTierRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session transitioned to target tier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForceTierResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported target tier or malformed body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tenant or session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/fork": {
+      "post": {
+        "tags": [
+          "primitives"
+        ],
+        "operationId": "fork_handler",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Parent session's external id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Child session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Parent tenant/session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stream": {
+      "get": {
+        "tags": [
+          "stream"
+        ],
+        "operationId": "sse_handler",
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream of StreamEvent payloads. OpenAPI does not model event streams well; see the StreamEvent schema for the shape of each emitted event."
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenant_id}/sessions/{session_id}/append_and_fetch": {
+      "post": {
+        "tags": [
+          "primitives"
+        ],
+        "operationId": "append_and_fetch",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "External tenant id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "External session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppendAndFetchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Event appended; last N events returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppendAndFetchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fault injected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AppendAndFetchRequest": {
+        "type": "object",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "event": {},
+          "fetch_last_n": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AppendAndFetchResponse": {
+        "type": "object",
+        "required": [
+          "seq",
+          "recent"
+        ],
+        "properties": {
+          "recent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventDto"
+            }
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "BoxListItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "num_tenants",
+          "metrics",
+          "quota",
+          "fault_active"
+        ],
+        "properties": {
+          "fault_active": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/MetricsSnapshot"
+          },
+          "num_tenants": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "quota": {
+            "$ref": "#/components/schemas/QuotaView"
+          },
+          "webhook_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Stable machine-readable error codes.",
+        "enum": [
+          "not_found",
+          "invalid_request",
+          "quota_exceeded",
+          "fault_injected",
+          "storage_error",
+          "serialization_error"
+        ]
+      },
+      "ErrorKind": {
+        "type": "string",
+        "enum": [
+          "invalid_request_error",
+          "rate_limit_error",
+          "api_error"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "The JSON body we emit for every REST error. Always carries\n`code`, `type`, `message`; typed extras per code are flat fields.",
+        "required": [
+          "code",
+          "type",
+          "message"
+        ],
+        "properties": {
+          "box_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "fault_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "field": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retry_after_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/ErrorKind"
+          }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "description": "An append-only record inside a session.",
+        "required": [
+          "seq",
+          "ts",
+          "payload"
+        ],
+        "properties": {
+          "payload": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix epoch millis at write time.",
+            "minimum": 0
+          }
+        }
+      },
+      "EventDto": {
+        "type": "object",
+        "required": [
+          "seq",
+          "ts",
+          "payload"
+        ],
+        "properties": {
+          "payload": {},
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ForceTierRequest": {
+        "type": "object",
+        "required": [
+          "tenant_id",
+          "session_id",
+          "target"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ForceTierResponse": {
+        "type": "object",
+        "required": [
+          "tier"
+        ],
+        "properties": {
+          "tier": {
+            "type": "string"
+          }
+        }
+      },
+      "ForkRef": {
+        "type": "object",
+        "description": "Reference to a parent session in a fork relationship.",
+        "required": [
+          "parent_session_internal_id",
+          "parent_seq_at_fork"
+        ],
+        "properties": {
+          "parent_seq_at_fork": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Parent's `next_seq` at the moment of fork. The child sees parent events\nwith `seq < parent_seq_at_fork`.",
+            "minimum": 0
+          },
+          "parent_session_internal_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Parent session's *internal* id (same tenant, same box as the child).",
+            "minimum": 0
+          }
+        }
+      },
+      "ForkRequest": {
+        "type": "object",
+        "required": [
+          "tenant_id",
+          "new_session_id"
+        ],
+        "properties": {
+          "new_session_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ForkResponse": {
+        "type": "object",
+        "required": [
+          "new_session_id",
+          "parent_session_id",
+          "parent_seq_at_fork"
+        ],
+        "properties": {
+          "new_session_id": {
+            "type": "string"
+          },
+          "parent_seq_at_fork": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "parent_session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "GaugeSnapshot": {
+        "type": "object",
+        "required": [
+          "warm_sessions",
+          "cold_sessions",
+          "archive_sessions"
+        ],
+        "properties": {
+          "archive_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cold_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "warm_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "InjectFaultRequest": {
+        "type": "object",
+        "required": [
+          "kind",
+          "duration_s"
+        ],
+        "properties": {
+          "duration_s": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string"
+          },
+          "latency_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "InjectFaultResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "expires_in_s"
+        ],
+        "properties": {
+          "expires_in_s": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MetricsSnapshot": {
+        "type": "object",
+        "required": [
+          "inserts",
+          "queries_find",
+          "queries_aggregate",
+          "appends",
+          "forks",
+          "tier_transitions",
+          "quota_hits",
+          "faults_injected",
+          "open_snapshots",
+          "segments_pinned_by_snapshots",
+          "segment_gc_reclaimed",
+          "segment_gc_skipped_pinned",
+          "webhook_fires",
+          "webhook_failures",
+          "gauges"
+        ],
+        "properties": {
+          "appends": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "faults_injected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "forks": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gauges": {
+            "$ref": "#/components/schemas/GaugeSnapshot"
+          },
+          "inserts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "open_snapshots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queries_aggregate": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queries_find": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "quota_hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "segment_gc_reclaimed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "segment_gc_skipped_pinned": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "segments_pinned_by_snapshots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tier_transitions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "webhook_failures": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "webhook_fires": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "QuotaRequest": {
+        "type": "object",
+        "properties": {
+          "burst": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_qps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_tenant_qps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_warm_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "QuotaView": {
+        "type": "object",
+        "properties": {
+          "burst": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_qps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_tenant_qps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_warm_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "description": "Persisted session record.",
+        "required": [
+          "internal_id",
+          "external_id",
+          "tenant_internal_id",
+          "box_id",
+          "created_at",
+          "last_active_at",
+          "tier",
+          "next_seq"
+        ],
+        "properties": {
+          "box_id": {
+            "$ref": "#/components/schemas/u16"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "external_id": {
+            "type": "string"
+          },
+          "forked_from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ForkRef"
+              }
+            ]
+          },
+          "internal_id": {
+            "$ref": "#/components/schemas/u64"
+          },
+          "last_active_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "next_seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "segment_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When `tier == Cold`, the `object_store` path where events live. None for warm sessions."
+          },
+          "tenant_internal_id": {
+            "$ref": "#/components/schemas/u64"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/Tier"
+          }
+        }
+      },
+      "SessionDetail": {
+        "type": "object",
+        "required": [
+          "session"
+        ],
+        "properties": {
+          "parent_external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session": {
+            "$ref": "#/components/schemas/Session"
+          }
+        }
+      },
+      "SessionQuery": {
+        "type": "object",
+        "required": [
+          "tenant_id"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          }
+        }
+      },
+      "StreamEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "boxes",
+              "event"
+            ],
+            "properties": {
+              "boxes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TickBox"
+                }
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "MetricsTick"
+                ]
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "box_id",
+              "session_id",
+              "from",
+              "to",
+              "event"
+            ],
+            "properties": {
+              "box_id": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "TierChange"
+                ]
+              },
+              "from": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "box_id",
+              "parent",
+              "child",
+              "event"
+            ],
+            "properties": {
+              "box_id": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "child": {
+                "type": "string"
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "ForkCreated"
+                ]
+              },
+              "parent": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "box_id",
+              "kind",
+              "event"
+            ],
+            "properties": {
+              "box_id": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "QuotaHit"
+                ]
+              },
+              "kind": {
+                "type": "string"
+              },
+              "tenant": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "box_id",
+              "kind",
+              "duration_s",
+              "event"
+            ],
+            "properties": {
+              "box_id": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "duration_s": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "FaultInjected"
+                ]
+              },
+              "kind": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "ts_ms",
+              "box_id",
+              "reclaimed",
+              "skipped_pinned",
+              "event"
+            ],
+            "properties": {
+              "box_id": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "SegmentGcRun"
+                ]
+              },
+              "reclaimed": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "skipped_pinned": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "ts_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          }
+        ]
+      },
+      "TickBox": {
+        "type": "object",
+        "required": [
+          "id",
+          "warm_sessions",
+          "cold_sessions",
+          "appends",
+          "forks",
+          "fault_active",
+          "open_snapshots",
+          "segments_pinned_by_snapshots"
+        ],
+        "properties": {
+          "appends": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cold_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "fault_active": {
+            "type": "boolean"
+          },
+          "forks": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "open_snapshots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "segments_pinned_by_snapshots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "warm_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "Tier": {
+        "type": "string",
+        "description": "Lifecycle tier of a session.",
+        "enum": [
+          "warm",
+          "cold",
+          "archive"
+        ]
+      },
+      "Value": {},
+      "WebhookRequest": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "WebhookResponse": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "u16": {
+        "type": "integer",
+        "format": "int32",
+        "minimum": 0
+      },
+      "u64": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "primitives",
+      "description": "Agent-native write and read primitives"
+    },
+    {
+      "name": "admin",
+      "description": "Operator-only endpoints (no agent exposure)"
+    },
+    {
+      "name": "stream",
+      "description": "Server-Sent Events"
+    }
+  ]
+}
