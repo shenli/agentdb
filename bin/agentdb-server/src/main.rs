@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
-    BoxRegistry, GcRunReporter, HlcClock, LeaseRenewalJob, LifecycleConfig, LifecycleEngine,
-    SegmentGc, SegmentGcConfig, SessionRegistry, TenantRegistry,
+    BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
+    LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig, SessionRegistry, TenantRegistry,
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
@@ -276,6 +276,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // M22: spawn the scheduler leader-election loop. This process
+    // contests with every other node sharing this meta store; one of
+    // them wins and keeps a lease fresh. Nothing *uses* leadership
+    // yet — the follow-up PR wires stale-node → tablet reassignment.
+    let election_cfg = LeaderElectionConfig::from_env();
+    let election = LeaderElection::start(meta.clone(), node_id.clone(), election_cfg);
+    tracing::info!(
+        %node_id,
+        lease_secs = election_cfg.lease_duration.as_secs(),
+        renew_secs = election_cfg.renew_interval.as_secs(),
+        attempt_secs = election_cfg.attempt_interval.as_secs(),
+        "scheduler leader-election loop started"
+    );
+
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
 
@@ -435,7 +449,9 @@ async fn main() -> anyhow::Result<()> {
     // (e.g. `GET /api/admin/nodes`) can reach it without it living
     // on `AppState`. Handlers use `Option<Extension<_>>` so tests
     // that build the router without a meta still work.
-    let app = router(http_state).layer(axum::Extension(meta.clone()));
+    let app = router(http_state)
+        .layer(axum::Extension(meta.clone()))
+        .layer(axum::Extension(election.clone()));
     let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
         .context("bind http listener")?;

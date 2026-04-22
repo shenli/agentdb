@@ -13,11 +13,18 @@ use crate::error::{MetaError, MetaResult};
 
 /// Every migration in order. Append new ones; NEVER renumber or
 /// reorder existing entries.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(
-    1,
-    "initial control-plane schema",
-    include_str!("../migrations/001_initial.sql"),
-)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "initial control-plane schema",
+        include_str!("../migrations/001_initial.sql"),
+    ),
+    (
+        2,
+        "scheduler leader singleton lease",
+        include_str!("../migrations/002_scheduler_leader.sql"),
+    ),
+];
 
 /// Apply all pending migrations to the given pool.
 pub async fn apply(pool: &SqlitePool) -> MetaResult<()> {
@@ -135,6 +142,7 @@ mod tests {
             "config",
             "nodes",
             "schema_migrations",
+            "scheduler_leader",
             "session_overrides",
             "shards",
             "tablets",

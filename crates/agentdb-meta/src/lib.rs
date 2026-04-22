@@ -18,6 +18,7 @@ pub mod config;
 pub mod error;
 pub mod migrations;
 pub mod nodes;
+pub mod scheduler;
 pub mod session_overrides;
 pub mod shards;
 pub mod tablets;
