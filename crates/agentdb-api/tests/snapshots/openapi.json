@@ -738,6 +738,13 @@
           "code": {
             "$ref": "#/components/schemas/ErrorCode"
           },
+          "doc_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute URL to the runbook for this error code. Present when\nthe code has a published runbook; omitted otherwise. Operators\nshould be able to paste this URL into a browser, Slack, or an\nincident ticket and land on concrete diagnose/remediate steps."
+          },
           "fault_kind": {
             "type": [
               "string",
