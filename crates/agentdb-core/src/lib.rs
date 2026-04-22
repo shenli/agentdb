@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod planner;
 pub mod primitives;
 pub mod read_ctx;
+pub mod reaper;
 pub mod registry;
 pub mod scheduler;
 pub mod segment;
@@ -48,6 +49,7 @@ pub use primitives::{
     scan_session_all_tiers, scan_session_events, AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
 pub use read_ctx::ReadCtx;
+pub use reaper::{ReaperConfig, StaleTabletReaper};
 pub use registry::{SessionRegistry, TenantRegistry};
 pub use scheduler::{LeaderElection, LeaderElectionConfig};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION};

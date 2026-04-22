@@ -1428,7 +1428,8 @@
         "required": [
           "this_node_id",
           "this_node_is_leader",
-          "this_node_epoch"
+          "this_node_epoch",
+          "reassignments_total"
         ],
         "properties": {
           "leader": {
@@ -1441,6 +1442,12 @@
                 "description": "Canonical leader row from the control plane. `None` means no\nleader has ever been elected on this cluster."
               }
             ]
+          },
+          "reassignments_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total number of tablet leases this process has cleared as\npart of the stale-lease reaper sweep. Only advances while\nthis process is the leader — followers report 0 even if\nanother node in the cluster has reaped many leases.",
+            "minimum": 0
           },
           "this_node_epoch": {
             "type": "integer",

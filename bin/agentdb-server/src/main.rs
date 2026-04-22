@@ -6,7 +6,8 @@ use std::time::Duration;
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
-    LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig, SessionRegistry, TenantRegistry,
+    LifecycleConfig, LifecycleEngine, ReaperConfig, SegmentGc, SegmentGcConfig, SessionRegistry,
+    StaleTabletReaper, TenantRegistry,
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
@@ -278,8 +279,7 @@ async fn main() -> anyhow::Result<()> {
 
     // M22: spawn the scheduler leader-election loop. This process
     // contests with every other node sharing this meta store; one of
-    // them wins and keeps a lease fresh. Nothing *uses* leadership
-    // yet — the follow-up PR wires stale-node → tablet reassignment.
+    // them wins and keeps a lease fresh.
     let election_cfg = LeaderElectionConfig::from_env();
     let election = LeaderElection::start(meta.clone(), node_id.clone(), election_cfg);
     tracing::info!(
@@ -288,6 +288,19 @@ async fn main() -> anyhow::Result<()> {
         renew_secs = election_cfg.renew_interval.as_secs(),
         attempt_secs = election_cfg.attempt_interval.as_secs(),
         "scheduler leader-election loop started"
+    );
+
+    // M22: spawn the stale-lease reaper. Runs on every node but is
+    // a no-op on followers — only the elected leader actually
+    // reaps expired tablet ownership. Follow-up PRs add richer
+    // reassignment policy; this loop just clears dead-owner rows
+    // so admin views stay honest.
+    let reaper_cfg = ReaperConfig::from_env();
+    let reaper = StaleTabletReaper::start(meta.clone(), election.clone(), reaper_cfg);
+    tracing::info!(
+        tick_secs = reaper_cfg.tick.as_secs(),
+        safety_margin_secs = reaper_cfg.safety_margin.as_secs(),
+        "stale-lease tablet reaper started"
     );
 
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
@@ -451,7 +464,8 @@ async fn main() -> anyhow::Result<()> {
     // that build the router without a meta still work.
     let app = router(http_state)
         .layer(axum::Extension(meta.clone()))
-        .layer(axum::Extension(election.clone()));
+        .layer(axum::Extension(election.clone()))
+        .layer(axum::Extension(reaper.clone()));
     let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
         .context("bind http listener")?;
