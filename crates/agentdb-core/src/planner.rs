@@ -204,6 +204,53 @@ impl<'a> HybridPlanner<'a> {
         })
     }
 
+    /// Return every event attributed to `actor_id` across every session
+    /// in this box's tenant. Uses the `agent_events` index built at
+    /// lazy-init time (see `PerBoxIndexes`). Resolves each `DocId`
+    /// through the `ReadCtx`, honoring snapshot visibility and HLC
+    /// cutoff.
+    ///
+    /// Events carry `score = 1.0` as a sentinel — there is no ranking
+    /// for an exact-match agent filter.
+    pub async fn scan_by_agent(&self, actor_id: &str) -> Result<Vec<Hit>> {
+        let cutoff = self.ctx.hlc_cutoff();
+        let docs = self.indexes.docs_by_agent(actor_id);
+        let mut hits: Vec<Hit> = Vec::with_capacity(docs.len());
+        for &doc_id in docs {
+            let Some(session) = self.ctx.session_by_internal(
+                self.sessions,
+                self.tenant_internal_id,
+                doc_id.session_internal_id,
+            )?
+            else {
+                continue;
+            };
+            if doc_id.seq >= session.next_seq {
+                continue;
+            }
+            let Some(event) = self.resolve(doc_id, &session).await? else {
+                continue;
+            };
+            // Defense in depth against a stale index: the index only
+            // grows, so an entry may reference an event whose
+            // `actor_id` has since been cleared (not possible today but
+            // worth guarding). The cutoff check is the HLC snapshot.
+            if event.actor_id.as_deref() != Some(actor_id) {
+                continue;
+            }
+            if event.hlc_ts > cutoff {
+                continue;
+            }
+            hits.push(Hit {
+                doc_id,
+                score: 1.0,
+                event,
+                session_external_id: session.external_id,
+            });
+        }
+        Ok(hits)
+    }
+
     async fn resolve(
         &self,
         doc_id: DocId,
@@ -628,5 +675,161 @@ mod tests {
             5,
             "visibility filter must drop post-snapshot candidates"
         );
+    }
+
+    #[tokio::test]
+    async fn scan_by_agent_returns_cross_session_events_for_one_agent() {
+        // Two sessions attributed to agent_a (3 events each), one session
+        // attributed to agent_b (2 events). Scanning for agent_a should
+        // return 6 events across both agent_a sessions; agent_b returns 2;
+        // an unknown agent returns nothing.
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
+
+        for session in ["a-1", "a-2"] {
+            for i in 1..=3u64 {
+                crate::primitives::append_and_fetch_with_actor(
+                    &reg,
+                    &tenants,
+                    &sessions,
+                    "t-agent",
+                    session,
+                    json!({"n": i}),
+                    Some("agent_a".into()),
+                    0,
+                    i,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        for i in 1..=2u64 {
+            crate::primitives::append_and_fetch_with_actor(
+                &reg,
+                &tenants,
+                &sessions,
+                "t-agent",
+                "b-1",
+                json!({"n": i}),
+                Some("agent_b".into()),
+                0,
+                i,
+            )
+            .await
+            .unwrap();
+        }
+
+        let tenant = tenants
+            .get_or_mint(reg.route_tenant("t-agent").id, "t-agent", 0)
+            .unwrap();
+
+        let mut indexes = PerBoxIndexes::new();
+        indexes
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
+            .await
+            .unwrap();
+
+        // Index sanity: both agents present, sizes match expectations.
+        assert_eq!(indexes.docs_by_agent("agent_a").len(), 6);
+        assert_eq!(indexes.docs_by_agent("agent_b").len(), 2);
+        assert_eq!(indexes.docs_by_agent("agent_c").len(), 0);
+
+        let box_ = reg.route_tenant("t-agent");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+        let p = HybridPlanner {
+            ctx: &ctx,
+            store: &store,
+            indexes: &indexes,
+            sessions: &sessions,
+            box_id: tenant.box_id,
+            tenant_internal_id: tenant.internal_id,
+        };
+
+        let a_hits = p.scan_by_agent("agent_a").await.unwrap();
+        assert_eq!(a_hits.len(), 6, "all agent_a events across both sessions");
+        for h in &a_hits {
+            assert_eq!(h.event.actor_id.as_deref(), Some("agent_a"));
+            assert!(h.session_external_id == "a-1" || h.session_external_id == "a-2");
+        }
+
+        let b_hits = p.scan_by_agent("agent_b").await.unwrap();
+        assert_eq!(b_hits.len(), 2);
+        for h in &b_hits {
+            assert_eq!(h.event.actor_id.as_deref(), Some("agent_b"));
+            assert_eq!(h.session_external_id, "b-1");
+        }
+
+        let c_hits = p.scan_by_agent("agent_c").await.unwrap();
+        assert!(c_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_by_agent_respects_hlc_cutoff_against_post_snapshot_writes() {
+        // An event written after the ReadCtx opens must not appear through
+        // scan_by_agent even if the index has been rebuilt since. This
+        // mirrors the M14 HLC-cutoff contract on fetch_last_n.
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
+
+        // Warm up: one pre-snapshot event for agent_x.
+        crate::primitives::append_and_fetch_with_actor(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-agent",
+            "s-1",
+            json!({"n": 1}),
+            Some("agent_x".into()),
+            0,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let tenant = tenants
+            .get_or_mint(reg.route_tenant("t-agent").id, "t-agent", 0)
+            .unwrap();
+        let box_ = reg.route_tenant("t-agent");
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+
+        // Post-snapshot writes under the same agent.
+        for i in 2..=4u64 {
+            crate::primitives::append_and_fetch_with_actor(
+                &reg,
+                &tenants,
+                &sessions,
+                "t-agent",
+                "s-1",
+                json!({"n": i}),
+                Some("agent_x".into()),
+                0,
+                i,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Rebuild indexes so they DO contain the post-snapshot events;
+        // the HLC cutoff on the ctx is what must filter them out.
+        let mut indexes = PerBoxIndexes::new();
+        indexes
+            .build(&kv, &store, &tenants, &sessions, tenant.box_id)
+            .await
+            .unwrap();
+        assert_eq!(indexes.docs_by_agent("agent_x").len(), 4);
+
+        let p = HybridPlanner {
+            ctx: &ctx,
+            store: &store,
+            indexes: &indexes,
+            sessions: &sessions,
+            box_id: tenant.box_id,
+            tenant_internal_id: tenant.internal_id,
+        };
+        let hits = p.scan_by_agent("agent_x").await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "ctx opened after 1 event; post-snapshot events must be filtered"
+        );
+        assert_eq!(hits[0].event.payload["n"], 1);
     }
 }
