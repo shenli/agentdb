@@ -267,20 +267,11 @@ pub async fn append_and_fetch(
     if newly_minted {
         box_.metrics.bump_tier(session.tier);
     }
-    // Phase B placeholder: HLC is threaded through to `append_event`'s
-    // signature so the write path accepts it, but the actual
-    // `HlcClock::now()` call-site lands in Phase C (Task C1). Using ZERO
-    // here means events temporarily carry a zero HLC; snapshot-read
-    // filtering (Phase D) treats ZERO as "older than everything," which
-    // is the right degraded behavior while HLC wiring is partial.
-    let event = append_event(
-        &kv,
-        &guard,
-        &mut session,
-        payload,
-        now_millis,
-        HlcTimestamp::ZERO,
-    )?;
+    // Allocate the HLC inside the session lock, just before `seq`, so that
+    // (seq, hlc_ts) within one session is strictly monotonic. See
+    // `docs/superpowers/notes/2026-04-21-hlc-clock-decision.md` §3.3.
+    let hlc_ts = registry.hlc().now();
+    let event = append_event(&kv, &guard, &mut session, payload, now_millis, hlc_ts)?;
     box_.metrics.record_append();
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
@@ -401,6 +392,70 @@ mod tests {
         assert_eq!(e2.seq, 2);
         assert_eq!(s2.next_seq, 3);
         assert_eq!(s2.last_active_at, 200);
+    }
+
+    #[tokio::test]
+    async fn appends_in_a_session_are_monotonic_in_both_seq_and_hlc() {
+        // `append_and_fetch` assigns HLC inside the session lock, right
+        // before `seq`. The invariant is: for any session's events, both
+        // fields strictly increase.
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+        let mut outputs = Vec::new();
+        for i in 1..=20u64 {
+            let out = append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-mono",
+                "s-mono",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+            outputs.push(out);
+        }
+
+        // seq increases by 1 each time.
+        for (i, out) in outputs.iter().enumerate() {
+            assert_eq!(
+                out.new_seq,
+                (i + 1) as u64,
+                "seq at index {} not monotonic",
+                i
+            );
+        }
+
+        // Pull events back and verify their hlc_ts is strictly increasing.
+        let box_ = registry.route_tenant("t-mono");
+        let tenant = tenants.get_or_mint(box_.id, "t-mono", 0).unwrap();
+        let session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-mono")
+            .unwrap()
+            .unwrap();
+        let ctx = crate::read_ctx::ReadCtx::open(&box_, registry.kv()).unwrap();
+        let events = fetch_last_n(&ctx, &session, 100).unwrap();
+        assert_eq!(events.len(), 20);
+        for pair in events.windows(2) {
+            assert!(
+                pair[0].hlc_ts < pair[1].hlc_ts,
+                "hlc_ts not strictly monotonic across appends: {:?} then {:?}",
+                pair[0].hlc_ts,
+                pair[1].hlc_ts
+            );
+        }
+
+        // Every event's hlc_ts is non-zero — real wall-clock-backed HLC,
+        // not the Phase-B placeholder ZERO.
+        for ev in &events {
+            assert_ne!(
+                ev.hlc_ts,
+                crate::hlc::HlcTimestamp::ZERO,
+                "event seq {} got placeholder HLC — did append_and_fetch regress?",
+                ev.seq
+            );
+        }
     }
 
     #[tokio::test]

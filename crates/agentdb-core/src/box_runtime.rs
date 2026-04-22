@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::admission::{AdmissionDenied, Scope, TokenBucket};
 use crate::error::{Error, Result};
+use crate::hlc::HlcClock;
 use crate::metrics::BoxMetrics;
 use crate::segment_pin::SegmentPinRegistry;
 
@@ -175,18 +176,33 @@ impl Box_ {
 }
 
 /// Owns the pool of boxes and the shared KV store, plus the tenant→box
-/// routing function.
+/// routing function and the process-global HLC.
 pub struct BoxRegistry {
     boxes: Vec<Arc<Box_>>,
     kv: Arc<dyn KvStore>,
     object_store: Arc<dyn ObjectStore>,
+    hlc: Arc<HlcClock>,
 }
 
 impl BoxRegistry {
+    /// Build a registry with a default HLC (10s max-offset). The server
+    /// binary should prefer `new_with_hlc` to honor the
+    /// `AGENTDB_HLC_MAX_OFFSET_SECS` env var.
     pub fn new(
         kv: Arc<dyn KvStore>,
         object_store: Arc<dyn ObjectStore>,
         num_boxes: u16,
+    ) -> Result<Self> {
+        Self::new_with_hlc(kv, object_store, num_boxes, Arc::new(HlcClock::default()))
+    }
+
+    /// Build a registry with a caller-provided HLC. There is exactly one
+    /// `HlcClock` per process; all boxes share it.
+    pub fn new_with_hlc(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        num_boxes: u16,
+        hlc: Arc<HlcClock>,
     ) -> Result<Self> {
         if num_boxes == 0 {
             return Err(Error::Invalid {
@@ -199,6 +215,7 @@ impl BoxRegistry {
             boxes,
             kv,
             object_store,
+            hlc,
         })
     }
 
@@ -208,6 +225,13 @@ impl BoxRegistry {
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
+    }
+
+    /// The process-global hybrid logical clock. Every event append assigns
+    /// its `hlc_ts` from this, and every RPC-layer receive updates it via
+    /// `HlcClock::update`.
+    pub fn hlc(&self) -> &Arc<HlcClock> {
+        &self.hlc
     }
 
     pub fn num_boxes(&self) -> u16 {
