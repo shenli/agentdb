@@ -6,20 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-instant-distance = { workspace = true }
+hnsw_rs = "0.3"
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 criterion = "0.5"
 tempfile = { workspace = true }
-# M16 Phase A — HNSW backend spike. If the spike succeeds, promote to
-# a real [dependencies] entry and drop instant-distance.
-hnsw_rs = "0.3"
-bincode = "1.3"
 rand = "0.8"
 
 [[bench]]
