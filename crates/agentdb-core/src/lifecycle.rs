@@ -99,7 +99,7 @@ async fn sweep(
             if now_ms.saturating_sub(session.last_active_at) < cold_threshold_ms {
                 continue;
             }
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock(&tenant_ext).lock_owned().await;
             let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)? else {
                 continue;
             };
@@ -142,7 +142,7 @@ async fn sweep(
             if now_ms.saturating_sub(session.last_active_at) < archive_threshold_ms {
                 continue;
             }
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock(&tenant_ext).lock_owned().await;
             let Some(mut fresh) = sessions.lookup(box_.id, tenant.internal_id, session_ext)? else {
                 continue;
             };
@@ -330,7 +330,7 @@ mod tests {
                 .lookup(box_.id, tenant.internal_id, "s-arch")
                 .unwrap()
                 .unwrap();
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(&kv, &store, &sessions, &guard, &mut session)
                 .await
                 .unwrap();

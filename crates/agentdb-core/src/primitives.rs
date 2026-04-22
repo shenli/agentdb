@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agentdb_storage::{encode_key, KvStore, Namespace, WriteOp};
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::error::{Error, Result};
 use crate::hlc::HlcTimestamp;
@@ -13,8 +13,8 @@ use crate::types::{Event, Session, Tier};
 pub const DEFAULT_BRANCH_ID: u32 = 0;
 
 /// Append one event to a session, atomically bumping its `next_seq` and
-/// `last_active_at`. Must be called while holding the box's write lock
-/// (demonstrated by the MutexGuard reference).
+/// `last_active_at`. Must be called while holding the tenant's write
+/// lock (demonstrated by the OwnedMutexGuard reference).
 ///
 /// `hlc_ts` should be allocated from the process-global `HlcClock` before
 /// calling — see `append_and_fetch` for the wired-up call site. Callers
@@ -26,7 +26,7 @@ pub const DEFAULT_BRANCH_ID: u32 = 0;
 #[allow(clippy::too_many_arguments)]
 pub fn append_event(
     kv: &Arc<dyn KvStore>,
-    _lock: &MutexGuard<'_, ()>,
+    _lock: &OwnedMutexGuard<()>,
     session: &mut Session,
     payload: crate::types::Document,
     now_millis: u64,
@@ -358,10 +358,10 @@ pub async fn append_and_fetch_with_actor(
     }
     // Admission control: per-box gate always, per-tenant gate only for
     // already-minted tenants. `get_or_mint` is not safe to call outside
-    // the write_lock (it has a TOCTOU window on the "is this a new
-    // tenant?" check), so the first-ever request for a new tenant uses
-    // a sentinel id of 0 which skips the per-tenant gate. Subsequent
-    // requests for that tenant will hit both gates.
+    // the per-tenant write lock (it has a TOCTOU window on the "is
+    // this a new tenant?" check), so the first-ever request for a new
+    // tenant uses a sentinel id of 0 which skips the per-tenant gate.
+    // Subsequent requests for that tenant will hit both gates.
     let admit_tenant_id = tenants
         .lookup(box_.id, tenant_external)?
         .map(|t| t.internal_id)
@@ -385,7 +385,7 @@ pub async fn append_and_fetch_with_actor(
             }
         }
     }
-    let guard = box_.write_lock.lock().await;
+    let guard = box_.tenant_write_lock(tenant_external).lock_owned().await;
     let kv = registry.kv().clone();
     let tenant = tenants.get_or_mint(box_.id, tenant_external, now_millis)?;
     let newly_minted = sessions
@@ -415,9 +415,9 @@ pub async fn append_and_fetch_with_actor(
         .record("hlc_physical_ns", hlc_ts.physical_ns);
     box_.metrics.record_append();
     // M16 Phase C: keep the live index current. Lock order is always
-    // `write_lock -> indexes.write` — this call obeys it because we
-    // still hold `guard` (the write_lock) and `Box_::index_event` takes
-    // only the indexes write lock internally.
+    // `tenant_write_lock -> indexes.write` — this call obeys it
+    // because we still hold `guard` (the tenant lock) and
+    // `Box_::index_event` takes only the indexes write lock internally.
     box_.index_event(
         &kv,
         registry.object_store(),
@@ -470,14 +470,14 @@ mod tests {
     async fn open_and_append(
         kv: Arc<dyn KvStore>,
         sessions: &SessionRegistry,
-        box_lock: &tokio::sync::Mutex<()>,
+        lock: Arc<tokio::sync::Mutex<()>>,
         box_id: agentdb_storage::BoxId,
         tenant_id: agentdb_storage::TenantId,
         session_external: &str,
         payload: crate::types::Document,
         now_millis: u64,
     ) -> Result<(Event, Session)> {
-        let guard = box_lock.lock().await;
+        let guard = lock.lock_owned().await;
         let mut session = sessions.get_or_mint(box_id, tenant_id, session_external, now_millis)?;
         let event = append_event(
             &kv,
@@ -513,13 +513,13 @@ mod tests {
     #[tokio::test]
     async fn append_increments_seq_and_persists_event() {
         let (_dir, kv, tenants, sessions) = setup();
-        let lock = Mutex::new(());
+        let lock = Arc::new(Mutex::new(()));
         let t = tenants.get_or_mint(0, "t", 10).unwrap();
 
         let (e1, s1) = open_and_append(
             kv.clone(),
             &sessions,
-            &lock,
+            lock.clone(),
             0,
             t.internal_id,
             "s-1",
@@ -535,7 +535,7 @@ mod tests {
         let (e2, s2) = open_and_append(
             kv.clone(),
             &sessions,
-            &lock,
+            lock.clone(),
             0,
             t.internal_id,
             "s-1",
@@ -616,12 +616,12 @@ mod tests {
     #[tokio::test]
     async fn event_is_readable_at_expected_key() {
         let (_dir, kv, tenants, sessions) = setup();
-        let lock = Mutex::new(());
+        let lock = Arc::new(Mutex::new(()));
         let t = tenants.get_or_mint(0, "t", 1).unwrap();
         let (_e, s) = open_and_append(
             kv.clone(),
             &sessions,
-            &lock,
+            lock.clone(),
             0,
             t.internal_id,
             "s-1",
@@ -663,13 +663,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_last_n_returns_tail_in_order() {
         let (_dir, kv, tenants, sessions) = setup();
-        let lock = Mutex::new(());
+        let lock = Arc::new(Mutex::new(()));
         let t = tenants.get_or_mint(0, "t", 0).unwrap();
         for i in 1..=5u64 {
             open_and_append(
                 kv.clone(),
                 &sessions,
-                &lock,
+                lock.clone(),
                 0,
                 t.internal_id,
                 "s-1",
@@ -692,13 +692,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_last_n_larger_than_size_returns_all_in_order() {
         let (_dir, kv, tenants, sessions) = setup();
-        let lock = Mutex::new(());
+        let lock = Arc::new(Mutex::new(()));
         let t = tenants.get_or_mint(0, "t", 0).unwrap();
         for i in 1..=2u64 {
             open_and_append(
                 kv.clone(),
                 &sessions,
-                &lock,
+                lock.clone(),
                 0,
                 t.internal_id,
                 "s-1",
@@ -1067,7 +1067,7 @@ mod tests {
         // Transition parent to Cold (writes segment + flips tier),
         // then directly to Archive (metadata flip; segment stays put).
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(
                 registry.kv(),
                 registry.object_store(),

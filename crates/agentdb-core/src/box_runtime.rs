@@ -39,11 +39,18 @@ pub struct Quota {
     pub burst: Option<u64>,
 }
 
-/// One logical box. Owns a mutex that serializes the hot-path writes
-/// (append, metadata updates) for tenants it hosts.
+/// One logical box. Owns per-tenant write locks so writes to
+/// different tenants on the same box run in parallel (M23).
 pub struct Box_ {
     pub id: BoxId,
-    pub write_lock: Mutex<()>,
+    /// Per-tenant write lock. Keyed by the external tenant id.
+    /// Entries are created lazily on first acquire and retained for
+    /// the box's lifetime — LRU eviction is a follow-up PR. Two
+    /// callers targeting the same tenant share the `Arc<Mutex<()>>`
+    /// and serialize; two callers targeting different tenants get
+    /// distinct locks and proceed in parallel. Replaced the box-wide
+    /// `write_lock: Mutex<()>` that serialized every tenant.
+    tenant_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     indexes: tokio::sync::RwLock<Option<crate::indexes::PerBoxIndexes>>,
     pub metrics: Arc<BoxMetrics>,
     pub fault: RwLock<Option<InjectedFault>>,
@@ -72,7 +79,7 @@ impl Box_ {
     ) -> Self {
         Self {
             id,
-            write_lock: Mutex::new(()),
+            tenant_locks: RwLock::new(HashMap::new()),
             indexes: tokio::sync::RwLock::new(None),
             metrics: Arc::new(BoxMetrics::new()),
             fault: RwLock::new(None),
@@ -84,6 +91,26 @@ impl Box_ {
             hlc,
             lease,
         }
+    }
+
+    /// Get (or lazily create) the write lock for `tenant_external`.
+    /// Two callers for the same tenant share the same `Arc<Mutex<()>>`
+    /// and serialize; two callers for different tenants get distinct
+    /// locks and run in parallel. Use with `lock_owned().await` to get
+    /// an `OwnedMutexGuard<()>` suitable for passing to helper
+    /// functions.
+    pub fn tenant_write_lock(&self, tenant_external: &str) -> Arc<Mutex<()>> {
+        // Fast path: lock already exists — upgrade-free read.
+        if let Some(lock) = self.tenant_locks.read().get(tenant_external) {
+            return lock.clone();
+        }
+        // Slow path: first caller for this tenant on this box. Take
+        // the write lock and re-check to handle the race where two
+        // threads both passed the read-side miss.
+        let mut map = self.tenant_locks.write();
+        map.entry(tenant_external.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Lease manager for this box, if one was configured at registry
@@ -138,9 +165,9 @@ impl Box_ {
     ///
     /// `tenant_internal_id == 0` is a sentinel meaning "tenant not
     /// yet minted" (callers use it for the first-ever request from a
-    /// new tenant, where calling `get_or_mint` before the write_lock
-    /// would race). In that case the per-tenant gate is skipped; the
-    /// per-box gate still runs.
+    /// new tenant, where calling `get_or_mint` before the tenant
+    /// write lock would race). In that case the per-tenant gate is
+    /// skipped; the per-box gate still runs.
     ///
     /// Both buckets must grant. The per-box gate runs first so one
     /// tenant can't repeatedly drain the per-tenant bucket check while
@@ -209,9 +236,7 @@ impl Box_ {
                         );
                         let mut idx = indexes;
                         let replayed = idx
-                            .replay_events_after(
-                                kv, store, tenants, sessions, self.id, snap_hlc,
-                            )
+                            .replay_events_after(kv, store, tenants, sessions, self.id, snap_hlc)
                             .await?;
                         tracing::info!(box_id = self.id, replayed, "snapshot replay complete");
                         idx

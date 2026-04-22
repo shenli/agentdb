@@ -117,7 +117,7 @@ pub async fn force_tier(
             id: body.session_id.clone(),
         })?;
 
-    let guard = box_.write_lock.lock().await;
+    let guard = box_.tenant_write_lock(&body.tenant_id).lock_owned().await;
     // Walk one hop at a time until we reach the target tier. Each hop
     // records metrics, emits SSE, and fires a webhook.
     //

@@ -234,7 +234,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(
                 &kv,
                 reg.object_store(),
@@ -399,7 +399,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(
                 &kv,
                 reg.object_store(),

@@ -41,7 +41,7 @@ pub async fn fork_handler(
     Json(body): Json<ForkRequest>,
 ) -> Result<Json<ForkResponse>, ApiError> {
     let box_ = state.registry.route_tenant(&body.tenant_id);
-    let guard = box_.write_lock.lock().await;
+    let guard = box_.tenant_write_lock(&body.tenant_id).lock_owned().await;
     let child = match fork_session(
         &state.registry,
         &state.tenants,

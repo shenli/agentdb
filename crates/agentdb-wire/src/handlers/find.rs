@@ -303,7 +303,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             agentdb_core::cold_transition(
                 registry.kv(),
                 registry.object_store(),
@@ -353,7 +353,7 @@ mod tests {
             .unwrap();
         // Cold then flip to Archive (metadata-only in this prototype).
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             agentdb_core::cold_transition(
                 registry.kv(),
                 registry.object_store(),

@@ -76,7 +76,8 @@ impl<'a> HybridPlanner<'a> {
         session_id_hint: Option<&str>,
     ) -> Result<PlanOutput> {
         let out = if let Some(session_ext) = session_id_hint {
-            self.plan_locality_bound(source, filter, session_ext).await?
+            self.plan_locality_bound(source, filter, session_ext)
+                .await?
         } else {
             self.plan_over_fetch(source, filter).await?
         };
@@ -582,7 +583,7 @@ mod tests {
             .unwrap();
         let box_ = reg.route_tenant("t-1");
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(&kv, &store, &sessions, &guard, &mut session)
                 .await
                 .unwrap();
@@ -883,7 +884,7 @@ mod tests {
             .unwrap();
         // Cold + Archive transitions.
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             crate::tiering::cold_transition(
                 &kv,
                 reg.object_store(),
