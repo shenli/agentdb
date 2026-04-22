@@ -58,7 +58,7 @@ async fn snapshot_isolates_cold_transition_midread() {
 
     // Mid-read: tier transition to Cold.
     {
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let mut fresh = sessions
             .lookup(box_.id, tenant.internal_id, "s-1")
             .unwrap()
@@ -97,7 +97,7 @@ async fn snapshot_isolates_reactivate_midread() {
 
     // Pre-cold.
     {
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let mut fresh = sessions
             .lookup(box_.id, tenant.internal_id, "s-1")
             .unwrap()
@@ -118,7 +118,7 @@ async fn snapshot_isolates_reactivate_midread() {
 
     // Mid-read: reactivate.
     {
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let mut fresh = sessions
             .lookup(box_.id, tenant.internal_id, "s-1")
             .unwrap()

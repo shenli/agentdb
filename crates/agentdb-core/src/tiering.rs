@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::{encode_key, KvStore, Namespace, WriteOp};
 use object_store::ObjectStore;
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::error::{Error, Result};
 use crate::primitives::DEFAULT_BRANCH_ID;
@@ -23,13 +23,13 @@ fn now_millis() -> u64 {
 /// Move a warm session to cold: write a segment on the object store, then
 /// delete the session's warm events and mark the metadata.
 ///
-/// Precondition: caller holds the box's `write_lock` (demonstrated by the
-/// `MutexGuard` reference). `session.tier` must be `Warm`.
+/// Precondition: caller holds the tenant's write lock (demonstrated by the
+/// `OwnedMutexGuard` reference). `session.tier` must be `Warm`.
 pub async fn cold_transition(
     kv: &Arc<dyn KvStore>,
     store: &Arc<dyn ObjectStore>,
     sessions: &SessionRegistry,
-    _lock: &MutexGuard<'_, ()>,
+    _lock: &OwnedMutexGuard<()>,
     session: &mut Session,
 ) -> Result<()> {
     if session.tier != Tier::Warm {
@@ -41,9 +41,11 @@ pub async fn cold_transition(
             ),
         });
     }
-    // `cold_transition` runs under the box `write_lock`, so a live-KV
-    // prefix scan here is equivalent to a snapshot taken at lock-acquire
-    // time — no concurrent writer can mutate this session's event range.
+    // `cold_transition` runs under the tenant's write lock, so a
+    // live-KV prefix scan here is equivalent to a snapshot taken at
+    // lock-acquire time — no concurrent writer on the same tenant can
+    // mutate this session's event range. Writers on *other* tenants
+    // can proceed in parallel but operate on disjoint key prefixes.
     // Not routed through a ReadCtx because this is a writer path, not a
     // reader, and the caller doesn't have one to hand down.
     let events: Vec<crate::types::Event> = {
@@ -116,12 +118,12 @@ pub async fn cold_transition(
 
 /// Restore a cold session's events to warm, then delete the segment.
 ///
-/// Precondition: caller holds the box's `write_lock`. `session.tier` must be `Cold`.
+/// Precondition: caller holds the tenant's write lock. `session.tier` must be `Cold`.
 pub async fn reactivate(
     kv: &Arc<dyn KvStore>,
     store: &Arc<dyn ObjectStore>,
     sessions: &SessionRegistry,
-    _lock: &MutexGuard<'_, ()>,
+    _lock: &OwnedMutexGuard<()>,
     session: &mut Session,
 ) -> Result<()> {
     if session.tier != Tier::Cold {
@@ -183,7 +185,7 @@ pub async fn reactivate(
 /// Returns an error only if the session isn't currently `Cold`.
 pub async fn cold_to_archive(
     sessions: &crate::registry::SessionRegistry,
-    _guard: &tokio::sync::MutexGuard<'_, ()>,
+    _guard: &tokio::sync::OwnedMutexGuard<()>,
     session: &mut crate::types::Session,
 ) -> crate::error::Result<()> {
     if session.tier != crate::types::Tier::Cold {
@@ -205,7 +207,7 @@ pub async fn cold_to_archive(
 /// events back to warm.
 pub async fn archive_to_cold(
     sessions: &crate::registry::SessionRegistry,
-    _guard: &tokio::sync::MutexGuard<'_, ()>,
+    _guard: &tokio::sync::OwnedMutexGuard<()>,
     session: &mut crate::types::Session,
 ) -> crate::error::Result<()> {
     if session.tier != crate::types::Tier::Archive {
@@ -285,7 +287,7 @@ mod tests {
     async fn cold_transition_writes_segment_and_deletes_warm_events() {
         let (ctx, mut session) = seed("hello cold world", "s-1").await;
         let box_ = ctx.registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         cold_transition(
             ctx.registry.kv(),
             ctx.registry.object_store(),
@@ -322,7 +324,7 @@ mod tests {
         let (ctx, mut session) = seed("t", "s").await;
         session.tier = Tier::Cold;
         let box_ = ctx.registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let err = cold_transition(
             ctx.registry.kv(),
             ctx.registry.object_store(),
@@ -340,7 +342,7 @@ mod tests {
         let (ctx, mut session) = seed("round trip", "s-2").await;
         let box_ = ctx.registry.route_tenant("t-1");
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -354,7 +356,7 @@ mod tests {
         let path_before = session.segment_path.clone().unwrap();
 
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             reactivate(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -384,7 +386,7 @@ mod tests {
         let (ctx, mut session) = seed("round trip", "s-2").await;
         let box_ = ctx.registry.route_tenant("t-1");
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -397,7 +399,7 @@ mod tests {
         }
         let path = session.segment_path.clone().unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             reactivate(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -421,7 +423,7 @@ mod tests {
     async fn reactivate_rejects_non_cold_session() {
         let (ctx, mut session) = seed("t", "s").await;
         let box_ = ctx.registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let err = reactivate(
             ctx.registry.kv(),
             ctx.registry.object_store(),
@@ -446,7 +448,7 @@ mod tests {
         let box_ = ctx.registry.route_tenant("t-1");
         // First transition to Cold
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -463,7 +465,7 @@ mod tests {
 
         // Now archive
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_to_archive(&ctx.sessions, &guard, &mut session)
                 .await
                 .unwrap();
@@ -481,7 +483,7 @@ mod tests {
         let box_ = ctx.registry.route_tenant("t-1");
         // Transition Warm -> Cold -> Archive
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 ctx.registry.kv(),
                 ctx.registry.object_store(),
@@ -493,7 +495,7 @@ mod tests {
             .unwrap();
         }
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_to_archive(&ctx.sessions, &guard, &mut session)
                 .await
                 .unwrap();
@@ -504,7 +506,7 @@ mod tests {
 
         // Un-archive back to Cold
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             archive_to_cold(&ctx.sessions, &guard, &mut session)
                 .await
                 .unwrap();
@@ -520,7 +522,7 @@ mod tests {
         // A freshly seeded session is Warm; cold_to_archive should return Err
         let (ctx, mut session) = seed("reject me", "s-arch-3").await;
         let box_ = ctx.registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let err = cold_to_archive(&ctx.sessions, &guard, &mut session)
             .await
             .unwrap_err();

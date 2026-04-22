@@ -196,7 +196,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 reg.kv(),
                 reg.object_store(),
@@ -248,7 +248,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 reg.kv(),
                 reg.object_store(),
@@ -267,7 +267,7 @@ mod tests {
         // Reactivate so the session's current record no longer references the
         // segment — it's only referenced by the pin.
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             let mut fresh = sessions
                 .lookup(box_.id, tenant.internal_id, "s-1")
                 .unwrap()
@@ -318,7 +318,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 reg.kv(),
                 reg.object_store(),
@@ -331,7 +331,7 @@ mod tests {
         }
         // Reactivate, nobody pins the segment: orphan.
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             let mut fresh = sessions
                 .lookup(box_.id, tenant.internal_id, "s-1")
                 .unwrap()
@@ -382,7 +382,7 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             cold_transition(
                 reg.kv(),
                 reg.object_store(),
@@ -394,7 +394,7 @@ mod tests {
             .unwrap();
         }
         {
-            let guard = box_.write_lock.lock().await;
+            let guard = box_.tenant_write_lock("t-1").lock_owned().await;
             let mut fresh = sessions
                 .lookup(box_.id, tenant.internal_id, "s-1")
                 .unwrap()

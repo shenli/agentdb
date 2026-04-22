@@ -1,4 +1,4 @@
-use tokio::sync::MutexGuard;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::box_runtime::BoxRegistry;
 use crate::error::{Error, Result};
@@ -8,8 +8,8 @@ use crate::types::{ForkRef, Session};
 /// Create a new session whose history begins as a copy-on-write snapshot of
 /// the parent's events at `parent.next_seq - 1` (inclusive).
 ///
-/// - Must be called while holding the box write lock (demonstrated by the
-///   `MutexGuard` reference).
+/// - Must be called while holding the tenant's write lock
+///   (demonstrated by the `OwnedMutexGuard` reference).
 /// - Parent must exist. Child's external id must be free.
 /// - Both sessions live under the same tenant/box as the parent; fork never
 ///   crosses box boundaries.
@@ -18,7 +18,7 @@ pub fn fork_session(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
     sessions: &SessionRegistry,
-    _lock: &MutexGuard<'_, ()>,
+    _lock: &OwnedMutexGuard<()>,
     tenant_external: &str,
     parent_session_external: &str,
     new_session_external: &str,
@@ -117,7 +117,7 @@ mod tests {
             .unwrap();
         }
         let box_ = registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let child = fork_session(
             &registry, &tenants, &sessions, &guard, "t-1", "parent", "child", 1000,
         )
@@ -137,7 +137,7 @@ mod tests {
             .get_or_mint(registry.route_tenant("t-1").id, "t-1", 0)
             .unwrap();
         let box_ = registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let err = fork_session(
             &registry, &tenants, &sessions, &guard, "t-1", "nope", "child", 0,
         )
@@ -179,7 +179,7 @@ mod tests {
         .await
         .unwrap();
         let box_ = registry.route_tenant("t-1");
-        let guard = box_.write_lock.lock().await;
+        let guard = box_.tenant_write_lock("t-1").lock_owned().await;
         let err = fork_session(
             &registry, &tenants, &sessions, &guard, "t-1", "parent", "taken", 0,
         )
