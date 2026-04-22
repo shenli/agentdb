@@ -92,11 +92,15 @@ pub fn fetch_last_n(
         session.internal_id,
         DEFAULT_BRANCH_ID,
     );
+    let cutoff = ctx.hlc_cutoff();
     let mut ring: std::collections::VecDeque<Event> = std::collections::VecDeque::with_capacity(n);
     for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
         let ev: Event = serde_json::from_slice(&v)?;
         if ev.seq >= session.next_seq {
+            continue;
+        }
+        if ev.hlc_ts > cutoff {
             continue;
         }
         if ring.len() == n {
@@ -125,6 +129,7 @@ pub fn scan_session_events(
         session.internal_id,
         DEFAULT_BRANCH_ID,
     );
+    let cutoff = ctx.hlc_cutoff();
     let mut all: Vec<Event> = Vec::new();
     for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
@@ -132,9 +137,13 @@ pub fn scan_session_events(
         // Belt-and-suspenders: guard against stale session records passed in
         // from outside the snapshot. Under normal use the snapshot filters
         // newer writes already.
-        if ev.seq < session.next_seq {
-            all.push(ev);
+        if ev.seq >= session.next_seq {
+            continue;
         }
+        if ev.hlc_ts > cutoff {
+            continue;
+        }
+        all.push(ev);
     }
     Ok(all)
 }
@@ -173,9 +182,13 @@ pub async fn fetch_last_n_merged(
     else {
         return Ok(own);
     };
+    let cutoff = ctx.hlc_cutoff();
     let parent_events: Vec<Event> = match parent.tier {
         Tier::Warm => scan_session_events(ctx, &parent)?,
         Tier::Cold => {
+            // Segments are pulled from object storage and do not go through
+            // the RocksDB snapshot. The HLC cutoff is the only isolation
+            // mechanism for cold/archive/fork-parent reads.
             if let Some(path) = parent.segment_path.as_deref() {
                 match crate::segment::read_segment(store, path).await {
                     Ok(seg) => seg.events,
@@ -191,7 +204,7 @@ pub async fn fetch_last_n_merged(
     all.extend(
         parent_events
             .into_iter()
-            .filter(|e| e.seq < fork.parent_seq_at_fork),
+            .filter(|e| e.seq < fork.parent_seq_at_fork && e.hlc_ts <= cutoff),
     );
     all.sort_by_key(|e| e.ts);
     let start = all.len().saturating_sub(n);

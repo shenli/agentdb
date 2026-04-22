@@ -52,10 +52,11 @@ pub struct Box_ {
     pub segment_pins: Arc<SegmentPinRegistry>,
     box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
     tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
+    hlc: Arc<HlcClock>,
 }
 
 impl Box_ {
-    fn new(id: BoxId) -> Self {
+    fn new(id: BoxId, hlc: Arc<HlcClock>) -> Self {
         Self {
             id,
             write_lock: Mutex::new(()),
@@ -67,7 +68,14 @@ impl Box_ {
             segment_pins: Arc::new(SegmentPinRegistry::new()),
             box_bucket: parking_lot::Mutex::new(None),
             tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
+            hlc,
         }
+    }
+
+    /// The process-global hybrid logical clock shared by all boxes. Cheap
+    /// Arc clone; always returns the same clock instance.
+    pub fn hlc(&self) -> &Arc<HlcClock> {
+        &self.hlc
     }
 
     /// If a fault is active, apply its effect. For Latency, sleep. For
@@ -210,7 +218,9 @@ impl BoxRegistry {
                 message: "num_boxes must be > 0".into(),
             });
         }
-        let boxes = (0..num_boxes).map(|i| Arc::new(Box_::new(i))).collect();
+        let boxes = (0..num_boxes)
+            .map(|i| Arc::new(Box_::new(i, hlc.clone())))
+            .collect();
         Ok(Self {
             boxes,
             kv,
@@ -352,7 +362,7 @@ mod tests {
 
     #[test]
     fn box_has_segment_pin_registry() {
-        let b = Box_::new(0);
+        let b = Box_::new(0, Arc::new(HlcClock::default()));
         b.segment_pins.pin("seg1");
         assert_eq!(b.segment_pins.pinned_len(), 1);
     }
@@ -365,7 +375,7 @@ mod admit_tests {
     use std::time::Duration;
 
     fn make_box() -> Arc<Box_> {
-        Arc::new(Box_::new(0))
+        Arc::new(Box_::new(0, Arc::new(HlcClock::default())))
     }
 
     #[test]
