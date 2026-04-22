@@ -430,6 +430,61 @@ SSE event bodies (OpenAPI does not model event streams well — the
 endpoint is listed, but event shapes are defined only via the
 `StreamEvent` schema for SDK consumers).
 
+## Tracing and OpenTelemetry (M15 Part A)
+
+Every request produces a span tree observable via the `tracing` crate
+and optionally exported over OTLP to a collector (Jaeger, Tempo, etc).
+
+**Tree shape (REST `append_and_fetch` example).**
+
+```
+rest.append_and_fetch            tenant, session, actor, fetch_last_n
+ └── append_and_fetch            seq, hlc_physical_ns (recorded mid-span)
+      └── fetch_last_n_merged    session, tier, fork, n
+           └── read_segment_hedged  (only if tier is Cold/Archive)
+                                   path, tier, hedge_triggered, hedge_winner
+```
+
+Mongo wire gets the equivalent with a root `mongo.dispatch` span that
+records `command` (e.g. `find`, `insert`) and `db` (the tenant
+namespace). Hybrid retrieval paths produce `planner.plan` (with
+`strategy` + `hits` fields) or `planner.scan_by_agent` (`actor`,
+`candidates`, `hits`).
+
+**Two init modes (server binary, `bin/agentdb-server/src/tracing_init.rs`):**
+
+- **`AGENTDB_OTLP_ENDPOINT` unset** (dev): `tracing_subscriber::fmt`
+  pretty-prints spans + events to stdout. Zero external dependencies.
+- **`AGENTDB_OTLP_ENDPOINT=http://host:4317`** (prod): OTLP/gRPC
+  exporter batches spans to the named collector while stdout keeps the
+  same human-readable output for `docker compose logs` visibility.
+
+`init()` returns a `TracerGuard` RAII handle; dropping it flushes any
+pending batched spans. `main()` keeps the guard alive for the lifetime
+of the process.
+
+**Configuration env vars.**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `AGENTDB_OTLP_ENDPOINT` | *(empty)* | Collector address; empty disables OTLP export |
+| `AGENTDB_TRACE_SERVICE_NAME` | `"agentdb"` | OTel resource `service.name` attribute |
+| `RUST_LOG` | `info` | Standard `EnvFilter` syntax (e.g. `info,agentdb_core=debug`) |
+
+**Library-side: no OTel dependency.** Instrumented functions use
+`#[tracing::instrument]` only — no `opentelemetry::` imports in
+`agentdb-core` / `-wire` / `-api`. The OTel pipeline lives entirely in
+the server binary. This keeps the libraries usable with any
+`tracing_subscriber::Layer` (fmt, Jaeger-direct, in-memory test
+recorder — the M15 integration test in
+`crates/agentdb-api/tests/tracing_spans.rs` uses the last).
+
+**Deferred.** W3C `traceparent` header extract/inject (Task A4 Step
+2+3) is out of scope for this prototype and is a follow-up when
+distributed traces across HTTP clients become valuable. Admin
+endpoints are not yet instrumented — the hot path is covered, and
+admin can gain spans as debugging needs them.
+
 ## Observability (M7)
 
 Every mutation path records to `BoxMetrics`:

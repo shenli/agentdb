@@ -46,12 +46,31 @@ use bson::Bson;
 use crate::handlers::{browse, find as find_mod, hello as hello_mod, insert as insert_mod};
 use crate::state::WireState;
 
+#[tracing::instrument(
+    name = "mongo.dispatch",
+    skip_all,
+    fields(
+        command = tracing::field::Empty,
+        db = tracing::field::Empty,
+        connection_id,
+    ),
+)]
 pub async fn dispatch(
     body: &Document,
     doc_sequences: &[(&str, &[Document])],
     state: &WireState,
     connection_id: i64,
 ) -> Document {
+    // Record the command name + db on the current span; shape
+    // "{db}.{command}" is the common Mongo instrumentation convention.
+    if let Ok(head) = inspect(body) {
+        let span = tracing::Span::current();
+        span.record("command", head.name);
+        if let Some(db) = head.db {
+            span.record("db", db);
+        }
+    }
+
     // Absorb any incoming $clusterTime into the process-global HLC before
     // dispatching. A rejection (remote too far in the future) short-
     // circuits with a Mongo-style error document; otherwise we fall

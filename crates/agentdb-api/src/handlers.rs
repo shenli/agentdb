@@ -23,6 +23,16 @@ use crate::AppState;
         (status = 503, description = "Fault injected", body = ErrorResponse),
     ),
 )]
+#[tracing::instrument(
+    name = "rest.append_and_fetch",
+    skip(state, body),
+    fields(
+        tenant = %tenant,
+        session = %session,
+        actor = body.actor_id.as_deref().unwrap_or(""),
+        fetch_last_n = body.fetch_last_n,
+    ),
+)]
 pub async fn append_and_fetch(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,

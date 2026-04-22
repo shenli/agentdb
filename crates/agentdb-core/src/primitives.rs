@@ -165,6 +165,16 @@ use crate::registry::TenantRegistry;
 /// read from the parent's tier-appropriate source — warm reads from
 /// `cf_events`, cold reads the segment via `object_store`, archive is treated
 /// as empty. The merged set is sorted by `ts` and truncated to the last N.
+#[tracing::instrument(
+    name = "fetch_last_n_merged",
+    skip_all,
+    fields(
+        session = %session.external_id,
+        tier = ?session.tier,
+        fork = session.forked_from.is_some(),
+        n,
+    ),
+)]
 pub async fn fetch_last_n_merged(
     ctx: &crate::read_ctx::ReadCtx,
     store: &Arc<dyn ObjectStore>,
@@ -257,6 +267,18 @@ pub async fn append_and_fetch(
 /// Like [`append_and_fetch`] but attaches an `actor_id` (agent
 /// identifier) to the event. See `agent-db-v2.md` §2.3.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "append_and_fetch",
+    skip_all,
+    fields(
+        tenant = tenant_external,
+        session = session_external,
+        actor = actor_id.as_deref().unwrap_or(""),
+        fetch_last_n = fetch_last_n_,
+        seq = tracing::field::Empty,
+        hlc_physical_ns = tracing::field::Empty,
+    ),
+)]
 pub async fn append_and_fetch_with_actor(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
@@ -332,6 +354,10 @@ pub async fn append_and_fetch_with_actor(
         hlc_ts,
         actor_id,
     )?;
+    // Record HLC + seq on the current span for observability.
+    tracing::Span::current()
+        .record("seq", event.seq)
+        .record("hlc_physical_ns", hlc_ts.physical_ns);
     box_.metrics.record_append();
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent

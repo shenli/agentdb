@@ -14,7 +14,7 @@ use anyhow::Context;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
-use tracing_subscriber::EnvFilter;
+mod tracing_init;
 
 /// Build the object store chosen by `AGENTDB_OBJECT_STORE` (`local` default,
 /// `s3` opt-in).
@@ -84,9 +84,9 @@ fn tier_name(t: agentdb_core::Tier) -> &'static str {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    // Keep the guard alive for the duration of main(); drop flushes
+    // pending OTel spans. See `tracing_init.rs` for the env-var surface.
+    let _tracer_guard = tracing_init::init()?;
 
     let data_dir: PathBuf = std::env::var_os("AGENTDB_DATA")
         .map(PathBuf::from)
