@@ -156,6 +156,11 @@ impl Box_ {
 
     /// Build (on first call) and return a read guard over the box's indexes.
     /// Rebuilds are skipped — subsequent calls reuse the existing instance.
+    ///
+    /// M16 Phase E: the "first call" path first tries to load the most
+    /// recent index snapshot from object storage and replay only
+    /// events appended after the snapshot's HLC cutoff. Falls back to a
+    /// full KV scan if no snapshot is found or if loading fails.
     pub async fn indexes_built<'a>(
         &'a self,
         kv: &Arc<dyn KvStore>,
@@ -174,12 +179,92 @@ impl Box_ {
         {
             let mut w = self.indexes.write().await;
             if w.is_none() {
-                let mut built = crate::indexes::PerBoxIndexes::new();
-                built.build(kv, store, tenants, sessions, self.id).await?;
+                let mut built = match self.try_load_snapshot(store).await {
+                    Ok(Some((snap_hlc, indexes))) => {
+                        tracing::info!(
+                            box_id = self.id,
+                            cutoff = snap_hlc.physical_ns,
+                            "index snapshot loaded; replaying events after cutoff"
+                        );
+                        let mut idx = indexes;
+                        let replayed = idx
+                            .replay_events_after(
+                                kv, store, tenants, sessions, self.id, snap_hlc,
+                            )
+                            .await?;
+                        tracing::info!(box_id = self.id, replayed, "snapshot replay complete");
+                        idx
+                    }
+                    Ok(None) => {
+                        // No snapshot — fall back to full rebuild.
+                        let mut idx = crate::indexes::PerBoxIndexes::new();
+                        idx.build(kv, store, tenants, sessions, self.id).await?;
+                        idx
+                    }
+                    Err(err) => {
+                        // Snapshot exists but we couldn't load it —
+                        // log and fall back rather than wedging startup.
+                        tracing::warn!(
+                            box_id = self.id,
+                            error = %err,
+                            "failed to load index snapshot; falling back to full rebuild"
+                        );
+                        let mut idx = crate::indexes::PerBoxIndexes::new();
+                        idx.build(kv, store, tenants, sessions, self.id).await?;
+                        idx
+                    }
+                };
+                // Prevent "unused mut" from triggering when we assign
+                // without later modifying — `built` is already populated
+                // above but kept mutable for symmetry.
+                let _ = &mut built;
                 *w = Some(built);
             }
         }
         Ok(self.indexes.read().await)
+    }
+
+    /// Look for an existing snapshot in object storage and, if present,
+    /// deserialize it. Returns `Ok(None)` if there are no snapshots.
+    /// The caller is responsible for replaying post-cutoff events.
+    async fn try_load_snapshot(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+    ) -> Result<Option<(crate::hlc::HlcTimestamp, crate::indexes::PerBoxIndexes)>> {
+        let Some(path) = crate::index_snapshot::latest_snapshot_path(store, self.id).await? else {
+            return Ok(None);
+        };
+        let snap = crate::index_snapshot::read_snapshot(store, &path).await?;
+        let indexes = crate::index_snapshot::restore_indexes(&snap)?;
+        Ok(Some((snap.hlc_ts_at_snapshot, indexes)))
+    }
+
+    /// Capture the current state of this box's indexes to object
+    /// storage. Triggered by the periodic job (M16 Phase D) and by
+    /// `drain` (M16 Phase F). No-op if the indexes have not yet been
+    /// built (never queried, never written).
+    pub async fn snapshot_indexes_to_store(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        hlc: crate::hlc::HlcTimestamp,
+    ) -> Result<Option<String>> {
+        let guard = self.indexes.read().await;
+        let Some(indexes) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let snap = crate::index_snapshot::snapshot_indexes(indexes, self.id, hlc);
+        drop(guard);
+        let path = match crate::index_snapshot::write_snapshot(store, &snap).await {
+            Ok(p) => {
+                self.metrics.record_index_snapshot_written();
+                p
+            }
+            Err(e) => {
+                self.metrics.record_index_snapshot_failure();
+                return Err(e);
+            }
+        };
+        Ok(Some(path))
     }
 
     /// Incrementally index one newly-appended event (M16 Phase C).

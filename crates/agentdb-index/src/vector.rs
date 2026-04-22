@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use hnsw_rs::prelude::{DistCosine, Hnsw};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::doc_id::DocId;
 use crate::error::{IndexError, IndexResult};
@@ -85,6 +86,68 @@ impl HnswVectorIndex {
             .unwrap_or(DEFAULT_EF);
         Self::with_ef(ef)
     }
+
+    /// Capture current state as a serializable snapshot (M16 Phase D).
+    /// Stores the unit-normalized per-path `entries` only; HNSW graphs
+    /// are rebuilt lazily on first query after load (same lazy-build
+    /// rule that applies to a fresh instance).
+    pub fn to_snapshot(&self) -> VectorSnapshot {
+        let map = self.per_path.lock();
+        let paths: Vec<VectorPathSnapshot> = map
+            .iter()
+            .map(|(path, state)| VectorPathSnapshot {
+                path: path.clone(),
+                dim: state.dim,
+                entries: state
+                    .entries
+                    .iter()
+                    .map(|(d, v)| (d.session_internal_id, d.seq, v.clone()))
+                    .collect(),
+            })
+            .collect();
+        VectorSnapshot { paths }
+    }
+
+    /// Rebuild from a snapshot (M16 Phase D). HNSW graphs are not
+    /// pre-built — the first `knn()` call at a path crossing
+    /// `BRUTE_FORCE_THRESHOLD` will rebuild from the loaded entries.
+    pub fn from_snapshot(snap: &VectorSnapshot, ef: usize) -> Self {
+        let mut per_path = HashMap::new();
+        for p in &snap.paths {
+            let entries: Vec<(DocId, Vec<f32>)> = p
+                .entries
+                .iter()
+                .map(|(s, q, v)| (DocId::new(*s, *q), v.clone()))
+                .collect();
+            per_path.insert(
+                p.path.clone(),
+                PathState {
+                    dim: p.dim,
+                    entries,
+                    hnsw: None,
+                },
+            );
+        }
+        Self {
+            per_path: Mutex::new(per_path),
+            ef,
+        }
+    }
+}
+
+/// Serializable snapshot of the vector index. Preserves normalized
+/// per-path entries; HNSW structure is rebuilt lazily on first query.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorSnapshot {
+    pub paths: Vec<VectorPathSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorPathSnapshot {
+    pub path: String,
+    pub dim: usize,
+    /// `(session_internal_id, seq, normalized_vector)`.
+    pub entries: Vec<(u64, u64, Vec<f32>)>,
 }
 
 fn normalise(v: &[f32]) -> Vec<f32> {

@@ -44,6 +44,23 @@ impl PerBoxIndexes {
         }
     }
 
+    /// Construct from parts — used by `index_snapshot::restore_indexes`
+    /// (M16 Phase E) to rebuild `PerBoxIndexes` from a deserialized
+    /// snapshot.
+    pub fn from_parts(
+        text: InMemoryInverted,
+        vector: HnswVectorIndex,
+        agent_events: BTreeMap<String, Vec<DocId>>,
+        indexed: u64,
+    ) -> Self {
+        Self {
+            text,
+            vector,
+            agent_events,
+            indexed,
+        }
+    }
+
     /// DocIds of events attributed to `actor_id`. Empty if the agent is
     /// unknown or has no events.
     pub fn docs_by_agent(&self, actor_id: &str) -> &[DocId] {
@@ -120,6 +137,79 @@ impl PerBoxIndexes {
             }
         }
         Ok(())
+    }
+
+    /// Like `build`, but only indexes events whose `hlc_ts` is strictly
+    /// greater than `cutoff`. Used by M16 Phase E recovery: after
+    /// `from_snapshot(…)`, replay any events that were appended after
+    /// the snapshot's HLC cutoff.
+    pub async fn replay_events_after(
+        &mut self,
+        kv: &Arc<dyn KvStore>,
+        store: &Arc<dyn ObjectStore>,
+        tenants: &TenantRegistry,
+        sessions: &SessionRegistry,
+        box_id: BoxId,
+        cutoff: crate::hlc::HlcTimestamp,
+    ) -> Result<u64> {
+        let mut replayed = 0u64;
+        let tenant_externals = tenants.list_in_box(box_id)?;
+        for tenant_ext in tenant_externals {
+            let Some(tenant) = tenants.lookup(box_id, &tenant_ext)? else {
+                continue;
+            };
+            let session_externals = sessions.list_in_tenant(box_id, tenant.internal_id)?;
+            for session_ext in session_externals {
+                let Some(session) =
+                    sessions.lookup(box_id, tenant.internal_id, &session_ext)?
+                else {
+                    continue;
+                };
+                let events: Vec<Event> = match session.tier {
+                    Tier::Warm => {
+                        let prefix = agentdb_storage::prefix_for_session_branch(
+                            Namespace::Events,
+                            session.box_id,
+                            session.tenant_internal_id,
+                            session.internal_id,
+                            DEFAULT_BRANCH_ID,
+                        );
+                        let mut out: Vec<Event> = Vec::new();
+                        for res in kv.scan_prefix(&prefix)? {
+                            let (_k, v) = res?;
+                            let ev: Event = serde_json::from_slice(&v)?;
+                            out.push(ev);
+                        }
+                        out
+                    }
+                    Tier::Cold => {
+                        // A cold session's segment was written atomically
+                        // before the snapshot cutoff OR after (never
+                        // partial). If after, we would have seen the
+                        // segment-write HLC; but the snapshot already
+                        // covers the warm events it replaced. Include
+                        // the segment's events only if the post-cutoff
+                        // filter says so.
+                        if let Some(path) = &session.segment_path {
+                            match read_segment(store, path).await {
+                                Ok(seg) => seg.events,
+                                Err(_) => continue,
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Tier::Archive => continue,
+                };
+                for event in events {
+                    if event.hlc_ts > cutoff {
+                        self.index_event(session.internal_id, &event);
+                        replayed += 1;
+                    }
+                }
+            }
+        }
+        Ok(replayed)
     }
 
     /// Index one event under the indexes' by-path structure. The top-level

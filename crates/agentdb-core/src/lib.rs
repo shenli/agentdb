@@ -6,6 +6,7 @@ pub mod error;
 pub mod fork;
 pub mod hedge;
 pub mod hlc;
+pub mod index_snapshot;
 pub mod indexes;
 pub mod lifecycle;
 pub(crate) mod meta;
@@ -26,6 +27,11 @@ pub use error::{Error, Resource, Result};
 pub use fork::fork_session;
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};
 pub use hlc::{HlcClock, HlcError, HlcTimestamp};
+pub use index_snapshot::{
+    latest_snapshot_path, list_snapshots, prune_old_snapshots, read_snapshot, restore_indexes,
+    snapshot_indexes, snapshot_path, snapshot_prefix, write_snapshot, IndexSnapshot,
+    INDEX_SNAPSHOT_SCHEMA_VERSION,
+};
 pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::doc_id::DocId;
 
 pub type Score = f32;
@@ -33,6 +35,31 @@ struct PathState {
     total_tokens: u64,
 }
 
+/// `(session_internal_id, seq, term_frequency_in_doc)` — one entry per
+/// (doc, token) pair in a path's postings list.
+pub type PostingEntry = (u64, u64, u32);
+/// A single term's postings: token -> list of entries for that token.
+pub type TokenPostings = (String, Vec<PostingEntry>);
+/// `(session_internal_id, seq, doc_len_in_tokens)` — one entry per doc.
+pub type DocLenEntry = (u64, u64, u32);
+
+/// Serializable snapshot of a BM25 text index. Structurally mirrors the
+/// live state; rebuilds live state on `InMemoryInverted::from_snapshot`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TextSnapshot {
+    pub paths: Vec<PathSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathSnapshot {
+    pub path: String,
+    /// token -> [(session, seq, tf)] — same shape as the live postings list.
+    pub postings: Vec<TokenPostings>,
+    /// [(session, seq, doc_len)] — same shape as the live doc_len map.
+    pub doc_len: Vec<DocLenEntry>,
+    pub total_tokens: u64,
+}
+
 impl Default for InMemoryInverted {
     fn default() -> Self {
         Self::new()
@@ -44,6 +71,70 @@ impl InMemoryInverted {
         Self {
             per_path: HashMap::new(),
         }
+    }
+
+    /// Capture current state as a serializable snapshot (M16 Phase D).
+    pub fn to_snapshot(&self) -> TextSnapshot {
+        let mut paths = Vec::with_capacity(self.per_path.len());
+        for (path, state) in &self.per_path {
+            let postings: Vec<TokenPostings> = state
+                .postings
+                .iter()
+                .map(|(token, list)| {
+                    (
+                        token.clone(),
+                        list.iter()
+                            .map(|(d, tf)| (d.session_internal_id, d.seq, *tf))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let doc_len: Vec<DocLenEntry> = state
+                .doc_len
+                .iter()
+                .map(|(d, l)| (d.session_internal_id, d.seq, *l))
+                .collect();
+            paths.push(PathSnapshot {
+                path: path.clone(),
+                postings,
+                doc_len,
+                total_tokens: state.total_tokens,
+            });
+        }
+        TextSnapshot { paths }
+    }
+
+    /// Rebuild from a snapshot (M16 Phase D).
+    pub fn from_snapshot(snap: &TextSnapshot) -> Self {
+        let mut per_path: HashMap<String, PathState> = HashMap::new();
+        for p in &snap.paths {
+            let postings: HashMap<String, Vec<(DocId, u32)>> = p
+                .postings
+                .iter()
+                .map(|(tok, list)| {
+                    (
+                        tok.clone(),
+                        list.iter()
+                            .map(|(s, q, tf)| (DocId::new(*s, *q), *tf))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let doc_len: HashMap<DocId, u32> = p
+                .doc_len
+                .iter()
+                .map(|(s, q, l)| (DocId::new(*s, *q), *l))
+                .collect();
+            per_path.insert(
+                p.path.clone(),
+                PathState {
+                    postings,
+                    doc_len,
+                    total_tokens: p.total_tokens,
+                },
+            );
+        }
+        Self { per_path }
     }
 }
 
