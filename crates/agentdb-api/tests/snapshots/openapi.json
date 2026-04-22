@@ -545,6 +545,13 @@
           "event"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional agent identifier to attribute this event to. See\n`docs/agent-db-v2.md` §2.3 for the agent-as-metadata stance —\nfree-form string, no pre-registration, no separate resource."
+          },
           "event": {},
           "fetch_last_n": {
             "type": "integer",
@@ -705,6 +712,13 @@
           "payload"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form identifier of the agent that wrote this event. Optional\n— not every event is agent-attributable (system events, user\nedits, etc.). Indexed at the tablet level for cross-session\nretrieval (\"all events for agent X\"). See `agent-db-v2.md` §2.3.\n\nAgent is a metadata dimension, not a first-class resource: no\nregistration, no quota, no lifecycle. Promoting this to a full\nresource is deferred to v2+ per §10.4."
+          },
           "hlc_ts": {
             "$ref": "#/components/schemas/HlcTimestamp",
             "description": "Hybrid logical clock timestamp assigned under the session lock at\nappend time. Gives causality-respecting order across sessions and\ntablets. See `agent-db-v2.md` §4 and `hlc.rs`."
@@ -733,6 +747,13 @@
           "payload"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent attribution, if any. Mirrors `Event::actor_id`."
+          },
           "payload": {},
           "seq": {
             "type": "integer",
@@ -989,6 +1010,9 @@
           "segment_gc_skipped_pinned",
           "webhook_fires",
           "webhook_failures",
+          "hedged_triggers",
+          "hedged_primary_wins",
+          "hedged_secondary_wins",
           "gauges"
         ],
         "properties": {
@@ -1009,6 +1033,21 @@
           },
           "gauges": {
             "$ref": "#/components/schemas/GaugeSnapshot"
+          },
+          "hedged_primary_wins": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hedged_secondary_wins": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hedged_triggers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "inserts": {
             "type": "integer",
@@ -1188,6 +1227,13 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "primary_agent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The primary agent that owns this session, if single-agent. Multi-\nagent sessions (orchestrator + workers) may leave this unset and\ndisambiguate at the event level via `Event::actor_id`. Indexed\nfor cross-session queries. See `agent-db-v2.md` §2.3."
           },
           "segment_path": {
             "type": [

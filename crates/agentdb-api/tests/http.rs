@@ -76,6 +76,63 @@ async fn append_and_fetch_endpoint_round_trip() {
 
 #[tokio::test]
 #[serial]
+async fn actor_id_roundtrips_through_append_and_fetch() {
+    // M15 Part C: REST AppendAndFetchRequest accepts an optional
+    // actor_id, which is lifted onto Event::actor_id and echoed back
+    // in the `recent` response.
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Append one event with actor_id set.
+    let resp: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-agent/sessions/s-agent/append_and_fetch"
+        ))
+        .json(&json!({
+            "event": {"tool": "search"},
+            "actor_id": "agent-planner",
+            "fetch_last_n": 1,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["seq"], 1);
+    let recent = resp["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["actor_id"], "agent-planner");
+
+    // A follow-up append without actor_id must not surface the field at all.
+    let resp2: serde_json::Value = client
+        .post(format!(
+            "{base}/api/tenants/t-agent/sessions/s-agent/append_and_fetch"
+        ))
+        .json(&json!({
+            "event": {"tool": "reflect"},
+            "fetch_last_n": 1,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let recent2 = resp2["recent"].as_array().unwrap();
+    assert!(
+        recent2[0].get("actor_id").is_none(),
+        "event without actor_id should not include the field in JSON: {}",
+        recent2[0]
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn fetch_last_n_respects_bound() {
     let (_dir, _obj_dir, base) = spawn().await;
     let client = reqwest::Client::new();

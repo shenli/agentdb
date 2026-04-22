@@ -19,6 +19,16 @@ pub struct Event {
     /// append time. Gives causality-respecting order across sessions and
     /// tablets. See `agent-db-v2.md` §4 and `hlc.rs`.
     pub hlc_ts: HlcTimestamp,
+    /// Free-form identifier of the agent that wrote this event. Optional
+    /// — not every event is agent-attributable (system events, user
+    /// edits, etc.). Indexed at the tablet level for cross-session
+    /// retrieval ("all events for agent X"). See `agent-db-v2.md` §2.3.
+    ///
+    /// Agent is a metadata dimension, not a first-class resource: no
+    /// registration, no quota, no lifecycle. Promoting this to a full
+    /// resource is deferred to v2+ per §10.4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
     pub payload: Document,
 }
 
@@ -66,6 +76,12 @@ pub struct Session {
     pub segment_path: Option<String>,
     #[serde(default)]
     pub forked_from: Option<ForkRef>,
+    /// The primary agent that owns this session, if single-agent. Multi-
+    /// agent sessions (orchestrator + workers) may leave this unset and
+    /// disambiguate at the event level via `Event::actor_id`. Indexed
+    /// for cross-session queries. See `agent-db-v2.md` §2.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_agent_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -82,11 +98,45 @@ mod tests {
                 physical_ns: 1_700_000_000_123_456_789,
                 logical: 7,
             },
+            actor_id: Some("agent-planner".into()),
             payload: json!({ "kind": "tool_call", "name": "search" }),
         };
         let text = serde_json::to_string(&original).unwrap();
         let back: Event = serde_json::from_str(&text).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn event_without_actor_id_is_omitted_from_json() {
+        // `skip_serializing_if = Option::is_none` keeps the wire payload
+        // tight when actor_id is absent — important because most events
+        // will not have one.
+        let bare = Event {
+            seq: 1,
+            ts: 0,
+            hlc_ts: HlcTimestamp::ZERO,
+            actor_id: None,
+            payload: json!({}),
+        };
+        let text = serde_json::to_string(&bare).unwrap();
+        assert!(!text.contains("actor_id"), "unset actor_id leaked: {text}");
+        // And it deserializes back to None without the field present.
+        let back: Event = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.actor_id, None);
+    }
+
+    #[test]
+    fn event_without_actor_id_field_in_json_defaults_to_none() {
+        // Pre-M15 events (written before this field existed) must still
+        // deserialize — #[serde(default)] supplies None.
+        let text = r#"{
+            "seq": 1,
+            "ts": 0,
+            "hlc_ts": { "physical_ns": 0, "logical": 0 },
+            "payload": {}
+        }"#;
+        let back: Event = serde_json::from_str(text).unwrap();
+        assert_eq!(back.actor_id, None);
     }
 
     #[test]
@@ -109,8 +159,33 @@ mod tests {
             next_seq: 5,
             segment_path: None,
             forked_from: None,
+            primary_agent_id: Some("agent-main".into()),
         };
         let text = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn session_without_primary_agent_id_roundtrips() {
+        let s = Session {
+            internal_id: 17,
+            external_id: "s-9".into(),
+            tenant_internal_id: 3,
+            box_id: 1,
+            created_at: 100,
+            last_active_at: 150,
+            tier: Tier::Warm,
+            next_seq: 5,
+            segment_path: None,
+            forked_from: None,
+            primary_agent_id: None,
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(
+            !text.contains("primary_agent_id"),
+            "unset primary_agent_id leaked: {text}"
+        );
         let back: Session = serde_json::from_str(&text).unwrap();
         assert_eq!(back, s);
     }
@@ -151,6 +226,7 @@ mod tests {
                 parent_session_internal_id: 9,
                 parent_seq_at_fork: 42,
             }),
+            primary_agent_id: None,
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();

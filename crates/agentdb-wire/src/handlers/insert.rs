@@ -35,14 +35,21 @@ pub async fn insert_response(
 
         let mut payload_doc = d.clone();
         payload_doc.remove("session_id");
+        // If the inserted doc has a top-level `actor_id` string, extract
+        // it and lift it to `Event::actor_id`. Mirrors the REST surface's
+        // explicit `actor_id` field on AppendAndFetchRequest. See
+        // `docs/agent-db-v2.md` §2.3.
+        let actor_id = payload_doc
+            .remove("actor_id")
+            .and_then(|b| b.as_str().map(str::to_string));
         let payload = bson_to_json(Bson::Document(payload_doc));
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        match agentdb_core::append_and_fetch(
-            registry, tenants, sessions, db, session_id, payload, 0, now,
+        match agentdb_core::append_and_fetch_with_actor(
+            registry, tenants, sessions, db, session_id, payload, actor_id, 0, now,
         )
         .await
         {
@@ -137,6 +144,47 @@ mod tests {
             .get_str("errmsg")
             .unwrap()
             .contains("session_id"));
+    }
+
+    #[tokio::test]
+    async fn insert_with_actor_id_records_it_on_the_event() {
+        use agentdb_core::{fetch_last_n, ReadCtx};
+        let (_d, _od, r, t, s) = context();
+        insert_response(
+            &r,
+            &t,
+            &s,
+            "t-1",
+            "events",
+            &[doc! {
+                "session_id": "s-agent",
+                "actor_id": "agent-orchestrator",
+                "tool": "search",
+            }],
+        )
+        .await
+        .unwrap();
+
+        let box_ = r.route_tenant("t-1");
+        let tenant = t.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let session = s
+            .lookup(box_.id, tenant.internal_id, "s-agent")
+            .unwrap()
+            .unwrap();
+        let ctx = ReadCtx::open(&box_, r.kv()).unwrap();
+        let events = fetch_last_n(&ctx, &session, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].actor_id.as_deref(),
+            Some("agent-orchestrator"),
+            "actor_id not lifted from inserted doc to Event.actor_id"
+        );
+        // And it must not also remain in the payload.
+        assert!(
+            events[0].payload.get("actor_id").is_none(),
+            "actor_id leaked into payload: {:?}",
+            events[0].payload
+        );
     }
 
     #[tokio::test]

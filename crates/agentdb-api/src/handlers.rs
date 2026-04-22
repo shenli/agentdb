@@ -32,13 +32,14 @@ pub async fn append_and_fetch(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let out = match agentdb_core::append_and_fetch(
+    let out = match agentdb_core::append_and_fetch_with_actor(
         &state.registry,
         &state.tenants,
         &state.sessions,
         &tenant,
         &session,
         body.event,
+        body.actor_id,
         body.fetch_last_n,
         now_millis,
     )

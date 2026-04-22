@@ -21,6 +21,9 @@ pub const DEFAULT_BRANCH_ID: u32 = 0;
 /// that do not yet have an HLC wired (test fixtures, migration tools) may
 /// pass `HlcTimestamp::ZERO`; this is allowed but should not happen on
 /// the hot path.
+///
+/// `actor_id` is free-form agent attribution; optional per `agent-db-v2.md` §2.3.
+#[allow(clippy::too_many_arguments)]
 pub fn append_event(
     kv: &Arc<dyn KvStore>,
     _lock: &MutexGuard<'_, ()>,
@@ -28,12 +31,14 @@ pub fn append_event(
     payload: crate::types::Document,
     now_millis: u64,
     hlc_ts: HlcTimestamp,
+    actor_id: Option<String>,
 ) -> Result<Event> {
     let seq = session.next_seq;
     let event = Event {
         seq,
         ts: now_millis,
         hlc_ts,
+        actor_id,
         payload,
     };
     let event_key = encode_key(
@@ -188,9 +193,12 @@ pub async fn fetch_last_n_merged(
         Tier::Cold => {
             // Segments are pulled from object storage and do not go through
             // the RocksDB snapshot. The HLC cutoff is the only isolation
-            // mechanism for cold/archive/fork-parent reads.
+            // mechanism for cold/archive/fork-parent reads. Hedged against
+            // object-storage tail latency (design §6.3).
             if let Some(path) = parent.segment_path.as_deref() {
-                match crate::segment::read_segment(store, path).await {
+                match crate::segment::read_segment_hedged(store, path, Tier::Cold, ctx.metrics())
+                    .await
+                {
                     Ok(seg) => seg.events,
                     Err(_) => Vec::new(),
                 }
@@ -218,6 +226,9 @@ pub struct AppendFetchOutput {
     pub session: Session,
 }
 
+/// Append one event and return the last N events of the session in a
+/// single atomic request. The `actor_id` for the event is `None`; use
+/// [`append_and_fetch_with_actor`] for agent-attributed writes.
 #[allow(clippy::too_many_arguments)]
 pub async fn append_and_fetch(
     registry: &BoxRegistry,
@@ -226,6 +237,34 @@ pub async fn append_and_fetch(
     tenant_external: &str,
     session_external: &str,
     payload: crate::types::Document,
+    fetch_last_n_: usize,
+    now_millis: u64,
+) -> Result<AppendFetchOutput> {
+    append_and_fetch_with_actor(
+        registry,
+        tenants,
+        sessions,
+        tenant_external,
+        session_external,
+        payload,
+        None,
+        fetch_last_n_,
+        now_millis,
+    )
+    .await
+}
+
+/// Like [`append_and_fetch`] but attaches an `actor_id` (agent
+/// identifier) to the event. See `agent-db-v2.md` §2.3.
+#[allow(clippy::too_many_arguments)]
+pub async fn append_and_fetch_with_actor(
+    registry: &BoxRegistry,
+    tenants: &TenantRegistry,
+    sessions: &SessionRegistry,
+    tenant_external: &str,
+    session_external: &str,
+    payload: crate::types::Document,
+    actor_id: Option<String>,
     fetch_last_n_: usize,
     now_millis: u64,
 ) -> Result<AppendFetchOutput> {
@@ -284,7 +323,15 @@ pub async fn append_and_fetch(
     // (seq, hlc_ts) within one session is strictly monotonic. See
     // `docs/superpowers/notes/2026-04-21-hlc-clock-decision.md` §3.3.
     let hlc_ts = registry.hlc().now();
-    let event = append_event(&kv, &guard, &mut session, payload, now_millis, hlc_ts)?;
+    let event = append_event(
+        &kv,
+        &guard,
+        &mut session,
+        payload,
+        now_millis,
+        hlc_ts,
+        actor_id,
+    )?;
     box_.metrics.record_append();
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
@@ -345,6 +392,7 @@ mod tests {
             payload,
             now_millis,
             HlcTimestamp::ZERO,
+            None,
         )?;
         Ok((event, session))
     }
@@ -588,6 +636,7 @@ mod tests {
             next_seq: 1,
             segment_path: None,
             forked_from: None,
+            primary_agent_id: None,
         };
         let (_obj, ctx) = ephemeral_box_ctx(&kv);
         let out = fetch_last_n(&ctx, &session, 0).unwrap();

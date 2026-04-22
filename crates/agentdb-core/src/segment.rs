@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bson::Document;
 use object_store::path::Path as ObjectPath;
@@ -6,7 +7,9 @@ use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::types::Event;
+use crate::hedge::{hedged, Winner};
+use crate::metrics::BoxMetrics;
+use crate::types::{Event, Tier};
 
 /// On-disk segment schema version. Incremented whenever the binary layout
 /// of a `SegmentFile` changes incompatibly. Readers reject any other
@@ -90,6 +93,78 @@ pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<Se
     Ok(seg)
 }
 
+/// Hedged variant of `read_segment` for tail-latency protection on
+/// cold/archive tiers. Fires a primary read; if it hasn't completed
+/// within `delay`, fires a secondary read against the same path. First
+/// to finish wins; the loser is cancelled via drop.
+///
+/// Configuration (`hedge_delay_for`):
+/// - `Tier::Warm` → hedging disabled (returns the primary result).
+/// - `Tier::Cold` → `AGENTDB_HEDGE_COLD_MS` (default 50).
+/// - `Tier::Archive` → `AGENTDB_HEDGE_ARCHIVE_MS` (default 200).
+///
+/// Records `hedged_triggers` / `hedged_primary_wins` /
+/// `hedged_secondary_wins` on `BoxMetrics`. Honors the
+/// `AGENTDB_HEDGE_ENABLED` kill-switch (`false` bypasses hedging).
+pub async fn read_segment_hedged(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+    tier: Tier,
+    metrics: &BoxMetrics,
+) -> Result<SegmentFile> {
+    if !hedge_enabled() {
+        return read_segment(store, path).await;
+    }
+    let Some(delay) = hedge_delay_for(tier) else {
+        return read_segment(store, path).await;
+    };
+    let store2 = store.clone();
+    let path2 = path.to_string();
+    let result = hedged(
+        read_segment(store, path),
+        delay,
+        move || async move { read_segment(&store2, &path2).await },
+    )
+    .await?;
+    if result.triggered {
+        metrics.record_hedged_trigger();
+        match result.winner {
+            Winner::Primary => metrics.record_hedged_primary_win(),
+            Winner::Secondary => metrics.record_hedged_secondary_win(),
+        }
+    }
+    Ok(result.value)
+}
+
+/// Per-tier hedge delay, `None` for tiers where hedging is disabled.
+fn hedge_delay_for(tier: Tier) -> Option<Duration> {
+    match tier {
+        Tier::Warm => None,
+        Tier::Cold => Some(Duration::from_millis(env_ms(
+            "AGENTDB_HEDGE_COLD_MS",
+            50,
+        ))),
+        Tier::Archive => Some(Duration::from_millis(env_ms(
+            "AGENTDB_HEDGE_ARCHIVE_MS",
+            200,
+        ))),
+    }
+}
+
+fn hedge_enabled() -> bool {
+    !matches!(
+        std::env::var("AGENTDB_HEDGE_ENABLED").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("False")
+    )
+}
+
+fn env_ms(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 pub async fn delete_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<()> {
     let p = ObjectPath::from(path);
     store.delete(&p).await.map_err(|e| Error::Invalid {
@@ -129,6 +204,7 @@ mod tests {
                     seq: 1,
                     ts: 100,
                     hlc_ts: hlc,
+                    actor_id: None,
                     payload: json!({"text": "hello"}),
                 },
                 Event {
@@ -138,6 +214,7 @@ mod tests {
                         physical_ns: hlc.physical_ns + 1,
                         logical: 0,
                     },
+                    actor_id: Some("agent-builder".into()),
                     payload: json!({"embedding": [1.0, 0.0]}),
                 },
             ],
