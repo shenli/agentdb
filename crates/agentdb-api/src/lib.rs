@@ -8,6 +8,7 @@ pub mod admin;
 pub mod admin_boxes;
 pub mod admin_nodes;
 pub mod admin_sessions;
+pub mod admin_tablets;
 pub mod dto;
 pub mod error;
 pub mod fork;
@@ -50,6 +51,7 @@ pub struct AppState {
         admin_boxes::set_webhook,
         admin_nodes::list_nodes,
         admin_sessions::get_session,
+        admin_tablets::list_tablets,
         stream::sse_handler,
     ),
     components(schemas(
@@ -70,6 +72,8 @@ pub struct AppState {
         admin_nodes::NodesUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
+        admin_tablets::TabletView,
+        admin_tablets::TabletsUnavailable,
         fork::ForkRequest,
         fork::ForkResponse,
         stream::StreamEvent,
@@ -134,6 +138,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/nodes",
             axum::routing::get(admin_nodes::list_nodes),
+        )
+        .route(
+            "/api/admin/tablets",
+            axum::routing::get(admin_tablets::list_tablets),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))
