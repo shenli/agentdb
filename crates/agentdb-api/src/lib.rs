@@ -7,6 +7,7 @@ use axum::Router;
 pub mod admin;
 pub mod admin_boxes;
 pub mod admin_nodes;
+pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_tablets;
 pub mod dto;
@@ -50,6 +51,7 @@ pub struct AppState {
         admin_boxes::set_quota,
         admin_boxes::set_webhook,
         admin_nodes::list_nodes,
+        admin_scheduler::get_scheduler,
         admin_sessions::get_session,
         admin_tablets::list_tablets,
         stream::sse_handler,
@@ -70,6 +72,9 @@ pub struct AppState {
         admin_boxes::WebhookResponse,
         admin_nodes::NodeView,
         admin_nodes::NodesUnavailable,
+        admin_scheduler::LeaderView,
+        admin_scheduler::SchedulerStatus,
+        admin_scheduler::SchedulerUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
         admin_tablets::TabletView,
@@ -142,6 +147,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tablets",
             axum::routing::get(admin_tablets::list_tablets),
+        )
+        .route(
+            "/api/admin/scheduler",
+            axum::routing::get(admin_scheduler::get_scheduler),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

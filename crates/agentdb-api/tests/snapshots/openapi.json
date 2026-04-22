@@ -320,6 +320,36 @@
         }
       }
     },
+    "/api/admin/scheduler": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_scheduler",
+        "responses": {
+          "200": {
+            "description": "Scheduler leader-election status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchedulerStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Control plane or election loop not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchedulerUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/sessions/{session_id}": {
       "get": {
         "tags": [
@@ -1082,6 +1112,37 @@
           }
         }
       },
+      "LeaderView": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "epoch",
+          "expires_at_ms",
+          "acquired_at_ms",
+          "is_live"
+        ],
+        "properties": {
+          "acquired_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_live": {
+            "type": "boolean",
+            "description": "True when `expires_at_ms > now_ms` at the moment of the read.\nA `false` here on a long-quiet cluster indicates either the\nlast leader died without a successor acquiring, or the\n`lease_duration` is large compared to read cadence."
+          },
+          "node_id": {
+            "type": "string"
+          }
+        }
+      },
       "MetricsSnapshot": {
         "type": "object",
         "required": [
@@ -1359,6 +1420,51 @@
             ],
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "SchedulerStatus": {
+        "type": "object",
+        "required": [
+          "this_node_id",
+          "this_node_is_leader",
+          "this_node_epoch"
+        ],
+        "properties": {
+          "leader": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LeaderView",
+                "description": "Canonical leader row from the control plane. `None` means no\nleader has ever been elected on this cluster."
+              }
+            ]
+          },
+          "this_node_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current epoch observed by this process's election loop. Zero\nbefore the first acquire attempt completes."
+          },
+          "this_node_id": {
+            "type": "string",
+            "description": "Node id this process registered as."
+          },
+          "this_node_is_leader": {
+            "type": "boolean",
+            "description": "`true` if this process's `LeaderElection::is_leader()` says\nso. Derived from the last successful acquire/renew — may be\nup to `renew_interval` stale after a loss of leadership, but\nnever falsely `true` past `lease_duration`."
+          }
+        }
+      },
+      "SchedulerUnavailable": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
           }
         }
       },
