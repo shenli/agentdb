@@ -545,6 +545,13 @@
           "event"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional agent identifier to attribute this event to. See\n`docs/agent-db-v2.md` §2.3 for the agent-as-metadata stance —\nfree-form string, no pre-registration, no separate resource."
+          },
           "event": {},
           "fetch_last_n": {
             "type": "integer",
@@ -740,6 +747,13 @@
           "payload"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Agent attribution, if any. Mirrors `Event::actor_id`."
+          },
           "payload": {},
           "seq": {
             "type": "integer",
