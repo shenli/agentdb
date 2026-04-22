@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 agentdb-api = { path = "../../crates/agentdb-api" }
 agentdb-core = { path = "../../crates/agentdb-core" }
+agentdb-meta = { path = "../../crates/agentdb-meta" }
 agentdb-storage = { path = "../../crates/agentdb-storage" }
 agentdb-wire = { path = "../../crates/agentdb-wire" }
 anyhow = { workspace = true }
