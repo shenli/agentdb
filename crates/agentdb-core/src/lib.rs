@@ -4,6 +4,7 @@ pub mod admission;
 pub mod box_runtime;
 pub mod error;
 pub mod fork;
+pub mod hlc;
 pub mod indexes;
 pub mod lifecycle;
 pub(crate) mod meta;
@@ -22,6 +23,7 @@ pub use admission::{AdmissionDenied, Scope, TokenBucket};
 pub use box_runtime::{BoxRegistry, Box_, FaultKind, InjectedFault, Quota};
 pub use error::{Error, Resource, Result};
 pub use fork::fork_session;
+pub use hlc::{HlcClock, HlcError, HlcTimestamp};
 pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};
@@ -32,7 +34,9 @@ pub use primitives::{
 };
 pub use read_ctx::ReadCtx;
 pub use registry::{SessionRegistry, TenantRegistry};
-pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1};
+pub use segment::{
+    read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION,
+};
 pub use segment_gc::{GcRunReporter, SegmentGc, SegmentGcConfig};
 pub use segment_pin::SegmentPinRegistry;
 pub use tiering::{cold_transition, reactivate};

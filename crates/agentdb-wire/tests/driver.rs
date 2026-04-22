@@ -344,3 +344,46 @@ async fn transaction_wire_commands_are_rejected_with_not_implemented() {
         "error should indicate command is not supported; got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn cluster_time_is_returned_and_advances_per_command() {
+    // M14 Phase E: every response carries $clusterTime. Successive
+    // commands should see monotonically non-decreasing cluster times.
+    let (_dir, _obj_dir, port) = spawn().await;
+    let cli = client(port).await;
+    let admin = cli.database("admin");
+
+    let r1 = admin.run_command(doc! { "ping": 1 }).await.unwrap();
+    let ct1 = r1
+        .get_document("$clusterTime")
+        .expect("response must carry $clusterTime");
+    let ts1 = ct1
+        .get_timestamp("clusterTime")
+        .expect("$clusterTime.clusterTime must be a Timestamp");
+    let sig1 = ct1
+        .get_document("signature")
+        .expect("$clusterTime must include signature");
+    assert_eq!(
+        sig1.get_i64("keyId").unwrap(),
+        0,
+        "v1 ships an unsigned cluster time"
+    );
+    assert!(
+        sig1.get_binary_generic("hash").is_ok(),
+        "signature.hash must be BinData even if empty"
+    );
+
+    // Next command — cluster time must not go backward.
+    let r2 = admin.run_command(doc! { "ping": 1 }).await.unwrap();
+    let ts2 = r2
+        .get_document("$clusterTime")
+        .unwrap()
+        .get_timestamp("clusterTime")
+        .unwrap();
+    assert!(
+        (ts2.time, ts2.increment) >= (ts1.time, ts1.increment),
+        "cluster time regressed: {:?} -> {:?}",
+        ts1,
+        ts2
+    );
+}

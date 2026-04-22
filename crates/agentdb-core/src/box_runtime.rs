@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::admission::{AdmissionDenied, Scope, TokenBucket};
 use crate::error::{Error, Result};
+use crate::hlc::HlcClock;
 use crate::metrics::BoxMetrics;
 use crate::segment_pin::SegmentPinRegistry;
 
@@ -51,10 +52,11 @@ pub struct Box_ {
     pub segment_pins: Arc<SegmentPinRegistry>,
     box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
     tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
+    hlc: Arc<HlcClock>,
 }
 
 impl Box_ {
-    fn new(id: BoxId) -> Self {
+    fn new(id: BoxId, hlc: Arc<HlcClock>) -> Self {
         Self {
             id,
             write_lock: Mutex::new(()),
@@ -66,7 +68,14 @@ impl Box_ {
             segment_pins: Arc::new(SegmentPinRegistry::new()),
             box_bucket: parking_lot::Mutex::new(None),
             tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
+            hlc,
         }
+    }
+
+    /// The process-global hybrid logical clock shared by all boxes. Cheap
+    /// Arc clone; always returns the same clock instance.
+    pub fn hlc(&self) -> &Arc<HlcClock> {
+        &self.hlc
     }
 
     /// If a fault is active, apply its effect. For Latency, sleep. For
@@ -175,18 +184,33 @@ impl Box_ {
 }
 
 /// Owns the pool of boxes and the shared KV store, plus the tenant→box
-/// routing function.
+/// routing function and the process-global HLC.
 pub struct BoxRegistry {
     boxes: Vec<Arc<Box_>>,
     kv: Arc<dyn KvStore>,
     object_store: Arc<dyn ObjectStore>,
+    hlc: Arc<HlcClock>,
 }
 
 impl BoxRegistry {
+    /// Build a registry with a default HLC (10s max-offset). The server
+    /// binary should prefer `new_with_hlc` to honor the
+    /// `AGENTDB_HLC_MAX_OFFSET_SECS` env var.
     pub fn new(
         kv: Arc<dyn KvStore>,
         object_store: Arc<dyn ObjectStore>,
         num_boxes: u16,
+    ) -> Result<Self> {
+        Self::new_with_hlc(kv, object_store, num_boxes, Arc::new(HlcClock::default()))
+    }
+
+    /// Build a registry with a caller-provided HLC. There is exactly one
+    /// `HlcClock` per process; all boxes share it.
+    pub fn new_with_hlc(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        num_boxes: u16,
+        hlc: Arc<HlcClock>,
     ) -> Result<Self> {
         if num_boxes == 0 {
             return Err(Error::Invalid {
@@ -194,11 +218,14 @@ impl BoxRegistry {
                 message: "num_boxes must be > 0".into(),
             });
         }
-        let boxes = (0..num_boxes).map(|i| Arc::new(Box_::new(i))).collect();
+        let boxes = (0..num_boxes)
+            .map(|i| Arc::new(Box_::new(i, hlc.clone())))
+            .collect();
         Ok(Self {
             boxes,
             kv,
             object_store,
+            hlc,
         })
     }
 
@@ -208,6 +235,13 @@ impl BoxRegistry {
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
+    }
+
+    /// The process-global hybrid logical clock. Every event append assigns
+    /// its `hlc_ts` from this, and every RPC-layer receive updates it via
+    /// `HlcClock::update`.
+    pub fn hlc(&self) -> &Arc<HlcClock> {
+        &self.hlc
     }
 
     pub fn num_boxes(&self) -> u16 {
@@ -328,7 +362,7 @@ mod tests {
 
     #[test]
     fn box_has_segment_pin_registry() {
-        let b = Box_::new(0);
+        let b = Box_::new(0, Arc::new(HlcClock::default()));
         b.segment_pins.pin("seg1");
         assert_eq!(b.segment_pins.pinned_len(), 1);
     }
@@ -341,7 +375,7 @@ mod admit_tests {
     use std::time::Duration;
 
     fn make_box() -> Arc<Box_> {
-        Arc::new(Box_::new(0))
+        Arc::new(Box_::new(0, Arc::new(HlcClock::default())))
     }
 
     #[test]

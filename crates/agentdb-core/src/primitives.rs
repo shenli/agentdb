@@ -4,6 +4,7 @@ use agentdb_storage::{encode_key, KvStore, Namespace, WriteOp};
 use tokio::sync::MutexGuard;
 
 use crate::error::{Error, Result};
+use crate::hlc::HlcTimestamp;
 use crate::meta::key_session_record;
 use crate::registry::SessionRegistry;
 use crate::types::{Event, Session, Tier};
@@ -14,17 +15,25 @@ pub const DEFAULT_BRANCH_ID: u32 = 0;
 /// Append one event to a session, atomically bumping its `next_seq` and
 /// `last_active_at`. Must be called while holding the box's write lock
 /// (demonstrated by the MutexGuard reference).
+///
+/// `hlc_ts` should be allocated from the process-global `HlcClock` before
+/// calling — see `append_and_fetch` for the wired-up call site. Callers
+/// that do not yet have an HLC wired (test fixtures, migration tools) may
+/// pass `HlcTimestamp::ZERO`; this is allowed but should not happen on
+/// the hot path.
 pub fn append_event(
     kv: &Arc<dyn KvStore>,
     _lock: &MutexGuard<'_, ()>,
     session: &mut Session,
     payload: crate::types::Document,
     now_millis: u64,
+    hlc_ts: HlcTimestamp,
 ) -> Result<Event> {
     let seq = session.next_seq;
     let event = Event {
         seq,
         ts: now_millis,
+        hlc_ts,
         payload,
     };
     let event_key = encode_key(
@@ -83,11 +92,15 @@ pub fn fetch_last_n(
         session.internal_id,
         DEFAULT_BRANCH_ID,
     );
+    let cutoff = ctx.hlc_cutoff();
     let mut ring: std::collections::VecDeque<Event> = std::collections::VecDeque::with_capacity(n);
     for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
         let ev: Event = serde_json::from_slice(&v)?;
         if ev.seq >= session.next_seq {
+            continue;
+        }
+        if ev.hlc_ts > cutoff {
             continue;
         }
         if ring.len() == n {
@@ -116,6 +129,7 @@ pub fn scan_session_events(
         session.internal_id,
         DEFAULT_BRANCH_ID,
     );
+    let cutoff = ctx.hlc_cutoff();
     let mut all: Vec<Event> = Vec::new();
     for res in ctx.scan_prefix(&prefix)? {
         let (_k, v) = res?;
@@ -123,9 +137,13 @@ pub fn scan_session_events(
         // Belt-and-suspenders: guard against stale session records passed in
         // from outside the snapshot. Under normal use the snapshot filters
         // newer writes already.
-        if ev.seq < session.next_seq {
-            all.push(ev);
+        if ev.seq >= session.next_seq {
+            continue;
         }
+        if ev.hlc_ts > cutoff {
+            continue;
+        }
+        all.push(ev);
     }
     Ok(all)
 }
@@ -164,9 +182,13 @@ pub async fn fetch_last_n_merged(
     else {
         return Ok(own);
     };
+    let cutoff = ctx.hlc_cutoff();
     let parent_events: Vec<Event> = match parent.tier {
         Tier::Warm => scan_session_events(ctx, &parent)?,
         Tier::Cold => {
+            // Segments are pulled from object storage and do not go through
+            // the RocksDB snapshot. The HLC cutoff is the only isolation
+            // mechanism for cold/archive/fork-parent reads.
             if let Some(path) = parent.segment_path.as_deref() {
                 match crate::segment::read_segment(store, path).await {
                     Ok(seg) => seg.events,
@@ -182,7 +204,7 @@ pub async fn fetch_last_n_merged(
     all.extend(
         parent_events
             .into_iter()
-            .filter(|e| e.seq < fork.parent_seq_at_fork),
+            .filter(|e| e.seq < fork.parent_seq_at_fork && e.hlc_ts <= cutoff),
     );
     all.sort_by_key(|e| e.ts);
     let start = all.len().saturating_sub(n);
@@ -258,7 +280,11 @@ pub async fn append_and_fetch(
     if newly_minted {
         box_.metrics.bump_tier(session.tier);
     }
-    let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+    // Allocate the HLC inside the session lock, just before `seq`, so that
+    // (seq, hlc_ts) within one session is strictly monotonic. See
+    // `docs/superpowers/notes/2026-04-21-hlc-clock-decision.md` §3.3.
+    let hlc_ts = registry.hlc().now();
+    let event = append_event(&kv, &guard, &mut session, payload, now_millis, hlc_ts)?;
     box_.metrics.record_append();
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
@@ -312,7 +338,14 @@ mod tests {
     ) -> Result<(Event, Session)> {
         let guard = box_lock.lock().await;
         let mut session = sessions.get_or_mint(box_id, tenant_id, session_external, now_millis)?;
-        let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+        let event = append_event(
+            &kv,
+            &guard,
+            &mut session,
+            payload,
+            now_millis,
+            HlcTimestamp::ZERO,
+        )?;
         Ok((event, session))
     }
 
@@ -372,6 +405,70 @@ mod tests {
         assert_eq!(e2.seq, 2);
         assert_eq!(s2.next_seq, 3);
         assert_eq!(s2.last_active_at, 200);
+    }
+
+    #[tokio::test]
+    async fn appends_in_a_session_are_monotonic_in_both_seq_and_hlc() {
+        // `append_and_fetch` assigns HLC inside the session lock, right
+        // before `seq`. The invariant is: for any session's events, both
+        // fields strictly increase.
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+        let mut outputs = Vec::new();
+        for i in 1..=20u64 {
+            let out = append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-mono",
+                "s-mono",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+            outputs.push(out);
+        }
+
+        // seq increases by 1 each time.
+        for (i, out) in outputs.iter().enumerate() {
+            assert_eq!(
+                out.new_seq,
+                (i + 1) as u64,
+                "seq at index {} not monotonic",
+                i
+            );
+        }
+
+        // Pull events back and verify their hlc_ts is strictly increasing.
+        let box_ = registry.route_tenant("t-mono");
+        let tenant = tenants.get_or_mint(box_.id, "t-mono", 0).unwrap();
+        let session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-mono")
+            .unwrap()
+            .unwrap();
+        let ctx = crate::read_ctx::ReadCtx::open(&box_, registry.kv()).unwrap();
+        let events = fetch_last_n(&ctx, &session, 100).unwrap();
+        assert_eq!(events.len(), 20);
+        for pair in events.windows(2) {
+            assert!(
+                pair[0].hlc_ts < pair[1].hlc_ts,
+                "hlc_ts not strictly monotonic across appends: {:?} then {:?}",
+                pair[0].hlc_ts,
+                pair[1].hlc_ts
+            );
+        }
+
+        // Every event's hlc_ts is non-zero — real wall-clock-backed HLC,
+        // not the Phase-B placeholder ZERO.
+        for ev in &events {
+            assert_ne!(
+                ev.hlc_ts,
+                crate::hlc::HlcTimestamp::ZERO,
+                "event seq {} got placeholder HLC — did append_and_fetch regress?",
+                ev.seq
+            );
+        }
     }
 
     #[tokio::test]

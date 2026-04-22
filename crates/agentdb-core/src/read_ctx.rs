@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 
 use crate::box_runtime::Box_;
 use crate::error::Result;
+use crate::hlc::HlcTimestamp;
 use crate::registry::SessionRegistry;
 use crate::segment_pin::SegmentPinRegistry;
 use crate::types::{Session, Tier};
@@ -27,6 +28,12 @@ pub struct ReadCtx {
     // bound to a single box (see `open`); all entries share that box.
     session_cache: Mutex<HashMap<(TenantId, u64), Session>>,
     external_cache: Mutex<HashMap<(TenantId, String), u64>>,
+    /// HLC cutoff captured at `open()` time. Read paths filter out events
+    /// whose `hlc_ts` is greater than this cutoff — the HLC analogue of the
+    /// RocksDB snapshot, and the only isolation mechanism for segment-backed
+    /// (cold / archive / fork-parent) reads where RocksDB snapshots do not
+    /// apply. See `docs/agent-db-v2.md` §4.2.
+    hlc_cutoff: HlcTimestamp,
 }
 
 impl ReadCtx {
@@ -34,6 +41,7 @@ impl ReadCtx {
     pub fn open(box_: &Box_, kv: &Arc<dyn KvStore>) -> Result<Self> {
         let snapshot = Arc::clone(kv).snapshot_owned()?;
         box_.metrics.bump_open_snapshots();
+        let hlc_cutoff = box_.hlc().current();
         Ok(Self {
             box_id: box_.id,
             snapshot,
@@ -42,11 +50,18 @@ impl ReadCtx {
             pinned_segments: Mutex::new(BTreeSet::new()),
             session_cache: Mutex::new(HashMap::new()),
             external_cache: Mutex::new(HashMap::new()),
+            hlc_cutoff,
         })
     }
 
     pub fn box_id(&self) -> BoxId {
         self.box_id
+    }
+
+    /// The HLC cutoff captured at open time. Events with `hlc_ts > cutoff`
+    /// are not visible through this ReadCtx.
+    pub fn hlc_cutoff(&self) -> HlcTimestamp {
+        self.hlc_cutoff
     }
 
     /// Scan a key prefix against the pinned snapshot.
@@ -262,6 +277,98 @@ mod tests {
             .unwrap();
         assert_eq!(a.external_id, b.external_id);
         assert_eq!(a.next_seq, b.next_seq);
+    }
+
+    #[tokio::test]
+    async fn hlc_cutoff_captures_current_clock_at_open() {
+        // ReadCtx::open captures the HLC at the moment of call. Subsequent
+        // `hlc.now()` invocations (from a later append) must not affect
+        // this ctx's cutoff.
+        let (_k, _o, kv, reg, _t, _s) = ctx_setup().await;
+        let box_ = reg.route_tenant("t-1");
+        // Advance the clock once.
+        let before = reg.hlc().now();
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+        assert!(
+            ctx.hlc_cutoff() >= before,
+            "cutoff {:?} must be >= pre-open clock {:?}",
+            ctx.hlc_cutoff(),
+            before
+        );
+        let cutoff_at_open = ctx.hlc_cutoff();
+        // Advance the clock more times.
+        for _ in 0..5 {
+            reg.hlc().now();
+        }
+        assert_eq!(
+            ctx.hlc_cutoff(),
+            cutoff_at_open,
+            "ctx.hlc_cutoff() must not change after later hlc.now() calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn hlc_cutoff_hides_events_appended_after_open() {
+        // Write 2 events, then open a ReadCtx, then write 3 more events.
+        // The ReadCtx should see only the first 2. This is the HLC-cutoff
+        // version of snapshot isolation; it matches the RocksDB-snapshot
+        // story but also extends to any segment-sourced reads.
+        let (_k, _o, kv, reg, tenants, sessions) = ctx_setup().await;
+        for i in 1..=2u64 {
+            append_and_fetch(
+                &reg,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+        let box_ = reg.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+
+        // Write more events after ctx opens.
+        for i in 3..=5u64 {
+            append_and_fetch(
+                &reg,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+
+        let session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+        let seen = crate::primitives::fetch_last_n(&ctx, &session, 100).unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "ReadCtx should see only pre-open events; saw {}",
+            seen.len()
+        );
+        assert_eq!(seen[0].seq, 1);
+        assert_eq!(seen[1].seq, 2);
+        for ev in &seen {
+            assert!(
+                ev.hlc_ts <= ctx.hlc_cutoff(),
+                "event hlc_ts {:?} leaked past cutoff {:?}",
+                ev.hlc_ts,
+                ctx.hlc_cutoff()
+            );
+        }
     }
 
     #[tokio::test]

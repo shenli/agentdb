@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use agentdb_storage::{BoxId, SessionId, TenantId};
 use utoipa::ToSchema;
 
+use crate::hlc::HlcTimestamp;
+
 /// A schema-free document. Backed by serde_json for M2 simplicity;
 /// will move to BSON when the Mongo wire protocol lands in M3.
 pub type Document = serde_json::Value;
@@ -13,6 +15,10 @@ pub struct Event {
     pub seq: u64,
     /// Unix epoch millis at write time.
     pub ts: u64,
+    /// Hybrid logical clock timestamp assigned under the session lock at
+    /// append time. Gives causality-respecting order across sessions and
+    /// tablets. See `agent-db-v2.md` §4 and `hlc.rs`.
+    pub hlc_ts: HlcTimestamp,
     pub payload: Document,
 }
 
@@ -72,6 +78,10 @@ mod tests {
         let original = Event {
             seq: 42,
             ts: 1_700_000_000_000,
+            hlc_ts: HlcTimestamp {
+                physical_ns: 1_700_000_000_123_456_789,
+                logical: 7,
+            },
             payload: json!({ "kind": "tool_call", "name": "search" }),
         };
         let text = serde_json::to_string(&original).unwrap();

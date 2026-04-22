@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::types::Event;
 
-pub const SEGMENT_SCHEMA_V1: u32 = 1;
+/// On-disk segment schema version. Incremented whenever the binary layout
+/// of a `SegmentFile` changes incompatibly. Readers reject any other
+/// value; AgentDB is pre-1.0 so earlier on-disk layouts are not supported.
+///
+/// v2 (current): events carry `hlc_ts`. Bumped in M14.
+pub const SEGMENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentFile {
@@ -73,10 +78,13 @@ pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<Se
         field: None,
         message: e.to_string(),
     })?;
-    if seg.schema_version != SEGMENT_SCHEMA_V1 {
+    if seg.schema_version != SEGMENT_SCHEMA_VERSION {
         return Err(Error::Invalid {
             field: None,
-            message: format!("unknown segment schema version {}", seg.schema_version),
+            message: format!(
+                "unsupported segment schema version {}, expected {}",
+                seg.schema_version, SEGMENT_SCHEMA_VERSION
+            ),
         });
     }
     Ok(seg)
@@ -94,6 +102,7 @@ pub async fn delete_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hlc::HlcTimestamp;
     use object_store::local::LocalFileSystem;
     use serde_json::json;
     use tempfile::TempDir;
@@ -106,20 +115,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_roundtrip_preserves_events() {
+    async fn segment_roundtrip_preserves_events_with_hlc() {
         let (_d, store) = mem_store();
+        let hlc = HlcTimestamp {
+            physical_ns: 1_700_000_000_111_222_333,
+            logical: 4,
+        };
         let seg = SegmentFile {
-            schema_version: SEGMENT_SCHEMA_V1,
+            schema_version: SEGMENT_SCHEMA_VERSION,
             session_internal_id: 7,
             events: vec![
                 Event {
                     seq: 1,
                     ts: 100,
+                    hlc_ts: hlc,
                     payload: json!({"text": "hello"}),
                 },
                 Event {
                     seq: 2,
                     ts: 200,
+                    hlc_ts: HlcTimestamp {
+                        physical_ns: hlc.physical_ns + 1,
+                        logical: 0,
+                    },
                     payload: json!({"embedding": [1.0, 0.0]}),
                 },
             ],
@@ -127,14 +145,16 @@ mod tests {
         let path = segment_path(3, 42, 7, 1_700_000_000_000);
         write_segment(&store, &path, &seg).await.unwrap();
         let back = read_segment(&store, &path).await.unwrap();
+        assert_eq!(back.schema_version, SEGMENT_SCHEMA_VERSION);
         assert_eq!(back.session_internal_id, 7);
         assert_eq!(back.events.len(), 2);
+        assert_eq!(back.events[0].hlc_ts, hlc);
         assert_eq!(back.events[0].payload, json!({"text": "hello"}));
         assert_eq!(back.events[1].payload, json!({"embedding": [1.0, 0.0]}));
     }
 
     #[tokio::test]
-    async fn read_segment_with_unknown_schema_errors() {
+    async fn read_segment_with_unsupported_schema_errors() {
         let (_d, store) = mem_store();
         let seg = SegmentFile {
             schema_version: 99,
@@ -151,7 +171,7 @@ mod tests {
     async fn delete_removes_segment() {
         let (_d, store) = mem_store();
         let seg = SegmentFile {
-            schema_version: SEGMENT_SCHEMA_V1,
+            schema_version: SEGMENT_SCHEMA_VERSION,
             session_internal_id: 1,
             events: vec![],
         };

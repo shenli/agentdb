@@ -252,6 +252,26 @@
         }
       }
     },
+    "/api/admin/hlc": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_hlc",
+        "responses": {
+          "200": {
+            "description": "Process-global HLC status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HlcStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/sessions/{session_id}": {
       "get": {
         "tags": [
@@ -681,9 +701,14 @@
         "required": [
           "seq",
           "ts",
+          "hlc_ts",
           "payload"
         ],
         "properties": {
+          "hlc_ts": {
+            "$ref": "#/components/schemas/HlcTimestamp",
+            "description": "Hybrid logical clock timestamp assigned under the session lock at\nappend time. Gives causality-respecting order across sessions and\ntablets. See `agent-db-v2.md` §4 and `hlc.rs`."
+          },
           "payload": {
             "$ref": "#/components/schemas/Value"
           },
@@ -830,6 +855,77 @@
           "warm_sessions": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HlcStatus": {
+        "type": "object",
+        "description": "Process-global HLC health snapshot, served from `GET /api/admin/hlc`.",
+        "required": [
+          "physical_ns",
+          "logical",
+          "wall_clock_ns",
+          "offset_ns",
+          "max_offset_secs",
+          "rejects"
+        ],
+        "properties": {
+          "logical": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Current HLC logical counter.",
+            "minimum": 0
+          },
+          "max_offset_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Configured max-offset window in seconds. Inbound timestamps\nwhose physical component exceeds `wall + max_offset` are rejected\nand counted in `rejects`.",
+            "minimum": 0
+          },
+          "offset_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`physical_ns - wall_clock_ns`. Positive when HLC is ahead of wall\n(pushed by peers); negative when wall has jumped ahead and HLC\nhas not yet caught up. Absolute value > a few seconds warrants\ninvestigation."
+          },
+          "physical_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current HLC physical component (nanoseconds since UNIX epoch).",
+            "minimum": 0
+          },
+          "rejects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Running count of inbound timestamps rejected by the max-offset\nguard. Any non-zero value is a signal; a sustained growth rate\nindicates a clock-skew problem or a rogue peer.",
+            "minimum": 0
+          },
+          "wall_clock_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Local wall clock at the time of this snapshot, nanoseconds since\nepoch. Compare against `physical_ns` to estimate `offset_ns`.",
+            "minimum": 0
+          }
+        }
+      },
+      "HlcTimestamp": {
+        "type": "object",
+        "description": "A hybrid logical clock timestamp.\n\nEncoded as 12 bytes on the wire: an 8-byte physical component\n(nanoseconds since UNIX epoch) and a 4-byte logical counter that breaks\nties when the physical component does not advance between events.",
+        "required": [
+          "physical_ns",
+          "logical"
+        ],
+        "properties": {
+          "logical": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tie-breaker counter. Incremented when two events land in the same\nphysical nanosecond.",
+            "minimum": 0
+          },
+          "physical_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds since UNIX epoch. Tracks wall-clock time with\ncausality-respecting floors enforced on `update()`.",
             "minimum": 0
           }
         }

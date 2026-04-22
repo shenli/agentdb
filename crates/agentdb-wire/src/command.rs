@@ -52,6 +52,29 @@ pub async fn dispatch(
     state: &WireState,
     connection_id: i64,
 ) -> Document {
+    // Absorb any incoming $clusterTime into the process-global HLC before
+    // dispatching. A rejection (remote too far in the future) short-
+    // circuits with a Mongo-style error document; otherwise we fall
+    // through to normal command dispatch and inject the updated
+    // $clusterTime on the outbound path below.
+    let hlc = state.registry.hlc();
+    if let Err(e) = crate::hlc::update_hlc_from_request(body, hlc) {
+        let mut resp = crate::hlc::error_reply_for_hlc_rejection(&e);
+        crate::hlc::inject_cluster_time(&mut resp, hlc);
+        return resp;
+    }
+
+    let mut response = dispatch_inner(body, doc_sequences, state, connection_id).await;
+    crate::hlc::inject_cluster_time(&mut response, hlc);
+    response
+}
+
+async fn dispatch_inner(
+    body: &Document,
+    doc_sequences: &[(&str, &[Document])],
+    state: &WireState,
+    connection_id: i64,
+) -> Document {
     match inspect(body) {
         Err(e) => error_reply(&e),
         Ok(head) => match head.name {
