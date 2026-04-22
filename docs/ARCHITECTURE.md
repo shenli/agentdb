@@ -216,6 +216,54 @@ the wire), cross-box transactional snapshots, write-side MVCC, and
 versioned indexes (the text/vector index is unversioned and the
 planner post-filters hits by snapshot-visible `next_seq`).
 
+## HLC and causal consistency (M14)
+
+AgentDB carries a process-global **Hybrid Logical Clock** (`HlcClock`,
+`crates/agentdb-core/src/hlc.rs`) that assigns a causality-respecting
+timestamp to every event. Design rationale lives in
+`docs/agent-db-v2.md` §4 and
+`docs/superpowers/notes/2026-04-21-hlc-clock-decision.md`; this section
+documents what the prototype actually does.
+
+**Timestamp shape.** `HlcTimestamp { physical_ns: u64, logical: u32 }`
+— 12 bytes per event, stored on `Event::hlc_ts`. Segment schema
+bumped to `SEGMENT_SCHEMA_VERSION = 2`.
+
+**Allocation.** `append_and_fetch` calls `registry.hlc().now()` inside
+the session lock, immediately before allocating `seq`. Per-session
+`(seq, hlc_ts)` is jointly strictly monotonic.
+
+**Snapshot reads.** `ReadCtx::open` captures `box_.hlc().current()` as
+the `hlc_cutoff`. `fetch_last_n`, `scan_session_events`, and the fork
+path in `fetch_last_n_merged` filter events by `ev.hlc_ts <= cutoff`.
+For KV reads this is redundant with the RocksDB snapshot pin; for
+segment-sourced reads (cold / archive / fork parent), HLC is the only
+isolation mechanism — RocksDB snapshots don't cover object storage.
+
+**Wire propagation.** The Mongo wire dispatcher absorbs inbound
+`$clusterTime` via `HlcClock::update` before running the command and
+injects a fresh HLC-backed `$clusterTime` (with zero-signature sub-doc
+for Rust-driver compat) on every response. The REST layer does the
+same via an axum middleware and the `X-AgentDB-HLC: physical_ns.logical`
+header. Both paths short-circuit with a 400 / Mongo code 71 if the
+inbound timestamp violates the max-offset guard.
+
+**Max-offset guard.** `AGENTDB_HLC_MAX_OFFSET_SECS` (default 10,
+matching CockroachDB's `max_offset`) bounds how far in the future an
+inbound remote may be. Violations increment `HlcClock::rejects_count()`
+and fail the request.
+
+**Admin surface.** `GET /api/admin/hlc` returns the current HLC, wall
+clock, offset, configured max-offset, and reject count. Useful on-call
+tool for diagnosing clock skew or rogue peers.
+
+**What HLC does not give.** Not external consistency (a skewed reader
+may observe T2 < T1 when wall-clock commit was T1 < T2; acceptable for
+agent workloads, not for banking). Not a concurrency primitive — write
+conflicts are still prevented by per-session locks. Not a clock-repair
+mechanism — it bounds drift damage to the max-offset window, but
+monitoring must fix the cause.
+
 ## REST error taxonomy (M13)
 
 Every `/api/*` REST error returns a Stripe-style JSON body with
