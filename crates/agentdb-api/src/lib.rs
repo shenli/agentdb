@@ -11,6 +11,7 @@ pub mod dto;
 pub mod error;
 pub mod fork;
 pub mod handlers;
+pub mod health;
 pub mod hlc_header;
 pub mod stream;
 pub mod webhook;
@@ -127,6 +128,8 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(admin_sessions::get_session),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
+        .route("/health/live", axum::routing::get(health::live))
+        .route("/health/ready", axum::routing::get(health::ready))
         .route("/openapi.json", axum::routing::get(openapi_json))
         .nest_service("/dashboard", agentdb_dashboard::router())
         .layer(axum::middleware::from_fn_with_state(

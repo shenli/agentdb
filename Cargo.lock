@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "agentdb-core",
  "agentdb-dashboard",
+ "agentdb-meta",
  "agentdb-storage",
  "anyhow",
  "async-broadcast",
@@ -98,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "agentdb-api",
  "agentdb-core",
+ "agentdb-meta",
  "agentdb-storage",
  "agentdb-wire",
  "anyhow",

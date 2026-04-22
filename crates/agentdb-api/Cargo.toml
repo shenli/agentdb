@@ -22,6 +22,7 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+agentdb-meta = { path = "../agentdb-meta" }
 agentdb-storage = { path = "../agentdb-storage" }
 anyhow = { workspace = true }
 object_store = { workspace = true }

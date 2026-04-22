@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
-    BoxRegistry, GcRunReporter, LifecycleConfig, LifecycleEngine, SegmentGc, SegmentGcConfig,
-    SessionRegistry, TenantRegistry,
+    BoxRegistry, GcRunReporter, HlcClock, LeaseRenewalJob, LifecycleConfig, LifecycleEngine,
+    SegmentGc, SegmentGcConfig, SessionRegistry, TenantRegistry,
 };
+use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
 use agentdb_wire::{serve as serve_mongo, WireState};
 use anyhow::Context;
@@ -169,11 +170,51 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(other) => anyhow::bail!("unknown AGENTDB_KV_BACKEND={other}; expected rocksdb|slatedb"),
     };
-    let registry = Arc::new(BoxRegistry::new(
-        kv.clone(),
-        object_store.clone(),
-        num_boxes,
-    )?);
+    // Control-plane meta store (M18). Defaults to a local SQLite file
+    // so `cargo run` works with no setup. Postgres is not yet exposed
+    // via a constructor — follow-up PR.
+    let meta_path =
+        std::env::var("AGENTDB_META_PATH").unwrap_or_else(|_| "./data/meta.sqlite".to_string());
+    if let Some(parent) = std::path::Path::new(&meta_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).context("create meta dir")?;
+        }
+    }
+    let meta = Arc::new(
+        MetaStore::open_sqlite(&meta_path)
+            .await
+            .with_context(|| format!("open meta sqlite at {meta_path}"))?,
+    );
+
+    // Node id identifies this process to the control plane. Appears as
+    // `owner_node_id` on every `tablets` row this process owns.
+    let node_id =
+        std::env::var("AGENTDB_NODE_ID").unwrap_or_else(|_| format!("node-{}", std::process::id()));
+
+    let hlc = Arc::new(HlcClock::default());
+    tracing::info!(%node_id, %meta_path, num_boxes, "acquiring leases for boxes via control plane");
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            object_store.clone(),
+            num_boxes,
+            hlc,
+            meta.clone(),
+            node_id.clone(),
+        )
+        .await
+        .context("acquire leases via control plane")?,
+    );
+    // Spawn a per-box renewal loop now that the initial lease is held.
+    // Handles are intentionally forgotten — shutdown is process exit.
+    let mut renewal_jobs: Vec<LeaseRenewalJob> = Vec::with_capacity(num_boxes as usize);
+    for i in 0..num_boxes {
+        let b = registry.box_by_id(i).expect("box id in range");
+        let lease = b.lease().expect("new_with_meta attaches a lease").clone();
+        renewal_jobs.push(LeaseRenewalJob::start(lease));
+    }
+    std::mem::forget(renewal_jobs);
+
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
 
