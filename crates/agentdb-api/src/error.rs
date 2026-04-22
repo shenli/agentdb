@@ -211,10 +211,11 @@ fn fault_kind_name(k: &agentdb_core::FaultKind) -> &'static str {
     }
 }
 
-/// Runbook URL for each error code, or `None` when no runbook is
-/// published yet. The URL points to the repo's `docs/runbooks/`
-/// directory on GitHub so operators can open it from logs, Slack, or
-/// an incident ticket without pulling a local checkout.
+/// Runbook URL for each error code. The URL points to the repo's
+/// `docs/runbooks/` directory on GitHub so operators can open it
+/// from logs, Slack, or an incident ticket without pulling a local
+/// checkout. Returns `None` only for codes that don't yet have a
+/// runbook — currently every variant is covered.
 ///
 /// Adding a new runbook: commit the markdown under `docs/runbooks/`
 /// and return `Some(...)` here for the corresponding code.
@@ -229,10 +230,18 @@ pub fn doc_url_for(code: ErrorCode) -> Option<&'static str> {
         ErrorCode::QuotaExceeded => {
             Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/quota_exceeded.md")
         }
-        ErrorCode::NotFound
-        | ErrorCode::InvalidRequest
-        | ErrorCode::StorageError
-        | ErrorCode::SerializationError => None,
+        ErrorCode::NotFound => {
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/not_found.md")
+        }
+        ErrorCode::InvalidRequest => {
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/invalid_request.md")
+        }
+        ErrorCode::StorageError => {
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/storage_error.md")
+        }
+        ErrorCode::SerializationError => {
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/serialization_error.md")
+        }
     }
 }
 
@@ -255,10 +264,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn doc_url_covers_published_runbooks() {
-        // Every code that claims a runbook must point at the right
-        // filename. Opening these URLs in a browser is part of the
-        // operator's diagnose step — we lock them down here.
+    fn doc_url_covers_every_error_code() {
+        // Every variant must have a published runbook. Opening these
+        // URLs in a browser is part of the operator's diagnose step
+        // — we lock them down here against accidental renames.
         assert_eq!(
             doc_url_for(ErrorCode::LeaseLost),
             Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/lease_lost.md")
@@ -271,16 +280,24 @@ mod tests {
             doc_url_for(ErrorCode::QuotaExceeded),
             Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/quota_exceeded.md")
         );
-    }
-
-    #[test]
-    fn doc_url_is_none_for_codes_without_a_runbook_yet() {
-        // Per-code runbooks for these are follow-ups; explicit None
-        // here prevents silently returning stale/wrong URLs.
-        assert!(doc_url_for(ErrorCode::NotFound).is_none());
-        assert!(doc_url_for(ErrorCode::InvalidRequest).is_none());
-        assert!(doc_url_for(ErrorCode::StorageError).is_none());
-        assert!(doc_url_for(ErrorCode::SerializationError).is_none());
+        assert_eq!(
+            doc_url_for(ErrorCode::NotFound),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/not_found.md")
+        );
+        assert_eq!(
+            doc_url_for(ErrorCode::InvalidRequest),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/invalid_request.md")
+        );
+        assert_eq!(
+            doc_url_for(ErrorCode::StorageError),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/storage_error.md")
+        );
+        assert_eq!(
+            doc_url_for(ErrorCode::SerializationError),
+            Some(
+                "https://github.com/shenli/agentdb/blob/main/docs/runbooks/serialization_error.md"
+            )
+        );
     }
 
     #[test]
@@ -298,11 +315,14 @@ mod tests {
     }
 
     #[test]
-    fn storage_error_response_has_no_doc_url_yet() {
+    fn storage_error_response_populates_doc_url() {
         let err = ApiError::Core(agentdb_core::Error::Storage(agentdb_storage::Error::Other(
             "boom".into(),
         )));
         let (_, _, body) = err.to_response();
-        assert!(body.doc_url.is_none());
+        assert_eq!(
+            body.doc_url.as_deref(),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/storage_error.md")
+        );
     }
 }

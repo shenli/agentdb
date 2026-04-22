@@ -31,12 +31,19 @@ either of two unrelated codes, write two runbooks and cross-link.
 
 ## Currently published
 
+Every `ErrorCode` the REST API can emit has a published runbook:
+
 | Code | Runbook |
 |---|---|
 | `lease_lost` | [lease_lost.md](./lease_lost.md) |
 | `fault_injected` | [fault_injected.md](./fault_injected.md) |
 | `quota_exceeded` | [quota_exceeded.md](./quota_exceeded.md) |
+| `not_found` | [not_found.md](./not_found.md) |
+| `invalid_request` | [invalid_request.md](./invalid_request.md) |
+| `storage_error` | [storage_error.md](./storage_error.md) |
+| `serialization_error` | [serialization_error.md](./serialization_error.md) |
 
-Error codes without a published runbook yet (no `doc_url` surfaced):
-`not_found`, `invalid_request`, `storage_error`, `serialization_error`.
-Follow-up PRs add them.
+When a new `ErrorCode` variant is added to
+[`crates/agentdb-api/src/error.rs`](../../crates/agentdb-api/src/error.rs),
+add a corresponding runbook here and update `doc_url_for` to return
+`Some(...)`.
