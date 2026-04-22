@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agentdb_index::text::{InMemoryInverted, TextIndex};
@@ -12,10 +13,17 @@ use crate::registry::{SessionRegistry, TenantRegistry};
 use crate::segment::read_segment;
 use crate::types::{Event, Tier};
 
-/// Per-box index state: one text index + one vector index, both in-memory.
+/// Per-box index state: one text index, one vector index, and a small
+/// by-agent index — all in-memory.
 pub struct PerBoxIndexes {
     pub text: InMemoryInverted,
     pub vector: HnswVectorIndex,
+    /// `actor_id` → sorted `DocId`s of events that carry that actor_id.
+    /// Built at lazy-init time alongside the other indexes. `BTreeMap`
+    /// rather than `HashMap` so the iteration order is stable for tests
+    /// and the memory overhead of the map is predictable at high agent
+    /// cardinality.
+    pub agent_events: BTreeMap<String, Vec<DocId>>,
     /// Number of events indexed (for diagnostics).
     pub indexed: u64,
 }
@@ -31,8 +39,18 @@ impl PerBoxIndexes {
         Self {
             text: InMemoryInverted::new(),
             vector: HnswVectorIndex::from_env(),
+            agent_events: BTreeMap::new(),
             indexed: 0,
         }
+    }
+
+    /// DocIds of events attributed to `actor_id`. Empty if the agent is
+    /// unknown or has no events.
+    pub fn docs_by_agent(&self, actor_id: &str) -> &[DocId] {
+        self.agent_events
+            .get(actor_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Scan every session in `box_id`, pull all events, index them.
@@ -110,6 +128,12 @@ impl PerBoxIndexes {
     fn index_event(&mut self, session_internal_id: u64, event: &Event) {
         let doc_id = DocId::new(session_internal_id, event.seq);
         self.walk(doc_id, "payload", &event.payload);
+        if let Some(actor_id) = event.actor_id.as_ref() {
+            self.agent_events
+                .entry(actor_id.clone())
+                .or_default()
+                .push(doc_id);
+        }
         self.indexed += 1;
     }
 

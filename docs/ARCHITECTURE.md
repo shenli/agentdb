@@ -264,6 +264,112 @@ conflicts are still prevented by per-session locks. Not a clock-repair
 mechanism — it bounds drift damage to the max-offset window, but
 monitoring must fix the cause.
 
+## Agent schema (M15)
+
+Agent attribution is a schema feature, not a first-class API resource.
+Design rationale in `docs/agent-db-v2.md` §2.3; this section documents
+what the prototype does.
+
+**Fields.**
+
+- `Event::actor_id: Option<String>` — free-form identifier of the agent
+  that wrote this event. `#[serde(default, skip_serializing_if =
+  "Option::is_none")]` keeps the wire format tight when absent.
+- `Session::primary_agent_id: Option<String>` — the owning agent for
+  single-agent sessions. Multi-agent sessions (orchestrator + workers)
+  may leave this unset and disambiguate at the event level via
+  `actor_id`.
+
+Both fields are additive and optional: segments written before M15
+(i.e. v2 segments whose `Event` payload lacks the field) deserialize
+cleanly with the new code via serde defaults. This is the repo's
+policy for on-disk format evolution: **required fields bump the
+`SEGMENT_SCHEMA_VERSION`; additive `Option<T>` fields do not**.
+
+**Ingress paths.**
+
+- REST `AppendAndFetchRequest` carries an optional `actor_id`;
+  `handlers::append_and_fetch` routes through
+  `agentdb_core::append_and_fetch_with_actor`. A sibling
+  `append_and_fetch` preserves the old signature for call sites that
+  don't know about agents, keeping the change non-breaking across the
+  50+ internal uses.
+- Mongo `insert` extracts a top-level `actor_id` string field from the
+  inserted document (removing it from the payload reaching `Event`)
+  and threads it through the same `_with_actor` path.
+
+**Cross-session retrieval.**
+
+`PerBoxIndexes::agent_events: BTreeMap<String, Vec<DocId>>` maps each
+`actor_id` to the events carrying it. Built at lazy-index-init time
+next to the text and vector indexes. `BTreeMap` (not `HashMap`) for
+stable iteration and predictable memory at high agent cardinality.
+
+`HybridPlanner::scan_by_agent(actor_id)` resolves the index entries
+through the `ReadCtx`, inheriting snapshot visibility (`next_seq`
+filter) and HLC cutoff filtering for free. Events carry `score = 1.0`
+as a sentinel since there is no ranking for an exact-match agent
+lookup. Defense-in-depth: a resolved event whose `actor_id` no
+longer matches the query is filtered out after resolve (guards
+against index/storage drift).
+
+**Not in v1:** an agent-as-resource API (registration endpoints,
+per-agent quotas, agent lifecycle). That is a v2+ product decision
+per design §10.4; promoting `actor_id` from metadata to resource
+would force opinions on what an "agent" is (LangGraph node, crew
+member, tool-calling loop), which the database should not hold.
+
+## Hedged reads (M15)
+
+Object storage has fat read tails (seconds, occasionally tens of
+seconds on S3). Cold- and archive-tier segment reads use a
+**hedged-request-with-cooperative-cancel** pattern from "The Tail at
+Scale" to bound p99.9.
+
+**Primitive.** `agentdb_core::hedge::hedged(primary, delay, secondary_factory)`:
+fires the primary at t=0; if it hasn't completed by `delay`, fires the
+secondary via `secondary_factory()`. First to complete wins; the
+loser is cancelled by Rust's cooperative future-drop. This is
+latency-only hedging — a primary error **before** the delay is
+returned directly, no retry. Error-driven retry is a separate
+feature, deliberately out of scope.
+
+**Applied sites.** `segment::read_segment_hedged` wraps the existing
+`read_segment` and is called from:
+
+- `primitives::fetch_last_n_merged` (fork-parent cold branch)
+- `HybridPlanner::plan_locality_bound` (cold-session scan)
+- `HybridPlanner::resolve` (warm-miss fallback onto segment)
+
+Warm-tier reads are **not** hedged — they go directly through the
+pinned RocksDB snapshot, which already has predictable latency.
+
+**Configuration.**
+
+- `AGENTDB_HEDGE_COLD_MS` — cold-tier delay, default 50.
+- `AGENTDB_HEDGE_ARCHIVE_MS` — archive-tier delay, default 200.
+- `AGENTDB_HEDGE_ENABLED` — emergency kill-switch (`false` /
+  `0` / `FALSE` / `False` disables hedging, making reads fall back
+  to a single plain `read_segment`).
+
+**Metrics.** Three counters on `BoxMetrics`, all surfaced in
+`MetricsSnapshot`:
+
+- `hedged_triggers` — secondary was fired (primary exceeded the delay).
+- `hedged_primary_wins` — primary finished first after the secondary
+  had been fired (primary was slow but still beat the hedge).
+- `hedged_secondary_wins` — secondary finished first; these are the
+  latency-saved cases.
+
+`hedged_triggers == hedged_primary_wins + hedged_secondary_wins` by
+construction.
+
+**What hedged reads do not give.** They don't accelerate a
+consistently-slow object store — if both primary and secondary are
+bottlenecked at the same tail, both return slowly. They don't retry
+errors. And they don't hedge the warm-tier KV path, which has its
+own latency characteristics.
+
 ## REST error taxonomy (M13)
 
 Every `/api/*` REST error returns a Stripe-style JSON body with
@@ -333,6 +439,9 @@ Every mutation path records to `BoxMetrics`:
 - `warm_sessions`, `cold_sessions` — gauges (bumped/dropped at
   session creation and tier transition)
 - `inserts`, `query_find`, `query_aggregate` — wire-protocol counters
+- `hedged_triggers`, `hedged_primary_wins`, `hedged_secondary_wins` —
+  counters for cold/archive segment hedging (M15). See
+  "Hedged reads" above.
 
 `GET /api/admin/boxes` returns a per-box snapshot. `GET /api/stream` is
 the Server-Sent Events channel; the server broadcasts:
