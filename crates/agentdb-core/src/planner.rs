@@ -101,7 +101,13 @@ impl<'a> HybridPlanner<'a> {
                         hits: Vec::new(),
                     });
                 };
-                let seg = crate::segment::read_segment(self.store, path).await?;
+                let seg = crate::segment::read_segment_hedged(
+                    self.store,
+                    path,
+                    Tier::Cold,
+                    self.ctx.metrics(),
+                )
+                .await?;
                 seg.events
                     .into_iter()
                     .filter(|e| e.seq < session.next_seq)
@@ -273,8 +279,15 @@ impl<'a> HybridPlanner<'a> {
         };
         // A concurrent `reactivate` could have deleted the segment between our
         // KV read and this object-store read. Treat that as a miss rather than
-        // propagating an error to the client.
-        let seg = match crate::segment::read_segment(self.store, path).await {
+        // propagating an error to the client. Hedged for tail protection.
+        let seg = match crate::segment::read_segment_hedged(
+            self.store,
+            path,
+            Tier::Cold,
+            self.ctx.metrics(),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };

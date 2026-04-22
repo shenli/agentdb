@@ -64,6 +64,12 @@ impl ReadCtx {
         self.hlc_cutoff
     }
 
+    /// The owning box's metrics. Read paths use this to record
+    /// hedged-read outcomes and similar per-request counters.
+    pub fn metrics(&self) -> &Arc<crate::metrics::BoxMetrics> {
+        &self.metrics
+    }
+
     /// Scan a key prefix against the pinned snapshot.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
         Ok(self.snapshot.scan_prefix(prefix)?)

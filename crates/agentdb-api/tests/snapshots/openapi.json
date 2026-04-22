@@ -1010,6 +1010,9 @@
           "segment_gc_skipped_pinned",
           "webhook_fires",
           "webhook_failures",
+          "hedged_triggers",
+          "hedged_primary_wins",
+          "hedged_secondary_wins",
           "gauges"
         ],
         "properties": {
@@ -1030,6 +1033,21 @@
           },
           "gauges": {
             "$ref": "#/components/schemas/GaugeSnapshot"
+          },
+          "hedged_primary_wins": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hedged_secondary_wins": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hedged_triggers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "inserts": {
             "type": "integer",

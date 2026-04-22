@@ -23,6 +23,18 @@ pub struct BoxMetrics {
     // M12 additions:
     pub webhook_fires: AtomicU64,
     pub webhook_failures: AtomicU64,
+    // M15 hedged-read additions:
+    /// Count of segment reads where the secondary (hedge) request was
+    /// fired because the primary did not finish within the per-tier
+    /// delay. A subset of these are `hedged_secondary_wins`.
+    pub hedged_triggers: AtomicU64,
+    /// Count of hedged reads where the primary completed first *after*
+    /// the secondary had been fired — primary was slow but still beat
+    /// the hedge.
+    pub hedged_primary_wins: AtomicU64,
+    /// Count of hedged reads where the secondary completed first. These
+    /// are the cases where hedging actually bought latency.
+    pub hedged_secondary_wins: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -98,6 +110,20 @@ impl BoxMetrics {
         self.webhook_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Secondary (hedge) request was fired because primary did not
+    /// finish within the per-tier delay.
+    pub fn record_hedged_trigger(&self) {
+        self.hedged_triggers.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Primary completed first after secondary had been fired.
+    pub fn record_hedged_primary_win(&self) {
+        self.hedged_primary_wins.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Secondary completed first — hedging bought latency.
+    pub fn record_hedged_secondary_win(&self) {
+        self.hedged_secondary_wins.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn bump_tier(&self, tier: crate::types::Tier) {
         let mut g = self.gauges.write();
         match tier {
@@ -133,6 +159,9 @@ impl BoxMetrics {
             segment_gc_skipped_pinned: self.segment_gc_skipped_pinned.load(Ordering::Relaxed),
             webhook_fires: self.webhook_fires.load(Ordering::Relaxed),
             webhook_failures: self.webhook_failures.load(Ordering::Relaxed),
+            hedged_triggers: self.hedged_triggers.load(Ordering::Relaxed),
+            hedged_primary_wins: self.hedged_primary_wins.load(Ordering::Relaxed),
+            hedged_secondary_wins: self.hedged_secondary_wins.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -154,6 +183,9 @@ pub struct MetricsSnapshot {
     pub segment_gc_skipped_pinned: u64,
     pub webhook_fires: u64,
     pub webhook_failures: u64,
+    pub hedged_triggers: u64,
+    pub hedged_primary_wins: u64,
+    pub hedged_secondary_wins: u64,
     pub gauges: GaugeSnapshot,
 }
 

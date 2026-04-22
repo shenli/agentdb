@@ -23,6 +23,10 @@ utoipa = { workspace = true }
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "time"] }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+serial_test = "3"
 criterion = "0.5"
 
 [[bench]]

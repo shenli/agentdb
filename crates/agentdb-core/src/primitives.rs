@@ -193,9 +193,12 @@ pub async fn fetch_last_n_merged(
         Tier::Cold => {
             // Segments are pulled from object storage and do not go through
             // the RocksDB snapshot. The HLC cutoff is the only isolation
-            // mechanism for cold/archive/fork-parent reads.
+            // mechanism for cold/archive/fork-parent reads. Hedged against
+            // object-storage tail latency (design §6.3).
             if let Some(path) = parent.segment_path.as_deref() {
-                match crate::segment::read_segment(store, path).await {
+                match crate::segment::read_segment_hedged(store, path, Tier::Cold, ctx.metrics())
+                    .await
+                {
                     Ok(seg) => seg.events,
                     Err(_) => Vec::new(),
                 }
