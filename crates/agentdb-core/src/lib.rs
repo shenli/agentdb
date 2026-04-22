@@ -40,7 +40,7 @@ pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
 pub use primitives::{
     append_and_fetch, append_and_fetch_with_actor, append_event, fetch_last_n, fetch_last_n_merged,
-    scan_session_events, AppendFetchOutput, DEFAULT_BRANCH_ID,
+    scan_session_all_tiers, scan_session_events, AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
 pub use read_ctx::ReadCtx;
 pub use registry::{SessionRegistry, TenantRegistry};
