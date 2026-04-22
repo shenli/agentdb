@@ -272,6 +272,39 @@
         }
       }
     },
+    "/api/admin/nodes": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_nodes",
+        "responses": {
+          "200": {
+            "description": "Every registered node, ordered by node_id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NodeView"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Control plane not configured on this process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodesUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/sessions/{session_id}": {
       "get": {
         "tags": [
@@ -1146,6 +1179,46 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "NodeView": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "address",
+          "state",
+          "last_heartbeat_ms",
+          "joined_at_ms"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "joined_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_heartbeat_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "NodesUnavailable": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
           }
         }
       },
