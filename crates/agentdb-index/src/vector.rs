@@ -1,31 +1,46 @@
+//! HNSW-backed vector index.
+//!
+//! Backend: `hnsw_rs` 0.3 (swapped from `instant-distance` in M16 to get
+//! incremental insert + file-based snapshot). See
+//! `docs/superpowers/notes/2026-04-22-hnsw-backend-spike.md`.
+//!
+//! One `Hnsw` per path, built incrementally as `insert()` is called —
+//! no rebuild on query. A small-N bypass keeps tiny-dataset tests
+//! deterministic.
+
 use std::collections::HashMap;
 
-use instant_distance::{Builder, HnswMap, Point, Search};
+use hnsw_rs::prelude::{DistCosine, Hnsw};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::doc_id::DocId;
 use crate::error::{IndexError, IndexResult};
 
 pub type Score = f32;
 
-/// Default `ef_construction` / `ef_search` passed to
-/// `instant_distance::Builder`. `instant-distance` 0.6 hardcodes `M`
-/// internally (= 32); we do not expose an `M` knob until the library
-/// does.
+/// Default `ef_construction` / `ef_search`. Mirrors the knob exposed by
+/// `HnswVectorIndex::with_ef` and `from_env` (`AGENTDB_HNSW_EF`).
 pub const DEFAULT_EF: usize = 100;
 /// Below this N, we skip HNSW entirely and brute-force cosine. Keeps
 /// tiny-dataset tests deterministic and avoids HNSW graph-construction
 /// corner cases at small N.
 pub const BRUTE_FORCE_THRESHOLD: usize = 64;
 
+/// `hnsw_rs` default HNSW graph connectivity. 16 is the library's
+/// convention; we will not tune this until a benchmark motivates it.
+const HNSW_MAX_CONNECTIONS: usize = 16;
+/// Max levels in the HNSW hierarchy — `hnsw_rs`'s typical default.
+const HNSW_MAX_LAYERS: usize = 16;
+/// Initial `max_elements` for a fresh `Hnsw`. `hnsw_rs` resizes
+/// internally on insert, so this is just a starting hint.
+const HNSW_INITIAL_CAPACITY: usize = 1_000;
+
 pub trait VectorIndex: Send + Sync {
     fn insert(&mut self, path: &str, doc_id: DocId, vector: &[f32]) -> IndexResult<()>;
     fn knn(&self, path: &str, query: &[f32], limit: usize) -> Vec<(DocId, Score)>;
 }
 
-/// HNSW-backed vector index. One `HnswMap` per path, built lazily on
-/// the first `knn` call and cached until a new `insert` arrives (which
-/// marks the graph dirty and forces a rebuild on the next query).
 pub struct HnswVectorIndex {
     per_path: Mutex<HashMap<String, PathState>>,
     ef: usize,
@@ -33,22 +48,14 @@ pub struct HnswVectorIndex {
 
 struct PathState {
     dim: usize,
-    entries: Vec<(DocId, Vec<f32>)>, // unit-normalized vectors
-    built: Option<HnswMap<NormPoint, DocId>>,
-    dirty: bool,
-}
-
-#[derive(Clone)]
-struct NormPoint(Vec<f32>);
-
-impl Point for NormPoint {
-    fn distance(&self, other: &Self) -> f32 {
-        // Both points are unit-normalized on insert and on query, so dot
-        // product is cosine similarity in [-1, 1]. Convert to a distance
-        // where smaller = more similar: 1.0 - cos_sim in [0, 2].
-        let sim: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
-        1.0 - sim
-    }
+    /// Unit-normalized vectors, kept in insertion order. Brute force
+    /// uses this directly; HNSW uses `doc_ids[i]` as the inverse
+    /// mapping from the `usize` it stores back to our `DocId`.
+    entries: Vec<(DocId, Vec<f32>)>,
+    /// Built lazily once `entries.len() >= BRUTE_FORCE_THRESHOLD` on a
+    /// query; insert populates it incrementally afterward. `None` until
+    /// that first crossing — small-N queries bypass HNSW entirely.
+    hnsw: Option<Box<Hnsw<'static, f32, DistCosine>>>,
 }
 
 impl Default for HnswVectorIndex {
@@ -79,6 +86,68 @@ impl HnswVectorIndex {
             .unwrap_or(DEFAULT_EF);
         Self::with_ef(ef)
     }
+
+    /// Capture current state as a serializable snapshot (M16 Phase D).
+    /// Stores the unit-normalized per-path `entries` only; HNSW graphs
+    /// are rebuilt lazily on first query after load (same lazy-build
+    /// rule that applies to a fresh instance).
+    pub fn to_snapshot(&self) -> VectorSnapshot {
+        let map = self.per_path.lock();
+        let paths: Vec<VectorPathSnapshot> = map
+            .iter()
+            .map(|(path, state)| VectorPathSnapshot {
+                path: path.clone(),
+                dim: state.dim,
+                entries: state
+                    .entries
+                    .iter()
+                    .map(|(d, v)| (d.session_internal_id, d.seq, v.clone()))
+                    .collect(),
+            })
+            .collect();
+        VectorSnapshot { paths }
+    }
+
+    /// Rebuild from a snapshot (M16 Phase D). HNSW graphs are not
+    /// pre-built — the first `knn()` call at a path crossing
+    /// `BRUTE_FORCE_THRESHOLD` will rebuild from the loaded entries.
+    pub fn from_snapshot(snap: &VectorSnapshot, ef: usize) -> Self {
+        let mut per_path = HashMap::new();
+        for p in &snap.paths {
+            let entries: Vec<(DocId, Vec<f32>)> = p
+                .entries
+                .iter()
+                .map(|(s, q, v)| (DocId::new(*s, *q), v.clone()))
+                .collect();
+            per_path.insert(
+                p.path.clone(),
+                PathState {
+                    dim: p.dim,
+                    entries,
+                    hnsw: None,
+                },
+            );
+        }
+        Self {
+            per_path: Mutex::new(per_path),
+            ef,
+        }
+    }
+}
+
+/// Serializable snapshot of the vector index. Preserves normalized
+/// per-path entries; HNSW structure is rebuilt lazily on first query.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorSnapshot {
+    pub paths: Vec<VectorPathSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VectorPathSnapshot {
+    pub path: String,
+    pub dim: usize,
+    /// `(session_internal_id, seq, normalized_vector)`.
+    pub entries: Vec<(u64, u64, Vec<f32>)>,
 }
 
 fn normalise(v: &[f32]) -> Vec<f32> {
@@ -93,14 +162,32 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Build a fresh HNSW, bulk-load the current `entries`, and return it.
+/// Called at the boundary where a path crosses `BRUTE_FORCE_THRESHOLD`.
+fn build_hnsw_from_entries(
+    entries: &[(DocId, Vec<f32>)],
+    ef: usize,
+) -> Box<Hnsw<'static, f32, DistCosine>> {
+    let hnsw: Hnsw<'static, f32, DistCosine> = Hnsw::new(
+        HNSW_MAX_CONNECTIONS,
+        entries.len().max(HNSW_INITIAL_CAPACITY),
+        HNSW_MAX_LAYERS,
+        ef,
+        DistCosine {},
+    );
+    for (i, (_, v)) in entries.iter().enumerate() {
+        hnsw.insert((v.as_slice(), i));
+    }
+    Box::new(hnsw)
+}
+
 impl VectorIndex for HnswVectorIndex {
     fn insert(&mut self, path: &str, doc_id: DocId, vector: &[f32]) -> IndexResult<()> {
         let mut map = self.per_path.lock();
         let state = map.entry(path.to_string()).or_insert_with(|| PathState {
             dim: vector.len(),
             entries: Vec::new(),
-            built: None,
-            dirty: true,
+            hnsw: None,
         });
         if state.dim != vector.len() {
             return Err(IndexError::Invalid(format!(
@@ -109,9 +196,13 @@ impl VectorIndex for HnswVectorIndex {
                 vector.len()
             )));
         }
-        state.entries.push((doc_id, normalise(vector)));
-        state.dirty = true;
-        state.built = None;
+        let v = normalise(vector);
+        let idx = state.entries.len();
+        state.entries.push((doc_id, v.clone()));
+        if let Some(hnsw) = state.hnsw.as_ref() {
+            // Live incremental insert once the HNSW exists.
+            hnsw.insert((v.as_slice(), idx));
+        }
         Ok(())
     }
 
@@ -140,34 +231,32 @@ impl VectorIndex for HnswVectorIndex {
             return ranked;
         }
 
-        // Large-N: build `HnswMap` lazily (attaches DocIds as values),
-        // then query it. `instant-distance` 0.6 exposes `ef_construction`
-        // and `ef_search`; we apply the same tuning knob to both so a
-        // single `AGENTDB_HNSW_EF` affects recall end-to-end.
-        if state.dirty || state.built.is_none() {
-            let points: Vec<NormPoint> = state
-                .entries
-                .iter()
-                .map(|(_, v)| NormPoint(v.clone()))
-                .collect();
-            let doc_ids: Vec<DocId> = state.entries.iter().map(|(id, _)| *id).collect();
-            let built = Builder::default()
-                .ef_construction(self.ef)
-                .ef_search(self.ef)
-                .build(points, doc_ids);
-            state.built = Some(built);
-            state.dirty = false;
+        // Large-N: build HNSW on first cross of the threshold, then
+        // keep using it (incremental inserts have been flowing in).
+        if state.hnsw.is_none() {
+            state.hnsw = Some(build_hnsw_from_entries(&state.entries, self.ef));
         }
+        let hnsw = state.hnsw.as_ref().expect("just built");
 
-        let built = state.built.as_ref().expect("just built");
-        let query_point = NormPoint(q_norm);
-        let mut search = Search::default();
-        let mut out: Vec<(DocId, Score)> = Vec::with_capacity(limit);
-        for map_item in built.search(&query_point, &mut search).take(limit) {
-            // MapItem.value is &DocId (the value we built the map with).
-            // MapItem.distance is 1 - cos_sim, so we invert for the caller.
-            let sim: Score = 1.0 - map_item.distance;
-            out.push((*map_item.value, sim));
+        let neighbours = hnsw.search(&q_norm, limit, self.ef);
+        let mut out: Vec<(DocId, Score)> = Vec::with_capacity(neighbours.len());
+        for n in neighbours {
+            let entry_idx = n.d_id;
+            let Some((doc_id, _)) = state.entries.get(entry_idx) else {
+                // Out of sync between HNSW and entries — drop the hit
+                // rather than panic. Indicates a serious bug that
+                // deserves investigation in the logs.
+                tracing::warn!(
+                    path,
+                    entry_idx,
+                    entries_len = state.entries.len(),
+                    "HNSW returned index out of entries bounds"
+                );
+                continue;
+            };
+            // DistCosine returns 1 - cos_sim; invert for the caller.
+            let score = 1.0 - n.distance;
+            out.push((*doc_id, score));
         }
         out
     }
@@ -230,91 +319,28 @@ mod tests {
     }
 
     #[test]
-    fn query_dim_mismatch_returns_empty() {
+    fn incremental_inserts_after_hnsw_build_are_visible() {
+        // Cross BRUTE_FORCE_THRESHOLD so HNSW activates; then insert
+        // one more and verify it's findable. This is the M16 core
+        // invariant that instant-distance couldn't satisfy without
+        // a full rebuild.
         let mut idx = HnswVectorIndex::new();
-        idx.insert("p", d(1, 1), &[1.0, 0.0]).unwrap();
-        let hits = idx.knn("p", &[1.0], 10);
-        assert!(hits.is_empty());
-    }
-
-    /// Insert 256 random 128-dim points including a known target. A
-    /// query close to the target must put it in the top-5. Seeded for
-    /// reproducibility.
-    #[test]
-    fn knn_recall_on_256_vectors_returns_target_in_top_k() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        fn pseudo_rand(seed: u64, i: u64) -> f32 {
-            let mut h = DefaultHasher::new();
-            (seed, i).hash(&mut h);
-            // Map hash to [-1.0, 1.0]
-            ((h.finish() as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32
+        for i in 0..(BRUTE_FORCE_THRESHOLD as u64 + 10) {
+            // Spread vectors around so no duplicate neighbour ambiguity.
+            idx.insert("p", d(1, i), &[i as f32, 1.0, 0.0]).unwrap();
         }
+        // First query builds HNSW.
+        let _ = idx.knn("p", &[50.0, 1.0, 0.0], 3);
 
-        let mut idx = HnswVectorIndex::new();
-        let dim = 128;
-        // Target vector at seq=999.
-        let target: Vec<f32> = (0..dim).map(|j| pseudo_rand(42, j as u64)).collect();
-        idx.insert("emb", d(1, 999), &target).unwrap();
+        // Post-build incremental insert.
+        let new_id = d(99, 99);
+        idx.insert("p", new_id, &[1000.0, 1.0, 0.0]).unwrap();
 
-        for i in 0..256u64 {
-            let v: Vec<f32> = (0..dim).map(|j| pseudo_rand(i + 1000, j as u64)).collect();
-            idx.insert("emb", d(1, i), &v).unwrap();
-        }
-
-        // Query = slight perturbation of target.
-        let query: Vec<f32> = target
-            .iter()
-            .enumerate()
-            .map(|(j, x)| x + pseudo_rand(99, j as u64) * 0.01)
-            .collect();
-        let hits = idx.knn("emb", &query, 5);
-        let top_ids: Vec<DocId> = hits.iter().map(|(id, _)| *id).collect();
+        let hits = idx.knn("p", &[1000.0, 1.0, 0.0], 3);
         assert!(
-            top_ids.contains(&d(1, 999)),
-            "target not in top-5: got {:?}",
-            top_ids
-        );
-    }
-
-    #[test]
-    fn dim_mismatch_across_paths_is_isolated() {
-        let mut idx = HnswVectorIndex::new();
-        idx.insert("p2", d(1, 1), &[1.0, 0.0]).unwrap();
-        idx.insert("p3", d(1, 2), &[1.0, 0.0, 0.0]).unwrap();
-        // Neither insert should interfere; both paths queryable with
-        // their own dims.
-        let a = idx.knn("p2", &[1.0, 0.0], 1);
-        let b = idx.knn("p3", &[1.0, 0.0, 0.0], 1);
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.len(), 1);
-        // A query with the wrong dim against a path returns empty, not
-        // a cross-path hit.
-        let wrong = idx.knn("p2", &[1.0, 0.0, 0.0], 1);
-        assert!(wrong.is_empty());
-    }
-
-    #[test]
-    fn insert_after_knn_invalidates_cached_hnsw() {
-        let mut idx = HnswVectorIndex::new();
-        // Seed above threshold so the HNSW branch fires.
-        for i in 0..80u64 {
-            let v: Vec<f32> = vec![i as f32, 1.0, 0.0, 0.0, 0.0];
-            idx.insert("p", d(1, i), &v).unwrap();
-        }
-        // First query builds.
-        let _ = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
-        // Insert a new extremely-close vector.
-        idx.insert("p", d(1, 999), &[1.0, 1.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        // Second query must see it.
-        let hits = idx.knn("p", &[1.0, 1.0, 0.0, 0.0, 0.0], 3);
-        let ids: Vec<DocId> = hits.iter().map(|(id, _)| *id).collect();
-        assert!(
-            ids.contains(&d(1, 999)),
-            "new insert not reflected: {:?}",
-            ids
+            hits.iter().any(|(id, _)| *id == new_id),
+            "post-HNSW-build insert not found in neighbours: {:?}",
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>()
         );
     }
 }

@@ -10,3 +10,5 @@ pub mod vector;
 
 pub use doc_id::DocId;
 pub use error::{IndexError, IndexResult};
+pub use text::{PathSnapshot, TextSnapshot};
+pub use vector::{VectorPathSnapshot, VectorSnapshot};

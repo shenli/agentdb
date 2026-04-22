@@ -1013,10 +1013,18 @@
           "hedged_triggers",
           "hedged_primary_wins",
           "hedged_secondary_wins",
+          "events_indexed",
+          "index_snapshots_written",
+          "index_snapshot_failures",
           "gauges"
         ],
         "properties": {
           "appends": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "events_indexed": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -1045,6 +1053,16 @@
             "minimum": 0
           },
           "hedged_triggers": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "index_snapshot_failures": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "index_snapshots_written": {
             "type": "integer",
             "format": "int64",
             "minimum": 0

@@ -44,6 +44,23 @@ impl PerBoxIndexes {
         }
     }
 
+    /// Construct from parts — used by `index_snapshot::restore_indexes`
+    /// (M16 Phase E) to rebuild `PerBoxIndexes` from a deserialized
+    /// snapshot.
+    pub fn from_parts(
+        text: InMemoryInverted,
+        vector: HnswVectorIndex,
+        agent_events: BTreeMap<String, Vec<DocId>>,
+        indexed: u64,
+    ) -> Self {
+        Self {
+            text,
+            vector,
+            agent_events,
+            indexed,
+        }
+    }
+
     /// DocIds of events attributed to `actor_id`. Empty if the agent is
     /// unknown or has no events.
     pub fn docs_by_agent(&self, actor_id: &str) -> &[DocId] {
@@ -122,10 +139,87 @@ impl PerBoxIndexes {
         Ok(())
     }
 
+    /// Like `build`, but only indexes events whose `hlc_ts` is strictly
+    /// greater than `cutoff`. Used by M16 Phase E recovery: after
+    /// `from_snapshot(…)`, replay any events that were appended after
+    /// the snapshot's HLC cutoff.
+    pub async fn replay_events_after(
+        &mut self,
+        kv: &Arc<dyn KvStore>,
+        store: &Arc<dyn ObjectStore>,
+        tenants: &TenantRegistry,
+        sessions: &SessionRegistry,
+        box_id: BoxId,
+        cutoff: crate::hlc::HlcTimestamp,
+    ) -> Result<u64> {
+        let mut replayed = 0u64;
+        let tenant_externals = tenants.list_in_box(box_id)?;
+        for tenant_ext in tenant_externals {
+            let Some(tenant) = tenants.lookup(box_id, &tenant_ext)? else {
+                continue;
+            };
+            let session_externals = sessions.list_in_tenant(box_id, tenant.internal_id)?;
+            for session_ext in session_externals {
+                let Some(session) =
+                    sessions.lookup(box_id, tenant.internal_id, &session_ext)?
+                else {
+                    continue;
+                };
+                let events: Vec<Event> = match session.tier {
+                    Tier::Warm => {
+                        let prefix = agentdb_storage::prefix_for_session_branch(
+                            Namespace::Events,
+                            session.box_id,
+                            session.tenant_internal_id,
+                            session.internal_id,
+                            DEFAULT_BRANCH_ID,
+                        );
+                        let mut out: Vec<Event> = Vec::new();
+                        for res in kv.scan_prefix(&prefix)? {
+                            let (_k, v) = res?;
+                            let ev: Event = serde_json::from_slice(&v)?;
+                            out.push(ev);
+                        }
+                        out
+                    }
+                    Tier::Cold => {
+                        // A cold session's segment was written atomically
+                        // before the snapshot cutoff OR after (never
+                        // partial). If after, we would have seen the
+                        // segment-write HLC; but the snapshot already
+                        // covers the warm events it replaced. Include
+                        // the segment's events only if the post-cutoff
+                        // filter says so.
+                        if let Some(path) = &session.segment_path {
+                            match read_segment(store, path).await {
+                                Ok(seg) => seg.events,
+                                Err(_) => continue,
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Tier::Archive => continue,
+                };
+                for event in events {
+                    if event.hlc_ts > cutoff {
+                        self.index_event(session.internal_id, &event);
+                        replayed += 1;
+                    }
+                }
+            }
+        }
+        Ok(replayed)
+    }
+
     /// Index one event under the indexes' by-path structure. The top-level
     /// prefix is `"payload"` so callers use natural paths like
     /// `"payload.text"` and `"payload.embedding"`.
-    fn index_event(&mut self, session_internal_id: u64, event: &Event) {
+    ///
+    /// Called from the write path (`Box_::index_event`, M16 Phase C) for
+    /// incremental maintenance; also called from `build()` for initial
+    /// lazy rebuild.
+    pub fn index_event(&mut self, session_internal_id: u64, event: &Event) {
         let doc_id = DocId::new(session_internal_id, event.seq);
         self.walk(doc_id, "payload", &event.payload);
         if let Some(actor_id) = event.actor_id.as_ref() {
@@ -272,5 +366,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx.indexed, 3);
+    }
+
+    #[tokio::test]
+    async fn append_and_fetch_keeps_the_live_index_current() {
+        // M16 Phase C regression: previously events appended after
+        // the initial lazy-build were NOT indexed until a server
+        // restart. With Box_::index_event wired into the write path,
+        // every append should make its content immediately searchable.
+        let (_dir, _obj_dir, _kv, registry, tenants, sessions) = setup_with_events().await;
+
+        // Seed one event to trigger the initial (empty-at-start) index build.
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-live",
+            "s-live",
+            json!({"text": "seed"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Append a second event AFTER the first one built the index.
+        // In the pre-M16 world, this second event would be absent from
+        // the index until the server restarted.
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-live",
+            "s-live",
+            json!({"text": "freshly_indexed_token"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Pull the indexes via the Box_'s read guard — no rebuild.
+        let box_ = registry.route_tenant("t-live");
+        let guard = box_
+            .indexes_built(
+                registry.kv(),
+                registry.object_store(),
+                &tenants,
+                &sessions,
+            )
+            .await
+            .unwrap();
+        let idx = guard.as_ref().expect("indexes built");
+        let hits = idx
+            .text
+            .search("payload.text", "freshly_indexed_token", 10);
+        assert!(
+            !hits.is_empty(),
+            "second event's text must be live-indexed; hits={:?}",
+            hits
+        );
+
+        // Metric assertion: events_indexed should have advanced twice.
+        let snap = box_.metrics.snapshot();
+        assert!(
+            snap.events_indexed >= 2,
+            "events_indexed should count both appends; got {}",
+            snap.events_indexed
+        );
     }
 }
