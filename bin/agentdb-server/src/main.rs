@@ -257,6 +257,20 @@ async fn main() -> anyhow::Result<()> {
     }
     std::mem::forget(gcs);
 
+    // M16: spawn one periodic IndexSnapshotJob per box.
+    let snapshot_cfg = agentdb_core::IndexSnapshotJobConfig::from_env();
+    let mut snapshot_jobs: Vec<agentdb_core::IndexSnapshotJob> =
+        Vec::with_capacity(num_boxes as usize);
+    for i in 0..num_boxes {
+        let box_ = registry.box_by_id(i).expect("box id in range");
+        snapshot_jobs.push(agentdb_core::IndexSnapshotJob::start(
+            object_store.clone(),
+            box_,
+            snapshot_cfg,
+        ));
+    }
+    std::mem::forget(snapshot_jobs);
+
     let http_state = AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),

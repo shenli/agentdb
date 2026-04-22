@@ -181,8 +181,9 @@ deliberately tiny — it supports three sources:
 
 - `Text(query)` → BM25 inverted-index lookup
 - `Vector(embedding, k)` → cosine-similarity kNN via HNSW
-  (`instant-distance` backend), with a brute-force bypass below 64
-  vectors per path for deterministic small-N behavior
+  (`hnsw_rs` backend — swapped from `instant-distance` in M16 to get
+  incremental insert without full rebuilds), with a brute-force bypass
+  below 64 vectors per path for deterministic small-N behavior
 - `Filter(tenant_id, session_id)` → KV scan
 
 A query can combine Text + Filter or Vector + Filter; the planner runs
@@ -430,6 +431,77 @@ SSE event bodies (OpenAPI does not model event streams well — the
 endpoint is listed, but event shapes are defined only via the
 `StreamEvent` schema for SDK consumers).
 
+## Persistent + incremental indexing (M16)
+
+Pre-M16 indexing had two problems:
+
+- **Lazy rebuild on first query.** New events appended between server
+  starts were invisible to queries until the next full rebuild —
+  M14/M15 sidestepped by rebuilding the index on every restart (ouch
+  at scale).
+- **`instant-distance` rebuilt the full HNSW graph on every insert.**
+  BoTE estimated ~33 min cold-start at v2-target scale; intolerable.
+
+M16 fixes both. Three components.
+
+**Backend swap (`hnsw_rs`).** Incremental HNSW: `insert()` is O(log N)
+amortized directly on the live graph, no rebuild. `VectorIndex` trait
+is unchanged; all existing callers work without modification. Small-N
+brute-force bypass survives for deterministic tiny-dataset behavior.
+Spike note: `docs/superpowers/notes/2026-04-22-hnsw-backend-spike.md`.
+
+**Incremental insert on the write path.** `append_and_fetch` now calls
+`Box_::index_event` under the session lock immediately after the KV
+write. Events are searchable the moment they're acknowledged — no
+staleness window. Metric: `events_indexed` on `BoxMetrics`.
+
+**Persistent snapshots + recovery.** The whole point of M16.
+
+- **Snapshot format.** `IndexSnapshot` captures BM25 postings,
+  normalized vector entries per path, and the agent-events index, all
+  serialized as BSON (same format segments use) at
+  `indexes/{box_id:04x}/snap-{hlc_physical_ns:016x}.bson`. HNSW graph
+  itself is NOT serialized — the first query at each path rebuilds
+  the graph from the restored entries. This keeps the on-disk format
+  stable across `hnsw_rs` version upgrades and avoids the tempdir
+  gymnastics `file_dump` would require.
+
+- **Periodic job.** One task per box (`IndexSnapshotJob`), defaults to
+  hourly (`AGENTDB_INDEX_SNAPSHOT_SECS`, default 3600). Captures the
+  current HLC, serializes the live `PerBoxIndexes`, uploads, then
+  prunes to retain the last N (`AGENTDB_INDEX_SNAPSHOT_RETAIN`,
+  default 3). Metrics: `index_snapshots_written`,
+  `index_snapshot_failures`.
+
+- **Recovery on startup.** `Box_::indexes_built` now follows this
+  flow on first access:
+
+  1. Discover the latest snapshot via `list_snapshots` (lex order on
+     the fixed-width hex HLC name == newest first).
+  2. Deserialize, restore `PerBoxIndexes`.
+  3. Walk every session's events, replaying only those with
+     `hlc_ts > snapshot_cutoff` via `PerBoxIndexes::replay_events_after`.
+  4. If no snapshot exists OR load fails, fall back to the full-KV-scan
+     rebuild (pre-M16 behavior). Degraded but correct.
+
+**Integration tests** in `crates/agentdb-core/tests/index_snapshot_recovery.rs`
+cover all three paths: snapshot-only recovery, snapshot + post-cutoff
+replay, and no-snapshot fallback.
+
+**Env surface:**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `AGENTDB_INDEX_SNAPSHOT_SECS` | `3600` | Gap between periodic snapshot attempts |
+| `AGENTDB_INDEX_SNAPSHOT_RETAIN` | `3` | How many snapshots to keep per box |
+| `AGENTDB_HNSW_EF` | `100` | HNSW `ef_construction` + `ef_search` (unchanged from pre-M16; honored on both fresh and snapshot-restored indexes) |
+
+**Deferred to follow-ups:** `agentdb drain` CLI command that triggers
+a final snapshot before shutdown (Phase F of the M16 plan, but the
+drain CLI is §15.5-scope operational surface that hasn't landed yet);
+cross-box fanout (M23); pre-built HNSW snapshot (optimization if
+rebuild-on-first-query becomes a p99 issue — currently not measured).
+
 ## Tracing and OpenTelemetry (M15 Part A)
 
 Every request produces a span tree observable via the `tracing` crate
@@ -497,6 +569,9 @@ Every mutation path records to `BoxMetrics`:
 - `hedged_triggers`, `hedged_primary_wins`, `hedged_secondary_wins` —
   counters for cold/archive segment hedging (M15). See
   "Hedged reads" above.
+- `events_indexed`, `index_snapshots_written`, `index_snapshot_failures`
+  — counters for persistent + incremental indexing (M16). See
+  "Persistent + incremental indexing" above.
 
 `GET /api/admin/boxes` returns a per-box snapshot. `GET /api/stream` is
 the Server-Sent Events channel; the server broadcasts:
