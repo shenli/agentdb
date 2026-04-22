@@ -9,6 +9,7 @@ pub mod hlc;
 pub mod index_snapshot;
 pub mod index_snapshot_job;
 pub mod indexes;
+pub mod lease;
 pub mod lifecycle;
 pub(crate) mod meta;
 pub mod metrics;
@@ -34,6 +35,7 @@ pub use index_snapshot::{
     INDEX_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use index_snapshot_job::{snapshot_once, IndexSnapshotJob, IndexSnapshotJobConfig};
+pub use lease::{LeaseConfig, LeaseManager, LeaseRenewalJob};
 pub use indexes::PerBoxIndexes;
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};

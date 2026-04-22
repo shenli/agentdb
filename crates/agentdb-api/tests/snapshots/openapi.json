@@ -625,7 +625,8 @@
           "quota_exceeded",
           "fault_injected",
           "storage_error",
-          "serialization_error"
+          "serialization_error",
+          "lease_lost"
         ]
       },
       "ErrorKind": {
@@ -1016,6 +1017,10 @@
           "events_indexed",
           "index_snapshots_written",
           "index_snapshot_failures",
+          "lease_renewals",
+          "lease_renewal_failures",
+          "lease_lost",
+          "lease_epoch",
           "gauges"
         ],
         "properties": {
@@ -1068,6 +1073,26 @@
             "minimum": 0
           },
           "inserts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lease_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lease_lost": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lease_renewal_failures": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lease_renewals": {
             "type": "integer",
             "format": "int64",
             "minimum": 0

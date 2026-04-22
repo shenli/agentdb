@@ -45,6 +45,12 @@ pub enum ErrorCode {
     FaultInjected,
     StorageError,
     SerializationError,
+    /// M21: the box's lease has expired. Callers should retry (the
+    /// scheduler may have reassigned the tablet to a new owner) or
+    /// fail over. Returned as HTTP 503 — same shape as FaultInjected
+    /// because from the client's perspective it's "this node can't
+    /// serve this tablet right now."
+    LeaseLost,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -129,6 +135,22 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: Some(*box_id),
                     fault_kind: Some(fault_kind_name(fault_kind).into()),
+                },
+            ),
+            agentdb_core::Error::LeaseLost { box_id, epoch: _ } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                HeaderMap::new(),
+                ErrorResponse {
+                    code: ErrorCode::LeaseLost,
+                    kind: ErrorKind::ApiError,
+                    message,
+                    resource: None,
+                    id: None,
+                    field: None,
+                    scope: None,
+                    retry_after_ms: None,
+                    box_id: Some(*box_id),
+                    fault_kind: None,
                 },
             ),
             agentdb_core::Error::Storage(_) => (

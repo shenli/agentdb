@@ -34,6 +34,17 @@ pub enum Error {
         box_id: BoxId,
         fault_kind: FaultKind,
     },
+
+    /// The box's lease has expired and writes are no longer safe.
+    /// Issued on a fail-fast basis from the pre-write check in
+    /// `append_and_fetch_with_actor` when `Box_::lease` is configured
+    /// but its `is_live()` check fails. Callers should retry with
+    /// backoff; by then either the same node will have re-acquired
+    /// the lease (meta recovered) or the scheduler will have
+    /// reassigned the tablet and the request will land on the new
+    /// owner.
+    #[error("box {box_id}: lease lost (epoch {epoch})")]
+    LeaseLost { box_id: BoxId, epoch: i64 },
 }
 
 /// Resource kinds referenced by `Error::NotFound`. Keep in sync with

@@ -33,6 +33,7 @@ name = "agentdb-core"
 version = "0.1.0"
 dependencies = [
  "agentdb-index",
+ "agentdb-meta",
  "agentdb-storage",
  "anyhow",
  "async-trait",
