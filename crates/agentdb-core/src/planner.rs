@@ -60,17 +60,30 @@ pub struct HybridPlanner<'a> {
 
 impl<'a> HybridPlanner<'a> {
     /// Hint: if the filter pins the session by external id, use locality-bound.
+    #[tracing::instrument(
+        name = "planner.plan",
+        skip(self, filter),
+        fields(
+            session_hint = session_id_hint.unwrap_or(""),
+            strategy = tracing::field::Empty,
+            hits = tracing::field::Empty,
+        ),
+    )]
     pub async fn plan(
         &self,
         source: &Source,
         filter: FilterFn,
         session_id_hint: Option<&str>,
     ) -> Result<PlanOutput> {
-        if let Some(session_ext) = session_id_hint {
-            self.plan_locality_bound(source, filter, session_ext).await
+        let out = if let Some(session_ext) = session_id_hint {
+            self.plan_locality_bound(source, filter, session_ext).await?
         } else {
-            self.plan_over_fetch(source, filter).await
-        }
+            self.plan_over_fetch(source, filter).await?
+        };
+        tracing::Span::current()
+            .record("strategy", format!("{:?}", out.strategy))
+            .record("hits", out.hits.len());
+        Ok(out)
     }
 
     async fn plan_locality_bound(
@@ -218,9 +231,19 @@ impl<'a> HybridPlanner<'a> {
     ///
     /// Events carry `score = 1.0` as a sentinel — there is no ranking
     /// for an exact-match agent filter.
+    #[tracing::instrument(
+        name = "planner.scan_by_agent",
+        skip(self),
+        fields(
+            actor = actor_id,
+            candidates = tracing::field::Empty,
+            hits = tracing::field::Empty,
+        ),
+    )]
     pub async fn scan_by_agent(&self, actor_id: &str) -> Result<Vec<Hit>> {
         let cutoff = self.ctx.hlc_cutoff();
         let docs = self.indexes.docs_by_agent(actor_id);
+        tracing::Span::current().record("candidates", docs.len());
         let mut hits: Vec<Hit> = Vec::with_capacity(docs.len());
         for &doc_id in docs {
             let Some(session) = self.ctx.session_by_internal(
@@ -254,6 +277,7 @@ impl<'a> HybridPlanner<'a> {
                 session_external_id: session.external_id,
             });
         }
+        tracing::Span::current().record("hits", hits.len());
         Ok(hits)
     }
 

@@ -106,6 +106,16 @@ pub async fn read_segment(store: &Arc<dyn ObjectStore>, path: &str) -> Result<Se
 /// Records `hedged_triggers` / `hedged_primary_wins` /
 /// `hedged_secondary_wins` on `BoxMetrics`. Honors the
 /// `AGENTDB_HEDGE_ENABLED` kill-switch (`false` bypasses hedging).
+#[tracing::instrument(
+    name = "read_segment_hedged",
+    skip(store, metrics),
+    fields(
+        tier = ?tier,
+        path,
+        hedge_triggered = tracing::field::Empty,
+        hedge_winner = tracing::field::Empty,
+    ),
+)]
 pub async fn read_segment_hedged(
     store: &Arc<dyn ObjectStore>,
     path: &str,
@@ -126,12 +136,21 @@ pub async fn read_segment_hedged(
         move || async move { read_segment(&store2, &path2).await },
     )
     .await?;
+    let span = tracing::Span::current();
+    span.record("hedge_triggered", result.triggered);
     if result.triggered {
         metrics.record_hedged_trigger();
-        match result.winner {
-            Winner::Primary => metrics.record_hedged_primary_win(),
-            Winner::Secondary => metrics.record_hedged_secondary_win(),
-        }
+        let winner = match result.winner {
+            Winner::Primary => {
+                metrics.record_hedged_primary_win();
+                "primary"
+            }
+            Winner::Secondary => {
+                metrics.record_hedged_secondary_win();
+                "secondary"
+            }
+        };
+        span.record("hedge_winner", winner);
     }
     Ok(result.value)
 }
