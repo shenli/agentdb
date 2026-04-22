@@ -69,6 +69,29 @@ pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
     }))
 }
 
+/// Every registered node, ordered by `node_id`. Point-in-time
+/// snapshot — a node can be updated between this return and the
+/// caller acting on it. Used by `GET /api/admin/nodes` and by the
+/// scheduler's membership scan.
+pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Node>> {
+    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT node_id, address, state, last_heartbeat_ms, joined_at_ms
+           FROM nodes ORDER BY node_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, a, s, h, j)| Node {
+            node_id: n,
+            address: a,
+            state: s,
+            last_heartbeat_ms: h,
+            joined_at_ms: j,
+        })
+        .collect())
+}
+
 /// Nodes whose last heartbeat is older than `threshold_ms`. Used by
 /// the scheduler to detect dead nodes and start failover.
 pub async fn stale(pool: &SqlitePool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
@@ -118,7 +141,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_updates_existing_row() {
         let p = pool().await;
-        upsert(&p, "node-a", "old-addr", "alive", 100).await.unwrap();
+        upsert(&p, "node-a", "old-addr", "alive", 100)
+            .await
+            .unwrap();
         upsert(&p, "node-a", "new-addr", "draining", 200)
             .await
             .unwrap();
@@ -144,6 +169,17 @@ mod tests {
         let p = pool().await;
         let err = heartbeat(&p, "ghost", 500).await.unwrap_err();
         assert!(matches!(err, MetaError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_node_in_id_order() {
+        let p = pool().await;
+        upsert(&p, "node-b", "bb", "alive", 100).await.unwrap();
+        upsert(&p, "node-a", "aa", "alive", 100).await.unwrap();
+        upsert(&p, "node-c", "cc", "draining", 200).await.unwrap();
+        let all = list_all(&p).await.unwrap();
+        let ids: Vec<_> = all.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, ["node-a", "node-b", "node-c"]);
     }
 
     #[tokio::test]

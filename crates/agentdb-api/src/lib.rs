@@ -6,6 +6,7 @@ use axum::Router;
 
 pub mod admin;
 pub mod admin_boxes;
+pub mod admin_nodes;
 pub mod admin_sessions;
 pub mod dto;
 pub mod error;
@@ -47,6 +48,7 @@ pub struct AppState {
         admin_boxes::inject_fault,
         admin_boxes::set_quota,
         admin_boxes::set_webhook,
+        admin_nodes::list_nodes,
         admin_sessions::get_session,
         stream::sse_handler,
     ),
@@ -64,6 +66,8 @@ pub struct AppState {
         admin_boxes::QuotaRequest,
         admin_boxes::WebhookRequest,
         admin_boxes::WebhookResponse,
+        admin_nodes::NodeView,
+        admin_nodes::NodesUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
         fork::ForkRequest,
@@ -126,6 +130,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/sessions/:session_id",
             axum::routing::get(admin_sessions::get_session),
+        )
+        .route(
+            "/api/admin/nodes",
+            axum::routing::get(admin_nodes::list_nodes),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

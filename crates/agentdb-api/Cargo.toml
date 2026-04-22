@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agentdb-core = { path = "../agentdb-core" }
 agentdb-dashboard = { path = "../agentdb-dashboard" }
+agentdb-meta = { path = "../agentdb-meta" }
 async-broadcast = { workspace = true }
 axum = { workspace = true }
 futures-util = "0.3"
@@ -22,7 +23,6 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
-agentdb-meta = { path = "../agentdb-meta" }
 agentdb-storage = { path = "../agentdb-storage" }
 anyhow = { workspace = true }
 object_store = { workspace = true }

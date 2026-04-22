@@ -83,6 +83,16 @@ fn tier_name(t: agentdb_core::Tier) -> &'static str {
     }
 }
 
+/// Wall-clock ms since UNIX epoch, as `i64` — the shape the control
+/// plane's heartbeat/lease columns expect. Saturates to 0 if the
+/// wall clock is somehow before the epoch.
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Keep the guard alive for the duration of main(); drop flushes
@@ -214,6 +224,44 @@ async fn main() -> anyhow::Result<()> {
         renewal_jobs.push(LeaseRenewalJob::start(lease));
     }
     std::mem::forget(renewal_jobs);
+
+    // Register this process as a node in the control plane and start
+    // its heartbeat loop. Advertised address is `AGENTDB_NODE_ADDRESS`
+    // if set, otherwise the REST http address (sufficient for local
+    // dev; production will set it explicitly to a peer-reachable host).
+    let node_address =
+        std::env::var("AGENTDB_NODE_ADDRESS").unwrap_or_else(|_| http_addr.to_string());
+    let heartbeat_secs: u64 = std::env::var("AGENTDB_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    agentdb_meta::nodes::upsert(meta.pool(), &node_id, &node_address, "alive", now_ms_i64())
+        .await
+        .context("register node in control plane")?;
+    tracing::info!(%node_id, %node_address, heartbeat_secs, "registered node in control plane");
+    {
+        let meta = meta.clone();
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip to align with "heartbeat
+            // every N seconds after the initial register".
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if let Err(err) =
+                    agentdb_meta::nodes::heartbeat(meta.pool(), &node_id, now_ms_i64()).await
+                {
+                    tracing::warn!(
+                        %node_id,
+                        error = %err,
+                        "node heartbeat failed; will retry on next tick"
+                    );
+                }
+            }
+        });
+    }
 
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
@@ -370,7 +418,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = router(http_state);
+    // Layer the MetaStore as an axum Extension so admin handlers
+    // (e.g. `GET /api/admin/nodes`) can reach it without it living
+    // on `AppState`. Handlers use `Option<Extension<_>>` so tests
+    // that build the router without a meta still work.
+    let app = router(http_state).layer(axum::Extension(meta.clone()));
     let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
         .context("bind http listener")?;
