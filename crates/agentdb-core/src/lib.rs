@@ -24,7 +24,9 @@ pub mod tiering;
 pub mod types;
 
 pub use admission::{AdmissionDenied, Scope, TokenBucket};
-pub use box_runtime::{BoxRegistry, Box_, FaultKind, InjectedFault, Quota};
+pub use box_runtime::{
+    BoxRegistry, Box_, FaultKind, InjectedFault, Quota, DEFAULT_ADMISSION_CAPACITY,
+};
 pub use error::{Error, Resource, Result};
 pub use fork::fork_session;
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};
@@ -35,8 +37,8 @@ pub use index_snapshot::{
     INDEX_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use index_snapshot_job::{snapshot_once, IndexSnapshotJob, IndexSnapshotJobConfig};
-pub use lease::{LeaseConfig, LeaseManager, LeaseRenewalJob};
 pub use indexes::PerBoxIndexes;
+pub use lease::{LeaseConfig, LeaseManager, LeaseRenewalJob};
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
@@ -46,9 +48,7 @@ pub use primitives::{
 };
 pub use read_ctx::ReadCtx;
 pub use registry::{SessionRegistry, TenantRegistry};
-pub use segment::{
-    read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION,
-};
+pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION};
 pub use segment_gc::{GcRunReporter, SegmentGc, SegmentGcConfig};
 pub use segment_pin::SegmentPinRegistry;
 pub use tiering::{cold_transition, reactivate};

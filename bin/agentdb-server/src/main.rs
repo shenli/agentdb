@@ -109,6 +109,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(v) => v.parse().context("AGENTDB_BOXES must be a valid u16")?,
         Err(_) => 4,
     };
+    let admission_capacity: u32 = match std::env::var("AGENTDB_ADMISSION_CAPACITY") {
+        Ok(v) => v
+            .parse()
+            .context("AGENTDB_ADMISSION_CAPACITY must be a valid u32")?,
+        Err(_) => agentdb_core::DEFAULT_ADMISSION_CAPACITY,
+    };
     let http_addr: SocketAddr = match std::env::var("AGENTDB_ADDR") {
         Ok(v) => v
             .parse()
@@ -202,15 +208,22 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("AGENTDB_NODE_ID").unwrap_or_else(|_| format!("node-{}", std::process::id()));
 
     let hlc = Arc::new(HlcClock::default());
-    tracing::info!(%node_id, %meta_path, num_boxes, "acquiring leases for boxes via control plane");
+    tracing::info!(
+        %node_id,
+        %meta_path,
+        num_boxes,
+        admission_capacity,
+        "acquiring leases for boxes via control plane"
+    );
     let registry = Arc::new(
-        BoxRegistry::new_with_meta(
+        BoxRegistry::new_with_meta_and_capacity(
             kv.clone(),
             object_store.clone(),
             num_boxes,
             hlc,
             meta.clone(),
             node_id.clone(),
+            admission_capacity,
         )
         .await
         .context("acquire leases via control plane")?,
