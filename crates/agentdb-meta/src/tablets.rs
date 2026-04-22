@@ -93,6 +93,29 @@ pub async fn assume_ownership(
         .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id}")))
 }
 
+/// Every tablet row, ordered by `tablet_id`. Point-in-time snapshot —
+/// ownership can change between this return and the caller acting on
+/// it. Used by `GET /api/admin/tablets` and by the scheduler when it
+/// needs a cluster-wide view of which tablets exist.
+pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Tablet>> {
+    let rows: Vec<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+           FROM tablets ORDER BY tablet_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, owner, epoch, lease, created)| Tablet {
+            tablet_id: id,
+            owner_node_id: owner,
+            epoch,
+            lease_expires_at_ms: lease,
+            created_at_ms: created,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +155,22 @@ mod tests {
         assert_eq!(t1.epoch, 1);
         assert_eq!(t1.owner_node_id.as_deref(), Some("node-a"));
         assert_eq!(t1.lease_expires_at_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_tablet_in_id_order() {
+        let p = pool().await;
+        get_or_create(&p, 2, 100).await.unwrap();
+        get_or_create(&p, 1, 100).await.unwrap();
+        get_or_create(&p, 3, 100).await.unwrap();
+        assume_ownership(&p, 2, 0, "node-a", 500).await.unwrap();
+        let all = list_all(&p).await.unwrap();
+        let ids: Vec<_> = all.iter().map(|t| t.tablet_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        // tablet 2 has an owner now; the others are still unowned.
+        assert_eq!(all[1].owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(all[0].owner_node_id, None);
+        assert_eq!(all[2].owner_node_id, None);
     }
 
     #[tokio::test]
