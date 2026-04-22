@@ -1,0 +1,149 @@
+//! Tablets — runtime units that own shard ranges. See design §2.5.
+//!
+//! Every tablet row carries an `epoch` that increments on every
+//! ownership change. Writes to object storage are tagged with their
+//! epoch; stale-epoch writes are rejected at read time — the fencing-
+//! token pattern committed to in design §5.5.
+
+use sqlx::sqlite::SqlitePool;
+
+use crate::error::{MetaError, MetaResult};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tablet {
+    pub tablet_id: i64,
+    pub owner_node_id: Option<String>,
+    pub epoch: i64,
+    pub lease_expires_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+/// Idempotent create: insert the tablet row if absent; do nothing if
+/// already present. Returns the row as it now exists on-disk.
+pub async fn get_or_create(pool: &SqlitePool, tablet_id: i64, now_ms: i64) -> MetaResult<Tablet> {
+    // Try insert first; if the PK already exists we fall through to
+    // lookup. `INSERT OR IGNORE` is idempotent and doesn't error.
+    sqlx::query(
+        "INSERT OR IGNORE INTO tablets (tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms)
+         VALUES (?, NULL, 0, 0, ?)",
+    )
+    .bind(tablet_id)
+    .bind(now_ms)
+    .execute(pool)
+    .await?;
+    get(pool, tablet_id)
+        .await?
+        .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after insert-or-ignore")))
+}
+
+pub async fn get(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
+    let row: Option<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+         FROM tablets WHERE tablet_id = ?",
+    )
+    .bind(tablet_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, owner, epoch, lease, created)| Tablet {
+        tablet_id: id,
+        owner_node_id: owner,
+        epoch,
+        lease_expires_at_ms: lease,
+        created_at_ms: created,
+    }))
+}
+
+/// Atomically claim or renew ownership. Bumps `epoch` and sets
+/// `owner_node_id` + `lease_expires_at_ms`. If the current row's
+/// `epoch` doesn't match `expected_epoch`, returns
+/// [`MetaError::Conflict`] — the caller lost a race and should
+/// re-read before retrying.
+///
+/// Pass `expected_epoch = current.epoch` for a renewal; pass it the
+/// same way for a take-over — the scheduler reads, waits for lease
+/// expiry, then calls this with the epoch it read at decision time.
+pub async fn assume_ownership(
+    pool: &SqlitePool,
+    tablet_id: i64,
+    expected_epoch: i64,
+    new_owner: &str,
+    new_lease_expires_at_ms: i64,
+) -> MetaResult<Tablet> {
+    let rows = sqlx::query(
+        "UPDATE tablets
+           SET owner_node_id       = ?,
+               epoch               = epoch + 1,
+               lease_expires_at_ms = ?
+         WHERE tablet_id = ? AND epoch = ?",
+    )
+    .bind(new_owner)
+    .bind(new_lease_expires_at_ms)
+    .bind(tablet_id)
+    .bind(expected_epoch)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        return Err(MetaError::Conflict(format!(
+            "tablet {tablet_id} epoch mismatch (expected {expected_epoch})"
+        )));
+    }
+    get(pool, tablet_id)
+        .await?
+        .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations;
+
+    async fn pool() -> SqlitePool {
+        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        migrations::apply(&p).await.unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn create_and_get() {
+        let p = pool().await;
+        let t = get_or_create(&p, 7, 100).await.unwrap();
+        assert_eq!(t.tablet_id, 7);
+        assert_eq!(t.epoch, 0);
+        assert_eq!(t.owner_node_id, None);
+        let back = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[tokio::test]
+    async fn get_or_create_is_idempotent() {
+        let p = pool().await;
+        let a = get_or_create(&p, 7, 100).await.unwrap();
+        let b = get_or_create(&p, 7, 200).await.unwrap();
+        assert_eq!(a, b, "second get_or_create returns the original row");
+    }
+
+    #[tokio::test]
+    async fn assume_ownership_bumps_epoch_and_sets_owner() {
+        let p = pool().await;
+        let t0 = get_or_create(&p, 1, 100).await.unwrap();
+        assert_eq!(t0.epoch, 0);
+        let t1 = assume_ownership(&p, 1, 0, "node-a", 500).await.unwrap();
+        assert_eq!(t1.epoch, 1);
+        assert_eq!(t1.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(t1.lease_expires_at_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn assume_ownership_fails_on_epoch_mismatch() {
+        let p = pool().await;
+        get_or_create(&p, 1, 100).await.unwrap();
+        // First claim at epoch 0 succeeds → now at epoch 1
+        assume_ownership(&p, 1, 0, "node-a", 500).await.unwrap();
+        // Second claim still at epoch 0 must fail
+        let err = assume_ownership(&p, 1, 0, "node-b", 1000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Conflict(_)));
+    }
+}

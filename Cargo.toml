@@ -6,6 +6,7 @@ members = [
     "crates/agentdb-api",
     "crates/agentdb-dashboard",
     "crates/agentdb-index",
+    "crates/agentdb-meta",
     "crates/agentdb-wire",
     "bin/agentdb-server",
 ]
