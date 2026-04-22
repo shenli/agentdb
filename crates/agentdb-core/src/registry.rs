@@ -188,6 +188,7 @@ impl SessionRegistry {
             next_seq: 1,
             segment_path: None,
             forked_from,
+            primary_agent_id: None,
         };
         let session_bytes = serde_json::to_vec(&session)?;
         let lookup_bytes = serde_json::to_vec(&session.internal_id)?;

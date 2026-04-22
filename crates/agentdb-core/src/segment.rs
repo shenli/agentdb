@@ -129,6 +129,7 @@ mod tests {
                     seq: 1,
                     ts: 100,
                     hlc_ts: hlc,
+                    actor_id: None,
                     payload: json!({"text": "hello"}),
                 },
                 Event {
@@ -138,6 +139,7 @@ mod tests {
                         physical_ns: hlc.physical_ns + 1,
                         logical: 0,
                     },
+                    actor_id: Some("agent-builder".into()),
                     payload: json!({"embedding": [1.0, 0.0]}),
                 },
             ],
