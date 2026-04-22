@@ -34,7 +34,9 @@ pub use primitives::{
 };
 pub use read_ctx::ReadCtx;
 pub use registry::{SessionRegistry, TenantRegistry};
-pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1};
+pub use segment::{
+    read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION,
+};
 pub use segment_gc::{GcRunReporter, SegmentGc, SegmentGcConfig};
 pub use segment_pin::SegmentPinRegistry;
 pub use tiering::{cold_transition, reactivate};

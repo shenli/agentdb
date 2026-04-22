@@ -17,14 +17,16 @@ use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 
 /// A hybrid logical clock timestamp.
 ///
 /// Encoded as 12 bytes on the wire: an 8-byte physical component
 /// (nanoseconds since UNIX epoch) and a 4-byte logical counter that breaks
 /// ties when the physical component does not advance between events.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, ToSchema)]
 pub struct HlcTimestamp {
     /// Nanoseconds since UNIX epoch. Tracks wall-clock time with
     /// causality-respecting floors enforced on `update()`.

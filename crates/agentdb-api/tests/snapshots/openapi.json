@@ -681,9 +681,14 @@
         "required": [
           "seq",
           "ts",
+          "hlc_ts",
           "payload"
         ],
         "properties": {
+          "hlc_ts": {
+            "$ref": "#/components/schemas/HlcTimestamp",
+            "description": "Hybrid logical clock timestamp assigned under the session lock at\nappend time. Gives causality-respecting order across sessions and\ntablets. See `agent-db-v2.md` §4 and `hlc.rs`."
+          },
           "payload": {
             "$ref": "#/components/schemas/Value"
           },
@@ -830,6 +835,28 @@
           "warm_sessions": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HlcTimestamp": {
+        "type": "object",
+        "description": "A hybrid logical clock timestamp.\n\nEncoded as 12 bytes on the wire: an 8-byte physical component\n(nanoseconds since UNIX epoch) and a 4-byte logical counter that breaks\nties when the physical component does not advance between events.",
+        "required": [
+          "physical_ns",
+          "logical"
+        ],
+        "properties": {
+          "logical": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tie-breaker counter. Incremented when two events land in the same\nphysical nanosecond.",
+            "minimum": 0
+          },
+          "physical_ns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds since UNIX epoch. Tracks wall-clock time with\ncausality-respecting floors enforced on `update()`.",
             "minimum": 0
           }
         }

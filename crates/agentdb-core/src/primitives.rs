@@ -4,6 +4,7 @@ use agentdb_storage::{encode_key, KvStore, Namespace, WriteOp};
 use tokio::sync::MutexGuard;
 
 use crate::error::{Error, Result};
+use crate::hlc::HlcTimestamp;
 use crate::meta::key_session_record;
 use crate::registry::SessionRegistry;
 use crate::types::{Event, Session, Tier};
@@ -14,17 +15,25 @@ pub const DEFAULT_BRANCH_ID: u32 = 0;
 /// Append one event to a session, atomically bumping its `next_seq` and
 /// `last_active_at`. Must be called while holding the box's write lock
 /// (demonstrated by the MutexGuard reference).
+///
+/// `hlc_ts` should be allocated from the process-global `HlcClock` before
+/// calling — see `append_and_fetch` for the wired-up call site. Callers
+/// that do not yet have an HLC wired (test fixtures, migration tools) may
+/// pass `HlcTimestamp::ZERO`; this is allowed but should not happen on
+/// the hot path.
 pub fn append_event(
     kv: &Arc<dyn KvStore>,
     _lock: &MutexGuard<'_, ()>,
     session: &mut Session,
     payload: crate::types::Document,
     now_millis: u64,
+    hlc_ts: HlcTimestamp,
 ) -> Result<Event> {
     let seq = session.next_seq;
     let event = Event {
         seq,
         ts: now_millis,
+        hlc_ts,
         payload,
     };
     let event_key = encode_key(
@@ -258,7 +267,20 @@ pub async fn append_and_fetch(
     if newly_minted {
         box_.metrics.bump_tier(session.tier);
     }
-    let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+    // Phase B placeholder: HLC is threaded through to `append_event`'s
+    // signature so the write path accepts it, but the actual
+    // `HlcClock::now()` call-site lands in Phase C (Task C1). Using ZERO
+    // here means events temporarily carry a zero HLC; snapshot-read
+    // filtering (Phase D) treats ZERO as "older than everything," which
+    // is the right degraded behavior while HLC wiring is partial.
+    let event = append_event(
+        &kv,
+        &guard,
+        &mut session,
+        payload,
+        now_millis,
+        HlcTimestamp::ZERO,
+    )?;
     box_.metrics.record_append();
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
@@ -312,7 +334,14 @@ mod tests {
     ) -> Result<(Event, Session)> {
         let guard = box_lock.lock().await;
         let mut session = sessions.get_or_mint(box_id, tenant_id, session_external, now_millis)?;
-        let event = append_event(&kv, &guard, &mut session, payload, now_millis)?;
+        let event = append_event(
+            &kv,
+            &guard,
+            &mut session,
+            payload,
+            now_millis,
+            HlcTimestamp::ZERO,
+        )?;
         Ok((event, session))
     }
 

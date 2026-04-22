@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::primitives::DEFAULT_BRANCH_ID;
 use crate::registry::SessionRegistry;
 use crate::segment::{
-    delete_segment, read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_V1,
+    delete_segment, read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION,
 };
 use crate::types::{Session, Tier};
 
@@ -71,7 +71,7 @@ pub async fn cold_transition(
 
     // (1) Write segment. If this fails we return before touching any other state.
     let seg = SegmentFile {
-        schema_version: SEGMENT_SCHEMA_V1,
+        schema_version: SEGMENT_SCHEMA_VERSION,
         session_internal_id: session.internal_id,
         events: events.clone(),
     };
