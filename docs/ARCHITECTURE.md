@@ -157,16 +157,16 @@ would use this hook to copy the segment to a cheaper object-storage
 class (S3 Intelligent-Tiering / Glacier Instant); that copy is
 explicitly out of prototype scope.
 
-Reads of a cold session automatically go through the segment file,
-concatenated with any WAL events that arrived after the segment was
-written (the merge path). **Archive read paths are partial in M12**:
-the over-fetch hybrid-retrieval path (`planner::plan_over_fetch`) does
-resolve hits against the segment for archived sessions, so text and
-vector search that don't pin a single `session_id` still work. But
-`fetch_last_n` on a forked child whose parent is archived returns the
-child's own events only, locality-bound planner calls return empty,
-and Mongo wire `find` on `events` returns empty. Threading segment
-reads through those remaining paths is a follow-up.
+Reads of cold and archive sessions go through the same segment-based
+path via `primitives::scan_session_all_tiers`: a tier match selects
+either the KV prefix scan (warm) or a hedged segment read
+(`read_segment_hedged`, per-tier delay — 50 ms cold / 200 ms archive).
+M12 initially shipped archive as partial; M17 closed the three
+remaining gaps so that `fetch_last_n_merged` on a forked-archived
+parent, `plan_locality_bound` on an archived session, and Mongo wire
+`find` on archived sessions all return semantically-correct results.
+The archive tier now affects **latency**, not **semantics** — which is
+exactly the contract in `docs/agent-db-v2.md` §6.
 
 An admin endpoint `POST /api/admin/tier/force` can force any tier
 transition (warm↔cold↔archive). Multi-step transitions (warm→archive

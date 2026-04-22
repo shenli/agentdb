@@ -105,29 +105,12 @@ impl<'a> HybridPlanner<'a> {
             }
         };
 
-        let all: Vec<Event> = match session.tier {
-            Tier::Warm => crate::primitives::scan_session_events(self.ctx, &session)?,
-            Tier::Cold => {
-                let Some(path) = session.segment_path.as_deref() else {
-                    return Ok(PlanOutput {
-                        strategy: Strategy::LocalityBound,
-                        hits: Vec::new(),
-                    });
-                };
-                let seg = crate::segment::read_segment_hedged(
-                    self.store,
-                    path,
-                    Tier::Cold,
-                    self.ctx.metrics(),
-                )
-                .await?;
-                seg.events
-                    .into_iter()
-                    .filter(|e| e.seq < session.next_seq)
-                    .collect()
-            }
-            Tier::Archive => Vec::new(),
-        };
+        // M17: unify across tiers. Archive-tier sessions no longer
+        // short-circuit to empty; the underlying segment read is the
+        // same as cold, with the per-tier hedge delay picking up the
+        // longer archive threshold.
+        let all: Vec<Event> =
+            crate::primitives::scan_session_all_tiers(self.ctx, self.store, &session).await?;
 
         let mut scored: Vec<Hit> = Vec::new();
         for event in all {
@@ -868,5 +851,80 @@ mod tests {
             "ctx opened after 1 event; post-snapshot events must be filtered"
         );
         assert_eq!(hits[0].event.payload["n"], 1);
+    }
+
+    #[tokio::test]
+    async fn locality_bound_text_search_works_on_archived_session() {
+        // M17 regression: pre-M17 the planner's `Tier::Archive` branch
+        // returned empty, so text/vector queries hinted at a specific
+        // archived session found nothing. Now archive reads through
+        // the segment uniformly with cold.
+        use crate::read_ctx::ReadCtx;
+        let (_kd, _od, kv, store, reg, tenants, sessions) = setup_with_store().await;
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-arc",
+            "s-arc",
+            json!({"text": "refund policy archive"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let box_ = reg.route_tenant("t-arc");
+        let tenant = tenants
+            .get_or_mint(reg.route_tenant("t-arc").id, "t-arc", 0)
+            .unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-arc")
+            .unwrap()
+            .unwrap();
+        // Cold + Archive transitions.
+        {
+            let guard = box_.write_lock.lock().await;
+            crate::tiering::cold_transition(
+                &kv,
+                reg.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        session.tier = crate::types::Tier::Archive;
+        sessions.save(&session).unwrap();
+
+        // Indexes are intentionally empty — the locality-bound path
+        // doesn't use them for archive; it reads the segment directly.
+        let indexes = PerBoxIndexes::new();
+        let ctx = ReadCtx::open(&box_, &kv).unwrap();
+        let p = HybridPlanner {
+            ctx: &ctx,
+            store: &store,
+            indexes: &indexes,
+            sessions: &sessions,
+            box_id: tenant.box_id,
+            tenant_internal_id: tenant.internal_id,
+        };
+        let out = p
+            .plan(
+                &Source::Text {
+                    path: "payload.text".into(),
+                    query: "refund".into(),
+                    limit: 10,
+                },
+                Box::new(|_, _| true),
+                Some("s-arc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.hits.len(),
+            1,
+            "archived-session locality-bound search must hit (M17)"
+        );
     }
 }

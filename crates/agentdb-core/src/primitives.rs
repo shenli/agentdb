@@ -158,6 +158,62 @@ use object_store::ObjectStore;
 use crate::box_runtime::BoxRegistry;
 use crate::registry::TenantRegistry;
 
+/// Scan every event of a session regardless of tier, honoring the
+/// current `ReadCtx`'s HLC cutoff. Unifies warm-KV, cold-segment, and
+/// archive-segment reads behind a single call — so that "reading an
+/// archived session" and "reading a cold session" differ only in
+/// latency, not in semantics (M17).
+///
+/// - `Tier::Warm` → KV prefix scan via the pinned snapshot.
+/// - `Tier::Cold` / `Tier::Archive` → `read_segment_hedged` against
+///   the session's `segment_path`, with per-tier hedge delay.
+///
+/// A cold/archive session with no `segment_path` (shouldn't happen
+/// under normal lifecycle transitions) surfaces as empty rather than
+/// an error — the caller already tolerates an empty tier in the
+/// pre-M17 code paths.
+#[tracing::instrument(
+    name = "scan_session_all_tiers",
+    skip_all,
+    fields(
+        session = %session.external_id,
+        tier = ?session.tier,
+        next_seq = session.next_seq,
+    ),
+)]
+pub async fn scan_session_all_tiers(
+    ctx: &crate::read_ctx::ReadCtx,
+    store: &Arc<dyn ObjectStore>,
+    session: &Session,
+) -> Result<Vec<Event>> {
+    match session.tier {
+        Tier::Warm => scan_session_events(ctx, session),
+        Tier::Cold | Tier::Archive => {
+            let Some(path) = session.segment_path.as_deref() else {
+                return Ok(Vec::new());
+            };
+            let seg =
+                match crate::segment::read_segment_hedged(store, path, session.tier, ctx.metrics())
+                    .await
+                {
+                    Ok(s) => s,
+                    // A concurrent `reactivate` / GC could have deleted
+                    // the segment between the metadata read and this
+                    // object-store fetch. Treat as empty rather than
+                    // propagating; matches the existing fork-parent
+                    // cold branch in `fetch_last_n_merged`.
+                    Err(_) => return Ok(Vec::new()),
+                };
+            let cutoff = ctx.hlc_cutoff();
+            Ok(seg
+                .events
+                .into_iter()
+                .filter(|e| e.seq < session.next_seq && e.hlc_ts <= cutoff)
+                .collect())
+        }
+    }
+}
+
 /// Fork+tier-aware version of `fetch_last_n`.
 ///
 /// Non-forked session: returns the last N events of the session itself.
@@ -198,26 +254,10 @@ pub async fn fetch_last_n_merged(
         return Ok(own);
     };
     let cutoff = ctx.hlc_cutoff();
-    let parent_events: Vec<Event> = match parent.tier {
-        Tier::Warm => scan_session_events(ctx, &parent)?,
-        Tier::Cold => {
-            // Segments are pulled from object storage and do not go through
-            // the RocksDB snapshot. The HLC cutoff is the only isolation
-            // mechanism for cold/archive/fork-parent reads. Hedged against
-            // object-storage tail latency (design §6.3).
-            if let Some(path) = parent.segment_path.as_deref() {
-                match crate::segment::read_segment_hedged(store, path, Tier::Cold, ctx.metrics())
-                    .await
-                {
-                    Ok(seg) => seg.events,
-                    Err(_) => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            }
-        }
-        Tier::Archive => Vec::new(),
-    };
+    // M17: unify cold/archive reads via the tier-aware helper. Archive
+    // no longer shortcircuits to empty; the segment lookup is the same
+    // as cold-tier read, with the (longer) archive hedge delay.
+    let parent_events = scan_session_all_tiers(ctx, store, &parent).await?;
     let mut all: Vec<Event> = own;
     all.extend(
         parent_events
@@ -971,6 +1011,91 @@ mod tests {
             .unwrap();
         let tss: Vec<u64> = got.iter().map(|e| e.ts).collect();
         assert_eq!(tss, vec![20, 30, 100, 110]);
+    }
+
+    #[tokio::test]
+    async fn fetch_last_n_merged_on_archived_parent_still_pulls_parent_tail() {
+        // M17 core regression: previously the `Tier::Archive` branch
+        // short-circuited to empty and the child's fetch_last_n would
+        // miss parent events. Now archive reads through the cold
+        // segment just like cold tier.
+        use crate::read_ctx::ReadCtx;
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+        for i in 1..=3u64 {
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-arc",
+                "parent",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+        let box_ = registry.route_tenant("t-arc");
+        let tenant = tenants.get_or_mint(box_.id, "t-arc", 0).unwrap();
+        let mut parent = sessions
+            .lookup(box_.id, tenant.internal_id, "parent")
+            .unwrap()
+            .unwrap();
+        let fork_ref = crate::types::ForkRef {
+            parent_session_internal_id: parent.internal_id,
+            parent_seq_at_fork: 4,
+        };
+        sessions
+            .get_or_mint_with_fork(box_.id, tenant.internal_id, "child", 1000, Some(fork_ref))
+            .unwrap();
+
+        // Transition parent to Cold (writes segment + flips tier),
+        // then directly to Archive (metadata flip; segment stays put).
+        {
+            let guard = box_.write_lock.lock().await;
+            crate::tiering::cold_transition(
+                registry.kv(),
+                registry.object_store(),
+                &sessions,
+                &guard,
+                &mut parent,
+            )
+            .await
+            .unwrap();
+        }
+        parent.tier = crate::types::Tier::Archive;
+        sessions.save(&parent).unwrap();
+
+        append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-arc",
+            "child",
+            json!({"c": 1}),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let child = sessions
+            .lookup(box_.id, tenant.internal_id, "child")
+            .unwrap()
+            .unwrap();
+        let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
+        let got = fetch_last_n_merged(&ctx, registry.object_store(), &sessions, &child, 10)
+            .await
+            .unwrap();
+        // Parent events (seq 1..=3, with parent_seq_at_fork=4) plus
+        // child seq 1. All four ts values must be present regardless
+        // of the parent's Archive tier.
+        let tss: std::collections::BTreeSet<u64> = got.iter().map(|e| e.ts).collect();
+        assert_eq!(
+            tss,
+            std::collections::BTreeSet::from([10, 20, 30, 100]),
+            "archived parent must still surface all pre-fork events"
+        );
     }
 
     #[tokio::test]

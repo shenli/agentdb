@@ -1,5 +1,5 @@
 use agentdb_core::{
-    scan_session_events, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry,
+    scan_session_all_tiers, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry,
 };
 use bson::{doc, Bson, Document};
 use serde_json::Value;
@@ -8,7 +8,7 @@ use crate::bsonx::json_to_bson;
 use crate::error::{WireError, WireResult};
 use crate::handlers::filter::Filter;
 
-pub fn find_response(
+pub async fn find_response(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
     sessions: &SessionRegistry,
@@ -35,6 +35,7 @@ pub fn find_response(
     };
     let filter = Filter::parse(filter_doc)?;
     let ctx = ReadCtx::open(&box_, registry.kv())?;
+    let store = registry.object_store();
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;
 
@@ -50,7 +51,10 @@ pub fn find_response(
                 let Some(session) = ctx.session(sessions, tenant.internal_id, &s_ext)? else {
                     continue;
                 };
-                for ev in scan_session_events(&ctx, &session)? {
+                // M17: tier-aware scan. Warm goes through the KV
+                // snapshot; cold/archive read through the segment with
+                // per-tier hedge delay.
+                for ev in scan_session_all_tiers(&ctx, store, &session).await? {
                     let row = project_event(&session.external_id, ev);
                     if filter.matches(&row) {
                         batch.push(row);
@@ -171,6 +175,7 @@ mod tests {
             &doc! {},
             None,
         )
+        .await
         .unwrap();
         let batch = resp
             .get_document("cursor")
@@ -207,6 +212,7 @@ mod tests {
             &doc! { "session_id": "s-1" },
             None,
         )
+        .await
         .unwrap();
         let batch = resp
             .get_document("cursor")
@@ -228,6 +234,7 @@ mod tests {
             &doc! {},
             Some(2),
         )
+        .await
         .unwrap();
         let batch = resp
             .get_document("cursor")
@@ -249,6 +256,7 @@ mod tests {
             &doc! {},
             None,
         )
+        .await
         .unwrap();
         let batch = resp
             .get_document("cursor")
@@ -270,6 +278,7 @@ mod tests {
             &doc! {},
             None,
         )
+        .await
         .unwrap();
         let batch = resp
             .get_document("cursor")
@@ -279,5 +288,105 @@ mod tests {
         assert_eq!(batch.len(), 1);
         let rec = batch[0].as_document().unwrap();
         assert_eq!(rec.get_str("external_id").unwrap(), "s-1");
+    }
+
+    #[tokio::test]
+    async fn find_events_on_cold_session_returns_segment_contents() {
+        // M17 regression: before this milestone, find over `events` on
+        // a cold session returned empty because scan_session_events
+        // only walked KV (already evicted on tier transition).
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+        {
+            let guard = box_.write_lock.lock().await;
+            agentdb_core::cold_transition(
+                registry.kv(),
+                registry.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(session.tier, agentdb_core::Tier::Cold);
+
+        let resp = find_response(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "events",
+            &doc! {},
+            None,
+        )
+        .await
+        .unwrap();
+        let batch = resp
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(
+            batch.len(),
+            3,
+            "cold session should surface 3 events via segment read"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_events_on_archive_session_returns_segment_contents() {
+        // M17 core regression: find on an archived session returned
+        // empty pre-M17 because `Tier::Archive => Vec::new()`. Now it
+        // must return the same events as the cold case.
+        let (_dir, _obj_dir, registry, tenants, sessions) = setup_with_events().await;
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+        // Cold then flip to Archive (metadata-only in this prototype).
+        {
+            let guard = box_.write_lock.lock().await;
+            agentdb_core::cold_transition(
+                registry.kv(),
+                registry.object_store(),
+                &sessions,
+                &guard,
+                &mut session,
+            )
+            .await
+            .unwrap();
+        }
+        session.tier = agentdb_core::Tier::Archive;
+        sessions.save(&session).unwrap();
+
+        let resp = find_response(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-1",
+            "events",
+            &doc! {},
+            None,
+        )
+        .await
+        .unwrap();
+        let batch = resp
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(
+            batch.len(),
+            3,
+            "archive session should surface 3 events via unified segment read (M17)"
+        );
     }
 }

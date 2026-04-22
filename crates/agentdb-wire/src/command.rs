@@ -132,7 +132,9 @@ async fn dispatch_inner(
                     &collection,
                     &filter,
                     limit,
-                ) {
+                )
+                .await
+                {
                     Ok(d) => d,
                     Err(e) => error_reply(&e),
                 }
