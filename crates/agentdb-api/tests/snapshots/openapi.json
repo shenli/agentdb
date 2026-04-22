@@ -1109,9 +1109,15 @@
           "lease_renewal_failures",
           "lease_lost",
           "lease_epoch",
+          "admission_waits_total",
           "gauges"
         ],
         "properties": {
+          "admission_waits_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
           "appends": {
             "type": "integer",
             "format": "int64",

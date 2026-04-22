@@ -356,6 +356,11 @@ pub async fn append_and_fetch_with_actor(
             fault_kind: crate::box_runtime::FaultKind::Error,
         });
     }
+    // M23 admission gate: bounded-concurrency cap, independent of the
+    // QPS token bucket below. Waits (rather than rejects) for a permit.
+    // Permit lives until the function returns, at which point Drop
+    // releases capacity back to the semaphore.
+    let _admission = box_.acquire_admission().await;
     // Admission control: per-box gate always, per-tenant gate only for
     // already-minted tenants. `get_or_mint` is not safe to call outside
     // the per-tenant write lock (it has a TOCTOU window on the "is

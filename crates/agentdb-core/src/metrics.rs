@@ -54,6 +54,13 @@ pub struct BoxMetrics {
     pub lease_lost: AtomicU64,
     /// Current lease epoch, gauge-style. Zero means no lease held.
     pub lease_epoch: AtomicU64,
+    // M23 admission semaphore:
+    /// Count of write-path requests that had to wait on the per-box
+    /// admission semaphore because all permits were in use. Sustained
+    /// growth means the configured capacity is biting and either the
+    /// workload needs `AGENTDB_ADMISSION_CAPACITY` raised or the
+    /// cluster needs more boxes.
+    pub admission_waits_total: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -149,13 +156,11 @@ impl BoxMetrics {
     }
     /// Index snapshot successfully uploaded to object storage.
     pub fn record_index_snapshot_written(&self) {
-        self.index_snapshots_written
-            .fetch_add(1, Ordering::Relaxed);
+        self.index_snapshots_written.fetch_add(1, Ordering::Relaxed);
     }
     /// Index snapshot attempt failed; incremented by the periodic job.
     pub fn record_index_snapshot_failure(&self) {
-        self.index_snapshot_failures
-            .fetch_add(1, Ordering::Relaxed);
+        self.index_snapshot_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_lease_renewal(&self) {
@@ -169,6 +174,11 @@ impl BoxMetrics {
     }
     pub fn set_lease_epoch(&self, epoch: i64) {
         self.lease_epoch.store(epoch as u64, Ordering::Relaxed);
+    }
+
+    /// Admission semaphore forced the caller to wait for a permit.
+    pub fn record_admission_wait(&self) {
+        self.admission_waits_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn bump_tier(&self, tier: crate::types::Tier) {
@@ -216,6 +226,7 @@ impl BoxMetrics {
             lease_renewal_failures: self.lease_renewal_failures.load(Ordering::Relaxed),
             lease_lost: self.lease_lost.load(Ordering::Relaxed),
             lease_epoch: self.lease_epoch.load(Ordering::Relaxed),
+            admission_waits_total: self.admission_waits_total.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -247,6 +258,7 @@ pub struct MetricsSnapshot {
     pub lease_renewal_failures: u64,
     pub lease_lost: u64,
     pub lease_epoch: u64,
+    pub admission_waits_total: u64,
     pub gauges: GaugeSnapshot,
 }
 

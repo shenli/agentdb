@@ -5,7 +5,7 @@ use std::time::Instant;
 use agentdb_storage::{BoxId, KvStore};
 use object_store::ObjectStore;
 use parking_lot::RwLock;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::admission::{AdmissionDenied, Scope, TokenBucket};
 use crate::error::{Error, Result};
@@ -39,8 +39,17 @@ pub struct Quota {
     pub burst: Option<u64>,
 }
 
+/// Default admission semaphore capacity when no override is supplied.
+/// Matches the v2 design's "bounded tablet admission" recommendation
+/// (§5.2) at the prototype-scale default; operators tune upward for
+/// higher-concurrency workloads via `BoxRegistry::new_with_capacity`.
+pub const DEFAULT_ADMISSION_CAPACITY: u32 = 64;
+
 /// One logical box. Owns per-tenant write locks so writes to
-/// different tenants on the same box run in parallel (M23).
+/// different tenants on the same box run in parallel (M23), plus a
+/// per-box admission semaphore that bounds in-flight write
+/// concurrency so a burst across many tenants can't drive unbounded
+/// IO / memory pressure.
 pub struct Box_ {
     pub id: BoxId,
     /// Per-tenant write lock. Keyed by the external tenant id.
@@ -51,6 +60,15 @@ pub struct Box_ {
     /// distinct locks and proceed in parallel. Replaced the box-wide
     /// `write_lock: Mutex<()>` that serialized every tenant.
     tenant_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Bounded-concurrency admission gate. Complements the QPS
+    /// token bucket (`admit`): token bucket controls sustained rate,
+    /// semaphore controls instantaneous concurrency. Write-path
+    /// callers acquire a permit before proceeding; burst beyond
+    /// capacity waits rather than rejects (waiting clients count
+    /// under `admission_in_flight` and surface in
+    /// `admission_waits_total`).
+    admission: Arc<Semaphore>,
+    admission_capacity: u32,
     indexes: tokio::sync::RwLock<Option<crate::indexes::PerBoxIndexes>>,
     pub metrics: Arc<BoxMetrics>,
     pub fault: RwLock<Option<InjectedFault>>,
@@ -68,18 +86,23 @@ pub struct Box_ {
 }
 
 impl Box_ {
+    #[cfg(test)]
     fn new(id: BoxId, hlc: Arc<HlcClock>) -> Self {
-        Self::new_with_lease(id, hlc, None)
+        Self::new_with_lease_and_capacity(id, hlc, None, DEFAULT_ADMISSION_CAPACITY)
     }
 
-    fn new_with_lease(
+    fn new_with_lease_and_capacity(
         id: BoxId,
         hlc: Arc<HlcClock>,
         lease: Option<Arc<crate::lease::LeaseManager>>,
+        admission_capacity: u32,
     ) -> Self {
+        let cap = admission_capacity.max(1);
         Self {
             id,
             tenant_locks: RwLock::new(HashMap::new()),
+            admission: Arc::new(Semaphore::new(cap as usize)),
+            admission_capacity: cap,
             indexes: tokio::sync::RwLock::new(None),
             metrics: Arc::new(BoxMetrics::new()),
             fault: RwLock::new(None),
@@ -90,6 +113,47 @@ impl Box_ {
             tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
             hlc,
             lease,
+        }
+    }
+
+    /// Configured admission semaphore capacity. Operators need this
+    /// to compute `admission_in_flight = capacity - available_permits`
+    /// in external dashboards.
+    pub fn admission_capacity(&self) -> u32 {
+        self.admission_capacity
+    }
+
+    /// Snapshot of permits currently held — i.e. writes currently
+    /// past the admission gate. Read by the metrics snapshotter to
+    /// expose `admission_in_flight`; never acquire on this method's
+    /// return value since it's just a counter read.
+    pub fn admission_in_flight(&self) -> u32 {
+        self.admission_capacity
+            .saturating_sub(self.admission.available_permits() as u32)
+    }
+
+    /// Acquire one admission permit. Returns an owned permit whose
+    /// Drop releases capacity back to the semaphore. Used by the
+    /// write path; operators reading this code should note that
+    /// admission is *blocking* (waits for capacity) rather than
+    /// *rejecting* — the QPS token bucket via [`Box_::admit`] is the
+    /// rejecting gate. The `admission_waits_total` counter bumps
+    /// when the permit wasn't available immediately.
+    pub async fn acquire_admission(&self) -> tokio::sync::OwnedSemaphorePermit {
+        // Fast path: permit available right now.
+        match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_closed_or_full) => {
+                // Either the semaphore is at capacity (common) or was
+                // closed (impossible — we never close it). Count the
+                // wait and fall through to the blocking path.
+                self.metrics.record_admission_wait();
+                self.admission
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("admission semaphore is never closed")
+            }
         }
     }
 
@@ -377,12 +441,29 @@ impl BoxRegistry {
     }
 
     /// Build a registry with a caller-provided HLC. There is exactly one
-    /// `HlcClock` per process; all boxes share it.
+    /// `HlcClock` per process; all boxes share it. Admission capacity
+    /// defaults to [`DEFAULT_ADMISSION_CAPACITY`]; use
+    /// [`Self::new_with_capacity`] to override.
     pub fn new_with_hlc(
         kv: Arc<dyn KvStore>,
         object_store: Arc<dyn ObjectStore>,
         num_boxes: u16,
         hlc: Arc<HlcClock>,
+    ) -> Result<Self> {
+        Self::new_with_capacity(kv, object_store, num_boxes, hlc, DEFAULT_ADMISSION_CAPACITY)
+    }
+
+    /// Build a registry with a caller-provided HLC and admission
+    /// capacity. Every box in the registry is initialized with the
+    /// same capacity (heterogeneous per-box caps aren't useful at
+    /// prototype scale). `capacity` is clamped to `>= 1` — the server
+    /// binary reads `AGENTDB_ADMISSION_CAPACITY` and passes it here.
+    pub fn new_with_capacity(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        num_boxes: u16,
+        hlc: Arc<HlcClock>,
+        capacity: u32,
     ) -> Result<Self> {
         if num_boxes == 0 {
             return Err(Error::Invalid {
@@ -391,7 +472,14 @@ impl BoxRegistry {
             });
         }
         let boxes = (0..num_boxes)
-            .map(|i| Arc::new(Box_::new(i, hlc.clone())))
+            .map(|i| {
+                Arc::new(Box_::new_with_lease_and_capacity(
+                    i,
+                    hlc.clone(),
+                    None,
+                    capacity,
+                ))
+            })
             .collect();
         Ok(Self {
             boxes,
@@ -425,6 +513,32 @@ impl BoxRegistry {
         meta: Arc<agentdb_meta::MetaStore>,
         node_id: String,
     ) -> Result<Self> {
+        Self::new_with_meta_and_capacity(
+            kv,
+            object_store,
+            num_boxes,
+            hlc,
+            meta,
+            node_id,
+            DEFAULT_ADMISSION_CAPACITY,
+        )
+        .await
+    }
+
+    /// Like [`Self::new_with_meta`] but with an explicit admission
+    /// capacity. The server binary uses this path so operators can
+    /// tune `AGENTDB_ADMISSION_CAPACITY` alongside the control-plane
+    /// envs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_meta_and_capacity(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        num_boxes: u16,
+        hlc: Arc<HlcClock>,
+        meta: Arc<agentdb_meta::MetaStore>,
+        node_id: String,
+        capacity: u32,
+    ) -> Result<Self> {
         if num_boxes == 0 {
             return Err(Error::Invalid {
                 field: Some("num_boxes".into()),
@@ -436,8 +550,8 @@ impl BoxRegistry {
         for i in 0..num_boxes {
             // Metrics is created inside Box_::new; but LeaseManager::acquire
             // needs it before the Box_ exists. Build it here, attach to the
-            // Box_ via new_with_lease. Same Arc shared with the Box_'s
-            // BoxMetrics slot so counters increment as expected.
+            // Box_ via new_with_lease_and_capacity. Same Arc shared with
+            // the Box_'s BoxMetrics slot so counters increment as expected.
             let metrics = Arc::new(BoxMetrics::new());
             let lease = crate::lease::LeaseManager::acquire(
                 meta.clone(),
@@ -447,7 +561,7 @@ impl BoxRegistry {
                 metrics.clone(),
             )
             .await?;
-            let mut b = Box_::new_with_lease(i, hlc.clone(), Some(lease));
+            let mut b = Box_::new_with_lease_and_capacity(i, hlc.clone(), Some(lease), capacity);
             // Overwrite the Box_'s own metrics with the one the lease
             // is already wired to. (new_with_lease creates a fresh
             // BoxMetrics; replace with the lease-connected one.)
