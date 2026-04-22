@@ -222,3 +222,114 @@ async fn fork_endpoint_creates_child_and_fetch_last_n_merges_parent_tail() {
     let recent = resp["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 3);
 }
+
+#[tokio::test]
+#[serial]
+async fn every_response_carries_x_agentdb_hlc_header() {
+    // M14 Phase F: the HLC middleware must inject X-AgentDB-HLC on
+    // every response and must absorb inbound headers on every request.
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!(
+            "{base}/api/tenants/t-hlc/sessions/s-hlc/append_and_fetch"
+        ))
+        .json(&json!({"event": {"k": 1}, "fetch_last_n": 1}))
+        .send()
+        .await
+        .unwrap();
+    let hdr1 = first
+        .headers()
+        .get("x-agentdb-hlc")
+        .expect("response must carry X-AgentDB-HLC")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Header must parse as `physical_ns.logical`.
+    let (phys, log) = hdr1.split_once('.').expect("header has `phys.log` form");
+    let phys: u64 = phys.parse().expect("physical_ns is numeric");
+    let _log: u32 = log.parse().expect("logical is numeric");
+    assert!(phys > 0, "physical_ns should be non-zero after an append");
+
+    // Second request — server HLC must not regress. We send our own
+    // header back (echo) so the server absorbs it. The response's
+    // header must be >= what we sent.
+    let second = client
+        .post(format!(
+            "{base}/api/tenants/t-hlc/sessions/s-hlc/append_and_fetch"
+        ))
+        .header("x-agentdb-hlc", hdr1.clone())
+        .json(&json!({"event": {"k": 2}, "fetch_last_n": 1}))
+        .send()
+        .await
+        .unwrap();
+    let hdr2 = second
+        .headers()
+        .get("x-agentdb-hlc")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    // Ordering is lexicographic on (phys, log) — compare as tuples.
+    let parse = |s: &str| {
+        let (p, l) = s.split_once('.').unwrap();
+        (p.parse::<u64>().unwrap(), l.parse::<u32>().unwrap())
+    };
+    assert!(
+        parse(&hdr2) >= parse(&hdr1),
+        "hlc header regressed: {hdr1} -> {hdr2}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn far_future_hlc_header_is_rejected_with_400() {
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Inject an HLC 1 hour in the future — far beyond default 10s max_offset.
+    let one_hour_ns: u64 = 3_600 * 1_000_000_000;
+    let future_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        + one_hour_ns;
+    let bogus = format!("{future_ns}.0");
+
+    let resp = client
+        .post(format!(
+            "{base}/api/tenants/t-bogus/sessions/s/append_and_fetch"
+        ))
+        .header("x-agentdb-hlc", bogus)
+        .json(&json!({"event": {"k": 1}, "fetch_last_n": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "expected 400 for HLC beyond max_offset"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn malformed_hlc_header_is_ignored() {
+    // Parsing is lenient: a malformed header is treated as "no HLC" and
+    // the request proceeds normally.
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "{base}/api/tenants/t-x/sessions/s/append_and_fetch"
+        ))
+        .header("x-agentdb-hlc", "not-a-timestamp")
+        .json(&json!({"event": {"k": 1}, "fetch_last_n": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "malformed header must not 400");
+}
