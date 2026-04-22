@@ -331,6 +331,21 @@ pub async fn append_and_fetch_with_actor(
     now_millis: u64,
 ) -> Result<AppendFetchOutput> {
     let box_ = registry.route_tenant(tenant_external);
+    // M21: lease-alive check. If this box has a lease configured
+    // (MetaStore-backed registry) and it has expired, fail fast so
+    // the caller can retry or be routed to the new owner. When no
+    // lease is configured (common path in tests + single-node dev),
+    // the check is a cheap `Option::is_none` and we skip to the
+    // existing fault path unchanged.
+    if let Some(lease) = box_.lease() {
+        if !lease.is_live() {
+            box_.metrics.record_lease_lost();
+            return Err(Error::LeaseLost {
+                box_id: box_.id,
+                epoch: lease.current_epoch(),
+            });
+        }
+    }
     // Fault injection check — if an error fault is active, short-circuit.
     if box_.apply_fault().await {
         box_.metrics.record_fault();

@@ -44,6 +44,16 @@ pub struct BoxMetrics {
     pub index_snapshots_written: AtomicU64,
     /// Count of failed index snapshot uploads (logged + retried next tick).
     pub index_snapshot_failures: AtomicU64,
+    // M21 lease management:
+    /// Successful lease renewals (including the initial acquire).
+    pub lease_renewals: AtomicU64,
+    /// Failed renewal attempts (meta unreachable, epoch conflict, etc.).
+    pub lease_renewal_failures: AtomicU64,
+    /// Lease observed lost — renewal failed AND the local lease
+    /// expiry has passed wall clock.
+    pub lease_lost: AtomicU64,
+    /// Current lease epoch, gauge-style. Zero means no lease held.
+    pub lease_epoch: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -148,6 +158,19 @@ impl BoxMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_lease_renewal(&self) {
+        self.lease_renewals.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_lease_renewal_failure(&self) {
+        self.lease_renewal_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_lease_lost(&self) {
+        self.lease_lost.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn set_lease_epoch(&self, epoch: i64) {
+        self.lease_epoch.store(epoch as u64, Ordering::Relaxed);
+    }
+
     pub fn bump_tier(&self, tier: crate::types::Tier) {
         let mut g = self.gauges.write();
         match tier {
@@ -189,6 +212,10 @@ impl BoxMetrics {
             events_indexed: self.events_indexed.load(Ordering::Relaxed),
             index_snapshots_written: self.index_snapshots_written.load(Ordering::Relaxed),
             index_snapshot_failures: self.index_snapshot_failures.load(Ordering::Relaxed),
+            lease_renewals: self.lease_renewals.load(Ordering::Relaxed),
+            lease_renewal_failures: self.lease_renewal_failures.load(Ordering::Relaxed),
+            lease_lost: self.lease_lost.load(Ordering::Relaxed),
+            lease_epoch: self.lease_epoch.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -216,6 +243,10 @@ pub struct MetricsSnapshot {
     pub events_indexed: u64,
     pub index_snapshots_written: u64,
     pub index_snapshot_failures: u64,
+    pub lease_renewals: u64,
+    pub lease_renewal_failures: u64,
+    pub lease_lost: u64,
+    pub lease_epoch: u64,
     pub gauges: GaugeSnapshot,
 }
 

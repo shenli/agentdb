@@ -53,10 +53,23 @@ pub struct Box_ {
     box_bucket: parking_lot::Mutex<Option<TokenBucket>>,
     tenant_buckets: parking_lot::Mutex<HashMap<u64, TokenBucket>>,
     hlc: Arc<HlcClock>,
+    /// Optional lease manager (M21). `None` when the registry was
+    /// built without a `MetaStore`; in that mode the write path
+    /// skips the lease check entirely — every pre-M21 test keeps
+    /// working unchanged.
+    lease: Option<Arc<crate::lease::LeaseManager>>,
 }
 
 impl Box_ {
     fn new(id: BoxId, hlc: Arc<HlcClock>) -> Self {
+        Self::new_with_lease(id, hlc, None)
+    }
+
+    fn new_with_lease(
+        id: BoxId,
+        hlc: Arc<HlcClock>,
+        lease: Option<Arc<crate::lease::LeaseManager>>,
+    ) -> Self {
         Self {
             id,
             write_lock: Mutex::new(()),
@@ -69,7 +82,15 @@ impl Box_ {
             box_bucket: parking_lot::Mutex::new(None),
             tenant_buckets: parking_lot::Mutex::new(HashMap::new()),
             hlc,
+            lease,
         }
+    }
+
+    /// Lease manager for this box, if one was configured at registry
+    /// build time (see `BoxRegistry::new_with_meta`). Returns `None`
+    /// when running without a control-plane connection.
+    pub fn lease(&self) -> Option<&Arc<crate::lease::LeaseManager>> {
+        self.lease.as_ref()
     }
 
     /// The process-global hybrid logical clock shared by all boxes. Cheap
@@ -347,6 +368,67 @@ impl BoxRegistry {
         let boxes = (0..num_boxes)
             .map(|i| Arc::new(Box_::new(i, hlc.clone())))
             .collect();
+        Ok(Self {
+            boxes,
+            kv,
+            object_store,
+            hlc,
+        })
+    }
+
+    /// Build a registry whose boxes each hold a lease acquired via the
+    /// given `MetaStore` (M21). The node id identifies this process
+    /// to the control plane — used as the `owner_node_id` on every
+    /// `tablets::assume_ownership` call. Lease config is read from
+    /// env via `LeaseConfig::from_env`.
+    ///
+    /// **Acquires the initial lease for each box before returning.**
+    /// If any box fails to acquire (meta unreachable, epoch race
+    /// with a peer), the error propagates — the caller should treat
+    /// this as fatal for the process because the scheduler has
+    /// presumably assigned this tablet elsewhere.
+    ///
+    /// **Does not start the periodic renewal task**; that's the
+    /// caller's responsibility via `LeaseRenewalJob::start` per
+    /// box. Separating spawn from acquire keeps tests able to
+    /// observe the acquired state without a live renewal loop.
+    pub async fn new_with_meta(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        num_boxes: u16,
+        hlc: Arc<HlcClock>,
+        meta: Arc<agentdb_meta::MetaStore>,
+        node_id: String,
+    ) -> Result<Self> {
+        if num_boxes == 0 {
+            return Err(Error::Invalid {
+                field: Some("num_boxes".into()),
+                message: "num_boxes must be > 0".into(),
+            });
+        }
+        let config = crate::lease::LeaseConfig::from_env();
+        let mut boxes: Vec<Arc<Box_>> = Vec::with_capacity(num_boxes as usize);
+        for i in 0..num_boxes {
+            // Metrics is created inside Box_::new; but LeaseManager::acquire
+            // needs it before the Box_ exists. Build it here, attach to the
+            // Box_ via new_with_lease. Same Arc shared with the Box_'s
+            // BoxMetrics slot so counters increment as expected.
+            let metrics = Arc::new(BoxMetrics::new());
+            let lease = crate::lease::LeaseManager::acquire(
+                meta.clone(),
+                i as i64,
+                node_id.clone(),
+                config,
+                metrics.clone(),
+            )
+            .await?;
+            let mut b = Box_::new_with_lease(i, hlc.clone(), Some(lease));
+            // Overwrite the Box_'s own metrics with the one the lease
+            // is already wired to. (new_with_lease creates a fresh
+            // BoxMetrics; replace with the lease-connected one.)
+            b.metrics = metrics;
+            boxes.push(Arc::new(b));
+        }
         Ok(Self {
             boxes,
             kv,

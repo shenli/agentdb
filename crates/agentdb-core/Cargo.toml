@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agentdb-storage = { path = "../agentdb-storage" }
 agentdb-index = { path = "../agentdb-index" }
+agentdb-meta = { path = "../agentdb-meta" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
