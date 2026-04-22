@@ -67,8 +67,11 @@ pub async fn hlc_middleware(
 
     let mut response = next.run(req).await;
 
-    // Inject outbound header from the (possibly advanced) local clock.
-    let out = format_header(hlc_clock.current());
+    // Advance the clock on the outbound path so every response carries a
+    // fresh HLC tick — matches MongoDB `$clusterTime` per-message
+    // semantics and guarantees the outbound header is strictly > any
+    // inbound we just absorbed.
+    let out = format_header(hlc_clock.now());
     if let Ok(v) = HeaderValue::from_str(&out) {
         response.headers_mut().insert(HLC_HEADER, v);
     }

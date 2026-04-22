@@ -316,6 +316,63 @@ async fn far_future_hlc_header_is_rejected_with_400() {
 
 #[tokio::test]
 #[serial]
+async fn admin_hlc_endpoint_reports_running_clock_and_reject_count() {
+    let (_dir, _obj_dir, base) = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Baseline — no rejects yet.
+    let before: serde_json::Value = client
+        .get(format!("{base}/api/admin/hlc"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["rejects"], 0);
+    assert_eq!(before["max_offset_secs"], 10);
+    assert!(
+        before["wall_clock_ns"].as_u64().unwrap() > 0,
+        "wall clock should be populated"
+    );
+
+    // Trigger a rejection via a far-future header (same as the Phase F
+    // test). The /hlc endpoint's `rejects` field must reflect it.
+    let one_hour_ns: u64 = 3_600 * 1_000_000_000;
+    let future_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        + one_hour_ns;
+    let _ = client
+        .post(format!(
+            "{base}/api/tenants/t-r/sessions/s/append_and_fetch"
+        ))
+        .header("x-agentdb-hlc", format!("{future_ns}.0"))
+        .json(&json!({"event": {"k": 1}, "fetch_last_n": 1}))
+        .send()
+        .await
+        .unwrap();
+
+    let after: serde_json::Value = client
+        .get(format!("{base}/api/admin/hlc"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["rejects"], 1, "reject counter must advance");
+    // Physical must be non-zero after all this activity.
+    assert!(after["physical_ns"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+#[serial]
 async fn malformed_hlc_header_is_ignored() {
     // Parsing is lenient: a malformed header is treated as "no HLC" and
     // the request proceeds normally.

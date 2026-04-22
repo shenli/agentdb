@@ -14,6 +14,7 @@
 //! Physical Clocks." OPODIS 2014.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -90,6 +91,7 @@ pub enum HlcError {
 pub struct HlcClock {
     state: Mutex<HlcTimestamp>,
     max_offset_ns: u64,
+    rejects: AtomicU64,
 }
 
 impl HlcClock {
@@ -100,6 +102,7 @@ impl HlcClock {
         Self {
             state: Mutex::new(HlcTimestamp::ZERO),
             max_offset_ns: max_offset_secs.saturating_mul(1_000_000_000),
+            rejects: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +134,7 @@ impl HlcClock {
     pub fn update(&self, remote: HlcTimestamp) -> Result<HlcTimestamp, HlcError> {
         let wall = wall_clock_ns();
         if remote.physical_ns > wall.saturating_add(self.max_offset_ns) {
+            self.rejects.fetch_add(1, AtomicOrdering::Relaxed);
             return Err(HlcError::OffsetTooLarge {
                 inbound_ns: remote.physical_ns,
                 local_ns: wall,
@@ -174,6 +178,13 @@ impl HlcClock {
     /// The configured max-offset in seconds. Exposed for admin endpoints.
     pub fn max_offset_secs(&self) -> u64 {
         self.max_offset_ns / 1_000_000_000
+    }
+
+    /// Running count of inbound timestamps rejected by the max-offset
+    /// guard. Non-zero values warrant investigation (clock skew, rogue
+    /// peer). Exposed via `GET /api/admin/hlc`.
+    pub fn rejects_count(&self) -> u64 {
+        self.rejects.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -379,5 +390,26 @@ mod tests {
     fn default_clock_has_10s_max_offset() {
         let clock = HlcClock::default();
         assert_eq!(clock.max_offset_secs(), 10);
+    }
+
+    #[test]
+    fn rejects_counter_increments_on_offset_violation() {
+        let clock = HlcClock::new(10);
+        assert_eq!(clock.rejects_count(), 0);
+        let bogus = HlcTimestamp {
+            physical_ns: wall_clock_ns() + 3_600_000_000_000,
+            logical: 0,
+        };
+        let _ = clock.update(bogus);
+        assert_eq!(clock.rejects_count(), 1);
+        let _ = clock.update(bogus);
+        assert_eq!(clock.rejects_count(), 2);
+        // Accepted update does not increment.
+        let ok_ts = HlcTimestamp {
+            physical_ns: wall_clock_ns() + 1_000_000_000,
+            logical: 0,
+        };
+        clock.update(ok_ts).expect("within offset");
+        assert_eq!(clock.rejects_count(), 2);
     }
 }

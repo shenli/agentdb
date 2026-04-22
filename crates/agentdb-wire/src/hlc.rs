@@ -67,8 +67,12 @@ pub fn update_hlc_from_request(
 }
 
 /// Inject the local HLC as `$clusterTime` on a response body, mirroring
-/// what mongod does on every reply. Idempotent — overwrites any existing
-/// `$clusterTime` already in the response.
+/// what mongod does on every reply. Advances the clock (`HlcClock::now`)
+/// so every response carries a strictly-fresh timestamp — matches
+/// MongoDB's per-message `$clusterTime` semantics and guarantees the
+/// emitted value is strictly greater than any inbound we absorbed.
+/// Idempotent — overwrites any existing `$clusterTime` already in the
+/// response.
 ///
 /// Includes a zero-signature sub-document (empty hash + keyId 0). The
 /// Rust `mongodb` driver and others validate `$clusterTime` structure
@@ -76,7 +80,7 @@ pub fn update_hlc_from_request(
 /// well-formed-but-unsigned structure is the idiomatic way to advertise
 /// "this server does not sign cluster times".
 pub fn inject_cluster_time(response: &mut Document, hlc: &HlcClock) {
-    let ts = bson_timestamp_from_hlc(hlc.current());
+    let ts = bson_timestamp_from_hlc(hlc.now());
     response.insert(
         "$clusterTime",
         Bson::Document(doc! {

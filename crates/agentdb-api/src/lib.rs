@@ -40,6 +40,7 @@ pub struct AppState {
         handlers::append_and_fetch,
         fork::fork_handler,
         admin::force_tier,
+        admin::get_hlc,
         admin_boxes::list_boxes,
         admin_boxes::get_box,
         admin_boxes::inject_fault,
@@ -54,6 +55,7 @@ pub struct AppState {
         dto::EventDto,
         admin::ForceTierRequest,
         admin::ForceTierResponse,
+        admin::HlcStatus,
         admin_boxes::BoxListItem,
         admin_boxes::QuotaView,
         admin_boxes::InjectFaultRequest,
@@ -95,6 +97,7 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/tier/force",
             axum::routing::post(admin::force_tier),
         )
+        .route("/api/admin/hlc", axum::routing::get(admin::get_hlc))
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),

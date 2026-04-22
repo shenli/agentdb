@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use agentdb_core::types::Tier;
 use axum::extract::State;
 use axum::Json;
@@ -6,6 +8,57 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ApiError, ErrorResponse};
 use crate::stream::{now_ms, StreamEvent};
 use crate::AppState;
+
+/// Process-global HLC health snapshot, served from `GET /api/admin/hlc`.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct HlcStatus {
+    /// Current HLC physical component (nanoseconds since UNIX epoch).
+    pub physical_ns: u64,
+    /// Current HLC logical counter.
+    pub logical: u32,
+    /// Local wall clock at the time of this snapshot, nanoseconds since
+    /// epoch. Compare against `physical_ns` to estimate `offset_ns`.
+    pub wall_clock_ns: u64,
+    /// `physical_ns - wall_clock_ns`. Positive when HLC is ahead of wall
+    /// (pushed by peers); negative when wall has jumped ahead and HLC
+    /// has not yet caught up. Absolute value > a few seconds warrants
+    /// investigation.
+    pub offset_ns: i64,
+    /// Configured max-offset window in seconds. Inbound timestamps
+    /// whose physical component exceeds `wall + max_offset` are rejected
+    /// and counted in `rejects`.
+    pub max_offset_secs: u64,
+    /// Running count of inbound timestamps rejected by the max-offset
+    /// guard. Any non-zero value is a signal; a sustained growth rate
+    /// indicates a clock-skew problem or a rogue peer.
+    pub rejects: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/hlc",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Process-global HLC status", body = HlcStatus),
+    ),
+)]
+pub async fn get_hlc(State(state): State<AppState>) -> Json<HlcStatus> {
+    let hlc = state.registry.hlc();
+    let current = hlc.current();
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock must not precede UNIX epoch")
+        .as_nanos() as u64;
+    let offset_ns = current.physical_ns as i64 - wall as i64;
+    Json(HlcStatus {
+        physical_ns: current.physical_ns,
+        logical: current.logical,
+        wall_clock_ns: wall,
+        offset_ns,
+        max_offset_secs: hlc.max_offset_secs(),
+        rejects: hlc.rejects_count(),
+    })
+}
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForceTierRequest {
