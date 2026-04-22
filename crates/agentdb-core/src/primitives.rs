@@ -359,6 +359,19 @@ pub async fn append_and_fetch_with_actor(
         .record("seq", event.seq)
         .record("hlc_physical_ns", hlc_ts.physical_ns);
     box_.metrics.record_append();
+    // M16 Phase C: keep the live index current. Lock order is always
+    // `write_lock -> indexes.write` — this call obeys it because we
+    // still hold `guard` (the write_lock) and `Box_::index_event` takes
+    // only the indexes write lock internally.
+    box_.index_event(
+        &kv,
+        registry.object_store(),
+        tenants,
+        sessions,
+        session.internal_id,
+        &event,
+    )
+    .await?;
     drop(guard);
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
     // snapshot including the write we just committed. The snapshot opens

@@ -181,6 +181,47 @@ impl Box_ {
         }
         Ok(self.indexes.read().await)
     }
+
+    /// Incrementally index one newly-appended event (M16 Phase C).
+    ///
+    /// If the box's indexes have not yet been built, this triggers the
+    /// full initial build from KV+object-store first — the same lazy
+    /// pattern as `indexes_built`. In that case the newly-appended
+    /// event is already present in KV and gets picked up by the full
+    /// build, so the explicit incremental insert is skipped to avoid
+    /// double-indexing.
+    ///
+    /// When the indexes are already built, the event is inserted
+    /// incrementally with no rebuild (the M16 improvement).
+    ///
+    /// Callers hold `Box_::write_lock` while invoking this; the lock
+    /// order is always `write_lock → indexes.write`, never inverted.
+    pub async fn index_event(
+        &self,
+        kv: &Arc<dyn KvStore>,
+        store: &Arc<dyn ObjectStore>,
+        tenants: &crate::registry::TenantRegistry,
+        sessions: &crate::registry::SessionRegistry,
+        session_internal_id: u64,
+        event: &crate::types::Event,
+    ) -> Result<()> {
+        let mut w = self.indexes.write().await;
+        let was_built = w.is_some();
+        if !was_built {
+            let mut built = crate::indexes::PerBoxIndexes::new();
+            built.build(kv, store, tenants, sessions, self.id).await?;
+            *w = Some(built);
+            // The full build already includes the event (it's been
+            // persisted to KV by the time we reach here).
+            self.metrics.record_event_indexed();
+            return Ok(());
+        }
+        if let Some(indexes) = w.as_mut() {
+            indexes.index_event(session_internal_id, event);
+            self.metrics.record_event_indexed();
+        }
+        Ok(())
+    }
 }
 
 /// Owns the pool of boxes and the shared KV store, plus the tenant→box

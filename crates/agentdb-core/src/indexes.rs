@@ -125,7 +125,11 @@ impl PerBoxIndexes {
     /// Index one event under the indexes' by-path structure. The top-level
     /// prefix is `"payload"` so callers use natural paths like
     /// `"payload.text"` and `"payload.embedding"`.
-    fn index_event(&mut self, session_internal_id: u64, event: &Event) {
+    ///
+    /// Called from the write path (`Box_::index_event`, M16 Phase C) for
+    /// incremental maintenance; also called from `build()` for initial
+    /// lazy rebuild.
+    pub fn index_event(&mut self, session_internal_id: u64, event: &Event) {
         let doc_id = DocId::new(session_internal_id, event.seq);
         self.walk(doc_id, "payload", &event.payload);
         if let Some(actor_id) = event.actor_id.as_ref() {
@@ -272,5 +276,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx.indexed, 3);
+    }
+
+    #[tokio::test]
+    async fn append_and_fetch_keeps_the_live_index_current() {
+        // M16 Phase C regression: previously events appended after
+        // the initial lazy-build were NOT indexed until a server
+        // restart. With Box_::index_event wired into the write path,
+        // every append should make its content immediately searchable.
+        let (_dir, _obj_dir, _kv, registry, tenants, sessions) = setup_with_events().await;
+
+        // Seed one event to trigger the initial (empty-at-start) index build.
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-live",
+            "s-live",
+            json!({"text": "seed"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Append a second event AFTER the first one built the index.
+        // In the pre-M16 world, this second event would be absent from
+        // the index until the server restarted.
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-live",
+            "s-live",
+            json!({"text": "freshly_indexed_token"}),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Pull the indexes via the Box_'s read guard — no rebuild.
+        let box_ = registry.route_tenant("t-live");
+        let guard = box_
+            .indexes_built(
+                registry.kv(),
+                registry.object_store(),
+                &tenants,
+                &sessions,
+            )
+            .await
+            .unwrap();
+        let idx = guard.as_ref().expect("indexes built");
+        let hits = idx
+            .text
+            .search("payload.text", "freshly_indexed_token", 10);
+        assert!(
+            !hits.is_empty(),
+            "second event's text must be live-indexed; hits={:?}",
+            hits
+        );
+
+        // Metric assertion: events_indexed should have advanced twice.
+        let snap = box_.metrics.snapshot();
+        assert!(
+            snap.events_indexed >= 2,
+            "events_indexed should count both appends; got {}",
+            snap.events_indexed
+        );
     }
 }

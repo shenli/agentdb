@@ -35,6 +35,15 @@ pub struct BoxMetrics {
     /// Count of hedged reads where the secondary completed first. These
     /// are the cases where hedging actually bought latency.
     pub hedged_secondary_wins: AtomicU64,
+    // M16 persistent+incremental indexing:
+    /// Count of events inserted into the live index via the write
+    /// path. Does not include events processed during a lazy initial
+    /// rebuild; only counts post-build increments.
+    pub events_indexed: AtomicU64,
+    /// Count of successful index snapshot uploads to object storage.
+    pub index_snapshots_written: AtomicU64,
+    /// Count of failed index snapshot uploads (logged + retried next tick).
+    pub index_snapshot_failures: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -124,6 +133,21 @@ impl BoxMetrics {
         self.hedged_secondary_wins.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Event reached the incremental index via the write path.
+    pub fn record_event_indexed(&self) {
+        self.events_indexed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Index snapshot successfully uploaded to object storage.
+    pub fn record_index_snapshot_written(&self) {
+        self.index_snapshots_written
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    /// Index snapshot attempt failed; incremented by the periodic job.
+    pub fn record_index_snapshot_failure(&self) {
+        self.index_snapshot_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn bump_tier(&self, tier: crate::types::Tier) {
         let mut g = self.gauges.write();
         match tier {
@@ -162,6 +186,9 @@ impl BoxMetrics {
             hedged_triggers: self.hedged_triggers.load(Ordering::Relaxed),
             hedged_primary_wins: self.hedged_primary_wins.load(Ordering::Relaxed),
             hedged_secondary_wins: self.hedged_secondary_wins.load(Ordering::Relaxed),
+            events_indexed: self.events_indexed.load(Ordering::Relaxed),
+            index_snapshots_written: self.index_snapshots_written.load(Ordering::Relaxed),
+            index_snapshot_failures: self.index_snapshot_failures.load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -186,6 +213,9 @@ pub struct MetricsSnapshot {
     pub hedged_triggers: u64,
     pub hedged_primary_wins: u64,
     pub hedged_secondary_wins: u64,
+    pub events_indexed: u64,
+    pub index_snapshots_written: u64,
+    pub index_snapshot_failures: u64,
     pub gauges: GaugeSnapshot,
 }
 
