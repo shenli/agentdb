@@ -18,9 +18,9 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, CreateTabletOpts,
-    MigrateSessionOpts, SetShardOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, UserAddOpts,
-    UserDeleteOpts,
+    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, ClearTenantQuotaOpts,
+    CreateTabletOpts, MigrateSessionOpts, SetShardOpts, SetTenantQuotaOpts, ShedTabletOpts,
+    ShowLatencyOpts, ShowShardOpts, ShowTenantQuotaOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -316,6 +316,59 @@ pub async fn show_latency(opts: ShowLatencyOpts) -> Result<()> {
         opts.box_id,
     );
     fetch_and_print(&url).await
+}
+
+/// `PUT /api/admin/tenant-quotas/:tenant_id` — set a global
+/// per-tenant rate limit.
+pub async fn set_tenant_quota(opts: SetTenantQuotaOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tenant-quotas/{}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.tenant_id),
+    );
+    let body = serde_json::json!({"max_qps": opts.max_qps, "burst": opts.burst});
+    let client = admin_client();
+    let resp = client
+        .put(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("PUT {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/tenant-quotas[/:tenant_id]` — show one or all.
+pub async fn show_tenant_quota(opts: ShowTenantQuotaOpts) -> Result<()> {
+    let url = match &opts.tenant_id {
+        Some(tid) => format!(
+            "{}/api/admin/tenant-quotas/{}",
+            opts.server_url.trim_end_matches('/'),
+            urlencode(tid),
+        ),
+        None => format!(
+            "{}/api/admin/tenant-quotas",
+            opts.server_url.trim_end_matches('/'),
+        ),
+    };
+    fetch_and_print(&url).await
+}
+
+/// `DELETE /api/admin/tenant-quotas/:tenant_id` — clear.
+pub async fn clear_tenant_quota(opts: ClearTenantQuotaOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tenant-quotas/{}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.tenant_id),
+    );
+    let client = admin_client();
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    // 204 No Content expected; print_json_and_exit_on_failure
+    // handles success and error bodies.
+    print_json_and_exit_on_failure(resp).await
 }
 
 /// `GET /api/admin/audit` — list recent admin-plane requests.

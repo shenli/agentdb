@@ -100,6 +100,17 @@ pub enum Cmd {
     /// 401 attempts) is recorded.
     /// HTTP-client wrapper for `GET /api/admin/audit`.
     AuditLog(AuditLogOpts),
+    /// Set (or replace) the global per-tenant rate-limit for
+    /// a tenant. Subsequent writes above `max_qps` with a
+    /// full `burst` deplete the bucket and are refused.
+    SetTenantQuota(SetTenantQuotaOpts),
+    /// Show the current quota + running deny count for a
+    /// tenant, or list every configured quota when no
+    /// tenant_id is given.
+    ShowTenantQuota(ShowTenantQuotaOpts),
+    /// Clear the global per-tenant rate-limit for a tenant.
+    /// Idempotent.
+    ClearTenantQuota(ClearTenantQuotaOpts),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -133,6 +144,36 @@ pub struct AuditLogOpts {
     /// Literal URL-path prefix (LIKE wildcards are escaped).
     #[arg(long = "path-prefix")]
     pub path_prefix: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SetTenantQuotaOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// External tenant id.
+    pub tenant_id: String,
+    /// Steady-state refill rate in requests/second.
+    #[arg(long = "max-qps")]
+    pub max_qps: u64,
+    /// Bucket capacity (max burst above the steady rate).
+    #[arg(long)]
+    pub burst: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowTenantQuotaOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// External tenant id. Omit to list every configured quota.
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ClearTenantQuotaOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// External tenant id.
+    pub tenant_id: String,
 }
 
 #[derive(Args, Debug, Clone)]

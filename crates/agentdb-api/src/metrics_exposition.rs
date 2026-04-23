@@ -267,6 +267,52 @@ fn render(state: &AppState) -> String {
         "Time spent blocked on the per-box admission semaphore (only contended writes)",
         &rows.iter().map(|r| (r.box_id, &r.admission)).collect::<Vec<_>>(),
     );
+
+    // Global per-tenant rate-limit denies. One series per
+    // tenant that has ever denied on this process; absent
+    // series (no denies yet) are Prometheus-equivalent to
+    // zero and we don't emit them. Cardinality is bounded by
+    // operator intent — only tenants with configured quotas
+    // can deny.
+    if let Some(quotas) = state.registry.tenant_quotas() {
+        let denies = quotas.deny_snapshot();
+        if !denies.is_empty() {
+            writeln!(
+                out,
+                "# HELP agentdb_tenant_quota_denies_total Global per-tenant rate-limit denials since process start"
+            )
+            .ok();
+            writeln!(out, "# TYPE agentdb_tenant_quota_denies_total counter").ok();
+            for (tenant_id, count) in denies {
+                writeln!(
+                    out,
+                    "agentdb_tenant_quota_denies_total{{tenant=\"{}\"}} {}",
+                    escape_prom_label(&tenant_id),
+                    count,
+                )
+                .ok();
+            }
+        }
+    }
+
+    out
+}
+
+/// Minimal Prometheus label-value escaping per the exposition
+/// format: backslash, double-quote, newline. No label we emit
+/// currently contains these, but tenant ids are operator-
+/// supplied strings so guarding against malformed input here
+/// keeps the exposition parseable.
+fn escape_prom_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
     out
 }
 

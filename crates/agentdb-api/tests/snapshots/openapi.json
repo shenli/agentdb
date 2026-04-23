@@ -980,6 +980,151 @@
         }
       }
     },
+    "/api/admin/tenant-quotas": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_tenant_quotas",
+        "responses": {
+          "200": {
+            "description": "Every configured tenant quota",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TenantQuotaView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
+    "/api/admin/tenant-quotas/{tenant_id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_tenant_quota",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "External tenant id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The configured quota",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "404": {
+            "description": "No quota set for this tenant"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "put_tenant_quota",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "External tenant id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetTenantQuotaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Quota upserted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantQuotaView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "max_qps or burst is zero"
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_tenant_quota",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "External tenant id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Quota cleared (or was already absent)"
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
     "/api/admin/tier/force": {
       "post": {
         "tags": [
@@ -2729,6 +2874,25 @@
           }
         }
       },
+      "SetTenantQuotaRequest": {
+        "type": "object",
+        "required": [
+          "max_qps",
+          "burst"
+        ],
+        "properties": {
+          "burst": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_qps": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "ShardAssignment": {
         "type": "object",
         "required": [
@@ -3202,6 +3366,41 @@
         "properties": {
           "message": {
             "type": "string"
+          }
+        }
+      },
+      "TenantQuotaView": {
+        "type": "object",
+        "required": [
+          "tenant_id",
+          "max_qps",
+          "burst",
+          "updated_at_ms"
+        ],
+        "properties": {
+          "burst": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deny_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Running count of denials this process has served for\nthis tenant since the bucket was (re)configured. Not\npersisted — resets on restart. Operators watching\n`agentdb_tenant_quota_denies_total{tenant=\"...\"}` on\n`/metrics` get the same number across restarts.",
+            "minimum": 0
+          },
+          "max_qps": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "updated_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock ms when the quota was last set via PUT."
           }
         }
       },

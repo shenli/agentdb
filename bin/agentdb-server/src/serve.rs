@@ -471,6 +471,35 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         "node address proxy attached to registry; cross-node forwarding active"
     );
 
+    // Global per-tenant rate limits. Hydrate the in-memory
+    // registry from the meta store so the first request for a
+    // tenant with a configured quota sees its bucket
+    // immediately — hydration before we bind the listener
+    // avoids a cold-start window where a quota'd tenant is
+    // unthrottled.
+    let tenant_quota_registry = Arc::new(agentdb_core::TenantQuotaRegistry::new());
+    {
+        let persisted = agentdb_meta::tenant_quotas::list_all(meta.pool())
+            .await
+            .context("load tenant_quotas from meta")?;
+        for q in &persisted {
+            tenant_quota_registry.set(
+                &q.tenant_id,
+                agentdb_core::TenantQuotaConfig {
+                    max_qps: q.max_qps,
+                    burst: q.burst,
+                },
+            );
+        }
+        tracing::info!(
+            hydrated = persisted.len(),
+            "global per-tenant rate limits hydrated from meta",
+        );
+    }
+    registry
+        .attach_tenant_quotas(tenant_quota_registry.clone())
+        .map_err(|_| anyhow::anyhow!("tenant quota registry already attached"))?;
+
     // Stale-lease reaper. Started after the location proxy so it
     // can refresh the local cache immediately after reassigning
     // shards away from a reaped tablet (M22).

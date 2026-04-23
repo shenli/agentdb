@@ -39,6 +39,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "admin audit log",
         include_str!("../migrations/005_admin_audit.sql"),
     ),
+    (
+        6,
+        "global per-tenant rate limits",
+        include_str!("../migrations/006_tenant_quotas.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.
@@ -165,6 +170,7 @@ mod tests {
             "users",
             "admin_tokens",
             "admin_audit",
+            "tenant_quotas",
         ] {
             assert!(
                 names.contains(&expected),
