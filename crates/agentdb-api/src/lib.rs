@@ -17,6 +17,7 @@ pub mod auth_middleware;
 pub mod dto;
 pub mod error;
 pub mod fork;
+pub mod forwarding;
 pub mod handlers;
 pub mod health;
 pub mod hlc_header;

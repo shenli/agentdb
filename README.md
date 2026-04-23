@@ -277,6 +277,10 @@ M18+ milestones added:
   actually moves future writes to the targeted box
 - **M22 reaper-driven shard reassignment** — when a tablet's lease
   expires, its orphaned shards round-robin to surviving tablets
+- **M20 multi-node write forwarding** — a write for a tablet
+  owned by a peer node is proxied via HTTP preserving auth and
+  HLC, with a loop-guard (`X-AgentDB-Forwarded`) that returns
+  421 on routing drift
 - **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
   — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
   Basic auth; user→tenant ACL; `agentdb user add|list|delete`
@@ -290,11 +294,15 @@ M18+ milestones added:
 
 **Still out of scope:**
 
-- **Cross-node routing.** Multi-node compose is still blocked —
-  `tablet_id` maps 1:1 to a local `box_id` today. An override
-  pointing at a tablet on another node falls back to tenant-hash
-  routing as a safety net. Real cross-node forwarding (gRPC to the
-  tablet's current owner node) is future work.
+- **Cross-node Mongo wire.** REST `append_and_fetch` forwards
+  across nodes; the Mongo wire subset does not. Operators
+  running multi-node Mongo point clients at the tablet's
+  owning node (or put a proxy in front).
+- **Cross-node reads.** Reads still route by tenant hash; an
+  overridden session whose writes landed on a remote tablet
+  will not be visible from a read issued against the
+  tenant's hash node. Closing this gap requires migrating
+  session state alongside the override (quiesce + handoff).
 - **Quiesce / data-handoff on reassignment.** Moves via
   `set_shard` or the reaper change *future* routing; data already
   accepted on the old box stays there (append-only event streams

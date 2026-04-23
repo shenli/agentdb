@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod box_runtime;
 pub mod error;
+pub mod forwarding;
 pub mod fork;
 pub mod hedge;
 pub mod hlc;
@@ -28,9 +29,11 @@ pub mod types;
 
 pub use admission::{AdmissionDenied, Scope, TokenBucket};
 pub use box_runtime::{
-    BoxRegistry, Box_, FaultKind, InjectedFault, Quota, DEFAULT_ADMISSION_CAPACITY,
+    BoxRegistry, Box_, FaultKind, InjectedFault, Quota, RouteDecision,
+    DEFAULT_ADMISSION_CAPACITY,
 };
 pub use error::{Error, Resource, Result};
+pub use forwarding::{NodeAddressProxy, NodeAddressRefreshJob, NodeTarget};
 pub use fork::fork_session;
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};
 pub use hlc::{HlcClock, HlcError, HlcTimestamp};

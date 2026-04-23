@@ -956,6 +956,9 @@
               }
             }
           },
+          "421": {
+            "description": "Routing drift on a forwarded request"
+          },
           "429": {
             "description": "Rate limit exceeded",
             "content": {
@@ -967,7 +970,7 @@
             }
           },
           "503": {
-            "description": "Fault injected",
+            "description": "Fault injected, forwarding failed, or node draining",
             "content": {
               "application/json": {
                 "schema": {
@@ -1605,6 +1608,8 @@
           "lease_lost",
           "lease_epoch",
           "admission_waits_total",
+          "forwarded_writes_total",
+          "forwarded_write_failures_total",
           "gauges"
         ],
         "properties": {
@@ -1629,6 +1634,16 @@
             "minimum": 0
           },
           "forks": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "forwarded_write_failures_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "forwarded_writes_total": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
