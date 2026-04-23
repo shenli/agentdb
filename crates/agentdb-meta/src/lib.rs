@@ -15,6 +15,7 @@
 //! PR (see the M18 plan doc).
 
 pub mod admin_tokens;
+pub mod audit;
 pub mod config;
 pub mod error;
 pub mod migrations;

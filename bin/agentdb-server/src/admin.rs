@@ -18,8 +18,9 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, CreateTabletOpts, MigrateSessionOpts,
-    SetShardOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
+    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, CreateTabletOpts,
+    MigrateSessionOpts, SetShardOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, UserAddOpts,
+    UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -313,6 +314,33 @@ pub async fn show_latency(opts: ShowLatencyOpts) -> Result<()> {
         "{}/api/admin/boxes/{}/latency",
         opts.server_url.trim_end_matches('/'),
         opts.box_id,
+    );
+    fetch_and_print(&url).await
+}
+
+/// `GET /api/admin/audit` — list recent admin-plane requests.
+pub async fn audit_log(opts: AuditLogOpts) -> Result<()> {
+    let mut qs: Vec<(String, String)> = vec![("limit".into(), opts.limit.to_string())];
+    if let Some(v) = opts.since_ms {
+        qs.push(("since_ms".into(), v.to_string()));
+    }
+    if let Some(v) = opts.until_ms {
+        qs.push(("until_ms".into(), v.to_string()));
+    }
+    if let Some(v) = &opts.actor_id {
+        qs.push(("actor_id".into(), v.clone()));
+    }
+    if let Some(v) = &opts.path_prefix {
+        qs.push(("path_prefix".into(), v.clone()));
+    }
+    let qstr = qs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!(
+        "{}/api/admin/audit?{qstr}",
+        opts.server_url.trim_end_matches('/'),
     );
     fetch_and_print(&url).await
 }

@@ -34,6 +34,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "admin bearer tokens",
         include_str!("../migrations/004_admin_tokens.sql"),
     ),
+    (
+        5,
+        "admin audit log",
+        include_str!("../migrations/005_admin_audit.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.
@@ -159,6 +164,7 @@ mod tests {
             "tenants",
             "users",
             "admin_tokens",
+            "admin_audit",
         ] {
             assert!(
                 names.contains(&expected),
