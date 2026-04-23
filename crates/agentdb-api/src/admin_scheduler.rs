@@ -223,6 +223,7 @@ mod tests {
                 tick: Duration::from_millis(100),
                 safety_margin: Duration::from_millis(0),
             },
+            None,
         );
         tokio::time::sleep(Duration::from_millis(400)).await;
 

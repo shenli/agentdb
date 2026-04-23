@@ -344,7 +344,12 @@ pub async fn append_and_fetch_with_actor(
             });
         }
     }
-    let box_ = registry.route_tenant(tenant_external);
+    // M20: route by (tenant, session). If a shard override is set
+    // for this session's shard, the write lands on the overridden
+    // tablet's box. Otherwise falls back to tenant-hash routing.
+    // When no LocationProxy is attached (legacy test paths) this
+    // degenerates to `route_tenant`.
+    let box_ = registry.route_session(tenant_external, session_external);
     // M21: lease-alive check. If this box has a lease configured
     // (MetaStore-backed registry) and it has expired, fail fast so
     // the caller can retry or be routed to the new owner. When no

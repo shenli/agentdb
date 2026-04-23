@@ -445,6 +445,14 @@ pub struct BoxRegistry {
     /// drain calls remain idempotent (second+ calls return the
     /// original `drained_at_ms` in admin responses).
     drained_at_ms: Arc<std::sync::OnceLock<i64>>,
+    /// Shard→tablet lookup (M20). `None` on the legacy `new*`
+    /// paths that don't attach a meta store; `Some` when the server
+    /// binary calls [`Self::attach_location`] after building the
+    /// proxy. When set, [`Self::route_session`] consults it for
+    /// shard overrides; when unset, `route_session` degenerates to
+    /// tenant-hash routing. Tests that don't care about shard
+    /// overrides leave it `None`.
+    location: std::sync::OnceLock<Arc<crate::shard::LocationProxy>>,
 }
 
 impl BoxRegistry {
@@ -508,6 +516,7 @@ impl BoxRegistry {
             node_id: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
+            location: std::sync::OnceLock::new(),
         })
     }
 
@@ -598,6 +607,7 @@ impl BoxRegistry {
             node_id: Some(node_id),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
+            location: std::sync::OnceLock::new(),
         })
     }
 
@@ -629,6 +639,52 @@ impl BoxRegistry {
         }
         let idx = (hash as usize) % self.boxes.len();
         self.boxes[idx].clone()
+    }
+
+    /// Route a (tenant, session) pair to a box. When the control
+    /// plane has an explicit shard override (set via `POST
+    /// /api/admin/shards/:id`) and this registry has a proxy
+    /// attached via [`Self::attach_location`], the write lands on
+    /// the box backing that override's tablet. Otherwise falls
+    /// back to tenant-based hash routing — the pre-M20 behavior.
+    ///
+    /// **Fallback on unreachable tablet.** `LocationProxy` can
+    /// legitimately return a `tablet_id` that this node doesn't own
+    /// (shard pointed at a different node) or that's out of this
+    /// node's box range. We return the tenant-hash box in both cases
+    /// rather than panicking — writes still land *somewhere* durable
+    /// even if the operator's override is stale or points at a
+    /// remote tablet. Cross-node forwarding is future work; see
+    /// `docs/superpowers/plans/2026-04-22-m20-write-path-m22-reassignment.md`.
+    pub fn route_session(&self, tenant_external: &str, session_external: &str) -> Arc<Box_> {
+        if let Some(location) = self.location.get() {
+            if let Some(tablet_id) = location.tablet_for_session(session_external) {
+                // Tablet id is i64 in meta; box ids are u16. Guard the
+                // cast and fall back if out of range.
+                if (0..self.boxes.len() as i64).contains(&tablet_id) {
+                    return self.boxes[tablet_id as usize].clone();
+                }
+            }
+        }
+        self.route_tenant(tenant_external)
+    }
+
+    /// Attach a [`LocationProxy`] so [`Self::route_session`] starts
+    /// consulting it. Idempotent at the OnceLock level — calling
+    /// twice returns `Err` on the second call. The server binary
+    /// calls this exactly once, right after building the proxy.
+    pub fn attach_location(
+        &self,
+        location: Arc<crate::shard::LocationProxy>,
+    ) -> std::result::Result<(), Arc<crate::shard::LocationProxy>> {
+        self.location.set(location)
+    }
+
+    /// Currently-attached location proxy, if any. Exposed for the
+    /// reaper + admin endpoints that need to force a refresh after
+    /// writing an override.
+    pub fn location(&self) -> Option<Arc<crate::shard::LocationProxy>> {
+        self.location.get().cloned()
     }
 
     /// Look up an `Arc<Box_>` by index. Used by the server binary to start
@@ -742,6 +798,78 @@ mod tests {
     fn num_boxes_reports_correct_count() {
         let (_dir, _obj_dir, reg) = registry(5);
         assert_eq!(reg.num_boxes(), 5);
+    }
+
+    // M20 route_session coverage. LocationProxy needs a meta
+    // pool; build it with migrations + seed so route_session can
+    // be exercised end-to-end without spinning up the full
+    // registry-with-meta code path.
+    async fn location_with(
+        session: &str,
+        tablet_override: Option<i64>,
+    ) -> Arc<crate::shard::LocationProxy> {
+        use agentdb_meta::{migrations, shards as meta_shards, MetaStore};
+        let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
+        migrations::apply(meta.pool()).await.unwrap();
+        meta_shards::seed_shards(meta.pool(), crate::shard::SHARD_COUNT as i64, 0)
+            .await
+            .unwrap();
+        if let Some(t) = tablet_override {
+            let sid = crate::shard::shard_id(session) as i64;
+            meta_shards::set_assignment(meta.pool(), sid, Some(t), 0)
+                .await
+                .unwrap();
+        }
+        crate::shard::LocationProxy::new(meta).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_session_with_no_proxy_falls_back_to_tenant() {
+        let (_dir, _obj_dir, reg) = registry(4);
+        // No attach_location call — route_session must behave like route_tenant.
+        let routed = reg.route_session("t-1", "s-1").id;
+        let fallback = reg.route_tenant("t-1").id;
+        assert_eq!(routed, fallback);
+    }
+
+    #[tokio::test]
+    async fn route_session_falls_back_to_tenant_when_no_override() {
+        let (_dir, _obj_dir, reg) = registry(4);
+        let loc = location_with("s-1", None).await;
+        reg.attach_location(loc).ok();
+        let routed = reg.route_session("t-1", "s-1").id;
+        let fallback = reg.route_tenant("t-1").id;
+        assert_eq!(routed, fallback);
+    }
+
+    #[tokio::test]
+    async fn route_session_uses_override_when_set() {
+        let (_dir, _obj_dir, reg) = registry(4);
+        let fallback = reg.route_tenant("t-1").id;
+        // Pick a target that differs from the fallback.
+        let target = ((fallback as i64) + 1) % 4;
+        let loc = location_with("s-1", Some(target)).await;
+        reg.attach_location(loc).ok();
+        let routed = reg.route_session("t-1", "s-1").id;
+        assert_eq!(routed as i64, target);
+        assert_ne!(
+            routed, fallback,
+            "override must redirect away from hash target"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_session_falls_back_on_out_of_range_tablet() {
+        let (_dir, _obj_dir, reg) = registry(4);
+        // Tablet 99 is outside 0..4 — a cross-node or stale override.
+        let loc = location_with("s-1", Some(99)).await;
+        reg.attach_location(loc).ok();
+        let routed = reg.route_session("t-1", "s-1").id;
+        let fallback = reg.route_tenant("t-1").id;
+        assert_eq!(
+            routed, fallback,
+            "out-of-range tablet must fall back to tenant hash"
+        );
     }
 
     #[tokio::test]

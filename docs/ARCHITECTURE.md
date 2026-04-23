@@ -681,7 +681,7 @@ Replaced by:
   writes per box. Waits rather than rejects — complements the QPS
   token bucket, which rejects.
 
-### Shard hash + LocationProxy (M20 foundation)
+### Shard hash + LocationProxy + write-path routing (M20)
 
 `agentdb_core::shard::shard_id(session_external) -> u16` is FNV-1a
 (64-bit) modulo 16384. `LocationProxy` holds a cached lookup
@@ -689,9 +689,54 @@ Replaced by:
 every `AGENTDB_SHARD_REFRESH_SECS` (30s). Operators pin shards via
 `POST /api/admin/shards/:id` (immediately refreshes the proxy) and
 inspect assignments via `GET /api/admin/shards/:id` or
-`GET /api/admin/shards?session_id=...`. The write path doesn't yet
-consume the proxy — the M20 full routing refactor is what wires it
-in (still pending).
+`GET /api/admin/shards?session_id=...`.
+
+**Write-path integration.** At server start, the proxy is attached
+to the `BoxRegistry` via `attach_location`. `BoxRegistry::route_session(tenant, session)`
+then consults the proxy before falling back to tenant-hash
+routing:
+
+1. If the proxy has an override for the session's shard, look up
+   the tablet id.
+2. If that tablet id is within this node's box range
+   (`0..num_boxes`), route to `boxes[tablet_id]`. Since
+   `tablet_id == box_id` on a single-node cluster, this is an
+   identity map today; the indirection is there so multi-node
+   adds cross-node forwarding without changing callers.
+3. Otherwise (no override, or override points at a remote/stale
+   tablet) fall back to `route_tenant(tenant)` — the pre-M20
+   hash behavior. The fallback is deliberate: the write path
+   must never panic on a stale override, and falling back
+   guarantees writes land somewhere durable even if the
+   operator's override is wrong.
+
+`append_and_fetch_with_actor` uses `route_session`; every other
+caller (fork, admin endpoints, tier/lifecycle background jobs)
+stays on `route_tenant` because it operates on tenant-wide state.
+
+### Reaper-driven shard reassignment (M22)
+
+When `clear_expired_ownership` returns a non-empty set of reaped
+tablets, the reaper does a second pass:
+
+1. `tablets::list_all` → keep only rows with `owner_node_id.is_some()`
+   and `lease_expires_at_ms > now`. That's the "live" set.
+2. For each reaped tablet, `shards::list_by_tablet` returns the
+   shard ids that pointed at it.
+3. Round-robin those shards across the live set, one
+   `set_assignment` call per shard. The counter
+   `shard_reassignments_total` increments once per move.
+4. Refresh the local `LocationProxy` immediately so this node's
+   write path picks up the new routing on the next request
+   (rather than waiting up to 30s for the periodic refresh).
+
+If the live set is empty (every tablet is dead — the whole
+cluster is down), the reaper logs a WARN and leaves overrides
+alone. Writes for affected shards fall through `route_session`'s
+safety net to tenant-hash routing.
+
+Round-robin is deliberately simple; load-aware reassignment
+requires per-tablet metrics that don't exist yet (M25 work).
 
 ### Clap CLI (M26 piece 1)
 

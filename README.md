@@ -273,6 +273,10 @@ M18+ milestones added:
 - **Per-tenant locking** + per-box admission semaphore
 - **Shard hash + `LocationProxy`** with operator-visible
   assignment management (admin endpoint + CLI)
+- **M20 session-shard write routing** — `POST /api/admin/shards/:id`
+  actually moves future writes to the targeted box
+- **M22 reaper-driven shard reassignment** — when a tablet's lease
+  expires, its orphaned shards round-robin to surviving tablets
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
   `set-shard`, `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
@@ -283,17 +287,24 @@ M18+ milestones added:
 
 **Still out of scope:**
 
-- **M20 write-path integration** — shard-based routing + tablet
-  layout refactor. The `LocationProxy` is built and tested but
-  not yet wired into `append_and_fetch`. Multi-node compose is
-  blocked on this.
+- **Cross-node routing.** Multi-node compose is still blocked —
+  `tablet_id` maps 1:1 to a local `box_id` today. An override
+  pointing at a tablet on another node falls back to tenant-hash
+  routing as a safety net. Real cross-node forwarding (gRPC to the
+  tablet's current owner node) is future work.
+- **Quiesce / data-handoff on reassignment.** Moves via
+  `set_shard` or the reaper change *future* routing; data already
+  accepted on the old box stays there (append-only event streams
+  remain durable wherever they were written, but cross-box reads
+  that don't consult the shard map will miss them). Reads still
+  route by tenant-hash.
 - **M19 SCRAM + tenant-implicit auth** — admin endpoints remain
   open, tenants still explicit in the request path.
-- **M22 reassignment policy** — cross-AZ preference, anti-
-  affinity, node-weight awareness. Reaper clears dead-owner rows
-  but doesn't elect replacements.
-- **M25 hot-tablet auto-split** — depends on M20's tablet
-  abstraction being real.
+- **M22 sophisticated policy** — cross-AZ preference, anti-
+  affinity, node-weight awareness. Current reassignment is
+  round-robin across live tablets.
+- **M25 hot-tablet auto-split** — requires per-tablet load
+  tracking (`TabletMetrics`) that doesn't exist yet.
 - **Cross-box (distributed) transactions** — design is single-box
   2PC-free.
 - **Real ANN at 100M+ vectors** — HNSW is single-node, in-process.

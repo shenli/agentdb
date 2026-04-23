@@ -60,7 +60,9 @@ pub async fn append_and_fetch(
             scope,
             retry_after_ms,
         }) => {
-            let box_id = state.registry.route_tenant(&tenant).id;
+            // Attribute the QuotaHit event to the box that actually
+            // rejected — matches the M20 session routing above.
+            let box_id = state.registry.route_session(&tenant, &session).id;
             state.stream.emit(crate::stream::StreamEvent::QuotaHit {
                 ts_ms: crate::stream::now_ms(),
                 box_id,
