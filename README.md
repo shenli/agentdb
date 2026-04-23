@@ -288,6 +288,13 @@ M18+ milestones added:
 - **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
   — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
   Basic auth; user→tenant ACL; `agentdb user add|list|delete`
+- **Admin-plane bearer auth** (optional,
+  `AGENTDB_REQUIRE_ADMIN_AUTH=true`) — `/api/admin/*` requires
+  `Authorization: Bearer <token>`. Health/metrics stay open.
+  First-mint bootstrap exception lets operators obtain the
+  initial token without out-of-band DB access.
+  `agentdb admin-token add|list|revoke`; admin CLI
+  subcommands pick up `$AGENTDB_ADMIN_TOKEN` automatically
 - **M25 hot-tablet detection + shed + dynamic tablet
   creation** — sliding rate window on every box;
   scheduler-leader detector flags saturated tablets;
@@ -327,9 +334,10 @@ M18+ milestones added:
   remain durable wherever they were written, but cross-box reads
   that don't consult the shard map will miss them). Reads still
   route by tenant-hash.
-- **Admin-plane auth.** `/api/admin/*` endpoints stay open —
-  operators are trusted on the loopback interface. mTLS or a
-  bearer token is a follow-up PR.
+- **Admin-plane mTLS / scoped tokens.** Bearer-token auth
+  ships; every token has full admin access today. Scoped
+  ("read-only", "shed-only") tokens and mTLS-based admin
+  auth are future work.
 - **TLS termination.** Basic auth over plaintext is weak; the
   prototype assumes the caller terminates TLS at an ingress.
 - **M22 sophisticated policy** — cross-AZ preference, anti-

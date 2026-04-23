@@ -323,6 +323,7 @@ mod tests {
                 stream,
                 http,
                 auth: None,
+        admin_auth: None,
             },
         )
     }

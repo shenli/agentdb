@@ -963,9 +963,62 @@ Off by default (backward-compatible). Enable with
   password from `--password` or, if omitted, from stdin.
 
 Out of scope (explicitly): SCRAM-SHA-1 (MongoDB ≥ 4.0
-defaults to SHA-256), admin-plane auth (separate PR; mTLS or
-bearer token), TLS termination (assumed at the ingress),
-Argon2 at-rest hashing.
+defaults to SHA-256), TLS termination (assumed at the
+ingress), Argon2 at-rest hashing.
+
+### Admin-plane bearer auth
+
+Companion to M19 (tenant auth). Closes the last "wide-open
+endpoint" gap: `/api/admin/*` now requires a Bearer token
+when `AGENTDB_REQUIRE_ADMIN_AUTH=true`.
+
+**Token store.** Migration 004 adds `admin_tokens`
+`(token_id, token_hash_b64, description, created_at_ms,
+revoked_at_ms)`. `agentdb_meta::admin_tokens` does the
+CRUD. Mint generates 32 random bytes, hashes with SHA-256,
+persists only the hash. The plaintext is returned ONCE and
+never stored — if the operator loses it, they mint a new
+one and revoke the old.
+
+Verification is constant-time against the stored hash set
+(rows are tiny at prototype scale; bumps to a hash-indexed
+lookup later if it ever matters).
+
+**Middleware.** Layered only on the `/api/admin/*`
+subtree — `/health/*`, `/metrics`, `/openapi.json`,
+`/dashboard`, `/api/stream` always stay open so operators
+can probe without credentials. When admin auth is
+configured:
+
+- Absent / malformed `Authorization: Bearer <...>` → 401.
+- Token not in active set (unknown or revoked) → 401.
+- Match → pass through.
+
+**Bootstrap exception.** When no active tokens exist,
+`POST /api/admin/tokens` is allowed without auth so an
+operator can mint the first one. The moment a token is
+active, subsequent mints require auth. Every other admin
+endpoint 401s during bootstrap. Rationale: the alternative
+(mint via direct SQLite access) is awkward and doesn't
+generalize to a server behind a proxy.
+
+**CLI.** `agentdb admin-token add [--description X]`
+prints the plaintext to stdout ONCE. All admin CLI
+subcommands read `AGENTDB_ADMIN_TOKEN` and attach it as
+`Bearer` — one export covers a whole session.
+
+**Operator bootstrap:**
+
+```bash
+# Server up with AGENTDB_REQUIRE_ADMIN_AUTH=true and no tokens yet.
+TOKEN=$(agentdb admin-token add --description bootstrap | jq -r .token)
+export AGENTDB_ADMIN_TOKEN="$TOKEN"
+agentdb show-tablets          # now authenticated
+```
+
+Out of scope this PR: mTLS / cert-based admin auth,
+scoped tokens (everything is full-access today), audit log
+of admin actions.
 
 ### Clap CLI (M26 piece 1)
 
@@ -988,6 +1041,9 @@ agentdb show-hot-tablets    GET /api/admin/tablets/hot
 agentdb show-tablet-load    GET /api/admin/tablets/load
 agentdb shed-tablet <id>    POST /api/admin/tablets/:id/shed
 agentdb create-tablet       POST /api/admin/tablets/create
+agentdb admin-token add     POST /api/admin/tokens
+agentdb admin-token list    GET  /api/admin/tokens
+agentdb admin-token revoke <id>  DELETE /api/admin/tokens/:id
 ```
 
 `--dev` sets up an ephemeral tempdir for KV + object store + meta;

@@ -89,6 +89,7 @@ async fn spawn_dynamic_node() -> (
         stream: StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
+        admin_auth: None,
     };
     let app = router(state)
         .layer(Extension(meta.clone()))

@@ -18,14 +18,14 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, CreateTabletOpts, SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts,
-    UserDeleteOpts,
+    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, CreateTabletOpts, SetShardOpts,
+    ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
 pub async fn drain(opts: AdminOpts) -> Result<()> {
     let url = format!("{}/api/admin/drain", opts.server_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .post(&url)
         .send()
@@ -82,7 +82,7 @@ pub async fn set_shard(opts: SetShardOpts) -> Result<()> {
         // `--clear` and missing `--tablet` both produce null here.
         "tablet_id": opts.tablet,
     });
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .post(&url)
         .json(&body)
@@ -123,7 +123,7 @@ pub async fn user_add(opts: UserAddOpts) -> Result<()> {
     if let Some(iter) = opts.iterations {
         body["iterations"] = serde_json::Value::from(iter);
     }
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .post(&url)
         .json(&body)
@@ -147,7 +147,7 @@ pub async fn user_delete(opts: UserDeleteOpts) -> Result<()> {
         opts.server_url.trim_end_matches('/'),
         urlencode(&opts.user_id),
     );
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .delete(&url)
         .send()
@@ -195,7 +195,7 @@ pub async fn shed_tablet(opts: ShedTabletOpts) -> Result<()> {
     if let Some(f) = opts.fraction {
         body["fraction"] = serde_json::Value::from(f);
     }
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .post(&url)
         .json(&body)
@@ -216,7 +216,7 @@ pub async fn create_tablet(opts: CreateTabletOpts) -> Result<()> {
         Some(id) => serde_json::json!({ "tablet_id": id }),
         None => serde_json::json!({}),
     };
-    let client = reqwest::Client::new();
+    let client = admin_client();
     let resp = client
         .post(&url)
         .json(&body)
@@ -224,6 +224,62 @@ pub async fn create_tablet(opts: CreateTabletOpts) -> Result<()> {
         .await
         .with_context(|| format!("POST {url}"))?;
     print_json_and_exit_on_failure(resp).await
+}
+
+/// `POST /api/admin/tokens` — mint a new admin bearer token.
+/// The server returns the plaintext token in the response
+/// body ONCE; we print the whole JSON so the operator can
+/// pipe it through `jq -r .token` into an env var.
+pub async fn admin_token_add(opts: AdminTokenAddOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tokens",
+        opts.server_url.trim_end_matches('/')
+    );
+    let mut body = serde_json::json!({});
+    if let Some(d) = opts.description {
+        body["description"] = serde_json::Value::from(d);
+    }
+    let client = admin_client_with_opt(opts.token.as_deref());
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/tokens` — list active tokens.
+pub async fn admin_token_list(opts: AdminOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tokens",
+        opts.server_url.trim_end_matches('/')
+    );
+    // Uses the env-var-driven admin_client; list doesn't
+    // take a --token flag of its own.
+    fetch_and_print(&url).await
+}
+
+/// `DELETE /api/admin/tokens/:id` — soft-revoke.
+pub async fn admin_token_revoke(opts: AdminTokenRevokeOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tokens/{}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.token_id),
+    );
+    let client = admin_client_with_opt(opts.token.as_deref());
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("revoke failed ({status}): {body}");
+        std::process::exit(exit_code_for(status));
+    }
+    Ok(())
 }
 
 /// Read a line from stdin with a minimal prompt. Not a
@@ -265,8 +321,49 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Build an admin HTTP client that attaches
+/// `Authorization: Bearer <token>` automatically when
+/// `AGENTDB_ADMIN_TOKEN` is set in the environment. Every
+/// admin subcommand routes through this so operators don't
+/// have to thread `--token` through each call — a single
+/// export handles the whole session.
+fn admin_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Ok(token) = std::env::var("AGENTDB_ADMIN_TOKEN") {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+            builder = builder.default_headers(headers);
+        }
+    }
+    builder
+        .build()
+        .expect("reqwest Client::builder().build() is infallible for our config")
+}
+
+/// Variant of [`admin_client`] that uses an explicit
+/// override token when present, falling back to
+/// `AGENTDB_ADMIN_TOKEN`. Used by the token subcommands
+/// which accept `--token` directly.
+fn admin_client_with_opt(explicit: Option<&str>) -> reqwest::Client {
+    let token = explicit.map(str::to_string).or_else(|| std::env::var("AGENTDB_ADMIN_TOKEN").ok());
+    let mut builder = reqwest::Client::builder();
+    if let Some(t) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+            builder = builder.default_headers(headers);
+        }
+    }
+    builder
+        .build()
+        .expect("reqwest Client::builder().build() is infallible for our config")
+}
+
 async fn fetch_and_print(url: &str) -> Result<()> {
-    let resp = reqwest::get(url)
+    let resp = admin_client()
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     print_json_and_exit_on_failure(resp).await

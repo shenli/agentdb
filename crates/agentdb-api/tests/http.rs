@@ -22,6 +22,7 @@ async fn spawn() -> (TempDir, TempDir, String) {
         stream: StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
+        admin_auth: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

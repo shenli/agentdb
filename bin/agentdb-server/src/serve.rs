@@ -563,6 +563,14 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    // Admin-plane auth is a separate toggle: deployments
+    // might require admin auth while leaving tenant
+    // endpoints open (behind a tenant-identity proxy) or
+    // vice versa.
+    let require_admin_auth = std::env::var("AGENTDB_REQUIRE_ADMIN_AUTH")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let http_state = AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),
@@ -571,6 +579,13 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         http: http_client.clone(),
         auth: if require_auth {
             Some(agentdb_api::AuthConfig {
+                meta: Some(meta.clone()),
+            })
+        } else {
+            None
+        },
+        admin_auth: if require_admin_auth {
+            Some(agentdb_api::admin_auth_middleware::AdminAuthConfig {
                 meta: Some(meta.clone()),
             })
         } else {

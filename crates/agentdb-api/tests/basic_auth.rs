@@ -38,6 +38,7 @@ async fn spawn_with_auth() -> (TempDir, TempDir, tempfile::NamedTempFile, String
         auth: Some(AuthConfig {
             meta: Some(meta.clone()),
         }),
+        admin_auth: None,
     };
     let app = router(state).layer(axum::Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

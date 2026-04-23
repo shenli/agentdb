@@ -141,6 +141,7 @@ mod tests {
                 stream: crate::stream::StreamBus::default(),
                 http: crate::webhook::new_client(),
                 auth: None,
+        admin_auth: None,
             },
         )
     }
@@ -162,6 +163,7 @@ mod tests {
                 stream: crate::stream::StreamBus::default(),
                 http: crate::webhook::new_client(),
                 auth: None,
+        admin_auth: None,
             },
         )
     }
