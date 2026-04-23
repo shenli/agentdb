@@ -62,6 +62,15 @@ exits and restarts.
    SIGTERM the process. Drain is a prelude to shutdown, not a
    runtime state this node stays in indefinitely.
 
+   The drain also stops this node's lease renewal loop, so its
+   tablet leases expire naturally after `lease_duration` and the
+   stale-lease reaper on another node clears the tablet rows
+   without waiting for SIGTERM. An operator who wants a completely
+   clean handoff can wait `lease_duration + reaper_safety_margin +
+   one reaper tick` (≈45s with defaults) after drain before
+   SIGTERMing; by then `/api/admin/tablets` shows
+   `owner_node_id = null` for the drained node's rows.
+
 2. **Unexpected drain (someone initiated one and shouldn't have).**
    Because drain is one-way, the only way to restore service is to
    SIGTERM and restart the process. On restart the `draining` flag

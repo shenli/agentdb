@@ -672,6 +672,16 @@ impl BoxRegistry {
         self.drained_at_ms.get().copied()
     }
 
+    /// Shared handle to the process-level drain flag. Cheap clone
+    /// (just an Arc bump). Consumed by the lease-renewal loop so it
+    /// can stop renewing when drain flips — without needing a
+    /// back-reference to the registry itself. Any caller that wants
+    /// to *react* to drain (rather than merely *read* its current
+    /// value) should take this handle and poll it.
+    pub fn draining_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.draining.clone()
+    }
+
     /// Node id of the process hosting this registry, if it was built
     /// via `new_with_meta*`. Returns `None` for legacy-path registries
     /// (which don't have a control plane and so can't be drained).

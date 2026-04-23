@@ -235,15 +235,53 @@ impl LeaseRenewalJob {
     /// `lease.config().renew`; failures are logged but do not abort
     /// the loop — a transient meta outage shorter than the renewal
     /// margin should not kill writes.
+    ///
+    /// This overload exists for tests and legacy paths that don't
+    /// have a drain flag to wire up. Production callers should
+    /// prefer [`Self::start_with_drain`].
     pub fn start(lease: Arc<LeaseManager>) -> Self {
+        Self::start_with_drain(lease, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    /// Spawn the renewal loop, tied to a process-level drain flag
+    /// (typically `BoxRegistry::draining_flag()`). When the flag
+    /// flips to true (via `POST /api/admin/drain`), the next tick
+    /// skips the `lease.renew()` call. The lease expires naturally
+    /// after `lease.config().duration` and the stale-lease reaper
+    /// on another node clears the tablet row — without needing the
+    /// operator to SIGTERM first.
+    ///
+    /// Counter behavior under drain: `lease_renewals` stops
+    /// advancing; `lease_renewal_failures` also stops. The lease's
+    /// `is_live()` will return false once wall clock passes
+    /// `lease_expires_at_ms`, at which point the write path returns
+    /// `LeaseLost` — but the drain check in
+    /// `append_and_fetch_with_actor` fires first, so the client
+    /// actually sees `NodeDraining`.
+    pub fn start_with_drain(
+        lease: Arc<LeaseManager>,
+        drain_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(lease.config().renew);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // First tick fires immediately; skip to align with "renew
             // every N seconds after the initial acquire".
             interval.tick().await;
+            let mut drain_logged = false;
             loop {
                 interval.tick().await;
+                if drain_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    if !drain_logged {
+                        tracing::info!(
+                            tablet_id = lease.tablet_id(),
+                            node_id = %lease.node_id(),
+                            "lease renewal halted: node is draining; lease will expire naturally"
+                        );
+                        drain_logged = true;
+                    }
+                    continue;
+                }
                 if let Err(err) = lease.renew().await {
                     tracing::warn!(
                         tablet_id = lease.tablet_id(),
@@ -410,5 +448,83 @@ mod tests {
         assert_eq!(c.duration, Duration::from_secs(12));
         std::env::remove_var("AGENTDB_LEASE_RENEW_SECS");
         std::env::remove_var("AGENTDB_LEASE_DURATION_SECS");
+    }
+
+    #[tokio::test]
+    async fn renewal_loop_stops_when_drain_flag_is_set_before_start() {
+        // Drain already set at spawn time: the renewal loop must
+        // skip every tick and never call lease.renew(). We verify by
+        // watching lease_renewals — it starts at 1 (from the initial
+        // acquire) and must remain 1.
+        let meta = meta_in_memory().await;
+        let metrics = Arc::new(crate::metrics::BoxMetrics::new());
+        let lease = LeaseManager::acquire(
+            meta,
+            5,
+            "node-a".into(),
+            LeaseConfig {
+                renew: Duration::from_millis(20),
+                duration: Duration::from_secs(30),
+                safety_margin: Duration::from_secs(5),
+            },
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.snapshot().lease_renewals, 1, "initial acquire");
+
+        let drain = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _job = LeaseRenewalJob::start_with_drain(lease, drain);
+        // Let several tick intervals pass.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            metrics.snapshot().lease_renewals,
+            1,
+            "drained loop must not renew"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_loop_stops_after_drain_flag_flips_mid_run() {
+        // Drain flips after one or more successful renewals: the
+        // counter advances for a bit and then stops.
+        let meta = meta_in_memory().await;
+        let metrics = Arc::new(crate::metrics::BoxMetrics::new());
+        let lease = LeaseManager::acquire(
+            meta,
+            6,
+            "node-a".into(),
+            LeaseConfig {
+                renew: Duration::from_millis(20),
+                duration: Duration::from_secs(30),
+                safety_margin: Duration::from_secs(5),
+            },
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+
+        let drain = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _job = LeaseRenewalJob::start_with_drain(lease, drain.clone());
+        // Run for a while so renewals accumulate.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let renewals_before = metrics.snapshot().lease_renewals;
+        assert!(
+            renewals_before > 1,
+            "expected at least one renewal before drain; got {renewals_before}"
+        );
+
+        // Flip drain; wait well past several tick periods.
+        drain.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let renewals_after_drain = metrics.snapshot().lease_renewals;
+
+        // Give yet more time to confirm the counter has frozen.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let renewals_final = metrics.snapshot().lease_renewals;
+        assert_eq!(
+            renewals_after_drain, renewals_final,
+            "after drain, renewals must stop advancing"
+        );
     }
 }
