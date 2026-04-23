@@ -592,6 +592,36 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
             None
         },
     };
+
+    // Auto-shed scheduler (post-M25 operator ergonomics).
+    // Off by default. When on, consumes the hot-tablet
+    // detector's snapshot and fires shed-with-migrate
+    // against the least-loaded sibling tablet, with a
+    // per-tablet cooldown to prevent thrash.
+    let auto_shed_enabled = std::env::var("AGENTDB_AUTO_SHED_ENABLED")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let _auto_shed_job = if auto_shed_enabled {
+        let cfg = agentdb_api::auto_shed::AutoShedConfig::from_env();
+        tracing::info!(
+            tick_secs = cfg.tick.as_secs(),
+            cooldown_secs = cfg.cooldown.as_secs(),
+            fraction = cfg.fraction,
+            "auto-shed scheduler starting"
+        );
+        Some(agentdb_api::auto_shed::AutoShedJob::start(
+            http_state.clone(),
+            hot_detector.clone(),
+            meta.clone(),
+            cfg,
+        ))
+    } else {
+        None
+    };
+    if let Some(job) = _auto_shed_job {
+        std::mem::forget(job);
+    }
     let wire_state = if require_auth {
         WireState::with_auth(
             registry.clone(),

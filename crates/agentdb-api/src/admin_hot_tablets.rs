@@ -219,6 +219,17 @@ pub struct ShedRequest {
     /// move. Clamped to (0, 1]. Defaults to 0.5 (half).
     #[serde(default)]
     pub fraction: Option<f64>,
+    /// When true, after reassigning the shards the server
+    /// enumerates sessions on the source tablet whose shard
+    /// is in the moved set and migrates each warm one to
+    /// the destination via
+    /// [`agentdb_core::migrate_warm_session`]. Cold/archive
+    /// sessions are reported in `skipped_sessions` and
+    /// otherwise left alone. Default false for backward
+    /// compatibility (previous callers don't expect data to
+    /// move).
+    #[serde(default)]
+    pub migrate_data: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -226,6 +237,29 @@ pub struct ShedResponse {
     pub source_tablet_id: i64,
     pub to_tablet_id: i64,
     pub moved_shards: Vec<i64>,
+    /// Sessions whose warm state was rekeyed to the dest
+    /// tablet. Only populated when `migrate_data == true`.
+    #[serde(default)]
+    pub migrated_sessions: Vec<MigratedSessionSummary>,
+    /// Sessions on the moved shards that the migration
+    /// refused (cold / archive / fork parent). Operators
+    /// handle these out of band.
+    #[serde(default)]
+    pub skipped_sessions: Vec<SkippedSession>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MigratedSessionSummary {
+    pub session_id: String,
+    pub tenant_id: String,
+    pub events_migrated: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SkippedSession {
+    pub session_id: String,
+    pub tenant_id: String,
+    pub reason: String,
 }
 
 #[utoipa::path(
@@ -244,6 +278,7 @@ pub async fn shed_tablet(
     meta: Option<Extension<Arc<MetaStore>>>,
     detector: Option<Extension<Arc<HotTabletDetector>>>,
     location: Option<Extension<Arc<agentdb_core::LocationProxy>>>,
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
     Path(tablet_id): Path<i64>,
     Json(body): Json<ShedRequest>,
 ) -> Result<Json<ShedResponse>, ApiError> {
@@ -311,6 +346,8 @@ pub async fn shed_tablet(
             source_tablet_id: tablet_id,
             to_tablet_id: dest,
             moved_shards: vec![],
+            migrated_sessions: vec![],
+            skipped_sessions: vec![],
         }));
     }
     let n = ((shards.len() as f64) * fraction).ceil() as usize;
@@ -329,9 +366,96 @@ pub async fn shed_tablet(
         }
     }
 
+    // Optional: migrate the warm data for every session on
+    // the moved shards. Cold / fork-parent sessions refuse
+    // inside migrate_warm_session; we capture the reason
+    // and report it so operators can act on it out of band.
+    let (migrated_sessions, skipped_sessions) = if body.migrate_data {
+        migrate_sessions_for_shards(&state, tablet_id as u16, dest as u16, &moved).await
+    } else {
+        (vec![], vec![])
+    };
+
     Ok(Json(ShedResponse {
         source_tablet_id: tablet_id,
         to_tablet_id: dest,
         moved_shards: moved,
+        migrated_sessions,
+        skipped_sessions,
     }))
+}
+
+/// Enumerate sessions on `from_box_id` whose `session_id`
+/// hashes into any of `moved_shards`, then run
+/// `migrate_warm_session` on each. Warm sessions land in
+/// `migrated`; everything else (cold, archive, fork parent,
+/// already-migrated) lands in `skipped` with a human-
+/// readable reason.
+///
+/// This scan is O(sessions × tenants on source box). At
+/// prototype scale that's fine — tens of tenants, hundreds
+/// of sessions. For bigger deployments we'd index shards
+/// by tablet in a separate meta table.
+pub(crate) async fn migrate_sessions_for_shards(
+    state: &crate::AppState,
+    from_box_id: u16,
+    to_box_id: u16,
+    moved_shards: &[i64],
+) -> (Vec<MigratedSessionSummary>, Vec<SkippedSession>) {
+    let mut migrated = Vec::new();
+    let mut skipped = Vec::new();
+    let now_ms = crate::stream::now_ms();
+    let moved_set: std::collections::HashSet<u16> = moved_shards
+        .iter()
+        .filter_map(|s| u16::try_from(*s).ok())
+        .collect();
+    let tenants = match state.tenants.list_in_box(from_box_id) {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(%e, from_box_id, "shed migrate: list tenants failed");
+            return (migrated, skipped);
+        }
+    };
+    for tenant_external in tenants {
+        let Ok(Some(tenant)) = state.tenants.lookup(from_box_id, &tenant_external) else {
+            continue;
+        };
+        let Ok(session_externals) =
+            state.sessions.list_in_tenant(from_box_id, tenant.internal_id)
+        else {
+            continue;
+        };
+        for session_external in session_externals {
+            let sid = agentdb_core::shard_id(&session_external);
+            if !moved_set.contains(&sid) {
+                continue;
+            }
+            match agentdb_core::migrate_warm_session(
+                &state.registry,
+                state.registry.kv(),
+                &state.tenants,
+                &state.sessions,
+                &tenant_external,
+                &session_external,
+                to_box_id,
+                now_ms,
+            )
+            .await
+            {
+                Ok(m) => migrated.push(MigratedSessionSummary {
+                    session_id: session_external,
+                    tenant_id: tenant_external.clone(),
+                    events_migrated: m.events_migrated,
+                }),
+                Err(e) => {
+                    skipped.push(SkippedSession {
+                        session_id: session_external,
+                        tenant_id: tenant_external.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    (migrated, skipped)
 }
