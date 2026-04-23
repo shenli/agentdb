@@ -53,6 +53,52 @@ pub enum Cmd {
     /// List shards that currently carry an explicit tablet override.
     /// HTTP-client wrapper for `GET /api/admin/shards/list`.
     ListShardOverrides(AdminOpts),
+    /// Manage SCRAM-SHA-256 user accounts (M19).
+    #[command(subcommand)]
+    User(UserCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UserCmd {
+    /// Create a new user. Reads the password from `--password`
+    /// or, if omitted, from stdin. Maps the user to a tenant;
+    /// all requests from this user are clamped to that tenant.
+    Add(UserAddOpts),
+    /// List registered users (summaries only — credentials are
+    /// never returned over the wire).
+    List(AdminOpts),
+    /// Delete a user. Idempotent — exits success even if the
+    /// user doesn't exist.
+    Delete(UserDeleteOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UserAddOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// SCRAM username. Required positional argument.
+    pub user_id: String,
+    /// External tenant id this user can access. Required.
+    #[arg(long)]
+    pub tenant: String,
+    /// Plaintext password. If omitted, read from stdin (useful
+    /// for scripting + keeping passwords out of shell history).
+    #[arg(long)]
+    pub password: Option<String>,
+    /// PBKDF2 iterations. Defaults to the RFC 5802 floor (4096).
+    /// Higher values slow down per-auth PBKDF2 work.
+    #[arg(long)]
+    pub iterations: Option<u32>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UserDeleteOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// SCRAM username. Required positional argument.
+    pub user_id: String,
 }
 
 #[derive(Args, Debug, Clone)]

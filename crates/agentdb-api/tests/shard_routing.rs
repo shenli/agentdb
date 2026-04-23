@@ -64,6 +64,7 @@ async fn spawn() -> (
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
+        auth: None,
     };
     let app = router(state)
         .layer(axum::Extension(meta.clone()))

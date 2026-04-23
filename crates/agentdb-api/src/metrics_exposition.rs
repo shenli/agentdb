@@ -298,6 +298,7 @@ mod tests {
                 sessions,
                 stream,
                 http,
+                auth: None,
             },
         )
     }

@@ -46,3 +46,13 @@ object_store = { version = "0.12", features = ["aws"] }
 slatedb = "0.12.1"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.2"
+# M19 auth primitives. SCRAM-SHA-256 is RFC 5802 / RFC 7677;
+# implemented from SHA-256 + HMAC + PBKDF2 rather than pulling a
+# full SASL crate (keeps the dep surface narrow and the crypto
+# auditable).
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+rand = "0.8"
+base64 = "0.22"
+subtle = "2"

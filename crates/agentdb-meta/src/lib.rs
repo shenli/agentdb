@@ -19,10 +19,12 @@ pub mod error;
 pub mod migrations;
 pub mod nodes;
 pub mod scheduler;
+pub mod scram;
 pub mod session_overrides;
 pub mod shards;
 pub mod tablets;
 pub mod tenants;
+pub mod users;
 
 pub use error::{MetaError, MetaResult};
 

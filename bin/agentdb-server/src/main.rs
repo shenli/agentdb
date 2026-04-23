@@ -14,7 +14,7 @@ mod dump_config;
 mod serve;
 mod tracing_init;
 
-use cli::{Cli, Cmd};
+use cli::{Cli, Cmd, UserCmd};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,5 +35,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowShard(opts) => admin::show_shard(opts).await,
         Cmd::SetShard(opts) => admin::set_shard(opts).await,
         Cmd::ListShardOverrides(opts) => admin::list_shard_overrides(opts).await,
+        Cmd::User(user_cmd) => match user_cmd {
+            UserCmd::Add(opts) => admin::user_add(opts).await,
+            UserCmd::List(opts) => admin::user_list(opts).await,
+            UserCmd::Delete(opts) => admin::user_delete(opts).await,
+        },
     }
 }

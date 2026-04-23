@@ -24,6 +24,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "scheduler leader singleton lease",
         include_str!("../migrations/002_scheduler_leader.sql"),
     ),
+    (
+        3,
+        "SCRAM-SHA-256 users",
+        include_str!("../migrations/003_users.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.
@@ -147,6 +152,7 @@ mod tests {
             "shards",
             "tablets",
             "tenants",
+            "users",
         ] {
             assert!(
                 names.contains(&expected),

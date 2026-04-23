@@ -13,12 +13,14 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "axum 0.7.9",
+ "base64",
  "futures-util",
  "object_store",
  "reqwest",
  "serde",
  "serde_json",
  "serial_test",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -84,9 +86,15 @@ name = "agentdb-meta"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
+ "hmac",
+ "pbkdf2",
+ "rand 0.8.6",
  "serde",
+ "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -141,15 +149,19 @@ dependencies = [
  "agentdb-api",
  "agentdb-core",
  "agentdb-index",
+ "agentdb-meta",
  "agentdb-storage",
  "anyhow",
  "axum 0.7.9",
+ "base64",
  "bson",
  "byteorder",
  "bytes",
  "futures-util",
  "mongodb",
  "object_store",
+ "parking_lot",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -2986,6 +2998,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
+ "hmac",
 ]
 
 [[package]]

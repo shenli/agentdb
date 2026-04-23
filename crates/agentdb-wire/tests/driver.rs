@@ -20,11 +20,7 @@ async fn spawn() -> (TempDir, TempDir, u16) {
     let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv));
-    let state = WireState {
-        registry,
-        tenants,
-        sessions,
-    };
+    let state = WireState::new(registry, tenants, sessions);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -49,17 +45,14 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_port = http_listener.local_addr().unwrap().port();
 
-    let wire_state = WireState {
-        registry: registry.clone(),
-        tenants: tenants.clone(),
-        sessions: sessions.clone(),
-    };
+    let wire_state = WireState::new(registry.clone(), tenants.clone(), sessions.clone());
     let http_state = agentdb_api::AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: agentdb_api::StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
+        auth: None,
     };
 
     tokio::spawn(async move {

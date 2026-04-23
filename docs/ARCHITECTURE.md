@@ -738,6 +738,54 @@ safety net to tenant-hash routing.
 Round-robin is deliberately simple; load-aware reassignment
 requires per-tablet metrics that don't exist yet (M25 work).
 
+### SCRAM-SHA-256 auth (M19)
+
+Off by default (backward-compatible). Enable with
+`AGENTDB_REQUIRE_AUTH=true`. When on:
+
+- **Users live in the meta store** (`users` table, migration
+  003). Credentials are stored as `(iterations, salt_b64,
+  stored_key_b64, server_key_b64)` per RFC 5802; the password
+  itself never touches disk. `agentdb-meta::scram` is a pure
+  crypto module — derive, verify, constant-time compare.
+
+- **Mongo wire.** `hello` advertises `SCRAM-SHA-256` when auth
+  is configured. `saslStart` parses the client-first message,
+  looks up the user, and returns `server-first` (salt + iter +
+  combined nonce). `saslContinue` parses `client-final`,
+  verifies the client proof, and returns `server-final`
+  (server signature). Failures are uniformly `code: 18
+  AuthenticationFailed` — no user-enumeration.
+
+  Per-connection state lives in `WireState::sasl_sessions`
+  (`Arc<Mutex<HashMap<conn_id, SaslSession>>>`). Non-auth
+  commands check `AuthStatus` on every dispatch; while
+  `require_auth == true`, unauthenticated connections get
+  `AuthenticationFailed` until `saslStart`/`saslContinue`
+  completes. After auth, the command's `$db` must match the
+  authenticated user's tenant (except `admin`, always
+  allowed) — cross-tenant access returns `code: 13
+  Unauthorized`.
+
+- **REST.** A Basic-Auth middleware layers only on
+  `/api/tenants/*`. Admin-plane routes (`/api/admin/*`,
+  `/health/*`, `/metrics`) stay open — the threat model
+  assumes operators run admin behind network isolation.
+  PBKDF2 runs per request (~5–10 ms @ 4096 iters); a future
+  PR adds a short-TTL cache.
+
+- **Admin endpoints.** `POST /api/admin/users` (create),
+  `GET /api/admin/users` (list, summaries only), `DELETE
+  /api/admin/users/:id` (idempotent 204).
+
+- **CLI.** `agentdb user add|list|delete`. `add` reads the
+  password from `--password` or, if omitted, from stdin.
+
+Out of scope (explicitly): SCRAM-SHA-1 (MongoDB ≥ 4.0
+defaults to SHA-256), admin-plane auth (separate PR; mTLS or
+bearer token), TLS termination (assumed at the ingress),
+Argon2 at-rest hashing.
+
 ### Clap CLI (M26 piece 1)
 
 The binary is now `agentdb` (was `agentdb-server`). Subcommands:
@@ -752,6 +800,9 @@ agentdb show-nodes          GET  /api/admin/nodes
 agentdb show-shard <sid>    GET  /api/admin/shards?session_id=...
 agentdb set-shard <id> ...  POST /api/admin/shards/:id
 agentdb list-shard-overrides GET /api/admin/shards/list
+agentdb user add <uid> --tenant <tid>  POST /api/admin/users
+agentdb user list           GET /api/admin/users
+agentdb user delete <uid>   DELETE /api/admin/users/:uid
 ```
 
 `--dev` sets up an ephemeral tempdir for KV + object store + meta;

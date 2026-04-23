@@ -11,6 +11,8 @@ agentdb-dashboard = { path = "../agentdb-dashboard" }
 agentdb-meta = { path = "../agentdb-meta" }
 async-broadcast = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
+subtle = { workspace = true }
 futures-util = "0.3"
 reqwest = { workspace = true }
 tokio = { workspace = true }

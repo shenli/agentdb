@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::cli::{AdminOpts, SetShardOpts, ShowShardOpts};
+use crate::cli::{AdminOpts, SetShardOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts};
 
 /// `POST /api/admin/drain`.
 pub async fn drain(opts: AdminOpts) -> Result<()> {
@@ -96,6 +96,88 @@ pub async fn list_shard_overrides(opts: AdminOpts) -> Result<()> {
         opts.server_url.trim_end_matches('/')
     );
     fetch_and_print(&url).await
+}
+
+/// `POST /api/admin/users` — create a user. Reads the password
+/// from `--password` if supplied, otherwise from stdin with a
+/// prompt (no echo suppression — we don't pull a terminfo/tty
+/// dep just for this; callers running in automation should
+/// supply `--password`).
+pub async fn user_add(opts: UserAddOpts) -> Result<()> {
+    let password = match opts.password {
+        Some(p) => p,
+        None => prompt_password_from_stdin()?,
+    };
+    let url = format!(
+        "{}/api/admin/users",
+        opts.server_url.trim_end_matches('/')
+    );
+    let mut body = serde_json::json!({
+        "user_id": opts.user_id,
+        "tenant_external": opts.tenant,
+        "password": password,
+    });
+    if let Some(iter) = opts.iterations {
+        body["iterations"] = serde_json::Value::from(iter);
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/users` — list users.
+pub async fn user_list(opts: AdminOpts) -> Result<()> {
+    let url = format!("{}/api/admin/users", opts.server_url.trim_end_matches('/'));
+    fetch_and_print(&url).await
+}
+
+/// `DELETE /api/admin/users/:user_id` — delete a user
+/// (idempotent; always 204).
+pub async fn user_delete(opts: UserDeleteOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/users/{}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.user_id),
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("delete failed ({status}): {body}");
+        std::process::exit(exit_code_for(status));
+    }
+    Ok(())
+}
+
+/// Read a line from stdin with a minimal prompt. Not a
+/// password-masking prompt — that requires a terminfo dep. The
+/// plan doc explicitly acknowledges this tradeoff: scripts
+/// should pass `--password`, interactive users can live with
+/// echoed input in a prototype.
+fn prompt_password_from_stdin() -> Result<String> {
+    use std::io::{BufRead, Write};
+    eprint!("password: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read password from stdin")?;
+    let trimmed = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    if trimmed.is_empty() {
+        anyhow::bail!("empty password");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Minimal percent-encoding for a query value. Covers the characters
