@@ -277,8 +277,11 @@ M18+ milestones added:
   actually moves future writes to the targeted box
 - **M22 reaper-driven shard reassignment** — when a tablet's lease
   expires, its orphaned shards round-robin to surviving tablets
+- **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
+  — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
+  Basic auth; user→tenant ACL; `agentdb user add|list|delete`
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
-  `set-shard`, `dump-config`)
+  `set-shard`, `user *`, `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
@@ -298,8 +301,11 @@ M18+ milestones added:
   remain durable wherever they were written, but cross-box reads
   that don't consult the shard map will miss them). Reads still
   route by tenant-hash.
-- **M19 SCRAM + tenant-implicit auth** — admin endpoints remain
-  open, tenants still explicit in the request path.
+- **Admin-plane auth.** `/api/admin/*` endpoints stay open —
+  operators are trusted on the loopback interface. mTLS or a
+  bearer token is a follow-up PR.
+- **TLS termination.** Basic auth over plaintext is weak; the
+  prototype assumes the caller terminates TLS at an ingress.
 - **M22 sophisticated policy** — cross-AZ preference, anti-
   affinity, node-weight awareness. Current reassignment is
   round-robin across live tablets.

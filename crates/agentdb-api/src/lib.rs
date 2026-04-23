@@ -12,6 +12,8 @@ pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
 pub mod admin_tablets;
+pub mod admin_users;
+pub mod auth_middleware;
 pub mod dto;
 pub mod error;
 pub mod fork;
@@ -32,6 +34,44 @@ pub struct AppState {
     pub sessions: Arc<agentdb_core::SessionRegistry>,
     pub stream: StreamBus,
     pub http: reqwest::Client,
+    /// M19 auth config. `None` → no auth required; the Basic
+    /// Auth middleware is a no-op. `Some` → `/api/tenants/*`
+    /// endpoints require `Authorization: Basic <...>` that
+    /// verifies against a user in the meta store.
+    pub auth: Option<AuthConfig>,
+}
+
+#[derive(Clone)]
+pub struct AuthConfig {
+    /// Handle on the meta store. The middleware pulls users
+    /// from here; `None` is an invariant violation (Internal
+    /// 500) rather than "auth disabled" because callers only
+    /// set `auth = Some(...)` when they've attached a real
+    /// meta store.
+    pub meta: Option<Arc<agentdb_meta::MetaStore>>,
+}
+
+impl AppState {
+    /// Convenience constructor that matches the pre-M19 shape.
+    /// Existing tests use the full struct literal — the struct
+    /// field is public so adding `auth: None` there is a
+    /// one-line change; this helper exists for new call sites.
+    pub fn no_auth(
+        registry: Arc<agentdb_core::BoxRegistry>,
+        tenants: Arc<agentdb_core::TenantRegistry>,
+        sessions: Arc<agentdb_core::SessionRegistry>,
+        stream: StreamBus,
+        http: reqwest::Client,
+    ) -> Self {
+        Self {
+            registry,
+            tenants,
+            sessions,
+            stream,
+            http,
+            auth: None,
+        }
+    }
 }
 
 /// OpenAPI 3.x spec for the native REST surface. Mongo wire protocol
@@ -63,6 +103,9 @@ pub struct AppState {
         admin_shards::list_shard_overrides,
         admin_shards::set_shard,
         admin_tablets::list_tablets,
+        admin_users::create_user,
+        admin_users::list_users,
+        admin_users::delete_user,
         stream::sse_handler,
     ),
     components(schemas(
@@ -95,6 +138,9 @@ pub struct AppState {
         admin_shards::ShardsUnavailable,
         admin_tablets::TabletView,
         admin_tablets::TabletsUnavailable,
+        admin_users::CreateUserRequest,
+        admin_users::CreateUserResponse,
+        admin_users::UserListItem,
         fork::ForkRequest,
         fork::ForkResponse,
         stream::StreamEvent,
@@ -118,11 +164,21 @@ pub struct AppState {
 pub struct ApiDoc;
 
 pub fn router(state: AppState) -> Router {
+    // Routes that require Basic auth when AppState::auth is Some.
+    // Split into a separate Router so the auth middleware only
+    // sees tenant-scoped paths — admin-plane routes are a
+    // separate subtree below with no auth layer.
+    let tenant_routes: Router<AppState> = Router::new().route(
+        "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
+        axum::routing::post(handlers::append_and_fetch),
+    );
+    let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware::basic_auth_middleware,
+    ));
+
     Router::new()
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
-            axum::routing::post(handlers::append_and_fetch),
-        )
+        .merge(tenant_routes)
         .route(
             "/api/admin/tier/force",
             axum::routing::post(admin::force_tier),
@@ -183,6 +239,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/scheduler",
             axum::routing::get(admin_scheduler::get_scheduler),
+        )
+        .route(
+            "/api/admin/users",
+            axum::routing::post(admin_users::create_user)
+                .get(admin_users::list_users),
+        )
+        .route(
+            "/api/admin/users/:user_id",
+            axum::routing::delete(admin_users::delete_user),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

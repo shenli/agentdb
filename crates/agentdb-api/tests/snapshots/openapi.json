@@ -728,6 +728,93 @@
         }
       }
     },
+    "/api/admin/users": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "description": "Users by created_at_ms ascending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserListItem"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "User created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUserResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "user_id already exists"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
+    "/api/admin/users/{user_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "SCRAM username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "User deleted (or did not exist)"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/fork": {
       "post": {
         "tags": [
@@ -972,6 +1059,57 @@
           }
         }
       },
+      "CreateUserRequest": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "tenant_external",
+          "password"
+        ],
+        "properties": {
+          "iterations": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "PBKDF2 iteration count. Defaults to the RFC floor (4096)\nwhen omitted. Higher values slow down per-auth PBKDF2\nwork; set for high-security deployments.",
+            "minimum": 0
+          },
+          "password": {
+            "type": "string",
+            "description": "Plaintext password. Goes through PBKDF2 on the server\nand is never persisted. Must be sent over TLS in any\ndeployment past \"localhost dev\"."
+          },
+          "tenant_external": {
+            "type": "string",
+            "description": "External tenant id this user can access. After SCRAM\nhandshake completes, this connection is clamped to this\ntenant — requests targeting any other tenant are rejected\nwith 403."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "SCRAM username. Used as both the auth identity and the\nstable id for `DELETE /api/admin/users/:user_id`."
+          }
+        }
+      },
+      "CreateUserResponse": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "tenant_external",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_external": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        }
+      },
       "DrainStatus": {
         "type": "object",
         "required": [
@@ -1021,7 +1159,12 @@
           "storage_error",
           "serialization_error",
           "lease_lost",
-          "node_draining"
+          "node_draining",
+          "unauthorized",
+          "forbidden",
+          "conflict",
+          "service_unavailable",
+          "internal"
         ]
       },
       "ErrorKind": {
@@ -2286,6 +2429,27 @@
           "cold",
           "archive"
         ]
+      },
+      "UserListItem": {
+        "type": "object",
+        "description": "Response envelope for `GET /api/admin/users`. Wraps\n`users::UserSummary` so utoipa can generate a schema without\nmaking the meta crate depend on utoipa.",
+        "required": [
+          "user_id",
+          "tenant_external",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tenant_external": {
+            "type": "string"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        }
       },
       "Value": {},
       "WebhookRequest": {

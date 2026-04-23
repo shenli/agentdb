@@ -51,6 +51,7 @@ async fn spawn_db() -> (TempDir, TempDir, String, Arc<BoxRegistry>) {
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
+        auth: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

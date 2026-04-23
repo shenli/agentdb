@@ -44,7 +44,8 @@ pub fn not_implemented(cmd: &str) -> Document {
 use bson::Bson;
 
 use crate::handlers::{browse, find as find_mod, hello as hello_mod, insert as insert_mod};
-use crate::state::WireState;
+use crate::sasl;
+use crate::state::{AuthStatus, WireState};
 
 #[tracing::instrument(
     name = "mongo.dispatch",
@@ -97,130 +98,197 @@ async fn dispatch_inner(
     match inspect(body) {
         Err(e) => error_reply(&e),
         Ok(head) => match head.name {
-            "hello" | "isMaster" | "ismaster" => hello_mod::hello_response(connection_id),
+            "hello" | "isMaster" | "ismaster" => {
+                hello_mod::hello_response(connection_id, state.auth.is_some())
+            }
             "ping" => browse::ping_response(),
             "buildInfo" | "buildinfo" => browse::build_info_response(),
-            "listDatabases" => {
-                match browse::list_databases_response(&state.registry, &state.tenants) {
-                    Ok(d) => d,
-                    Err(e) => error_reply(&e),
-                }
-            }
-            "listCollections" => browse::list_collections_response(head.db.unwrap_or("")),
-            "find" => {
-                let collection = match body.get_str("find") {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        return error_reply(&crate::error::WireError::Protocol(
-                            "find command missing collection name".into(),
-                        ))
-                    }
+            "saslStart" => {
+                let Some(auth) = state.auth.clone() else {
+                    return sasl::auth_failed_reply("auth not configured");
                 };
-                let filter = body.get_document("filter").cloned().unwrap_or_default();
-                // Drivers encode small integers as BSON Int32 and larger ones as Int64;
-                // accept both. A limit of 0 means "no limit" per the MongoDB spec.
-                let limit = match body.get("limit") {
-                    Some(Bson::Int64(n)) if *n > 0 => Some(*n),
-                    Some(Bson::Int32(n)) if *n > 0 => Some(*n as i64),
-                    _ => None,
-                };
-                match find_mod::find_response(
-                    &state.registry,
-                    &state.tenants,
-                    &state.sessions,
-                    head.db.unwrap_or(""),
-                    &collection,
-                    &filter,
-                    limit,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => error_reply(&e),
-                }
-            }
-            "insert" => {
-                let collection = match body.get_str("insert") {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        return error_reply(&crate::error::WireError::Protocol(
-                            "insert command missing collection name".into(),
-                        ))
-                    }
-                };
-                // Documents may arrive either in a Type-1 document sequence (identifier
-                // "documents", as the real driver sends) or as a BSON array in the body
-                // (as our raw test helper sends).
-                let seq_docs: Vec<Document> = doc_sequences
-                    .iter()
-                    .find(|(id, _)| *id == "documents")
-                    .map(|(_, docs)| docs.to_vec())
-                    .unwrap_or_default();
-                let docs = if !seq_docs.is_empty() {
-                    seq_docs
+                let (reply, session) = sasl::handle_sasl_start(body, &auth).await;
+                if let Some(s) = session {
+                    state.sasl_sessions.lock().insert(connection_id, s);
                 } else {
-                    body.get_array("documents")
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|b| match b {
-                            Bson::Document(d) => Some(d),
-                            _ => None,
-                        })
-                        .collect()
-                };
-                match insert_mod::insert_response(
-                    &state.registry,
-                    &state.tenants,
-                    &state.sessions,
-                    head.db.unwrap_or(""),
-                    &collection,
-                    &docs,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => error_reply(&e),
+                    state.sasl_sessions.lock().remove(&connection_id);
                 }
+                reply
             }
-            "aggregate" => {
-                let collection = match body.get_str("aggregate") {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        return error_reply(&crate::error::WireError::Protocol(
-                            "aggregate command missing collection name".into(),
-                        ));
-                    }
+            "saslContinue" => {
+                let prior = state.sasl_sessions.lock().remove(&connection_id);
+                let Some(prior) = prior else {
+                    return sasl::auth_failed_reply("no saslStart in progress");
                 };
-                let pipeline_arr = body.get_array("pipeline").cloned().unwrap_or_default();
-                let pipeline: Vec<Document> = pipeline_arr
+                let (reply, session) = sasl::handle_sasl_continue(body, prior);
+                if let Some(s) = session {
+                    state.sasl_sessions.lock().insert(connection_id, s);
+                }
+                reply
+            }
+            other => {
+                // M19 auth gate: once auth is enforced, non-SASL
+                // commands require the connection to have
+                // completed the handshake first.
+                match state.auth_status(connection_id) {
+                    AuthStatus::Required => {
+                        return sasl::auth_failed_reply(
+                            "authentication required; run saslStart",
+                        )
+                    }
+                    AuthStatus::Authenticated { tenant_external } => {
+                        // Enforce tenant ACL: a non-admin command's
+                        // `$db` must match the authenticated
+                        // tenant. The `admin` db is always allowed
+                        // (Mongo drivers probe it for hello/ping).
+                        if let Some(db) = head.db {
+                            if db != "admin" && db != tenant_external.as_str() {
+                                return doc! {
+                                    "ok": 0.0,
+                                    "code": 13_i32, // Unauthorized
+                                    "errmsg": format!(
+                                        "user tenant {tenant_external} cannot access db {db}"
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                    AuthStatus::AuthNotRequired => {}
+                }
+                dispatch_command_body(other, body, doc_sequences, state, head.db).await
+            }
+        },
+    }
+}
+
+async fn dispatch_command_body(
+    name: &str,
+    body: &Document,
+    doc_sequences: &[(&str, &[Document])],
+    state: &WireState,
+    db: Option<&str>,
+) -> Document {
+    match name {
+        "listDatabases" => {
+            match browse::list_databases_response(&state.registry, &state.tenants) {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
+            }
+        }
+        "listCollections" => browse::list_collections_response(db.unwrap_or("")),
+        "find" => {
+            let collection = match body.get_str("find") {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    return error_reply(&crate::error::WireError::Protocol(
+                        "find command missing collection name".into(),
+                    ))
+                }
+            };
+            let filter = body.get_document("filter").cloned().unwrap_or_default();
+            // Drivers encode small integers as BSON Int32 and larger ones as Int64;
+            // accept both. A limit of 0 means "no limit" per the MongoDB spec.
+            let limit = match body.get("limit") {
+                Some(Bson::Int64(n)) if *n > 0 => Some(*n),
+                Some(Bson::Int32(n)) if *n > 0 => Some(*n as i64),
+                _ => None,
+            };
+            match find_mod::find_response(
+                &state.registry,
+                &state.tenants,
+                &state.sessions,
+                db.unwrap_or(""),
+                &collection,
+                &filter,
+                limit,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
+            }
+        }
+        "insert" => {
+            let collection = match body.get_str("insert") {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    return error_reply(&crate::error::WireError::Protocol(
+                        "insert command missing collection name".into(),
+                    ))
+                }
+            };
+            // Documents may arrive either in a Type-1 document sequence (identifier
+            // "documents", as the real driver sends) or as a BSON array in the body
+            // (as our raw test helper sends).
+            let seq_docs: Vec<Document> = doc_sequences
+                .iter()
+                .find(|(id, _)| *id == "documents")
+                .map(|(_, docs)| docs.to_vec())
+                .unwrap_or_default();
+            let docs = if !seq_docs.is_empty() {
+                seq_docs
+            } else {
+                body.get_array("documents")
+                    .cloned()
+                    .unwrap_or_default()
                     .into_iter()
                     .filter_map(|b| match b {
                         Bson::Document(d) => Some(d),
                         _ => None,
                     })
-                    .collect();
-                match crate::handlers::aggregate::aggregate_response(
-                    &state.registry,
-                    &state.tenants,
-                    &state.sessions,
-                    head.db.unwrap_or(""),
-                    &collection,
-                    &pipeline,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => error_reply(&e),
-                }
+                    .collect()
+            };
+            match insert_mod::insert_response(
+                &state.registry,
+                &state.tenants,
+                &state.sessions,
+                db.unwrap_or(""),
+                &collection,
+                &docs,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
             }
-            // Mongo transaction commands: the server does not provide
-            // multi-doc atomicity (see M6 plan). Falling through to
-            // `not_implemented` returns ok:0 so the client-side driver
-            // surfaces the limitation as an error rather than silently
-            // accepting a fake transaction.
-            other => not_implemented(other),
-        },
+        }
+        "aggregate" => {
+            let collection = match body.get_str("aggregate") {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    return error_reply(&crate::error::WireError::Protocol(
+                        "aggregate command missing collection name".into(),
+                    ));
+                }
+            };
+            let pipeline_arr = body.get_array("pipeline").cloned().unwrap_or_default();
+            let pipeline: Vec<Document> = pipeline_arr
+                .into_iter()
+                .filter_map(|b| match b {
+                    Bson::Document(d) => Some(d),
+                    _ => None,
+                })
+                .collect();
+            match crate::handlers::aggregate::aggregate_response(
+                &state.registry,
+                &state.tenants,
+                &state.sessions,
+                db.unwrap_or(""),
+                &collection,
+                &pipeline,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
+            }
+        }
+        // Mongo transaction commands: the server does not provide
+        // multi-doc atomicity (see M6 plan). Falling through to
+        // `not_implemented` returns ok:0 so the client-side driver
+        // surfaces the limitation as an error rather than silently
+        // accepting a fake transaction.
+        other => not_implemented(other),
     }
 }
 
@@ -278,11 +346,7 @@ mod tests {
         (
             dir,
             obj_dir,
-            WireState {
-                registry,
-                tenants,
-                sessions,
-            },
+            WireState::new(registry, tenants, sessions),
         )
     }
 

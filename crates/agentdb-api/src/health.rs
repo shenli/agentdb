@@ -164,6 +164,7 @@ mod tests {
                 sessions,
                 stream,
                 http,
+                auth: None,
             },
         )
     }
@@ -199,6 +200,7 @@ mod tests {
                 sessions,
                 stream: crate::stream::StreamBus::default(),
                 http: crate::webhook::new_client(),
+                auth: None,
             },
         )
     }

@@ -511,17 +511,42 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
     }
     std::mem::forget(snapshot_jobs);
 
+    // M19 auth toggle. Off by default. When on, the wire
+    // server advertises SCRAM-SHA-256 in hello and requires
+    // every non-SASL command to come from an authenticated
+    // connection; and the REST `/api/tenants/*` subtree
+    // requires HTTP Basic auth whose user maps to the
+    // targeted tenant.
+    let require_auth = std::env::var("AGENTDB_REQUIRE_AUTH")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     let http_state = AppState {
         registry: registry.clone(),
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: stream.clone(),
         http: http_client.clone(),
+        auth: if require_auth {
+            Some(agentdb_api::AuthConfig {
+                meta: Some(meta.clone()),
+            })
+        } else {
+            None
+        },
     };
-    let wire_state = WireState {
-        registry: registry.clone(),
-        tenants,
-        sessions,
+    let wire_state = if require_auth {
+        WireState::with_auth(
+            registry.clone(),
+            tenants,
+            sessions,
+            agentdb_wire::WireAuthConfig {
+                meta: meta.clone(),
+                require_auth: true,
+            },
+        )
+    } else {
+        WireState::new(registry.clone(), tenants, sessions)
     };
 
     // Periodic MetricsTick broadcaster for the dashboard SSE stream.

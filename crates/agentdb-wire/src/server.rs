@@ -104,11 +104,7 @@ mod tests {
         let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
         let tenants = Arc::new(TenantRegistry::new(kv.clone()));
         let sessions = Arc::new(SessionRegistry::new(kv));
-        let state = WireState {
-            registry,
-            tenants,
-            sessions,
-        };
+        let state = WireState::new(registry, tenants, sessions);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let st = state.clone();

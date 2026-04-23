@@ -15,4 +15,10 @@ pub enum MetaError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// Data on disk failed an integrity check — e.g. a base64
+    /// column didn't decode, or a stored hash was the wrong
+    /// length. Should never happen absent DB tampering.
+    #[error("invariant violation: {0}")]
+    Invariant(String),
 }

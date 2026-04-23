@@ -8,9 +8,13 @@ license.workspace = true
 [dependencies]
 agentdb-core = { path = "../agentdb-core" }
 agentdb-index = { path = "../agentdb-index" }
+agentdb-meta = { path = "../agentdb-meta" }
+base64 = { workspace = true }
 bson = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -140,6 +140,7 @@ mod tests {
                 sessions: Arc::new(SessionRegistry::new(kv)),
                 stream: crate::stream::StreamBus::default(),
                 http: crate::webhook::new_client(),
+                auth: None,
             },
         )
     }
@@ -160,6 +161,7 @@ mod tests {
                 sessions: Arc::new(SessionRegistry::new(kv)),
                 stream: crate::stream::StreamBus::default(),
                 http: crate::webhook::new_client(),
+                auth: None,
             },
         )
     }
