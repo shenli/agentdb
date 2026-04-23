@@ -370,21 +370,11 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         "scheduler leader-election loop started"
     );
 
-    // Stale-lease reaper.
-    let reaper_cfg = ReaperConfig::from_env();
-    let reaper = StaleTabletReaper::start(meta.clone(), election.clone(), reaper_cfg);
-    tracing::info!(
-        tick_secs = reaper_cfg.tick.as_secs(),
-        safety_margin_secs = reaper_cfg.safety_margin.as_secs(),
-        "stale-lease tablet reaper started"
-    );
-
     // M20: seed the shards table (idempotent) and build a
-    // LocationProxy that caches shard→tablet assignments. The proxy
-    // is only *consumed* today by the `/api/admin/shards/*`
-    // endpoints; the write path still routes by tenant-hash.
-    // Switching the write path over happens in a follow-up once the
-    // tablet-id layout refactor lands.
+    // LocationProxy that caches shard→tablet assignments. As of
+    // the M20 write-path PR the registry consults the proxy on the
+    // hot path — an operator who sets a shard override via
+    // `POST /api/admin/shards/:id` actually routes traffic.
     agentdb_meta::shards::seed_shards(
         meta.pool(),
         agentdb_meta::shards::DEFAULT_SHARD_COUNT,
@@ -404,10 +394,33 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         Duration::from_secs(refresh_secs),
     );
     std::mem::forget(_shard_refresh_job);
+    // Wire the proxy into the registry so `route_session` starts
+    // consulting it. Must happen before the HTTP server starts
+    // accepting writes, otherwise early requests would silently use
+    // tenant-hash routing even when overrides are set.
+    registry
+        .attach_location(location_proxy.clone())
+        .map_err(|_| anyhow::anyhow!("location proxy already attached"))?;
     tracing::info!(
         refresh_secs,
         shard_count = agentdb_core::SHARD_COUNT,
-        "location proxy + shard refresh loop started"
+        "location proxy attached to registry; shard refresh loop started"
+    );
+
+    // Stale-lease reaper. Started after the location proxy so it
+    // can refresh the local cache immediately after reassigning
+    // shards away from a reaped tablet (M22).
+    let reaper_cfg = ReaperConfig::from_env();
+    let reaper = StaleTabletReaper::start(
+        meta.clone(),
+        election.clone(),
+        reaper_cfg,
+        Some(location_proxy.clone()),
+    );
+    tracing::info!(
+        tick_secs = reaper_cfg.tick.as_secs(),
+        safety_margin_secs = reaper_cfg.safety_margin.as_secs(),
+        "stale-lease tablet reaper started"
     );
 
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));

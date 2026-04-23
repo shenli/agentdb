@@ -111,6 +111,20 @@ pub async fn list_overrides(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
         .collect())
 }
 
+/// Shard ids whose override points at `tablet_id`, ordered by
+/// shard_id. Used by the stale-tablet reaper: after clearing a
+/// dead tablet's ownership, it needs the list of shards pointing
+/// at that tablet so it can reassign them to a live tablet.
+pub async fn list_by_tablet(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT shard_id FROM shards WHERE tablet_id = ? ORDER BY shard_id",
+    )
+    .bind(tablet_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +206,21 @@ mod tests {
         let p = pool().await;
         seed_shards(&p, 16, 100).await.unwrap();
         assert!(list_overrides(&p).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_tablet_returns_only_matching_shards() {
+        let p = pool().await;
+        seed_shards(&p, 16, 100).await.unwrap();
+        // Point 3 and 11 at tablet 7; 5 at tablet 9.
+        set_assignment(&p, 3, Some(7), 200).await.unwrap();
+        set_assignment(&p, 11, Some(7), 200).await.unwrap();
+        set_assignment(&p, 5, Some(9), 200).await.unwrap();
+        let shards_of_7 = list_by_tablet(&p, 7).await.unwrap();
+        assert_eq!(shards_of_7, vec![3, 11]);
+        let shards_of_9 = list_by_tablet(&p, 9).await.unwrap();
+        assert_eq!(shards_of_9, vec![5]);
+        let shards_of_42 = list_by_tablet(&p, 42).await.unwrap();
+        assert!(shards_of_42.is_empty());
     }
 }
