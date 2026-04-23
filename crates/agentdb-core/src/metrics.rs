@@ -71,6 +71,11 @@ pub struct BoxMetrics {
     /// response) or that failed to connect. Helps operators
     /// diagnose partial multi-node partitions.
     pub forwarded_write_failures_total: AtomicU64,
+    /// Count of session-scoped reads (e.g. GET admin session
+    /// detail, POST fork) this node has forwarded to a peer.
+    /// Counted on the originating node's box 0.
+    pub forwarded_reads_total: AtomicU64,
+    pub forwarded_read_failures_total: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -241,6 +246,10 @@ impl BoxMetrics {
             forwarded_write_failures_total: self
                 .forwarded_write_failures_total
                 .load(Ordering::Relaxed),
+            forwarded_reads_total: self.forwarded_reads_total.load(Ordering::Relaxed),
+            forwarded_read_failures_total: self
+                .forwarded_read_failures_total
+                .load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -275,6 +284,8 @@ pub struct MetricsSnapshot {
     pub admission_waits_total: u64,
     pub forwarded_writes_total: u64,
     pub forwarded_write_failures_total: u64,
+    pub forwarded_reads_total: u64,
+    pub forwarded_read_failures_total: u64,
     pub gauges: GaugeSnapshot,
 }
 

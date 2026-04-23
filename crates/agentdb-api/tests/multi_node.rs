@@ -60,7 +60,7 @@ async fn spawn_two_nodes() -> (tempfile::NamedTempFile, Arc<MetaStore>, Node, No
         .unwrap();
 
     // Each node owns 2 tablets. Both nodes' BoxRegistrys have
-    // num_boxes=4, but the route_session_for_write path uses the
+    // num_boxes=4, but the route_session_for_io path uses the
     // NodeAddressProxy to decide who's the actual owner, not
     // box_id arithmetic.
     for t in 0..4 {
@@ -292,3 +292,127 @@ async fn locally_owned_tablet_does_not_forward() {
     // Node B saw nothing.
     assert_eq!(sum_appends(&node_b.registry), 0);
 }
+
+/// Helper: run the full override-and-refresh choreography for a
+/// session owned by node B, then land a write on node A that
+/// forwards to B (so subsequent reads on that session have
+/// something to find).
+async fn seed_session_on_node_b(
+    meta: &Arc<MetaStore>,
+    node_a: &Node,
+    node_b: &Node,
+    session: &str,
+) {
+    let shard_id = agentdb_core::shard_id(session) as i64;
+    meta_shards::set_assignment(meta.pool(), shard_id, Some(3), 0)
+        .await
+        .unwrap();
+    for n in [node_a, node_b] {
+        n.registry.location().unwrap().refresh().await.unwrap();
+        n.registry
+            .node_address_proxy()
+            .unwrap()
+            .refresh()
+            .await
+            .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/tenants/t-1/sessions/{session}/append_and_fetch",
+        node_a.addr
+    );
+    let resp = client
+        .post(&url)
+        .json(&json!({"event": {"text": "seed"}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "seed write must succeed");
+}
+
+#[tokio::test]
+async fn admin_get_session_forwards_to_owner() {
+    let (_m, meta, node_a, node_b) = spawn_two_nodes().await;
+    let session = "s-detail";
+    seed_session_on_node_b(&meta, &node_a, &node_b, session).await;
+
+    // Hit node A for the session detail. A must forward to B;
+    // the response must describe a session that actually exists
+    // on B (proof the read landed on the right node).
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/admin/sessions/{session}?tenant_id=t-1",
+        node_a.addr
+    );
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "forwarded GET must succeed: {}",
+        resp.text().await.unwrap()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ext = body["session"]["external_id"]
+        .as_str()
+        .expect("external_id in body");
+    assert_eq!(ext, session);
+
+    // Node A recorded one forwarded read.
+    let reads = node_a
+        .registry
+        .box_by_id(0)
+        .unwrap()
+        .metrics
+        .snapshot()
+        .forwarded_reads_total;
+    assert_eq!(reads, 1, "node A must have counted one forwarded read");
+}
+
+#[tokio::test]
+async fn fork_forwards_to_owner() {
+    let (_m, meta, node_a, node_b) = spawn_two_nodes().await;
+    let parent = "s-fork-parent";
+    seed_session_on_node_b(&meta, &node_a, &node_b, parent).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/sessions/{parent}/fork", node_a.addr);
+    let resp = client
+        .post(&url)
+        .json(&json!({
+            "tenant_id": "t-1",
+            "new_session_id": "s-fork-child",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "forwarded fork must succeed: {}",
+        resp.text().await.unwrap()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["new_session_id"].as_str(), Some("s-fork-child"));
+    assert_eq!(body["parent_session_id"].as_str(), Some(parent));
+
+    // The forward credits node A's forwarded_reads_total.
+    // We don't follow up with a GET on the child because the
+    // child session's shard is hashed from "s-fork-child"
+    // (not overridden), so a GET would route by that hash
+    // rather than to wherever the fork actually landed —
+    // that's the known "child-inherits-parent-box" gap
+    // called out in ARCHITECTURE.md's multi-node limits.
+    let reads = node_a
+        .registry
+        .box_by_id(0)
+        .unwrap()
+        .metrics
+        .snapshot()
+        .forwarded_reads_total;
+    assert!(reads >= 1, "node A must have counted the forwarded fork");
+}
+
+// Mongo wire cross-node behavior is exercised in
+// crates/agentdb-wire/tests/cross_node.rs — the wire crate
+// already has mongodb + bson dev-deps. Keeping the REST-only
+// scenarios in this file.

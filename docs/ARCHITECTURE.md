@@ -738,65 +738,86 @@ safety net to tenant-hash routing.
 Round-robin is deliberately simple; load-aware reassignment
 requires per-tablet metrics that don't exist yet (M25 work).
 
-### Cross-node write forwarding (M20 multi-node)
+### Cross-node forwarding (M20 multi-node)
 
 Before this slice, `route_session` silently fell back to
 tenant-hash on the local node whenever a shard override
 pointed at a tablet this node didn't own. Safe on a single-
-node cluster; silently wrong on multi-node. This slice
-closes the gap for REST `append_and_fetch`.
+node cluster; silently wrong on multi-node. Two PRs close
+the gap — the first shipped write-path forwarding, this one
+extends reads and generalizes the helper.
 
-New pieces:
+**Routing primitives.**
 
-- **`NodeAddressProxy`** in `agentdb_core::forwarding`. Caches
+- **`NodeAddressProxy`** (`agentdb_core::forwarding`). Caches
   `tablet_id → NodeTarget { node_id, address }` from joining
   the `tablets` and `nodes` tables every
   `AGENTDB_NODE_ADDR_REFRESH_SECS` (default 10s — shorter
   than LocationProxy's 30s because node-address changes are
   failover-critical).
 - **`RouteDecision`** enum returned by
-  `BoxRegistry::route_session_for_write`:
+  `BoxRegistry::route_session_for_io`:
   `Local(Arc<Box_>)` or
-  `Remote { target: NodeTarget, tablet_id: i64 }`.
-- **`agentdb_api::forwarding`** — the HTTP helper that
-  re-issues the request against `target.address`, preserving
-  `Authorization` and `X-AgentDB-HLC` and adding
-  `X-AgentDB-Forwarded: 1` for the loop guard.
-- **Loop guard.** If an inbound request carries
-  `X-AgentDB-Forwarded: 1` *and* this node's own routing
-  still says Remote, we return **421 Misdirected Request**
-  instead of forwarding again. Prevents ping-pong when
-  control-plane state drifts between two nodes.
-- **Metrics.** `agentdb_forwarded_writes_total` and
-  `agentdb_forwarded_write_failures_total` per box (credited
-  to box 0 on the originating node since the actual work
-  lands on a remote box).
+  `Remote { target: NodeTarget, tablet_id: i64 }`. Same
+  decision powers writes and reads; the method was named
+  `route_session_for_write` in the first slice and renamed
+  when reads adopted it.
+- **`agentdb_api::forwarding::forward_request`** — generic
+  HTTP forwarder taking method + path + optional JSON body.
+  `forward_append_and_fetch`, `forward_admin_session_get`,
+  `forward_fork` are thin wrappers that build the URL.
 
-Safety properties preserved:
+**Safety properties preserved on every forwarded request:**
 
-- **Tenant-scope ACL.** When auth is enabled, the forwarded
-  request carries the client's `Authorization` header
-  verbatim; the remote node verifies independently and
-  rejects cross-tenant access with its own 403.
-- **HLC merge.** `X-AgentDB-HLC` is forwarded in both
-  directions so the cluster clock converges across the
-  forwarded hop.
+- **Tenant-scope ACL.** `Authorization` header forwarded
+  verbatim; the remote node's Basic Auth middleware verifies
+  independently and rejects cross-tenant access with its own
+  403.
+- **HLC merge.** `X-AgentDB-HLC` forwarded in both
+  directions so the cluster clock converges across the hop.
+- **Loop guard.** Every forward adds
+  `X-AgentDB-Forwarded: 1`. A node that receives a request
+  with that header *and* still routes Remote returns **421
+  Misdirected Request** instead of forwarding again.
 - **No internal retry.** Forwarding failures surface as 503
-  immediately. Masking slow failover with retries hides the
-  signal operators need.
+  immediately. Operators see slow failover rather than it
+  being masked.
 
-Scope limits:
+**Covered endpoints:**
 
-- **Mongo wire** is not forwarded. Binary, stateful per-
-  connection protocol; forwarding requires tunneling OpMsg
-  over HTTP or a parallel TCP hop. Operators running multi-
-  node Mongo point clients at the tablet's owning node (or
-  run a proxy).
-- **Read path** still routes by tenant hash. An overridden
-  session's reads can miss writes that landed on the
-  overridden tablet. This is the "quiesce / data-handoff"
-  gap; closing it requires migrating session state along
-  with the override.
+| Endpoint | Method | Cross-node behavior |
+|---|---|---|
+| `/api/tenants/:tid/sessions/:sid/append_and_fetch` | POST | forwarded |
+| `/api/admin/sessions/:sid?tenant_id=...` | GET | forwarded |
+| `/api/sessions/:sid/fork` | POST | forwarded |
+| Mongo `find` with `{session_id: S}` filter | — | 421-equivalent: `code: 10107 NotWritablePrimary` with owner address |
+| Mongo `aggregate` pinning `session_id = S` | — | same as find |
+
+**Metrics** (per box, credited to box 0 on the originating
+node):
+`agentdb_forwarded_writes_total`,
+`agentdb_forwarded_write_failures_total`,
+`agentdb_forwarded_reads_total`,
+`agentdb_forwarded_read_failures_total`.
+
+**Scope limits (still out):**
+
+- **Mongo wire forwarding.** Binary, stateful per-connection
+  protocol — SASL state doesn't transfer across a forwarded
+  hop without an inter-node trust model. Mongo clients get
+  `code: 10107` with the owner's address and reconnect;
+  real forwarding is future work.
+- **Tenant-wide reads** (`find` without a session filter,
+  `listDatabases`, `listCollections`). Still tenant-hash
+  routed. An override moves one session, not the whole
+  tenant.
+- **Child-inherits-parent-box.** A forked child session
+  lives on whatever box its parent was on; the child's
+  `session_id` hashes to a potentially different shard, so
+  reads routed by shard hash may miss it. Closing this gap
+  requires either migrating the child's session record at
+  fork time or teaching the read path to follow the parent
+  pointer.
 
 ### SCRAM-SHA-256 auth (M19)
 

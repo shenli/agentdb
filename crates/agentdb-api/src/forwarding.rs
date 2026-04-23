@@ -1,9 +1,14 @@
-//! Cross-node REST forwarding for write requests (M20 multi-node).
+//! Cross-node REST forwarding for session-scoped requests
+//! (M20 multi-node).
 //!
-//! When `BoxRegistry::route_session_for_write` returns
+//! When `BoxRegistry::route_session_for_io` returns
 //! [`agentdb_core::RouteDecision::Remote`], the REST handler
 //! calls into this module to re-issue the same request against
-//! the owning node and stream the response back.
+//! the owning node and stream the response back. Both write
+//! paths (POST append_and_fetch, POST fork) and read paths
+//! (GET admin session detail) share the same forwarder —
+//! [`forward_request`] — and wrappers specialize the URL
+//! construction.
 //!
 //! Design:
 //!
@@ -49,34 +54,32 @@ pub const FORWARDED_HEADER: &str = "x-agentdb-forwarded";
 /// compile-time assertion in unit tests.
 pub const HLC_HEADER: &str = "x-agentdb-hlc";
 
-/// Forward a POST `/api/tenants/:tid/sessions/:sid/append_and_fetch`
-/// to `target` and return the remote response verbatim. The
-/// caller passes the original body + the headers of interest
-/// (Authorization, HLC); everything else is reconstructed from
-/// the path.
+/// Generic forwarder. Re-issues any HTTP method+path to the
+/// target node, preserves the auth + HLC headers, adds the
+/// loop-guard, and streams the peer's response back verbatim.
 ///
-/// Returns either a successful `Response` (copied from the peer)
-/// or an `Err(ForwardError)` that the caller maps to 503.
-pub async fn forward_append_and_fetch(
+/// `path_with_query` must already be percent-encoded; callers
+/// build it via [`urlencode`] + explicit concatenation so the
+/// forwarder isn't second-guessing routing.
+pub async fn forward_request(
     http: &Client,
     target: &NodeTarget,
-    tenant_id: &str,
-    session_id: &str,
-    body: Bytes,
+    method: reqwest::Method,
+    path_with_query: &str,
+    body: Option<Bytes>,
     passthrough: PassthroughHeaders,
 ) -> Result<Response, ForwardError> {
     let base = normalize_base(&target.address);
-    let url = format!(
-        "{base}/api/tenants/{}/sessions/{}/append_and_fetch",
-        urlencode(tenant_id),
-        urlencode(session_id),
-    );
+    let url = format!("{base}{path_with_query}");
 
     let mut req = http
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(FORWARDED_HEADER, "1")
-        .body(body);
+        .request(method, &url)
+        .header(FORWARDED_HEADER, "1");
+    if let Some(b) = body {
+        req = req
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(b);
+    }
     if let Some(v) = passthrough.authorization {
         req = req.header(header::AUTHORIZATION, v);
     }
@@ -117,6 +120,78 @@ pub async fn forward_append_and_fetch(
         resp.headers_mut().insert(k, v.clone());
     }
     Ok(resp)
+}
+
+/// Forward a POST `/api/tenants/:tid/sessions/:sid/append_and_fetch`
+/// to `target` and return the remote response verbatim.
+pub async fn forward_append_and_fetch(
+    http: &Client,
+    target: &NodeTarget,
+    tenant_id: &str,
+    session_id: &str,
+    body: Bytes,
+    passthrough: PassthroughHeaders,
+) -> Result<Response, ForwardError> {
+    let path = format!(
+        "/api/tenants/{}/sessions/{}/append_and_fetch",
+        urlencode(tenant_id),
+        urlencode(session_id),
+    );
+    forward_request(
+        http,
+        target,
+        reqwest::Method::POST,
+        &path,
+        Some(body),
+        passthrough,
+    )
+    .await
+}
+
+/// Forward `GET /api/admin/sessions/:sid?tenant_id=...` to
+/// the tablet's owner node. Unlike append_and_fetch, the
+/// tenant lives in the query string, not the path.
+pub async fn forward_admin_session_get(
+    http: &Client,
+    target: &NodeTarget,
+    session_id: &str,
+    tenant_id: &str,
+    passthrough: PassthroughHeaders,
+) -> Result<Response, ForwardError> {
+    let path = format!(
+        "/api/admin/sessions/{}?tenant_id={}",
+        urlencode(session_id),
+        urlencode(tenant_id),
+    );
+    forward_request(
+        http,
+        target,
+        reqwest::Method::GET,
+        &path,
+        None,
+        passthrough,
+    )
+    .await
+}
+
+/// Forward `POST /api/sessions/:sid/fork`.
+pub async fn forward_fork(
+    http: &Client,
+    target: &NodeTarget,
+    session_id: &str,
+    body: Bytes,
+    passthrough: PassthroughHeaders,
+) -> Result<Response, ForwardError> {
+    let path = format!("/api/sessions/{}/fork", urlencode(session_id));
+    forward_request(
+        http,
+        target,
+        reqwest::Method::POST,
+        &path,
+        Some(body),
+        passthrough,
+    )
+    .await
 }
 
 /// 421 Misdirected Request. Used when a forwarded request

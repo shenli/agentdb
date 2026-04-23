@@ -277,10 +277,14 @@ M18+ milestones added:
   actually moves future writes to the targeted box
 - **M22 reaper-driven shard reassignment** — when a tablet's lease
   expires, its orphaned shards round-robin to surviving tablets
-- **M20 multi-node write forwarding** — a write for a tablet
-  owned by a peer node is proxied via HTTP preserving auth and
-  HLC, with a loop-guard (`X-AgentDB-Forwarded`) that returns
-  421 on routing drift
+- **M20 multi-node forwarding** — both writes (POST
+  append_and_fetch, POST fork) and session-scoped reads (GET
+  admin session detail) forward to the tablet's owning node
+  via HTTP, preserving auth and HLC, with a loop-guard
+  (`X-AgentDB-Forwarded` → 421 on routing drift). Mongo
+  `find`/`aggregate` with a pinned `session_id` return
+  `code: 10107 NotWritablePrimary` with the owning node's
+  address (real forwarding deferred — see Architecture)
 - **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
   — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
   Basic auth; user→tenant ACL; `agentdb user add|list|delete`
@@ -294,15 +298,19 @@ M18+ milestones added:
 
 **Still out of scope:**
 
-- **Cross-node Mongo wire.** REST `append_and_fetch` forwards
-  across nodes; the Mongo wire subset does not. Operators
-  running multi-node Mongo point clients at the tablet's
-  owning node (or put a proxy in front).
-- **Cross-node reads.** Reads still route by tenant hash; an
-  overridden session whose writes landed on a remote tablet
-  will not be visible from a read issued against the
-  tenant's hash node. Closing this gap requires migrating
-  session state alongside the override (quiesce + handoff).
+- **Cross-node Mongo wire forwarding.** Mongo clients
+  targeting a session on a peer get `code: 10107
+  NotWritablePrimary` with the owner's address so they can
+  reconnect, but there's no server-side proxy. Binary
+  stateful protocol (SASL state doesn't transfer); separate
+  PR.
+- **Tenant-wide reads.** `find` without a session filter,
+  `listDatabases`, `listCollections` still route by tenant
+  hash. An override moves one session, not the whole tenant.
+- **Child-inherits-parent-box.** A forked child lives on
+  whatever box its parent was on; the child's `session_id`
+  hashes independently and reads routed by that hash may
+  miss it.
 - **Quiesce / data-handoff on reassignment.** Moves via
   `set_shard` or the reaper change *future* routing; data already
   accepted on the old box stays there (append-only event streams

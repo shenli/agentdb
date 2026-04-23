@@ -487,7 +487,7 @@ pub struct BoxRegistry {
     /// overrides leave it `None`.
     location: std::sync::OnceLock<Arc<crate::shard::LocationProxy>>,
     /// Tablet→node address lookup (M20 multi-node). When set,
-    /// [`Self::route_session_for_write`] returns
+    /// [`Self::route_session_for_io`] returns
     /// [`RouteDecision::Remote`] for tablets owned by other
     /// nodes; when unset, every routed decision degrades to
     /// Local (the single-node path).
@@ -729,7 +729,7 @@ impl BoxRegistry {
     }
 
     /// Attach a [`NodeAddressProxy`] so
-    /// [`Self::route_session_for_write`] can differentiate
+    /// [`Self::route_session_for_io`] can differentiate
     /// local-tablet vs. remote-tablet targets. Idempotent at
     /// the OnceLock level.
     pub fn attach_node_address(
@@ -763,7 +763,7 @@ impl BoxRegistry {
     /// the normal case in single-node clusters where
     /// tablet_id == box_id and the prefix happens to match
     /// the peer's too).
-    pub fn route_session_for_write(
+    pub fn route_session_for_io(
         &self,
         tenant_external: &str,
         session_external: &str,
@@ -997,7 +997,7 @@ mod tests {
         );
     }
 
-    // M20 multi-node: route_session_for_write coverage.
+    // M20 multi-node: route_session_for_io coverage.
     // Builds a meta store with two nodes registered, assigns
     // tablets explicitly to one or the other, and verifies
     // the RouteDecision the registry returns.
@@ -1032,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn route_for_write_without_proxies_is_local_tenant_hash() {
         let (_dir, _obj_dir, reg) = registry(4);
-        match reg.route_session_for_write("t-1", "s-1") {
+        match reg.route_session_for_io("t-1", "s-1") {
             RouteDecision::Local(box_) => {
                 assert_eq!(box_.id, reg.route_tenant("t-1").id);
             }
@@ -1062,7 +1062,7 @@ mod tests {
             .unwrap();
         reg.attach_node_address(addr_proxy).ok();
 
-        match reg.route_session_for_write("t-1", "s-1") {
+        match reg.route_session_for_io("t-1", "s-1") {
             RouteDecision::Local(box_) => assert_eq!(box_.id, 2),
             RouteDecision::Remote { .. } => panic!("expected Local for self-owned tablet"),
         }
@@ -1089,7 +1089,7 @@ mod tests {
             .unwrap();
         reg.attach_node_address(addr_proxy).ok();
 
-        match reg.route_session_for_write("t-1", "s-remote") {
+        match reg.route_session_for_io("t-1", "s-remote") {
             RouteDecision::Local(_) => panic!("expected Remote for peer-owned tablet"),
             RouteDecision::Remote { target, tablet_id } => {
                 assert_eq!(target.node_id, "other");
@@ -1129,7 +1129,7 @@ mod tests {
             .unwrap();
         reg.attach_node_address(addr_proxy).ok();
 
-        match reg.route_session_for_write("t-1", "s-orphan") {
+        match reg.route_session_for_io("t-1", "s-orphan") {
             RouteDecision::Local(_) => {} // expected — fallback
             RouteDecision::Remote { .. } => panic!("unresolvable owner must not forward"),
         }
