@@ -290,6 +290,28 @@ pub struct ServeOpts {
     /// Override AGENTDB_META_PATH. Control-plane SQLite file.
     #[arg(long = "meta-path")]
     pub meta_path: Option<String>,
+
+    /// Path to a TLS certificate chain (PEM). When set
+    /// together with `--tls-key`, the REST listener serves
+    /// HTTPS via rustls. Falls back to
+    /// `AGENTDB_TLS_CERT` if the flag is omitted. Mongo
+    /// wire stays plaintext either way — a separate PR
+    /// adds Mongo TLS.
+    #[arg(long = "tls-cert")]
+    pub tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to the TLS private key (PEM, PKCS#8 or RSA).
+    /// Falls back to `AGENTDB_TLS_KEY`.
+    #[arg(long = "tls-key")]
+    pub tls_key: Option<std::path::PathBuf>,
+
+    /// Generate an ephemeral self-signed certificate at
+    /// startup so operators can smoke-test TLS without
+    /// provisioning a real cert. Valid for `localhost` and
+    /// `127.0.0.1`. Mutually exclusive with explicit
+    /// `--tls-cert` / `--tls-key`.
+    #[arg(long = "dev-tls", conflicts_with_all = ["tls_cert", "tls_key"])]
+    pub dev_tls: bool,
 }
 
 #[derive(Args, Debug, Default, Clone)]

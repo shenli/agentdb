@@ -98,6 +98,44 @@ fn now_ms_i64() -> i64 {
         .unwrap_or(0)
 }
 
+/// Resolve REST TLS config from CLI flags + env. Returns
+/// `Some` when TLS should be active, `None` for plaintext.
+///
+/// Precedence: explicit `--tls-cert` + `--tls-key` wins;
+/// otherwise `AGENTDB_TLS_CERT` + `AGENTDB_TLS_KEY` env
+/// vars; otherwise `--dev-tls` synthesizes an ephemeral
+/// self-signed cert; otherwise plaintext.
+async fn resolve_tls(
+    opts: &ServeOpts,
+) -> anyhow::Result<Option<axum_server::tls_rustls::RustlsConfig>> {
+    // Flag pair.
+    if let (Some(cert), Some(key)) = (opts.tls_cert.as_ref(), opts.tls_key.as_ref()) {
+        return Ok(Some(crate::tls::load_tls_config(cert, key).await?));
+    }
+    // Env-var pair.
+    let env_cert = std::env::var("AGENTDB_TLS_CERT").ok().map(std::path::PathBuf::from);
+    let env_key = std::env::var("AGENTDB_TLS_KEY").ok().map(std::path::PathBuf::from);
+    if let (Some(cert), Some(key)) = (&env_cert, &env_key) {
+        return Ok(Some(crate::tls::load_tls_config(cert, key).await?));
+    }
+    if env_cert.is_some() || env_key.is_some() {
+        anyhow::bail!(
+            "AGENTDB_TLS_CERT and AGENTDB_TLS_KEY must be set together (or neither)"
+        );
+    }
+    // Dev ephemeral.
+    if opts.dev_tls || opts.dev {
+        // `--dev` implies dev-tls for the zero-config
+        // quickstart? No — keep `--dev` as HTTP unless
+        // operator opts in explicitly with --dev-tls.
+        // Re-enable if feedback asks for it.
+        if opts.dev_tls {
+            return Ok(Some(crate::tls::generate_dev_tls().await?));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolved configuration for the server process. Each field is the
 /// end result of `default → env → flag → dev-mode override`.
 struct Resolved {
@@ -687,9 +725,9 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         .layer(axum::Extension(reaper.clone()))
         .layer(axum::Extension(hot_detector.clone()))
         .layer(axum::Extension(location_proxy.clone()));
-    let http_listener = tokio::net::TcpListener::bind(cfg.http_addr)
-        .await
-        .context("bind http listener")?;
+    // Resolve TLS config. Explicit flags win; else env
+    // vars; else `--dev-tls` ephemeral; else plaintext.
+    let tls_cfg = resolve_tls(&opts).await?;
     let mongo_listener = tokio::net::TcpListener::bind(cfg.mongo_addr)
         .await
         .context("bind mongo listener")?;
@@ -698,11 +736,28 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         mongo_addr = %cfg.mongo_addr,
         objects = %cfg.objects_dir.display(),
         dev = opts.dev,
+        tls = tls_cfg.is_some(),
         "agentdb listening"
     );
 
-    let http_task =
-        tokio::spawn(async move { axum::serve(http_listener, app).await.context("http serve") });
+    let http_task = if let Some(rustls_cfg) = tls_cfg {
+        // TLS path. axum_server owns its own listener, so we
+        // give it the socket address directly instead of a
+        // pre-bound tokio listener.
+        let addr = cfg.http_addr;
+        let service = app.into_make_service();
+        tokio::spawn(async move {
+            axum_server::bind_rustls(addr, rustls_cfg)
+                .serve(service)
+                .await
+                .context("https serve")
+        })
+    } else {
+        let http_listener = tokio::net::TcpListener::bind(cfg.http_addr)
+            .await
+            .context("bind http listener")?;
+        tokio::spawn(async move { axum::serve(http_listener, app).await.context("http serve") })
+    };
     let mongo_task = tokio::spawn(async move {
         serve_mongo(mongo_listener, wire_state)
             .await
