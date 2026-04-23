@@ -230,12 +230,19 @@ async fn main() -> anyhow::Result<()> {
         .context("acquire leases via control plane")?,
     );
     // Spawn a per-box renewal loop now that the initial lease is held.
+    // Drain-aware: when `POST /api/admin/drain` flips the registry's
+    // drain flag, each renewal loop observes the change on its next
+    // tick and stops renewing. Leases expire naturally after
+    // `lease_duration`, the reaper on another node clears the tablet
+    // rows, and the operator can SIGTERM cleanly without stale
+    // ownership pinned to this node.
     // Handles are intentionally forgotten — shutdown is process exit.
     let mut renewal_jobs: Vec<LeaseRenewalJob> = Vec::with_capacity(num_boxes as usize);
+    let drain_flag = registry.draining_flag();
     for i in 0..num_boxes {
         let b = registry.box_by_id(i).expect("box id in range");
         let lease = b.lease().expect("new_with_meta attaches a lease").clone();
-        renewal_jobs.push(LeaseRenewalJob::start(lease));
+        renewal_jobs.push(LeaseRenewalJob::start_with_drain(lease, drain_flag.clone()));
     }
     std::mem::forget(renewal_jobs);
 
