@@ -45,6 +45,14 @@ pub enum Error {
     /// owner.
     #[error("box {box_id}: lease lost (epoch {epoch})")]
     LeaseLost { box_id: BoxId, epoch: i64 },
+
+    /// This node is draining — an operator called
+    /// `POST /api/admin/drain` and the write path refuses new work
+    /// until the process exits. Callers should retry the request
+    /// at a different node. Unlike `LeaseLost`, this is intentional
+    /// and will not self-resolve on this process.
+    #[error("node {node_id}: draining; retry at a different node")]
+    NodeDraining { node_id: String },
 }
 
 /// Resource kinds referenced by `Error::NotFound`. Keep in sync with

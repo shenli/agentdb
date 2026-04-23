@@ -330,6 +330,20 @@ pub async fn append_and_fetch_with_actor(
     fetch_last_n_: usize,
     now_millis: u64,
 ) -> Result<AppendFetchOutput> {
+    // M22 drain gate: once an operator has flipped the drain
+    // switch via `POST /api/admin/drain`, every subsequent write
+    // fails fast with `NodeDraining`. Meaningful only for
+    // meta-backed registries — legacy registries have `node_id ==
+    // None` and `is_draining() == false`, so this is a free no-op
+    // for them. Checked before routing so the error body carries
+    // the process node id, not some per-box context.
+    if registry.is_draining() {
+        if let Some(node_id) = registry.node_id() {
+            return Err(Error::NodeDraining {
+                node_id: node_id.to_string(),
+            });
+        }
+    }
     let box_ = registry.route_tenant(tenant_external);
     // M21: lease-alive check. If this box has a lease configured
     // (MetaStore-backed registry) and it has expired, fail fast so

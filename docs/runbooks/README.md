@@ -42,6 +42,7 @@ Every `ErrorCode` the REST API can emit has a published runbook:
 | `invalid_request` | [invalid_request.md](./invalid_request.md) |
 | `storage_error` | [storage_error.md](./storage_error.md) |
 | `serialization_error` | [serialization_error.md](./serialization_error.md) |
+| `node_draining` | [node_draining.md](./node_draining.md) |
 
 When a new `ErrorCode` variant is added to
 [`crates/agentdb-api/src/error.rs`](../../crates/agentdb-api/src/error.rs),
