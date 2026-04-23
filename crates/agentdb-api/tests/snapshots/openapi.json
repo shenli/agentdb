@@ -252,6 +252,54 @@
         }
       }
     },
+    "/api/admin/drain": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_drain",
+        "responses": {
+          "200": {
+            "description": "Drain state of this process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrainStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "post_drain",
+        "responses": {
+          "200": {
+            "description": "Drain activated (idempotent on repeat)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrainStatus"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "This process has no control-plane node id — cannot drain a legacy-path registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrainUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/hlc": {
       "get": {
         "tags": [
@@ -727,6 +775,44 @@
           }
         }
       },
+      "DrainStatus": {
+        "type": "object",
+        "required": [
+          "is_draining"
+        ],
+        "properties": {
+          "drained_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock ms of the first drain call on this process, or\n`None` before the first call."
+          },
+          "is_draining": {
+            "type": "boolean",
+            "description": "Whether this process is currently draining."
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Node id of this process. `None` for legacy-path registries\n(no control plane); those registries can't be drained."
+          }
+        }
+      },
+      "DrainUnavailable": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
       "ErrorCode": {
         "type": "string",
         "description": "Stable machine-readable error codes.",
@@ -737,7 +823,8 @@
           "fault_injected",
           "storage_error",
           "serialization_error",
-          "lease_lost"
+          "lease_lost",
+          "node_draining"
         ]
       },
       "ErrorKind": {
@@ -795,6 +882,13 @@
           },
           "message": {
             "type": "string"
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Node identifier carried by process-level errors\n(`NodeDraining`) so clients can log which specific process\nemitted the error when they round-robin across a fleet."
           },
           "resource": {
             "type": [

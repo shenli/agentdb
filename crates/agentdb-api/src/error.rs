@@ -33,6 +33,11 @@ pub struct ErrorResponse {
     pub box_id: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fault_kind: Option<String>,
+    /// Node identifier carried by process-level errors
+    /// (`NodeDraining`) so clients can log which specific process
+    /// emitted the error when they round-robin across a fleet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     /// Absolute URL to the runbook for this error code. Present when
     /// the code has a published runbook; omitted otherwise. Operators
     /// should be able to paste this URL into a browser, Slack, or an
@@ -57,6 +62,10 @@ pub enum ErrorCode {
     /// because from the client's perspective it's "this node can't
     /// serve this tablet right now."
     LeaseLost,
+    /// M22: this node has been drained via `POST /api/admin/drain`.
+    /// Unlike `LeaseLost`, this is permanent for the process's
+    /// lifetime — clients must retry at a different node.
+    NodeDraining,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -86,6 +95,7 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: None,
                     fault_kind: None,
+                    node_id: None,
                     doc_url: None,
                 },
             ),
@@ -103,6 +113,7 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: None,
                     fault_kind: None,
+                    node_id: None,
                     doc_url: None,
                 },
             ),
@@ -126,6 +137,7 @@ impl ApiError {
                         retry_after_ms: Some(*retry_after_ms),
                         box_id: None,
                         fault_kind: None,
+                        node_id: None,
                         doc_url: None,
                     },
                 )
@@ -144,6 +156,7 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: Some(*box_id),
                     fault_kind: Some(fault_kind_name(fault_kind).into()),
+                    node_id: None,
                     doc_url: None,
                 },
             ),
@@ -161,6 +174,25 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: Some(*box_id),
                     fault_kind: None,
+                    node_id: None,
+                    doc_url: None,
+                },
+            ),
+            agentdb_core::Error::NodeDraining { node_id } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                HeaderMap::new(),
+                ErrorResponse {
+                    code: ErrorCode::NodeDraining,
+                    kind: ErrorKind::ApiError,
+                    message,
+                    resource: None,
+                    id: None,
+                    field: None,
+                    scope: None,
+                    retry_after_ms: None,
+                    box_id: None,
+                    fault_kind: None,
+                    node_id: Some(node_id.clone()),
                     doc_url: None,
                 },
             ),
@@ -178,6 +210,7 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: None,
                     fault_kind: None,
+                    node_id: None,
                     doc_url: None,
                 },
             ),
@@ -195,6 +228,7 @@ impl ApiError {
                     retry_after_ms: None,
                     box_id: None,
                     fault_kind: None,
+                    node_id: None,
                     doc_url: None,
                 },
             ),
@@ -241,6 +275,9 @@ pub fn doc_url_for(code: ErrorCode) -> Option<&'static str> {
         }
         ErrorCode::SerializationError => {
             Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/serialization_error.md")
+        }
+        ErrorCode::NodeDraining => {
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/node_draining.md")
         }
     }
 }
@@ -297,6 +334,25 @@ mod tests {
             Some(
                 "https://github.com/shenli/agentdb/blob/main/docs/runbooks/serialization_error.md"
             )
+        );
+        assert_eq!(
+            doc_url_for(ErrorCode::NodeDraining),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/node_draining.md")
+        );
+    }
+
+    #[test]
+    fn node_draining_response_carries_node_id_and_doc_url() {
+        let err = ApiError::Core(agentdb_core::Error::NodeDraining {
+            node_id: "node-smoke".into(),
+        });
+        let (status, _, body) = err.to_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(body.code, ErrorCode::NodeDraining));
+        assert_eq!(body.node_id.as_deref(), Some("node-smoke"));
+        assert_eq!(
+            body.doc_url.as_deref(),
+            Some("https://github.com/shenli/agentdb/blob/main/docs/runbooks/node_draining.md")
         );
     }
 

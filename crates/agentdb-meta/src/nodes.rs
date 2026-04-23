@@ -53,6 +53,30 @@ pub async fn heartbeat(pool: &SqlitePool, node_id: &str, now_ms: i64) -> MetaRes
     Ok(())
 }
 
+/// Update just the `state` column (and bump `last_heartbeat_ms` so
+/// observers don't simultaneously see "draining" and "stale").
+/// Unlike [`upsert`], this preserves the existing `address` —
+/// `POST /api/admin/drain` uses it to flip state to `"draining"`
+/// without accidentally wiping the advertised address.
+pub async fn set_state(
+    pool: &SqlitePool,
+    node_id: &str,
+    state: &str,
+    now_ms: i64,
+) -> MetaResult<()> {
+    let rows = sqlx::query("UPDATE nodes SET state = ?, last_heartbeat_ms = ? WHERE node_id = ?")
+        .bind(state)
+        .bind(now_ms)
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(MetaError::NotFound(format!("node {node_id}")));
+    }
+    Ok(())
+}
+
 pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
     let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
         "SELECT node_id, address, state, last_heartbeat_ms, joined_at_ms FROM nodes WHERE node_id = ?",
@@ -168,6 +192,26 @@ mod tests {
     async fn heartbeat_errors_on_unknown_node() {
         let p = pool().await;
         let err = heartbeat(&p, "ghost", 500).await.unwrap_err();
+        assert!(matches!(err, MetaError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_state_preserves_address_and_bumps_heartbeat() {
+        let p = pool().await;
+        upsert(&p, "node-a", "addr-keep", "alive", 100)
+            .await
+            .unwrap();
+        set_state(&p, "node-a", "draining", 500).await.unwrap();
+        let n = get(&p, "node-a").await.unwrap().unwrap();
+        assert_eq!(n.state, "draining");
+        assert_eq!(n.address, "addr-keep", "address must be preserved");
+        assert_eq!(n.last_heartbeat_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn set_state_errors_on_unknown_node() {
+        let p = pool().await;
+        let err = set_state(&p, "ghost", "draining", 500).await.unwrap_err();
         assert!(matches!(err, MetaError::NotFound(_)));
     }
 

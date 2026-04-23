@@ -426,6 +426,25 @@ pub struct BoxRegistry {
     kv: Arc<dyn KvStore>,
     object_store: Arc<dyn ObjectStore>,
     hlc: Arc<HlcClock>,
+    /// Node id of the process hosting this registry. `None` under
+    /// the legacy `new` / `new_with_hlc` / `new_with_capacity`
+    /// paths that don't involve a control plane; `Some` when built
+    /// via `new_with_meta*`. Surfaced in the `NodeDraining` error so
+    /// clients know which specific process refused the write.
+    node_id: Option<String>,
+    /// Process-level drain flag (M22). Flipped via
+    /// [`Self::drain`] from the `POST /api/admin/drain` admin
+    /// endpoint. Once set, the write path returns
+    /// [`Error::NodeDraining`] for every subsequent request. Reset
+    /// only by restarting the process — un-draining via the API
+    /// invites load-balancer state to drift from node state and has
+    /// no clear use case.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Wall-clock ms at which `drain()` was first called, or `None`
+    /// before the first call. Captured in an `OnceLock` so repeated
+    /// drain calls remain idempotent (second+ calls return the
+    /// original `drained_at_ms` in admin responses).
+    drained_at_ms: Arc<std::sync::OnceLock<i64>>,
 }
 
 impl BoxRegistry {
@@ -486,6 +505,9 @@ impl BoxRegistry {
             kv,
             object_store,
             hlc,
+            node_id: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drained_at_ms: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -573,6 +595,9 @@ impl BoxRegistry {
             kv,
             object_store,
             hlc,
+            node_id: Some(node_id),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drained_at_ms: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -610,6 +635,48 @@ impl BoxRegistry {
     /// one `LifecycleEngine` per box at process startup.
     pub fn box_by_id(&self, id: BoxId) -> Option<Arc<Box_>> {
         self.boxes.get(id as usize).cloned()
+    }
+
+    /// Mark this process as draining. Subsequent writes fail fast with
+    /// [`Error::NodeDraining`]. Idempotent — the first call records
+    /// `now_ms` in an `OnceLock`, later calls leave the recorded time
+    /// alone so admin views stay stable.
+    ///
+    /// There is no `undrain()` — operators restart the process to
+    /// reverse a drain. Allowing un-drain invites load-balancer
+    /// state to drift from node state and has no clear use case.
+    pub fn drain(&self, now_ms: i64) {
+        // Initialize `drained_at_ms` before flipping the flag so
+        // concurrent readers that see `is_draining() == true` are
+        // guaranteed to see a populated timestamp. The ordering
+        // between these two stores doesn't need SeqCst because each
+        // call is idempotent and the first-writer-wins semantics on
+        // the OnceLock are atomic by construction.
+        let _ = self.drained_at_ms.set(now_ms);
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Is this process currently draining? Atomic load; safe from
+    /// any task. Hot-path callers (the write path) check this before
+    /// any other work.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wall-clock ms of the first `drain()` call on this process, or
+    /// `None` if drain has never been called. Admin handlers surface
+    /// this so operators can verify drain has been in effect long
+    /// enough for in-flight writes to have drained.
+    pub fn drained_at_ms(&self) -> Option<i64> {
+        self.drained_at_ms.get().copied()
+    }
+
+    /// Node id of the process hosting this registry, if it was built
+    /// via `new_with_meta*`. Returns `None` for legacy-path registries
+    /// (which don't have a control plane and so can't be drained).
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
     }
 }
 

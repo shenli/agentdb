@@ -6,6 +6,7 @@ use axum::Router;
 
 pub mod admin;
 pub mod admin_boxes;
+pub mod admin_drain;
 pub mod admin_nodes;
 pub mod admin_scheduler;
 pub mod admin_sessions;
@@ -50,6 +51,8 @@ pub struct AppState {
         admin_boxes::inject_fault,
         admin_boxes::set_quota,
         admin_boxes::set_webhook,
+        admin_drain::get_drain,
+        admin_drain::post_drain,
         admin_nodes::list_nodes,
         admin_scheduler::get_scheduler,
         admin_sessions::get_session,
@@ -70,6 +73,8 @@ pub struct AppState {
         admin_boxes::QuotaRequest,
         admin_boxes::WebhookRequest,
         admin_boxes::WebhookResponse,
+        admin_drain::DrainStatus,
+        admin_drain::DrainUnavailable,
         admin_nodes::NodeView,
         admin_nodes::NodesUnavailable,
         admin_scheduler::LeaderView,
@@ -143,6 +148,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/nodes",
             axum::routing::get(admin_nodes::list_nodes),
+        )
+        .route(
+            "/api/admin/drain",
+            axum::routing::get(admin_drain::get_drain).post(admin_drain::post_drain),
         )
         .route(
             "/api/admin/tablets",
