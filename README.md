@@ -295,6 +295,10 @@ M18+ milestones added:
   initial token without out-of-band DB access.
   `agentdb admin-token add|list|revoke`; admin CLI
   subcommands pick up `$AGENTDB_ADMIN_TOKEN` automatically
+- **REST TLS termination** — `--tls-cert` / `--tls-key`
+  (or env vars) serve HTTPS via rustls + axum-server.
+  `agentdb serve --dev-tls` generates an ephemeral
+  self-signed cert for smoke testing
 - **M25 hot-tablet detection + shed + dynamic tablet
   creation** — sliding rate window on every box;
   scheduler-leader detector flags saturated tablets;
@@ -354,8 +358,11 @@ M18+ milestones added:
   ships; every token has full admin access today. Scoped
   ("read-only", "shed-only") tokens and mTLS-based admin
   auth are future work.
-- **TLS termination.** Basic auth over plaintext is weak; the
-  prototype assumes the caller terminates TLS at an ingress.
+- **Mongo wire TLS.** REST TLS ships; the Mongo listener
+  stays plaintext for now. Cross-node Mongo requires the
+  same + an inter-node trust model.
+- **Admin-plane mTLS / cert-based auth.** Bearer tokens
+  handle admin auth today; mTLS is a follow-up.
 - **M22 sophisticated policy** — cross-AZ preference, anti-
   affinity, node-weight awareness. Current reassignment is
   round-robin across live tablets.

@@ -12,6 +12,7 @@ mod admin;
 mod cli;
 mod dump_config;
 mod serve;
+mod tls;
 mod tracing_init;
 
 use cli::{AdminTokenCmd, Cli, Cmd, UserCmd};

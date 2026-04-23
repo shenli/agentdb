@@ -1008,6 +1008,36 @@ Out of scope:
   land on source after the scan and survive the
   Delete. Operators should migrate idle sessions only.
 
+### TLS termination
+
+REST listens over HTTP by default. Supply `--tls-cert PATH
+--tls-key PATH` (or `AGENTDB_TLS_CERT` / `AGENTDB_TLS_KEY`
+env vars) to serve HTTPS via rustls + axum-server.
+
+The flag pair and env pair are mutually exclusive — setting
+one without the other is a startup error so operators
+don't accidentally boot plaintext under a name that
+suggests otherwise. `rcgen`-based dev mode
+(`agentdb serve --dev-tls`) generates an ephemeral
+self-signed cert at startup covering `localhost`,
+`127.0.0.1`, `::1`. Clients must skip cert verification
+for the dev cert; the cert lives only in memory and each
+invocation gets a fresh one.
+
+On the crypto provider — rustls 0.23 requires an explicit
+`CryptoProvider::install_default()` before any handshake.
+We install `aws_lc_rs` once at TLS entry time. The
+provider is process-wide.
+
+**Out of scope:**
+- **Mongo wire TLS.** The Mongo listener stays plaintext;
+  separate PR.
+- **mTLS.** Client-cert auth isn't wired. Bearer + Basic
+  Auth remain the auth layer; TLS adds confidentiality
+  on top.
+- **Certificate rotation.** Cert is loaded once at
+  startup. SIGHUP reload is follow-up work.
+
 ### SCRAM-SHA-256 auth (M19)
 
 Off by default (backward-compatible). Enable with
