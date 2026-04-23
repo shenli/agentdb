@@ -489,6 +489,36 @@
         }
       }
     },
+    "/api/admin/shards/list": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_shard_overrides",
+        "responses": {
+          "200": {
+            "description": "Shards that have explicit tablet overrides",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardOverridesList"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "meta store not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/shards/{id}": {
       "get": {
         "tags": [
@@ -543,6 +573,67 @@
           },
           "503": {
             "description": "LocationProxy not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "set_shard",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shard id (0..16384)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetShardRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Assignment set; post-update proxy view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardAssignment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "id out of range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "meta / LocationProxy not configured",
             "content": {
               "application/json": {
                 "schema": {
@@ -1773,6 +1864,19 @@
           }
         }
       },
+      "SetShardRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/admin/shards/:id`. `tablet_id: null` reverts\nthe shard to default (hash) routing; a set value pins it.",
+        "properties": {
+          "tablet_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
       "ShardAssignment": {
         "type": "object",
         "required": [
@@ -1805,6 +1909,48 @@
             ],
             "format": "int64",
             "description": "Tablet currently assigned to this shard. `null` means \"no\noverride — routing falls back to the default (hash % num\nboxes) rule the client should already know about\"."
+          }
+        }
+      },
+      "ShardOverride": {
+        "type": "object",
+        "required": [
+          "shard_id",
+          "tablet_id",
+          "updated_at_ms"
+        ],
+        "properties": {
+          "shard_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tablet_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ShardOverridesList": {
+        "type": "object",
+        "description": "Response for `GET /api/admin/shards/list`. Only shards with an\nexplicit assignment are returned — 16384 rows is too many for a\nhuman-scale listing.",
+        "required": [
+          "overrides",
+          "total_count"
+        ],
+        "properties": {
+          "overrides": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShardOverride"
+            }
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },

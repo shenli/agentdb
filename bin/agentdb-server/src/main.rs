@@ -33,5 +33,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowScheduler(opts) => admin::show_scheduler(opts).await,
         Cmd::ShowNodes(opts) => admin::show_nodes(opts).await,
         Cmd::ShowShard(opts) => admin::show_shard(opts).await,
+        Cmd::SetShard(opts) => admin::set_shard(opts).await,
+        Cmd::ListShardOverrides(opts) => admin::list_shard_overrides(opts).await,
     }
 }
