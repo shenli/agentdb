@@ -106,6 +106,12 @@ extra config needed. See
 [`docs/ARCHITECTURE.md` § Prometheus exposition](docs/ARCHITECTURE.md#prometheus-exposition-m27-piece)
 for the full metric catalog.
 
+Per-box latency histograms (`agentdb_append_latency_seconds`,
+`agentdb_admission_wait_seconds`) ride the same endpoint.
+`GET /api/admin/boxes/:id/latency` and `agentdb show-latency <box>`
+return pre-computed p50/p95/p99 for ad-hoc inspection without a
+Prometheus query.
+
 ### Production shape (SlateDB + S3)
 
 ```bash
@@ -327,6 +333,9 @@ M18+ milestones added:
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
+- **Per-box latency histograms** (append, admission-wait) on
+  `/metrics` and via `GET /api/admin/boxes/:id/latency` +
+  `agentdb show-latency <box>`
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

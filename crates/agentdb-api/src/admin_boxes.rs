@@ -114,6 +114,62 @@ pub async fn get_box(
     }))
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct HistogramView {
+    pub count: u64,
+    pub sum_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+}
+
+impl From<agentdb_core::HistogramSnapshot> for HistogramView {
+    fn from(s: agentdb_core::HistogramSnapshot) -> Self {
+        Self {
+            count: s.count,
+            sum_ns: s.sum_ns,
+            p50_ns: s.p50(),
+            p95_ns: s.p95(),
+            p99_ns: s.p99(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BoxLatency {
+    pub box_id: u16,
+    pub append: HistogramView,
+    pub admission_wait: HistogramView,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/boxes/{id}/latency",
+    tag = "admin",
+    params(("id" = u16, Path, description = "Box id")),
+    responses(
+        (status = 200, body = BoxLatency),
+        (status = 404, description = "No such box"),
+    ),
+)]
+pub async fn get_box_latency(
+    State(state): State<AppState>,
+    Path(id): Path<u16>,
+) -> Result<Json<BoxLatency>, ApiError> {
+    let b = state
+        .registry
+        .box_by_id(id)
+        .ok_or_else(|| agentdb_core::Error::NotFound {
+            resource: agentdb_core::Resource::Box_,
+            id: id.to_string(),
+        })?;
+    Ok(Json(BoxLatency {
+        box_id: id,
+        append: b.metrics.append_latency.snapshot().into(),
+        admission_wait: b.metrics.admission_wait_latency.snapshot().into(),
+    }))
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct InjectFaultRequest {
     pub kind: String,

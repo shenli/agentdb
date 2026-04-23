@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::cli::{
     AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, CreateTabletOpts, MigrateSessionOpts,
-    SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
+    SetShardOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -305,6 +305,16 @@ pub async fn migrate_session(opts: MigrateSessionOpts) -> Result<()> {
         .await
         .with_context(|| format!("POST {url}"))?;
     print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/boxes/:id/latency` — show p50/p95/p99.
+pub async fn show_latency(opts: ShowLatencyOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/boxes/{}/latency",
+        opts.server_url.trim_end_matches('/'),
+        opts.box_id,
+    );
+    fetch_and_print(&url).await
 }
 
 /// Read a line from stdin with a minimal prompt. Not a

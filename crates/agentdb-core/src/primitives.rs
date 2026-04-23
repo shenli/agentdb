@@ -330,6 +330,12 @@ pub async fn append_and_fetch_with_actor(
     fetch_last_n_: usize,
     now_millis: u64,
 ) -> Result<AppendFetchOutput> {
+    // Latency histogram: record the *full* append_and_fetch
+    // cost from entry to return (including admission wait,
+    // fork logic, fetch_last_n tail). A separate histogram
+    // on admission wait alone exists for diagnosing
+    // saturation vs. real work.
+    let started = std::time::Instant::now();
     // M22 drain gate: once an operator has flipped the drain
     // switch via `POST /api/admin/drain`, every subsequent write
     // fails fast with `NodeDraining`. Meaningful only for
@@ -464,6 +470,13 @@ pub async fn append_and_fetch_with_actor(
         fetch_last_n_,
     )
     .await?;
+    // Record total append_and_fetch latency (includes admission
+    // wait + tenant lock + fork lookup + event commit + fetch
+    // tail). Recorded only on the success path so a failing
+    // write doesn't pollute latency percentiles with the cost
+    // of teardown.
+    let ns = started.elapsed().as_nanos() as u64;
+    box_.metrics.append_latency.record(ns);
     Ok(AppendFetchOutput {
         new_seq: event.seq,
         recent,

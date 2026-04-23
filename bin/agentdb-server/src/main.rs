@@ -51,5 +51,6 @@ async fn main() -> anyhow::Result<()> {
             AdminTokenCmd::Revoke(opts) => admin::admin_token_revoke(opts).await,
         },
         Cmd::MigrateSession(opts) => admin::migrate_session(opts).await,
+        Cmd::ShowLatency(opts) => admin::show_latency(opts).await,
     }
 }

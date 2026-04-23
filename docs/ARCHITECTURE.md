@@ -1008,6 +1008,42 @@ Out of scope:
   land on source after the scan and survive the
   Delete. Operators should migrate idle sessions only.
 
+### Latency histograms
+
+Every box carries two fixed-bucket histograms alongside
+the existing counter metrics:
+
+- `append_latency` — full
+  `append_and_fetch_with_actor` duration (admission wait
+  + tenant lock + fork + event commit + fetch tail).
+  Recorded only on the success path.
+- `admission_wait_latency` — time spent blocked on the
+  per-box admission semaphore. Recorded only when a
+  request actually waited (fast-path excluded) so the
+  histogram reflects *pressure*, not uncontended writes.
+
+**Buckets** (upper bound inclusive):
+1 ms, 2 ms, 5 ms, 10 ms, 20 ms, 50 ms, 100 ms, 200 ms,
+500 ms, 1 s, 2 s, 5 s, 10 s, +Inf. Fourteen lock-free
+`AtomicU64` buckets + a running count + sum; `record(ns)`
+is one array index + three fetch-adds. No allocation.
+
+**Exposition.** Prometheus histogram shape: `_bucket{le}` +
+`_sum` + `_count`. Bucket upper bounds in seconds so
+standard histogram queries work out of the box.
+
+**Admin.** `GET /api/admin/boxes/:id/latency` returns
+`{ box_id, append, admission_wait }` where each view
+carries `{ count, sum_ns, p50_ns, p95_ns, p99_ns }`.
+Percentiles are linearly interpolated inside the hit
+bucket.
+
+**CLI.** `agentdb show-latency <box_id>`.
+
+Out of scope: per-session histograms (needs a bounded
+top-K sketch), read-side latency, `/metrics` labels
+beyond `box` (tenant labels would balloon the cardinality).
+
 ### TLS termination
 
 REST listens over HTTP by default. Supply `--tls-cert PATH
