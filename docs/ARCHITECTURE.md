@@ -911,11 +911,20 @@ show-tablet-load`, `agentdb shed-tablet <id> [--to N]
 - **Auto-shed / auto-create.** Detector flags; operator
   acts. Autonomy needs calibrated thresholds + anti-thrash
   logic that only production data can provide.
-- **Automatic data handoff on shed.** `shed` moves future
-  routing only; to also move the already-written events
-  operators call `POST /api/admin/sessions/:sid/migrate`
-  per session (see "Warm-session data handoff" below).
-  Coupling the two is future work.
+- **Shed with data handoff.** `POST /api/admin/tablets/:id/shed`
+  accepts `{ "migrate_data": true }` to also rekey every
+  warm session on the moved shards. Cold/archive + fork
+  parents land in `skipped_sessions`; the rest land in
+  `migrated_sessions` with event counts. Bare shed stays
+  routing-only.
+- **Auto-shed scheduler.** With
+  `AGENTDB_AUTO_SHED_ENABLED=true`, a background task
+  reads the detector's hot list on a tick (default 10s)
+  and fires shed-with-migrate against the least-loaded
+  sibling tablet. Per-tablet cooldown
+  (`AGENTDB_AUTO_SHED_COOLDOWN_SECS`, default 300s)
+  prevents thrash when the shed doesn't immediately cool
+  the source.
 - **Tablet deletion.** Once created, a tablet stays.
   Shrinking requires data migration.
 - **Per-session hot-key detection.** Requires per-session

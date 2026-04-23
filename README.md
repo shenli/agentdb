@@ -304,16 +304,22 @@ M18+ milestones added:
   runtime (no process restart). Full relief loop:
   `show-hot-tablets` → `create-tablet` → `shed-tablet
   <hot> --to <new>`
-- **Warm-session data handoff** —
-  `POST /api/admin/sessions/:sid/migrate` atomically
-  rekeys a warm session's events, record, and lookup to a
-  new tablet in a single KV write batch. Pairs with
-  `shed-tablet` to make reads-after-shed actually work.
-  Warm-only (cold/archive segments embed box_id in paths);
-  fork parents refused
+- **Warm-session data handoff** — per-session via
+  `POST /api/admin/sessions/:sid/migrate`, or bulk via
+  `shed-tablet --migrate-data` which chains the routing
+  move with a per-session warm rekey for every session
+  on the moved shards (cold/archive + fork parents
+  reported in `skipped_sessions`)
+- **Auto-shed scheduler** (optional,
+  `AGENTDB_AUTO_SHED_ENABLED=true`) — background task
+  fires shed-with-migrate against the least-loaded
+  sibling whenever the hot-tablet detector flags a
+  tablet; per-tablet cooldown
+  (`AGENTDB_AUTO_SHED_COOLDOWN_SECS`) prevents thrash
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
-  `set-shard`, `user *`, `shed-tablet`, `create-tablet`,
-  `admin-token *`, `migrate-session`, `dump-config`)
+  `set-shard`, `user *`, `shed-tablet [--migrate-data]`,
+  `create-tablet`, `admin-token *`, `migrate-session`,
+  `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
@@ -360,9 +366,6 @@ M18+ milestones added:
   tablet wherever load is lowest") is future work.
 - **Tablet deletion / shrink.** Once created, a tablet
   stays. Shrinking requires data migration.
-- **Auto-shed policy.** The detector flags; an operator
-  calls `shed`. Automatic policy needs calibrated
-  thresholds that only production data can provide.
 - **Cross-box (distributed) transactions** — design is single-box
   2PC-free.
 - **Real ANN at 100M+ vectors** — HNSW is single-node, in-process.

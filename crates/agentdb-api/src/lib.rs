@@ -17,6 +17,7 @@ pub mod admin_users;
 pub mod admin_auth_middleware;
 pub mod admin_tokens;
 pub mod auth_middleware;
+pub mod auto_shed;
 pub mod dto;
 pub mod error;
 pub mod fork;
@@ -165,6 +166,8 @@ impl AppState {
         admin_hot_tablets::TabletLoadResponse,
         admin_hot_tablets::ShedRequest,
         admin_hot_tablets::ShedResponse,
+        admin_hot_tablets::MigratedSessionSummary,
+        admin_hot_tablets::SkippedSession,
         admin_hot_tablets::CreateTabletRequest,
         admin_hot_tablets::CreateTabletResponse,
         admin_tokens::MintTokenRequest,

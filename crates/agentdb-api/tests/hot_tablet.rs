@@ -241,3 +241,76 @@ async fn detector_flags_tablet_after_burst_and_shed_moves_shards() {
         "post-shed write should land on tablet 3"
     );
 }
+
+#[tokio::test]
+async fn shed_with_migrate_data_moves_events_atomically() {
+    let (_d, _o, _m, base, registry, _detector, location) = spawn_saturable_node().await;
+
+    // Write 8 events on the default tenant-hash box.
+    let client = reqwest::Client::new();
+    let session = "s-shed-migrate";
+    let url = format!("{base}/api/tenants/t-1/sessions/{session}/append_and_fetch");
+    for i in 1..=8 {
+        let r = client
+            .post(&url)
+            .json(&json!({"event": {"i": i}, "fetch_last_n": 0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+    }
+    let from_box = registry.route_tenant("t-1").id;
+    let to_box = (from_box + 1) % 4;
+
+    // Set an override so the session's shard is on from_box
+    // (needed so shed sees it in list_by_tablet). Pin the
+    // shard to from_box explicitly.
+    let shard_id = agentdb_core::shard_id(session) as i64;
+    let r = client
+        .post(format!("{base}/api/admin/shards/{shard_id}"))
+        .json(&json!({ "tablet_id": from_box }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    location.refresh().await.unwrap();
+
+    // Shed the one shard off from_box → to_box with
+    // migrate_data=true. The response should list our
+    // session as migrated.
+    let r = client
+        .post(format!("{base}/api/admin/tablets/{from_box}/shed"))
+        .json(&json!({"to_tablet_id": to_box, "fraction": 1.0, "migrate_data": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "shed w/ migrate failed: {}",
+        r.text().await.unwrap()
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    let migrated = body["migrated_sessions"].as_array().unwrap();
+    assert!(
+        migrated.iter().any(|m| m["session_id"].as_str() == Some(session)),
+        "shed should have migrated {session}; got {body}"
+    );
+    let m = migrated
+        .iter()
+        .find(|m| m["session_id"].as_str() == Some(session))
+        .unwrap();
+    assert_eq!(m["events_migrated"].as_u64(), Some(8));
+
+    // One more write — lands on the new box and the full
+    // history is visible.
+    let r = client
+        .post(&url)
+        .json(&json!({"event": {"i": 9}, "fetch_last_n": 30}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["recent"].as_array().unwrap().len(), 9);
+}

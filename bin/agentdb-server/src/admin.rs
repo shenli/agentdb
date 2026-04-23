@@ -195,6 +195,9 @@ pub async fn shed_tablet(opts: ShedTabletOpts) -> Result<()> {
     if let Some(f) = opts.fraction {
         body["fraction"] = serde_json::Value::from(f);
     }
+    if opts.migrate_data {
+        body["migrate_data"] = serde_json::Value::from(true);
+    }
     let client = admin_client();
     let resp = client
         .post(&url)

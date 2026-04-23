@@ -173,6 +173,15 @@ pub struct ShedTabletOpts {
     /// Defaults server-side to 0.5. Clamps to (0, 1].
     #[arg(long)]
     pub fraction: Option<f64>,
+    /// When set, after moving the shards the server also
+    /// rekeys every warm session on those shards to the
+    /// destination tablet in an atomic write-batch per
+    /// session. Cold / archive / fork-parent sessions are
+    /// skipped with a reason in the response. Without
+    /// this flag, shed only moves future routing —
+    /// already-written events stay on source.
+    #[arg(long = "migrate-data", default_value_t = false)]
+    pub migrate_data: bool,
 }
 
 #[derive(Subcommand, Debug)]

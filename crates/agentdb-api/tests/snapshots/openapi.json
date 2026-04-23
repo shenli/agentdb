@@ -2167,6 +2167,27 @@
           }
         }
       },
+      "MigratedSessionSummary": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "tenant_id",
+          "events_migrated"
+        ],
+        "properties": {
+          "events_migrated": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          }
+        }
+      },
       "MintTokenRequest": {
         "type": "object",
         "properties": {
@@ -2585,6 +2606,10 @@
             "format": "double",
             "description": "Fraction of the source's currently-overridden shards to\nmove. Clamped to (0, 1]. Defaults to 0.5 (half)."
           },
+          "migrate_data": {
+            "type": "boolean",
+            "description": "When true, after reassigning the shards the server\nenumerates sessions on the source tablet whose shard\nis in the moved set and migrates each warm one to\nthe destination via\n[`agentdb_core::migrate_warm_session`]. Cold/archive\nsessions are reported in `skipped_sessions` and\notherwise left alone. Default false for backward\ncompatibility (previous callers don't expect data to\nmove)."
+          },
           "to_tablet_id": {
             "type": [
               "integer",
@@ -2603,12 +2628,26 @@
           "moved_shards"
         ],
         "properties": {
+          "migrated_sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MigratedSessionSummary"
+            },
+            "description": "Sessions whose warm state was rekeyed to the dest\ntablet. Only populated when `migrate_data == true`."
+          },
           "moved_shards": {
             "type": "array",
             "items": {
               "type": "integer",
               "format": "int64"
             }
+          },
+          "skipped_sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkippedSession"
+            },
+            "description": "Sessions on the moved shards that the migration\nrefused (cold / archive / fork parent). Operators\nhandle these out of band."
           },
           "source_tablet_id": {
             "type": "integer",
@@ -2617,6 +2656,25 @@
           "to_tablet_id": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "SkippedSession": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "tenant_id",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
           }
         }
       },
