@@ -1044,6 +1044,36 @@ Out of scope: per-session histograms (needs a bounded
 top-K sketch), read-side latency, `/metrics` labels
 beyond `box` (tenant labels would balloon the cardinality).
 
+### Admin audit log
+
+Every request that reaches the admin-auth middleware (on
+`/api/admin/*`) is persisted to the meta store's
+`admin_audit` table, including 401 rejections. One row
+records: timestamp, actor token id (NULL when the request
+failed auth or took the bootstrap mint exception), method,
+path, query string, response status, and client IP
+(X-Forwarded-For leftmost entry — NULL when there's no
+reverse proxy).
+
+Reads are `GET /api/admin/audit` with filters: `limit`,
+`since_ms`, `until_ms`, `actor_id`, `path_prefix`. Rows
+return newest first; clients paginate by passing the
+oldest `ts_ms` from a page as the next `until_ms`.
+`agentdb audit-log` wraps this from the CLI.
+
+Writes are fire-and-forget: the middleware spawns the
+insert after `next.run(req)` so a slow SQLite write never
+blocks the client response. Insert failures log at warn
+and are otherwise invisible.
+
+Out of scope: request-body hashing (bodies are tiny and
+the interesting operations — who revoked which token, who
+migrated which session — are visible from method + path +
+query); time- or count-based retention (operators prune
+the meta store directly today); surfacing the audit log
+on `/metrics` (row counts are a gauge, but tailing is a
+worse UX than the JSON endpoint).
+
 ### TLS termination
 
 REST listens over HTTP by default. Supply `--tls-cert PATH

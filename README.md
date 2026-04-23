@@ -336,6 +336,10 @@ M18+ milestones added:
 - **Per-box latency histograms** (append, admission-wait) on
   `/metrics` and via `GET /api/admin/boxes/:id/latency` +
   `agentdb show-latency <box>`
+- **Admin audit log** — every `/api/admin/*` request
+  (including 401 attempts) persists to the meta store.
+  Query via `GET /api/admin/audit` or `agentdb audit-log`
+  with actor / path-prefix / time-window filters
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

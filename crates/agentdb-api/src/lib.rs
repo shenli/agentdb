@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 
 pub mod admin;
+pub mod admin_audit;
 pub mod admin_boxes;
 pub mod admin_drain;
 pub mod admin_nodes;
@@ -101,6 +102,7 @@ impl AppState {
         fork::fork_handler,
         admin::force_tier,
         admin::get_hlc,
+        admin_audit::list_audit,
         admin_boxes::list_boxes,
         admin_boxes::get_box,
         admin_boxes::inject_fault,
@@ -137,6 +139,7 @@ impl AppState {
         admin::ForceTierRequest,
         admin::ForceTierResponse,
         admin::HlcStatus,
+        admin_audit::AuditRecordView,
         admin_boxes::BoxListItem,
         admin_boxes::QuotaView,
         admin_boxes::InjectFaultRequest,
@@ -318,6 +321,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tokens/:token_id",
             axum::routing::delete(admin_tokens::revoke_token),
+        )
+        .route(
+            "/api/admin/audit",
+            axum::routing::get(admin_audit::list_audit),
         );
     let admin_routes = admin_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),

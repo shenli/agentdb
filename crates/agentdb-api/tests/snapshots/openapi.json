@@ -10,6 +10,85 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/admin/audit": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_audit",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Cap on returned rows. Defaults to\n[`agentdb_meta::audit::DEFAULT_LIMIT`]; clamped to\n[`agentdb_meta::audit::MAX_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "since_ms",
+            "in": "query",
+            "description": "Inclusive lower bound on `ts_ms` (wall-clock, UTC).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "until_ms",
+            "in": "query",
+            "description": "Exclusive upper bound on `ts_ms`. Pass the oldest\n`ts_ms` from a previous page to paginate.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "actor_id",
+            "in": "query",
+            "description": "Exact match on an admin token id.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path_prefix",
+            "in": "query",
+            "description": "Literal prefix on `path`. LIKE wildcards are escaped\nso operators can paste a real URL prefix.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit rows (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditRecordView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
     "/api/admin/boxes": {
       "get": {
         "tags": [
@@ -1341,6 +1420,55 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "AuditRecordView": {
+        "type": "object",
+        "required": [
+          "id",
+          "ts_ms",
+          "method",
+          "path",
+          "status"
+        ],
+        "properties": {
+          "actor_token_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "method": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

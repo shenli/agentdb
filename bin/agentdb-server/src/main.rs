@@ -52,5 +52,6 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::MigrateSession(opts) => admin::migrate_session(opts).await,
         Cmd::ShowLatency(opts) => admin::show_latency(opts).await,
+        Cmd::AuditLog(opts) => admin::audit_log(opts).await,
     }
 }

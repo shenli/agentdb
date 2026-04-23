@@ -95,6 +95,11 @@ pub enum Cmd {
     /// HTTP-client wrapper for
     /// `GET /api/admin/boxes/:id/latency`.
     ShowLatency(ShowLatencyOpts),
+    /// List recent admin-plane requests from the audit log.
+    /// Every request that hits `/api/admin/*` (including
+    /// 401 attempts) is recorded.
+    /// HTTP-client wrapper for `GET /api/admin/audit`.
+    AuditLog(AuditLogOpts),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -104,6 +109,30 @@ pub struct ShowLatencyOpts {
     pub server_url: String,
     /// Box id. Required positional.
     pub box_id: u16,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditLogOpts {
+    /// Base URL of the server.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Maximum rows to return (server clamps to its MAX_LIMIT).
+    #[arg(long, default_value_t = 50)]
+    pub limit: i64,
+    /// Only include rows at or after this `ts_ms` (UTC ms).
+    #[arg(long = "since-ms")]
+    pub since_ms: Option<i64>,
+    /// Only include rows strictly before this `ts_ms`. Pair
+    /// with `--since-ms` for windowed queries, or with the
+    /// oldest `ts_ms` from a previous page to paginate.
+    #[arg(long = "until-ms")]
+    pub until_ms: Option<i64>,
+    /// Exact match on admin token id (e.g. `9f2a...`).
+    #[arg(long = "actor")]
+    pub actor_id: Option<String>,
+    /// Literal URL-path prefix (LIKE wildcards are escaped).
+    #[arg(long = "path-prefix")]
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
