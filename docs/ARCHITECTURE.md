@@ -911,13 +911,93 @@ show-tablet-load`, `agentdb shed-tablet <id> [--to N]
 - **Auto-shed / auto-create.** Detector flags; operator
   acts. Autonomy needs calibrated thresholds + anti-thrash
   logic that only production data can provide.
-- **Data handoff on shed.** Shed moves *future* routing,
-  not already-written data. The "quiesce + handoff" gap is
-  documented.
+- **Automatic data handoff on shed.** `shed` moves future
+  routing only; to also move the already-written events
+  operators call `POST /api/admin/sessions/:sid/migrate`
+  per session (see "Warm-session data handoff" below).
+  Coupling the two is future work.
 - **Tablet deletion.** Once created, a tablet stays.
   Shrinking requires data migration.
 - **Per-session hot-key detection.** Requires per-session
   metrics the prototype doesn't track.
+
+### Warm-session data handoff
+
+Closes the single biggest correctness gap from the M20 /
+M22 / M25 era: when `shed` (or `set_shard`) reassigns a
+shard, previously-written events stay on the old tablet,
+so session-scoped reads routed to the new tablet miss
+them.
+
+**Design.**
+`agentdb_core::handoff::migrate_warm_session(registry,
+kv, tenants, sessions, tenant_external,
+session_external, to_box_id, now_ms)` atomically rekeys
+a warm session from its current box to the destination
+box, in a single `write_batch` over the shared KV store:
+
+1. Locate the source: scan the registry's current boxes
+   for a matching `(tenant, session)`.
+2. Refuse if `tier != Warm` (cold/archive segments embed
+   `box_id` in their object-store paths; copying is out
+   of scope).
+3. Refuse if the session is a fork parent (child
+   sessions carry `parent_session_internal_id` pointing
+   into the source's session registry; cross-box fork
+   trees aren't supported yet).
+4. Mint or resolve the tenant + session on the
+   destination. `tenant_internal_id` is per-box, so
+   dest's internal id is different from source's —
+   every migrated event's key has both ids remapped.
+5. Scan the source's `Events` prefix; build a
+   `WriteOp::Put(new_key) + WriteOp::Delete(old_key)`
+   pair per event, plus the session record
+   replace/delete pair.
+6. `kv.write_batch(ops)` — atomic at the RocksDB level.
+   Either every event is under the new keys or nothing
+   is.
+7. Replay events into the dest box's `PerBoxIndexes`
+   (best-effort; the lazy-build path rebuilds from KV on
+   first read if this step fails).
+
+**Admin surface.**
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/admin/sessions/:sid/migrate` | Move one warm session; body `{ tenant_id, to_tablet_id }` |
+
+Returns `{ events_migrated, from_tablet_id, to_tablet_id }`.
+Errors: 404 (session or tenant not found), 409 (cold/archive,
+or has forked children).
+
+**CLI.** `agentdb migrate-session <sid> --tenant t --to N`.
+
+**Operator workflow for full shed-with-data-handoff:**
+
+```bash
+# See what's hot
+agentdb show-hot-tablets
+
+# Move future traffic off the hot one
+agentdb shed-tablet <hot> --to <new>
+
+# Move the already-written data for each affected session
+for sid in $(agentdb show-shard <session_hint> | jq -r ...); do
+  agentdb migrate-session $sid --tenant t-1 --to <new>
+done
+```
+
+Out of scope:
+- **Cold / archive migration** — would need to copy the
+  object-store segment or rewrite its path.
+- **Cross-node migration** — intra-process (shared KV)
+  only; cross-node would need snapshot shipping.
+- **Fork-parent migration** — refused; children's
+  parent pointers are box-local.
+- **Quiesce / concurrent-write safety.** A writer that
+  appends during the scan-window may have its event
+  land on source after the scan and survive the
+  Delete. Operators should migrate idle sessions only.
 
 ### SCRAM-SHA-256 auth (M19)
 
@@ -1044,6 +1124,8 @@ agentdb create-tablet       POST /api/admin/tablets/create
 agentdb admin-token add     POST /api/admin/tokens
 agentdb admin-token list    GET  /api/admin/tokens
 agentdb admin-token revoke <id>  DELETE /api/admin/tokens/:id
+agentdb migrate-session <sid> --tenant T --to N
+                            POST /api/admin/sessions/:sid/migrate
 ```
 
 `--dev` sets up an ephemeral tempdir for KV + object store + meta;

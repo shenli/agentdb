@@ -5,6 +5,7 @@ pub mod box_runtime;
 pub mod error;
 pub mod forwarding;
 pub mod fork;
+pub mod handoff;
 pub mod hedge;
 pub mod hlc;
 pub mod hot_tablet;
@@ -37,6 +38,7 @@ pub use box_runtime::{
 pub use error::{Error, Resource, Result};
 pub use forwarding::{NodeAddressProxy, NodeAddressRefreshJob, NodeTarget};
 pub use fork::fork_session;
+pub use handoff::{migrate_warm_session, MigratedSession};
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};
 pub use hlc::{HlcClock, HlcError, HlcTimestamp};
 pub use hot_tablet::{HotTablet, HotTabletConfig, HotTabletDetector, TabletLoad};

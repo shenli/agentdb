@@ -304,9 +304,16 @@ M18+ milestones added:
   runtime (no process restart). Full relief loop:
   `show-hot-tablets` → `create-tablet` → `shed-tablet
   <hot> --to <new>`
+- **Warm-session data handoff** —
+  `POST /api/admin/sessions/:sid/migrate` atomically
+  rekeys a warm session's events, record, and lookup to a
+  new tablet in a single KV write batch. Pairs with
+  `shed-tablet` to make reads-after-shed actually work.
+  Warm-only (cold/archive segments embed box_id in paths);
+  fork parents refused
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
   `set-shard`, `user *`, `shed-tablet`, `create-tablet`,
-  `dump-config`)
+  `admin-token *`, `migrate-session`, `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
@@ -328,12 +335,15 @@ M18+ milestones added:
   whatever box its parent was on; the child's `session_id`
   hashes independently and reads routed by that hash may
   miss it.
-- **Quiesce / data-handoff on reassignment.** Moves via
-  `set_shard` or the reaper change *future* routing; data already
-  accepted on the old box stays there (append-only event streams
-  remain durable wherever they were written, but cross-box reads
-  that don't consult the shard map will miss them). Reads still
-  route by tenant-hash.
+- **Automatic data handoff on shed.** `shed` moves future
+  routing; operators call `migrate-session` per affected
+  session to move the already-written events. Coupling the
+  two (so `shed` also migrates every session on the moved
+  shards) is future work.
+- **Cross-node / cold-session handoff.** `migrate-session`
+  is warm-only and intra-process (shared KV). Cross-node
+  would need snapshot shipping; cold/archive needs
+  object-store path rewrites.
 - **Admin-plane mTLS / scoped tokens.** Bearer-token auth
   ships; every token has full admin access today. Scoped
   ("read-only", "shed-only") tokens and mTLS-based admin
