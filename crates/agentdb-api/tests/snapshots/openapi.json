@@ -451,6 +451,60 @@
         }
       }
     },
+    "/api/admin/sessions/{session_id}/migrate": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "migrate_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session to move",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrateSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session or tenant not found"
+          },
+          "409": {
+            "description": "Session tier is cold/archive; migration refuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/shards": {
       "get": {
         "tags": [
@@ -2067,6 +2121,48 @@
           "webhook_fires": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "MigrateSessionRequest": {
+        "type": "object",
+        "required": [
+          "tenant_id",
+          "to_tablet_id"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string"
+          },
+          "to_tablet_id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "MigrateSessionResponse": {
+        "type": "object",
+        "required": [
+          "events_migrated",
+          "from_tablet_id",
+          "to_tablet_id"
+        ],
+        "properties": {
+          "events_migrated": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "from_tablet_id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "to_tablet_id": {
+            "type": "integer",
+            "format": "int32",
             "minimum": 0
           }
         }

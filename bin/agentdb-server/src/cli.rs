@@ -82,6 +82,29 @@ pub enum Cmd {
     /// `AGENTDB_REQUIRE_ADMIN_AUTH=true` on the server.
     #[command(subcommand)]
     AdminToken(AdminTokenCmd),
+    /// Migrate a warm session from its current tablet to a
+    /// new one. Use `shed-tablet` first to move the shard,
+    /// then `migrate-session` to move any previously-
+    /// written events so reads via the new tablet find
+    /// them.
+    /// HTTP-client wrapper for
+    /// `POST /api/admin/sessions/:sid/migrate`.
+    MigrateSession(MigrateSessionOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MigrateSessionOpts {
+    /// Base URL of the server.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Session to move. Required positional.
+    pub session_id: String,
+    /// Tenant that owns the session.
+    #[arg(long)]
+    pub tenant: String,
+    /// Destination tablet id.
+    #[arg(long)]
+    pub to: u16,
 }
 
 #[derive(Subcommand, Debug)]

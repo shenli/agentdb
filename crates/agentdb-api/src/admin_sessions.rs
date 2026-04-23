@@ -123,3 +123,64 @@ pub async fn get_session(
         Err(e) => e.into_response(),
     }
 }
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct MigrateSessionRequest {
+    pub tenant_id: String,
+    pub to_tablet_id: u16,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct MigrateSessionResponse {
+    pub events_migrated: u64,
+    pub from_tablet_id: u16,
+    pub to_tablet_id: u16,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/sessions/{session_id}/migrate",
+    tag = "admin",
+    params(("session_id" = String, Path, description = "Session to move")),
+    request_body = MigrateSessionRequest,
+    responses(
+        (status = 200, body = MigrateSessionResponse),
+        (status = 404, description = "Session or tenant not found"),
+        (status = 409, description = "Session tier is cold/archive; migration refuses",
+            body = ErrorResponse),
+    ),
+)]
+pub async fn migrate_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<MigrateSessionRequest>,
+) -> Result<Json<MigrateSessionResponse>, ApiError> {
+    let now_ms = crate::stream::now_ms();
+    let result = agentdb_core::migrate_warm_session(
+        &state.registry,
+        state.registry.kv(),
+        &state.tenants,
+        &state.sessions,
+        &body.tenant_id,
+        &session_id,
+        body.to_tablet_id,
+        now_ms,
+    )
+    .await
+    .map_err(|e| match e {
+        agentdb_core::Error::Invalid {
+            field: Some(ref f),
+            ref message,
+        } if f == "tier" => ApiError::Conflict(message.clone()),
+        agentdb_core::Error::Invalid {
+            field: Some(ref f),
+            ref message,
+        } if f == "forked_from" => ApiError::Conflict(message.clone()),
+        other => ApiError::Core(other),
+    })?;
+    Ok(Json(MigrateSessionResponse {
+        events_migrated: result.events_migrated,
+        from_tablet_id: result.from_box_id,
+        to_tablet_id: result.to_box_id,
+    }))
+}

@@ -110,6 +110,7 @@ impl AppState {
         admin_nodes::list_nodes,
         admin_scheduler::get_scheduler,
         admin_sessions::get_session,
+        admin_sessions::migrate_session,
         admin_shards::get_shard_by_id,
         admin_shards::get_shard_by_session,
         admin_shards::list_shard_overrides,
@@ -150,6 +151,8 @@ impl AppState {
         admin_scheduler::SchedulerUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
+        admin_sessions::MigrateSessionRequest,
+        admin_sessions::MigrateSessionResponse,
         admin_shards::SetShardRequest,
         admin_shards::ShardAssignment,
         admin_shards::ShardOverride,
@@ -239,6 +242,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/sessions/:session_id",
             axum::routing::get(admin_sessions::get_session),
+        )
+        .route(
+            "/api/admin/sessions/:session_id/migrate",
+            axum::routing::post(admin_sessions::migrate_session),
         )
         .route(
             "/api/admin/nodes",

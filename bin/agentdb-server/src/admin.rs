@@ -18,8 +18,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, CreateTabletOpts, SetShardOpts,
-    ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
+    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, CreateTabletOpts, MigrateSessionOpts,
+    SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -280,6 +280,28 @@ pub async fn admin_token_revoke(opts: AdminTokenRevokeOpts) -> Result<()> {
         std::process::exit(exit_code_for(status));
     }
     Ok(())
+}
+
+/// `POST /api/admin/sessions/:sid/migrate` — warm session
+/// data handoff between two local tablets on this node.
+pub async fn migrate_session(opts: MigrateSessionOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/sessions/{}/migrate",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.session_id),
+    );
+    let body = serde_json::json!({
+        "tenant_id": opts.tenant,
+        "to_tablet_id": opts.to,
+    });
+    let client = admin_client();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
 }
 
 /// Read a line from stdin with a minimal prompt. Not a
