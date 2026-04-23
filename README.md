@@ -72,6 +72,40 @@ cd workload && go run ./cmd/agentdb-workload -config config.yaml
 Hit the Go workload's control server on `:9090` (`/demo/burst`,
 `/demo/fork`, `/demo/cold`) for scripted load shaping.
 
+### Docker compose (SlateDB + MinIO)
+
+A production-shape stack with MinIO as the S3-compatible backend
+lives under [`examples/compose/`](examples/compose/):
+
+```bash
+cd examples/compose
+docker compose up --build
+# REST + dashboard + /metrics on :7878, Mongo wire on :7879,
+# MinIO console on :9001 (minio / minio123)
+docker compose exec agentdb agentdb show-scheduler
+```
+
+The compose stack is single-node — multi-node is blocked on the
+M20 shard/tablet refactor. Use `agentdb serve --dev` for local
+development; the compose stack is for operators evaluating the
+production storage path without provisioning real S3.
+
+### Prometheus metrics
+
+Every running server exposes `/metrics` in Prometheus text format:
+
+```bash
+curl -s http://127.0.0.1:7878/metrics | grep agentdb_appends_total
+# agentdb_appends_total{box="0"} 42
+# agentdb_appends_total{box="1"} 37
+# ...
+```
+
+Point Prometheus / Grafana Agent / VictoriaMetrics at it — no
+extra config needed. See
+[`docs/ARCHITECTURE.md` § Prometheus exposition](docs/ARCHITECTURE.md#prometheus-exposition-m27-piece)
+for the full metric catalog.
+
 ### Production shape (SlateDB + S3)
 
 ```bash
@@ -221,22 +255,54 @@ cargo bench -p agentdb-index --bench vector_bench     # HNSW vs brute-force vect
 
 ## Status
 
-Prototype. Every agent-native primitive from the design doc is
-implemented within one box: append-and-fetch, fork, hybrid retrieval,
-three-tier lifecycle, box isolation, admission control, lifecycle
-webhooks, MVCC snapshot reads, and a choice of pluggable KV backend.
+Prototype with a working control plane. Every single-process agent-
+native primitive is implemented (append-and-fetch, fork, hybrid
+retrieval, three-tier lifecycle, box isolation, admission control,
+lifecycle webhooks, MVCC snapshot reads, HLC, pluggable KV). The
+M18+ milestones added:
 
-**Explicitly out of scope for the prototype:**
+- **SQLite control plane** (tenants, nodes, tablets, shards, scheduler leader)
+- **Tablet leases** with fencing-token epoch — writes fail fast on lease loss
+- **Node membership + heartbeat** with stale-node detection
+- **Scheduler leader election** via singleton lease (SQLite
+  equivalent of `pg_advisory_lock`)
+- **Stale-lease reaper** — the elected leader cleans up dead
+  owners' tablet rows
+- **Node drain** (`POST /api/admin/drain`) with drain-aware lease
+  renewal for clean handoff without SIGTERM
+- **Per-tenant locking** + per-box admission semaphore
+- **Shard hash + `LocationProxy`** with operator-visible
+  assignment management (admin endpoint + CLI)
+- **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
+  `set-shard`, `dump-config`)
+- **Docker packaging** (multi-stage `Dockerfile`, compose stack
+  with MinIO)
+- **Prometheus `/metrics`** exposition
+- **Structured `/health/ready`** body with per-reason `doc_url`
+- **Runbook library** for every REST error code
 
-- Cross-box (distributed) transactions — design is single-box 2PC-free
-- Replication / HA — single process, no leader election
-- LLM / embedding generation — caller's responsibility, webhook signal only
-- Production-grade auth / quotas / billing — admin endpoints are open
-- Real ANN at 100M+ vectors — HNSW is single-node
-- Fine-grained observability beyond per-box counters + SSE
+**Still out of scope:**
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §"What the prototype
-does NOT do" for the current limitation list.
+- **M20 write-path integration** — shard-based routing + tablet
+  layout refactor. The `LocationProxy` is built and tested but
+  not yet wired into `append_and_fetch`. Multi-node compose is
+  blocked on this.
+- **M19 SCRAM + tenant-implicit auth** — admin endpoints remain
+  open, tenants still explicit in the request path.
+- **M22 reassignment policy** — cross-AZ preference, anti-
+  affinity, node-weight awareness. Reaper clears dead-owner rows
+  but doesn't elect replacements.
+- **M25 hot-tablet auto-split** — depends on M20's tablet
+  abstraction being real.
+- **Cross-box (distributed) transactions** — design is single-box
+  2PC-free.
+- **Real ANN at 100M+ vectors** — HNSW is single-node, in-process.
+- **LLM / embedding generation** — caller's responsibility;
+  webhook signal only.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Control plane
+(M18 and later)" and "What the prototype does NOT do" for the full
+picture.
 
 ---
 

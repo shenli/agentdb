@@ -1,0 +1,25 @@
+# Anything rebuilt inside the container — don't ship it into the
+# build context.
+target/
+.worktrees/
+
+# Local dev state.
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# IDE + git clutter.
+.idea/
+.vscode/
+.git/
+
+# Docs + scripts that aren't needed to compile.
+docs/
+scripts/
+benchmarks/
+workload/target/
+
+# Test fixtures that bloat the context but aren't compile inputs.
+**/*.png
+**/*.svg
