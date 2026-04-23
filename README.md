@@ -27,21 +27,50 @@ when you actually build them.
 
 ## Quickstart
 
+The `agentdb` binary has a clap CLI with subcommands. `agentdb serve`
+runs the server; a handful of admin subcommands wrap the operator
+endpoints so you don't have to curl them manually.
+
 ```bash
-# 1. Start the server (REST on :7878, Mongo wire on :7879)
-cargo run -p agentdb-server
+# 1. Build once
+cargo build -p agentdb-server
 
-# 2. Dashboard
-open http://127.0.0.1:7878/dashboard
+# 2. Dev mode — ephemeral tempdirs, zero-config launch
+./target/debug/agentdb serve --dev
+```
 
-# 3. Drive some synthetic traffic
+Dev mode uses a fresh temp directory for RocksDB + object store +
+meta SQLite; state doesn't persist across restart. Perfect for a
+first-time-user walkthrough and for local testing.
+
+```bash
+# 3. In another shell — hit the admin endpoints through the CLI
+./target/debug/agentdb show-scheduler
+./target/debug/agentdb show-tablets
+./target/debug/agentdb show-nodes
+
+# 4. Or gracefully drain before shutdown
+./target/debug/agentdb drain
+
+# 5. See what config the server would run with
+./target/debug/agentdb dump-config
+
+# 6. Dashboard at http://127.0.0.1:7878/dashboard
+```
+
+For production-shaped config, run `agentdb serve` without `--dev`
+and set the relevant env vars (see [Configuration](#configuration-env-vars)
+below). Env vars still work on every invocation — the clap flags are
+optional overrides, not replacements.
+
+### Synthetic workload
+
+```bash
 cd workload && go run ./cmd/agentdb-workload -config config.yaml
 ```
 
-The dashboard has three demo buttons — fork a session, inject a
-latency fault on box 0, cool a session. For scripted load shaping, hit
-the Go workload's control server on `:9090` (`/demo/burst`,
-`/demo/fork`, `/demo/cold`).
+Hit the Go workload's control server on `:9090` (`/demo/burst`,
+`/demo/fork`, `/demo/cold`) for scripted load shaping.
 
 ### Production shape (SlateDB + S3)
 
