@@ -1,10 +1,14 @@
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::Json;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use crate::dto::{AppendAndFetchRequest, AppendAndFetchResponse, EventDto};
 use crate::error::{ApiError, ErrorResponse};
+use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::AppState;
 
 #[utoipa::path(
@@ -19,25 +23,89 @@ use crate::AppState;
     responses(
         (status = 200, description = "Event appended; last N events returned", body = AppendAndFetchResponse),
         (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 421, description = "Routing drift on a forwarded request"),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
-        (status = 503, description = "Fault injected", body = ErrorResponse),
+        (status = 503, description = "Fault injected, forwarding failed, or node draining", body = ErrorResponse),
     ),
 )]
 #[tracing::instrument(
     name = "rest.append_and_fetch",
-    skip(state, body),
+    skip(state, headers, body),
     fields(
         tenant = %tenant,
         session = %session,
-        actor = body.actor_id.as_deref().unwrap_or(""),
-        fetch_last_n = body.fetch_last_n,
+        forwarded = headers.contains_key(FORWARDED_HEADER),
     ),
 )]
 pub async fn append_and_fetch(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
-    Json(body): Json<AppendAndFetchRequest>,
-) -> Result<Json<AppendAndFetchResponse>, ApiError> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // M20 multi-node: decide whether to write locally or
+    // forward before we deserialize, so we can ship the original
+    // bytes to the peer without a round-trip through JSON.
+    let decision = state.registry.route_session_for_write(&tenant, &session);
+    let already_forwarded = headers.contains_key(FORWARDED_HEADER);
+
+    if let agentdb_core::RouteDecision::Remote { target, tablet_id } = &decision {
+        if already_forwarded {
+            // A peer forwarded to us, and our own routing still
+            // says Remote. Routing drift between nodes — surface
+            // 421 so operators see it in logs rather than a
+            // silent infinite loop.
+            let local_node = state
+                .registry
+                .node_id()
+                .unwrap_or("unknown")
+                .to_string();
+            return forwarding::misdirected_reply(&local_node, *tablet_id);
+        }
+        // Count the forward attempt on box 0 (admin-chosen
+        // attribution — the actual write lands on a remote
+        // box, so there's no natural local box to attribute to).
+        let box_for_metrics = state.registry.box_by_id(0);
+        if let Some(ref b) = box_for_metrics {
+            b.metrics.forwarded_writes_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let passthrough = PassthroughHeaders::from_headers(&headers);
+        match forwarding::forward_append_and_fetch(
+            &state.http,
+            target,
+            &tenant,
+            &session,
+            body,
+            passthrough,
+        )
+        .await
+        {
+            Ok(resp) => return resp,
+            Err(err) => {
+                if let Some(b) = box_for_metrics {
+                    b.metrics
+                        .forwarded_write_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let body = err.to_body();
+                let status = StatusCode::SERVICE_UNAVAILABLE;
+                return (status, axum::Json(body)).into_response();
+            }
+        }
+    }
+
+    // Local path: deserialize the body we read as bytes and
+    // fall through to the existing append_and_fetch.
+    let parsed: AppendAndFetchRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::Core(agentdb_core::Error::Invalid {
+                field: None,
+                message: format!("invalid JSON body: {e}"),
+            })
+            .into_response()
+        }
+    };
     let now_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -48,9 +116,9 @@ pub async fn append_and_fetch(
         &state.sessions,
         &tenant,
         &session,
-        body.event,
-        body.actor_id,
-        body.fetch_last_n,
+        parsed.event,
+        parsed.actor_id,
+        parsed.fetch_last_n,
         now_millis,
     )
     .await
@@ -69,16 +137,18 @@ pub async fn append_and_fetch(
                 kind: scope.as_str().into(),
                 tenant: Some(tenant.clone()),
             });
-            return Err(ApiError::Core(agentdb_core::Error::TooManyRequests {
+            return ApiError::Core(agentdb_core::Error::TooManyRequests {
                 scope,
                 retry_after_ms,
-            }));
+            })
+            .into_response();
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return ApiError::Core(e).into_response(),
     };
     let recent = out.recent.into_iter().map(EventDto::from).collect();
-    Ok(Json(AppendAndFetchResponse {
+    axum::Json(AppendAndFetchResponse {
         seq: out.new_seq,
         recent,
-    }))
+    })
+    .into_response()
 }

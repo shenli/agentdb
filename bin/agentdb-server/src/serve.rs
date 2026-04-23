@@ -407,6 +407,32 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         "location proxy attached to registry; shard refresh loop started"
     );
 
+    // M20 multi-node: build the node-address proxy so writes
+    // for tablets owned elsewhere forward instead of falling
+    // back to tenant-hash. The refresh tick is shorter than
+    // LocationProxy's because node address changes (node
+    // restart, IP change) are failover-critical.
+    let node_address_proxy =
+        agentdb_core::NodeAddressProxy::new(meta.clone(), cfg.node_id.clone())
+            .await
+            .context("initialize NodeAddressProxy")?;
+    let node_addr_refresh_secs: u64 = std::env::var("AGENTDB_NODE_ADDR_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let _node_addr_refresh_job = agentdb_core::NodeAddressRefreshJob::start(
+        node_address_proxy.clone(),
+        Duration::from_secs(node_addr_refresh_secs),
+    );
+    std::mem::forget(_node_addr_refresh_job);
+    registry
+        .attach_node_address(node_address_proxy.clone())
+        .map_err(|_| anyhow::anyhow!("node address proxy already attached"))?;
+    tracing::info!(
+        refresh_secs = node_addr_refresh_secs,
+        "node address proxy attached to registry; cross-node forwarding active"
+    );
+
     // Stale-lease reaper. Started after the location proxy so it
     // can refresh the local cache immediately after reassigning
     // shards away from a reaped tablet (M22).

@@ -61,6 +61,16 @@ pub struct BoxMetrics {
     /// workload needs `AGENTDB_ADMISSION_CAPACITY` raised or the
     /// cluster needs more boxes.
     pub admission_waits_total: AtomicU64,
+    // M20 multi-node forwarding:
+    /// Count of writes this node has forwarded to a peer node
+    /// because the target tablet is owned elsewhere. Counted
+    /// on the originating node's box 0 (admin-chosen attribution
+    /// since the actual work happens on the remote box).
+    pub forwarded_writes_total: AtomicU64,
+    /// Forwarded writes that the peer rejected (non-2xx
+    /// response) or that failed to connect. Helps operators
+    /// diagnose partial multi-node partitions.
+    pub forwarded_write_failures_total: AtomicU64,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -227,6 +237,10 @@ impl BoxMetrics {
             lease_lost: self.lease_lost.load(Ordering::Relaxed),
             lease_epoch: self.lease_epoch.load(Ordering::Relaxed),
             admission_waits_total: self.admission_waits_total.load(Ordering::Relaxed),
+            forwarded_writes_total: self.forwarded_writes_total.load(Ordering::Relaxed),
+            forwarded_write_failures_total: self
+                .forwarded_write_failures_total
+                .load(Ordering::Relaxed),
             gauges: self.gauges.read().clone(),
         }
     }
@@ -259,6 +273,8 @@ pub struct MetricsSnapshot {
     pub lease_lost: u64,
     pub lease_epoch: u64,
     pub admission_waits_total: u64,
+    pub forwarded_writes_total: u64,
+    pub forwarded_write_failures_total: u64,
     pub gauges: GaugeSnapshot,
 }
 

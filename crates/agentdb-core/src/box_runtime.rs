@@ -45,6 +45,39 @@ pub struct Quota {
 /// higher-concurrency workloads via `BoxRegistry::new_with_capacity`.
 pub const DEFAULT_ADMISSION_CAPACITY: u32 = 64;
 
+/// Result of a write-path routing decision. `Local` is the
+/// fast path — the caller hands off to an `Arc<Box_>` and runs
+/// the append/fetch inline. `Remote` means the tablet is owned
+/// by another node; the caller must forward the request via
+/// HTTP rather than serving it locally.
+#[derive(Clone)]
+pub enum RouteDecision {
+    /// Write this locally on the returned box.
+    Local(Arc<Box_>),
+    /// Forward the write to another node. `target` carries
+    /// the node id + advertised address; `tablet_id` is the
+    /// specific tablet the shard currently maps to (used for
+    /// tracing and error reporting, not for the HTTP path).
+    Remote {
+        target: crate::forwarding::NodeTarget,
+        tablet_id: i64,
+    },
+}
+
+impl std::fmt::Debug for RouteDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteDecision::Local(b) => f.debug_tuple("Local").field(&b.id).finish(),
+            RouteDecision::Remote { target, tablet_id } => f
+                .debug_struct("Remote")
+                .field("node_id", &target.node_id)
+                .field("address", &target.address)
+                .field("tablet_id", tablet_id)
+                .finish(),
+        }
+    }
+}
+
 /// One logical box. Owns per-tenant write locks so writes to
 /// different tenants on the same box run in parallel (M23), plus a
 /// per-box admission semaphore that bounds in-flight write
@@ -453,6 +486,12 @@ pub struct BoxRegistry {
     /// tenant-hash routing. Tests that don't care about shard
     /// overrides leave it `None`.
     location: std::sync::OnceLock<Arc<crate::shard::LocationProxy>>,
+    /// Tablet→node address lookup (M20 multi-node). When set,
+    /// [`Self::route_session_for_write`] returns
+    /// [`RouteDecision::Remote`] for tablets owned by other
+    /// nodes; when unset, every routed decision degrades to
+    /// Local (the single-node path).
+    node_addr: std::sync::OnceLock<Arc<crate::forwarding::NodeAddressProxy>>,
 }
 
 impl BoxRegistry {
@@ -517,6 +556,7 @@ impl BoxRegistry {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
+            node_addr: std::sync::OnceLock::new(),
         })
     }
 
@@ -608,6 +648,7 @@ impl BoxRegistry {
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
+            node_addr: std::sync::OnceLock::new(),
         })
     }
 
@@ -685,6 +726,90 @@ impl BoxRegistry {
     /// writing an override.
     pub fn location(&self) -> Option<Arc<crate::shard::LocationProxy>> {
         self.location.get().cloned()
+    }
+
+    /// Attach a [`NodeAddressProxy`] so
+    /// [`Self::route_session_for_write`] can differentiate
+    /// local-tablet vs. remote-tablet targets. Idempotent at
+    /// the OnceLock level.
+    pub fn attach_node_address(
+        &self,
+        node_addr: Arc<crate::forwarding::NodeAddressProxy>,
+    ) -> std::result::Result<(), Arc<crate::forwarding::NodeAddressProxy>> {
+        self.node_addr.set(node_addr)
+    }
+
+    pub fn node_address_proxy(&self) -> Option<Arc<crate::forwarding::NodeAddressProxy>> {
+        self.node_addr.get().cloned()
+    }
+
+    /// Route a (tenant, session) write with multi-node awareness.
+    ///
+    /// - **No override / no location proxy** → `Local(route_tenant(tenant))`.
+    ///   Matches pre-M20 behavior.
+    /// - **Override points at a tablet this node owns locally** →
+    ///   `Local(boxes[tablet_id])`.
+    /// - **Override points at a tablet owned by another live
+    ///   node** (requires `attach_node_address`) →
+    ///   `Remote { target, tablet_id }`.
+    /// - **Override points at a tablet with no resolvable owner
+    ///   (unowned / just reaped / owner absent from nodes
+    ///   table)** → `Local(route_tenant(tenant))` + warn.
+    ///
+    /// The "resolvable" case trumps local box-index check —
+    /// when the node-address proxy knows the tablet is owned
+    /// by a *different* node, we forward even if the
+    /// `tablet_id` happens to be in `0..num_boxes` (which is
+    /// the normal case in single-node clusters where
+    /// tablet_id == box_id and the prefix happens to match
+    /// the peer's too).
+    pub fn route_session_for_write(
+        &self,
+        tenant_external: &str,
+        session_external: &str,
+    ) -> RouteDecision {
+        let Some(location) = self.location.get() else {
+            return RouteDecision::Local(self.route_tenant(tenant_external));
+        };
+        let Some(tablet_id) = location.tablet_for_session(session_external) else {
+            return RouteDecision::Local(self.route_tenant(tenant_external));
+        };
+
+        // If we have a node-address proxy, consult it first.
+        // The proxy's answer is authoritative when present:
+        // it tells us which node currently owns the tablet,
+        // which is exactly what a multi-node write needs.
+        if let Some(addr_proxy) = self.node_addr.get() {
+            if let Some(target) = addr_proxy.target_for_tablet(tablet_id) {
+                if addr_proxy.is_self(&target) {
+                    // This node owns the tablet. Fall through
+                    // to the local box lookup below.
+                } else {
+                    return RouteDecision::Remote { target, tablet_id };
+                }
+            } else {
+                // Tablet has no resolvable owner — unowned,
+                // reaped, or address unknown. Safety fallback.
+                tracing::warn!(
+                    tablet_id,
+                    session = session_external,
+                    "shard override points at tablet with no resolvable owner; falling back to tenant-hash"
+                );
+                return RouteDecision::Local(self.route_tenant(tenant_external));
+            }
+        }
+
+        // No address proxy attached (single-node path), or
+        // proxy confirmed we own this tablet. Resolve to a
+        // local box.
+        if (0..self.boxes.len() as i64).contains(&tablet_id) {
+            RouteDecision::Local(self.boxes[tablet_id as usize].clone())
+        } else {
+            // Override points at a tablet outside our box
+            // range and we have no address proxy to tell us
+            // where it really lives. Fall back for safety.
+            RouteDecision::Local(self.route_tenant(tenant_external))
+        }
     }
 
     /// Look up an `Arc<Box_>` by index. Used by the server binary to start
@@ -870,6 +995,144 @@ mod tests {
             routed, fallback,
             "out-of-range tablet must fall back to tenant hash"
         );
+    }
+
+    // M20 multi-node: route_session_for_write coverage.
+    // Builds a meta store with two nodes registered, assigns
+    // tablets explicitly to one or the other, and verifies
+    // the RouteDecision the registry returns.
+    async fn meta_with_nodes_and_tablets(
+        self_tablets: &[i64],
+        other_node_tablets: &[i64],
+    ) -> Arc<agentdb_meta::MetaStore> {
+        use agentdb_meta::{migrations, nodes as meta_nodes, tablets as meta_tablets, MetaStore};
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        migrations::apply(meta.pool()).await.unwrap();
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", "alive", 100)
+            .await
+            .unwrap();
+        meta_nodes::upsert(meta.pool(), "other", "127.0.0.1:7001", "alive", 100)
+            .await
+            .unwrap();
+        for &t in self_tablets {
+            meta_tablets::get_or_create(meta.pool(), t, 100).await.unwrap();
+            meta_tablets::assume_ownership(meta.pool(), t, 0, "self", i64::MAX)
+                .await
+                .unwrap();
+        }
+        for &t in other_node_tablets {
+            meta_tablets::get_or_create(meta.pool(), t, 100).await.unwrap();
+            meta_tablets::assume_ownership(meta.pool(), t, 0, "other", i64::MAX)
+                .await
+                .unwrap();
+        }
+        Arc::new(meta)
+    }
+
+    #[tokio::test]
+    async fn route_for_write_without_proxies_is_local_tenant_hash() {
+        let (_dir, _obj_dir, reg) = registry(4);
+        match reg.route_session_for_write("t-1", "s-1") {
+            RouteDecision::Local(box_) => {
+                assert_eq!(box_.id, reg.route_tenant("t-1").id);
+            }
+            RouteDecision::Remote { .. } => panic!("expected Local without proxies"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_for_write_locally_owned_tablet_is_local() {
+        use agentdb_meta::shards as meta_shards;
+        let (_dir, _obj_dir, reg) = registry(4);
+        let meta = meta_with_nodes_and_tablets(&[0, 1, 2, 3], &[]).await;
+        meta_shards::seed_shards(meta.pool(), crate::shard::SHARD_COUNT as i64, 0)
+            .await
+            .unwrap();
+        let sid = crate::shard::shard_id("s-1") as i64;
+        // Point the shard at tablet 2 (locally owned).
+        meta_shards::set_assignment(meta.pool(), sid, Some(2), 0)
+            .await
+            .unwrap();
+        let loc = crate::shard::LocationProxy::new(meta.clone())
+            .await
+            .unwrap();
+        reg.attach_location(loc).ok();
+        let addr_proxy = crate::forwarding::NodeAddressProxy::new(meta, "self".into())
+            .await
+            .unwrap();
+        reg.attach_node_address(addr_proxy).ok();
+
+        match reg.route_session_for_write("t-1", "s-1") {
+            RouteDecision::Local(box_) => assert_eq!(box_.id, 2),
+            RouteDecision::Remote { .. } => panic!("expected Local for self-owned tablet"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_for_write_remote_tablet_is_remote() {
+        use agentdb_meta::shards as meta_shards;
+        let (_dir, _obj_dir, reg) = registry(4);
+        let meta = meta_with_nodes_and_tablets(&[0, 1], &[2, 3]).await;
+        meta_shards::seed_shards(meta.pool(), crate::shard::SHARD_COUNT as i64, 0)
+            .await
+            .unwrap();
+        let sid = crate::shard::shard_id("s-remote") as i64;
+        meta_shards::set_assignment(meta.pool(), sid, Some(3), 0)
+            .await
+            .unwrap();
+        let loc = crate::shard::LocationProxy::new(meta.clone())
+            .await
+            .unwrap();
+        reg.attach_location(loc).ok();
+        let addr_proxy = crate::forwarding::NodeAddressProxy::new(meta, "self".into())
+            .await
+            .unwrap();
+        reg.attach_node_address(addr_proxy).ok();
+
+        match reg.route_session_for_write("t-1", "s-remote") {
+            RouteDecision::Local(_) => panic!("expected Remote for peer-owned tablet"),
+            RouteDecision::Remote { target, tablet_id } => {
+                assert_eq!(target.node_id, "other");
+                assert_eq!(target.address, "127.0.0.1:7001");
+                assert_eq!(tablet_id, 3);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn route_for_write_unresolvable_owner_falls_back_to_local() {
+        use agentdb_meta::{migrations, nodes as meta_nodes, shards as meta_shards, tablets as meta_tablets, MetaStore};
+        let (_dir, _obj_dir, reg) = registry(4);
+        let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
+        migrations::apply(meta.pool()).await.unwrap();
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", "alive", 100)
+            .await
+            .unwrap();
+        // tablet 5 claims a ghost owner that isn't in the nodes table.
+        meta_tablets::get_or_create(meta.pool(), 5, 100).await.unwrap();
+        meta_tablets::assume_ownership(meta.pool(), 5, 0, "ghost", i64::MAX)
+            .await
+            .unwrap();
+        meta_shards::seed_shards(meta.pool(), crate::shard::SHARD_COUNT as i64, 0)
+            .await
+            .unwrap();
+        let sid = crate::shard::shard_id("s-orphan") as i64;
+        meta_shards::set_assignment(meta.pool(), sid, Some(5), 0)
+            .await
+            .unwrap();
+        let loc = crate::shard::LocationProxy::new(meta.clone())
+            .await
+            .unwrap();
+        reg.attach_location(loc).ok();
+        let addr_proxy = crate::forwarding::NodeAddressProxy::new(meta, "self".into())
+            .await
+            .unwrap();
+        reg.attach_node_address(addr_proxy).ok();
+
+        match reg.route_session_for_write("t-1", "s-orphan") {
+            RouteDecision::Local(_) => {} // expected — fallback
+            RouteDecision::Remote { .. } => panic!("unresolvable owner must not forward"),
+        }
     }
 
     #[tokio::test]
