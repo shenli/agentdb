@@ -10,6 +10,7 @@ pub mod admin_drain;
 pub mod admin_nodes;
 pub mod admin_scheduler;
 pub mod admin_sessions;
+pub mod admin_shards;
 pub mod admin_tablets;
 pub mod dto;
 pub mod error;
@@ -56,6 +57,8 @@ pub struct AppState {
         admin_nodes::list_nodes,
         admin_scheduler::get_scheduler,
         admin_sessions::get_session,
+        admin_shards::get_shard_by_id,
+        admin_shards::get_shard_by_session,
         admin_tablets::list_tablets,
         stream::sse_handler,
     ),
@@ -82,6 +85,8 @@ pub struct AppState {
         admin_scheduler::SchedulerUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
+        admin_shards::ShardAssignment,
+        admin_shards::ShardsUnavailable,
         admin_tablets::TabletView,
         admin_tablets::TabletsUnavailable,
         fork::ForkRequest,
@@ -156,6 +161,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tablets",
             axum::routing::get(admin_tablets::list_tablets),
+        )
+        .route(
+            "/api/admin/shards",
+            axum::routing::get(admin_shards::get_shard_by_session),
+        )
+        .route(
+            "/api/admin/shards/:id",
+            axum::routing::get(admin_shards::get_shard_by_id),
         )
         .route(
             "/api/admin/scheduler",

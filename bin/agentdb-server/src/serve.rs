@@ -149,15 +149,12 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
         .or_else(|| std::env::var_os("AGENTDB_OBJECTS").map(PathBuf::from))
         .or(dev_objects)
         .unwrap_or_else(|| PathBuf::from("./data/objects"));
-    let meta_path = opts
-        .meta_path
-        .clone()
-        .unwrap_or_else(|| {
-            std::env::var("AGENTDB_META_PATH")
-                .ok()
-                .or(dev_meta)
-                .unwrap_or_else(|| "./data/meta.sqlite".to_string())
-        });
+    let meta_path = opts.meta_path.clone().unwrap_or_else(|| {
+        std::env::var("AGENTDB_META_PATH")
+            .ok()
+            .or(dev_meta)
+            .unwrap_or_else(|| "./data/meta.sqlite".to_string())
+    });
     let num_boxes: u16 = match opts.boxes {
         Some(n) => n,
         None => match std::env::var("AGENTDB_BOXES") {
@@ -382,6 +379,37 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         "stale-lease tablet reaper started"
     );
 
+    // M20: seed the shards table (idempotent) and build a
+    // LocationProxy that caches shard→tablet assignments. The proxy
+    // is only *consumed* today by the `/api/admin/shards/*`
+    // endpoints; the write path still routes by tenant-hash.
+    // Switching the write path over happens in a follow-up once the
+    // tablet-id layout refactor lands.
+    agentdb_meta::shards::seed_shards(
+        meta.pool(),
+        agentdb_meta::shards::DEFAULT_SHARD_COUNT,
+        now_ms_i64(),
+    )
+    .await
+    .context("seed shards table")?;
+    let location_proxy = agentdb_core::LocationProxy::new(meta.clone())
+        .await
+        .context("initialize LocationProxy")?;
+    let refresh_secs: u64 = std::env::var("AGENTDB_SHARD_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let _shard_refresh_job = agentdb_core::LocationProxyRefreshJob::start(
+        location_proxy.clone(),
+        Duration::from_secs(refresh_secs),
+    );
+    std::mem::forget(_shard_refresh_job);
+    tracing::info!(
+        refresh_secs,
+        shard_count = agentdb_core::SHARD_COUNT,
+        "location proxy + shard refresh loop started"
+    );
+
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
     let stream = StreamBus::default();
@@ -531,7 +559,8 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
     let app = router(http_state)
         .layer(axum::Extension(meta.clone()))
         .layer(axum::Extension(election.clone()))
-        .layer(axum::Extension(reaper.clone()));
+        .layer(axum::Extension(reaper.clone()))
+        .layer(axum::Extension(location_proxy.clone()));
     let http_listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await
         .context("bind http listener")?;

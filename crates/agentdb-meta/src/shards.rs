@@ -6,6 +6,16 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::error::MetaResult;
 
+/// Raw row from the `shards` table. `tablet_id == None` means "no
+/// override — default routing applies". `updated_at_ms` tracks the
+/// last time an operator or the scheduler rewrote the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRow {
+    pub shard_id: i64,
+    pub tablet_id: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
 /// Default shard count `S`. Fixed at cluster-init, never changes for a
 /// given cluster. See design §2.4.
 pub const DEFAULT_SHARD_COUNT: i64 = 16384;
@@ -52,11 +62,32 @@ pub async fn set_assignment(
 }
 
 pub async fn get_assignment(pool: &SqlitePool, shard_id: i64) -> MetaResult<Option<i64>> {
-    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT tablet_id FROM shards WHERE shard_id = ?")
-        .bind(shard_id)
-        .fetch_optional(pool)
-        .await?;
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT tablet_id FROM shards WHERE shard_id = ?")
+            .bind(shard_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.and_then(|(t,)| t))
+}
+
+/// Fetch every shard row, ordered by `shard_id`. Used by
+/// [`crate::LocationProxy`]'s periodic refresh to rebuild its local
+/// cache in one round-trip. At prototype scale (16384 rows) this is
+/// cheap; production-scale sync will need incremental LISTEN/NOTIFY
+/// (Postgres-only, follow-up PR).
+pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
+    let rows: Vec<(i64, Option<i64>, i64)> =
+        sqlx::query_as("SELECT shard_id, tablet_id, updated_at_ms FROM shards ORDER BY shard_id")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(shard_id, tablet_id, updated_at_ms)| ShardRow {
+            shard_id,
+            tablet_id,
+            updated_at_ms,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -103,5 +134,23 @@ mod tests {
         // Revert.
         set_assignment(&p, 3, None, 300).await.unwrap();
         assert_eq!(get_assignment(&p, 3).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_row_ordered_by_shard_id() {
+        let p = pool().await;
+        seed_shards(&p, 16, 100).await.unwrap();
+        set_assignment(&p, 5, Some(55), 200).await.unwrap();
+        set_assignment(&p, 3, Some(33), 200).await.unwrap();
+        let rows = list_all(&p).await.unwrap();
+        assert_eq!(rows.len(), 16);
+        // Sorted by shard_id.
+        for i in 0..15 {
+            assert!(rows[i].shard_id < rows[i + 1].shard_id);
+        }
+        // Overrides visible; unassigned shards are None.
+        assert_eq!(rows[3].tablet_id, Some(33));
+        assert_eq!(rows[5].tablet_id, Some(55));
+        assert_eq!(rows[0].tablet_id, None);
     }
 }

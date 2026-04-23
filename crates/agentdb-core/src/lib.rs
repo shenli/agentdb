@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod segment;
 pub mod segment_gc;
 pub mod segment_pin;
+pub mod shard;
 pub mod tiering;
 pub mod types;
 
@@ -55,5 +56,6 @@ pub use scheduler::{LeaderElection, LeaderElectionConfig};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION};
 pub use segment_gc::{GcRunReporter, SegmentGc, SegmentGcConfig};
 pub use segment_pin::SegmentPinRegistry;
+pub use shard::{shard_id, LocationProxy, LocationProxyRefreshJob, SHARD_COUNT};
 pub use tiering::{cold_transition, reactivate};
 pub use types::{Document, Event, ForkRef, Session, Tenant, Tier};
