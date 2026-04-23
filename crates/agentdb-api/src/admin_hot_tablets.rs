@@ -120,6 +120,94 @@ pub async fn list_tablet_load(
     }))
 }
 
+/// Request body for `POST /api/admin/tablets/create` (M25
+/// dynamic tablet creation).
+#[derive(Debug, Deserialize, Default, ToSchema)]
+pub struct CreateTabletRequest {
+    /// Explicit tablet id. When null, the server picks
+    /// `max(existing) + 1` (simple and predictable at
+    /// prototype scale).
+    #[serde(default)]
+    pub tablet_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreateTabletResponse {
+    pub tablet_id: i64,
+    pub owner_node_id: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/tablets/create",
+    tag = "admin",
+    request_body = CreateTabletRequest,
+    responses(
+        (status = 200, description = "New tablet created and owned by this node", body = CreateTabletResponse),
+        (status = 409, description = "tablet_id already exists on this node"),
+        (status = 503, description = "Meta store / node id not configured"),
+    ),
+)]
+pub async fn create_tablet(
+    meta: Option<Extension<Arc<MetaStore>>>,
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    Json(body): Json<CreateTabletRequest>,
+) -> Result<Json<CreateTabletResponse>, ApiError> {
+    let Some(Extension(meta)) = meta else {
+        return Err(ApiError::ServiceUnavailable(
+            "meta store not configured on this server".into(),
+        ));
+    };
+    let Some(node_id) = state.registry.node_id().map(str::to_string) else {
+        return Err(ApiError::ServiceUnavailable(
+            "node id not configured on this server".into(),
+        ));
+    };
+
+    // Pick tablet_id: explicit from body, else max(existing) + 1.
+    let tablet_id = match body.tablet_id {
+        Some(id) => id,
+        None => {
+            let existing = agentdb_meta::tablets::list_all(meta.pool())
+                .await
+                .map_err(|e| ApiError::Internal(format!("list tablets: {e}")))?;
+            existing
+                .iter()
+                .map(|t| t.tablet_id)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0)
+        }
+    };
+
+    if tablet_id < 0 || tablet_id > u16::MAX as i64 {
+        return Err(ApiError::Core(agentdb_core::Error::Invalid {
+            field: Some("tablet_id".into()),
+            message: format!("tablet_id {tablet_id} out of range 0..65535"),
+        }));
+    }
+
+    // Delegate to BoxRegistry::add_box (idempotent meta
+    // row + lease acquire + push under write lock).
+    state
+        .registry
+        .add_box(tablet_id as u16)
+        .await
+        .map_err(|e| match e {
+            agentdb_core::Error::Invalid { message, .. }
+                if message.contains("already exists") =>
+            {
+                ApiError::Conflict(message)
+            }
+            other => ApiError::Core(other),
+        })?;
+
+    Ok(Json(CreateTabletResponse {
+        tablet_id,
+        owner_node_id: node_id,
+    }))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ShedRequest {
     /// Target tablet to move shards to. When `null`, the server

@@ -43,5 +43,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowHotTablets(opts) => admin::show_hot_tablets(opts).await,
         Cmd::ShowTabletLoad(opts) => admin::show_tablet_load(opts).await,
         Cmd::ShedTablet(opts) => admin::shed_tablet(opts).await,
+        Cmd::CreateTablet(opts) => admin::create_tablet(opts).await,
     }
 }

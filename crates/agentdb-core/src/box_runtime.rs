@@ -454,8 +454,14 @@ impl Box_ {
 
 /// Owns the pool of boxes and the shared KV store, plus the tenant→box
 /// routing function and the process-global HLC.
+///
+/// The `boxes` vector is behind an `RwLock` so [`Self::add_box`] can
+/// grow the registry at runtime. Hot-path readers take a read
+/// guard, clone the `Arc<Box_>` they need, and drop the guard
+/// immediately. Writes only happen when an operator calls the
+/// dynamic-tablet admin endpoint — no contention in steady state.
 pub struct BoxRegistry {
-    boxes: Vec<Arc<Box_>>,
+    boxes: RwLock<Vec<Arc<Box_>>>,
     kv: Arc<dyn KvStore>,
     object_store: Arc<dyn ObjectStore>,
     hlc: Arc<HlcClock>,
@@ -465,6 +471,13 @@ pub struct BoxRegistry {
     /// via `new_with_meta*`. Surfaced in the `NodeDraining` error so
     /// clients know which specific process refused the write.
     node_id: Option<String>,
+    /// Meta store + lease config + admission capacity stashed so
+    /// `add_box` can acquire a lease without the caller threading
+    /// them through. `None` on the legacy / test construction
+    /// paths that never call `add_box`.
+    meta: Option<Arc<agentdb_meta::MetaStore>>,
+    lease_config: crate::lease::LeaseConfig,
+    admission_capacity: u32,
     /// Process-level drain flag (M22). Flipped via
     /// [`Self::drain`] from the `POST /api/admin/drain` admin
     /// endpoint. Once set, the write path returns
@@ -537,7 +550,7 @@ impl BoxRegistry {
                 message: "num_boxes must be > 0".into(),
             });
         }
-        let boxes = (0..num_boxes)
+        let boxes: Vec<Arc<Box_>> = (0..num_boxes)
             .map(|i| {
                 Arc::new(Box_::new_with_lease_and_capacity(
                     i,
@@ -548,11 +561,14 @@ impl BoxRegistry {
             })
             .collect();
         Ok(Self {
-            boxes,
+            boxes: RwLock::new(boxes),
             kv,
             object_store,
             hlc,
             node_id: None,
+            meta: None,
+            lease_config: crate::lease::LeaseConfig::default(),
+            admission_capacity: capacity,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
@@ -640,11 +656,14 @@ impl BoxRegistry {
             boxes.push(Arc::new(b));
         }
         Ok(Self {
-            boxes,
+            boxes: RwLock::new(boxes),
             kv,
             object_store,
             hlc,
             node_id: Some(node_id),
+            meta: Some(meta),
+            lease_config: config,
+            admission_capacity: capacity,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
@@ -668,7 +687,7 @@ impl BoxRegistry {
     }
 
     pub fn num_boxes(&self) -> u16 {
-        self.boxes.len() as u16
+        self.boxes.read().len() as u16
     }
 
     /// Route a tenant external id to a box using FNV-1a hash mod num_boxes.
@@ -678,8 +697,9 @@ impl BoxRegistry {
             hash ^= u64::from(*b);
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        let idx = (hash as usize) % self.boxes.len();
-        self.boxes[idx].clone()
+        let boxes = self.boxes.read();
+        let idx = (hash as usize) % boxes.len();
+        boxes[idx].clone()
     }
 
     /// Route a (tenant, session) pair to a box. When the control
@@ -700,10 +720,15 @@ impl BoxRegistry {
     pub fn route_session(&self, tenant_external: &str, session_external: &str) -> Arc<Box_> {
         if let Some(location) = self.location.get() {
             if let Some(tablet_id) = location.tablet_for_session(session_external) {
-                // Tablet id is i64 in meta; box ids are u16. Guard the
-                // cast and fall back if out of range.
-                if (0..self.boxes.len() as i64).contains(&tablet_id) {
-                    return self.boxes[tablet_id as usize].clone();
+                // Under M25 dynamic-tablet, a box's id equals
+                // its tablet_id — so a simple scan of the
+                // current snapshot finds the right one. The
+                // linear scan is fine at prototype scale
+                // (dozens of boxes); move to a HashMap if
+                // callers ever grow it past hundreds.
+                let boxes = self.boxes.read();
+                if let Some(b) = boxes.iter().find(|b| b.id as i64 == tablet_id) {
+                    return b.clone();
                 }
             }
         }
@@ -801,13 +826,15 @@ impl BoxRegistry {
 
         // No address proxy attached (single-node path), or
         // proxy confirmed we own this tablet. Resolve to a
-        // local box.
-        if (0..self.boxes.len() as i64).contains(&tablet_id) {
-            RouteDecision::Local(self.boxes[tablet_id as usize].clone())
+        // local box via id scan (see note on route_session).
+        let boxes = self.boxes.read();
+        if let Some(b) = boxes.iter().find(|b| b.id as i64 == tablet_id) {
+            RouteDecision::Local(b.clone())
         } else {
-            // Override points at a tablet outside our box
-            // range and we have no address proxy to tell us
-            // where it really lives. Fall back for safety.
+            drop(boxes);
+            // Override points at a tablet we don't host and
+            // no address proxy told us where it is. Fall back
+            // for safety.
             RouteDecision::Local(self.route_tenant(tenant_external))
         }
     }
@@ -815,7 +842,96 @@ impl BoxRegistry {
     /// Look up an `Arc<Box_>` by index. Used by the server binary to start
     /// one `LifecycleEngine` per box at process startup.
     pub fn box_by_id(&self, id: BoxId) -> Option<Arc<Box_>> {
-        self.boxes.get(id as usize).cloned()
+        // Scan: the vector is typically dozens of entries,
+        // and box_id == tablet_id but isn't the same as the
+        // vector index once runtime-added boxes exist (they
+        // get ids past the initial 0..num_boxes range).
+        let boxes = self.boxes.read();
+        boxes.iter().find(|b| b.id == id).cloned()
+    }
+
+    /// Snapshot of all boxes in this registry. Returns a
+    /// cloned `Vec<Arc<Box_>>` — cheap because boxes are
+    /// Arc'd; callers can iterate without holding the lock
+    /// (important for anything that awaits inside the
+    /// iteration). The snapshot is a point-in-time view: if
+    /// [`Self::add_box`] fires mid-iteration, the new box
+    /// is missed and picked up on the next call.
+    pub fn boxes_snapshot(&self) -> Vec<Arc<Box_>> {
+        self.boxes.read().clone()
+    }
+
+    /// Dynamically grow the registry with a new tablet/box at
+    /// runtime (M25 continuation).
+    ///
+    /// Only available on meta-backed registries built via
+    /// `new_with_meta*` — legacy paths lack the lease
+    /// acquisition plumbing and return `Error::Invalid`.
+    ///
+    /// Atomic at the visibility level: the new `Arc<Box_>`
+    /// isn't exposed via `box_by_id` or `num_boxes` until
+    /// after the meta row is created and the lease is
+    /// acquired. A caller who sees the tablet in
+    /// `/api/admin/tablets` can rely on the lease already
+    /// being live.
+    pub async fn add_box(&self, tablet_id: BoxId) -> Result<Arc<Box_>> {
+        let Some(meta) = self.meta.clone() else {
+            return Err(Error::Invalid {
+                field: None,
+                message: "cannot add_box on legacy (meta-less) registry".into(),
+            });
+        };
+        let Some(node_id) = self.node_id.clone() else {
+            return Err(Error::Invalid {
+                field: None,
+                message: "cannot add_box: node_id not configured".into(),
+            });
+        };
+
+        // Reject duplicates with a clear error.
+        {
+            let boxes = self.boxes.read();
+            if boxes.iter().any(|b| b.id == tablet_id) {
+                return Err(Error::Invalid {
+                    field: Some("tablet_id".into()),
+                    message: format!("tablet {tablet_id} already exists on this node"),
+                });
+            }
+        }
+
+        // Create the meta row (idempotent) and acquire the lease.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        agentdb_meta::tablets::get_or_create(meta.pool(), tablet_id as i64, now)
+            .await
+            .map_err(|e| Error::Invalid {
+                field: None,
+                message: format!("add_box: meta tablets::get_or_create: {e}"),
+            })?;
+        let metrics = Arc::new(BoxMetrics::new());
+        let lease = crate::lease::LeaseManager::acquire(
+            meta.clone(),
+            tablet_id as i64,
+            node_id,
+            self.lease_config,
+            metrics.clone(),
+        )
+        .await?;
+        let mut b = Box_::new_with_lease_and_capacity(
+            tablet_id,
+            self.hlc.clone(),
+            Some(lease),
+            self.admission_capacity,
+        );
+        b.metrics = metrics;
+        let arc = Arc::new(b);
+        // Publish under the write lock. Hot-path readers that
+        // held a read lock during scan will drop it and pick
+        // up the new box on their next iteration.
+        self.boxes.write().push(arc.clone());
+        Ok(arc)
     }
 
     /// Mark this process as draining. Subsequent writes fail fast with
@@ -1133,6 +1249,102 @@ mod tests {
             RouteDecision::Local(_) => {} // expected — fallback
             RouteDecision::Remote { .. } => panic!("unresolvable owner must not forward"),
         }
+    }
+
+    /// Helper for dynamic-tablet (add_box) tests: build a
+    /// meta-backed registry with capacity=1 so lease
+    /// acquisition works.
+    async fn meta_registry(num_boxes: u16) -> (TempDir, TempDir, tempfile::NamedTempFile, Arc<BoxRegistry>) {
+        let meta_file = tempfile::NamedTempFile::new().unwrap();
+        let meta_path = meta_file.path().to_string_lossy().to_string();
+        let meta = Arc::new(agentdb_meta::MetaStore::open_sqlite(&meta_path).await.unwrap());
+        let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let reg = Arc::new(
+            BoxRegistry::new_with_meta(
+                kv,
+                store,
+                num_boxes,
+                Arc::new(HlcClock::default()),
+                meta,
+                "add-box-test".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        (dir, obj_dir, meta_file, reg)
+    }
+
+    #[tokio::test]
+    async fn add_box_grows_the_registry_and_exposes_new_box() {
+        let (_d, _o, _m, reg) = meta_registry(2).await;
+        assert_eq!(reg.num_boxes(), 2);
+        let new_box = reg.add_box(2).await.unwrap();
+        assert_eq!(new_box.id, 2);
+        assert_eq!(reg.num_boxes(), 3);
+        // box_by_id finds the new box by id.
+        let via_lookup = reg.box_by_id(2).expect("box 2 should be reachable");
+        assert!(Arc::ptr_eq(&new_box, &via_lookup));
+    }
+
+    #[tokio::test]
+    async fn add_box_rejects_duplicate_tablet_id() {
+        let (_d, _o, _m, reg) = meta_registry(2).await;
+        let result = reg.add_box(1).await;
+        match result {
+            Err(Error::Invalid { field, .. }) => {
+                assert_eq!(field.as_deref(), Some("tablet_id"));
+            }
+            Ok(_) => panic!("duplicate add_box should fail"),
+            Err(other) => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_box_errors_on_legacy_registry() {
+        let (_dir, _obj_dir, reg) = registry(2);
+        let result = reg.add_box(2).await;
+        assert!(
+            matches!(result, Err(Error::Invalid { .. })),
+            "legacy registry must reject add_box"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_box_survives_route_tenant_under_concurrent_readers() {
+        // Hammer route_tenant while add_box grows the vec,
+        // to catch any RwLock misuse or ABA-style bug. The
+        // number of boxes grows from 2 → 6 under a load of
+        // route_tenant calls. Uses multi_thread flavor so
+        // the reader doesn't starve the add_box futures; on
+        // current_thread the tight loop below would monopolize
+        // the single worker.
+        let (_d, _o, _m, reg) = meta_registry(2).await;
+        let reg2 = reg.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let reader = tokio::spawn(async move {
+            let mut hits = 0u64;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let b = reg2.route_tenant("t-concurrent");
+                assert!(b.id < 64, "box id stays bounded");
+                hits += 1;
+                if hits % 1000 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            hits
+        });
+        for i in 2..6 {
+            let _ = reg.add_box(i).await.unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let hits = reader.await.unwrap();
+        assert!(hits > 100, "reader should have run many loops");
+        assert_eq!(reg.num_boxes(), 6);
     }
 
     #[tokio::test]

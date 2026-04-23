@@ -18,7 +18,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
+    AdminOpts, CreateTabletOpts, SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts,
+    UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -194,6 +195,27 @@ pub async fn shed_tablet(opts: ShedTabletOpts) -> Result<()> {
     if let Some(f) = opts.fraction {
         body["fraction"] = serde_json::Value::from(f);
     }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `POST /api/admin/tablets/create` — M25 dynamic-tablet
+/// creation.
+pub async fn create_tablet(opts: CreateTabletOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tablets/create",
+        opts.server_url.trim_end_matches('/'),
+    );
+    let body = match opts.id {
+        Some(id) => serde_json::json!({ "tablet_id": id }),
+        None => serde_json::json!({}),
+    };
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
