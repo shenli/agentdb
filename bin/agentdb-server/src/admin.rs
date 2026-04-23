@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::cli::{AdminOpts, ShowShardOpts};
+use crate::cli::{AdminOpts, SetShardOpts, ShowShardOpts};
 
 /// `POST /api/admin/drain`.
 pub async fn drain(opts: AdminOpts) -> Result<()> {
@@ -61,6 +61,39 @@ pub async fn show_shard(opts: ShowShardOpts) -> Result<()> {
         "{}/api/admin/shards?session_id={}",
         opts.server_url.trim_end_matches('/'),
         urlencode(&opts.session_id),
+    );
+    fetch_and_print(&url).await
+}
+
+/// `POST /api/admin/shards/:id`.
+pub async fn set_shard(opts: SetShardOpts) -> Result<()> {
+    if opts.tablet.is_none() && !opts.clear {
+        anyhow::bail!("must supply --tablet <id> or --clear");
+    }
+    let url = format!(
+        "{}/api/admin/shards/{}",
+        opts.server_url.trim_end_matches('/'),
+        opts.shard_id
+    );
+    let body = serde_json::json!({
+        // `--clear` and missing `--tablet` both produce null here.
+        "tablet_id": opts.tablet,
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/shards/list`.
+pub async fn list_shard_overrides(opts: AdminOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/shards/list",
+        opts.server_url.trim_end_matches('/')
     );
     fetch_and_print(&url).await
 }

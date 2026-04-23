@@ -59,6 +59,8 @@ pub struct AppState {
         admin_sessions::get_session,
         admin_shards::get_shard_by_id,
         admin_shards::get_shard_by_session,
+        admin_shards::list_shard_overrides,
+        admin_shards::set_shard,
         admin_tablets::list_tablets,
         stream::sse_handler,
     ),
@@ -85,7 +87,10 @@ pub struct AppState {
         admin_scheduler::SchedulerUnavailable,
         admin_sessions::SessionQuery,
         admin_sessions::SessionDetail,
+        admin_shards::SetShardRequest,
         admin_shards::ShardAssignment,
+        admin_shards::ShardOverride,
+        admin_shards::ShardOverridesList,
         admin_shards::ShardsUnavailable,
         admin_tablets::TabletView,
         admin_tablets::TabletsUnavailable,
@@ -167,8 +172,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(admin_shards::get_shard_by_session),
         )
         .route(
+            "/api/admin/shards/list",
+            axum::routing::get(admin_shards::list_shard_overrides),
+        )
+        .route(
             "/api/admin/shards/:id",
-            axum::routing::get(admin_shards::get_shard_by_id),
+            axum::routing::get(admin_shards::get_shard_by_id).post(admin_shards::set_shard),
         )
         .route(
             "/api/admin/scheduler",

@@ -46,6 +46,13 @@ pub enum Cmd {
     /// Resolve a session id to its shard + tablet assignment.
     /// HTTP-client wrapper for `GET /api/admin/shards?session_id=...`.
     ShowShard(ShowShardOpts),
+    /// Pin a shard to a specific tablet, or revert it to default
+    /// routing with `--clear`. HTTP-client wrapper for
+    /// `POST /api/admin/shards/:id`.
+    SetShard(SetShardOpts),
+    /// List shards that currently carry an explicit tablet override.
+    /// HTTP-client wrapper for `GET /api/admin/shards/list`.
+    ListShardOverrides(AdminOpts),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -55,6 +62,23 @@ pub struct ShowShardOpts {
     pub server_url: String,
     /// Session id to hash + look up. Required positional argument.
     pub session_id: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SetShardOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Shard id to set (0..16384). Required positional argument.
+    pub shard_id: u16,
+    /// Tablet id to pin this shard to. Mutually exclusive with
+    /// `--clear`; exactly one of the two must be set.
+    #[arg(long, conflicts_with = "clear")]
+    pub tablet: Option<i64>,
+    /// Revert this shard to default (hash) routing. Mutually
+    /// exclusive with `--tablet`.
+    #[arg(long, conflicts_with = "tablet")]
+    pub clear: bool,
 }
 
 #[derive(Args, Debug, Default, Clone)]

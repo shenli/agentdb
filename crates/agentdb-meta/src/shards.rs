@@ -90,6 +90,27 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
         .collect())
 }
 
+/// Every shard that carries an explicit tablet override, ordered
+/// by shard_id. Used by `GET /api/admin/shards/list` — the full
+/// 16384-row listing is too noisy for humans; operators almost
+/// always want "show me what's actually overridden."
+pub async fn list_overrides(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
+    let rows: Vec<(i64, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT shard_id, tablet_id, updated_at_ms FROM shards \
+         WHERE tablet_id IS NOT NULL ORDER BY shard_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(shard_id, tablet_id, updated_at_ms)| ShardRow {
+            shard_id,
+            tablet_id,
+            updated_at_ms,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +173,24 @@ mod tests {
         assert_eq!(rows[3].tablet_id, Some(33));
         assert_eq!(rows[5].tablet_id, Some(55));
         assert_eq!(rows[0].tablet_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_overrides_returns_only_set_rows() {
+        let p = pool().await;
+        seed_shards(&p, 16, 100).await.unwrap();
+        set_assignment(&p, 5, Some(55), 200).await.unwrap();
+        set_assignment(&p, 3, Some(33), 200).await.unwrap();
+        set_assignment(&p, 11, Some(11), 200).await.unwrap();
+        let rows = list_overrides(&p).await.unwrap();
+        let pairs: Vec<_> = rows.iter().map(|r| (r.shard_id, r.tablet_id)).collect();
+        assert_eq!(pairs, vec![(3, Some(33)), (5, Some(55)), (11, Some(11))]);
+    }
+
+    #[tokio::test]
+    async fn list_overrides_is_empty_on_fresh_table() {
+        let p = pool().await;
+        seed_shards(&p, 16, 100).await.unwrap();
+        assert!(list_overrides(&p).await.unwrap().is_empty());
     }
 }
