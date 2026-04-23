@@ -347,6 +347,14 @@ M18+ milestones added:
   Denials surface as `429` with `scope: "tenant_global"`
   and as `agentdb_tenant_quota_denies_total{tenant="..."}`
   on `/metrics`
+- **Slow-query log** — bounded ring buffer of every
+  append / find / aggregate that exceeds
+  `AGENTDB_SLOW_QUERY_THRESHOLD_MS`. Records carry
+  tenant, session, latency and a short detail. Surfaced
+  via `GET /api/admin/slow-queries` and
+  `agentdb show-slow-queries`;
+  `agentdb_slow_queries_recorded_total{kind="..."}` on
+  `/metrics`
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

@@ -24,6 +24,7 @@ pub async fn aggregate_response(
     collection: &str,
     pipeline: &[Document],
 ) -> WireResult<Document> {
+    let started = std::time::Instant::now();
     // M20 multi-node: if the pipeline pins a specific session
     // (via source-stage filter or a $match), and that session
     // lives on a peer, fail loudly. Symmetric with find.rs; see
@@ -170,14 +171,37 @@ pub async fn aggregate_response(
         .map(|h| hit_to_bson(&h, project.as_ref()))
         .collect();
 
-    Ok(doc! {
+    let batch_len = batch.len();
+    let response = doc! {
         "cursor": {
             "id": 0_i64,
             "ns": format!("{}.{}", db, collection),
             "firstBatch": Bson::Array(batch),
         },
         "ok": 1.0,
-    })
+    };
+    if let Some(buf) = registry.slow_queries() {
+        let ns = started.elapsed().as_nanos() as u64;
+        let stages = pipeline.len();
+        buf.maybe_record(
+            agentdb_core::slow_query::SlowQueryKind::Aggregate,
+            ns,
+            wall_ms(),
+            box_.id,
+            db,
+            session_hint.as_deref().unwrap_or(""),
+            || format!("collection={collection}, stages={stages}, hits={batch_len}"),
+        );
+    }
+    Ok(response)
+}
+
+fn wall_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn empty_batch(db: &str, collection: &str) -> Document {

@@ -817,6 +817,73 @@
         }
       }
     },
+    "/api/admin/slow-queries": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_slow_queries",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "One of `append`, `find`, `aggregate`. Omit for all.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SlowQueryKind"
+            }
+          },
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "Exact external tenant id. Omit for all tenants.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max rows to return. Default 100, clamped to 10_000.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "after_id",
+            "in": "query",
+            "description": "Return only rows whose id is strictly greater than\nthis value. Pair with the largest id from a previous\npage for pagination.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent slow-query records (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SlowQueryRecord"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          }
+        }
+      }
+    },
     "/api/admin/tablets": {
       "get": {
         "tags": [
@@ -3061,6 +3128,66 @@
           },
           "tenant_id": {
             "type": "string"
+          }
+        }
+      },
+      "SlowQueryKind": {
+        "type": "string",
+        "description": "What kind of request this record describes. Used for\nfiltering in the admin endpoint and as a label on the\nrecorded-count counter.",
+        "enum": [
+          "append",
+          "find",
+          "aggregate"
+        ]
+      },
+      "SlowQueryRecord": {
+        "type": "object",
+        "description": "One recorded slow request.",
+        "required": [
+          "id",
+          "ts_ms",
+          "kind",
+          "box_id",
+          "tenant_id",
+          "latency_ms",
+          "detail"
+        ],
+        "properties": {
+          "box_id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "detail": {
+            "type": "string",
+            "description": "Short request summary. For append this is the\npayload byte size; for find/aggregate it's a\ntruncated filter/pipeline BSON excerpt. Never\nincludes secrets — callers are responsible for the\nredaction boundary."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonically-increasing id assigned at record time.\nExposed so clients can page via `after_id` without\nfighting timestamp ties.",
+            "minimum": 0
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SlowQueryKind"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Session or collection identifier, if the request\ncarries one. Find/aggregate on an unscoped tenant\nleaves this empty."
+          },
+          "tenant_id": {
+            "type": "string",
+            "description": "External tenant id (the URL path segment)."
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock ms when the request completed."
           }
         }
       },

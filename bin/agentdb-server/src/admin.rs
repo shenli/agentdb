@@ -20,7 +20,8 @@ use serde_json::Value;
 use crate::cli::{
     AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, ClearTenantQuotaOpts,
     CreateTabletOpts, MigrateSessionOpts, SetShardOpts, SetTenantQuotaOpts, ShedTabletOpts,
-    ShowLatencyOpts, ShowShardOpts, ShowTenantQuotaOpts, UserAddOpts, UserDeleteOpts,
+    ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts, ShowTenantQuotaOpts, UserAddOpts,
+    UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -369,6 +370,30 @@ pub async fn clear_tenant_quota(opts: ClearTenantQuotaOpts) -> Result<()> {
     // 204 No Content expected; print_json_and_exit_on_failure
     // handles success and error bodies.
     print_json_and_exit_on_failure(resp).await
+}
+
+/// `GET /api/admin/slow-queries` — list recent slow requests.
+pub async fn show_slow_queries(opts: ShowSlowQueriesOpts) -> Result<()> {
+    let mut qs: Vec<(String, String)> = vec![("limit".into(), opts.limit.to_string())];
+    if let Some(k) = &opts.kind {
+        qs.push(("kind".into(), k.clone()));
+    }
+    if let Some(t) = &opts.tenant {
+        qs.push(("tenant".into(), t.clone()));
+    }
+    if let Some(a) = opts.after_id {
+        qs.push(("after_id".into(), a.to_string()));
+    }
+    let qstr = qs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!(
+        "{}/api/admin/slow-queries?{qstr}",
+        opts.server_url.trim_end_matches('/'),
+    );
+    fetch_and_print(&url).await
 }
 
 /// `GET /api/admin/audit` — list recent admin-plane requests.

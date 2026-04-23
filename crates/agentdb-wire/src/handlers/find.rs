@@ -17,6 +17,7 @@ pub async fn find_response(
     filter_doc: &Document,
     limit: Option<i64>,
 ) -> WireResult<Document> {
+    let started = std::time::Instant::now();
     // M20 multi-node: if the filter pins a specific session
     // and that session's shard is owned by another node, the
     // read is routed wrong and we'd silently return empty
@@ -112,14 +113,65 @@ pub async fn find_response(
     }
 
     let first_batch: Vec<Bson> = batch.into_iter().map(json_to_bson).collect();
-    Ok(doc! {
+    let batch_len = first_batch.len();
+    let response = doc! {
         "cursor": {
             "id": 0_i64,
             "ns": format!("{}.{}", db, collection),
             "firstBatch": Bson::Array(first_batch),
         },
         "ok": 1.0,
-    })
+    };
+    // Slow-query log — buffered only when elapsed clears the
+    // operator threshold. Off-path cost is one atomic load.
+    if let Some(buf) = registry.slow_queries() {
+        let ns = started.elapsed().as_nanos() as u64;
+        let pinned_session = Filter::parse(filter_doc)
+            .ok()
+            .and_then(|f| {
+                f.top_level_eq("session_id").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let filter_json = serde_json::to_string(&bson::Bson::Document(filter_doc.clone()))
+            .unwrap_or_default();
+        buf.maybe_record(
+            agentdb_core::slow_query::SlowQueryKind::Find,
+            ns,
+            wall_ms(),
+            box_.id,
+            db,
+            &pinned_session,
+            || {
+                format!(
+                    "collection={collection}, batch={batch_len}, limit={}, filter={}",
+                    limit.unwrap_or(-1),
+                    truncate(&filter_json, 256),
+                )
+            },
+        );
+    }
+    Ok(response)
+}
+
+fn wall_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut out = s[..max].to_string();
+        out.push_str("…");
+        out
+    }
 }
 
 fn empty_batch(db: &str, collection: &str) -> Document {

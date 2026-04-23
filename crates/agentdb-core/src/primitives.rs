@@ -490,6 +490,24 @@ pub async fn append_and_fetch_with_actor(
     // of teardown.
     let ns = started.elapsed().as_nanos() as u64;
     box_.metrics.append_latency.record(ns);
+    // Slow-query log. The buffer's `maybe_record` does the
+    // threshold check internally and only invokes the detail
+    // closure when we're above threshold — the fast path is
+    // one atomic load.
+    if let Some(buf) = registry.slow_queries() {
+        let payload_bytes = serde_json::to_vec(&event.payload)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        buf.maybe_record(
+            crate::slow_query::SlowQueryKind::Append,
+            ns,
+            now_millis as i64,
+            box_.id,
+            tenant_external,
+            session_external,
+            || format!("payload_bytes={payload_bytes}, fetch_last_n={fetch_last_n_}"),
+        );
+    }
     Ok(AppendFetchOutput {
         new_seq: event.seq,
         recent,
