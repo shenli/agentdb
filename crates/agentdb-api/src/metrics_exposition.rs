@@ -219,26 +219,90 @@ const METRICS: &[MetricMeta] = &[
 /// simpler than streaming and cheap at prototype scale (one KB per
 /// box for ~30 metrics).
 fn render(state: &AppState) -> String {
-    let mut out = String::with_capacity(8 * 1024);
+    let mut out = String::with_capacity(16 * 1024);
     // Snapshot every box up front so we walk them in a stable order
     // and don't re-read atomics per metric.
-    let mut box_snapshots: Vec<(u16, agentdb_core::MetricsSnapshot)> = Vec::new();
+    struct BoxRow {
+        box_id: u16,
+        snap: agentdb_core::MetricsSnapshot,
+        append: agentdb_core::HistogramSnapshot,
+        admission: agentdb_core::HistogramSnapshot,
+    }
+    let mut rows: Vec<BoxRow> = Vec::new();
     for i in 0..state.registry.num_boxes() {
         let Some(b) = state.registry.box_by_id(i) else {
             continue;
         };
-        box_snapshots.push((i, b.metrics.snapshot()));
+        rows.push(BoxRow {
+            box_id: i,
+            snap: b.metrics.snapshot(),
+            append: b.metrics.append_latency.snapshot(),
+            admission: b.metrics.admission_wait_latency.snapshot(),
+        });
     }
 
     for m in METRICS {
         writeln!(out, "# HELP {} {}", m.name, m.help).ok();
         writeln!(out, "# TYPE {} {}", m.name, m.kind.as_str()).ok();
-        for (box_id, snap) in &box_snapshots {
-            let value = value_for(m.name, snap);
-            writeln!(out, "{}{{box=\"{}\"}} {}", m.name, box_id, value).ok();
+        for row in &rows {
+            let value = value_for(m.name, &row.snap);
+            writeln!(out, "{}{{box=\"{}\"}} {}", m.name, row.box_id, value).ok();
         }
     }
+
+    // Histograms. Prometheus histograms emit one row per
+    // bucket (`_bucket{le="..."}`) plus `_sum` and
+    // `_count`. The `le` label is in seconds to match
+    // Prometheus convention (convert ns → s at exposition
+    // time).
+    render_histogram(
+        &mut out,
+        "agentdb_append_latency_seconds",
+        "End-to-end append_and_fetch latency",
+        &rows.iter().map(|r| (r.box_id, &r.append)).collect::<Vec<_>>(),
+    );
+    render_histogram(
+        &mut out,
+        "agentdb_admission_wait_seconds",
+        "Time spent blocked on the per-box admission semaphore (only contended writes)",
+        &rows.iter().map(|r| (r.box_id, &r.admission)).collect::<Vec<_>>(),
+    );
     out
+}
+
+fn render_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    rows: &[(u16, &agentdb_core::HistogramSnapshot)],
+) {
+    writeln!(out, "# HELP {name} {help}").ok();
+    writeln!(out, "# TYPE {name} histogram").ok();
+    for (box_id, snap) in rows {
+        for (i, &upper_ns) in agentdb_core::BUCKET_NS.iter().enumerate() {
+            let le = if upper_ns == u64::MAX {
+                "+Inf".to_string()
+            } else {
+                // ns → seconds with enough precision to keep
+                // sub-ms buckets distinguishable.
+                format!("{:.6}", upper_ns as f64 / 1_000_000_000.0)
+            };
+            let cumul = snap.cumulative_buckets[i];
+            writeln!(
+                out,
+                "{name}_bucket{{box=\"{box_id}\",le=\"{le}\"}} {cumul}"
+            )
+            .ok();
+        }
+        let sum_seconds = snap.sum_ns as f64 / 1_000_000_000.0;
+        writeln!(out, "{name}_sum{{box=\"{box_id}\"}} {sum_seconds:.9}").ok();
+        writeln!(
+            out,
+            "{name}_count{{box=\"{box_id}\"}} {}",
+            snap.count
+        )
+        .ok();
+    }
 }
 
 /// Map metric name to the correct field on the snapshot. Keeping
@@ -328,20 +392,30 @@ mod tests {
         )
     }
 
+    // Two histogram families (append latency, admission wait) add
+    // two HELP/TYPE blocks on top of the counter/gauge catalog.
+    const HISTOGRAM_FAMILIES: usize = 2;
+
+    // Per histogram per box: one sample line per bucket upper
+    // bound plus `_sum` + `_count`.
+    fn histogram_lines_per_box() -> usize {
+        agentdb_core::BUCKET_NS.len() + 2
+    }
+
     #[test]
     fn render_emits_help_and_type_per_metric() {
         let (_k, _o, state) = state_with_two_boxes();
         let body = render(&state);
-        // One HELP + TYPE per metric in the catalog.
+        let expected = METRICS.len() + HISTOGRAM_FAMILIES;
         assert_eq!(
             body.matches("# HELP agentdb_").count(),
-            METRICS.len(),
-            "expected one HELP line per catalog entry"
+            expected,
+            "expected one HELP line per metric family (catalog + histograms)"
         );
         assert_eq!(
             body.matches("# TYPE agentdb_").count(),
-            METRICS.len(),
-            "expected one TYPE line per catalog entry"
+            expected,
+            "expected one TYPE line per metric family (catalog + histograms)"
         );
     }
 
@@ -349,12 +423,14 @@ mod tests {
     fn render_emits_one_sample_per_box_per_metric() {
         let (_k, _o, state) = state_with_two_boxes();
         let body = render(&state);
-        // Two boxes * METRICS.len() sample lines expected.
         let sample_count = body
             .lines()
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .count();
-        assert_eq!(sample_count, 2 * METRICS.len());
+        // Two boxes * (scalar metrics + histogram bucket/sum/count lines).
+        let expected = 2
+            * (METRICS.len() + HISTOGRAM_FAMILIES * histogram_lines_per_box());
+        assert_eq!(sample_count, expected);
     }
 
     #[test]

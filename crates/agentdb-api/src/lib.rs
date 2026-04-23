@@ -106,6 +106,7 @@ impl AppState {
         admin_boxes::inject_fault,
         admin_boxes::set_quota,
         admin_boxes::set_webhook,
+        admin_boxes::get_box_latency,
         admin_drain::get_drain,
         admin_drain::post_drain,
         admin_nodes::list_nodes,
@@ -143,6 +144,8 @@ impl AppState {
         admin_boxes::QuotaRequest,
         admin_boxes::WebhookRequest,
         admin_boxes::WebhookResponse,
+        admin_boxes::BoxLatency,
+        admin_boxes::HistogramView,
         admin_drain::DrainStatus,
         admin_drain::DrainUnavailable,
         admin_nodes::NodeView,
@@ -241,6 +244,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/boxes/:id/webhook",
             axum::routing::post(admin_boxes::set_webhook),
+        )
+        .route(
+            "/api/admin/boxes/:id/latency",
+            axum::routing::get(admin_boxes::get_box_latency),
         )
         .route(
             "/api/admin/sessions/:session_id",

@@ -181,11 +181,22 @@ impl Box_ {
                 // closed (impossible — we never close it). Count the
                 // wait and fall through to the blocking path.
                 self.metrics.record_admission_wait();
-                self.admission
+                let started = std::time::Instant::now();
+                let permit = self
+                    .admission
                     .clone()
                     .acquire_owned()
                     .await
-                    .expect("admission semaphore is never closed")
+                    .expect("admission semaphore is never closed");
+                // Record the wait latency so operators can
+                // see p50/p95/p99 of how long the semaphore
+                // was contended. Only records when we
+                // actually waited — fast path is excluded
+                // so the histogram reflects pressure, not
+                // uncontended writes.
+                let ns = started.elapsed().as_nanos() as u64;
+                self.metrics.admission_wait_latency.record(ns);
+                permit
             }
         }
     }

@@ -138,6 +138,42 @@
         }
       }
     },
+    "/api/admin/boxes/{id}/latency": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_box_latency",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Box id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BoxLatency"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such box"
+          }
+        }
+      }
+    },
     "/api/admin/boxes/{id}/quota": {
       "post": {
         "tags": [
@@ -1308,6 +1344,27 @@
           }
         }
       },
+      "BoxLatency": {
+        "type": "object",
+        "required": [
+          "box_id",
+          "append",
+          "admission_wait"
+        ],
+        "properties": {
+          "admission_wait": {
+            "$ref": "#/components/schemas/HistogramView"
+          },
+          "append": {
+            "$ref": "#/components/schemas/HistogramView"
+          },
+          "box_id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "BoxListItem": {
         "type": "object",
         "required": [
@@ -1743,6 +1800,43 @@
             "minimum": 0
           },
           "warm_sessions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HistogramView": {
+        "type": "object",
+        "required": [
+          "count",
+          "sum_ns",
+          "p50_ns",
+          "p95_ns",
+          "p99_ns"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "p50_ns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "p95_ns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "p99_ns": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sum_ns": {
             "type": "integer",
             "format": "int64",
             "minimum": 0

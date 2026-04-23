@@ -96,6 +96,13 @@ pub struct BoxMetrics {
     /// window's absolute clock only matters for warm-up, and
     /// the recorders pass the real clock each call.
     pub rate: Option<RateWindow>,
+    /// Latency histograms (latency-histograms PR).
+    /// Observations are in nanoseconds. Populated on the
+    /// hot path by Box_-level wrappers that take a timestamp
+    /// before + after the operation. Safe under
+    /// concurrency; no allocation on record.
+    pub append_latency: crate::histogram::LatencyHistogram,
+    pub admission_wait_latency: crate::histogram::LatencyHistogram,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
