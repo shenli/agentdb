@@ -32,5 +32,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowTablets(opts) => admin::show_tablets(opts).await,
         Cmd::ShowScheduler(opts) => admin::show_scheduler(opts).await,
         Cmd::ShowNodes(opts) => admin::show_nodes(opts).await,
+        Cmd::ShowShard(opts) => admin::show_shard(opts).await,
     }
 }

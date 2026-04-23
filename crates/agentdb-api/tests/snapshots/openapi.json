@@ -448,6 +448,112 @@
         }
       }
     },
+    "/api/admin/shards": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_shard_by_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "description": "External session id. Required.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Shard + assignment for the given session id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardAssignment"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "LocationProxy not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/shards/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_shard_by_id",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Shard id (0..16384)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "description": "If set, the response echoes this back under `session_id`.\n(The path already carries `:id`, so this is only for scripted\ncorrelation.)",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current assignment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardAssignment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "id out of range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "LocationProxy not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShardsUnavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/tablets": {
       "get": {
         "tags": [
@@ -1663,6 +1769,52 @@
         ],
         "properties": {
           "tenant_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ShardAssignment": {
+        "type": "object",
+        "required": [
+          "shard_id",
+          "last_refresh_ms"
+        ],
+        "properties": {
+          "last_refresh_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock ms of the last successful refresh from meta; if\nthe shown `tablet_id` is stale, it's never more stale than\n`refresh_interval` seconds."
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "If the caller provided `?session_id=...`, echo it back so\nscripts and the CLI can correlate."
+          },
+          "shard_id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Shard id the request resolved to.",
+            "minimum": 0
+          },
+          "tablet_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Tablet currently assigned to this shard. `null` means \"no\noverride — routing falls back to the default (hash % num\nboxes) rule the client should already know about\"."
+          }
+        }
+      },
+      "ShardsUnavailable": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
             "type": "string"
           }
         }

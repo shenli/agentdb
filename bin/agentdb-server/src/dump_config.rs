@@ -236,10 +236,7 @@ pub fn run(opts: DumpConfigOpts) -> anyhow::Result<()> {
         .collect();
 
     let mut preamble = serde_json::Map::new();
-    preamble.insert(
-        "dev_mode_preview".into(),
-        serde_json::Value::Bool(opts.dev),
-    );
+    preamble.insert("dev_mode_preview".into(), serde_json::Value::Bool(opts.dev));
     preamble.insert(
         "note".into(),
         serde_json::Value::String(

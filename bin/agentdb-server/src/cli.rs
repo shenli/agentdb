@@ -43,6 +43,18 @@ pub enum Cmd {
     /// List registered cluster nodes. HTTP-client wrapper for
     /// `GET /api/admin/nodes`.
     ShowNodes(AdminOpts),
+    /// Resolve a session id to its shard + tablet assignment.
+    /// HTTP-client wrapper for `GET /api/admin/shards?session_id=...`.
+    ShowShard(ShowShardOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowShardOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Session id to hash + look up. Required positional argument.
+    pub session_id: String,
 }
 
 #[derive(Args, Debug, Default, Clone)]

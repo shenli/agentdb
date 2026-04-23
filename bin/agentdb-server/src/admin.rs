@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::cli::AdminOpts;
+use crate::cli::{AdminOpts, ShowShardOpts};
 
 /// `POST /api/admin/drain`.
 pub async fn drain(opts: AdminOpts) -> Result<()> {
@@ -55,6 +55,34 @@ pub async fn show_nodes(opts: AdminOpts) -> Result<()> {
     fetch_and_print(&url).await
 }
 
+/// `GET /api/admin/shards?session_id=...`.
+pub async fn show_shard(opts: ShowShardOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/shards?session_id={}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.session_id),
+    );
+    fetch_and_print(&url).await
+}
+
+/// Minimal percent-encoding for a query value. Covers the characters
+/// session ids are likely to include; the admin CLI isn't a
+/// general-purpose URL builder so we don't need full RFC 3986.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+            _ => {
+                for b in c.to_string().as_bytes() {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+    }
+    out
+}
+
 async fn fetch_and_print(url: &str) -> Result<()> {
     let resp = reqwest::get(url)
         .await
@@ -64,10 +92,7 @@ async fn fetch_and_print(url: &str) -> Result<()> {
 
 async fn print_json_and_exit_on_failure(resp: reqwest::Response) -> Result<()> {
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .context("read response body")?;
+    let body = resp.text().await.context("read response body")?;
     let pretty = match serde_json::from_str::<Value>(&body) {
         Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(body.clone()),
         Err(_) => body.clone(),
