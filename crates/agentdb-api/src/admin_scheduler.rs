@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdb_core::LeaderElection;
+use agentdb_core::{LeaderElection, StaleTabletReaper};
 use agentdb_meta::{scheduler as meta_scheduler, MetaStore};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -52,6 +52,11 @@ pub struct SchedulerStatus {
     /// Canonical leader row from the control plane. `None` means no
     /// leader has ever been elected on this cluster.
     pub leader: Option<LeaderView>,
+    /// Total number of tablet leases this process has cleared as
+    /// part of the stale-lease reaper sweep. Only advances while
+    /// this process is the leader — followers report 0 even if
+    /// another node in the cluster has reaped many leases.
+    pub reassignments_total: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -71,6 +76,7 @@ pub struct SchedulerUnavailable {
 pub async fn get_scheduler(
     meta: Option<Extension<Arc<MetaStore>>>,
     election: Option<Extension<Arc<LeaderElection>>>,
+    reaper: Option<Extension<Arc<StaleTabletReaper>>>,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<SchedulerUnavailable>)> {
     let Some(Extension(meta)) = meta else {
         return Err((
@@ -107,11 +113,19 @@ pub async fn get_scheduler(
         expires_at_ms: r.expires_at_ms,
         acquired_at_ms: r.acquired_at_ms,
     });
+    // Reaper is optional — tests that build a router without one
+    // report 0 rather than 503. Election is the core concept; the
+    // reaper is a per-leader detail.
+    let reassignments_total = reaper
+        .as_ref()
+        .map(|Extension(r)| r.reassignments_total())
+        .unwrap_or(0);
     Ok(Json(SchedulerStatus {
         this_node_id: election.node_id().to_string(),
         this_node_is_leader: election.is_leader(),
         this_node_epoch: election.current_epoch(),
         leader,
+        reassignments_total,
     }))
 }
 
@@ -125,12 +139,12 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdb_core::{LeaderElection, LeaderElectionConfig};
+    use agentdb_core::{LeaderElection, LeaderElectionConfig, ReaperConfig, StaleTabletReaper};
     use std::time::Duration;
 
     #[tokio::test]
     async fn returns_503_when_meta_extension_is_absent() {
-        let (code, body) = get_scheduler(None, None).await.expect_err("503");
+        let (code, body) = get_scheduler(None, None, None).await.expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.0.message.contains("meta store"));
     }
@@ -138,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn returns_503_when_election_extension_is_absent() {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        let (code, body) = get_scheduler(Some(Extension(meta)), None)
+        let (code, body) = get_scheduler(Some(Extension(meta)), None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -164,6 +178,7 @@ mod tests {
         let Json(status) = get_scheduler(
             Some(Extension(meta.clone())),
             Some(Extension(election.clone())),
+            None, // no reaper in this test — counter reports 0
         )
         .await
         .expect("200");
@@ -171,8 +186,56 @@ mod tests {
         assert_eq!(status.this_node_id, "test-node");
         assert!(status.this_node_is_leader);
         assert!(status.this_node_epoch >= 1);
+        assert_eq!(
+            status.reassignments_total, 0,
+            "no reaper wired → counter is zero"
+        );
         let leader = status.leader.expect("leader row present");
         assert_eq!(leader.node_id, "test-node");
         assert!(leader.is_live);
+    }
+
+    #[tokio::test]
+    async fn reassignments_total_reflects_reaper_counter_when_present() {
+        // Seed meta with a stale tablet so the reaper immediately
+        // has work to do on its first on-leader tick.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        let meta = Arc::new(MetaStore::open_sqlite(&path).await.unwrap());
+        agentdb_meta::tablets::get_or_create(meta.pool(), 42, 0)
+            .await
+            .unwrap();
+        agentdb_meta::tablets::assume_ownership(meta.pool(), 42, 0, "dead", 1)
+            .await
+            .unwrap();
+
+        let cfg = LeaderElectionConfig {
+            lease_duration: Duration::from_secs(10),
+            renew_interval: Duration::from_millis(100),
+            attempt_interval: Duration::from_millis(50),
+        };
+        let election = LeaderElection::start(meta.clone(), "test-node".into(), cfg);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reaper = StaleTabletReaper::start(
+            meta.clone(),
+            election.clone(),
+            ReaperConfig {
+                tick: Duration::from_millis(100),
+                safety_margin: Duration::from_millis(0),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let Json(status) = get_scheduler(
+            Some(Extension(meta.clone())),
+            Some(Extension(election.clone())),
+            Some(Extension(reaper.clone())),
+        )
+        .await
+        .expect("200");
+        assert!(
+            status.reassignments_total >= 1,
+            "reaper counter should reflect the cleared-stale row"
+        );
     }
 }
