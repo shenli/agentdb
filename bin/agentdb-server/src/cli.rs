@@ -78,6 +78,49 @@ pub enum Cmd {
     /// HTTP-client wrapper for
     /// `POST /api/admin/tablets/create`.
     CreateTablet(CreateTabletOpts),
+    /// Manage admin bearer tokens. Required when
+    /// `AGENTDB_REQUIRE_ADMIN_AUTH=true` on the server.
+    #[command(subcommand)]
+    AdminToken(AdminTokenCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminTokenCmd {
+    /// Mint a new token. The plaintext is printed to stdout
+    /// ONCE and never again; capture it immediately.
+    Add(AdminTokenAddOpts),
+    /// List active (non-revoked) tokens as summaries.
+    List(AdminOpts),
+    /// Soft-revoke a token by id. Idempotent.
+    Revoke(AdminTokenRevokeOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AdminTokenAddOpts {
+    /// Base URL of the server.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Free-form label for this token (shown in `list`).
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Bearer token to authenticate this request. Not
+    /// needed for the bootstrap mint (no tokens exist
+    /// yet). Falls back to the AGENTDB_ADMIN_TOKEN env var.
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AdminTokenRevokeOpts {
+    /// Base URL of the server.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Token id (opaque 12-char prefix) to revoke.
+    pub token_id: String,
+    /// Bearer token to authenticate this request. Falls
+    /// back to the AGENTDB_ADMIN_TOKEN env var.
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

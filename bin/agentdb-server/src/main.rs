@@ -14,7 +14,7 @@ mod dump_config;
 mod serve;
 mod tracing_init;
 
-use cli::{Cli, Cmd, UserCmd};
+use cli::{AdminTokenCmd, Cli, Cmd, UserCmd};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,5 +44,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowTabletLoad(opts) => admin::show_tablet_load(opts).await,
         Cmd::ShedTablet(opts) => admin::shed_tablet(opts).await,
         Cmd::CreateTablet(opts) => admin::create_tablet(opts).await,
+        Cmd::AdminToken(cmd) => match cmd {
+            AdminTokenCmd::Add(opts) => admin::admin_token_add(opts).await,
+            AdminTokenCmd::List(opts) => admin::admin_token_list(opts).await,
+            AdminTokenCmd::Revoke(opts) => admin::admin_token_revoke(opts).await,
+        },
     }
 }

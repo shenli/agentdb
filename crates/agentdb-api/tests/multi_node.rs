@@ -118,6 +118,7 @@ async fn build_node(
         stream: StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
+        admin_auth: None,
     };
     let app = router(state);
     tokio::spawn(async move {

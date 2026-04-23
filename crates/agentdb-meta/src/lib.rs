@@ -14,6 +14,7 @@
 //! production target and is added via a feature flag in a follow-up
 //! PR (see the M18 plan doc).
 
+pub mod admin_tokens;
 pub mod config;
 pub mod error;
 pub mod migrations;

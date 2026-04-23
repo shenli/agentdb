@@ -53,6 +53,7 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
         stream: agentdb_api::StreamBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
+        admin_auth: None,
     };
 
     tokio::spawn(async move {

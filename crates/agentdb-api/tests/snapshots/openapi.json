@@ -861,6 +861,99 @@
         }
       }
     },
+    "/api/admin/tokens": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_tokens",
+        "responses": {
+          "200": {
+            "description": "Active (non-revoked) tokens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TokenSummaryView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "mint_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MintTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "New token minted; plaintext returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintTokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required (except for the bootstrap mint when no tokens exist)"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
+    "/api/admin/tokens/{token_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "token_id",
+            "in": "path",
+            "description": "Token id to revoke",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token revoked (or was already absent / revoked)"
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
     "/api/admin/users": {
       "get": {
         "tags": [
@@ -1978,6 +2071,43 @@
           }
         }
       },
+      "MintTokenRequest": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form label so operators can tell tokens apart.\nShown in the list endpoint; never used for auth."
+          }
+        }
+      },
+      "MintTokenResponse": {
+        "type": "object",
+        "required": [
+          "token_id",
+          "token",
+          "description",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string",
+            "description": "**The plaintext token.** Returned ONCE at mint time;\nthe server never carries it again. Callers must\ncapture it immediately or issue a new one."
+          },
+          "token_id": {
+            "type": "string"
+          }
+        }
+      },
       "NodeView": {
         "type": "object",
         "required": [
@@ -2760,6 +2890,33 @@
           "cold",
           "archive"
         ]
+      },
+      "TokenSummaryView": {
+        "type": "object",
+        "required": [
+          "token_id",
+          "description",
+          "created_at_ms"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "revoked_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "token_id": {
+            "type": "string"
+          }
+        }
       },
       "UserListItem": {
         "type": "object",

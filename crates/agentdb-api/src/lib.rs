@@ -14,6 +14,8 @@ pub mod admin_shards;
 pub mod admin_hot_tablets;
 pub mod admin_tablets;
 pub mod admin_users;
+pub mod admin_auth_middleware;
+pub mod admin_tokens;
 pub mod auth_middleware;
 pub mod dto;
 pub mod error;
@@ -41,6 +43,13 @@ pub struct AppState {
     /// endpoints require `Authorization: Basic <...>` that
     /// verifies against a user in the meta store.
     pub auth: Option<AuthConfig>,
+    /// Admin-plane auth config (post-M25). `None` → admin
+    /// endpoints stay open (dev mode, backward compat).
+    /// `Some` → `/api/admin/*` requires a Bearer token that
+    /// verifies against the admin_tokens table. Bootstrap
+    /// exception: the first `POST /api/admin/tokens` is
+    /// allowed without auth when no active tokens exist.
+    pub admin_auth: Option<admin_auth_middleware::AdminAuthConfig>,
 }
 
 #[derive(Clone)]
@@ -72,6 +81,7 @@ impl AppState {
             stream,
             http,
             auth: None,
+            admin_auth: None,
         }
     }
 }
@@ -109,6 +119,9 @@ impl AppState {
         admin_hot_tablets::list_tablet_load,
         admin_hot_tablets::shed_tablet,
         admin_hot_tablets::create_tablet,
+        admin_tokens::mint_token,
+        admin_tokens::list_tokens,
+        admin_tokens::revoke_token,
         admin_users::create_user,
         admin_users::list_users,
         admin_users::delete_user,
@@ -151,6 +164,9 @@ impl AppState {
         admin_hot_tablets::ShedResponse,
         admin_hot_tablets::CreateTabletRequest,
         admin_hot_tablets::CreateTabletResponse,
+        admin_tokens::MintTokenRequest,
+        admin_tokens::MintTokenResponse,
+        admin_tokens::TokenSummaryView,
         admin_tablets::TabletsUnavailable,
         admin_users::CreateUserRequest,
         admin_users::CreateUserResponse,
@@ -191,17 +207,15 @@ pub fn router(state: AppState) -> Router {
         auth_middleware::basic_auth_middleware,
     ));
 
-    Router::new()
-        .merge(tenant_routes)
+    // Admin-plane routes. Every `/api/admin/*` endpoint goes
+    // here; the bearer-token middleware layers over the
+    // subtree so health/metrics/dashboard stay open.
+    let admin_routes: Router<AppState> = Router::new()
         .route(
             "/api/admin/tier/force",
             axum::routing::post(admin::force_tier),
         )
         .route("/api/admin/hlc", axum::routing::get(admin::get_hlc))
-        .route(
-            "/api/sessions/:session_id/fork",
-            axum::routing::post(fork::fork_handler),
-        )
         .route(
             "/api/admin/boxes",
             axum::routing::get(admin_boxes::list_boxes),
@@ -278,6 +292,27 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/users/:user_id",
             axum::routing::delete(admin_users::delete_user),
+        )
+        .route(
+            "/api/admin/tokens",
+            axum::routing::post(admin_tokens::mint_token)
+                .get(admin_tokens::list_tokens),
+        )
+        .route(
+            "/api/admin/tokens/:token_id",
+            axum::routing::delete(admin_tokens::revoke_token),
+        );
+    let admin_routes = admin_routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        admin_auth_middleware::admin_auth_middleware,
+    ));
+
+    Router::new()
+        .merge(tenant_routes)
+        .merge(admin_routes)
+        .route(
+            "/api/sessions/:session_id/fork",
+            axum::routing::post(fork::fork_handler),
         )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

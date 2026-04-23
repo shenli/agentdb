@@ -29,6 +29,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "SCRAM-SHA-256 users",
         include_str!("../migrations/003_users.sql"),
     ),
+    (
+        4,
+        "admin bearer tokens",
+        include_str!("../migrations/004_admin_tokens.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.
@@ -153,6 +158,7 @@ mod tests {
             "tablets",
             "tenants",
             "users",
+            "admin_tokens",
         ] {
             assert!(
                 names.contains(&expected),
