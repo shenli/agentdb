@@ -340,6 +340,13 @@ M18+ milestones added:
   (including 401 attempts) persists to the meta store.
   Query via `GET /api/admin/audit` or `agentdb audit-log`
   with actor / path-prefix / time-window filters
+- **Global per-tenant rate limits** — cap a tenant's
+  aggregate QPS across every box on this node.
+  `PUT /api/admin/tenant-quotas/:id` or
+  `agentdb set-tenant-quota <id> --max-qps N --burst M`.
+  Denials surface as `429` with `scope: "tenant_global"`
+  and as `agentdb_tenant_quota_denies_total{tenant="..."}`
+  on `/metrics`
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

@@ -381,6 +381,19 @@ pub async fn append_and_fetch_with_actor(
             fault_kind: crate::box_runtime::FaultKind::Error,
         });
     }
+    // Global per-tenant QPS gate. Checked BEFORE the box-level
+    // concurrency semaphore so a throttled tenant fails fast
+    // without parking a permit. `None` when no registry is
+    // attached (tests / legacy paths); in that case this is a
+    // no-op.
+    if let Some(quotas) = registry.tenant_quotas() {
+        quotas
+            .admit(tenant_external)
+            .map_err(|d| Error::TooManyRequests {
+                scope: d.scope,
+                retry_after_ms: 1000,
+            })?;
+    }
     // M23 admission gate: bounded-concurrency cap, independent of the
     // QPS token bucket below. Waits (rather than rejects) for a permit.
     // Permit lives until the function returns, at which point Drop

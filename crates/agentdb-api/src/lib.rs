@@ -14,6 +14,7 @@ pub mod admin_sessions;
 pub mod admin_shards;
 pub mod admin_hot_tablets;
 pub mod admin_tablets;
+pub mod admin_tenant_quotas;
 pub mod admin_users;
 pub mod admin_auth_middleware;
 pub mod admin_tokens;
@@ -127,6 +128,10 @@ impl AppState {
         admin_tokens::mint_token,
         admin_tokens::list_tokens,
         admin_tokens::revoke_token,
+        admin_tenant_quotas::list_tenant_quotas,
+        admin_tenant_quotas::get_tenant_quota,
+        admin_tenant_quotas::put_tenant_quota,
+        admin_tenant_quotas::delete_tenant_quota,
         admin_users::create_user,
         admin_users::list_users,
         admin_users::delete_user,
@@ -179,6 +184,8 @@ impl AppState {
         admin_tokens::MintTokenRequest,
         admin_tokens::MintTokenResponse,
         admin_tokens::TokenSummaryView,
+        admin_tenant_quotas::SetTenantQuotaRequest,
+        admin_tenant_quotas::TenantQuotaView,
         admin_tablets::TabletsUnavailable,
         admin_users::CreateUserRequest,
         admin_users::CreateUserResponse,
@@ -325,6 +332,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/audit",
             axum::routing::get(admin_audit::list_audit),
+        )
+        .route(
+            "/api/admin/tenant-quotas",
+            axum::routing::get(admin_tenant_quotas::list_tenant_quotas),
+        )
+        .route(
+            "/api/admin/tenant-quotas/:tenant_id",
+            axum::routing::get(admin_tenant_quotas::get_tenant_quota)
+                .put(admin_tenant_quotas::put_tenant_quota)
+                .delete(admin_tenant_quotas::delete_tenant_quota),
         );
     let admin_routes = admin_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),

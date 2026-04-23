@@ -516,6 +516,13 @@ pub struct BoxRegistry {
     /// nodes; when unset, every routed decision degrades to
     /// Local (the single-node path).
     node_addr: std::sync::OnceLock<Arc<crate::forwarding::NodeAddressProxy>>,
+    /// Global per-tenant rate-limit registry. `None` on the
+    /// legacy / test paths that don't attach one. When `Some`,
+    /// [`crate::primitives::append_and_fetch_with_actor`]
+    /// consults it before the per-box admit; denial surfaces as
+    /// [`Error::TooManyRequests`] with
+    /// [`Scope::TenantGlobal`](crate::admission::Scope::TenantGlobal).
+    tenant_quotas: std::sync::OnceLock<Arc<crate::TenantQuotaRegistry>>,
 }
 
 impl BoxRegistry {
@@ -584,6 +591,7 @@ impl BoxRegistry {
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
             node_addr: std::sync::OnceLock::new(),
+            tenant_quotas: std::sync::OnceLock::new(),
         })
     }
 
@@ -679,6 +687,7 @@ impl BoxRegistry {
             drained_at_ms: Arc::new(std::sync::OnceLock::new()),
             location: std::sync::OnceLock::new(),
             node_addr: std::sync::OnceLock::new(),
+            tenant_quotas: std::sync::OnceLock::new(),
         })
     }
 
@@ -762,6 +771,26 @@ impl BoxRegistry {
     /// writing an override.
     pub fn location(&self) -> Option<Arc<crate::shard::LocationProxy>> {
         self.location.get().cloned()
+    }
+
+    /// Attach the global per-tenant rate-limit registry so the
+    /// write path enforces the quotas configured in the meta
+    /// store's `tenant_quotas` table. Idempotent at the
+    /// OnceLock level — second call returns the input back to
+    /// the caller. The server binary calls this exactly once
+    /// after hydrating the registry from meta.
+    pub fn attach_tenant_quotas(
+        &self,
+        quotas: Arc<crate::TenantQuotaRegistry>,
+    ) -> std::result::Result<(), Arc<crate::TenantQuotaRegistry>> {
+        self.tenant_quotas.set(quotas)
+    }
+
+    /// Currently-attached global per-tenant rate-limit registry,
+    /// if any. `None` means "no enforcement" — tests and legacy
+    /// construction paths operate this way.
+    pub fn tenant_quotas(&self) -> Option<Arc<crate::TenantQuotaRegistry>> {
+        self.tenant_quotas.get().cloned()
     }
 
     /// Attach a [`NodeAddressProxy`] so

@@ -14,8 +14,15 @@ pub struct AdmissionDenied {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
+    /// Per-box QPS cap (via `Quota::max_qps`).
     Box,
+    /// Per-box-per-tenant QPS cap (via `Quota::max_tenant_qps`).
+    /// One bucket per tenant, each box maintains its own map.
     Tenant,
+    /// Global per-tenant QPS cap (via the meta store's
+    /// `tenant_quotas` table). One bucket per tenant,
+    /// aggregated across every box on this node.
+    TenantGlobal,
 }
 
 impl Scope {
@@ -23,6 +30,7 @@ impl Scope {
         match self {
             Scope::Box => "box",
             Scope::Tenant => "tenant",
+            Scope::TenantGlobal => "tenant_global",
         }
     }
 }
@@ -108,5 +116,6 @@ mod tests {
     fn scope_as_str_is_stable() {
         assert_eq!(Scope::Box.as_str(), "box");
         assert_eq!(Scope::Tenant.as_str(), "tenant");
+        assert_eq!(Scope::TenantGlobal.as_str(), "tenant_global");
     }
 }

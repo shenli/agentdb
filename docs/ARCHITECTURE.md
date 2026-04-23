@@ -1074,6 +1074,45 @@ the meta store directly today); surfacing the audit log
 on `/metrics` (row counts are a gauge, but tailing is a
 worse UX than the JSON endpoint).
 
+### Per-tenant rate limits
+
+Per-box admission already had two token buckets: a global
+box cap (`Quota::max_qps`) and a per-box-per-tenant cap
+(`Quota::max_tenant_qps`). Those protect the box from a
+noisy tenant. What they do **not** do is cap a single
+tenant's aggregate impact across every box.
+
+The global per-tenant rate limit closes that gap. One
+`TokenBucket` per tenant, keyed by the external tenant id
+(the string), held in an in-memory `TenantQuotaRegistry`
+on the `BoxRegistry`. The persistent source of truth is
+the meta store's `tenant_quotas` table (migration 006).
+Server startup hydrates the registry from meta before the
+HTTP listener binds, so no cold-start window leaks
+unthrottled traffic from a quota'd tenant.
+
+`append_and_fetch_with_actor` consults the registry before
+the per-box admission semaphore — denial fails fast
+without parking a semaphore permit. Denials surface as
+`429 TooManyRequests` with
+`scope: "tenant_global"` in the error body.
+
+**Admin surface.** `/api/admin/tenant-quotas` — PUT / GET /
+DELETE by tenant id; list via the index endpoint. CLI:
+`agentdb set-tenant-quota <id> --max-qps N --burst M`,
+`agentdb show-tenant-quota [id]`,
+`agentdb clear-tenant-quota <id>`.
+
+**Observability.** `agentdb_tenant_quota_denies_total{tenant="..."}`
+on `/metrics`, one series per tenant that has denied since
+process start. Cardinality is operator-controlled:
+unconfigured tenants never deny and never produce a series.
+
+**Scope.** Per-node, not cluster-global. Multi-node
+deployments divide the quota by node count manually;
+cluster-global coordination needs a shared token source
+(out of scope for the prototype).
+
 ### TLS termination
 
 REST listens over HTTP by default. Supply `--tls-cert PATH

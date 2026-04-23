@@ -53,5 +53,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::MigrateSession(opts) => admin::migrate_session(opts).await,
         Cmd::ShowLatency(opts) => admin::show_latency(opts).await,
         Cmd::AuditLog(opts) => admin::audit_log(opts).await,
+        Cmd::SetTenantQuota(opts) => admin::set_tenant_quota(opts).await,
+        Cmd::ShowTenantQuota(opts) => admin::show_tenant_quota(opts).await,
+        Cmd::ClearTenantQuota(opts) => admin::clear_tenant_quota(opts).await,
     }
 }
