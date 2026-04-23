@@ -288,15 +288,18 @@ M18+ milestones added:
 - **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
   — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
   Basic auth; user→tenant ACL; `agentdb user add|list|delete`
-- **M25 hot-tablet detection + shed** — 60-second sliding
-  rate window on every box; scheduler-leader detector flags
-  tablets whose admission_wait_ratio stays > threshold for
-  N ticks; `POST /api/admin/tablets/:id/shed` bulk-moves a
-  fraction of the hot tablet's shards to a destination
-  (auto-picked or explicit); `agentdb show-hot-tablets` /
-  `shed-tablet` CLI
+- **M25 hot-tablet detection + shed + dynamic tablet
+  creation** — sliding rate window on every box;
+  scheduler-leader detector flags saturated tablets;
+  `POST /api/admin/tablets/:id/shed` redistributes shards
+  between existing tablets;
+  `POST /api/admin/tablets/create` grows the box pool at
+  runtime (no process restart). Full relief loop:
+  `show-hot-tablets` → `create-tablet` → `shed-tablet
+  <hot> --to <new>`
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
-  `set-shard`, `user *`, `shed-tablet`, `dump-config`)
+  `set-shard`, `user *`, `shed-tablet`, `create-tablet`,
+  `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
@@ -332,10 +335,13 @@ M18+ milestones added:
 - **M22 sophisticated policy** — cross-AZ preference, anti-
   affinity, node-weight awareness. Current reassignment is
   round-robin across live tablets.
-- **Dynamic tablet / box creation.** `shed` redistributes
-  shards among *existing* tablets; a "real" split that
-  creates a new tablet with id ≥ num_boxes would require
-  growing the `BoxRegistry` at runtime. Separate PR.
+- **Cross-node `create-tablet`.** The admin endpoint
+  creates the tablet on the node receiving the call. To
+  spawn a tablet on a different node, post to that node's
+  admin URL. Automatic placement (e.g. "put the new
+  tablet wherever load is lowest") is future work.
+- **Tablet deletion / shrink.** Once created, a tablet
+  stays. Shrinking requires data migration.
 - **Auto-shed policy.** The detector flags; an operator
   calls `shed`. Automatic policy needs calibrated
   thresholds that only production data can provide.

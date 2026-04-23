@@ -864,6 +864,7 @@ no SQLite writes.
 | `GET /api/admin/tablets/hot` | Currently-flagged tablets + last sample time |
 | `GET /api/admin/tablets/load` | Every tablet with `{ appends_per_sec, admission_wait_ratio, is_hot }` |
 | `POST /api/admin/tablets/:id/shed` | Move a fraction of this tablet's overridden shards to another |
+| `POST /api/admin/tablets/create` | Grow the box pool by one new tablet at runtime |
 
 Shed body: `{ "to_tablet_id": i64 | null, "fraction": f64 | null }`.
 `to_tablet_id = null` → server picks the least-loaded
@@ -875,18 +876,46 @@ source tablet. Same semantics as `set_shard` — same
 rationale (the "quiesce + handoff" gap is acknowledged in
 ARCHITECTURE.md and is real-split-specific future work).
 
+**Dynamic tablet creation** (`POST /api/admin/tablets/create`).
+Body: `{ "tablet_id": i64 | null }`. When null, the server
+picks `max(existing) + 1`. Calls
+`BoxRegistry::add_box(tablet_id)` which:
+
+1. Idempotently inserts the tablet row in meta.
+2. Acquires the lease via the existing `LeaseManager::acquire`.
+3. Builds a `Box_` and pushes it under a write lock on
+   the `boxes` Vec.
+
+The Vec lives behind `parking_lot::RwLock` (added in this
+PR — replaces the old `Vec<Arc<Box_>>`); hot-path readers
+take a read lock, clone the `Arc<Box_>` they need, and
+drop the lock. Reads incur one atomic per request — not
+measurable under normal load. Writes only happen when
+operators call `create` — zero steady-state contention.
+
+Operator workflow for relief under load:
+
+1. `agentdb show-hot-tablets` — identify the saturated tablet
+2. `agentdb create-tablet` — grow the pool by one
+3. `agentdb shed-tablet <hot_id> --to <new_id>` — move half
+   of the hot tablet's shards to the new one
+
 **CLI.** `agentdb show-hot-tablets`, `agentdb
 show-tablet-load`, `agentdb shed-tablet <id> [--to N]
-[--fraction F]`.
+[--fraction F]`, `agentdb create-tablet [--id N]`.
 
 **Out of scope for this PR:**
-- **Dynamic tablet/box creation.** Real split creates a
-  *new* tablet with id ≥ num_boxes. The prototype's fixed
-  `BoxRegistry.boxes: Vec<Arc<Box_>>` can't grow at
-  runtime. Shed is "redistribute among existing tablets."
-- **Auto-shed.** The detector flags; an operator calls
-  shed. Automatic policy needs calibrated thresholds that
-  require production data.
+- **Cross-node new-tablet placement.** `create-tablet`
+  acquires the lease locally. To create a tablet on a
+  different node, post to that node's admin URL.
+- **Auto-shed / auto-create.** Detector flags; operator
+  acts. Autonomy needs calibrated thresholds + anti-thrash
+  logic that only production data can provide.
+- **Data handoff on shed.** Shed moves *future* routing,
+  not already-written data. The "quiesce + handoff" gap is
+  documented.
+- **Tablet deletion.** Once created, a tablet stays.
+  Shrinking requires data migration.
 - **Per-session hot-key detection.** Requires per-session
   metrics the prototype doesn't track.
 
@@ -958,6 +987,7 @@ agentdb user delete <uid>   DELETE /api/admin/users/:uid
 agentdb show-hot-tablets    GET /api/admin/tablets/hot
 agentdb show-tablet-load    GET /api/admin/tablets/load
 agentdb shed-tablet <id>    POST /api/admin/tablets/:id/shed
+agentdb create-tablet       POST /api/admin/tablets/create
 ```
 
 `--dev` sets up an ephemeral tempdir for KV + object store + meta;

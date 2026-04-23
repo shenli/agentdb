@@ -71,6 +71,24 @@ pub enum Cmd {
     /// HTTP-client wrapper for
     /// `POST /api/admin/tablets/:id/shed`.
     ShedTablet(ShedTabletOpts),
+    /// Create a new tablet on this node at runtime (M25
+    /// dynamic-tablet). Grows the box pool by one; the new
+    /// tablet starts empty and owned by the node that
+    /// received this call.
+    /// HTTP-client wrapper for
+    /// `POST /api/admin/tablets/create`.
+    CreateTablet(CreateTabletOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CreateTabletOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Explicit tablet id. Omit to let the server pick
+    /// `max(existing) + 1`.
+    #[arg(long)]
+    pub id: Option<i64>,
 }
 
 #[derive(Args, Debug, Clone)]

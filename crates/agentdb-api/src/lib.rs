@@ -108,6 +108,7 @@ impl AppState {
         admin_hot_tablets::list_hot_tablets,
         admin_hot_tablets::list_tablet_load,
         admin_hot_tablets::shed_tablet,
+        admin_hot_tablets::create_tablet,
         admin_users::create_user,
         admin_users::list_users,
         admin_users::delete_user,
@@ -148,6 +149,8 @@ impl AppState {
         admin_hot_tablets::TabletLoadResponse,
         admin_hot_tablets::ShedRequest,
         admin_hot_tablets::ShedResponse,
+        admin_hot_tablets::CreateTabletRequest,
+        admin_hot_tablets::CreateTabletResponse,
         admin_tablets::TabletsUnavailable,
         admin_users::CreateUserRequest,
         admin_users::CreateUserResponse,
@@ -246,6 +249,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tablets/:id/shed",
             axum::routing::post(admin_hot_tablets::shed_tablet),
+        )
+        .route(
+            "/api/admin/tablets/create",
+            axum::routing::post(admin_hot_tablets::create_tablet),
         )
         .route(
             "/api/admin/shards",

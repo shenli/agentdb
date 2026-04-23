@@ -681,6 +681,42 @@
         }
       }
     },
+    "/api/admin/tablets/create": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_tablet",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTabletRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "New tablet created and owned by this node",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTabletResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "tablet_id already exists on this node"
+          },
+          "503": {
+            "description": "Meta store / node id not configured"
+          }
+        }
+      }
+    },
     "/api/admin/tablets/hot": {
       "get": {
         "tags": [
@@ -1159,6 +1195,36 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "CreateTabletRequest": {
+        "type": "object",
+        "description": "Request body for `POST /api/admin/tablets/create` (M25\ndynamic tablet creation).",
+        "properties": {
+          "tablet_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Explicit tablet id. When null, the server picks\n`max(existing) + 1` (simple and predictable at\nprototype scale)."
+          }
+        }
+      },
+      "CreateTabletResponse": {
+        "type": "object",
+        "required": [
+          "tablet_id",
+          "owner_node_id"
+        ],
+        "properties": {
+          "owner_node_id": {
+            "type": "string"
+          },
+          "tablet_id": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
