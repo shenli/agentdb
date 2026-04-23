@@ -53,7 +53,15 @@ serialized but different boxes run in parallel.
 `Box_` (`crates/agentdb-core/src/box_runtime.rs`) is the unit of
 physical isolation described in §3.5 of the design doc. Each box owns:
 
-- a `write_lock` for serializing mutations
+- a **per-tenant lock map** (`tenant_locks`) so different tenants on
+  one box run in parallel while preserving ordering within each
+  tenant (M23; replaced the original single `write_lock` mutex)
+- an **admission semaphore** bounding in-flight writes to
+  `AGENTDB_ADMISSION_CAPACITY` (default 64), complementing the QPS
+  token bucket
+- an optional **tablet lease** (M21) that writes check on every
+  request — a stale lease short-circuits with `NodeDraining` /
+  `LeaseLost`
 - `BoxMetrics` counters (appends, forks, tier transitions, quota hits,
   warm/cold gauges)
 - an optional `InjectedFault` (latency or error, expiring after N
@@ -584,6 +592,163 @@ the Server-Sent Events channel; the server broadcasts:
 The dashboard (`crates/agentdb-dashboard/static/app.js`) consumes both
 the snapshot endpoint and the SSE stream to render box tiles + event
 feed live.
+
+## Control plane (M18 and later)
+
+The sections above describe the original single-process prototype —
+one process, one set of boxes, state persisted via RocksDB +
+object_store, no coordination needed. M18 onward layer a **control
+plane** on top of that core without rewriting it: a second SQLite
+database (the "meta store") tracks cluster-wide state that every
+process agrees on, and a bundle of background loops keep it fresh.
+
+### Meta store (`crates/agentdb-meta`)
+
+SQLite-backed cluster-wide metadata. One file (`meta.sqlite`) holds
+five tables:
+
+| Table | What it tracks |
+|---|---|
+| `tenants` | Global tenant id space — one row per external tenant id. Superset of the per-box `TenantRegistry`. |
+| `nodes` | Cluster membership + heartbeat. Each running `agentdb serve` process upserts a row and bumps `last_heartbeat_ms` every 5s. |
+| `tablets` | Runtime ownership units. Every box owns a tablet (today `tablet_id == box_id`); each row carries a monotonic `epoch` for fencing. |
+| `scheduler_leader` | Singleton row (enforced via `CHECK (id = 1)`) holding the current scheduler leader's lease. |
+| `shards` | 16384-row shard → tablet assignment. Default NULL means "route via hash"; operators can pin specific shards. |
+
+Migrations are hand-rolled (`migrations.rs`), idempotent, forward-
+only. Both SQLite (local dev) and Postgres (future production) are
+target dialects; the crate currently implements only SQLite but the
+helper functions keep dialect-agnostic SQL so a Postgres backend is
+additive.
+
+### Leases + fencing (M21)
+
+Each box holds a lease on its tablet row, acquired via
+`tablets::assume_ownership` (a CAS on `epoch` — the row's epoch
+is the fencing token). A background `LeaseRenewalJob` refreshes
+the lease every `AGENTDB_LEASE_RENEW_SECS` (default 10s); the
+lease duration is `AGENTDB_LEASE_DURATION_SECS` (30s) so a missed
+renewal window is tolerable. Writers check `is_live()` on every
+request — a stale lease returns `Error::LeaseLost` immediately,
+which surfaces as HTTP 503 `code: "lease_lost"` with a doc_url.
+
+### Node heartbeat + staleness (M22 piece 1)
+
+`agentdb_meta::nodes::upsert` on boot; `heartbeat` every
+`AGENTDB_HEARTBEAT_SECS` (default 5s). The
+`/api/admin/nodes?stale_threshold_ms=N` endpoint flags rows whose
+`last_heartbeat_ms` is older than the threshold — operators see
+stale nodes without needing a separate probe.
+
+### Scheduler election (M22 piece 2)
+
+Every node runs a `LeaderElection` loop (`agentdb_core::scheduler`)
+that alternates between "try-acquire every `AGENTDB_LEADER_ATTEMPT_SECS`
+(2s default)" and "renew every `AGENTDB_LEADER_RENEW_SECS` (5s)".
+Exactly one process in the cluster wins; others sit as followers.
+`GET /api/admin/scheduler` shows the current leader plus the local
+node's view.
+
+### Stale-lease reaper (M22 piece 3)
+
+The leader runs a `StaleTabletReaper` that periodically scans the
+`tablets` table (`AGENTDB_REAPER_TICK_SECS`, default 10s) for
+entries whose lease expired longer than `AGENTDB_REAPER_SAFETY_MARGIN_SECS`
+(5s) ago, clears the owner, and bumps the epoch. Followers' loops
+no-op — `is_leader()` checks the scheduler state on every tick.
+
+### Drain (M22 piece 4)
+
+`POST /api/admin/drain` flips a process-level atomic
+(`BoxRegistry::draining`). Subsequent writes return
+`Error::NodeDraining` immediately; the lease-renewal loop stops
+renewing, so after the lease duration + safety margin the reaper on
+another node clears the rows. Operators get a clean handoff without
+SIGTERM. No un-drain — restart the process to reverse.
+`docs/runbooks/node_draining.md` has the full procedure.
+
+### Per-tenant locking + admission semaphore (M23)
+
+`Box_::write_lock: Mutex<()>` (serializes every tenant) is gone.
+Replaced by:
+
+- **Per-tenant lock map** (`tenant_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>`)
+  keyed by external tenant id. Different tenants on one box run in
+  parallel; a single tenant still serializes. Preserves the
+  mint-race invariant that the old single mutex provided.
+- **Admission semaphore** (`tokio::sync::Semaphore`, cap via
+  `AGENTDB_ADMISSION_CAPACITY`, default 64) bounding concurrent
+  writes per box. Waits rather than rejects — complements the QPS
+  token bucket, which rejects.
+
+### Shard hash + LocationProxy (M20 foundation)
+
+`agentdb_core::shard::shard_id(session_external) -> u16` is FNV-1a
+(64-bit) modulo 16384. `LocationProxy` holds a cached lookup
+`shard_id → Option<tablet_id>`, refreshed from the `shards` table
+every `AGENTDB_SHARD_REFRESH_SECS` (30s). Operators pin shards via
+`POST /api/admin/shards/:id` (immediately refreshes the proxy) and
+inspect assignments via `GET /api/admin/shards/:id` or
+`GET /api/admin/shards?session_id=...`. The write path doesn't yet
+consume the proxy — the M20 full routing refactor is what wires it
+in (still pending).
+
+### Clap CLI (M26 piece 1)
+
+The binary is now `agentdb` (was `agentdb-server`). Subcommands:
+
+```
+agentdb serve [--dev]       long-running server
+agentdb dump-config         print effective env + defaults as JSON
+agentdb drain               POST /api/admin/drain
+agentdb show-tablets        GET  /api/admin/tablets
+agentdb show-scheduler      GET  /api/admin/scheduler
+agentdb show-nodes          GET  /api/admin/nodes
+agentdb show-shard <sid>    GET  /api/admin/shards?session_id=...
+agentdb set-shard <id> ...  POST /api/admin/shards/:id
+agentdb list-shard-overrides GET /api/admin/shards/list
+```
+
+`--dev` sets up an ephemeral tempdir for KV + object store + meta;
+every storage env var is auto-overridden so `agentdb serve --dev` is
+a zero-config quickstart. Admin CLI subcommands exit 1 on 4xx and
+2 on 5xx for shell-pipeline branching.
+
+### Docker + compose (M26 piece 2)
+
+`Dockerfile` is multi-stage (Rust builder → debian-slim runtime,
+non-root user, tini PID 1). `examples/compose/docker-compose.yml`
+boots a single AgentDB node backed by MinIO for S3-compat; the
+AgentDB process runs the production-shape storage path (SlateDB on
+S3). Multi-node compose is blocked on M20 — see the compose
+`README.md` for the reason.
+
+### Prometheus exposition (M27 piece)
+
+`GET /metrics` returns the standard Prometheus text-format body —
+one HELP/TYPE block per metric plus per-box samples labelled by
+`box`. No `prometheus` crate dep; the format is trivial. Scraping
+an AgentDB node needs no extra config beyond pointing at
+`http://<node>:7878/metrics`.
+
+### Structured `/health/ready` (M27 piece)
+
+Failure body is a `reasons: []` array of `{code, message, doc_url}`
+objects, one per distinct problem (so "node draining *and* a
+lease expired" surface both signals, not just one). `code` is a
+typed enum — `node_draining`, `lease_not_live` today, easy to add
+more. Every code carries a runbook URL (same contract as REST
+error `doc_url`).
+
+### Runbooks (M27 piece)
+
+`docs/runbooks/` carries one file per user-facing error code. Every
+REST error response (including `lease_lost`, `fault_injected`,
+`quota_exceeded`, `node_draining`, `storage_error`, `invalid_request`,
+`not_found`, `serialization_error`) embeds a `doc_url` pointing at
+the relevant file. The structure is always Symptom → Diagnose →
+Verify → Remediate → Prevent so operators skimming one runbook
+know the shape of every other.
 
 ## What the prototype does NOT do
 
