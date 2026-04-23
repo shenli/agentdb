@@ -288,8 +288,15 @@ M18+ milestones added:
 - **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
   — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
   Basic auth; user→tenant ACL; `agentdb user add|list|delete`
+- **M25 hot-tablet detection + shed** — 60-second sliding
+  rate window on every box; scheduler-leader detector flags
+  tablets whose admission_wait_ratio stays > threshold for
+  N ticks; `POST /api/admin/tablets/:id/shed` bulk-moves a
+  fraction of the hot tablet's shards to a destination
+  (auto-picked or explicit); `agentdb show-hot-tablets` /
+  `shed-tablet` CLI
 - **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
-  `set-shard`, `user *`, `dump-config`)
+  `set-shard`, `user *`, `shed-tablet`, `dump-config`)
 - **Docker packaging** (multi-stage `Dockerfile`, compose stack
   with MinIO)
 - **Prometheus `/metrics`** exposition
@@ -325,8 +332,13 @@ M18+ milestones added:
 - **M22 sophisticated policy** — cross-AZ preference, anti-
   affinity, node-weight awareness. Current reassignment is
   round-robin across live tablets.
-- **M25 hot-tablet auto-split** — requires per-tablet load
-  tracking (`TabletMetrics`) that doesn't exist yet.
+- **Dynamic tablet / box creation.** `shed` redistributes
+  shards among *existing* tablets; a "real" split that
+  creates a new tablet with id ≥ num_boxes would require
+  growing the `BoxRegistry` at runtime. Separate PR.
+- **Auto-shed policy.** The detector flags; an operator
+  calls `shed`. Automatic policy needs calibrated
+  thresholds that only production data can provide.
 - **Cross-box (distributed) transactions** — design is single-box
   2PC-free.
 - **Real ANN at 100M+ vectors** — HNSW is single-node, in-process.

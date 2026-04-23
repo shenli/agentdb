@@ -7,6 +7,7 @@ pub mod forwarding;
 pub mod fork;
 pub mod hedge;
 pub mod hlc;
+pub mod hot_tablet;
 pub mod index_snapshot;
 pub mod index_snapshot_job;
 pub mod indexes;
@@ -16,6 +17,7 @@ pub(crate) mod meta;
 pub mod metrics;
 pub mod planner;
 pub mod primitives;
+pub mod rate_window;
 pub mod read_ctx;
 pub mod reaper;
 pub mod registry;
@@ -37,6 +39,7 @@ pub use forwarding::{NodeAddressProxy, NodeAddressRefreshJob, NodeTarget};
 pub use fork::fork_session;
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};
 pub use hlc::{HlcClock, HlcError, HlcTimestamp};
+pub use hot_tablet::{HotTablet, HotTabletConfig, HotTabletDetector, TabletLoad};
 pub use index_snapshot::{
     latest_snapshot_path, list_snapshots, prune_old_snapshots, read_snapshot, restore_indexes,
     snapshot_indexes, snapshot_path, snapshot_prefix, write_snapshot, IndexSnapshot,
@@ -52,6 +55,7 @@ pub use primitives::{
     append_and_fetch, append_and_fetch_with_actor, append_event, fetch_last_n, fetch_last_n_merged,
     scan_session_all_tiers, scan_session_events, AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
+pub use rate_window::{RateSnapshot, RateWindow};
 pub use read_ctx::ReadCtx;
 pub use reaper::{ReaperConfig, StaleTabletReaper};
 pub use registry::{SessionRegistry, TenantRegistry};

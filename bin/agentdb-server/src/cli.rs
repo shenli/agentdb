@@ -56,6 +56,39 @@ pub enum Cmd {
     /// Manage SCRAM-SHA-256 user accounts (M19).
     #[command(subcommand)]
     User(UserCmd),
+    /// Show tablets the hot-tablet detector has flagged as
+    /// saturated (M25).
+    /// HTTP-client wrapper for `GET /api/admin/tablets/hot`.
+    ShowHotTablets(AdminOpts),
+    /// Show every tablet's current rate + hot/cool status
+    /// (M25). Useful for "which tablet is warm but not yet
+    /// saturated?".
+    /// HTTP-client wrapper for `GET /api/admin/tablets/load`.
+    ShowTabletLoad(AdminOpts),
+    /// Move a fraction of one tablet's overridden shards to
+    /// another tablet (M25). Manual load redistribution; pair
+    /// with `show-hot-tablets` to pick a source.
+    /// HTTP-client wrapper for
+    /// `POST /api/admin/tablets/:id/shed`.
+    ShedTablet(ShedTabletOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShedTabletOpts {
+    /// Base URL of the server to talk to.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Source tablet id (the hot one). Required positional
+    /// argument.
+    pub tablet_id: i64,
+    /// Destination tablet. If omitted, the server picks the
+    /// least-loaded tablet excluding the source.
+    #[arg(long)]
+    pub to: Option<i64>,
+    /// Fraction of the source's overridden shards to move.
+    /// Defaults server-side to 0.5. Clamps to (0, 1].
+    #[arg(long)]
+    pub fraction: Option<f64>,
 }
 
 #[derive(Subcommand, Debug)]

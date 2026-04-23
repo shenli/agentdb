@@ -17,7 +17,9 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::cli::{AdminOpts, SetShardOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts};
+use crate::cli::{
+    AdminOpts, SetShardOpts, ShedTabletOpts, ShowShardOpts, UserAddOpts, UserDeleteOpts,
+};
 
 /// `POST /api/admin/drain`.
 pub async fn drain(opts: AdminOpts) -> Result<()> {
@@ -157,6 +159,49 @@ pub async fn user_delete(opts: UserDeleteOpts) -> Result<()> {
         std::process::exit(exit_code_for(status));
     }
     Ok(())
+}
+
+/// `GET /api/admin/tablets/hot` — show flagged hot tablets.
+pub async fn show_hot_tablets(opts: AdminOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tablets/hot",
+        opts.server_url.trim_end_matches('/')
+    );
+    fetch_and_print(&url).await
+}
+
+/// `GET /api/admin/tablets/load` — all tablets with rate info.
+pub async fn show_tablet_load(opts: AdminOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tablets/load",
+        opts.server_url.trim_end_matches('/')
+    );
+    fetch_and_print(&url).await
+}
+
+/// `POST /api/admin/tablets/:id/shed` — bulk-move shards off a
+/// hot tablet.
+pub async fn shed_tablet(opts: ShedTabletOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/tablets/{}/shed",
+        opts.server_url.trim_end_matches('/'),
+        opts.tablet_id,
+    );
+    let mut body = serde_json::json!({});
+    if let Some(to) = opts.to {
+        body["to_tablet_id"] = serde_json::Value::from(to);
+    }
+    if let Some(f) = opts.fraction {
+        body["fraction"] = serde_json::Value::from(f);
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    print_json_and_exit_on_failure(resp).await
 }
 
 /// Read a line from stdin with a minimal prompt. Not a
