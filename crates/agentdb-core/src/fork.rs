@@ -24,7 +24,15 @@ pub fn fork_session(
     new_session_external: &str,
     now_millis: u64,
 ) -> Result<Session> {
-    let box_ = registry.route_tenant(tenant_external);
+    // M20: route by (tenant, session) so a parent session
+    // whose shard was overridden lives on the same box the
+    // fork hits. `route_session` returns a local Arc<Box_>
+    // (falling back to tenant-hash when no override is set or
+    // the override is out of local range), which matches
+    // fork_session's contract of "fork never crosses box
+    // boundaries" — the fork_handler caller already handled
+    // any cross-node case before we get here.
+    let box_ = registry.route_session(tenant_external, parent_session_external);
     let tenant = tenants
         .lookup(box_.id, tenant_external)?
         .ok_or_else(|| Error::NotFound {

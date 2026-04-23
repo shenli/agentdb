@@ -17,6 +17,27 @@ pub async fn find_response(
     filter_doc: &Document,
     limit: Option<i64>,
 ) -> WireResult<Document> {
+    // M20 multi-node: if the filter pins a specific session
+    // and that session's shard is owned by another node, the
+    // read is routed wrong and we'd silently return empty
+    // from the tenant-hash box. Fail loudly with a
+    // NotWritablePrimary-shaped error that tells the client
+    // where to reconnect. Mongo-wire cross-node forwarding is
+    // deferred (binary stateful protocol; see plan doc).
+    if let Some(pinned_session) = Filter::parse(filter_doc)
+        .ok()
+        .and_then(|f| f.top_level_eq("session_id").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }))
+    {
+        if let agentdb_core::RouteDecision::Remote { target, tablet_id } =
+            registry.route_session_for_io(db, &pinned_session)
+        {
+            return Ok(cross_node_error(&target.node_id, &target.address, tablet_id));
+        }
+    }
+
     let box_ = registry.route_tenant(db);
     box_.metrics.record_query_find();
     let tenant_opt = tenants.lookup(box_.id, db)?;
@@ -109,6 +130,25 @@ fn empty_batch(db: &str, collection: &str) -> Document {
             "firstBatch": Bson::Array(vec![]),
         },
         "ok": 1.0,
+    }
+}
+
+/// Mongo-shaped error body for the session-pinned-on-a-peer
+/// case. `code: 10107` (NotWritablePrimary) is the canonical
+/// signal for "your connection is to the wrong node" — drivers
+/// interpret it as "reconnect." We include the owning node's
+/// address so a human operator sees it immediately and a
+/// driver that logs errmsg has a breadcrumb.
+pub fn cross_node_error(node_id: &str, address: &str, tablet_id: i64) -> Document {
+    doc! {
+        "ok": 0.0,
+        "code": 10107_i32,
+        "codeName": "NotWritablePrimary",
+        "errmsg": format!(
+            "session shard is owned by node {node_id} at {address} (tablet {tablet_id}); \
+             reconnect there. Cross-node Mongo-wire forwarding is not implemented; \
+             see docs/ARCHITECTURE.md M20 multi-node section."
+        ),
     }
 }
 

@@ -24,6 +24,22 @@ pub async fn aggregate_response(
     collection: &str,
     pipeline: &[Document],
 ) -> WireResult<Document> {
+    // M20 multi-node: if the pipeline pins a specific session
+    // (via source-stage filter or a $match), and that session
+    // lives on a peer, fail loudly. Symmetric with find.rs; see
+    // that file for the cross-node-Mongo rationale.
+    if let Some(pinned) = pinned_session_from_pipeline(pipeline) {
+        if let agentdb_core::RouteDecision::Remote { target, tablet_id } =
+            registry.route_session_for_io(db, &pinned)
+        {
+            return Ok(super::find::cross_node_error(
+                &target.node_id,
+                &target.address,
+                tablet_id,
+            ));
+        }
+    }
+
     let box_ = registry.route_tenant(db);
     box_.metrics.record_query_aggregate();
     let tenant_opt = tenants.lookup(box_.id, db)?;
@@ -173,6 +189,60 @@ fn empty_batch(db: &str, collection: &str) -> Document {
         },
         "ok": 1.0,
     }
+}
+
+/// Inspect a pipeline for an equality-pin on `session_id`, in
+/// either the source stage's filter or a downstream `$match`.
+/// Returns the pinned session id string, if any. Used by the
+/// M20 multi-node cross-node detection path *before* we pay the
+/// cost of building indexes — so a mis-routed read fails fast.
+fn pinned_session_from_pipeline(pipeline: &[Document]) -> Option<String> {
+    fn pin_from_filter_doc(d: &Document) -> Option<String> {
+        Filter::parse(d).ok().and_then(|f| {
+            f.top_level_eq("session_id").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+        })
+    }
+    let first = pipeline.first()?;
+    // Source stage uses `filter: { ... }` for Mongo-compatible
+    // filter syntax. Vector/text search stages may carry
+    // `filter` inside themselves.
+    if let Ok(filter_doc) = first.get_document("filter") {
+        if let Some(s) = pin_from_filter_doc(filter_doc) {
+            return Some(s);
+        }
+    }
+    if let Ok(vs) = first.get_document("$vectorSearch") {
+        if let Ok(f) = vs.get_document("filter") {
+            if let Some(s) = pin_from_filter_doc(f) {
+                return Some(s);
+            }
+        }
+    }
+    if let Ok(ts) = first.get_document("$search") {
+        if let Ok(f) = ts.get_document("filter") {
+            if let Some(s) = pin_from_filter_doc(f) {
+                return Some(s);
+            }
+        }
+    }
+    // $match in any stage (first or later). Production
+    // aggregation must start with $vectorSearch / $search /
+    // `filter`, but adversarially malformed pipelines that
+    // lead with $match still get the cross-node signal
+    // before we reach the "malformed" rejection path — a
+    // mis-routed client deserves a routing hint no matter
+    // what.
+    for stage in pipeline.iter() {
+        if let Ok(inner) = stage.get_document("$match") {
+            if let Some(s) = pin_from_filter_doc(inner) {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 fn parse_source(stage: &Document) -> WireResult<(Source, Filter)> {

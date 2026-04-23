@@ -159,6 +159,16 @@ const METRICS: &[MetricMeta] = &[
         kind: MetricKind::Counter,
     },
     MetricMeta {
+        name: "agentdb_forwarded_reads_total",
+        help: "Session-scoped reads (admin session detail, fork) this node forwarded to a peer (M20 multi-node)",
+        kind: MetricKind::Counter,
+    },
+    MetricMeta {
+        name: "agentdb_forwarded_read_failures_total",
+        help: "Forwarded reads where the peer returned non-2xx or the request failed",
+        kind: MetricKind::Counter,
+    },
+    MetricMeta {
         name: "agentdb_webhook_fires_total",
         help: "Total tier-change webhooks fired per box",
         kind: MetricKind::Counter,
@@ -257,6 +267,8 @@ fn value_for(name: &str, s: &agentdb_core::MetricsSnapshot) -> u64 {
         "agentdb_admission_waits_total" => s.admission_waits_total,
         "agentdb_forwarded_writes_total" => s.forwarded_writes_total,
         "agentdb_forwarded_write_failures_total" => s.forwarded_write_failures_total,
+        "agentdb_forwarded_reads_total" => s.forwarded_reads_total,
+        "agentdb_forwarded_read_failures_total" => s.forwarded_read_failures_total,
         "agentdb_webhook_fires_total" => s.webhook_fires,
         "agentdb_webhook_failures_total" => s.webhook_failures,
         "agentdb_open_snapshots" => s.open_snapshots,
