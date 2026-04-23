@@ -1,7 +1,17 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+use crate::rate_window::{RateSnapshot, RateWindow};
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Per-box counters and gauges. All writes are non-blocking via atomics; the
 /// single `RwLock` protects the tier gauge bundle.
@@ -76,6 +86,16 @@ pub struct BoxMetrics {
     /// Counted on the originating node's box 0.
     pub forwarded_reads_total: AtomicU64,
     pub forwarded_read_failures_total: AtomicU64,
+    /// M25 hot-tablet detection: 60-second sliding window
+    /// over (appends, admission_waits). `record_append` and
+    /// `record_admission_wait` write into this window in
+    /// addition to the cumulative counters above. Optional
+    /// so that call sites that build a `BoxMetrics::default()`
+    /// get a window automatically — `new()` / `Default`
+    /// initialize it with `now_ms = 0`; in production the
+    /// window's absolute clock only matters for warm-up, and
+    /// the recorders pass the real clock each call.
+    pub rate: Option<RateWindow>,
     pub gauges: RwLock<GaugeSnapshot>,
 }
 
@@ -88,7 +108,17 @@ pub struct GaugeSnapshot {
 
 impl BoxMetrics {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            rate: Some(RateWindow::new(now_ms())),
+            ..Default::default()
+        }
+    }
+
+    /// Snapshot of the 60-second sliding rate window. `None`
+    /// when `rate` wasn't initialized (legacy `Default::default()`
+    /// path); production always has it.
+    pub fn rate_snapshot(&self) -> Option<RateSnapshot> {
+        self.rate.as_ref().map(|w| w.snapshot(now_ms()))
     }
 
     pub fn record_insert(&self) {
@@ -102,6 +132,9 @@ impl BoxMetrics {
     }
     pub fn record_append(&self) {
         self.appends.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = &self.rate {
+            r.record_a(now_ms());
+        }
     }
     pub fn record_fork(&self) {
         self.forks.fetch_add(1, Ordering::Relaxed);
@@ -194,6 +227,9 @@ impl BoxMetrics {
     /// Admission semaphore forced the caller to wait for a permit.
     pub fn record_admission_wait(&self) {
         self.admission_waits_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = &self.rate {
+            r.record_b(now_ms());
+        }
     }
 
     pub fn bump_tier(&self, tier: crate::types::Tier) {

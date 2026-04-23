@@ -40,5 +40,8 @@ async fn main() -> anyhow::Result<()> {
             UserCmd::List(opts) => admin::user_list(opts).await,
             UserCmd::Delete(opts) => admin::user_delete(opts).await,
         },
+        Cmd::ShowHotTablets(opts) => admin::show_hot_tablets(opts).await,
+        Cmd::ShowTabletLoad(opts) => admin::show_tablet_load(opts).await,
+        Cmd::ShedTablet(opts) => admin::shed_tablet(opts).await,
     }
 }

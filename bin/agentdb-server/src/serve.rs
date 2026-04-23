@@ -449,6 +449,22 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         "stale-lease tablet reaper started"
     );
 
+    // M25 hot-tablet detector. Runs on the scheduler leader;
+    // followers report an empty hot set. Admin endpoints read
+    // the detector's in-memory snapshot.
+    let hot_tablet_cfg = agentdb_core::HotTabletConfig::from_env();
+    let hot_detector = agentdb_core::HotTabletDetector::start(
+        registry.clone(),
+        election.clone(),
+        hot_tablet_cfg,
+    );
+    tracing::info!(
+        tick_secs = hot_tablet_cfg.tick.as_secs(),
+        wait_ratio_threshold = hot_tablet_cfg.wait_ratio_threshold,
+        consecutive_samples = hot_tablet_cfg.consecutive_samples,
+        "hot-tablet detector started"
+    );
+
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
     let stream = StreamBus::default();
@@ -624,6 +640,7 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         .layer(axum::Extension(meta.clone()))
         .layer(axum::Extension(election.clone()))
         .layer(axum::Extension(reaper.clone()))
+        .layer(axum::Extension(hot_detector.clone()))
         .layer(axum::Extension(location_proxy.clone()));
     let http_listener = tokio::net::TcpListener::bind(cfg.http_addr)
         .await

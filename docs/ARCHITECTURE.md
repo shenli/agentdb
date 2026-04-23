@@ -819,6 +819,77 @@ node):
   fork time or teaching the read path to follow the parent
   pointer.
 
+### Hot-tablet detection + shed (M25)
+
+The control plane knows how to *move* load between tablets
+(M20 shard overrides, M22 reaper reassignment). What was
+missing was the *signal* — which tablet is hot, and when? —
+and a convenient bulk operation to act on it.
+
+**Rate window.** `BoxMetrics` carries a 60-second sliding
+window bucketed into six 10-second slots. Every
+`record_append` and `record_admission_wait` fetch-adds into
+the current slot; every ~10 seconds the window rolls one
+slot forward. Readers sum across slots and compute:
+
+- `appends_per_sec` = total appends / effective window sec
+- `admission_wait_ratio` = total waits / max(total appends, 1)
+
+Hot-path cost per record is one atomic fetch_add; no locks.
+The rate window is `Option<RateWindow>` on `BoxMetrics` so
+legacy `Default::default()` paths (tests) don't pay the
+allocation.
+
+**Detector.** A background task on the scheduler leader
+samples each tablet's rate window every
+`AGENTDB_HOT_DETECT_TICK_SECS` (default 10s). A tablet flips
+`cool → hot` when its `admission_wait_ratio >
+AGENTDB_HOT_WAIT_RATIO` (default 0.3) for
+`AGENTDB_HOT_CONSECUTIVE` samples in a row (default 3,
+≈30 seconds of sustained saturation). A single sample back
+under threshold flips it `hot → cool` — asymmetric
+hysteresis favors false negatives over false positives for
+an operator-facing signal. Followers keep an empty
+snapshot; admin endpoints on followers report "no hot
+tablets."
+
+Output lives in memory only (`Arc<RwLock<DetectorSnapshot>>`).
+Hot/cool is a transient runtime signal, not a durable fact;
+no SQLite writes.
+
+**Admin surface.**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/admin/tablets/hot` | Currently-flagged tablets + last sample time |
+| `GET /api/admin/tablets/load` | Every tablet with `{ appends_per_sec, admission_wait_ratio, is_hot }` |
+| `POST /api/admin/tablets/:id/shed` | Move a fraction of this tablet's overridden shards to another |
+
+Shed body: `{ "to_tablet_id": i64 | null, "fraction": f64 | null }`.
+`to_tablet_id = null` → server picks the least-loaded
+tablet from the detector snapshot. `fraction` defaults to
+0.5, clamps to (0, 1]. Returns the list of moved shard ids.
+
+Shed does **not** migrate data. Old events stay on the
+source tablet. Same semantics as `set_shard` — same
+rationale (the "quiesce + handoff" gap is acknowledged in
+ARCHITECTURE.md and is real-split-specific future work).
+
+**CLI.** `agentdb show-hot-tablets`, `agentdb
+show-tablet-load`, `agentdb shed-tablet <id> [--to N]
+[--fraction F]`.
+
+**Out of scope for this PR:**
+- **Dynamic tablet/box creation.** Real split creates a
+  *new* tablet with id ≥ num_boxes. The prototype's fixed
+  `BoxRegistry.boxes: Vec<Arc<Box_>>` can't grow at
+  runtime. Shed is "redistribute among existing tablets."
+- **Auto-shed.** The detector flags; an operator calls
+  shed. Automatic policy needs calibrated thresholds that
+  require production data.
+- **Per-session hot-key detection.** Requires per-session
+  metrics the prototype doesn't track.
+
 ### SCRAM-SHA-256 auth (M19)
 
 Off by default (backward-compatible). Enable with
@@ -884,6 +955,9 @@ agentdb list-shard-overrides GET /api/admin/shards/list
 agentdb user add <uid> --tenant <tid>  POST /api/admin/users
 agentdb user list           GET /api/admin/users
 agentdb user delete <uid>   DELETE /api/admin/users/:uid
+agentdb show-hot-tablets    GET /api/admin/tablets/hot
+agentdb show-tablet-load    GET /api/admin/tablets/load
+agentdb shed-tablet <id>    POST /api/admin/tablets/:id/shed
 ```
 
 `--dev` sets up an ephemeral tempdir for KV + object store + meta;

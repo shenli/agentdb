@@ -11,6 +11,7 @@ pub mod admin_nodes;
 pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
+pub mod admin_hot_tablets;
 pub mod admin_tablets;
 pub mod admin_users;
 pub mod auth_middleware;
@@ -104,6 +105,9 @@ impl AppState {
         admin_shards::list_shard_overrides,
         admin_shards::set_shard,
         admin_tablets::list_tablets,
+        admin_hot_tablets::list_hot_tablets,
+        admin_hot_tablets::list_tablet_load,
+        admin_hot_tablets::shed_tablet,
         admin_users::create_user,
         admin_users::list_users,
         admin_users::delete_user,
@@ -138,6 +142,12 @@ impl AppState {
         admin_shards::ShardOverridesList,
         admin_shards::ShardsUnavailable,
         admin_tablets::TabletView,
+        admin_hot_tablets::HotTabletView,
+        admin_hot_tablets::TabletLoadView,
+        admin_hot_tablets::HotTabletsResponse,
+        admin_hot_tablets::TabletLoadResponse,
+        admin_hot_tablets::ShedRequest,
+        admin_hot_tablets::ShedResponse,
         admin_tablets::TabletsUnavailable,
         admin_users::CreateUserRequest,
         admin_users::CreateUserResponse,
@@ -224,6 +234,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/tablets",
             axum::routing::get(admin_tablets::list_tablets),
+        )
+        .route(
+            "/api/admin/tablets/hot",
+            axum::routing::get(admin_hot_tablets::list_hot_tablets),
+        )
+        .route(
+            "/api/admin/tablets/load",
+            axum::routing::get(admin_hot_tablets::list_tablet_load),
+        )
+        .route(
+            "/api/admin/tablets/:id/shed",
+            axum::routing::post(admin_hot_tablets::shed_tablet),
         )
         .route(
             "/api/admin/shards",

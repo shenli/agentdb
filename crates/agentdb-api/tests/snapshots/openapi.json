@@ -681,6 +681,100 @@
         }
       }
     },
+    "/api/admin/tablets/hot": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_hot_tablets",
+        "responses": {
+          "200": {
+            "description": "Currently-flagged tablets + last sample time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HotTabletsResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hot-tablet detector not configured on this server"
+          }
+        }
+      }
+    },
+    "/api/admin/tablets/load": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_tablet_load",
+        "responses": {
+          "200": {
+            "description": "All tablets with hot/cool status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TabletLoadResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hot-tablet detector not configured on this server"
+          }
+        }
+      }
+    },
+    "/api/admin/tablets/{id}/shed": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "shed_tablet",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source tablet id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Shards moved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request invalid or no viable destination"
+          },
+          "503": {
+            "description": "Meta / detector not configured"
+          }
+        }
+      }
+    },
     "/api/admin/tier/force": {
       "post": {
         "tags": [
@@ -1513,6 +1607,53 @@
           }
         }
       },
+      "HotTabletView": {
+        "type": "object",
+        "required": [
+          "tablet_id",
+          "appends_per_sec",
+          "admission_wait_ratio",
+          "flagged_at_ms"
+        ],
+        "properties": {
+          "admission_wait_ratio": {
+            "type": "number",
+            "format": "double"
+          },
+          "appends_per_sec": {
+            "type": "number",
+            "format": "double"
+          },
+          "flagged_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tablet_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "HotTabletsResponse": {
+        "type": "object",
+        "required": [
+          "hot",
+          "last_sample_ms"
+        ],
+        "properties": {
+          "hot": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HotTabletView"
+            }
+          },
+          "last_sample_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock ms of the last detector sample. Zero when\nthis node isn't the scheduler leader."
+          }
+        }
+      },
       "InjectFaultRequest": {
         "type": "object",
         "required": [
@@ -2141,6 +2282,52 @@
           }
         }
       },
+      "ShedRequest": {
+        "type": "object",
+        "properties": {
+          "fraction": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Fraction of the source's currently-overridden shards to\nmove. Clamped to (0, 1]. Defaults to 0.5 (half)."
+          },
+          "to_tablet_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Target tablet to move shards to. When `null`, the server\npicks the least-loaded tablet from the detector's\nsnapshot (excluding the source)."
+          }
+        }
+      },
+      "ShedResponse": {
+        "type": "object",
+        "required": [
+          "source_tablet_id",
+          "to_tablet_id",
+          "moved_shards"
+        ],
+        "properties": {
+          "moved_shards": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "source_tablet_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "to_tablet_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "StreamEvent": {
         "oneOf": [
           {
@@ -2353,6 +2540,51 @@
             }
           }
         ]
+      },
+      "TabletLoadResponse": {
+        "type": "object",
+        "required": [
+          "tablets",
+          "last_sample_ms"
+        ],
+        "properties": {
+          "last_sample_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tablets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TabletLoadView"
+            }
+          }
+        }
+      },
+      "TabletLoadView": {
+        "type": "object",
+        "required": [
+          "tablet_id",
+          "appends_per_sec",
+          "admission_wait_ratio",
+          "is_hot"
+        ],
+        "properties": {
+          "admission_wait_ratio": {
+            "type": "number",
+            "format": "double"
+          },
+          "appends_per_sec": {
+            "type": "number",
+            "format": "double"
+          },
+          "is_hot": {
+            "type": "boolean"
+          },
+          "tablet_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
       },
       "TabletView": {
         "type": "object",
