@@ -500,6 +500,27 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         .attach_tenant_quotas(tenant_quota_registry.clone())
         .map_err(|_| anyhow::anyhow!("tenant quota registry already attached"))?;
 
+    // Slow-query ring buffer. `AGENTDB_SLOW_QUERY_DISABLE`
+    // skips the attach entirely (useful for benchmarks where
+    // recording overhead would show up in the measurement).
+    // Otherwise threshold + capacity come from env.
+    let slow_query_disabled = std::env::var("AGENTDB_SLOW_QUERY_DISABLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if slow_query_disabled {
+        tracing::info!("slow-query buffer disabled via AGENTDB_SLOW_QUERY_DISABLE");
+    } else {
+        let slow_query_buffer = Arc::new(agentdb_core::SlowQueryBuffer::from_env());
+        tracing::info!(
+            threshold_ms = slow_query_buffer.threshold_ms(),
+            "slow-query buffer attached to registry",
+        );
+        registry
+            .attach_slow_queries(slow_query_buffer)
+            .map_err(|_| anyhow::anyhow!("slow-query buffer already attached"))?;
+    }
+
     // Stale-lease reaper. Started after the location proxy so it
     // can refresh the local cache immediately after reassigning
     // shards away from a reaped tablet (M22).

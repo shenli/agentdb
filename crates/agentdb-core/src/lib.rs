@@ -28,6 +28,7 @@ pub mod segment;
 pub mod segment_gc;
 pub mod segment_pin;
 pub mod shard;
+pub mod slow_query;
 pub mod tenant_quota;
 pub mod tiering;
 pub mod types;
@@ -64,6 +65,11 @@ pub use rate_window::{RateSnapshot, RateWindow};
 pub use read_ctx::ReadCtx;
 pub use reaper::{ReaperConfig, StaleTabletReaper};
 pub use registry::{SessionRegistry, TenantRegistry};
+pub use slow_query::{
+    SlowQueryBuffer, SlowQueryFilter, SlowQueryKind, SlowQueryRecord,
+    DEFAULT_BUFFER_CAPACITY as SLOW_QUERY_DEFAULT_BUFFER_CAPACITY,
+    DEFAULT_THRESHOLD_MS as SLOW_QUERY_DEFAULT_THRESHOLD_MS,
+};
 pub use tenant_quota::{TenantQuotaConfig, TenantQuotaRegistry, TenantQuotaView};
 pub use scheduler::{LeaderElection, LeaderElectionConfig};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION};

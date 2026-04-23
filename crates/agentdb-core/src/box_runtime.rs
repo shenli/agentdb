@@ -523,6 +523,11 @@ pub struct BoxRegistry {
     /// [`Error::TooManyRequests`] with
     /// [`Scope::TenantGlobal`](crate::admission::Scope::TenantGlobal).
     tenant_quotas: std::sync::OnceLock<Arc<crate::TenantQuotaRegistry>>,
+    /// Slow-query ring buffer. `None` on the legacy / test
+    /// paths; when `Some`, the write path and wire read
+    /// handlers record completed requests whose latency
+    /// exceeds the configured threshold.
+    slow_queries: std::sync::OnceLock<Arc<crate::SlowQueryBuffer>>,
 }
 
 impl BoxRegistry {
@@ -592,6 +597,7 @@ impl BoxRegistry {
             location: std::sync::OnceLock::new(),
             node_addr: std::sync::OnceLock::new(),
             tenant_quotas: std::sync::OnceLock::new(),
+            slow_queries: std::sync::OnceLock::new(),
         })
     }
 
@@ -688,6 +694,7 @@ impl BoxRegistry {
             location: std::sync::OnceLock::new(),
             node_addr: std::sync::OnceLock::new(),
             tenant_quotas: std::sync::OnceLock::new(),
+            slow_queries: std::sync::OnceLock::new(),
         })
     }
 
@@ -791,6 +798,24 @@ impl BoxRegistry {
     /// construction paths operate this way.
     pub fn tenant_quotas(&self) -> Option<Arc<crate::TenantQuotaRegistry>> {
         self.tenant_quotas.get().cloned()
+    }
+
+    /// Attach the slow-query ring buffer. Idempotent at the
+    /// OnceLock level. The server binary calls this once
+    /// after constructing the buffer from env vars; tests
+    /// can attach a smaller buffer to exercise eviction.
+    pub fn attach_slow_queries(
+        &self,
+        buffer: Arc<crate::SlowQueryBuffer>,
+    ) -> std::result::Result<(), Arc<crate::SlowQueryBuffer>> {
+        self.slow_queries.set(buffer)
+    }
+
+    /// Currently-attached slow-query buffer, if any.
+    /// `None` means "no recording" — every `maybe_record` is
+    /// a no-op.
+    pub fn slow_queries(&self) -> Option<Arc<crate::SlowQueryBuffer>> {
+        self.slow_queries.get().cloned()
     }
 
     /// Attach a [`NodeAddressProxy`] so

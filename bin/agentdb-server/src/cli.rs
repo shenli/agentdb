@@ -111,6 +111,29 @@ pub enum Cmd {
     /// Clear the global per-tenant rate-limit for a tenant.
     /// Idempotent.
     ClearTenantQuota(ClearTenantQuotaOpts),
+    /// Show recent slow-query records (requests whose
+    /// elapsed time exceeded `AGENTDB_SLOW_QUERY_THRESHOLD_MS`).
+    /// HTTP-client wrapper for `GET /api/admin/slow-queries`.
+    ShowSlowQueries(ShowSlowQueriesOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowSlowQueriesOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Cap on returned rows. Server clamps to its MAX_LIMIT.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    /// Filter by kind: `append`, `find`, or `aggregate`.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Exact external tenant id.
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// Return rows with id > this value. Pair with the
+    /// largest id from a previous page for pagination.
+    #[arg(long = "after-id")]
+    pub after_id: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]

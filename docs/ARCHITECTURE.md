@@ -1113,6 +1113,55 @@ deployments divide the quota by node count manually;
 cluster-global coordination needs a shared token source
 (out of scope for the prototype).
 
+### Slow-query log
+
+Latency histograms answer "how fast is the system?"; the
+slow-query log answers "which specific requests were slow,
+and for whom?" — it captures every request whose elapsed
+time clears an operator-configured threshold.
+
+Implementation is a bounded in-memory ring buffer
+(`SlowQueryBuffer`) attached to the `BoxRegistry` via
+`OnceLock`, symmetrical with the tenant-quota and location
+proxies. Each record carries timestamp, kind
+(`append` / `find` / `aggregate`), box id, tenant id,
+session id, latency, and a short detail string (payload
+bytes for append, collection + filter excerpt + hit count
+for find/aggregate). Writes are lock-taking but the hot
+path on every request is the threshold compare: one atomic
+load, one branch.
+
+Env configuration:
+
+- `AGENTDB_SLOW_QUERY_THRESHOLD_MS` — default 100; `0`
+  records every request (debug mode).
+- `AGENTDB_SLOW_QUERY_BUFFER_CAPACITY` — default 1024; when
+  full the oldest record is evicted.
+- `AGENTDB_SLOW_QUERY_DISABLE` — any non-empty value skips
+  the attach at startup entirely. Cheaper than setting a
+  very high threshold if operators don't want any
+  instrumentation at all.
+
+**Admin surface.**
+`GET /api/admin/slow-queries?kind=&tenant=&limit=&after_id=`
+returns rows newest-first. Pagination: pass the largest id
+from a page as `after_id` to skip it. CLI:
+`agentdb show-slow-queries`.
+
+**Observability.**
+`agentdb_slow_queries_recorded_total{kind="..."}` on
+`/metrics`. Fixed cardinality (three kinds).
+
+Out of scope: persistence across restart (the buffer is in
+memory — by design, so operators never see stale records
+that predate a config change); per-tenant cardinality on
+the counter (would require adding a tenant label, which
+operators can already get by scraping the JSON endpoint);
+wire-protocol insert (the REST `append_and_fetch` path and
+the Mongo `insert` handler both go through
+`append_and_fetch_with_actor`, so inserts are already
+covered).
+
 ### TLS termination
 
 REST listens over HTTP by default. Supply `--tls-cert PATH

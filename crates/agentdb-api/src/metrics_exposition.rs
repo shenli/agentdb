@@ -268,6 +268,26 @@ fn render(state: &AppState) -> String {
         &rows.iter().map(|r| (r.box_id, &r.admission)).collect::<Vec<_>>(),
     );
 
+    // Slow-query recorded counts. One series per kind
+    // (append / find / aggregate). Constant cardinality.
+    if let Some(sq) = state.registry.slow_queries() {
+        writeln!(
+            out,
+            "# HELP agentdb_slow_queries_recorded_total Requests whose elapsed time exceeded the slow-query threshold since process start"
+        )
+        .ok();
+        writeln!(out, "# TYPE agentdb_slow_queries_recorded_total counter").ok();
+        for (kind, count) in sq.counts() {
+            writeln!(
+                out,
+                "agentdb_slow_queries_recorded_total{{kind=\"{}\"}} {}",
+                kind.as_str(),
+                count,
+            )
+            .ok();
+        }
+    }
+
     // Global per-tenant rate-limit denies. One series per
     // tenant that has ever denied on this process; absent
     // series (no denies yet) are Prometheus-equivalent to

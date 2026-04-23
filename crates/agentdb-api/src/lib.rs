@@ -13,6 +13,7 @@ pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
 pub mod admin_hot_tablets;
+pub mod admin_slow_queries;
 pub mod admin_tablets;
 pub mod admin_tenant_quotas;
 pub mod admin_users;
@@ -128,6 +129,7 @@ impl AppState {
         admin_tokens::mint_token,
         admin_tokens::list_tokens,
         admin_tokens::revoke_token,
+        admin_slow_queries::list_slow_queries,
         admin_tenant_quotas::list_tenant_quotas,
         admin_tenant_quotas::get_tenant_quota,
         admin_tenant_quotas::put_tenant_quota,
@@ -203,6 +205,8 @@ impl AppState {
         agentdb_core::Event,
         agentdb_core::ForkRef,
         agentdb_core::Tier,
+        agentdb_core::SlowQueryRecord,
+        agentdb_core::SlowQueryKind,
     )),
     tags(
         (name = "primitives", description = "Agent-native write and read primitives"),
@@ -332,6 +336,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/audit",
             axum::routing::get(admin_audit::list_audit),
+        )
+        .route(
+            "/api/admin/slow-queries",
+            axum::routing::get(admin_slow_queries::list_slow_queries),
         )
         .route(
             "/api/admin/tenant-quotas",
