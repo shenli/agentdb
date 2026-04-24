@@ -244,6 +244,16 @@ pub async fn admin_token_add(opts: AdminTokenAddOpts) -> Result<()> {
     if let Some(d) = opts.description {
         body["description"] = serde_json::Value::from(d);
     }
+    // Reject unknown scope strings locally so operators get a
+    // fast, clear error instead of bouncing off the server.
+    let scope_lc = opts.scope.to_ascii_lowercase();
+    if scope_lc != "admin" && scope_lc != "readonly" {
+        anyhow::bail!(
+            "invalid scope '{}': expected 'admin' or 'readonly'",
+            opts.scope
+        );
+    }
+    body["scope"] = serde_json::Value::from(scope_lc);
     let client = admin_client_with_opt(opts.token.as_deref());
     let resp = client
         .post(&url)

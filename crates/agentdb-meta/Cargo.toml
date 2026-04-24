@@ -28,6 +28,9 @@ pbkdf2 = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 subtle = { workspace = true }
+# utoipa so the RBAC scope enum can be rendered in the OpenAPI
+# spec alongside the admin-token DTOs.
+utoipa = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

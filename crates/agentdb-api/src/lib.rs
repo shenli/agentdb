@@ -190,6 +190,7 @@ impl AppState {
         admin_tokens::MintTokenRequest,
         admin_tokens::MintTokenResponse,
         admin_tokens::TokenSummaryView,
+        agentdb_meta::admin_tokens::AdminScope,
         admin_tenant_quotas::SetTenantQuotaRequest,
         admin_tenant_quotas::TenantQuotaView,
         admin_tablets::TabletsUnavailable,

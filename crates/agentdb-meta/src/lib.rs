@@ -111,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn backup_produces_readable_standalone_file() {
         let (dir, src) = fresh_file_store().await;
-        admin_tokens::mint(src.pool(), "alice", 1000)
+        admin_tokens::mint(src.pool(), "alice", admin_tokens::AdminScope::Admin, 1000)
             .await
             .unwrap();
 

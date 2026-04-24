@@ -1074,6 +1074,42 @@ the meta store directly today); surfacing the audit log
 on `/metrics` (row counts are a gauge, but tailing is a
 worse UX than the JSON endpoint).
 
+### Admin token RBAC
+
+Admin tokens now carry a scope. Two levels in this PR:
+
+- `admin` — full access, any HTTP method, any
+  `/api/admin/*` route. The default, and the scope the
+  bootstrap mint always produces.
+- `readonly` — `GET` only. `POST` / `PUT` / `DELETE`
+  return `403 Forbidden`; the audit log records the
+  attempt with the actor_token_id, so oncall can see
+  "alice tried to drain the node but her token was
+  readonly."
+
+The scope column (`admin_tokens.scope`) was added in
+migration 007 with a `'admin'` default, so every pre-
+existing token keeps working across upgrade — no
+re-mint required.
+
+Scope is checked after the existing hash-verify pass in
+`admin_auth_middleware`. An `admin` scope authorizes any
+method; `readonly` authorizes only `GET`. HEAD/OPTIONS
+aren't used by the admin surface today and are refused
+defensively — a future route addition never quietly lets
+a readonly token through.
+
+Mint carries an optional `scope` field in the body
+(default `admin`). CLI: `agentdb admin-token add
+--scope readonly --description grafana`. The list /
+summary surface includes the scope alongside description.
+
+Out of scope: finer-grained scopes (e.g. "tablets only",
+"audit only") — two levels covers the common
+"oncall monitors" split and keeps the ACL table simple.
+Future scopes can widen the column without another
+migration.
+
 ### Per-tenant rate limits
 
 Per-box admission already had two token buckets: a global
