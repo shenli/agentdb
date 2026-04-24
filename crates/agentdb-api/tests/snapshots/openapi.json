@@ -2974,6 +2974,13 @@
             "type": "integer",
             "format": "int64"
           },
+          "mongo_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Mongo wire listener address advertised for cross-node\nforwarding. `None` when the node predates migration\n008 or didn't set `AGENTDB_NODE_MONGO_ADDRESS`."
+          },
           "node_id": {
             "type": "string"
           },

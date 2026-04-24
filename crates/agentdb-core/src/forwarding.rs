@@ -36,10 +36,17 @@ use crate::error::{Error, Result};
 /// Where a tablet lives. `address` is whatever the owning node
 /// wrote to `nodes.address` — typically `"host:port"` but could
 /// be a full URL. Callers normalize at request-build time.
+///
+/// `mongo_address` is the Mongo wire listener advertised by
+/// the node, used by the cross-node Mongo forwarding proxy.
+/// `None` means the owner predates the advertise column or
+/// opted out — the wire handler falls back to the
+/// NotWritablePrimary error in that case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeTarget {
     pub node_id: String,
     pub address: String,
+    pub mongo_address: Option<String>,
 }
 
 pub struct NodeAddressProxy {
@@ -113,9 +120,9 @@ impl NodeAddressProxy {
                 field: None,
                 message: format!("node_address_proxy refresh nodes: {e}"),
             })?;
-        let node_addr: HashMap<String, String> = nodes
+        let node_addr: HashMap<String, (String, Option<String>)> = nodes
             .into_iter()
-            .map(|n| (n.node_id, n.address))
+            .map(|n| (n.node_id, (n.address, n.mongo_address)))
             .collect();
 
         let mut next: HashMap<i64, NodeTarget> = HashMap::new();
@@ -123,7 +130,7 @@ impl NodeAddressProxy {
             let Some(owner) = t.owner_node_id else {
                 continue;
             };
-            let Some(addr) = node_addr.get(&owner) else {
+            let Some((addr, mongo)) = node_addr.get(&owner) else {
                 // Owner is stale in the nodes table. Skip — callers
                 // will see None and fall back to local routing
                 // until the nodes row is re-upserted at next
@@ -135,6 +142,7 @@ impl NodeAddressProxy {
                 NodeTarget {
                     node_id: owner,
                     address: addr.clone(),
+                    mongo_address: mongo.clone(),
                 },
             );
         }
@@ -204,10 +212,10 @@ mod tests {
     async fn refresh_populates_tablet_to_node_mapping() {
         let meta = fresh_meta().await;
         // Register two nodes, one tablet owned by each.
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "node-b", "127.0.0.1:7001", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-b", "127.0.0.1:7001", None, "alive", 100)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 0, 100).await.unwrap();
@@ -240,7 +248,7 @@ mod tests {
         // drop the tablet's entry rather than pointing at a
         // nonexistent node.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 5, 100).await.unwrap();
@@ -256,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_drops_unowned_tablets() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 9, 100).await.unwrap();
@@ -270,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_job_updates_cache_after_new_ownership() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
         let proxy = NodeAddressProxy::new(meta.clone(), "node-a".into())

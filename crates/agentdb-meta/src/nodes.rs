@@ -9,6 +9,10 @@ use crate::error::{MetaError, MetaResult};
 pub struct Node {
     pub node_id: String,
     pub address: String,
+    /// Mongo wire listener advertised for cross-node
+    /// forwarding. `None` when the node predates migration
+    /// 008 or didn't set `AGENTDB_NODE_MONGO_ADDRESS`.
+    pub mongo_address: Option<String>,
     pub state: String,
     pub last_heartbeat_ms: i64,
     pub joined_at_ms: i64,
@@ -18,20 +22,23 @@ pub async fn upsert(
     pool: &SqlitePool,
     node_id: &str,
     address: &str,
+    mongo_address: Option<&str>,
     state: &str,
     now_ms: i64,
 ) -> MetaResult<()> {
     // SQLite's ON CONFLICT upsert syntax.
     sqlx::query(
-        "INSERT INTO nodes (node_id, address, state, last_heartbeat_ms, joined_at_ms)
-              VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO nodes (node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms)
+              VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT (node_id) DO UPDATE SET
               address = excluded.address,
+              mongo_address = excluded.mongo_address,
               state = excluded.state,
               last_heartbeat_ms = excluded.last_heartbeat_ms",
     )
     .bind(node_id)
     .bind(address)
+    .bind(mongo_address)
     .bind(state)
     .bind(now_ms)
     .bind(now_ms)
@@ -78,15 +85,17 @@ pub async fn set_state(
 }
 
 pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
-    let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT node_id, address, state, last_heartbeat_ms, joined_at_ms FROM nodes WHERE node_id = ?",
+    let row: Option<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms \
+           FROM nodes WHERE node_id = ?",
     )
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(n, a, s, h, j)| Node {
+    Ok(row.map(|(n, a, m, s, h, j)| Node {
         node_id: n,
         address: a,
+        mongo_address: m,
         state: s,
         last_heartbeat_ms: h,
         joined_at_ms: j,
@@ -98,17 +107,18 @@ pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
 /// caller acting on it. Used by `GET /api/admin/nodes` and by the
 /// scheduler's membership scan.
 pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Node>> {
-    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT node_id, address, state, last_heartbeat_ms, joined_at_ms
+    let rows: Vec<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms
            FROM nodes ORDER BY node_id",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(n, a, s, h, j)| Node {
+        .map(|(n, a, m, s, h, j)| Node {
             node_id: n,
             address: a,
+            mongo_address: m,
             state: s,
             last_heartbeat_ms: h,
             joined_at_ms: j,
@@ -119,8 +129,8 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Node>> {
 /// Nodes whose last heartbeat is older than `threshold_ms`. Used by
 /// the scheduler to detect dead nodes and start failover.
 pub async fn stale(pool: &SqlitePool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
-    let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT node_id, address, state, last_heartbeat_ms, joined_at_ms
+    let rows: Vec<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms
            FROM nodes WHERE last_heartbeat_ms < ? ORDER BY last_heartbeat_ms",
     )
     .bind(threshold_ms)
@@ -128,9 +138,10 @@ pub async fn stale(pool: &SqlitePool, threshold_ms: i64) -> MetaResult<Vec<Node>
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(n, a, s, h, j)| Node {
+        .map(|(n, a, m, s, h, j)| Node {
             node_id: n,
             address: a,
+            mongo_address: m,
             state: s,
             last_heartbeat_ms: h,
             joined_at_ms: j,
@@ -152,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_get() {
         let p = pool().await;
-        upsert(&p, "node-a", "127.0.0.1:9000", "alive", 100)
+        upsert(&p, "node-a", "127.0.0.1:9000", None, "alive", 100)
             .await
             .unwrap();
         let n = get(&p, "node-a").await.unwrap().unwrap();
@@ -165,14 +176,15 @@ mod tests {
     #[tokio::test]
     async fn upsert_updates_existing_row() {
         let p = pool().await;
-        upsert(&p, "node-a", "old-addr", "alive", 100)
+        upsert(&p, "node-a", "old-addr", None, "alive", 100)
             .await
             .unwrap();
-        upsert(&p, "node-a", "new-addr", "draining", 200)
+        upsert(&p, "node-a", "new-addr", Some("new-mongo"), "draining", 200)
             .await
             .unwrap();
         let n = get(&p, "node-a").await.unwrap().unwrap();
         assert_eq!(n.address, "new-addr");
+        assert_eq!(n.mongo_address.as_deref(), Some("new-mongo"));
         assert_eq!(n.state, "draining");
         assert_eq!(n.last_heartbeat_ms, 200);
         // joined_at should remain the original.
@@ -182,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_advances_timestamp() {
         let p = pool().await;
-        upsert(&p, "node-a", "addr", "alive", 100).await.unwrap();
+        upsert(&p, "node-a", "addr", None, "alive", 100).await.unwrap();
         heartbeat(&p, "node-a", 500).await.unwrap();
         let n = get(&p, "node-a").await.unwrap().unwrap();
         assert_eq!(n.last_heartbeat_ms, 500);
@@ -198,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn set_state_preserves_address_and_bumps_heartbeat() {
         let p = pool().await;
-        upsert(&p, "node-a", "addr-keep", "alive", 100)
+        upsert(&p, "node-a", "addr-keep", None, "alive", 100)
             .await
             .unwrap();
         set_state(&p, "node-a", "draining", 500).await.unwrap();
@@ -218,9 +230,9 @@ mod tests {
     #[tokio::test]
     async fn list_all_returns_every_node_in_id_order() {
         let p = pool().await;
-        upsert(&p, "node-b", "bb", "alive", 100).await.unwrap();
-        upsert(&p, "node-a", "aa", "alive", 100).await.unwrap();
-        upsert(&p, "node-c", "cc", "draining", 200).await.unwrap();
+        upsert(&p, "node-b", "bb", None, "alive", 100).await.unwrap();
+        upsert(&p, "node-a", "aa", Some("amongo"), "alive", 100).await.unwrap();
+        upsert(&p, "node-c", "cc", None, "draining", 200).await.unwrap();
         let all = list_all(&p).await.unwrap();
         let ids: Vec<_> = all.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(ids, ["node-a", "node-b", "node-c"]);
@@ -229,8 +241,8 @@ mod tests {
     #[tokio::test]
     async fn stale_detects_nodes_below_threshold() {
         let p = pool().await;
-        upsert(&p, "healthy", "a", "alive", 1000).await.unwrap();
-        upsert(&p, "dead", "b", "alive", 50).await.unwrap();
+        upsert(&p, "healthy", "a", None, "alive", 1000).await.unwrap();
+        upsert(&p, "dead", "b", None, "alive", 50).await.unwrap();
         let s = stale(&p, 500).await.unwrap();
         let ids: Vec<_> = s.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(ids, ["dead"]);

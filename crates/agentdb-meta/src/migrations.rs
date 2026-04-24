@@ -49,6 +49,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "admin token scope (RBAC)",
         include_str!("../migrations/007_admin_token_scope.sql"),
     ),
+    (
+        8,
+        "node mongo_address for cross-node Mongo wire forwarding",
+        include_str!("../migrations/008_node_mongo_address.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.

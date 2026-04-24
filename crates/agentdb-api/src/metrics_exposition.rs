@@ -298,6 +298,33 @@ fn render(state: &AppState) -> String {
         }
     }
 
+    // Cross-node Mongo wire forwarding counters. Node-level
+    // (not per-box) so one series each.
+    writeln!(
+        out,
+        "# HELP agentdb_wire_forwarded_total Mongo wire requests forwarded to a peer node since process start"
+    )
+    .ok();
+    writeln!(out, "# TYPE agentdb_wire_forwarded_total counter").ok();
+    writeln!(
+        out,
+        "agentdb_wire_forwarded_total {}",
+        state.registry.wire_forwarded_total()
+    )
+    .ok();
+    writeln!(
+        out,
+        "# HELP agentdb_wire_forward_failures_total Mongo wire forward attempts that failed to reach or read a framed reply from the peer"
+    )
+    .ok();
+    writeln!(out, "# TYPE agentdb_wire_forward_failures_total counter").ok();
+    writeln!(
+        out,
+        "agentdb_wire_forward_failures_total {}",
+        state.registry.wire_forward_failures_total()
+    )
+    .ok();
+
     // Scheduled-backup counters. Zero-cardinality gauges +
     // counters — one global series each. Only emitted when
     // the scheduler is configured on this process.
@@ -517,6 +544,12 @@ mod tests {
     // Two histogram families (append latency, admission wait) add
     // two HELP/TYPE blocks on top of the counter/gauge catalog.
     const HISTOGRAM_FAMILIES: usize = 2;
+    // Node-level counters emitted unconditionally alongside the
+    // per-box catalog: agentdb_wire_forwarded_total,
+    // agentdb_wire_forward_failures_total. Backup-scheduler
+    // counters are conditional on `backup_status` being
+    // attached, so they're absent in the default test state.
+    const NODE_SCALAR_FAMILIES: usize = 2;
 
     // Per histogram per box: one sample line per bucket upper
     // bound plus `_sum` + `_count`.
@@ -528,16 +561,16 @@ mod tests {
     fn render_emits_help_and_type_per_metric() {
         let (_k, _o, state) = state_with_two_boxes();
         let body = render(&state);
-        let expected = METRICS.len() + HISTOGRAM_FAMILIES;
+        let expected = METRICS.len() + HISTOGRAM_FAMILIES + NODE_SCALAR_FAMILIES;
         assert_eq!(
             body.matches("# HELP agentdb_").count(),
             expected,
-            "expected one HELP line per metric family (catalog + histograms)"
+            "expected one HELP line per metric family (catalog + histograms + node scalars)"
         );
         assert_eq!(
             body.matches("# TYPE agentdb_").count(),
             expected,
-            "expected one TYPE line per metric family (catalog + histograms)"
+            "expected one TYPE line per metric family (catalog + histograms + node scalars)"
         );
     }
 
@@ -549,9 +582,11 @@ mod tests {
             .lines()
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .count();
-        // Two boxes * (scalar metrics + histogram bucket/sum/count lines).
+        // Two boxes * (scalar metrics + histogram bucket/sum/count lines)
+        // plus one sample line per node-level scalar.
         let expected = 2
-            * (METRICS.len() + HISTOGRAM_FAMILIES * histogram_lines_per_box());
+            * (METRICS.len() + HISTOGRAM_FAMILIES * histogram_lines_per_box())
+            + NODE_SCALAR_FAMILIES;
         assert_eq!(sample_count, expected);
     }
 

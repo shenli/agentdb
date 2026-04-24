@@ -26,6 +26,11 @@ const DEFAULT_STALE_THRESHOLD_MS: i64 = 15_000;
 pub struct NodeView {
     pub node_id: String,
     pub address: String,
+    /// Mongo wire listener address advertised for cross-node
+    /// forwarding. `None` when the node predates migration
+    /// 008 or didn't set `AGENTDB_NODE_MONGO_ADDRESS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mongo_address: Option<String>,
     pub state: String,
     pub last_heartbeat_ms: i64,
     pub joined_at_ms: i64,
@@ -82,6 +87,7 @@ pub async fn list_nodes(
                     NodeView {
                         node_id: n.node_id,
                         address: n.address,
+                        mongo_address: n.mongo_address,
                         state: n.state,
                         last_heartbeat_ms: n.last_heartbeat_ms,
                         joined_at_ms: n.joined_at_ms,
@@ -113,7 +119,7 @@ mod tests {
     async fn meta_with(rows: &[(&str, &str, &str, i64)]) -> Arc<MetaStore> {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
         for (id, addr, state, ts) in rows {
-            nodes::upsert(meta.pool(), id, addr, state, *ts)
+            nodes::upsert(meta.pool(), id, addr, None, state, *ts)
                 .await
                 .unwrap();
         }
