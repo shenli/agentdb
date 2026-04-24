@@ -532,6 +532,13 @@ pub struct BoxRegistry {
     /// scheduler is configured. Attached once, at startup,
     /// right after spawning the scheduler loop.
     backup_status: std::sync::OnceLock<Arc<crate::BackupSchedulerHandle>>,
+    /// Node-level wire-forwarding counters. Mongo wire
+    /// requests that the local node forwards to a peer
+    /// increment these — kept at the BoxRegistry level
+    /// because wire forwarding is a node-scoped concept
+    /// (per-box counters already cover the REST path).
+    wire_forwarded_total: std::sync::atomic::AtomicU64,
+    wire_forward_failures_total: std::sync::atomic::AtomicU64,
 }
 
 impl BoxRegistry {
@@ -603,6 +610,8 @@ impl BoxRegistry {
             tenant_quotas: std::sync::OnceLock::new(),
             slow_queries: std::sync::OnceLock::new(),
             backup_status: std::sync::OnceLock::new(),
+            wire_forwarded_total: std::sync::atomic::AtomicU64::new(0),
+            wire_forward_failures_total: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -701,6 +710,8 @@ impl BoxRegistry {
             tenant_quotas: std::sync::OnceLock::new(),
             slow_queries: std::sync::OnceLock::new(),
             backup_status: std::sync::OnceLock::new(),
+            wire_forwarded_total: std::sync::atomic::AtomicU64::new(0),
+            wire_forward_failures_total: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -839,6 +850,30 @@ impl BoxRegistry {
     /// on this process."
     pub fn backup_status(&self) -> Option<Arc<crate::BackupSchedulerHandle>> {
         self.backup_status.get().cloned()
+    }
+
+    /// Increment the node-level successful-wire-forward
+    /// counter. Exposed on `/metrics` as
+    /// `agentdb_wire_forwarded_total`.
+    pub fn record_wire_forwarded(&self) {
+        self.wire_forwarded_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment the failed-wire-forward counter.
+    pub fn record_wire_forward_failure(&self) {
+        self.wire_forward_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn wire_forwarded_total(&self) -> u64 {
+        self.wire_forwarded_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn wire_forward_failures_total(&self) -> u64 {
+        self.wire_forward_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a [`NodeAddressProxy`] so
@@ -1212,10 +1247,10 @@ mod tests {
         use agentdb_meta::{migrations, nodes as meta_nodes, tablets as meta_tablets, MetaStore};
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         migrations::apply(meta.pool()).await.unwrap();
-        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "other", "127.0.0.1:7001", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "other", "127.0.0.1:7001", None, "alive", 100)
             .await
             .unwrap();
         for &t in self_tablets {
@@ -1309,7 +1344,7 @@ mod tests {
         let (_dir, _obj_dir, reg) = registry(4);
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
         migrations::apply(meta.pool()).await.unwrap();
-        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", "alive", 100)
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
         // tablet 5 claims a ghost owner that isn't in the nodes table.

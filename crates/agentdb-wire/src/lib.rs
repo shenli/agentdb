@@ -3,6 +3,7 @@
 pub mod bsonx;
 pub mod command;
 pub mod error;
+pub mod forward;
 pub mod handlers;
 pub mod hlc;
 pub mod opmsg;

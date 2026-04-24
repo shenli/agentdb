@@ -29,21 +29,27 @@ pub async fn find_response(
     // NotWritablePrimary-shaped error that tells the client
     // where to reconnect. Mongo-wire cross-node forwarding is
     // deferred (binary stateful protocol; see plan doc).
-    if let Some(pinned_session) = Filter::parse(filter_doc)
+    // If the filter pins a session, respect the shard
+    // override / tablet ownership: remote → cross-node signal
+    // (or forwarding at the connection layer); local but on a
+    // different box than tenant-hash → use the session's box
+    // so a find after an override doesn't silently miss.
+    let pinned_session: Option<String> = Filter::parse(filter_doc)
         .ok()
         .and_then(|f| f.top_level_eq("session_id").and_then(|v| match v {
             Value::String(s) => Some(s.clone()),
             _ => None,
-        }))
-    {
-        if let agentdb_core::RouteDecision::Remote { target, tablet_id } =
-            registry.route_session_for_io(db, &pinned_session)
-        {
-            return Ok(cross_node_error(&target.node_id, &target.address, tablet_id));
+        }));
+    let box_ = if let Some(s) = pinned_session.as_deref() {
+        match registry.route_session_for_io(db, s) {
+            agentdb_core::RouteDecision::Remote { target, tablet_id } => {
+                return Ok(cross_node_error(&target.node_id, &target.address, tablet_id));
+            }
+            agentdb_core::RouteDecision::Local(b) => b,
         }
-    }
-
-    let box_ = registry.route_tenant(db);
+    } else {
+        registry.route_tenant(db)
+    };
     box_.metrics.record_query_find();
     let tenant_opt = tenants.lookup(box_.id, db)?;
     // Admit unconditionally: unknown tenants still pay the per-box gate

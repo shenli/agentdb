@@ -304,6 +304,10 @@ struct Resolved {
     mongo_addr: SocketAddr,
     node_id: String,
     node_address: String,
+    /// Mongo wire address advertised to peers for cross-node
+    /// forwarding. Defaults to `mongo_addr.to_string()` when
+    /// `AGENTDB_NODE_MONGO_ADDRESS` is unset.
+    node_mongo_address: String,
     heartbeat_secs: u64,
     lifecycle_cfg: LifecycleConfig,
     segment_gc_cfg: SegmentGcConfig,
@@ -378,6 +382,8 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
     });
     let node_address =
         std::env::var("AGENTDB_NODE_ADDRESS").unwrap_or_else(|_| http_addr.to_string());
+    let node_mongo_address = std::env::var("AGENTDB_NODE_MONGO_ADDRESS")
+        .unwrap_or_else(|_| mongo_addr.to_string());
     let heartbeat_secs: u64 = std::env::var("AGENTDB_HEARTBEAT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -427,6 +433,7 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
         mongo_addr,
         node_id,
         node_address,
+        node_mongo_address,
         heartbeat_secs,
         lifecycle_cfg,
         segment_gc_cfg,
@@ -517,11 +524,17 @@ pub async fn run(
     }
     std::mem::forget(renewal_jobs);
 
-    // Node membership + heartbeat.
+    // Node membership + heartbeat. Advertise BOTH the REST
+    // address (for node-to-node REST forwarding) and the
+    // Mongo wire address (for cross-node Mongo forwarding).
+    // The mongo address is optional — peer nodes that don't
+    // see it fall back to the existing NotWritablePrimary
+    // error.
     agentdb_meta::nodes::upsert(
         meta.pool(),
         &cfg.node_id,
         &cfg.node_address,
+        Some(cfg.node_mongo_address.as_str()),
         "alive",
         now_ms_i64(),
     )

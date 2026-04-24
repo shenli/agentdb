@@ -1087,6 +1087,57 @@ the meta store directly today); surfacing the audit log
 on `/metrics` (row counts are a gauge, but tailing is a
 worse UX than the JSON endpoint).
 
+### Cross-node Mongo wire forwarding
+
+When a Mongo client connects to node-A but its session
+`S` is owned by node-B, the wire server forwards the
+entire OP_MSG frame to node-B and streams the reply back.
+Pre-v2.1 this case returned
+`code: 10107 NotWritablePrimary` with the peer address so
+the driver could reconnect — that still works when auth
+is required (see below).
+
+How it works:
+
+- Every node advertises its Mongo wire listener address
+  in `nodes.mongo_address` (migration 008). `NodeTarget`
+  carries it through the `NodeAddressProxy` cache.
+- Before dispatching an OP_MSG, the wire server inspects
+  the command (`find` / `insert` / `update` / `delete` /
+  `aggregate`). For commands carrying a top-level
+  `session_id` (single session only — mixed-session
+  inserts fall through to local handling where they'd be
+  rejected anyway), it calls
+  `BoxRegistry::route_session_for_io`.
+- If the route is remote AND the peer advertised a Mongo
+  address, `forward::forward_op_msg` dials the peer's
+  Mongo port, writes the raw frame, reads the framed
+  reply, and relays it back to the client. No cursor
+  continuation support: each command is its own forward.
+- Counters: `agentdb_wire_forwarded_total` and
+  `agentdb_wire_forward_failures_total` on `/metrics`.
+
+**Auth-required mode is NOT forwarded.** SASL session
+state is per-connection and doesn't transfer across a
+forward — so when `AGENTDB_REQUIRE_AUTH=true`, the wire
+handler keeps returning the legacy NotWritablePrimary
+error and drivers reconnect to the owner. Proper
+forwarding under SCRAM needs a separate inter-node trust
+model (shared secret, mTLS, or a synthetic internal auth
+identity) and is deferred.
+
+**Loop safety.** When a forwarded frame reaches node-B,
+node-B's own `routing_decision` returns `None` (the
+session routes locally) so the request is dispatched
+normally — no infinite forwarding ping-pong.
+
+**Timeouts.** `forward_op_msg` bounds each forward to
+30s (`DEFAULT_FORWARD_TIMEOUT`) so a misbehaving peer
+can't stall the client connection indefinitely. Failed
+forwards increment the failures counter and fall through
+to local dispatch (which emits the NotWritablePrimary
+signal, giving the driver a path to reconnect).
+
 ### Admin token RBAC
 
 Admin tokens now carry a scope. Two levels in this PR:

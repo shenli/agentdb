@@ -114,6 +114,36 @@ where
                 _ => None,
             })
             .collect();
+        // Cross-node routing: if the command targets a
+        // session owned by a peer AND auth is not required
+        // (SASL doesn't transfer), relay the raw frame to
+        // the peer and stream its reply back. Auth-required
+        // mode falls through to local dispatch, which returns
+        // NotWritablePrimary with the owner's address so the
+        // driver can reconnect.
+        let forward_to = crate::forward::routing_decision(
+            body,
+            &doc_seqs,
+            &state.registry,
+            state.auth.is_some(),
+        );
+        if let Some(peer_addr) = forward_to {
+            match crate::forward::forward_op_msg(&peer_addr, &buf).await {
+                Ok(reply_bytes) => {
+                    state.registry.record_wire_forwarded();
+                    socket.write_all(&reply_bytes).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+                Err(e) => {
+                    state.registry.record_wire_forward_failure();
+                    tracing::warn!(error = %e, peer = %peer_addr, "wire forward failed");
+                    // Fall through to local dispatch, which
+                    // will emit the NotWritablePrimary error
+                    // so the driver retries at the owner.
+                }
+            }
+        }
         let response_doc = dispatch(body, &doc_seqs, &state, connection_id).await;
         let mut reply = Vec::with_capacity(64 + response_doc.len() * 16);
         opmsg::encode_body_response(

@@ -396,13 +396,18 @@ M18+ milestones added:
 
 **Still out of scope:**
 
-- **Cross-node Mongo wire forwarding.** Mongo clients
-  targeting a session on a peer get `code: 10107
-  NotWritablePrimary` with the owner's address so they can
-  reconnect, but there's no server-side proxy. Binary
-  stateful protocol (SASL state doesn't transfer); this is
-  the single largest remaining v2 gap — flagged in
-  `docs/superpowers/plans/2026-04-23-m20-cross-node-forwarding.md`.
+- **Cross-node Mongo wire forwarding under auth.** With
+  auth off (the default), node-A forwards session-pinned
+  Mongo commands to the owning peer and relays the reply
+  end-to-end (counters:
+  `agentdb_wire_forwarded_total` /
+  `agentdb_wire_forward_failures_total`). With
+  `AGENTDB_REQUIRE_AUTH=true`, SASL session state can't
+  cross a forward, so the handler returns
+  `code: 10107 NotWritablePrimary` with the peer's
+  address — the driver reconnects there. Auth-aware
+  forwarding needs a shared-secret / mTLS inter-node
+  trust model; future PR.
 - **Tenant-wide reads.** `find` without a session filter,
   `listDatabases`, `listCollections` still route by tenant
   hash. An override moves one session, not the whole tenant.
