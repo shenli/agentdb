@@ -2,7 +2,7 @@
 //! `tablet_id = NULL` means "use hash-based default routing"
 //! — the common case until a manual override or tablet split.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::MetaResult;
 
@@ -20,7 +20,7 @@ pub struct ShardRow {
 /// given cluster. See design §2.4.
 pub const DEFAULT_SHARD_COUNT: i64 = 16384;
 
-pub async fn seed_shards(pool: &SqlitePool, s: i64, now_ms: i64) -> MetaResult<()> {
+pub async fn seed_shards(pool: &AnyPool, s: i64, now_ms: i64) -> MetaResult<()> {
     // Idempotent: skip seeding if the table already has rows.
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM shards")
         .fetch_one(pool)
@@ -47,7 +47,7 @@ pub async fn seed_shards(pool: &SqlitePool, s: i64, now_ms: i64) -> MetaResult<(
 /// Override the assignment for one shard. Pass `None` to revert to
 /// default (hash) routing.
 pub async fn set_assignment(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     shard_id: i64,
     tablet_id: Option<i64>,
     now_ms: i64,
@@ -61,7 +61,7 @@ pub async fn set_assignment(
     Ok(())
 }
 
-pub async fn get_assignment(pool: &SqlitePool, shard_id: i64) -> MetaResult<Option<i64>> {
+pub async fn get_assignment(pool: &AnyPool, shard_id: i64) -> MetaResult<Option<i64>> {
     let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT tablet_id FROM shards WHERE shard_id = ?")
             .bind(shard_id)
@@ -75,7 +75,7 @@ pub async fn get_assignment(pool: &SqlitePool, shard_id: i64) -> MetaResult<Opti
 /// cache in one round-trip. At prototype scale (16384 rows) this is
 /// cheap; production-scale sync will need incremental LISTEN/NOTIFY
 /// (Postgres-only, follow-up PR).
-pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<ShardRow>> {
     let rows: Vec<(i64, Option<i64>, i64)> =
         sqlx::query_as("SELECT shard_id, tablet_id, updated_at_ms FROM shards ORDER BY shard_id")
             .fetch_all(pool)
@@ -94,7 +94,7 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
 /// by shard_id. Used by `GET /api/admin/shards/list` — the full
 /// 16384-row listing is too noisy for humans; operators almost
 /// always want "show me what's actually overridden."
-pub async fn list_overrides(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
+pub async fn list_overrides(pool: &AnyPool) -> MetaResult<Vec<ShardRow>> {
     let rows: Vec<(i64, Option<i64>, i64)> = sqlx::query_as(
         "SELECT shard_id, tablet_id, updated_at_ms FROM shards \
          WHERE tablet_id IS NOT NULL ORDER BY shard_id",
@@ -115,7 +115,7 @@ pub async fn list_overrides(pool: &SqlitePool) -> MetaResult<Vec<ShardRow>> {
 /// shard_id. Used by the stale-tablet reaper: after clearing a
 /// dead tablet's ownership, it needs the list of shards pointing
 /// at that tablet so it can reassign them to a live tablet.
-pub async fn list_by_tablet(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Vec<i64>> {
+pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<i64>> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT shard_id FROM shards WHERE tablet_id = ? ORDER BY shard_id",
     )
@@ -128,12 +128,9 @@ pub async fn list_by_tablet(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

@@ -294,7 +294,7 @@ mod tests {
 
     async fn proxy_with(overrides: &[(u16, i64)]) -> Arc<LocationProxy> {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         meta_shards::seed_shards(meta.pool(), core_shard::SHARD_COUNT as i64, 0)
             .await
             .unwrap();
@@ -377,7 +377,7 @@ mod tests {
 
     async fn meta_and_proxy() -> (Arc<MetaStore>, Arc<LocationProxy>) {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         meta_shards::seed_shards(meta.pool(), core_shard::SHARD_COUNT as i64, 0)
             .await
             .unwrap();

@@ -11,7 +11,7 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 use crate::scram::{self, Credentials};
@@ -44,7 +44,7 @@ pub struct UserSummary {
 /// for tests that want to round-trip a handshake without
 /// re-fetching.
 pub async fn create(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     user_id: &str,
     tenant_external: &str,
     password: &str,
@@ -97,7 +97,7 @@ pub async fn create(
 /// base64 credential columns; a malformed row (shouldn't happen
 /// unless the DB was tampered with) yields a descriptive
 /// `MetaError`.
-pub async fn get(pool: &SqlitePool, user_id: &str) -> MetaResult<Option<User>> {
+pub async fn get(pool: &AnyPool, user_id: &str) -> MetaResult<Option<User>> {
     let row: Option<(String, String, i64, String, String, String, i64)> = sqlx::query_as(
         "SELECT user_id, tenant_external, iterations,
                 salt_b64, stored_key_b64, server_key_b64, created_at_ms
@@ -123,7 +123,7 @@ pub async fn get(pool: &SqlitePool, user_id: &str) -> MetaResult<Option<User>> {
 /// Every user, ordered by `created_at_ms` ascending so newly-
 /// added users appear at the tail. Returns summaries only —
 /// credentials never leave this crate.
-pub async fn list(pool: &SqlitePool) -> MetaResult<Vec<UserSummary>> {
+pub async fn list(pool: &AnyPool) -> MetaResult<Vec<UserSummary>> {
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT user_id, tenant_external, created_at_ms
            FROM users ORDER BY created_at_ms ASC, user_id ASC",
@@ -143,7 +143,7 @@ pub async fn list(pool: &SqlitePool) -> MetaResult<Vec<UserSummary>> {
 /// Delete a user. Idempotent: deleting a nonexistent user is
 /// not an error — returns `false`. Returns `true` on actual
 /// deletion so admin endpoints can distinguish 204 vs. 404.
-pub async fn delete(pool: &SqlitePool, user_id: &str) -> MetaResult<bool> {
+pub async fn delete(pool: &AnyPool, user_id: &str) -> MetaResult<bool> {
     let n = sqlx::query("DELETE FROM users WHERE user_id = ?")
         .bind(user_id)
         .execute(pool)
@@ -187,12 +187,9 @@ fn decode_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

@@ -6,18 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# SQLite-first for M18. Postgres support is added in a follow-up PR
-# once M19 has a consumer that needs it. Keeping sqlx's "postgres"
-# feature disabled here means workspace-wide builds don't pull in the
-# heavier pg-protocol dep tree yet.
+# Dual-dialect: SQLite for dev / single-node, Postgres for
+# production multi-node (LISTEN/NOTIFY-driven change
+# propagation, wider ops tooling). `AGENTDB_META_BACKEND`
+# selects at runtime; see `MetaBackend` in lib.rs.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlite",
+    "postgres",
+    "any",
     "macros",
     "chrono",
 ] }
+# tokio-stream: the Postgres LISTEN/NOTIFY plumbing uses a
+# stream of notifications as the change-propagation signal.
+tokio-stream = { version = "0.1", features = ["sync"] }
+# futures: used in the LISTEN loop + tests.
+futures = "0.3"
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 serde = { workspace = true }

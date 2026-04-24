@@ -5,7 +5,7 @@
 //! epoch; stale-epoch writes are rejected at read time — the fencing-
 //! token pattern committed to in design §5.5.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
@@ -20,7 +20,7 @@ pub struct Tablet {
 
 /// Idempotent create: insert the tablet row if absent; do nothing if
 /// already present. Returns the row as it now exists on-disk.
-pub async fn get_or_create(pool: &SqlitePool, tablet_id: i64, now_ms: i64) -> MetaResult<Tablet> {
+pub async fn get_or_create(pool: &AnyPool, tablet_id: i64, now_ms: i64) -> MetaResult<Tablet> {
     // Try insert first; if the PK already exists we fall through to
     // lookup. `INSERT OR IGNORE` is idempotent and doesn't error.
     sqlx::query(
@@ -36,7 +36,7 @@ pub async fn get_or_create(pool: &SqlitePool, tablet_id: i64, now_ms: i64) -> Me
         .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after insert-or-ignore")))
 }
 
-pub async fn get(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
+pub async fn get(pool: &AnyPool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
     let row: Option<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
         "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
          FROM tablets WHERE tablet_id = ?",
@@ -63,7 +63,7 @@ pub async fn get(pool: &SqlitePool, tablet_id: i64) -> MetaResult<Option<Tablet>
 /// same way for a take-over — the scheduler reads, waits for lease
 /// expiry, then calls this with the epoch it read at decision time.
 pub async fn assume_ownership(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     tablet_id: i64,
     expected_epoch: i64,
     new_owner: &str,
@@ -110,7 +110,7 @@ pub async fn assume_ownership(
 /// the reaper intervenes — a node whose renewal is momentarily
 /// slow, but which is still alive, has time to catch up.
 pub async fn clear_expired_ownership(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     safety_margin_ms: i64,
     now_ms: i64,
 ) -> MetaResult<Vec<i64>> {
@@ -155,7 +155,7 @@ pub async fn clear_expired_ownership(
 /// ownership can change between this return and the caller acting on
 /// it. Used by `GET /api/admin/tablets` and by the scheduler when it
 /// needs a cluster-wide view of which tablets exist.
-pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Tablet>> {
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Tablet>> {
     let rows: Vec<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
         "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
            FROM tablets ORDER BY tablet_id",
@@ -177,12 +177,9 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Tablet>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

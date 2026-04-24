@@ -9,7 +9,7 @@
 //! crate's `scheduler` module. This meta-crate module only manages
 //! the row.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
@@ -44,7 +44,7 @@ impl LeaderRow {
 ///   also calls this on boot to avoid a separate "am I already
 ///   leader" query).
 pub async fn try_acquire(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     node_id: &str,
     lease_duration_ms: i64,
     now_ms: i64,
@@ -125,7 +125,7 @@ pub async fn try_acquire(
 /// moved (which means another node stole the role or the row was
 /// wiped). Matches the tablet-renew shape.
 pub async fn renew(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     node_id: &str,
     expected_epoch: i64,
     new_expires_at_ms: i64,
@@ -153,7 +153,7 @@ pub async fn renew(
 
 /// Read the current row, if any. Does not evaluate liveness —
 /// callers compare `expires_at_ms` against their own wall clock.
-pub async fn get(pool: &SqlitePool) -> MetaResult<Option<LeaderRow>> {
+pub async fn get(pool: &AnyPool) -> MetaResult<Option<LeaderRow>> {
     let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT node_id, epoch, expires_at_ms, acquired_at_ms
            FROM scheduler_leader WHERE id = 1",
@@ -171,12 +171,9 @@ pub async fn get(pool: &SqlitePool) -> MetaResult<Option<LeaderRow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

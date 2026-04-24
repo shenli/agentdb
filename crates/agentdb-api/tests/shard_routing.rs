@@ -42,7 +42,7 @@ async fn spawn() -> (
             .await
             .unwrap(),
     );
-    agentdb_meta::migrations::apply(meta.pool()).await.unwrap();
+    agentdb_meta::migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
     agentdb_meta::shards::seed_shards(
         meta.pool(),
         agentdb_core::SHARD_COUNT as i64,

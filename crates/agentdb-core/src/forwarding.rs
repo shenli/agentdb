@@ -194,7 +194,7 @@ mod tests {
 
     async fn fresh_meta() -> Arc<MetaStore> {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         Arc::new(meta)
     }
 

@@ -461,7 +461,7 @@ mod tests {
         num_tablets: i64,
     ) -> (tempfile::NamedTempFile, Arc<MetaStore>) {
         let (file, meta) = file_backed_meta().await;
-        agentdb_meta::migrations::apply(meta.pool()).await.unwrap();
+        agentdb_meta::migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         agentdb_meta::shards::seed_shards(meta.pool(), 64, 0)
             .await
             .unwrap();

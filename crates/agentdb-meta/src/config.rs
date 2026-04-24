@@ -1,10 +1,10 @@
 //! Cluster-wide K-V config. Small — expected O(10) keys at most.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::MetaResult;
 
-pub async fn get(pool: &SqlitePool, key: &str) -> MetaResult<Option<String>> {
+pub async fn get(pool: &AnyPool, key: &str) -> MetaResult<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT value FROM config WHERE key = ?")
         .bind(key)
         .fetch_optional(pool)
@@ -12,7 +12,7 @@ pub async fn get(pool: &SqlitePool, key: &str) -> MetaResult<Option<String>> {
     Ok(row.map(|(v,)| v))
 }
 
-pub async fn set(pool: &SqlitePool, key: &str, value: &str, now_ms: i64) -> MetaResult<()> {
+pub async fn set(pool: &AnyPool, key: &str, value: &str, now_ms: i64) -> MetaResult<()> {
     sqlx::query(
         "INSERT INTO config (key, value, updated_at_ms) VALUES (?, ?, ?)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
@@ -25,7 +25,7 @@ pub async fn set(pool: &SqlitePool, key: &str, value: &str, now_ms: i64) -> Meta
     Ok(())
 }
 
-pub async fn delete(pool: &SqlitePool, key: &str) -> MetaResult<()> {
+pub async fn delete(pool: &AnyPool, key: &str) -> MetaResult<()> {
     sqlx::query("DELETE FROM config WHERE key = ?")
         .bind(key)
         .execute(pool)
@@ -36,12 +36,9 @@ pub async fn delete(pool: &SqlitePool, key: &str) -> MetaResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

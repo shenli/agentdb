@@ -88,6 +88,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "futures",
  "hmac",
  "pbkdf2",
  "rand 0.8.6",
@@ -98,6 +99,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tracing",
  "utoipa",
 ]
@@ -4696,6 +4698,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

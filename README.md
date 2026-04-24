@@ -205,6 +205,9 @@ contract.
 | `AGENTDB_SEGMENT_GC_GRACE_SECS` | `30` | Grace period before GC reclaims an unpinned segment |
 | `AGENTDB_TICK_MS` | `1000` | SSE `MetricsTick` broadcast interval |
 | `AGENTDB_HNSW_EF` | `100` | HNSW `ef_construction` + `ef_search` (vector recall knob) |
+| `AGENTDB_META_BACKEND` | `sqlite` | `sqlite` (default) or `postgres`. Selects the meta-store dialect |
+| `AGENTDB_META_PATH` | `meta.sqlite` | SQLite file path (ignored on postgres) |
+| `AGENTDB_META_URL` | — | Required when `AGENTDB_META_BACKEND=postgres` (`postgres://user:pw@host/db`) |
 
 AWS creds use the standard env chain (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).

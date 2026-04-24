@@ -1,7 +1,7 @@
 //! Cluster node membership + heartbeat. Follow-up PRs add LISTEN/NOTIFY
 //! for change propagation (Postgres only).
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
@@ -19,7 +19,7 @@ pub struct Node {
 }
 
 pub async fn upsert(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     node_id: &str,
     address: &str,
     mongo_address: Option<&str>,
@@ -47,7 +47,7 @@ pub async fn upsert(
     Ok(())
 }
 
-pub async fn heartbeat(pool: &SqlitePool, node_id: &str, now_ms: i64) -> MetaResult<()> {
+pub async fn heartbeat(pool: &AnyPool, node_id: &str, now_ms: i64) -> MetaResult<()> {
     let rows = sqlx::query("UPDATE nodes SET last_heartbeat_ms = ? WHERE node_id = ?")
         .bind(now_ms)
         .bind(node_id)
@@ -66,7 +66,7 @@ pub async fn heartbeat(pool: &SqlitePool, node_id: &str, now_ms: i64) -> MetaRes
 /// `POST /api/admin/drain` uses it to flip state to `"draining"`
 /// without accidentally wiping the advertised address.
 pub async fn set_state(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     node_id: &str,
     state: &str,
     now_ms: i64,
@@ -84,7 +84,7 @@ pub async fn set_state(
     Ok(())
 }
 
-pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
+pub async fn get(pool: &AnyPool, node_id: &str) -> MetaResult<Option<Node>> {
     let row: Option<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
         "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms \
            FROM nodes WHERE node_id = ?",
@@ -106,7 +106,7 @@ pub async fn get(pool: &SqlitePool, node_id: &str) -> MetaResult<Option<Node>> {
 /// snapshot — a node can be updated between this return and the
 /// caller acting on it. Used by `GET /api/admin/nodes` and by the
 /// scheduler's membership scan.
-pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Node>> {
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Node>> {
     let rows: Vec<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
         "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms
            FROM nodes ORDER BY node_id",
@@ -128,7 +128,7 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Node>> {
 
 /// Nodes whose last heartbeat is older than `threshold_ms`. Used by
 /// the scheduler to detect dead nodes and start failover.
-pub async fn stale(pool: &SqlitePool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
+pub async fn stale(pool: &AnyPool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
     let rows: Vec<(String, String, Option<String>, String, i64, i64)> = sqlx::query_as(
         "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms
            FROM nodes WHERE last_heartbeat_ms < ? ORDER BY last_heartbeat_ms",
@@ -152,12 +152,9 @@ pub async fn stale(pool: &SqlitePool, threshold_ms: i64) -> MetaResult<Vec<Node>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

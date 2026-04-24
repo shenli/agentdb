@@ -5,7 +5,7 @@
 //! this module is the persistent source of truth. Server
 //! startup loads every row into core's `TenantQuotaRegistry`.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::MetaResult;
 
@@ -22,7 +22,7 @@ pub struct TenantQuota {
 
 /// Upsert a quota. Replaces the existing row for `tenant_id`.
 pub async fn upsert(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     tenant_id: &str,
     max_qps: u64,
     burst: u64,
@@ -46,7 +46,7 @@ pub async fn upsert(
 }
 
 /// Return the quota for `tenant_id`, or `None` if absent.
-pub async fn get(pool: &SqlitePool, tenant_id: &str) -> MetaResult<Option<TenantQuota>> {
+pub async fn get(pool: &AnyPool, tenant_id: &str) -> MetaResult<Option<TenantQuota>> {
     let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT tenant_id, max_qps, burst, updated_at_ms FROM tenant_quotas WHERE tenant_id = ?",
     )
@@ -62,7 +62,7 @@ pub async fn get(pool: &SqlitePool, tenant_id: &str) -> MetaResult<Option<Tenant
 }
 
 /// Delete the quota. Returns `true` if a row existed.
-pub async fn delete(pool: &SqlitePool, tenant_id: &str) -> MetaResult<bool> {
+pub async fn delete(pool: &AnyPool, tenant_id: &str) -> MetaResult<bool> {
     let n = sqlx::query("DELETE FROM tenant_quotas WHERE tenant_id = ?")
         .bind(tenant_id)
         .execute(pool)
@@ -73,7 +73,7 @@ pub async fn delete(pool: &SqlitePool, tenant_id: &str) -> MetaResult<bool> {
 
 /// Every quota currently configured. Used on startup to
 /// populate the in-memory registry.
-pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<TenantQuota>> {
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TenantQuota>> {
     let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT tenant_id, max_qps, burst, updated_at_ms
            FROM tenant_quotas
@@ -95,12 +95,9 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<TenantQuota>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

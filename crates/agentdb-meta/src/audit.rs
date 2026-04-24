@@ -9,7 +9,7 @@
 //! `/api/admin/audit` handler is the only reader. No
 //! retention / compaction — documented as future work.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::MetaResult;
 
@@ -66,7 +66,7 @@ pub const MAX_LIMIT: i64 = 10_000;
 /// await point.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     ts_ms: i64,
     actor_token_id: Option<String>,
     method: String,
@@ -96,7 +96,7 @@ pub async fn insert(
 /// Newest rows first, bounded by [`AuditFilter::limit`] (or
 /// [`DEFAULT_LIMIT`]). Clients paginate by passing the oldest
 /// returned `ts_ms` as the next `until_ms`.
-pub async fn list(pool: &SqlitePool, filter: &AuditFilter) -> MetaResult<Vec<AuditRecord>> {
+pub async fn list(pool: &AnyPool, filter: &AuditFilter) -> MetaResult<Vec<AuditRecord>> {
     let limit = filter
         .limit
         .unwrap_or(DEFAULT_LIMIT)
@@ -197,15 +197,12 @@ impl From<AuditRow> for AuditRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
-    async fn seed(p: &SqlitePool) {
+    async fn seed(p: &AnyPool) {
         insert(
             p,
             1000,

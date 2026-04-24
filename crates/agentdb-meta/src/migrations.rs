@@ -1,78 +1,105 @@
-//! Embedded migrations. Hand-rolled because `refinery` pulls another
-//! dep tree; for the ~handful of migrations we'll have, the rolled
-//! version is simpler and the test surface is tiny.
+//! Embedded migrations — dual-dialect.
 //!
-//! A migration is (version, description, SQL). Applied in version
-//! order; each successfully-applied migration records a row in
-//! `schema_migrations`. Subsequent opens are no-ops because the
-//! version check skips anything already recorded.
+//! Each migration ships TWO SQL variants side-by-side: a
+//! SQLite file (`NNN_name.sql`) and a Postgres file
+//! (`NNN_name.pg.sql`). The runner picks the file that
+//! matches [`crate::MetaDialect`] at `apply` time.
+//!
+//! A migration is (version, description, sqlite_sql,
+//! postgres_sql). Applied in version order; each successfully-
+//! applied migration records a row in `schema_migrations`.
+//! Subsequent opens are no-ops because the version check
+//! skips anything already recorded.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
+use crate::MetaDialect;
 
-/// Every migration in order. Append new ones; NEVER renumber or
-/// reorder existing entries.
-const MIGRATIONS: &[(i64, &str, &str)] = &[
+/// Every migration in order. Append new ones; NEVER renumber
+/// or reorder existing entries.
+const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
     (
         1,
         "initial control-plane schema",
         include_str!("../migrations/001_initial.sql"),
+        include_str!("../migrations/001_initial.pg.sql"),
     ),
     (
         2,
         "scheduler leader singleton lease",
         include_str!("../migrations/002_scheduler_leader.sql"),
+        include_str!("../migrations/002_scheduler_leader.pg.sql"),
     ),
     (
         3,
         "SCRAM-SHA-256 users",
         include_str!("../migrations/003_users.sql"),
+        include_str!("../migrations/003_users.pg.sql"),
     ),
     (
         4,
         "admin bearer tokens",
         include_str!("../migrations/004_admin_tokens.sql"),
+        include_str!("../migrations/004_admin_tokens.pg.sql"),
     ),
     (
         5,
         "admin audit log",
         include_str!("../migrations/005_admin_audit.sql"),
+        include_str!("../migrations/005_admin_audit.pg.sql"),
     ),
     (
         6,
         "global per-tenant rate limits",
         include_str!("../migrations/006_tenant_quotas.sql"),
+        include_str!("../migrations/006_tenant_quotas.pg.sql"),
     ),
     (
         7,
         "admin token scope (RBAC)",
         include_str!("../migrations/007_admin_token_scope.sql"),
+        include_str!("../migrations/007_admin_token_scope.pg.sql"),
     ),
     (
         8,
         "node mongo_address for cross-node Mongo wire forwarding",
         include_str!("../migrations/008_node_mongo_address.sql"),
+        include_str!("../migrations/008_node_mongo_address.pg.sql"),
+    ),
+    (
+        9,
+        "Postgres LISTEN/NOTIFY triggers (SQLite no-op)",
+        include_str!("../migrations/009_pg_notify_triggers.sql"),
+        include_str!("../migrations/009_pg_notify_triggers.pg.sql"),
     ),
 ];
 
-/// Apply all pending migrations to the given pool.
-pub async fn apply(pool: &SqlitePool) -> MetaResult<()> {
-    // Bootstrap: create the tracking table first so we can check what's
-    // already applied. It's also created by migration 001 (for fresh
-    // DBs that skip this bootstrap), so `IF NOT EXISTS` guards both
-    // paths.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version       INTEGER PRIMARY KEY,
-            applied_at_ms INTEGER NOT NULL,
-            description   TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
+/// Apply all pending migrations to `pool`. `dialect` tells the
+/// runner which SQL variant to embed.
+pub async fn apply(pool: &AnyPool, dialect: MetaDialect) -> MetaResult<()> {
+    // Bootstrap: create the tracking table first so we can
+    // check what's already applied. Both dialects recreate it
+    // in migration 001 too; the `IF NOT EXISTS` guards that.
+    let bootstrap_sql = match dialect {
+        MetaDialect::Sqlite => {
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version       INTEGER PRIMARY KEY,
+                applied_at_ms INTEGER NOT NULL,
+                description   TEXT NOT NULL
+            )"
+        }
+        MetaDialect::Postgres => {
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version       BIGINT PRIMARY KEY,
+                applied_at_ms BIGINT NOT NULL,
+                description   TEXT NOT NULL
+            )"
+        }
+    };
+    sqlx::query(bootstrap_sql).execute(pool).await?;
 
-    for &(version, desc, sql) in MIGRATIONS {
+    for &(version, desc, sqlite_sql, pg_sql) in MIGRATIONS {
         let already_applied: Option<(i64,)> =
             sqlx::query_as("SELECT version FROM schema_migrations WHERE version = ?")
                 .bind(version)
@@ -81,10 +108,20 @@ pub async fn apply(pool: &SqlitePool) -> MetaResult<()> {
         if already_applied.is_some() {
             continue;
         }
-        // Execute each statement in the migration SQL separately — SQLite's
-        // sqlx doesn't run multi-statement strings by default.
+        let sql = match dialect {
+            MetaDialect::Sqlite => sqlite_sql,
+            MetaDialect::Postgres => pg_sql,
+        };
+        // Postgres' JDBC-style driver can handle
+        // multi-statement text directly, but sqlx-any routes
+        // through per-driver prepared statements that only
+        // accept one statement at a time. Split here on
+        // top-level `;` (respecting -- comments + $$-delimited
+        // plpgsql bodies so the trigger-function block in
+        // migration 009 stays intact).
         for stmt in split_sql(sql) {
-            if stmt.trim().is_empty() {
+            let trimmed = stmt.trim();
+            if trimmed.is_empty() {
                 continue;
             }
             sqlx::query(stmt).execute(pool).await.map_err(|e| {
@@ -102,31 +139,48 @@ pub async fn apply(pool: &SqlitePool) -> MetaResult<()> {
         .bind(desc)
         .execute(pool)
         .await?;
-        tracing::info!(%version, %desc, "applied control-plane migration");
+        tracing::info!(%version, %desc, dialect = dialect.as_str(), "applied control-plane migration");
     }
     Ok(())
 }
 
-/// Split a SQL file into statements on the `;` boundary, respecting
-/// line comments (-- to end-of-line). Crude but sufficient for our
-/// hand-maintained migration files.
+/// Split a SQL file on top-level `;`, respecting `--`-to-EOL
+/// comments AND `$$...$$` dollar-quoted string literals (the
+/// plpgsql bodies in migration 009). Crude but sufficient for
+/// our hand-written migration files — we don't parse SQL.
 fn split_sql(sql: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
-    let mut in_comment = false;
+    let mut in_line_comment = false;
+    let mut in_dollar = false;
     let bytes = sql.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if in_comment {
+        if in_line_comment {
             if b == b'\n' {
-                in_comment = false;
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dollar {
+            // Close on the next `$$`.
+            if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                in_dollar = false;
+                i += 2;
+                continue;
             }
             i += 1;
             continue;
         }
         if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            in_comment = true;
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+            in_dollar = true;
             i += 2;
             continue;
         }
@@ -153,15 +207,24 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::any::AnyPoolOptions;
 
-    async fn fresh_pool() -> SqlitePool {
-        SqlitePool::connect("sqlite::memory:").await.unwrap()
+    async fn fresh_pool() -> AnyPool {
+        // Cap at 1 conn so apply() + subsequent queries share
+        // the same in-memory DB (each SQLite `:memory:` conn
+        // gets its own private database otherwise).
+        crate::install_any_drivers_for_tests();
+        AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn apply_creates_tables_on_fresh_db() {
         let pool = fresh_pool().await;
-        apply(&pool).await.unwrap();
+        apply(&pool, MetaDialect::Sqlite).await.unwrap();
         let tables: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .fetch_all(&pool)
@@ -192,9 +255,9 @@ mod tests {
     #[tokio::test]
     async fn apply_is_idempotent() {
         let pool = fresh_pool().await;
-        apply(&pool).await.unwrap();
-        apply(&pool).await.unwrap();
-        apply(&pool).await.unwrap();
+        apply(&pool, MetaDialect::Sqlite).await.unwrap();
+        apply(&pool, MetaDialect::Sqlite).await.unwrap();
+        apply(&pool, MetaDialect::Sqlite).await.unwrap();
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await
@@ -209,5 +272,16 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].contains("CREATE TABLE"));
         assert!(stmts[1].contains("CREATE INDEX"));
+    }
+
+    #[test]
+    fn split_sql_respects_dollar_quoted_blocks() {
+        // plpgsql body carries `;`s inside `$$...$$`. The
+        // splitter must keep those intact.
+        let sql = "CREATE FUNCTION f() RETURNS TRIGGER AS $$\nBEGIN\n  PERFORM pg_notify('c', 'x');\n  RETURN NULL;\nEND;\n$$ LANGUAGE plpgsql;\nSELECT 1;";
+        let stmts = split_sql(sql);
+        assert_eq!(stmts.len(), 2, "got: {stmts:?}");
+        assert!(stmts[0].contains("CREATE FUNCTION"));
+        assert!(stmts[1].trim().starts_with("SELECT 1"));
     }
 }

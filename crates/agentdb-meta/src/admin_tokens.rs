@@ -15,7 +15,7 @@ use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 use subtle::ConstantTimeEq;
 
 use crate::error::{MetaError, MetaResult};
@@ -104,7 +104,7 @@ pub struct MintedToken {
 /// is for ("grafana", "alice"). `scope` gates what the token
 /// can do; see [`AdminScope`].
 pub async fn mint(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     description: &str,
     scope: AdminScope,
     now_ms: i64,
@@ -154,7 +154,7 @@ pub async fn mint(
 /// down, but per-request cost is already a single atomic
 /// per entry.
 pub async fn verify(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     presented: &str,
 ) -> MetaResult<Option<(String, AdminScope)>> {
     let candidate = B64.encode(sha256(presented.as_bytes()));
@@ -184,7 +184,7 @@ pub async fn verify(
 }
 
 /// Every non-revoked token, ordered by `created_at_ms`.
-pub async fn list_active(pool: &SqlitePool) -> MetaResult<Vec<TokenSummary>> {
+pub async fn list_active(pool: &AnyPool) -> MetaResult<Vec<TokenSummary>> {
     let rows: Vec<(String, String, i64, Option<i64>, String)> = sqlx::query_as(
         "SELECT token_id, description, created_at_ms, revoked_at_ms, scope
            FROM admin_tokens
@@ -207,7 +207,7 @@ pub async fn list_active(pool: &SqlitePool) -> MetaResult<Vec<TokenSummary>> {
 
 /// Mark a token revoked. Idempotent: revoking an already-
 /// revoked or nonexistent token returns `false`.
-pub async fn revoke(pool: &SqlitePool, token_id: &str, now_ms: i64) -> MetaResult<bool> {
+pub async fn revoke(pool: &AnyPool, token_id: &str, now_ms: i64) -> MetaResult<bool> {
     let n = sqlx::query(
         "UPDATE admin_tokens SET revoked_at_ms = ?
            WHERE token_id = ? AND revoked_at_ms IS NULL",
@@ -223,7 +223,7 @@ pub async fn revoke(pool: &SqlitePool, token_id: &str, now_ms: i64) -> MetaResul
 /// Count of tokens that are currently active (not revoked).
 /// Used by the auth middleware's bootstrap path — the first
 /// mint is allowed without auth when this returns 0.
-pub async fn count_active(pool: &SqlitePool) -> MetaResult<i64> {
+pub async fn count_active(pool: &AnyPool) -> MetaResult<i64> {
     let (n,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM admin_tokens WHERE revoked_at_ms IS NULL")
             .fetch_one(pool)
@@ -257,12 +257,9 @@ fn _hush_unused() -> MetaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

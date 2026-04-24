@@ -2,7 +2,7 @@
 //! entries added only when a specific session is migrated away from
 //! its hash-computed tablet (hot-session escape hatch per §2.5).
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::MetaResult;
 
@@ -13,7 +13,7 @@ pub struct SessionOverride {
     pub created_at_ms: i64,
 }
 
-pub async fn get(pool: &SqlitePool, session_id: &str) -> MetaResult<Option<SessionOverride>> {
+pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionOverride>> {
     let row: Option<(String, i64, i64)> = sqlx::query_as(
         "SELECT session_id, tablet_id, created_at_ms FROM session_overrides WHERE session_id = ?",
     )
@@ -28,7 +28,7 @@ pub async fn get(pool: &SqlitePool, session_id: &str) -> MetaResult<Option<Sessi
 }
 
 pub async fn set(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     session_id: &str,
     tablet_id: i64,
     now_ms: i64,
@@ -45,7 +45,7 @@ pub async fn set(
     Ok(())
 }
 
-pub async fn delete(pool: &SqlitePool, session_id: &str) -> MetaResult<()> {
+pub async fn delete(pool: &AnyPool, session_id: &str) -> MetaResult<()> {
     sqlx::query("DELETE FROM session_overrides WHERE session_id = ?")
         .bind(session_id)
         .execute(pool)
@@ -56,12 +56,9 @@ pub async fn delete(pool: &SqlitePool, session_id: &str) -> MetaResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]
