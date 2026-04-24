@@ -8,6 +8,9 @@ use crate::bsonx::json_to_bson;
 use crate::error::{WireError, WireResult};
 use crate::handlers::filter::Filter;
 
+/// `raw: true` returns un-folded events (corrections +
+/// tombstones visible). Default is `false` so clients that
+/// wrote via `update` / `delete` see the post-mutation view.
 pub async fn find_response(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
@@ -16,6 +19,7 @@ pub async fn find_response(
     collection: &str,
     filter_doc: &Document,
     limit: Option<i64>,
+    raw: bool,
 ) -> WireResult<Document> {
     let started = std::time::Instant::now();
     // M20 multi-node: if the filter pins a specific session
@@ -76,7 +80,15 @@ pub async fn find_response(
                 // M17: tier-aware scan. Warm goes through the KV
                 // snapshot; cold/archive read through the segment with
                 // per-tier hedge delay.
-                for ev in scan_session_all_tiers(&ctx, store, &session).await? {
+                let mut events = scan_session_all_tiers(&ctx, store, &session).await?;
+                // Default: fold correction + tombstone events
+                // into a latest-wins view so clients that
+                // wrote via `update` / `delete` see the
+                // expected result. `raw: true` opts out.
+                if !raw {
+                    events = agentdb_core::fold_events(events);
+                }
+                for ev in events {
                     let row = project_event(&session.external_id, ev);
                     if filter.matches(&row) {
                         batch.push(row);
@@ -266,6 +278,7 @@ mod tests {
             "events",
             &doc! {},
             None,
+            false,
         )
         .await
         .unwrap();
@@ -303,6 +316,7 @@ mod tests {
             "events",
             &doc! { "session_id": "s-1" },
             None,
+            false,
         )
         .await
         .unwrap();
@@ -325,6 +339,7 @@ mod tests {
             "events",
             &doc! {},
             Some(2),
+            false,
         )
         .await
         .unwrap();
@@ -347,6 +362,7 @@ mod tests {
             "events",
             &doc! {},
             None,
+            false,
         )
         .await
         .unwrap();
@@ -369,6 +385,7 @@ mod tests {
             "sessions",
             &doc! {},
             None,
+            false,
         )
         .await
         .unwrap();
@@ -416,6 +433,7 @@ mod tests {
             "events",
             &doc! {},
             None,
+            false,
         )
         .await
         .unwrap();
@@ -467,6 +485,7 @@ mod tests {
             "events",
             &doc! {},
             None,
+            false,
         )
         .await
         .unwrap();

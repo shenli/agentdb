@@ -62,16 +62,29 @@ async fn update_one_appends_a_correction_event() {
     assert_eq!(res.matched_count, 1);
     assert_eq!(res.modified_count, 1);
 
-    // Now the log has two events: the original + the
-    // correction. The correction carries the merged payload
-    // AND a `_update_of` marker pointing at the original seq.
-    use futures_util::StreamExt;
-    let cursor = events.find(doc! { "session_id": "s-1" }).await.unwrap();
-    let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
-    assert_eq!(docs.len(), 2, "expected original + correction: {docs:?}");
+    // Use `raw: true` to observe the underlying log
+    // (folded `find` is tested in materialized.rs). The raw
+    // log must carry the original plus the correction event
+    // with `_update_of` pointing at the original seq.
+    let db = cli.database("t-1");
+    let reply = db
+        .run_command(doc! {
+            "find": "events",
+            "filter": { "session_id": "s-1" },
+            "raw": true,
+        })
+        .await
+        .unwrap();
+    let batch = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(batch.len(), 2, "raw view: original + correction: {batch:?}");
 
-    let correction = docs
+    let correction = batch
         .iter()
+        .filter_map(|b| b.as_document())
         .find(|d| {
             d.get_document("payload")
                 .map(|p| p.get_i64("_update_of").is_ok() || p.get_i32("_update_of").is_ok())
@@ -80,7 +93,6 @@ async fn update_one_appends_a_correction_event() {
         .expect("no event carries `_update_of`");
     let payload = correction.get_document("payload").unwrap();
     assert_eq!(payload.get_str("status").unwrap(), "shipped");
-    // The merged payload keeps the order_id from the original.
     assert!(
         payload.get_i64("order_id").is_ok() || payload.get_i32("order_id").is_ok(),
         "correction should carry merged fields: {payload:?}"
@@ -186,18 +198,30 @@ async fn delete_one_appends_a_tombstone() {
         .unwrap();
     assert_eq!(res.deleted_count, 1);
 
-    use futures_util::StreamExt;
-    let cursor = events.find(doc! { "session_id": "s-1" }).await.unwrap();
-    let docs: Vec<bson::Document> = cursor.filter_map(|r| async move { r.ok() }).collect().await;
-    assert_eq!(docs.len(), 3, "original 2 + tombstone 1: {docs:?}");
-    let has_tombstone = docs.iter().any(|d| {
+    // Raw view: both originals + the tombstone event.
+    let db = cli.database("t-del");
+    let reply = db
+        .run_command(doc! {
+            "find": "events",
+            "filter": { "session_id": "s-1" },
+            "raw": true,
+        })
+        .await
+        .unwrap();
+    let batch = reply
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(batch.len(), 3, "raw view: 2 originals + tombstone: {batch:?}");
+    let has_tombstone = batch.iter().filter_map(|b| b.as_document()).any(|d| {
         d.get_document("payload")
             .map(|p| {
                 p.get_i64("_tombstone_of").is_ok() || p.get_i32("_tombstone_of").is_ok()
             })
             .unwrap_or(false)
     });
-    assert!(has_tombstone, "no tombstone event found: {docs:?}");
+    assert!(has_tombstone, "no tombstone event found: {batch:?}");
 }
 
 #[tokio::test]

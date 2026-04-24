@@ -193,6 +193,11 @@ async fn dispatch_command_body(
                 Some(Bson::Int32(n)) if *n > 0 => Some(*n as i64),
                 _ => None,
             };
+            // Extension: `raw: true` returns un-folded events
+            // (corrections + tombstones visible). Default is
+            // folded — clients that wrote via update/delete
+            // see the post-mutation payload on the next find.
+            let raw = matches!(body.get("raw"), Some(Bson::Boolean(true)));
             match find_mod::find_response(
                 &state.registry,
                 &state.tenants,
@@ -201,6 +206,7 @@ async fn dispatch_command_body(
                 &collection,
                 &filter,
                 limit,
+                raw,
             )
             .await
             {

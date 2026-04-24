@@ -148,16 +148,27 @@ async fn apply_one_update(
     // lock.
     drop(ctx);
 
+    // Match the filter against the FOLDED view so chained
+    // `update` / `delete` sequences compose correctly: an
+    // `updateOne({v:1})` after a prior `updateOne({v:0}→{v:1})`
+    // must see v=1, not the raw v=0 event. We preserve the
+    // folded event's `seq` which points at the underlying
+    // target, so the correction we append still references
+    // the right original.
+    let folded = agentdb_core::fold_events(events);
+
     let mut counts = UpdateCounts::default();
-    for ev in events {
+    for ev in folded {
         let row = project_event(&session.external_id, &ev);
         if !filter.matches(&row) {
             continue;
         }
         counts.matched += 1;
 
-        // Build the correction payload: start from the original
-        // payload, apply ops, attach the `_update_of` marker.
+        // Build the correction payload: start from the folded
+        // payload (post any prior correction), apply ops,
+        // attach the `_update_of` marker pointing at the
+        // original target seq.
         let mut payload = ev.payload.clone();
         if !payload.is_object() {
             payload = Value::Object(Default::default());
