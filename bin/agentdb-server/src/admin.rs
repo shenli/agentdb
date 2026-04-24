@@ -479,7 +479,7 @@ fn prompt_password_from_stdin() -> Result<String> {
         .lock()
         .read_line(&mut line)
         .context("read password from stdin")?;
-    let trimmed = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let trimmed = line.trim_end_matches(['\n', '\r']);
     if trimmed.is_empty() {
         anyhow::bail!("empty password");
     }

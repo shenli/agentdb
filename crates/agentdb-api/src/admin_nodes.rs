@@ -9,12 +9,17 @@
 //! row carries `is_stale`, set when
 //! `now_ms - last_heartbeat_ms > stale_threshold_ms`. Default
 //! threshold is 15000 ms — three times the default heartbeat period.
+//!
+//! `DELETE /api/admin/nodes/:node_id` is the operator-recovery
+//! path: manually evict a node row. Refuses to remove rows that
+//! are still `alive` (operator is expected to drain the node
+//! first, or wait for the node reaper to flip it to `dead`).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdb_meta::{nodes, MetaStore};
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -105,6 +110,88 @@ pub async fn list_nodes(
     }
 }
 
+/// Body shape for `DELETE /api/admin/nodes/:node_id` responses.
+/// `removed` is `true` when a row matching the path param existed
+/// before the call (so the operator sees the difference between
+/// "id not in table" and "id was already removed in a previous
+/// call").
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteNodeResponse {
+    pub node_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteNodeError {
+    pub message: String,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/admin/nodes/{node_id}",
+    tag = "admin",
+    params(("node_id" = String, Path, description = "Node id to evict")),
+    responses(
+        (status = 200, description = "Row removed (or already absent)", body = DeleteNodeResponse),
+        (status = 409, description = "Node is still state='alive'; drain it first", body = DeleteNodeError),
+        (status = 503, description = "Control plane not configured on this process", body = DeleteNodeError),
+    ),
+)]
+pub async fn delete_node(
+    meta: Option<Extension<Arc<MetaStore>>>,
+    Path(node_id): Path<String>,
+) -> Result<Json<DeleteNodeResponse>, (StatusCode, Json<DeleteNodeError>)> {
+    let Some(Extension(meta)) = meta else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(DeleteNodeError {
+                message: "meta store is not configured on this server".into(),
+            }),
+        ));
+    };
+    // Refuse to remove an `alive` row. If the operator wants to
+    // take a live node out of the cluster they should drain it
+    // first (POST /api/admin/drain); that transitions it to
+    // "draining" and stops traffic, and the node reaper will
+    // eventually flip it to "dead" when heartbeats stop. This
+    // also avoids a footgun where deleting the currently-running
+    // leader's row deletes the row its own heartbeat would just
+    // re-upsert, causing write churn.
+    match nodes::get(meta.pool(), &node_id).await {
+        Ok(Some(n)) if n.state == "alive" => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(DeleteNodeError {
+                    message: format!(
+                        "node '{node_id}' is still state='alive'; drain it before removing"
+                    ),
+                }),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(DeleteNodeError {
+                    message: format!("meta query failed: {e}"),
+                }),
+            ));
+        }
+    }
+    match nodes::remove(meta.pool(), &node_id).await {
+        Ok(removed) => {
+            tracing::info!(%node_id, removed, "admin evicted node via DELETE /api/admin/nodes");
+            Ok(Json(DeleteNodeResponse { node_id, removed }))
+        }
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(DeleteNodeError {
+                message: format!("meta delete failed: {e}"),
+            }),
+        )),
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,6 +264,70 @@ mod tests {
         .expect("ok");
         assert!(!rows[0].is_stale, "node-a heartbeated now — fresh");
         assert!(rows[1].is_stale, "node-b 60s old, threshold 5s — stale");
+    }
+
+    #[tokio::test]
+    async fn delete_returns_503_when_meta_extension_is_absent() {
+        let (code, body) = delete_node(None, Path("any-node".into()))
+            .await
+            .expect_err("503");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.0.message.contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_alive_node_with_409() {
+        let now = now_ms();
+        let meta = meta_with(&[("alive-node", "a", "alive", now)]).await;
+        let (code, body) = delete_node(Some(Extension(meta)), Path("alive-node".into()))
+            .await
+            .expect_err("409");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(body.0.message.to_lowercase().contains("drain"));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_dead_node_and_reports_true() {
+        let now = now_ms();
+        let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
+        nodes::upsert(meta.pool(), "gone", "a", None, "dead", now)
+            .await
+            .unwrap();
+        let Json(resp) = delete_node(Some(Extension(meta.clone())), Path("gone".into()))
+            .await
+            .expect("ok");
+        assert_eq!(resp.node_id, "gone");
+        assert!(resp.removed);
+        assert!(nodes::get(meta.pool(), "gone").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_reports_false_when_id_unknown() {
+        let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
+        let Json(resp) = delete_node(Some(Extension(meta)), Path("ghost".into()))
+            .await
+            .expect("ok");
+        // The path is idempotent: removing an id that was never
+        // in the table is success with removed=false, not an
+        // error. Matches the spirit of DELETE.
+        assert!(!resp.removed);
+    }
+
+    #[tokio::test]
+    async fn delete_allows_draining_and_leaving_and_dead() {
+        // The conflict check only fires on state='alive'. Every
+        // other state is fair game for manual eviction.
+        let now = now_ms();
+        for state in ["draining", "leaving", "dead"] {
+            let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
+            nodes::upsert(meta.pool(), "n", "addr", None, state, now)
+                .await
+                .unwrap();
+            let Json(resp) = delete_node(Some(Extension(meta)), Path("n".into()))
+                .await
+                .unwrap_or_else(|_| panic!("delete should succeed for state={state}"));
+            assert!(resp.removed, "state={state} → should report removed=true");
+        }
     }
 
     #[tokio::test]

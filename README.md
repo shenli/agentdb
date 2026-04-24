@@ -208,6 +208,9 @@ contract.
 | `AGENTDB_META_BACKEND` | `sqlite` | `sqlite` (default) or `postgres`. Selects the meta-store dialect |
 | `AGENTDB_META_PATH` | `meta.sqlite` | SQLite file path (ignored on postgres) |
 | `AGENTDB_META_URL` | — | Required when `AGENTDB_META_BACKEND=postgres` (`postgres://user:pw@host/db`) |
+| `AGENTDB_NODE_REAPER_TICK_SECS` | `10` | How often the leader scans `nodes` for failure + GC |
+| `AGENTDB_NODE_DEAD_AFTER_SECS` | `30` | Stale `alive` rows older than this flip to `dead` |
+| `AGENTDB_NODE_GC_AFTER_SECS` | `3600` | `dead` rows older than this are removed from `nodes` |
 
 AWS creds use the standard env chain (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).

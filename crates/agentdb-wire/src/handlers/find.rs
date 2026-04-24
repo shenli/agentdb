@@ -11,6 +11,7 @@ use crate::handlers::filter::Filter;
 /// `raw: true` returns un-folded events (corrections +
 /// tombstones visible). Default is `false` so clients that
 /// wrote via `update` / `delete` see the post-mutation view.
+#[allow(clippy::too_many_arguments)]
 pub async fn find_response(
     registry: &BoxRegistry,
     tenants: &TenantRegistry,
@@ -187,7 +188,7 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let mut out = s[..max].to_string();
-        out.push_str("…");
+        out.push('…');
         out
     }
 }

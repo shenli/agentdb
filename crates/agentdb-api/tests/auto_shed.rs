@@ -209,7 +209,7 @@ async fn auto_shed_respects_cooldown() {
     // next eligible at ~900ms; so in a 1200ms window we
     // expect 2 fires at most (maybe 3 if timing is tight).
     assert!(
-        fires >= 1 && fires <= 4,
+        (1..=4).contains(&fires),
         "auto-shed fires should be bounded by cooldown; got {fires}"
     );
 }

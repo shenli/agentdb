@@ -215,6 +215,7 @@ impl SlowQueryBuffer {
     ///
     /// `build_detail` is invoked lazily so callers only pay for
     /// building the detail string on the slow path.
+    #[allow(clippy::too_many_arguments)]
     pub fn maybe_record<F: FnOnce() -> String>(
         &self,
         kind: SlowQueryKind,

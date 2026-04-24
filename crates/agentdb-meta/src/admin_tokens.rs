@@ -38,6 +38,7 @@ pub const TOKEN_BYTES: usize = 32;
     Copy,
     PartialEq,
     Eq,
+    Default,
     serde::Serialize,
     serde::Deserialize,
     utoipa::ToSchema,
@@ -45,6 +46,7 @@ pub const TOKEN_BYTES: usize = 32;
 #[serde(rename_all = "snake_case")]
 pub enum AdminScope {
     /// Full access: every `/api/admin/*` endpoint, any method.
+    #[default]
     Admin,
     /// Read-only: only `GET` against `/api/admin/*`. Mutations
     /// (POST/PUT/DELETE) return 403.
@@ -68,12 +70,6 @@ impl AdminScope {
             "readonly" => AdminScope::Readonly,
             _ => AdminScope::Admin,
         }
-    }
-}
-
-impl Default for AdminScope {
-    fn default() -> Self {
-        AdminScope::Admin
     }
 }
 
