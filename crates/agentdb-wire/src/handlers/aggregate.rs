@@ -169,8 +169,8 @@ pub async fn aggregate_response(
     // every hit's full session log — deferred.
     hits.retain(|h| {
         let p = &h.event.payload;
-        !p.get(agentdb_core::UPDATE_OF_MARKER).is_some()
-            && !p.get(agentdb_core::TOMBSTONE_OF_MARKER).is_some()
+        p.get(agentdb_core::UPDATE_OF_MARKER).is_none()
+            && p.get(agentdb_core::TOMBSTONE_OF_MARKER).is_none()
     });
 
     if let Some(limit) = post_limit {

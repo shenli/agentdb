@@ -126,6 +126,63 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Node>> {
         .collect())
 }
 
+/// Flip `state` from `alive` to `dead` for every node whose last
+/// heartbeat is older than `deadline_ms`. Returns the list of
+/// node ids that were transitioned this call (empty when nothing
+/// was stale). Idempotent: a row already at `dead`/`leaving`/`gc`
+/// is left alone.
+///
+/// Used by the leader-owned failure detector in agentdb-core to
+/// surface membership changes. `last_heartbeat_ms` is NOT
+/// touched — we want the original timestamp preserved so GC and
+/// observability can see how long the node has been gone.
+pub async fn mark_dead_if_stale(
+    pool: &AnyPool,
+    deadline_ms: i64,
+) -> MetaResult<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "UPDATE nodes SET state = 'dead' \
+           WHERE state = 'alive' AND last_heartbeat_ms < ? \
+         RETURNING node_id",
+    )
+    .bind(deadline_ms)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
+}
+
+/// Delete every row whose `state = 'dead'` and whose last
+/// heartbeat is older than `gc_deadline_ms`. Returns the removed
+/// node ids. Idempotent across ticks — a row is gone on the
+/// second call, so the RETURNING set is empty.
+///
+/// The GC threshold should be much larger than the dead-detection
+/// threshold so operators have time to observe, debug, or recover
+/// a node before it disappears from the control-plane.
+pub async fn gc_dead(pool: &AnyPool, gc_deadline_ms: i64) -> MetaResult<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "DELETE FROM nodes \
+           WHERE state = 'dead' AND last_heartbeat_ms < ? \
+         RETURNING node_id",
+    )
+    .bind(gc_deadline_ms)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(n,)| n).collect())
+}
+
+/// Drop a specific node row. Returns `true` when a row was
+/// removed, `false` when the id wasn't present. Used by the
+/// `DELETE /api/admin/nodes/:id` operator-recovery path.
+pub async fn remove(pool: &AnyPool, node_id: &str) -> MetaResult<bool> {
+    let rows = sqlx::query("DELETE FROM nodes WHERE node_id = ?")
+        .bind(node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows > 0)
+}
+
 /// Nodes whose last heartbeat is older than `threshold_ms`. Used by
 /// the scheduler to detect dead nodes and start failover.
 pub async fn stale(pool: &AnyPool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
@@ -243,5 +300,85 @@ mod tests {
         let s = stale(&p, 500).await.unwrap();
         let ids: Vec<_> = s.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(ids, ["dead"]);
+    }
+
+    #[tokio::test]
+    async fn mark_dead_if_stale_transitions_and_reports() {
+        let p = pool().await;
+        upsert(&p, "fresh", "a", None, "alive", 1000).await.unwrap();
+        upsert(&p, "gone-1", "b", None, "alive", 100).await.unwrap();
+        upsert(&p, "gone-2", "c", None, "alive", 120).await.unwrap();
+        // deadline 500 → both gone-1/gone-2 flip; fresh stays alive.
+        let mut changed = mark_dead_if_stale(&p, 500).await.unwrap();
+        changed.sort();
+        assert_eq!(changed, vec!["gone-1", "gone-2"]);
+
+        assert_eq!(get(&p, "fresh").await.unwrap().unwrap().state, "alive");
+        assert_eq!(get(&p, "gone-1").await.unwrap().unwrap().state, "dead");
+        // Heartbeat timestamp is preserved so GC + operators can
+        // tell how long the node has been gone.
+        assert_eq!(get(&p, "gone-1").await.unwrap().unwrap().last_heartbeat_ms, 100);
+
+        // Idempotent: a second call returns an empty list because
+        // the stale rows are now state='dead' and the predicate
+        // only fires on state='alive'.
+        let again = mark_dead_if_stale(&p, 500).await.unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_dead_if_stale_ignores_non_alive_states() {
+        let p = pool().await;
+        upsert(&p, "leaving", "a", None, "leaving", 100).await.unwrap();
+        upsert(&p, "draining", "b", None, "draining", 100).await.unwrap();
+        let changed = mark_dead_if_stale(&p, 500).await.unwrap();
+        assert!(
+            changed.is_empty(),
+            "only state='alive' rows should transition; got {changed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_dead_removes_long_gone_rows_only() {
+        let p = pool().await;
+        // Three dead rows with different ages, plus one alive.
+        upsert(&p, "just-died", "a", None, "alive", 500).await.unwrap();
+        upsert(&p, "ancient", "b", None, "alive", 10).await.unwrap();
+        upsert(&p, "alive", "c", None, "alive", 1000).await.unwrap();
+        mark_dead_if_stale(&p, 900).await.unwrap();
+
+        // GC with a 100 deadline: "ancient" (hb=10) and
+        // "just-died" (hb=500) both qualify. But we want only
+        // ancient to drop, so set threshold between them.
+        let removed = gc_dead(&p, 100).await.unwrap();
+        assert_eq!(removed, vec!["ancient"]);
+        assert!(get(&p, "just-died").await.unwrap().is_some());
+        assert!(get(&p, "alive").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn gc_dead_skips_alive_and_leaving_rows() {
+        // Paranoia: even with an absurdly aggressive gc_deadline
+        // that would cover every timestamp in the table, rows
+        // whose state != 'dead' must be left alone.
+        let p = pool().await;
+        upsert(&p, "alive", "a", None, "alive", 10).await.unwrap();
+        upsert(&p, "leaving", "b", None, "leaving", 10).await.unwrap();
+        let removed = gc_dead(&p, i64::MAX).await.unwrap();
+        assert!(removed.is_empty());
+        assert!(get(&p, "alive").await.unwrap().is_some());
+        assert!(get(&p, "leaving").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_reports_whether_row_existed() {
+        let p = pool().await;
+        upsert(&p, "node-a", "a", None, "alive", 100).await.unwrap();
+        assert!(remove(&p, "node-a").await.unwrap());
+        assert!(get(&p, "node-a").await.unwrap().is_none());
+        // Second remove returns false — already gone.
+        assert!(!remove(&p, "node-a").await.unwrap());
+        // Removing a never-existed id also reports false.
+        assert!(!remove(&p, "ghost").await.unwrap());
     }
 }

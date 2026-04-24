@@ -548,6 +548,57 @@
         }
       }
     },
+    "/api/admin/nodes/{node_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_node",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "description": "Node id to evict",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Row removed (or already absent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteNodeResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Node is still state='alive'; drain it first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteNodeError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Control plane not configured on this process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteNodeError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/reload": {
       "post": {
         "tags": [
@@ -2084,6 +2135,33 @@
           }
         }
       },
+      "DeleteNodeError": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "DeleteNodeResponse": {
+        "type": "object",
+        "description": "Body shape for `DELETE /api/admin/nodes/:node_id` responses.\n`removed` is `true` when a row matching the path param existed\nbefore the call (so the operator sees the difference between\n\"id not in table\" and \"id was already removed in a previous\ncall\").",
+        "required": [
+          "node_id",
+          "removed"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "removed": {
+            "type": "boolean"
+          }
+        }
+      },
       "DrainStatus": {
         "type": "object",
         "required": [
@@ -3125,7 +3203,9 @@
           "this_node_id",
           "this_node_is_leader",
           "this_node_epoch",
-          "reassignments_total"
+          "reassignments_total",
+          "nodes_marked_dead_total",
+          "nodes_gc_removed_total"
         ],
         "properties": {
           "leader": {
@@ -3138,6 +3218,18 @@
                 "description": "Canonical leader row from the control plane. `None` means no\nleader has ever been elected on this cluster."
               }
             ]
+          },
+          "nodes_gc_removed_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total long-dead node rows this process has GC'd from the\nmeta table as leader.",
+            "minimum": 0
+          },
+          "nodes_marked_dead_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total `alive -> dead` node transitions this process has\nperformed as leader. Same leader-gated semantics as\n`reassignments_total`.",
+            "minimum": 0
           },
           "reassignments_total": {
             "type": "integer",

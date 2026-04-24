@@ -12,8 +12,8 @@ use std::time::Duration;
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
-    LifecycleConfig, LifecycleEngine, ReaperConfig, SegmentGc, SegmentGcConfig, SessionRegistry,
-    StaleTabletReaper, TenantRegistry,
+    LifecycleConfig, LifecycleEngine, NodeReaper, NodeReaperConfig, ReaperConfig, SegmentGc,
+    SegmentGcConfig, SessionRegistry, StaleTabletReaper, TenantRegistry,
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
@@ -745,6 +745,64 @@ pub async fn run(
         "stale-lease tablet reaper started"
     );
 
+    // Node-lifecycle reaper. Leader-owned: flips stale `alive`
+    // rows to `dead` and GCs rows that have been `dead` long
+    // enough. Paired with the graceful-shutdown hook below —
+    // together they keep the `nodes` table honest across crashes
+    // and clean restarts.
+    let node_reaper_cfg = NodeReaperConfig::from_env();
+    let node_reaper = NodeReaper::start(meta.clone(), election.clone(), node_reaper_cfg);
+    tracing::info!(
+        tick_secs = node_reaper_cfg.tick.as_secs(),
+        dead_after_secs = node_reaper_cfg.dead_after.as_secs(),
+        gc_after_secs = node_reaper_cfg.gc_after.as_secs(),
+        "node-lifecycle reaper started"
+    );
+
+    // Change-notifier: when the meta store signals a change to
+    // the `nodes` or `shards` tables (pg_notify on Postgres; inert
+    // on SQLite), force-refresh the in-memory caches instead of
+    // waiting for the next periodic tick. Reduces cross-node
+    // routing staleness after failover or shard rebalance from
+    // seconds to ~tens of milliseconds.
+    {
+        use agentdb_meta::change_notifier::{subscribe, Channel};
+        let mut rx = subscribe(&meta, &[Channel::Nodes, Channel::Shards]);
+        let node_proxy = node_address_proxy.clone();
+        let loc_proxy = location_proxy.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event.channel {
+                    Channel::Nodes => {
+                        if let Err(err) = node_proxy.refresh().await {
+                            tracing::warn!(
+                                %err,
+                                payload = %event.payload,
+                                "nodes-change refresh failed"
+                            );
+                        }
+                    }
+                    Channel::Shards => {
+                        if let Err(err) = loc_proxy.refresh().await {
+                            tracing::warn!(
+                                %err,
+                                payload = %event.payload,
+                                "shards-change refresh failed"
+                            );
+                        }
+                    }
+                    Channel::Tablets => {
+                        // No dedicated cache for tablets today —
+                        // NodeAddressProxy already joins tablets×nodes,
+                        // so any tablet ownership change also lands as
+                        // a Nodes-channel event (via the reaper's
+                        // follow-up writes). No-op.
+                    }
+                }
+            }
+        });
+    }
+
     // M25 hot-tablet detector. Runs on the scheduler leader;
     // followers report an empty hot set. Admin endpoints read
     // the detector's in-memory snapshot.
@@ -1032,6 +1090,7 @@ pub async fn run(
         .layer(axum::Extension(meta.clone()))
         .layer(axum::Extension(election.clone()))
         .layer(axum::Extension(reaper.clone()))
+        .layer(axum::Extension(node_reaper.clone()))
         .layer(axum::Extension(hot_detector.clone()))
         .layer(axum::Extension(location_proxy.clone()))
         .layer(axum::Extension(reload_handle));
@@ -1086,9 +1145,64 @@ pub async fn run(
         })
     };
 
+    // Shutdown: on SIGTERM/SIGINT, flip our own nodes row to
+    // `state='leaving'` before the process exits. Peers that
+    // cache node addresses invalidate immediately on the
+    // change_notifier signal (Postgres) or on their next
+    // periodic refresh (SQLite), so they route around us
+    // without waiting for the heartbeat-stale timeout.
+    let graceful = graceful_shutdown_signal();
+    tokio::pin!(graceful);
+
     tokio::select! {
         r = http_task => r.context("http task join")??,
         r = mongo_task => r.context("mongo task join")??,
+        sig = &mut graceful => {
+            tracing::info!(signal = sig, "shutdown signal received; marking node as leaving");
+            if let Err(err) =
+                agentdb_meta::nodes::set_state(meta.pool(), &cfg.node_id, "leaving", now_ms_i64())
+                    .await
+            {
+                tracing::warn!(
+                    %err,
+                    node_id = %cfg.node_id,
+                    "failed to mark node as leaving on shutdown"
+                );
+            } else {
+                tracing::info!(node_id = %cfg.node_id, "node marked as leaving");
+            }
+        }
     };
     Ok(())
+}
+
+/// Wait for SIGTERM or SIGINT and return the signal name.
+/// Resolves the first of the two to fire. Used to drive the
+/// graceful-shutdown path without hooking the whole tower
+/// middleware stack.
+async fn graceful_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return "sigterm-install-failed",
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return "sigint-install-failed",
+        };
+        tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-unix platforms: Ctrl+C is the only widely
+        // supported portable signal. Treat it the same as
+        // SIGINT on the unix path.
+        let _ = tokio::signal::ctrl_c().await;
+        "CTRL_C"
+    }
 }

@@ -97,7 +97,7 @@ pub async fn handle_sasl_start(
 
     // Build server-first: "r=<nonce>,s=<salt>,i=<iter>".
     let server_nonce_raw = random_nonce_raw();
-    let server_nonce = B64.encode(&server_nonce_raw);
+    let server_nonce = B64.encode(server_nonce_raw);
     let combined_nonce = format!("{}{}", parsed.client_nonce, server_nonce);
     let salt_b64 = B64.encode(&user.credentials.salt);
     let server_first = format!(

@@ -119,6 +119,7 @@ impl AppState {
         admin_drain::get_drain,
         admin_drain::post_drain,
         admin_nodes::list_nodes,
+        admin_nodes::delete_node,
         admin_scheduler::get_scheduler,
         admin_sessions::get_session,
         admin_sessions::migrate_session,
@@ -169,6 +170,8 @@ impl AppState {
         admin_drain::DrainUnavailable,
         admin_nodes::NodeView,
         admin_nodes::NodesUnavailable,
+        admin_nodes::DeleteNodeResponse,
+        admin_nodes::DeleteNodeError,
         admin_scheduler::LeaderView,
         admin_scheduler::SchedulerStatus,
         admin_scheduler::SchedulerUnavailable,
@@ -284,6 +287,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/nodes",
             axum::routing::get(admin_nodes::list_nodes),
+        )
+        .route(
+            "/api/admin/nodes/:node_id",
+            axum::routing::delete(admin_nodes::delete_node),
         )
         .route(
             "/api/admin/drain",

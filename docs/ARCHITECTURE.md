@@ -673,13 +673,72 @@ renewal window is tolerable. Writers check `is_live()` on every
 request — a stale lease returns `Error::LeaseLost` immediately,
 which surfaces as HTTP 503 `code: "lease_lost"` with a doc_url.
 
-### Node heartbeat + staleness (M22 piece 1)
+### Node lifecycle
 
-`agentdb_meta::nodes::upsert` on boot; `heartbeat` every
-`AGENTDB_HEARTBEAT_SECS` (default 5s). The
-`/api/admin/nodes?stale_threshold_ms=N` endpoint flags rows whose
-`last_heartbeat_ms` is older than the threshold — operators see
-stale nodes without needing a separate probe.
+Rows in `nodes` walk a small state machine managed jointly by
+each node's own heartbeat loop and the leader-owned
+`NodeReaper`:
+
+```
+boot                                shutdown (SIGTERM/SIGINT)
+  │                                        │
+  v                                        v
+ alive ───heartbeat stale────> dead ──gc_after──> removed
+  │                                  ^             (row gone)
+  │   drain (op cmd)                 │
+  └─────> draining ────stop heartbeat──┘
+  │
+  └─────> leaving ─────────────────────┘
+          (graceful shutdown)
+```
+
+- **Registration.** Every `agentdb serve` process calls
+  `agentdb_meta::nodes::upsert` on boot with
+  `state = "alive"`, advertising both its REST address and
+  (optionally) its Mongo wire listener address for cross-node
+  forwarding.
+- **Heartbeat.** A background tokio task calls
+  `agentdb_meta::nodes::heartbeat` every
+  `AGENTDB_HEARTBEAT_SECS` (default 5s) to bump
+  `last_heartbeat_ms`. Transient meta errors are logged and
+  retried on the next tick; they don't abort the loop.
+- **Failure detection.** The scheduler leader runs
+  `NodeReaper` (`AGENTDB_NODE_REAPER_TICK_SECS`, default 10s).
+  On each tick it flips every `state = 'alive'` row whose
+  `last_heartbeat_ms` is older than
+  `AGENTDB_NODE_DEAD_AFTER_SECS` (default 30s) to
+  `state = 'dead'`. The original heartbeat timestamp is
+  preserved so operators can see how long the node has been
+  gone and the GC pass can use it as an age signal.
+- **Dead-row GC.** The same tick also removes any
+  `state = 'dead'` row whose `last_heartbeat_ms` is older than
+  `AGENTDB_NODE_GC_AFTER_SECS` (default 3600s). Keeps the
+  `nodes` table bounded across deployments without letting dead
+  rows vanish before an operator has a chance to see them.
+- **Graceful shutdown.** On SIGTERM / SIGINT the server flips
+  its own row to `state = 'leaving'` before exiting. Peers
+  that hold a cached `NodeAddressProxy` invalidate on the next
+  `pg_notify` delivery (Postgres) or next periodic refresh
+  (SQLite), so cross-node writes route around a shutting-down
+  node immediately instead of waiting for heartbeat-stale
+  detection.
+- **Change propagation.** The migration-009 `pg_notify`
+  triggers on `nodes`/`shards`/`tablets` drive an
+  `agentdb_meta::change_notifier` stream subscribed on each
+  node. On every `Channel::Nodes` event, `NodeAddressProxy`
+  force-refreshes its cache. On SQLite the stream is inert —
+  the periodic refresh loops cover correctness.
+- **Operator eviction.** `DELETE /api/admin/nodes/{id}` drops
+  a row manually. Returns HTTP 409 on still-alive rows (drain
+  first); otherwise it's idempotent (removing an unknown id
+  returns `removed: false` with 200).
+
+The `/api/admin/nodes?stale_threshold_ms=N` endpoint still
+surfaces `is_stale` as a computed flag for short-lived
+monitoring probes — that's independent of the state-machine
+transitions above. `/api/admin/scheduler` reports
+`nodes_marked_dead_total` + `nodes_gc_removed_total` from the
+current leader's `NodeReaper`.
 
 ### Scheduler election (M22 piece 2)
 

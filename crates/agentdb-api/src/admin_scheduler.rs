@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdb_core::{LeaderElection, StaleTabletReaper};
+use agentdb_core::{LeaderElection, NodeReaper, StaleTabletReaper};
 use agentdb_meta::{scheduler as meta_scheduler, MetaStore};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -57,6 +57,13 @@ pub struct SchedulerStatus {
     /// this process is the leader — followers report 0 even if
     /// another node in the cluster has reaped many leases.
     pub reassignments_total: u64,
+    /// Total `alive -> dead` node transitions this process has
+    /// performed as leader. Same leader-gated semantics as
+    /// `reassignments_total`.
+    pub nodes_marked_dead_total: u64,
+    /// Total long-dead node rows this process has GC'd from the
+    /// meta table as leader.
+    pub nodes_gc_removed_total: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -77,6 +84,7 @@ pub async fn get_scheduler(
     meta: Option<Extension<Arc<MetaStore>>>,
     election: Option<Extension<Arc<LeaderElection>>>,
     reaper: Option<Extension<Arc<StaleTabletReaper>>>,
+    node_reaper: Option<Extension<Arc<NodeReaper>>>,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<SchedulerUnavailable>)> {
     let Some(Extension(meta)) = meta else {
         return Err((
@@ -120,12 +128,18 @@ pub async fn get_scheduler(
         .as_ref()
         .map(|Extension(r)| r.reassignments_total())
         .unwrap_or(0);
+    let (nodes_marked_dead_total, nodes_gc_removed_total) = node_reaper
+        .as_ref()
+        .map(|Extension(r)| (r.marked_dead_total(), r.gc_removed_total()))
+        .unwrap_or((0, 0));
     Ok(Json(SchedulerStatus {
         this_node_id: election.node_id().to_string(),
         this_node_is_leader: election.is_leader(),
         this_node_epoch: election.current_epoch(),
         leader,
         reassignments_total,
+        nodes_marked_dead_total,
+        nodes_gc_removed_total,
     }))
 }
 
@@ -144,7 +158,9 @@ mod tests {
 
     #[tokio::test]
     async fn returns_503_when_meta_extension_is_absent() {
-        let (code, body) = get_scheduler(None, None, None).await.expect_err("503");
+        let (code, body) = get_scheduler(None, None, None, None)
+            .await
+            .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.0.message.contains("meta store"));
     }
@@ -152,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn returns_503_when_election_extension_is_absent() {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        let (code, body) = get_scheduler(Some(Extension(meta)), None, None)
+        let (code, body) = get_scheduler(Some(Extension(meta)), None, None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -179,6 +195,7 @@ mod tests {
             Some(Extension(meta.clone())),
             Some(Extension(election.clone())),
             None, // no reaper in this test — counter reports 0
+            None, // no node_reaper either
         )
         .await
         .expect("200");
@@ -190,6 +207,8 @@ mod tests {
             status.reassignments_total, 0,
             "no reaper wired → counter is zero"
         );
+        assert_eq!(status.nodes_marked_dead_total, 0);
+        assert_eq!(status.nodes_gc_removed_total, 0);
         let leader = status.leader.expect("leader row present");
         assert_eq!(leader.node_id, "test-node");
         assert!(leader.is_live);
@@ -231,12 +250,76 @@ mod tests {
             Some(Extension(meta.clone())),
             Some(Extension(election.clone())),
             Some(Extension(reaper.clone())),
+            None,
         )
         .await
         .expect("200");
         assert!(
             status.reassignments_total >= 1,
             "reaper counter should reflect the cleared-stale row"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_reaper_counters_reflect_marked_and_gc_totals() {
+        // Seed a stale node + a long-dead-already row so the node
+        // reaper has one of each on its first on-leader tick.
+        use agentdb_core::{NodeReaper, NodeReaperConfig};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+        let meta = Arc::new(MetaStore::open_sqlite(&path).await.unwrap());
+        // "stale" is alive but hb is decades-stale (real-time "now"
+        // is definitely > 1000 + 1ms dead_after so it'll flip).
+        agentdb_meta::nodes::upsert(meta.pool(), "stale", "a", None, "alive", 1_000)
+            .await
+            .unwrap();
+        // Pre-flip "ancient" so GC has a candidate without a wait.
+        agentdb_meta::nodes::upsert(meta.pool(), "ancient", "b", None, "alive", 0)
+            .await
+            .unwrap();
+        agentdb_meta::nodes::mark_dead_if_stale(meta.pool(), 50)
+            .await
+            .unwrap();
+
+        let cfg = LeaderElectionConfig {
+            lease_duration: Duration::from_secs(10),
+            renew_interval: Duration::from_millis(100),
+            attempt_interval: Duration::from_millis(50),
+        };
+        let election = LeaderElection::start(meta.clone(), "solo".into(), cfg);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(election.is_leader());
+
+        let node_reaper = NodeReaper::start(
+            meta.clone(),
+            election.clone(),
+            NodeReaperConfig {
+                tick: Duration::from_millis(100),
+                dead_after: Duration::from_millis(1),
+                // Aggressive GC — "ancient" (hb=0) is millennia
+                // old on the wall clock, so it qualifies.
+                gc_after: Duration::from_millis(1),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let Json(status) = get_scheduler(
+            Some(Extension(meta)),
+            Some(Extension(election)),
+            None,
+            Some(Extension(node_reaper)),
+        )
+        .await
+        .expect("200");
+        assert!(
+            status.nodes_marked_dead_total >= 1,
+            "stale row should have been flipped to dead at least once, got {}",
+            status.nodes_marked_dead_total
+        );
+        assert!(
+            status.nodes_gc_removed_total >= 1,
+            "pre-dead row should have been GC'd at least once, got {}",
+            status.nodes_gc_removed_total
         );
     }
 }
