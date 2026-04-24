@@ -400,8 +400,9 @@ M18+ milestones added:
   targeting a session on a peer get `code: 10107
   NotWritablePrimary` with the owner's address so they can
   reconnect, but there's no server-side proxy. Binary
-  stateful protocol (SASL state doesn't transfer); separate
-  PR.
+  stateful protocol (SASL state doesn't transfer); this is
+  the single largest remaining v2 gap — flagged in
+  `docs/superpowers/plans/2026-04-23-m20-cross-node-forwarding.md`.
 - **Tenant-wide reads.** `find` without a session filter,
   `listDatabases`, `listCollections` still route by tenant
   hash. An override moves one session, not the whole tenant.
@@ -412,34 +413,27 @@ M18+ milestones added:
 - **Automatic data handoff on shed.** `shed` moves future
   routing; operators call `migrate-session` per affected
   session to move the already-written events. Coupling the
-  two (so `shed` also migrates every session on the moved
-  shards) is future work.
+  two is future work.
 - **Cross-node / cold-session handoff.** `migrate-session`
   is warm-only and intra-process (shared KV). Cross-node
   would need snapshot shipping; cold/archive needs
   object-store path rewrites.
-- **Admin-plane mTLS / scoped tokens.** Bearer-token auth
-  ships; every token has full admin access today. Scoped
-  ("read-only", "shed-only") tokens and mTLS-based admin
-  auth are future work.
-- **Mongo wire TLS.** REST TLS ships; the Mongo listener
-  stays plaintext for now. Cross-node Mongo requires the
-  same + an inter-node trust model.
-- **Admin-plane mTLS / cert-based auth.** Bearer tokens
-  handle admin auth today; mTLS is a follow-up.
-- **M22 sophisticated policy** — cross-AZ preference, anti-
-  affinity, node-weight awareness. Current reassignment is
-  round-robin across live tablets.
+- **Admin-plane mTLS.** Bearer-token auth + RBAC scopes
+  ship; mTLS-based admin auth is a follow-up.
+- **M22 sophisticated placement policy** — cross-AZ
+  preference, anti-affinity, node-weight awareness.
+  Current reassignment is round-robin across live
+  tablets.
 - **Cross-node `create-tablet`.** The admin endpoint
   creates the tablet on the node receiving the call. To
   spawn a tablet on a different node, post to that node's
-  admin URL. Automatic placement (e.g. "put the new
-  tablet wherever load is lowest") is future work.
+  admin URL. Automatic placement is future work.
 - **Tablet deletion / shrink.** Once created, a tablet
   stays. Shrinking requires data migration.
-- **Cross-box (distributed) transactions** — design is single-box
-  2PC-free.
-- **Real ANN at 100M+ vectors** — HNSW is single-node, in-process.
+- **Cross-box (distributed) transactions** — design is
+  single-box, 2PC-free.
+- **Real ANN at 100M+ vectors** — HNSW is single-node,
+  in-process.
 - **LLM / embedding generation** — caller's responsibility;
   webhook signal only.
 

@@ -1,6 +1,35 @@
 # AgentDB v2 — Implementation Plan
 
 **Date:** 2026-04-21
+**Status (2026-04-24):** substantially complete. M14 (HLC), M15
+(observability + agent schema), M16 (persistent indexing), M17
+(archive reads), M18 (control-plane meta store — SQLite-only by
+decision), M19 (SCRAM + tenant-implicit API), M20 (shard/tablet
+routing + Location Proxy), M21 (lease + fencing), M22 (scheduler
++ drain + stale-lease reaper), M23 (per-session locking +
+admission), M24 (fanout + over-fetch), M25 (hot-tablet detect +
+shed + dynamic tablet create), M26 (deployment modes: `--dev`,
+docker-compose, Helm skeleton), and M27 (operational surface:
+/health, admin CLI, error codes + doc URLs, runbooks) all land in
+the prototype. Additional post-v2 hardening shipped along the way:
+REST + Mongo TLS, admin audit log, per-tenant rate limits,
+slow-query log, point-in-time backup + scheduler + retention,
+admin-token RBAC scopes, tabbed dashboard, hot-reload,
+Mongo update/delete, and materialized (folded) reads.
+
+**Single remaining v2 gap:** cross-node Mongo wire forwarding.
+Tracked in `2026-04-23-m20-cross-node-forwarding.md`. Clients
+targeting a session on a peer node receive
+`code: 10107 NotWritablePrimary` with the owner's address so
+they can reconnect; a server-side forwarding proxy is deferred
+because the Mongo wire protocol is binary + stateful (SASL
+session, cursor continuations) and each command needs a
+forwarding policy.
+
+Smaller explicit deferrals are captured in
+`README.md § Still out of scope` — those stay tracked for
+operator visibility rather than becoming invisible tech debt.
+
 **Source of truth for design:** [`docs/agent-db-v2.md`](../../agent-db-v2.md)
 **Supporting notes:**
 - [`notes/2026-04-20-placement-unit-review-response.md`](../notes/2026-04-20-placement-unit-review-response.md)

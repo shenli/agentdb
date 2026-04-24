@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "agentdb.fullname" . }}
+  labels:
+    app.kubernetes.io/name: agentdb
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  serviceName: {{ include "agentdb.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentdb
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentdb
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: agentdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+          ports:
+            - name: rest
+              containerPort: {{ .Values.service.restPort }}
+            - name: mongo
+              containerPort: {{ .Values.service.mongoPort }}
+          env:
+            - name: AGENTDB_HTTP_ADDR
+              value: "0.0.0.0:{{ .Values.service.restPort }}"
+            - name: AGENTDB_MONGO_ADDR
+              value: "0.0.0.0:{{ .Values.service.mongoPort }}"
+            - name: AGENTDB_DATA_DIR
+              value: /data
+            {{- if .Values.admin.requireAuth }}
+            - name: AGENTDB_REQUIRE_ADMIN_AUTH
+              value: "true"
+            {{- end }}
+            {{- if .Values.backup.enabled }}
+            - name: AGENTDB_BACKUP_INTERVAL_SECS
+              value: "{{ .Values.backup.intervalSeconds }}"
+            - name: AGENTDB_BACKUP_DIR
+              value: "{{ .Values.backup.path }}"
+            - name: AGENTDB_BACKUP_RETAIN
+              value: "{{ .Values.backup.retain }}"
+            {{- end }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: "{{ $v }}"
+            {{- end }}
+            {{- range $k, $v := .Values.secretEnv }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $v.secretName }}
+                  key: {{ $v.key }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: rest
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: rest
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.backup.enabled }}
+            - name: backups
+              mountPath: {{ .Values.backup.path }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/agentdb/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if .Values.backup.enabled }}
+        - name: backups
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

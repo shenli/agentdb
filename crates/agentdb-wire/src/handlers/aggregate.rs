@@ -156,6 +156,23 @@ pub async fn aggregate_response(
         .await?;
     let mut hits = out.hits;
 
+    // Materialized view, aggregate edition. Drop hits whose
+    // underlying event is itself an update/tombstone marker
+    // so a search for "status: shipped" doesn't return the
+    // correction event (which carries _update_of) as a
+    // separate row alongside the original it was updating.
+    //
+    // Limitation: this is a single-pass filter, not a full
+    // cross-reference fold. A hit on event N whose later
+    // tombstone doesn't itself match the search will still
+    // show up. Full reconciliation would require loading
+    // every hit's full session log — deferred.
+    hits.retain(|h| {
+        let p = &h.event.payload;
+        !p.get(agentdb_core::UPDATE_OF_MARKER).is_some()
+            && !p.get(agentdb_core::TOMBSTONE_OF_MARKER).is_some()
+    });
+
     if let Some(limit) = post_limit {
         let cap = if limit <= 0 {
             usize::MAX
