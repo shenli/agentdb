@@ -2,7 +2,7 @@
 //! (the string clients authenticate as) and the internal integer id
 //! used for routing and KV keys.
 
-use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
@@ -14,7 +14,7 @@ pub struct Tenant {
 }
 
 /// Lookup by external id. Returns `Ok(None)` if the tenant doesn't exist.
-pub async fn get_by_external(pool: &SqlitePool, external_id: &str) -> MetaResult<Option<Tenant>> {
+pub async fn get_by_external(pool: &AnyPool, external_id: &str) -> MetaResult<Option<Tenant>> {
     let row: Option<(i64, String, i64)> = sqlx::query_as(
         "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE external_id = ?",
     )
@@ -31,15 +31,19 @@ pub async fn get_by_external(pool: &SqlitePool, external_id: &str) -> MetaResult
 /// Create a new tenant. Errors with [`MetaError::Conflict`] if one
 /// already exists under this external id. Use [`get_or_create`] if you
 /// want idempotent creation.
-pub async fn create(pool: &SqlitePool, external_id: &str, now_ms: i64) -> MetaResult<Tenant> {
-    let result = sqlx::query("INSERT INTO tenants (external_id, created_at_ms) VALUES (?, ?)")
-        .bind(external_id)
-        .bind(now_ms)
-        .execute(pool)
-        .await;
+pub async fn create(pool: &AnyPool, external_id: &str, now_ms: i64) -> MetaResult<Tenant> {
+    // `RETURNING` works on SQLite (>=3.35) and Postgres —
+    // dialect-agnostic and avoids SQLite's
+    // `last_insert_rowid` (unsupported on AnyQueryResult).
+    let result: Result<(i64,), _> =
+        sqlx::query_as("INSERT INTO tenants (external_id, created_at_ms) VALUES (?, ?) RETURNING internal_id")
+            .bind(external_id)
+            .bind(now_ms)
+            .fetch_one(pool)
+            .await;
     match result {
-        Ok(res) => Ok(Tenant {
-            internal_id: res.last_insert_rowid(),
+        Ok((id,)) => Ok(Tenant {
+            internal_id: id,
             external_id: external_id.to_string(),
             created_at_ms: now_ms,
         }),
@@ -52,7 +56,7 @@ pub async fn create(pool: &SqlitePool, external_id: &str, now_ms: i64) -> MetaRe
 
 /// Idempotent: return the existing tenant or create a new one.
 pub async fn get_or_create(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     external_id: &str,
     now_ms: i64,
 ) -> MetaResult<Tenant> {
@@ -70,7 +74,7 @@ pub async fn get_or_create(
 }
 
 /// List all tenants, oldest first. Small helper for admin tooling.
-pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Tenant>> {
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Tenant>> {
     let rows: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT internal_id, external_id, created_at_ms FROM tenants ORDER BY internal_id",
     )
@@ -89,12 +93,9 @@ pub async fn list_all(pool: &SqlitePool) -> MetaResult<Vec<Tenant>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations;
 
-    async fn pool() -> SqlitePool {
-        let p = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        migrations::apply(&p).await.unwrap();
-        p
+    async fn pool() -> AnyPool {
+        crate::test_pool_sqlite_memory().await
     }
 
     #[tokio::test]

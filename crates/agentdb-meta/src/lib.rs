@@ -1,21 +1,24 @@
-//! Control-plane metadata store (M18).
+//! Control-plane metadata store.
 //!
-//! Houses the global metadata that every node in the cluster agrees
-//! on: tenants, shard assignment, tablets, nodes, config. See
-//! `docs/agent-db-v2.md` §3.3 ("Metadata storage — two layers") for
-//! the design rationale — this crate is Layer 1 (global control
-//! plane); Layer 2 (per-tablet metadata, dogfooded in AgentDB's own
-//! storage engine) is the existing `Box_` state.
+//! Dual-dialect. SQLite is the dev / single-node default;
+//! Postgres is the production target. `AGENTDB_META_BACKEND`
+//! selects at runtime:
 //!
-//! M18 lands the schema + migrations + minimal CRUD. Runtime
-//! consumers land in M19 onwards.
+//! - `AGENTDB_META_BACKEND=sqlite` (default) → file-backed
+//!   SQLite at `AGENTDB_META_PATH`.
+//! - `AGENTDB_META_BACKEND=postgres` → Postgres at
+//!   `AGENTDB_META_URL` (a `postgres://user:pw@host/db`
+//!   URL).
 //!
-//! Dialect: SQLite is primary for dev + CI. Postgres is the intended
-//! production target and is added via a feature flag in a follow-up
-//! PR (see the M18 plan doc).
+//! Internally every query runs through `sqlx::Any` which
+//! rewrites the `?` placeholders to `$N` for Postgres. The
+//! small number of truly dialect-specific SQL statements
+//! (migrations, `VACUUM INTO`, `pg_dump`) branch on the
+//! [`MetaBackend`] discriminant.
 
 pub mod admin_tokens;
 pub mod audit;
+pub mod change_notifier;
 pub mod config;
 pub mod error;
 pub mod migrations;
@@ -31,66 +34,244 @@ pub mod users;
 
 pub use error::{MetaError, MetaResult};
 
+use std::sync::Once;
+
+use sqlx::any::AnyPoolOptions;
+use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
+use sqlx::AnyPool;
+
+/// Which concrete backend the current store is running on.
+/// Callers that need dialect-specific SQL (migrations,
+/// `VACUUM INTO`, `pg_dump`) match on this discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaDialect {
+    Sqlite,
+    Postgres,
+}
+
+impl MetaDialect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetaDialect::Sqlite => "sqlite",
+            MetaDialect::Postgres => "postgres",
+        }
+    }
+}
 
 /// A pool-backed handle on the control-plane store.
+///
+/// The public pool API ([`MetaStore::pool`]) returns a
+/// `sqlx::AnyPool` — every runtime query in this crate (and
+/// in callers) uses it. Dialect-aware branches call
+/// [`MetaStore::dialect`].
+///
+/// Hold on to the underlying `SqlitePool` / `PgPool` separately
+/// for dialect-specific operations (migrations,
+/// `VACUUM INTO`, `LISTEN/NOTIFY`).
 #[derive(Clone)]
 pub struct MetaStore {
-    pool: SqlitePool,
+    any: AnyPool,
+    dialect: MetaDialect,
+    sqlite: Option<SqlitePool>,
+    postgres: Option<PgPool>,
+}
+
+fn install_any_drivers() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // sqlx's Any layer needs its drivers registered once
+        // per process; calling twice is a hard error.
+        sqlx::any::install_default_drivers();
+    });
+}
+
+/// Test-only: install drivers from a test that doesn't open
+/// a full `MetaStore`. Kept pub(crate) so external callers
+/// don't accidentally depend on it.
+#[doc(hidden)]
+pub fn install_any_drivers_for_tests() {
+    install_any_drivers();
+}
+
+/// Test-only: build a ready-to-use `AnyPool` against an
+/// in-memory SQLite DB with migrations applied. Caps the pool
+/// at a single connection so all queries share the one
+/// `:memory:` DB (each SQLite connection opened with
+/// `:memory:` gets its own private DB otherwise).
+#[doc(hidden)]
+pub async fn test_pool_sqlite_memory() -> sqlx::AnyPool {
+    install_any_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("open sqlite in-memory AnyPool");
+    migrations::apply(&pool, MetaDialect::Sqlite)
+        .await
+        .expect("apply migrations");
+    pool
 }
 
 impl MetaStore {
-    /// Open a store backed by a SQLite file at the given path. The
-    /// file is created if absent. Migrations run automatically on
-    /// open; repeat opens are idempotent.
+    /// Open a SQLite-backed store at `path`. Creates the file
+    /// if absent. Runs migrations on open.
     pub async fn open_sqlite(path: &str) -> MetaResult<Self> {
-        let url = if path == ":memory:" {
+        install_any_drivers();
+        let is_memory = path == ":memory:";
+        let url = if is_memory {
             "sqlite::memory:".to_string()
         } else {
             format!("sqlite://{path}?mode=rwc")
         };
-        let pool = SqlitePool::connect(&url).await?;
-        migrations::apply(&pool).await?;
-        Ok(Self { pool })
+        // Keep a dedicated SqlitePool for dialect-specific
+        // operations that bypass AnyPool (VACUUM INTO in
+        // backup(), for example).
+        let sqlite = SqlitePool::connect(&url).await?;
+        // For `:memory:` databases every connection gets its
+        // own private DB (see SQLite docs). Cap the AnyPool
+        // at a single connection so migrations + subsequent
+        // queries all hit the same in-memory DB — required for
+        // tests that open with `:memory:`.
+        let mut opts = AnyPoolOptions::new();
+        if is_memory {
+            opts = opts.max_connections(1);
+        }
+        let any = opts.connect(&url).await?;
+        migrations::apply(&any, MetaDialect::Sqlite).await?;
+        Ok(Self {
+            any,
+            dialect: MetaDialect::Sqlite,
+            sqlite: Some(sqlite),
+            postgres: None,
+        })
     }
 
-    /// The underlying pool. Exposed for integration with async code
-    /// that wants to share the connection pool (e.g., spawning its
-    /// own transactions).
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Open a Postgres-backed store at `url`. Expects a
+    /// `postgres://user:pass@host/db` URL. Migrations run on
+    /// open.
+    pub async fn open_postgres(url: &str) -> MetaResult<Self> {
+        install_any_drivers();
+        let postgres = PgPool::connect(url).await?;
+        let any = AnyPoolOptions::new().connect(url).await?;
+        migrations::apply(&any, MetaDialect::Postgres).await?;
+        Ok(Self {
+            any,
+            dialect: MetaDialect::Postgres,
+            sqlite: None,
+            postgres: Some(postgres),
+        })
     }
 
-    /// Snapshot the meta DB to `dest_path` using SQLite's
-    /// `VACUUM INTO`. Runs on a live pool — no drain required.
-    /// `dest_path` MUST NOT exist; SQLite refuses to overwrite.
+    /// Backend-aware open. Reads `AGENTDB_META_BACKEND` and
+    /// the matching URL / path env var.
+    pub async fn open_from_env() -> MetaResult<Self> {
+        let backend = std::env::var("AGENTDB_META_BACKEND")
+            .unwrap_or_else(|_| "sqlite".to_string())
+            .to_lowercase();
+        match backend.as_str() {
+            "sqlite" => {
+                let path = std::env::var("AGENTDB_META_PATH")
+                    .unwrap_or_else(|_| "meta.sqlite".into());
+                Self::open_sqlite(&path).await
+            }
+            "postgres" | "pg" => {
+                let url = std::env::var("AGENTDB_META_URL").map_err(|_| {
+                    MetaError::Migration(
+                        "AGENTDB_META_BACKEND=postgres requires AGENTDB_META_URL".into(),
+                    )
+                })?;
+                Self::open_postgres(&url).await
+            }
+            other => Err(MetaError::Migration(format!(
+                "unknown AGENTDB_META_BACKEND={other}; expected 'sqlite' or 'postgres'"
+            ))),
+        }
+    }
+
+    /// The generic pool every query runs through.
+    pub fn pool(&self) -> &AnyPool {
+        &self.any
+    }
+
+    pub fn dialect(&self) -> MetaDialect {
+        self.dialect
+    }
+
+    /// Native SQLite pool, if this store is SQLite-backed.
+    /// `None` on Postgres.
+    pub fn sqlite_pool(&self) -> Option<&SqlitePool> {
+        self.sqlite.as_ref()
+    }
+
+    /// Native Postgres pool, if this store is PG-backed.
+    /// `None` on SQLite. Callers that need LISTEN / NOTIFY
+    /// unwrap this.
+    pub fn postgres_pool(&self) -> Option<&PgPool> {
+        self.postgres.as_ref()
+    }
+
+    /// Snapshot the meta DB to `dest_path`.
     ///
-    /// The resulting file is a standalone SQLite database the
-    /// caller can open (including re-opening via
-    /// [`MetaStore::open_sqlite`]). `schema_migrations` rows
-    /// carry over so a restored server does not re-run already-
-    /// applied migrations.
+    /// SQLite backend: uses the native `VACUUM INTO` (live
+    /// snapshot, no drain). `dest_path` MUST NOT pre-exist.
+    ///
+    /// Postgres backend: shells out to `pg_dump`, writing a
+    /// plain-SQL file. The dump includes `COPY` rows for
+    /// every table — `psql <new-db> < dump.sql` restores.
+    /// Requires `pg_dump` in `$PATH`.
     pub async fn backup(&self, dest_path: &std::path::Path) -> MetaResult<()> {
-        // SQLite's VACUUM INTO accepts existing zero-byte files
-        // (per its docs). That's a surprising corner — operators
-        // who `touch backup.sqlite` and then run backup would get
-        // silent overwrite. Enforce the "MUST NOT exist" contract
-        // here so the stricter guarantee holds regardless of the
-        // underlying SQL's tolerance.
         if dest_path.exists() {
             return Err(MetaError::Migration(format!(
                 "meta backup destination already exists: {}",
                 dest_path.display()
             )));
         }
+        match self.dialect {
+            MetaDialect::Sqlite => self.backup_sqlite(dest_path).await,
+            MetaDialect::Postgres => self.backup_pg(dest_path).await,
+        }
+    }
+
+    async fn backup_sqlite(&self, dest_path: &std::path::Path) -> MetaResult<()> {
+        let sqlite = self.sqlite.as_ref().ok_or_else(|| {
+            MetaError::Migration("sqlite backend missing native pool".into())
+        })?;
         let dest_str = dest_path.to_string_lossy().to_string();
-        // VACUUM INTO doesn't accept bound parameters in SQLite.
-        // Escape single quotes manually — the path comes from an
-        // admin endpoint, so hardening it here is the lesser
-        // burden than teaching the caller to quote correctly.
         let escaped = dest_str.replace('\'', "''");
         let sql = format!("VACUUM INTO '{escaped}'");
-        sqlx::query(&sql).execute(&self.pool).await?;
+        sqlx::query(&sql).execute(sqlite).await?;
+        Ok(())
+    }
+
+    async fn backup_pg(&self, dest_path: &std::path::Path) -> MetaResult<()> {
+        // Pull the connection URL from env. pg_dump is a
+        // separate process that can't share the sqlx pool,
+        // so the operator provides credentials via env the
+        // same way.
+        let url = std::env::var("AGENTDB_META_URL").map_err(|_| {
+            MetaError::Migration(
+                "postgres backup needs AGENTDB_META_URL set in this process's env".into(),
+            )
+        })?;
+        let out = tokio::process::Command::new("pg_dump")
+            .arg("--no-owner")
+            .arg("--clean")
+            .arg("--if-exists")
+            .arg("--format=plain")
+            .arg("--file")
+            .arg(dest_path)
+            .arg(&url)
+            .output()
+            .await
+            .map_err(|e| MetaError::Migration(format!("pg_dump exec: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(MetaError::Migration(format!(
+                "pg_dump failed (status {:?}): {stderr}",
+                out.status.code()
+            )));
+        }
         Ok(())
     }
 }

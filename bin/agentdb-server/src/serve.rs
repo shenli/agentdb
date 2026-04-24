@@ -478,19 +478,36 @@ pub async fn run(
         Ok(other) => anyhow::bail!("unknown AGENTDB_KV_BACKEND={other}; expected rocksdb|slatedb"),
     };
 
-    // Control-plane meta store (M18). Defaults to a local SQLite file
-    // so `agentdb serve` with no config works. Postgres is not yet
-    // exposed via a constructor — follow-up PR.
-    if let Some(parent) = std::path::Path::new(&cfg.meta_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).context("create meta dir")?;
+    // Control-plane meta store. Defaults to SQLite at
+    // `cfg.meta_path` — matches the pre-v2 single-node
+    // behavior. Operators who set `AGENTDB_META_BACKEND=postgres`
+    // (+ `AGENTDB_META_URL`) get the Postgres dialect with
+    // LISTEN/NOTIFY-driven change propagation.
+    let meta_backend = std::env::var("AGENTDB_META_BACKEND")
+        .unwrap_or_else(|_| "sqlite".into())
+        .to_lowercase();
+    let meta = Arc::new(match meta_backend.as_str() {
+        "sqlite" => {
+            if let Some(parent) = std::path::Path::new(&cfg.meta_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).context("create meta dir")?;
+                }
+            }
+            MetaStore::open_sqlite(&cfg.meta_path)
+                .await
+                .with_context(|| format!("open meta sqlite at {}", cfg.meta_path))?
         }
-    }
-    let meta = Arc::new(
-        MetaStore::open_sqlite(&cfg.meta_path)
-            .await
-            .with_context(|| format!("open meta sqlite at {}", cfg.meta_path))?,
-    );
+        "postgres" | "pg" => {
+            let url = std::env::var("AGENTDB_META_URL")
+                .context("AGENTDB_META_BACKEND=postgres requires AGENTDB_META_URL")?;
+            MetaStore::open_postgres(&url)
+                .await
+                .context("open meta postgres")?
+        }
+        other => anyhow::bail!(
+            "unknown AGENTDB_META_BACKEND={other}; expected 'sqlite' or 'postgres'"
+        ),
+    });
 
     let hlc = Arc::new(HlcClock::default());
     tracing::info!(

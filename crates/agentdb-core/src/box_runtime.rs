@@ -1174,7 +1174,7 @@ mod tests {
     ) -> Arc<crate::shard::LocationProxy> {
         use agentdb_meta::{migrations, shards as meta_shards, MetaStore};
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         meta_shards::seed_shards(meta.pool(), crate::shard::SHARD_COUNT as i64, 0)
             .await
             .unwrap();
@@ -1246,7 +1246,7 @@ mod tests {
     ) -> Arc<agentdb_meta::MetaStore> {
         use agentdb_meta::{migrations, nodes as meta_nodes, tablets as meta_tablets, MetaStore};
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();
@@ -1343,7 +1343,7 @@ mod tests {
         use agentdb_meta::{migrations, nodes as meta_nodes, shards as meta_shards, tablets as meta_tablets, MetaStore};
         let (_dir, _obj_dir, reg) = registry(4);
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
             .await
             .unwrap();

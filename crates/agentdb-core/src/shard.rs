@@ -216,7 +216,7 @@ mod tests {
 
     async fn fresh_meta() -> Arc<MetaStore> {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-        migrations::apply(meta.pool()).await.unwrap();
+        migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
         // Seed the shards table so list_all returns full rows.
         meta_shards::seed_shards(meta.pool(), SHARD_COUNT as i64, 0)
             .await

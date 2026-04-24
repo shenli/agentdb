@@ -617,22 +617,50 @@ process agrees on, and a bundle of background loops keep it fresh.
 
 ### Meta store (`crates/agentdb-meta`)
 
-SQLite-backed cluster-wide metadata. One file (`meta.sqlite`) holds
-five tables:
+Dual-dialect cluster-wide metadata. `AGENTDB_META_BACKEND`
+selects:
+
+- **`sqlite`** (default) — file at `AGENTDB_META_PATH`
+  (defaults to `meta.sqlite`). Zero-dep, great for dev /
+  single-node.
+- **`postgres`** — URL at `AGENTDB_META_URL`
+  (`postgres://user:pass@host/db`). Wider ops tooling,
+  LISTEN/NOTIFY-driven change propagation.
+
+Tables both backends carry:
 
 | Table | What it tracks |
 |---|---|
 | `tenants` | Global tenant id space — one row per external tenant id. Superset of the per-box `TenantRegistry`. |
-| `nodes` | Cluster membership + heartbeat. Each running `agentdb serve` process upserts a row and bumps `last_heartbeat_ms` every 5s. |
-| `tablets` | Runtime ownership units. Every box owns a tablet (today `tablet_id == box_id`); each row carries a monotonic `epoch` for fencing. |
+| `nodes` | Cluster membership + heartbeat. Each running `agentdb serve` process upserts a row and bumps `last_heartbeat_ms` every 5s. `address` + `mongo_address` are advertised for cross-node forwarding. |
+| `tablets` | Runtime ownership units. Each row carries a monotonic `epoch` for fencing. |
 | `scheduler_leader` | Singleton row (enforced via `CHECK (id = 1)`) holding the current scheduler leader's lease. |
-| `shards` | 16384-row shard → tablet assignment. Default NULL means "route via hash"; operators can pin specific shards. |
+| `shards` | 16384-row shard → tablet assignment. Default NULL means "route via hash". |
+| `users` | SCRAM-SHA-256 creds, one per tenant. |
+| `admin_tokens` | Admin bearer tokens + their RBAC scope. |
+| `admin_audit` | Append-only log of every `/api/admin/*` request. |
+| `tenant_quotas` | Global per-tenant rate limits. |
 
-Migrations are hand-rolled (`migrations.rs`), idempotent, forward-
-only. Both SQLite (local dev) and Postgres (future production) are
-target dialects; the crate currently implements only SQLite but the
-helper functions keep dialect-agnostic SQL so a Postgres backend is
-additive.
+Migrations are hand-rolled (`migrations.rs`), idempotent,
+forward-only, and carry **two SQL variants side-by-side** —
+`NNN_name.sql` (SQLite) + `NNN_name.pg.sql` (Postgres). The
+runner picks the right file based on the backend discriminant.
+
+Runtime queries go through `sqlx::Any`, which rewrites `?`
+placeholders to `$N` for Postgres. The small number of
+genuinely dialect-specific operations (`VACUUM INTO` vs
+`pg_dump` in `backup()`, `LISTEN/NOTIFY`) branch on
+`MetaDialect`.
+
+**Change propagation.**
+Migration 009 attaches Postgres triggers to `shards`, `nodes`,
+`tablets` that `NOTIFY agentdb_<table>_changed` with the PK
+of the changed row. The `change_notifier::subscribe` stream
+forwards those to consumers (LocationProxy, NodeAddressProxy)
+as a "refresh now" hint on top of the existing periodic
+polling. SQLite has no NOTIFY primitive; the stream is inert
+and callers fall back to the periodic refresh loops they
+already run.
 
 ### Leases + fencing (M21)
 
