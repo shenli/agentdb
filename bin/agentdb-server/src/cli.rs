@@ -422,9 +422,7 @@ pub struct ServeOpts {
     /// Path to a TLS certificate chain (PEM). When set
     /// together with `--tls-key`, the REST listener serves
     /// HTTPS via rustls. Falls back to
-    /// `AGENTDB_TLS_CERT` if the flag is omitted. Mongo
-    /// wire stays plaintext either way — a separate PR
-    /// adds Mongo TLS.
+    /// `AGENTDB_TLS_CERT` if the flag is omitted.
     #[arg(long = "tls-cert")]
     pub tls_cert: Option<std::path::PathBuf>,
 
@@ -436,10 +434,29 @@ pub struct ServeOpts {
     /// Generate an ephemeral self-signed certificate at
     /// startup so operators can smoke-test TLS without
     /// provisioning a real cert. Valid for `localhost` and
-    /// `127.0.0.1`. Mutually exclusive with explicit
+    /// `127.0.0.1`. Applies to both REST and Mongo wire
+    /// when set. Mutually exclusive with explicit
     /// `--tls-cert` / `--tls-key`.
     #[arg(long = "dev-tls", conflicts_with_all = ["tls_cert", "tls_key"])]
     pub dev_tls: bool,
+
+    /// Path to a TLS cert for the Mongo wire listener. When
+    /// set together with `--mongo-tls-key`, the wire
+    /// listener requires TLS. Falls back to
+    /// `AGENTDB_MONGO_TLS_CERT`.
+    ///
+    /// Separate from `--tls-cert` so operators can terminate
+    /// REST TLS at a proxy and still protect Mongo wire
+    /// end-to-end (or vice versa). Set
+    /// `AGENTDB_MONGO_TLS_REUSE_REST=1` on the env to share
+    /// the REST cert automatically.
+    #[arg(long = "mongo-tls-cert")]
+    pub mongo_tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to the Mongo-wire TLS private key (PEM).
+    /// Falls back to `AGENTDB_MONGO_TLS_KEY`.
+    #[arg(long = "mongo-tls-key")]
+    pub mongo_tls_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug, Default, Clone)]

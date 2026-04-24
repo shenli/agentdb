@@ -167,12 +167,15 @@ dependencies = [
  "object_store",
  "parking_lot",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

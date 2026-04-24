@@ -3,15 +3,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
 use crate::command::dispatch;
 use crate::error::{WireError, WireResult};
 use crate::opmsg;
 use crate::state::WireState;
 
-/// Accept connections and spawn per-connection tasks until the listener is dropped.
+/// Accept plaintext connections and spawn per-connection tasks
+/// until the listener is dropped.
 pub async fn serve(listener: TcpListener, state: WireState) -> WireResult<()> {
     let next_id = Arc::new(AtomicI64::new(1));
     loop {
@@ -26,11 +28,52 @@ pub async fn serve(listener: TcpListener, state: WireState) -> WireResult<()> {
     }
 }
 
-async fn run_connection(
-    mut socket: TcpStream,
+/// TLS-wrapped variant of [`serve`]. `tls_config` is an
+/// `Arc<rustls::ServerConfig>` — typically shared with the
+/// REST listener's `RustlsConfig::get_inner()` so both ports
+/// present the same cert.
+///
+/// Each handshake runs in its own spawned task, so a slow or
+/// misbehaving client can't tie up the accept loop — same
+/// shape as the plaintext path.
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    state: WireState,
+) -> WireResult<()> {
+    let acceptor = TlsAcceptor::from(tls_config);
+    let next_id = Arc::new(AtomicI64::new(1));
+    loop {
+        let (socket, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let st = state.clone();
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(socket).await {
+                Ok(s) => s,
+                Err(err) => {
+                    // Handshake failure is a client concern —
+                    // log at debug so a stream of bad clients
+                    // doesn't spam the logs at warn.
+                    tracing::debug!(%peer, ?err, "wire TLS handshake failed");
+                    return;
+                }
+            };
+            if let Err(err) = run_connection(tls, st, id).await {
+                tracing::debug!(%peer, ?err, "wire TLS connection closed with error");
+            }
+        });
+    }
+}
+
+async fn run_connection<S>(
+    mut socket: S,
     state: WireState,
     connection_id: i64,
-) -> WireResult<()> {
+) -> WireResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     loop {
         let mut len_buf = [0u8; 4];
         if let Err(err) = socket.read_exact(&mut len_buf).await {
@@ -121,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn raw_hello_round_trip() {
         let (addr, _state) = spawn_server().await;
-        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut req_bytes = Vec::new();
         opmsg::encode_body_response(&mut req_bytes, 1, 0, &doc! { "hello": 1, "$db": "admin" })
             .unwrap();

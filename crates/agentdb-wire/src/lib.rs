@@ -11,5 +11,5 @@ pub mod server;
 pub mod state;
 
 pub use error::{WireError, WireResult};
-pub use server::serve;
+pub use server::{serve, serve_tls};
 pub use state::{AuthStatus, WireAuthConfig, WireState};
