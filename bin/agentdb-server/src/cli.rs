@@ -115,6 +115,23 @@ pub enum Cmd {
     /// elapsed time exceeded `AGENTDB_SLOW_QUERY_THRESHOLD_MS`).
     /// HTTP-client wrapper for `GET /api/admin/slow-queries`.
     ShowSlowQueries(ShowSlowQueriesOpts),
+    /// Take a point-in-time backup of the meta store and the
+    /// live KV state into an output directory (which must not
+    /// exist). Restore is offline — see
+    /// `docs/ARCHITECTURE.md § Point-in-time backup`.
+    /// HTTP-client wrapper for `POST /api/admin/backup`.
+    Backup(BackupOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BackupOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Absolute path to the backup destination. Must not exist;
+    /// the server creates it and populates `kv/`, `meta.sqlite`,
+    /// `manifest.json`.
+    #[arg(long = "out")]
+    pub out_dir: String,
 }
 
 #[derive(Args, Debug, Clone)]

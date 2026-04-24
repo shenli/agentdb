@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -47,4 +48,26 @@ pub trait KvStore: Send + Sync {
     ///
     /// Takes `Arc<Self>` to ensure the store outlives the snapshot.
     fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>>;
+
+    /// Write a point-in-time snapshot of the entire KV state to
+    /// `out_dir`. `out_dir` MUST NOT exist — backends create it,
+    /// so accidentally overwriting an existing path is an error,
+    /// not silent corruption.
+    ///
+    /// Semantics per backend:
+    ///   - RocksDB: uses the native `Checkpoint` API, which
+    ///     hard-links SSTs where possible (instant, near-zero IO)
+    ///     and copies WAL/MANIFEST. Safe to run concurrent with
+    ///     live writes.
+    ///   - Others: return an error unless explicitly supported.
+    ///
+    /// The returned `Ok` shape carries nothing — callers can
+    /// `fs::metadata(out_dir)` to measure on-disk size if they
+    /// care.
+    fn checkpoint(&self, out_dir: &Path) -> Result<()> {
+        let _ = out_dir;
+        Err(crate::error::Error::Other(
+            "checkpoint not supported by this KvStore backend".into(),
+        ))
+    }
 }

@@ -57,5 +57,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ShowTenantQuota(opts) => admin::show_tenant_quota(opts).await,
         Cmd::ClearTenantQuota(opts) => admin::clear_tenant_quota(opts).await,
         Cmd::ShowSlowQueries(opts) => admin::show_slow_queries(opts).await,
+        Cmd::Backup(opts) => admin::backup(opts).await,
     }
 }

@@ -18,10 +18,10 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::cli::{
-    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, ClearTenantQuotaOpts,
-    CreateTabletOpts, MigrateSessionOpts, SetShardOpts, SetTenantQuotaOpts, ShedTabletOpts,
-    ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts, ShowTenantQuotaOpts, UserAddOpts,
-    UserDeleteOpts,
+    AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, BackupOpts,
+    ClearTenantQuotaOpts, CreateTabletOpts, MigrateSessionOpts, SetShardOpts, SetTenantQuotaOpts,
+    ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts, ShowTenantQuotaOpts,
+    UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -369,6 +369,23 @@ pub async fn clear_tenant_quota(opts: ClearTenantQuotaOpts) -> Result<()> {
         .with_context(|| format!("DELETE {url}"))?;
     // 204 No Content expected; print_json_and_exit_on_failure
     // handles success and error bodies.
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `POST /api/admin/backup` — point-in-time backup.
+pub async fn backup(opts: BackupOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/backup",
+        opts.server_url.trim_end_matches('/'),
+    );
+    let body = serde_json::json!({"out_dir": opts.out_dir});
+    let client = admin_client();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
     print_json_and_exit_on_failure(resp).await
 }
 

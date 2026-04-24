@@ -355,6 +355,11 @@ M18+ milestones added:
   `agentdb show-slow-queries`;
   `agentdb_slow_queries_recorded_total{kind="..."}` on
   `/metrics`
+- **Point-in-time backup** — live RocksDB checkpoint +
+  SQLite VACUUM INTO into a destination directory.
+  `POST /api/admin/backup` or
+  `agentdb backup --out /abs/path`. Restore is offline —
+  copy the files into the target dirs and restart
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

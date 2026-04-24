@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, DB};
 
 use crate::error::{Error, Result};
 use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
@@ -85,6 +85,16 @@ impl KvStore for RocksKvStore {
 
     fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>> {
         Ok(Arc::new(OwnedRocksSnapshotHandle::new(self.db.clone())))
+    }
+
+    fn checkpoint(&self, out_dir: &Path) -> Result<()> {
+        // `Checkpoint::create_checkpoint` refuses to overwrite,
+        // so the contract matches our trait ("MUST NOT exist").
+        let cp = Checkpoint::new(&self.db)
+            .map_err(|e| Error::Other(format!("rocksdb checkpoint init: {e}")))?;
+        cp.create_checkpoint(out_dir)
+            .map_err(|e| Error::Other(format!("rocksdb create_checkpoint: {e}")))?;
+        Ok(())
     }
 }
 
@@ -206,6 +216,41 @@ mod owned_snapshot_tests {
         store.put(b"k2", b"v2").unwrap();
         // Snapshot doesn't see the new key.
         assert!(snap.get(b"k2").unwrap().is_none());
+    }
+
+    #[test]
+    fn checkpoint_produces_a_readable_clone() {
+        let src = TempDir::new().unwrap();
+        let store = RocksKvStore::open(src.path()).unwrap();
+        store.put(b"alpha", b"a-val").unwrap();
+        store.put(b"beta", b"b-val").unwrap();
+
+        // Checkpoint into a sibling dir that must not exist.
+        let parent = TempDir::new().unwrap();
+        let dest = parent.path().join("ckpt");
+        store.checkpoint(&dest).unwrap();
+        assert!(dest.exists(), "checkpoint dir should have been created");
+
+        // Open the checkpoint as an independent store and read back.
+        let restored = RocksKvStore::open(&dest).unwrap();
+        assert_eq!(restored.get(b"alpha").unwrap().as_deref(), Some(b"a-val".as_ref()));
+        assert_eq!(restored.get(b"beta").unwrap().as_deref(), Some(b"b-val".as_ref()));
+    }
+
+    #[test]
+    fn checkpoint_refuses_to_overwrite_existing_dir() {
+        let src = TempDir::new().unwrap();
+        let store = RocksKvStore::open(src.path()).unwrap();
+        store.put(b"k", b"v").unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let err = store.checkpoint(dest_dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("exist")
+                || msg.to_lowercase().contains("invalid")
+                || msg.to_lowercase().contains("create_checkpoint"),
+            "expected 'already exists' style failure; got: {msg}",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
