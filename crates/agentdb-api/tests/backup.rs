@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{admin_backup::BackupManifest, router, AppState, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_api::{router, AppState, StreamBus};
+use agentdb_core::{BackupManifest, BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;

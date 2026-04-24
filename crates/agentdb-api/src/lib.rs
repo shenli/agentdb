@@ -106,6 +106,7 @@ impl AppState {
         admin::force_tier,
         admin::get_hlc,
         admin_backup::post_backup,
+        admin_backup::get_backup_status,
         admin_audit::list_audit,
         admin_boxes::list_boxes,
         admin_boxes::get_box,
@@ -150,7 +151,8 @@ impl AppState {
         admin::HlcStatus,
         admin_audit::AuditRecordView,
         admin_backup::BackupRequest,
-        admin_backup::BackupManifest,
+        agentdb_core::BackupManifest,
+        agentdb_core::BackupSchedulerStatus,
         admin_boxes::BoxListItem,
         admin_boxes::QuotaView,
         admin_boxes::InjectFaultRequest,
@@ -349,6 +351,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/backup",
             axum::routing::post(admin_backup::post_backup),
+        )
+        .route(
+            "/api/admin/backup/status",
+            axum::routing::get(admin_backup::get_backup_status),
         )
         .route(
             "/api/admin/tenant-quotas",

@@ -528,6 +528,10 @@ pub struct BoxRegistry {
     /// handlers record completed requests whose latency
     /// exceeds the configured threshold.
     slow_queries: std::sync::OnceLock<Arc<crate::SlowQueryBuffer>>,
+    /// Backup-scheduler status handle. `None` when no
+    /// scheduler is configured. Attached once, at startup,
+    /// right after spawning the scheduler loop.
+    backup_status: std::sync::OnceLock<Arc<crate::BackupSchedulerHandle>>,
 }
 
 impl BoxRegistry {
@@ -598,6 +602,7 @@ impl BoxRegistry {
             node_addr: std::sync::OnceLock::new(),
             tenant_quotas: std::sync::OnceLock::new(),
             slow_queries: std::sync::OnceLock::new(),
+            backup_status: std::sync::OnceLock::new(),
         })
     }
 
@@ -695,6 +700,7 @@ impl BoxRegistry {
             node_addr: std::sync::OnceLock::new(),
             tenant_quotas: std::sync::OnceLock::new(),
             slow_queries: std::sync::OnceLock::new(),
+            backup_status: std::sync::OnceLock::new(),
         })
     }
 
@@ -816,6 +822,23 @@ impl BoxRegistry {
     /// a no-op.
     pub fn slow_queries(&self) -> Option<Arc<crate::SlowQueryBuffer>> {
         self.slow_queries.get().cloned()
+    }
+
+    /// Attach the backup-scheduler status handle so admin
+    /// endpoints + `/metrics` can read recent activity.
+    /// Idempotent at the OnceLock level.
+    pub fn attach_backup_status(
+        &self,
+        handle: Arc<crate::BackupSchedulerHandle>,
+    ) -> std::result::Result<(), Arc<crate::BackupSchedulerHandle>> {
+        self.backup_status.set(handle)
+    }
+
+    /// Currently-attached backup-scheduler status handle,
+    /// if any. `None` means "no scheduled backups configured
+    /// on this process."
+    pub fn backup_status(&self) -> Option<Arc<crate::BackupSchedulerHandle>> {
+        self.backup_status.get().cloned()
     }
 
     /// Attach a [`NodeAddressProxy`] so

@@ -131,6 +131,29 @@
         }
       }
     },
+    "/api/admin/backup/status": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_backup_status",
+        "responses": {
+          "200": {
+            "description": "Backup scheduler status (last success + last failure)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupSchedulerStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          }
+        }
+      }
+    },
     "/api/admin/boxes": {
       "get": {
         "tags": [
@@ -1736,6 +1759,7 @@
       },
       "BackupManifest": {
         "type": "object",
+        "description": "Metadata written alongside every backup. Identical whether\nthe backup came from the admin endpoint or the scheduler.",
         "required": [
           "version",
           "created_at_ms",
@@ -1770,7 +1794,7 @@
               "string",
               "null"
             ],
-            "description": "Node id of the process that produced this backup. `None`\nwhen a meta-less test registry produced it (no node\nidentity)."
+            "description": "Node id that produced this backup, when available."
           },
           "version": {
             "type": "integer",
@@ -1787,7 +1811,108 @@
         "properties": {
           "out_dir": {
             "type": "string",
-            "description": "Absolute path to a directory that does NOT yet exist.\nThe endpoint creates it and writes `kv/`, `meta.sqlite`,\nand `manifest.json` into it."
+            "description": "Absolute path to a directory that does NOT yet exist."
+          }
+        }
+      },
+      "BackupSchedulerStatus": {
+        "type": "object",
+        "description": "Snapshot of the scheduler's recent activity. Surfaced via\n`GET /api/admin/backup/status` so operators can answer \"when\ndid the last backup succeed / fail?\" without SSHing to the\nbox.",
+        "required": [
+          "enabled",
+          "backups_on_disk",
+          "runs_total",
+          "failures_total"
+        ],
+        "properties": {
+          "backups_on_disk": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of `backup-*` subdirs currently under\n`base_dir` (i.e. post-retention count after the last\nrun).",
+            "minimum": 0
+          },
+          "base_dir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "`true` when the scheduler is configured and running on\nthis process (leader-gated; followers report `false`)."
+          },
+          "failures_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "interval_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable reason for the most recent failure."
+          },
+          "last_failure_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock ms of the most recent failure."
+          },
+          "last_manifest_created_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Manifest created_at of the most recent success.\nPresent iff `last_success_ms` is present."
+          },
+          "last_out_dir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path (relative or absolute) of the most recent success."
+          },
+          "last_success_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock ms of the most recent successful run.\n`None` before the first success."
+          },
+          "last_total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Bytes on disk for the most recent success (kv + meta).",
+            "minimum": 0
+          },
+          "retain": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "runs_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
