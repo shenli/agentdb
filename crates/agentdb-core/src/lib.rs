@@ -5,6 +5,7 @@ pub mod backup;
 pub mod backup_scheduler;
 pub mod box_runtime;
 pub mod error;
+pub mod fold;
 pub mod forwarding;
 pub mod fork;
 pub mod handoff;
@@ -48,6 +49,7 @@ pub use box_runtime::{
 };
 pub use error::{Error, Resource, Result};
 pub use forwarding::{NodeAddressProxy, NodeAddressRefreshJob, NodeTarget};
+pub use fold::{fold_events, TOMBSTONE_OF_MARKER, UPDATE_OF_MARKER};
 pub use fork::fork_session;
 pub use handoff::{migrate_warm_session, MigratedSession};
 pub use hedge::{hedged, HedgedResult, Winner as HedgeWinner};

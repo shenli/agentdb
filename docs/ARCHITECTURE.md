@@ -1383,9 +1383,39 @@ into appends:
 - **`delete`** appends a **tombstone event** per matched
   event. The tombstone's payload is
   `{_tombstone_of: <seq>}`. Response shape: `{ok: 1, n:
-  <tombstones appended>}`. Read-side projections may
-  choose to hide events referenced by a later tombstone in
-  the same session; the raw log preserves everything.
+  <tombstones appended>}`. The raw log preserves
+  everything; the read path folds it out (see below).
+
+#### Materialized read view
+
+By default, `find` on `events` returns a **folded** view:
+
+- Events carrying `_update_of: N` collapse onto event
+  `N` (their merged payload replaces the target's).
+  Latest correction wins when more than one targets the
+  same seq.
+- Events referenced by a `_tombstone_of: N` marker
+  disappear from the output, along with the tombstone
+  itself. Tombstoning a later correction falls back to
+  the previous correction (or the original if none
+  remain).
+- Correction events and tombstones themselves never
+  appear in the folded view.
+
+Opt out with `{raw: true}` in the find command body —
+this returns the un-folded log, correction markers and
+all. Intended for debugging and log-forensic work; most
+clients want the folded default.
+
+The write handlers (`update` / `delete`) also filter
+against the folded view, so chained mutations compose:
+`updateOne({v:0}→{v:1})` followed by `deleteOne({v:1})`
+removes the event entirely, as a Mongo user would
+expect.
+
+The folding primitive is `agentdb_core::fold_events` —
+two-pass, O(n), pure. Unit-tested in isolation from any
+transport.
 
 Both commands require the filter to carry a top-level
 `session_id` equality. An unscoped

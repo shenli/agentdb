@@ -174,9 +174,12 @@ literally mutate or remove events. `update` appends a
 **correction event** (merged payload + `_update_of: <seq>`
 marker); `delete` appends a **tombstone event**
 (`_tombstone_of: <seq>`). Both require a `session_id` in
-the filter — unscoped writes across every session aren't
-supported. See `docs/ARCHITECTURE.md § Mongo CRUD semantics`
-for the full contract.
+the filter. **`find` default-folds** both so
+`insertOne → updateOne → find` returns the post-update
+payload as you'd expect; `{raw: true}` in the find body
+opts out and returns the un-folded log. See
+`docs/ARCHITECTURE.md § Mongo CRUD semantics` for the full
+contract.
 
 ---
 

@@ -124,8 +124,16 @@ async fn apply_one_delete(
     // Don't hold the read context while we take the write lock.
     drop(ctx);
 
+    // Match against the folded view: a `delete` after a
+    // prior `update` must see the post-update payload,
+    // otherwise `update({v:0}→{v:1})` followed by
+    // `delete({v:1})` would silently miss (the raw v=1
+    // lives on a correction event that carries an
+    // `_update_of` marker).
+    let folded = agentdb_core::fold_events(events);
+
     let mut deleted: u32 = 0;
-    for ev in events {
+    for ev in folded {
         let row = project_event(&session.external_id, &ev);
         if !filter.matches(&row) {
             continue;
