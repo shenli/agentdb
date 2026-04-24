@@ -18,6 +18,8 @@ fn now_ms() -> i64 {
 #[derive(Debug, Default)]
 pub struct BoxMetrics {
     pub inserts: AtomicU64,
+    pub updates: AtomicU64,
+    pub deletes: AtomicU64,
     pub queries_find: AtomicU64,
     pub queries_aggregate: AtomicU64,
     pub appends: AtomicU64,
@@ -130,6 +132,12 @@ impl BoxMetrics {
 
     pub fn record_insert(&self) {
         self.inserts.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_update(&self) {
+        self.updates.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_delete(&self) {
+        self.deletes.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_query_find(&self) {
         self.queries_find.fetch_add(1, Ordering::Relaxed);
@@ -261,6 +269,8 @@ impl BoxMetrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             inserts: self.inserts.load(Ordering::Relaxed),
+            updates: self.updates.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
             queries_find: self.queries_find.load(Ordering::Relaxed),
             queries_aggregate: self.queries_aggregate.load(Ordering::Relaxed),
             appends: self.appends.load(Ordering::Relaxed),
@@ -301,6 +311,8 @@ impl BoxMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricsSnapshot {
     pub inserts: u64,
+    pub updates: u64,
+    pub deletes: u64,
     pub queries_find: u64,
     pub queries_aggregate: u64,
     pub appends: u64,

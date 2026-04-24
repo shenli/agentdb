@@ -165,8 +165,18 @@ db.getSiblingDB("t-1").events.aggregate([
 ```
 
 Supported commands: `hello`, `insert`, `find`, `aggregate` (with
-`$search`), `listDatabases`. Transactions, updates, and deletes
-return a standard "not implemented" error.
+`$search` + `$vectorSearch`), `update`, `delete`,
+`listDatabases`, `listCollections`. Transactions return a
+standard "not implemented" error.
+
+Because AgentDB is an event log, `update` and `delete` don't
+literally mutate or remove events. `update` appends a
+**correction event** (merged payload + `_update_of: <seq>`
+marker); `delete` appends a **tombstone event**
+(`_tombstone_of: <seq>`). Both require a `session_id` in
+the filter — unscoped writes across every session aren't
+supported. See `docs/ARCHITECTURE.md § Mongo CRUD semantics`
+for the full contract.
 
 ---
 
