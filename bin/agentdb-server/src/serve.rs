@@ -17,7 +17,7 @@ use agentdb_core::{
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
-use agentdb_wire::{serve as serve_mongo, WireState};
+use agentdb_wire::{serve as serve_mongo, serve_tls as serve_mongo_tls, WireState};
 use anyhow::Context;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
@@ -132,6 +132,60 @@ async fn resolve_tls(
         if opts.dev_tls {
             return Ok(Some(crate::tls::generate_dev_tls().await?));
         }
+    }
+    Ok(None)
+}
+
+/// Resolve TLS for the Mongo wire listener. Flag pair
+/// (`--mongo-tls-cert` + `--mongo-tls-key`) wins; otherwise
+/// env pair (`AGENTDB_MONGO_TLS_CERT` + `AGENTDB_MONGO_TLS_KEY`);
+/// otherwise when `AGENTDB_MONGO_TLS_REUSE_REST=1` is set and
+/// REST TLS is configured, reuse the REST cert; otherwise
+/// `--dev-tls` synthesizes an ephemeral cert (same cert as
+/// REST); otherwise plaintext.
+///
+/// Returns `Some(Arc<ServerConfig>)` ready to hand to
+/// `agentdb_wire::serve_tls`.
+async fn resolve_mongo_tls(
+    opts: &ServeOpts,
+    rest_tls: Option<&axum_server::tls_rustls::RustlsConfig>,
+) -> anyhow::Result<Option<std::sync::Arc<rustls::ServerConfig>>> {
+    // Explicit Mongo flag pair.
+    if let (Some(cert), Some(key)) = (
+        opts.mongo_tls_cert.as_ref(),
+        opts.mongo_tls_key.as_ref(),
+    ) {
+        let cfg = crate::tls::load_tls_config(cert, key).await?;
+        return Ok(Some(cfg.get_inner()));
+    }
+    // Mongo env pair.
+    let env_cert = std::env::var("AGENTDB_MONGO_TLS_CERT")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let env_key = std::env::var("AGENTDB_MONGO_TLS_KEY")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if let (Some(cert), Some(key)) = (&env_cert, &env_key) {
+        let cfg = crate::tls::load_tls_config(cert, key).await?;
+        return Ok(Some(cfg.get_inner()));
+    }
+    if env_cert.is_some() || env_key.is_some() {
+        anyhow::bail!(
+            "AGENTDB_MONGO_TLS_CERT and AGENTDB_MONGO_TLS_KEY must be set together (or neither)"
+        );
+    }
+    // Opt-in: reuse the REST cert for Mongo when the
+    // operator sets the env flag. Cheaper than provisioning
+    // two separate certs for the same hostname.
+    let reuse = std::env::var("AGENTDB_MONGO_TLS_REUSE_REST")
+        .ok()
+        .filter(|s| !s.is_empty() && s != "0" && s.to_lowercase() != "false");
+    if let (Some(_), Some(rest)) = (reuse, rest_tls) {
+        return Ok(Some(rest.get_inner()));
+    }
+    // Dev ephemeral applies to both ports when set.
+    if opts.dev_tls {
+        return Ok(Some(crate::tls::generate_dev_tls().await?.get_inner()));
     }
     Ok(None)
 }
@@ -778,6 +832,9 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
     // Resolve TLS config. Explicit flags win; else env
     // vars; else `--dev-tls` ephemeral; else plaintext.
     let tls_cfg = resolve_tls(&opts).await?;
+    // Mongo wire TLS is resolved AFTER REST so it can
+    // optionally reuse the REST cert via env.
+    let mongo_tls_cfg = resolve_mongo_tls(&opts, tls_cfg.as_ref()).await?;
     let mongo_listener = tokio::net::TcpListener::bind(cfg.mongo_addr)
         .await
         .context("bind mongo listener")?;
@@ -787,6 +844,7 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         objects = %cfg.objects_dir.display(),
         dev = opts.dev,
         tls = tls_cfg.is_some(),
+        mongo_tls = mongo_tls_cfg.is_some(),
         "agentdb listening"
     );
 
@@ -808,11 +866,19 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
             .context("bind http listener")?;
         tokio::spawn(async move { axum::serve(http_listener, app).await.context("http serve") })
     };
-    let mongo_task = tokio::spawn(async move {
-        serve_mongo(mongo_listener, wire_state)
-            .await
-            .map_err(|e| anyhow::anyhow!("mongo serve: {e}"))
-    });
+    let mongo_task = if let Some(mongo_tls) = mongo_tls_cfg {
+        tokio::spawn(async move {
+            serve_mongo_tls(mongo_listener, mongo_tls, wire_state)
+                .await
+                .map_err(|e| anyhow::anyhow!("mongo tls serve: {e}"))
+        })
+    } else {
+        tokio::spawn(async move {
+            serve_mongo(mongo_listener, wire_state)
+                .await
+                .map_err(|e| anyhow::anyhow!("mongo serve: {e}"))
+        })
+    };
 
     tokio::select! {
         r = http_task => r.context("http task join")??,

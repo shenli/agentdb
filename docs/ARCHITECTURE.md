@@ -1248,19 +1248,38 @@ themselves; scheduling is a policy concern.
 
 ### TLS termination
 
-REST listens over HTTP by default. Supply `--tls-cert PATH
+**REST.** HTTP by default. Supply `--tls-cert PATH
 --tls-key PATH` (or `AGENTDB_TLS_CERT` / `AGENTDB_TLS_KEY`
 env vars) to serve HTTPS via rustls + axum-server.
 
-The flag pair and env pair are mutually exclusive — setting
-one without the other is a startup error so operators
-don't accidentally boot plaintext under a name that
-suggests otherwise. `rcgen`-based dev mode
-(`agentdb serve --dev-tls`) generates an ephemeral
-self-signed cert at startup covering `localhost`,
-`127.0.0.1`, `::1`. Clients must skip cert verification
-for the dev cert; the cert lives only in memory and each
-invocation gets a fresh one.
+**Mongo wire.** Plaintext by default. Supply
+`--mongo-tls-cert PATH --mongo-tls-key PATH` (or
+`AGENTDB_MONGO_TLS_CERT` / `AGENTDB_MONGO_TLS_KEY`) to
+terminate TLS on the wire listener. The same PEM pair can
+be reused across both ports by setting
+`AGENTDB_MONGO_TLS_REUSE_REST=1` alongside the REST cert —
+saves operators provisioning a second cert for the same
+hostname. `agentdb serve --dev-tls` generates one
+ephemeral cert and applies it to both listeners.
+
+Under the hood the wire server exposes two entry points
+side-by-side: `agentdb_wire::serve` for plaintext and
+`agentdb_wire::serve_tls` for TLS. The connection-handling
+function is generic over `AsyncRead + AsyncWrite`, so the
+framing + dispatch path is identical for both; the TLS
+variant just wraps each accepted socket in a
+`tokio_rustls::TlsAcceptor` handshake task before handing
+off. Handshake failures log at debug (one message per bad
+client) so a stream of malicious probes doesn't flood warn.
+
+Both flag pairs and env pairs are mutually exclusive —
+setting one without the other is a startup error so
+operators don't accidentally boot plaintext under a name
+that suggests otherwise. `rcgen`-based dev mode
+(`--dev-tls`) generates an ephemeral self-signed cert at
+startup covering `localhost`, `127.0.0.1`, `::1`. Clients
+must skip cert verification for the dev cert; the cert
+lives only in memory and each invocation gets a fresh one.
 
 On the crypto provider — rustls 0.23 requires an explicit
 `CryptoProvider::install_default()` before any handshake.
@@ -1268,12 +1287,10 @@ We install `aws_lc_rs` once at TLS entry time. The
 provider is process-wide.
 
 **Out of scope:**
-- **Mongo wire TLS.** The Mongo listener stays plaintext;
-  separate PR.
 - **mTLS.** Client-cert auth isn't wired. Bearer + Basic
   Auth remain the auth layer; TLS adds confidentiality
   on top.
-- **Certificate rotation.** Cert is loaded once at
+- **Certificate rotation.** Certs are loaded once at
   startup. SIGHUP reload is follow-up work.
 
 ### SCRAM-SHA-256 auth (M19)

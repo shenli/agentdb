@@ -60,6 +60,8 @@ subtle = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
+# Mongo wire TLS termination (raw rustls handshake over TCP).
+tokio-rustls = "0.26"
 # Dev-only: generate ephemeral self-signed certs for
 # `agentdb serve --dev-tls` and integration tests.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }

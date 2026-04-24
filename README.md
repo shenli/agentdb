@@ -304,10 +304,14 @@ M18+ milestones added:
   Tokens carry an RBAC scope: `admin` (default) or
   `readonly` (GET-only; mutations return 403). Scope-403s
   show up in the audit log with the actor_token_id
-- **REST TLS termination** — `--tls-cert` / `--tls-key`
-  (or env vars) serve HTTPS via rustls + axum-server.
-  `agentdb serve --dev-tls` generates an ephemeral
-  self-signed cert for smoke testing
+- **TLS termination** (both ports) — REST
+  (`--tls-cert` / `--tls-key` + env pair) terminates
+  HTTPS via rustls + axum-server. Mongo wire
+  (`--mongo-tls-cert` / `--mongo-tls-key`) terminates
+  TLS via tokio-rustls; `AGENTDB_MONGO_TLS_REUSE_REST=1`
+  reuses the REST cert so operators don't provision two.
+  `agentdb serve --dev-tls` generates one ephemeral cert
+  for both ports
 - **M25 hot-tablet detection + shed + dynamic tablet
   creation** — sliding rate window on every box;
   scheduler-leader detector flags saturated tablets;
