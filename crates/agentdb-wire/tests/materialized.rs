@@ -177,3 +177,67 @@ async fn update_then_delete_hides_everything() {
         "after update + delete the event is gone: {docs:?}"
     );
 }
+
+#[tokio::test]
+async fn aggregate_search_does_not_return_correction_or_tombstone_rows() {
+    // Text-search a session where one event was updated
+    // (producing a correction) and one was deleted (producing
+    // a tombstone). The aggregate hits must not include the
+    // correction or tombstone events as separate rows.
+    let (_d, _o, port) = spawn().await;
+    let cli = client(port).await;
+    let db = cli.database("t-agg");
+    let events = db.collection::<bson::Document>("events");
+
+    events
+        .insert_one(doc! { "session_id": "s-1", "text": "refund policy draft" })
+        .await
+        .unwrap();
+    events
+        .insert_one(doc! { "session_id": "s-1", "text": "shipping update" })
+        .await
+        .unwrap();
+    // Update the refund event — the correction's text still
+    // contains "refund" so a naive hit set would return both
+    // the original and the correction.
+    events
+        .update_one(
+            doc! { "session_id": "s-1", "payload.text": "refund policy draft" },
+            doc! { "$set": { "text": "refund policy final" } },
+        )
+        .await
+        .unwrap();
+
+    let pipeline = vec![doc! {
+        "$search": {
+            "text": { "query": "refund", "path": "payload.text" },
+            "limit": 10_i64,
+        }
+    }];
+
+    let mut cursor = events
+        .aggregate(pipeline)
+        .await
+        .unwrap();
+    let mut hits: Vec<bson::Document> = Vec::new();
+    while let Some(r) = cursor.next().await {
+        hits.push(r.unwrap());
+    }
+
+    // Marker events must never appear in aggregate hits.
+    for h in &hits {
+        let payload = h.get_document("payload").unwrap();
+        assert!(
+            payload.get("_update_of").is_none(),
+            "aggregate returned a correction event: {h:?}"
+        );
+        assert!(
+            payload.get("_tombstone_of").is_none(),
+            "aggregate returned a tombstone event: {h:?}"
+        );
+    }
+    assert!(
+        !hits.is_empty(),
+        "search should still return the original refund event"
+    );
+}

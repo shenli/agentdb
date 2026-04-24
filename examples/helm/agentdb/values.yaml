@@ -1,0 +1,77 @@
+# AgentDB Helm values.
+#
+# This chart targets a single-node evaluation on a kubernetes
+# cluster. Multi-node clustering needs the shard-per-tablet
+# lease story plus a shared meta store — not modeled here.
+
+image:
+  repository: ghcr.io/shenli/agentdb
+  # Tag ships with the chart so a fresh pull from the chart
+  # never surprises an operator with `:latest` drift.
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Resources default to a conservative shape that fits on a
+# laptop k3d cluster. Bump for real workloads.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 2
+    memory: 2Gi
+
+service:
+  # Two ports: REST (+ dashboard + /metrics) and Mongo wire.
+  restPort: 7878
+  mongoPort: 7879
+
+# Persistent storage: 10Gi for the RocksDB KV dir + meta
+# SQLite + index snapshots. Object-store segments are NOT
+# kept here — point `agentdb` at S3 / GCS / MinIO for the
+# cold tier.
+persistence:
+  enabled: true
+  size: 10Gi
+  # Leave storageClassName empty to use the cluster default.
+  storageClassName: ""
+
+# Env passed straight to the container. Inline any
+# AGENTDB_* the design doc describes. Sensitive values
+# should come from secretEnv (below) in production.
+env:
+  AGENTDB_OBJECT_STORE: "local"
+  AGENTDB_BOXES: "4"
+  AGENTDB_ADMISSION_CAPACITY: "64"
+
+# Values pulled from a Secret rather than inline. Chart does
+# NOT create the Secret — operator provisions it separately
+# so a `helm install` doesn't dump credentials into state.
+secretEnv: {}
+# Example:
+#   secretEnv:
+#     AGENTDB_S3_SECRET_KEY:
+#       secretName: agentdb-s3
+#       key: secret-access-key
+
+# TLS is off by default. To terminate TLS inside the pod
+# instead of at the ingress, mount the cert/key via a Secret
+# and set `tls.enabled: true`.
+tls:
+  enabled: false
+  secretName: ""
+
+# Admin bearer-token auth. `false` leaves /api/admin/* open
+# (dev-mode-ish). Production should always set this.
+admin:
+  requireAuth: false
+
+# Optional scheduled backup. Writes to an emptyDir by
+# default — operators should mount a PVC or object-store
+# CSI when they actually care about the backups surviving
+# the pod.
+backup:
+  enabled: false
+  intervalSeconds: 86400  # daily
+  retain: 7
+  path: "/backups"

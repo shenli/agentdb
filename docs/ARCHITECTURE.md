@@ -1417,6 +1417,15 @@ The folding primitive is `agentdb_core::fold_events` —
 two-pass, O(n), pure. Unit-tested in isolation from any
 transport.
 
+Aggregate (`$search` / `$vectorSearch`) also filters out
+correction and tombstone events from the hit set so a
+search for "status: shipped" doesn't return the correction
+event alongside the original it was updating. This is a
+single-pass filter, not a full cross-reference fold — a
+hit whose later tombstone doesn't itself match the search
+will still appear. Full reconciliation would require
+loading every hit's full session log and is deferred.
+
 Both commands require the filter to carry a top-level
 `session_id` equality. An unscoped
 `updateMany({status: "x"})` would scan every session — a
