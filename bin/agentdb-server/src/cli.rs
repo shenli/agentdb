@@ -250,6 +250,10 @@ pub struct AdminTokenAddOpts {
     /// Free-form label for this token (shown in `list`).
     #[arg(long)]
     pub description: Option<String>,
+    /// RBAC scope: `admin` (default) or `readonly`. Readonly
+    /// tokens can only issue GETs against `/api/admin/*`.
+    #[arg(long, default_value = "admin")]
+    pub scope: String,
     /// Bearer token to authenticate this request. Not
     /// needed for the bootstrap mint (no tokens exist
     /// yet). Falls back to the AGENTDB_ADMIN_TOKEN env var.

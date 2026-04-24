@@ -300,7 +300,10 @@ M18+ milestones added:
   First-mint bootstrap exception lets operators obtain the
   initial token without out-of-band DB access.
   `agentdb admin-token add|list|revoke`; admin CLI
-  subcommands pick up `$AGENTDB_ADMIN_TOKEN` automatically
+  subcommands pick up `$AGENTDB_ADMIN_TOKEN` automatically.
+  Tokens carry an RBAC scope: `admin` (default) or
+  `readonly` (GET-only; mutations return 403). Scope-403s
+  show up in the audit log with the actor_token_id
 - **REST TLS termination** — `--tls-cert` / `--tls-key`
   (or env vars) serve HTTPS via rustls + axum-server.
   `agentdb serve --dev-tls` generates an ephemeral

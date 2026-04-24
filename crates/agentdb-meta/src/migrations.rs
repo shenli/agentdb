@@ -44,6 +44,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "global per-tenant rate limits",
         include_str!("../migrations/006_tenant_quotas.sql"),
     ),
+    (
+        7,
+        "admin token scope (RBAC)",
+        include_str!("../migrations/007_admin_token_scope.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to the given pool.

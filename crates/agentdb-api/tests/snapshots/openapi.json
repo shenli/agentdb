@@ -1637,6 +1637,14 @@
   },
   "components": {
     "schemas": {
+      "AdminScope": {
+        "type": "string",
+        "description": "Scope of an admin token — what the bearer is allowed to do.\nChecked by the admin-auth middleware against the HTTP\nmethod of the incoming request.",
+        "enum": [
+          "admin",
+          "readonly"
+        ]
+      },
       "AppendAndFetchRequest": {
         "type": "object",
         "required": [
@@ -2730,6 +2738,17 @@
               "null"
             ],
             "description": "Free-form label so operators can tell tokens apart.\nShown in the list endpoint; never used for auth."
+          },
+          "scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdminScope",
+                "description": "RBAC scope: `admin` (default) or `readonly`. Readonly\ntokens can only issue GET requests against\n`/api/admin/*`; every other method returns 403."
+              }
+            ]
           }
         }
       },
@@ -2739,7 +2758,8 @@
           "token_id",
           "token",
           "description",
-          "created_at_ms"
+          "created_at_ms",
+          "scope"
         ],
         "properties": {
           "created_at_ms": {
@@ -2748,6 +2768,10 @@
           },
           "description": {
             "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/AdminScope",
+            "description": "RBAC scope of the minted token."
           },
           "token": {
             "type": "string",
@@ -3697,7 +3721,8 @@
         "required": [
           "token_id",
           "description",
-          "created_at_ms"
+          "created_at_ms",
+          "scope"
         ],
         "properties": {
           "created_at_ms": {
@@ -3713,6 +3738,9 @@
               "null"
             ],
             "format": "int64"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/AdminScope"
           },
           "token_id": {
             "type": "string"

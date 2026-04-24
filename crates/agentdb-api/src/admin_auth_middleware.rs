@@ -13,12 +13,23 @@
 //! - `Some { meta }` + tokens exist → `Authorization:
 //!   Bearer <token>` required; look up, verify hash, allow.
 //!
+//! RBAC (scope enforcement): each token carries a scope.
+//!
+//! - `admin` — any method on `/api/admin/*`.
+//! - `readonly` — `GET` only; `POST/PUT/DELETE` return 403.
+//!
+//! The check runs after token verification, before dispatch.
+//! A scope-403 is still audited with the actor_token_id so
+//! operators can see "alice tried to revoke a token but
+//! couldn't" in the audit log.
+//!
 //! Audit: every request that reaches the middleware (when
 //! admin_auth is configured) writes one row to
-//! `admin_audit`, whether authenticated, bootstrap, or 401.
-//! The insert happens after the downstream response so we
-//! can log the status code; the middleware swallows insert
-//! errors (but logs them) rather than failing the request.
+//! `admin_audit`, whether authenticated, bootstrap, 401,
+//! or scope-403. The insert happens after the downstream
+//! response so we can log the status code; the middleware
+//! swallows insert errors (but logs them) rather than
+//! failing the request.
 //!
 //! Always open: `/health/*`, `/metrics`, `/openapi.json`,
 //! `/dashboard`, `/api/stream`. Those don't live under
@@ -28,8 +39,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdb_meta::{admin_tokens, audit, MetaStore};
+use agentdb_meta::admin_tokens::AdminScope;
 use axum::extract::{Request, State};
-use axum::http::header;
+use axum::http::{header, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -76,13 +88,11 @@ pub async fn admin_auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer ").map(|rest| rest.trim().to_string()));
 
-    // Decide the request's fate. Returns a tuple of
-    // (Option<actor_token_id>, Option<Response>) — the
-    // response slot is `Some` when auth rejected the
-    // request before we dispatched to the next layer.
-    let (actor_token_id, reject): (Option<String>, Option<Response>) = {
-        // Bootstrap exception: no tokens active AND this is
-        // the bootstrap mint path → allow unauthenticated.
+    // Decide the request's fate. `actor` is `Some(token_id,
+    // scope)` when auth succeeded, `None` for bootstrap /
+    // rejected requests. `reject` is `Some` when we already
+    // shaped a 4xx/5xx response (auth failure, scope block).
+    let (actor, mut reject): (Option<(String, AdminScope)>, Option<Response>) = {
         if path == BOOTSTRAP_MINT_PATH && method == BOOTSTRAP_MINT_METHOD {
             match admin_tokens::count_active(meta.pool()).await {
                 Ok(0) => (None, None),
@@ -99,6 +109,24 @@ pub async fn admin_auth_middleware(
             authenticate(&meta, presented.as_deref()).await
         }
     };
+
+    // Scope check: readonly tokens can only GET.
+    if reject.is_none() {
+        if let Some((_, scope)) = &actor {
+            if !scope_permits(*scope, req.method()) {
+                reject = Some(
+                    ApiError::Forbidden(format!(
+                        "this token has scope '{}' and cannot perform a {} request",
+                        scope.as_str(),
+                        method,
+                    ))
+                    .into_response(),
+                );
+            }
+        }
+    }
+
+    let actor_token_id = actor.map(|(id, _)| id);
 
     let response = match reject {
         Some(r) => r,
@@ -131,7 +159,7 @@ pub async fn admin_auth_middleware(
 async fn authenticate(
     meta: &MetaStore,
     presented: Option<&str>,
-) -> (Option<String>, Option<Response>) {
+) -> (Option<(String, AdminScope)>, Option<Response>) {
     let Some(token) = presented else {
         return (
             None,
@@ -139,7 +167,7 @@ async fn authenticate(
         );
     };
     match admin_tokens::verify(meta.pool(), token).await {
-        Ok(Some(id)) => (Some(id), None),
+        Ok(Some((id, scope))) => (Some((id, scope)), None),
         Ok(None) => (
             None,
             Some(
@@ -151,6 +179,19 @@ async fn authenticate(
             None,
             Some(ApiError::Internal(format!("admin auth: verify: {e}")).into_response()),
         ),
+    }
+}
+
+/// Decide whether `scope` permits `method` on an admin-plane
+/// request. Admin tokens can do anything; readonly tokens
+/// can only GET. HEAD and OPTIONS aren't used by the admin
+/// surface today — refuse to make a decision about them
+/// (returns false) so a future route addition doesn't quietly
+/// let a readonly token through.
+fn scope_permits(scope: AdminScope, method: &Method) -> bool {
+    match scope {
+        AdminScope::Admin => true,
+        AdminScope::Readonly => method == Method::GET,
     }
 }
 

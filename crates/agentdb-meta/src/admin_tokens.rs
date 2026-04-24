@@ -29,6 +29,54 @@ pub const TOKEN_PREFIX: &str = "agentdb_";
 /// brute-force cost at this size.
 pub const TOKEN_BYTES: usize = 32;
 
+/// Scope of an admin token — what the bearer is allowed to do.
+/// Checked by the admin-auth middleware against the HTTP
+/// method of the incoming request.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminScope {
+    /// Full access: every `/api/admin/*` endpoint, any method.
+    Admin,
+    /// Read-only: only `GET` against `/api/admin/*`. Mutations
+    /// (POST/PUT/DELETE) return 403.
+    Readonly,
+}
+
+impl AdminScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdminScope::Admin => "admin",
+            AdminScope::Readonly => "readonly",
+        }
+    }
+
+    /// Parse from the persisted string form. Unknown values map
+    /// to `Admin` so an operator rolling back the code with the
+    /// migrated schema still gets a functional token (the column
+    /// default is `admin`, but this is belt-and-braces).
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "readonly" => AdminScope::Readonly,
+            _ => AdminScope::Admin,
+        }
+    }
+}
+
+impl Default for AdminScope {
+    fn default() -> Self {
+        AdminScope::Admin
+    }
+}
+
 /// Summary of a minted token. Never carries the plaintext.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenSummary {
@@ -36,6 +84,8 @@ pub struct TokenSummary {
     pub description: String,
     pub created_at_ms: i64,
     pub revoked_at_ms: Option<i64>,
+    #[serde(default)]
+    pub scope: AdminScope,
 }
 
 /// Return of [`mint`]. The `plaintext` field is the ONLY time
@@ -51,10 +101,12 @@ pub struct MintedToken {
 /// Create a new token. Server generates the random bytes so
 /// callers can't accidentally mint weak tokens. `description`
 /// is free-form — operators use it to remember what a token
-/// is for ("grafana", "alice").
+/// is for ("grafana", "alice"). `scope` gates what the token
+/// can do; see [`AdminScope`].
 pub async fn mint(
     pool: &SqlitePool,
     description: &str,
+    scope: AdminScope,
     now_ms: i64,
 ) -> MetaResult<MintedToken> {
     let mut raw = [0u8; TOKEN_BYTES];
@@ -67,13 +119,14 @@ pub async fn mint(
     let token_id = short_id(&hash_b64);
 
     sqlx::query(
-        "INSERT INTO admin_tokens (token_id, token_hash_b64, description, created_at_ms, revoked_at_ms)
-             VALUES (?, ?, ?, ?, NULL)",
+        "INSERT INTO admin_tokens (token_id, token_hash_b64, description, created_at_ms, revoked_at_ms, scope)
+             VALUES (?, ?, ?, ?, NULL, ?)",
     )
     .bind(&token_id)
     .bind(&hash_b64)
     .bind(description)
     .bind(now_ms)
+    .bind(scope.as_str())
     .execute(pool)
     .await?;
 
@@ -83,6 +136,7 @@ pub async fn mint(
             description: description.to_string(),
             created_at_ms: now_ms,
             revoked_at_ms: None,
+            scope,
         },
         token_id,
         plaintext,
@@ -99,38 +153,40 @@ pub async fn mint(
 /// real deployment would index on a prefix to cut the scan
 /// down, but per-request cost is already a single atomic
 /// per entry.
-pub async fn verify(pool: &SqlitePool, presented: &str) -> MetaResult<Option<String>> {
+pub async fn verify(
+    pool: &SqlitePool,
+    presented: &str,
+) -> MetaResult<Option<(String, AdminScope)>> {
     let candidate = B64.encode(sha256(presented.as_bytes()));
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT token_id, token_hash_b64 FROM admin_tokens WHERE revoked_at_ms IS NULL",
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT token_id, token_hash_b64, scope FROM admin_tokens WHERE revoked_at_ms IS NULL",
     )
     .fetch_all(pool)
     .await?;
     // Walk all rows even after a match, to keep timing
-    // independent of token position. The `match_found` Choice
-    // aggregates matches; we materialize it at the end.
-    let mut matched_id: Option<String> = None;
-    for (id, hash) in rows {
+    // independent of token position.
+    let mut matched: Option<(String, AdminScope)> = None;
+    for (id, hash, scope) in rows {
         if candidate
             .as_bytes()
             .ct_eq(hash.as_bytes())
             .unwrap_u8()
             == 1
         {
-            // First match wins — the index is UNIQUE, so there
-            // can't be two.
-            if matched_id.is_none() {
-                matched_id = Some(id);
+            // First match wins — the hash index is UNIQUE, so
+            // there can't be two.
+            if matched.is_none() {
+                matched = Some((id, AdminScope::from_stored(&scope)));
             }
         }
     }
-    Ok(matched_id)
+    Ok(matched)
 }
 
 /// Every non-revoked token, ordered by `created_at_ms`.
 pub async fn list_active(pool: &SqlitePool) -> MetaResult<Vec<TokenSummary>> {
-    let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT token_id, description, created_at_ms, revoked_at_ms
+    let rows: Vec<(String, String, i64, Option<i64>, String)> = sqlx::query_as(
+        "SELECT token_id, description, created_at_ms, revoked_at_ms, scope
            FROM admin_tokens
           WHERE revoked_at_ms IS NULL
           ORDER BY created_at_ms ASC, token_id ASC",
@@ -139,11 +195,12 @@ pub async fn list_active(pool: &SqlitePool) -> MetaResult<Vec<TokenSummary>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, desc, created, revoked)| TokenSummary {
+        .map(|(id, desc, created, revoked, scope)| TokenSummary {
             token_id: id,
             description: desc,
             created_at_ms: created,
             revoked_at_ms: revoked,
+            scope: AdminScope::from_stored(&scope),
         })
         .collect())
 }
@@ -211,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn mint_returns_plaintext_and_persists_hash() {
         let p = pool().await;
-        let minted = mint(&p, "bootstrap", 100).await.unwrap();
+        let minted = mint(&p, "bootstrap", AdminScope::Admin, 100).await.unwrap();
         assert!(minted.plaintext.starts_with(TOKEN_PREFIX));
         // Plaintext never hits the DB.
         let (rows,): (i64,) = sqlx::query_as(
@@ -225,17 +282,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_by_presented_plaintext_returns_token_id() {
+    async fn verify_by_presented_plaintext_returns_token_id_and_scope() {
         let p = pool().await;
-        let minted = mint(&p, "alice", 100).await.unwrap();
-        let found = verify(&p, &minted.plaintext).await.unwrap();
-        assert_eq!(found.as_deref(), Some(minted.token_id.as_str()));
+        let minted = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
+        let found = verify(&p, &minted.plaintext).await.unwrap().unwrap();
+        assert_eq!(found.0, minted.token_id);
+        assert_eq!(found.1, AdminScope::Admin);
     }
 
     #[tokio::test]
     async fn verify_rejects_unknown_token() {
         let p = pool().await;
-        mint(&p, "alice", 100).await.unwrap();
+        mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
         let found = verify(&p, "agentdb_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
             .await
             .unwrap();
@@ -245,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn verify_rejects_revoked_token() {
         let p = pool().await;
-        let minted = mint(&p, "alice", 100).await.unwrap();
+        let minted = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
         assert!(revoke(&p, &minted.token_id, 200).await.unwrap());
         let found = verify(&p, &minted.plaintext).await.unwrap();
         assert_eq!(found, None, "revoked tokens must not verify");
@@ -254,8 +312,8 @@ mod tests {
     #[tokio::test]
     async fn list_active_excludes_revoked() {
         let p = pool().await;
-        let a = mint(&p, "alice", 100).await.unwrap();
-        let b = mint(&p, "bob", 200).await.unwrap();
+        let a = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
+        let b = mint(&p, "bob", AdminScope::Admin, 200).await.unwrap();
         revoke(&p, &b.token_id, 300).await.unwrap();
         let active = list_active(&p).await.unwrap();
         let ids: Vec<_> = active.iter().map(|t| t.token_id.as_str()).collect();
@@ -265,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_is_idempotent() {
         let p = pool().await;
-        let t = mint(&p, "alice", 100).await.unwrap();
+        let t = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
         assert!(revoke(&p, &t.token_id, 200).await.unwrap());
         assert!(!revoke(&p, &t.token_id, 300).await.unwrap());
         assert!(!revoke(&p, "nonexistent", 400).await.unwrap());
@@ -275,10 +333,35 @@ mod tests {
     async fn count_active_tracks_mints_and_revokes() {
         let p = pool().await;
         assert_eq!(count_active(&p).await.unwrap(), 0);
-        let a = mint(&p, "a", 100).await.unwrap();
-        let _b = mint(&p, "b", 200).await.unwrap();
+        let a = mint(&p, "a", AdminScope::Admin, 100).await.unwrap();
+        let _b = mint(&p, "b", AdminScope::Admin, 200).await.unwrap();
         assert_eq!(count_active(&p).await.unwrap(), 2);
         revoke(&p, &a.token_id, 300).await.unwrap();
         assert_eq!(count_active(&p).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn readonly_scope_roundtrips_through_list() {
+        let p = pool().await;
+        let _ = mint(&p, "grafana", AdminScope::Readonly, 100).await.unwrap();
+        let _ = mint(&p, "cron", AdminScope::Admin, 200).await.unwrap();
+        let active = list_active(&p).await.unwrap();
+        let scopes: std::collections::HashMap<&str, AdminScope> = active
+            .iter()
+            .map(|t| (t.description.as_str(), t.scope))
+            .collect();
+        assert_eq!(scopes.get("grafana").copied(), Some(AdminScope::Readonly));
+        assert_eq!(scopes.get("cron").copied(), Some(AdminScope::Admin));
+    }
+
+    #[tokio::test]
+    async fn verify_returns_the_token_s_scope() {
+        let p = pool().await;
+        let r = mint(&p, "r", AdminScope::Readonly, 10).await.unwrap();
+        let a = mint(&p, "a", AdminScope::Admin, 20).await.unwrap();
+        let v_r = verify(&p, &r.plaintext).await.unwrap().unwrap();
+        let v_a = verify(&p, &a.plaintext).await.unwrap().unwrap();
+        assert_eq!(v_r.1, AdminScope::Readonly);
+        assert_eq!(v_a.1, AdminScope::Admin);
     }
 }

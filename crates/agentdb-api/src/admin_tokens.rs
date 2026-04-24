@@ -26,6 +26,11 @@ pub struct MintTokenRequest {
     /// Shown in the list endpoint; never used for auth.
     #[serde(default)]
     pub description: Option<String>,
+    /// RBAC scope: `admin` (default) or `readonly`. Readonly
+    /// tokens can only issue GET requests against
+    /// `/api/admin/*`; every other method returns 403.
+    #[serde(default)]
+    pub scope: Option<admin_tokens::AdminScope>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -37,6 +42,8 @@ pub struct MintTokenResponse {
     pub token: String,
     pub description: String,
     pub created_at_ms: i64,
+    /// RBAC scope of the minted token.
+    pub scope: admin_tokens::AdminScope,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -45,6 +52,7 @@ pub struct TokenSummaryView {
     pub description: String,
     pub created_at_ms: i64,
     pub revoked_at_ms: Option<i64>,
+    pub scope: admin_tokens::AdminScope,
 }
 
 impl From<admin_tokens::TokenSummary> for TokenSummaryView {
@@ -54,6 +62,7 @@ impl From<admin_tokens::TokenSummary> for TokenSummaryView {
             description: t.description,
             created_at_ms: t.created_at_ms,
             revoked_at_ms: t.revoked_at_ms,
+            scope: t.scope,
         }
     }
 }
@@ -79,8 +88,9 @@ pub async fn mint_token(
         ));
     };
     let description = body.description.unwrap_or_default();
+    let scope = body.scope.unwrap_or_default();
     let now_ms = crate::stream::now_ms() as i64;
-    let minted = admin_tokens::mint(meta.pool(), &description, now_ms)
+    let minted = admin_tokens::mint(meta.pool(), &description, scope, now_ms)
         .await
         .map_err(|e| ApiError::Internal(format!("mint token: {e}")))?;
     Ok(Json(MintTokenResponse {
@@ -88,6 +98,7 @@ pub async fn mint_token(
         token: minted.plaintext,
         description: minted.summary.description,
         created_at_ms: minted.summary.created_at_ms,
+        scope: minted.summary.scope,
     }))
 }
 
