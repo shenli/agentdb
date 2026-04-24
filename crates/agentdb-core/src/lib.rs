@@ -1,6 +1,8 @@
 //! AgentDB core types, metadata registries, and box runtime.
 
 pub mod admission;
+pub mod backup;
+pub mod backup_scheduler;
 pub mod box_runtime;
 pub mod error;
 pub mod forwarding;
@@ -34,6 +36,12 @@ pub mod tiering;
 pub mod types;
 
 pub use admission::{AdmissionDenied, Scope, TokenBucket};
+pub use backup::{
+    list_backup_dirs, prune_backup_dirs, run_backup, BackupManifest, BACKUP_MANIFEST_VERSION,
+};
+pub use backup_scheduler::{
+    BackupScheduler, BackupSchedulerConfig, BackupSchedulerHandle, BackupSchedulerStatus,
+};
 pub use box_runtime::{
     BoxRegistry, Box_, FaultKind, InjectedFault, Quota, RouteDecision,
     DEFAULT_ADMISSION_CAPACITY,

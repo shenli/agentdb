@@ -366,7 +366,13 @@ M18+ milestones added:
   SQLite VACUUM INTO into a destination directory.
   `POST /api/admin/backup` or
   `agentdb backup --out /abs/path`. Restore is offline —
-  copy the files into the target dirs and restart
+  copy the files into the target dirs and restart.
+  Optional scheduler via `AGENTDB_BACKUP_INTERVAL_SECS`
+  + `AGENTDB_BACKUP_DIR` + `AGENTDB_BACKUP_RETAIN` runs
+  leader-gated periodic backups and prunes older copies.
+  Status + counters on `GET /api/admin/backup/status`
+  and `agentdb_backup_runs_total{failures,…}` on
+  `/metrics`
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

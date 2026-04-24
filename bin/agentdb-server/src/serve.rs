@@ -575,6 +575,42 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("slow-query buffer already attached"))?;
     }
 
+    // Scheduled backup. Off by default. When
+    // AGENTDB_BACKUP_INTERVAL_SECS is set, the scheduler loop
+    // runs on the current leader; followers stay idle. Status
+    // handle is always attached to the registry so admin
+    // endpoints can read last-run info regardless of leader
+    // state — the value carries `enabled=false` on followers.
+    match agentdb_core::BackupSchedulerConfig::from_env() {
+        Ok(Some(backup_cfg)) => {
+            tracing::info!(
+                base_dir = %backup_cfg.base_dir.display(),
+                interval_secs = backup_cfg.interval.as_secs(),
+                retain = backup_cfg.retain,
+                "starting scheduled backup loop (leader-gated)",
+            );
+            let scheduler = agentdb_core::BackupScheduler::start(
+                registry.kv().clone(),
+                meta.clone(),
+                election.clone(),
+                Some(cfg.node_id.clone()),
+                backup_cfg,
+            );
+            registry
+                .attach_backup_status(scheduler.status_handle())
+                .map_err(|_| anyhow::anyhow!("backup scheduler status already attached"))?;
+            std::mem::forget(scheduler);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "scheduled backup off (AGENTDB_BACKUP_INTERVAL_SECS unset)"
+            );
+        }
+        Err(msg) => {
+            anyhow::bail!("backup scheduler config: {msg}");
+        }
+    }
+
     // Stale-lease reaper. Started after the location proxy so it
     // can refresh the local cache immediately after reassigning
     // shards away from a reaped tablet (M22).

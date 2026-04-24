@@ -1248,6 +1248,28 @@ lease mechanism re-acquires ownership.
 **Admin surface.** CLI wrapper:
 `agentdb backup --out /abs/path`.
 
+**Scheduled backups.** When `AGENTDB_BACKUP_INTERVAL_SECS`
+and `AGENTDB_BACKUP_DIR` are both set, the server starts
+a background loop that fires one backup per interval on
+the **scheduler leader** (multi-node clusters don't
+produce duplicate copies — followers sleep). Each run
+writes to `<base>/backup-<ms>/`; after success, a
+retention pass keeps the newest
+`AGENTDB_BACKUP_RETAIN` dirs (default 7; `0` disables
+retention). Failures bump a counter but never remove
+prior copies — a failed prune never destroys the last
+good backup.
+
+Observability: `GET /api/admin/backup/status` returns
+last-success / last-failure info and counters. `/metrics`
+emits `agentdb_backup_runs_total`,
+`agentdb_backup_failures_total`, and
+`agentdb_backup_last_success_ts_seconds`. Only the
+process running the scheduler attaches the status
+handle; followers return defaults, so a dashboard polling
+any node never has to special-case "who has the
+scheduler."
+
 Out of scope: object-store segments (cold/archive
 blobs) — those are content-addressed and immutable, so
 operators back up S3 / GCS separately using the
@@ -1255,9 +1277,11 @@ provider's own tooling; the manifest records which
 segments exist via the meta tablets table and the
 existing index snapshots, so a backup+restore on a
 fresh bucket is recoverable as long as the segments are
-restored alongside. Automated scheduling (cron-like
-backup cadence) — operators call the endpoint
-themselves; scheduling is a policy concern.
+restored alongside. Cron-style precision (specific times
+of day / weekdays) — operators who need that use systemd
+timers or their platform's scheduler to fire
+`agentdb backup` directly; the interval loop is the
+zero-dependency option.
 
 ### TLS termination
 

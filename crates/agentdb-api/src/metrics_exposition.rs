@@ -288,6 +288,50 @@ fn render(state: &AppState) -> String {
         }
     }
 
+    // Scheduled-backup counters. Zero-cardinality gauges +
+    // counters — one global series each. Only emitted when
+    // the scheduler is configured on this process.
+    if let Some(bh) = state.registry.backup_status() {
+        let snap = bh.snapshot();
+        writeln!(
+            out,
+            "# HELP agentdb_backup_runs_total Successful scheduled backups since process start"
+        )
+        .ok();
+        writeln!(out, "# TYPE agentdb_backup_runs_total counter").ok();
+        writeln!(out, "agentdb_backup_runs_total {}", snap.runs_total).ok();
+        writeln!(
+            out,
+            "# HELP agentdb_backup_failures_total Failed scheduled backup attempts since process start"
+        )
+        .ok();
+        writeln!(out, "# TYPE agentdb_backup_failures_total counter").ok();
+        writeln!(
+            out,
+            "agentdb_backup_failures_total {}",
+            snap.failures_total
+        )
+        .ok();
+        if let Some(ts) = snap.last_success_ms {
+            writeln!(
+                out,
+                "# HELP agentdb_backup_last_success_ts_seconds Unix-seconds timestamp of the most recent successful scheduled backup"
+            )
+            .ok();
+            writeln!(
+                out,
+                "# TYPE agentdb_backup_last_success_ts_seconds gauge"
+            )
+            .ok();
+            writeln!(
+                out,
+                "agentdb_backup_last_success_ts_seconds {}",
+                ts / 1000
+            )
+            .ok();
+        }
+    }
+
     // Global per-tenant rate-limit denies. One series per
     // tenant that has ever denied on this process; absent
     // series (no denies yet) are Prometheus-equivalent to
