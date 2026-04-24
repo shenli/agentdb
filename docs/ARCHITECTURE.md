@@ -591,7 +591,20 @@ the Server-Sent Events channel; the server broadcasts:
 
 The dashboard (`crates/agentdb-dashboard/static/app.js`) consumes both
 the snapshot endpoint and the SSE stream to render box tiles + event
-feed live.
+feed live. The page is tabbed: Overview (boxes + events), Slow queries
+(`GET /api/admin/slow-queries`), Audit log
+(`GET /api/admin/audit`), Tokens (mint / list / revoke with RBAC
+scope), and Tenant quotas (list / PUT / DELETE). Each admin tab
+polls its endpoint every ~5s and only when visible.
+
+**Auth.** An `<input>` in the header accepts an admin bearer
+token, which the dashboard persists in `localStorage` under
+`agentdb.admin.token` and sends as `Authorization: Bearer ...`
+on every admin fetch. On an auth-less dev server the input
+stays empty and requests go through plaintext. Non-2xx
+responses surface a human-readable hint inline (401 → "set an
+admin token above", 403 → "this token lacks the required
+scope", 503 → "meta store not configured"); no silent failures.
 
 ## Control plane (M18 and later)
 

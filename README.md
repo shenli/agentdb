@@ -21,7 +21,7 @@ when you actually build them.
 | **3-tier lifecycle** | Warm → cold → archive, with a pluggable object store underneath. Tier transitions emit webhooks so you can fan out derived data (summaries, embeddings, archival copies). |
 | **Per-box isolation** | Tenants FNV-route to boxes. Each box has its own metrics, quota, token-bucket admission control, fault injection, webhook URL. |
 | **Pluggable KV** | RocksDB (local disk) or SlateDB (object store — S3 / MinIO). Swap via one env var. |
-| **Live dashboard** | Alpine.js page at `/dashboard`, driven by `/api/admin/boxes` + a Server-Sent Events stream of tier changes, forks, fault injections, rate-limit hits, and per-second metric ticks. |
+| **Live dashboard** | Tabbed Alpine.js page at `/dashboard`: overview (box grid + SSE event feed), slow queries, audit log, token mint/revoke, tenant-quota editor. Takes an admin bearer token in the header input and stores it in `localStorage`. |
 
 ---
 
