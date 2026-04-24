@@ -136,6 +136,108 @@ async fn resolve_tls(
     Ok(None)
 }
 
+/// Pull every row from `tenant_quotas` and hydrate the
+/// in-memory registry. Used both at startup and on reload.
+async fn hydrate_tenant_quotas(
+    registry: &Arc<agentdb_core::TenantQuotaRegistry>,
+    meta: &Arc<agentdb_meta::MetaStore>,
+) -> anyhow::Result<agentdb_core::TenantQuotaReloadDiff> {
+    let persisted = agentdb_meta::tenant_quotas::list_all(meta.pool())
+        .await
+        .context("load tenant_quotas from meta")?;
+    let rows: Vec<(String, agentdb_core::TenantQuotaConfig)> = persisted
+        .into_iter()
+        .map(|q| {
+            (
+                q.tenant_id,
+                agentdb_core::TenantQuotaConfig {
+                    max_qps: q.max_qps,
+                    burst: q.burst,
+                },
+            )
+        })
+        .collect();
+    let diff = registry.hydrate(&rows);
+    tracing::info!(
+        hydrated = rows.len(),
+        added = diff.added.len(),
+        removed = diff.removed.len(),
+        "global per-tenant rate limits hydrated from meta",
+    );
+    Ok(diff)
+}
+
+/// Run one hot-reload cycle. Called from both the admin
+/// endpoint and the SIGHUP handler. Each target is
+/// best-effort: failure of one subsystem (e.g. a bad
+/// `RUST_LOG` string) doesn't abort the others, and the
+/// running values for those that did apply stay in effect.
+async fn do_reload(
+    meta: &Arc<agentdb_meta::MetaStore>,
+    quota_registry: &Arc<agentdb_core::TenantQuotaRegistry>,
+    registry: &Arc<agentdb_core::BoxRegistry>,
+    tracing_reload: &crate::tracing_init::TracingReloadHandle,
+) -> Result<agentdb_api::admin_reload::ReloadSummary, String> {
+    use agentdb_api::admin_reload::ReloadSummary;
+
+    // 1. Tenant quotas — re-read from meta. Errors propagate
+    //    because an unavailable meta store is a hard failure;
+    //    operators need to see the 500.
+    let diff = hydrate_tenant_quotas(quota_registry, meta)
+        .await
+        .map_err(|e| format!("hydrate tenant quotas: {e:#}"))?;
+
+    // 2. Slow-query buffer — bump threshold + capacity from
+    //    env if present. If the buffer isn't attached (test
+    //    registry / AGENTDB_SLOW_QUERY_DISABLE), skip; no
+    //    operator change is possible there anyway.
+    let slow = registry.slow_queries();
+    if let Some(buf) = &slow {
+        if let Some(ms) = std::env::var("AGENTDB_SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            buf.set_threshold_ms(ms);
+        }
+        if let Some(cap) = std::env::var("AGENTDB_SLOW_QUERY_BUFFER_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            buf.set_capacity(cap);
+        }
+    }
+
+    // 3. Tracing filter — only apply if `RUST_LOG` is set.
+    //    Malformed filters don't disrupt the existing one;
+    //    we surface the error in the response so operators
+    //    know their change didn't land.
+    let mut tracing_filter_applied = String::new();
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        match tracing_reload.reload(&filter) {
+            Ok(()) => tracing_filter_applied = filter,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "reload: tracing filter rejected; previous filter kept"
+            ),
+        }
+    }
+
+    let slow_threshold = slow.as_ref().map(|b| b.threshold_ms()).unwrap_or(0);
+    let slow_capacity = slow.as_ref().map(|b| b.capacity() as u64).unwrap_or(0);
+
+    Ok(ReloadSummary {
+        slow_query_threshold_ms: slow_threshold,
+        slow_query_buffer_capacity: slow_capacity,
+        tracing_filter: tracing_filter_applied,
+        tenant_quotas_added: diff.added,
+        tenant_quotas_removed: diff.removed,
+        reloaded_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    })
+}
+
 /// Resolve TLS for the Mongo wire listener. Flag pair
 /// (`--mongo-tls-cert` + `--mongo-tls-key`) wins; otherwise
 /// env pair (`AGENTDB_MONGO_TLS_CERT` + `AGENTDB_MONGO_TLS_KEY`);
@@ -335,7 +437,10 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
 /// Entry point for `agentdb serve`. Consumes parsed flags, resolves
 /// them against env + defaults (dev mode if requested), and runs
 /// until either the HTTP or Mongo listener task terminates.
-pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
+pub async fn run(
+    opts: ServeOpts,
+    tracing_reload: crate::tracing_init::TracingReloadHandle,
+) -> anyhow::Result<()> {
     let cfg = resolve_config(&opts)?;
     if opts.dev {
         tracing::info!("running in dev mode (ephemeral state — nothing persists across restart)");
@@ -532,24 +637,7 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
     // avoids a cold-start window where a quota'd tenant is
     // unthrottled.
     let tenant_quota_registry = Arc::new(agentdb_core::TenantQuotaRegistry::new());
-    {
-        let persisted = agentdb_meta::tenant_quotas::list_all(meta.pool())
-            .await
-            .context("load tenant_quotas from meta")?;
-        for q in &persisted {
-            tenant_quota_registry.set(
-                &q.tenant_id,
-                agentdb_core::TenantQuotaConfig {
-                    max_qps: q.max_qps,
-                    burst: q.burst,
-                },
-            );
-        }
-        tracing::info!(
-            hydrated = persisted.len(),
-            "global per-tenant rate limits hydrated from meta",
-        );
-    }
+    hydrate_tenant_quotas(&tenant_quota_registry, &meta).await?;
     registry
         .attach_tenant_quotas(tenant_quota_registry.clone())
         .map_err(|_| anyhow::anyhow!("tenant quota registry already attached"))?;
@@ -859,12 +947,64 @@ pub async fn run(opts: ServeOpts) -> anyhow::Result<()> {
         });
     }
 
+    // Reload engine: a closure that re-reads env + meta and
+    // pushes fresh values into the live subsystems. Shared
+    // by the POST /api/admin/reload handler and the SIGHUP
+    // task below.
+    let reload_handle: agentdb_api::admin_reload::ReloadHandle = {
+        let meta = meta.clone();
+        let quota_registry = tenant_quota_registry.clone();
+        let registry_for_reload = registry.clone();
+        let tracing_reload = tracing_reload.clone();
+        Arc::new(move || {
+            let meta = meta.clone();
+            let quota_registry = quota_registry.clone();
+            let registry = registry_for_reload.clone();
+            let tracing_reload = tracing_reload.clone();
+            Box::pin(async move {
+                do_reload(&meta, &quota_registry, &registry, &tracing_reload).await
+            })
+        })
+    };
+
+    // SIGHUP handler (unix). Firing SIGHUP runs the same
+    // logic as POST /api/admin/reload; admin CLIs that prefer
+    // signals (nginx muscle memory) get the same thing.
+    #[cfg(unix)]
+    {
+        let reload_for_signal = reload_handle.clone();
+        tokio::spawn(async move {
+            let mut stream = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGHUP handler install failed; hot-reload requires POST /api/admin/reload");
+                    return;
+                }
+            };
+            while stream.recv().await.is_some() {
+                tracing::info!("SIGHUP received; reloading config");
+                match (reload_for_signal)().await {
+                    Ok(summary) => tracing::info!(
+                        slow_query_threshold_ms = summary.slow_query_threshold_ms,
+                        tenant_quotas_added = summary.tenant_quotas_added.len(),
+                        tenant_quotas_removed = summary.tenant_quotas_removed.len(),
+                        "SIGHUP reload complete",
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "SIGHUP reload failed"),
+                }
+            }
+        });
+    }
+
     let app = router(http_state)
         .layer(axum::Extension(meta.clone()))
         .layer(axum::Extension(election.clone()))
         .layer(axum::Extension(reaper.clone()))
         .layer(axum::Extension(hot_detector.clone()))
-        .layer(axum::Extension(location_proxy.clone()));
+        .layer(axum::Extension(location_proxy.clone()))
+        .layer(axum::Extension(reload_handle));
     // Resolve TLS config. Explicit flags win; else env
     // vars; else `--dev-tls` ephemeral; else plaintext.
     let tls_cfg = resolve_tls(&opts).await?;

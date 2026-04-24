@@ -373,6 +373,11 @@ M18+ milestones added:
   Status + counters on `GET /api/admin/backup/status`
   and `agentdb_backup_runs_total{failures,…}` on
   `/metrics`
+- **Config hot-reload** — `POST /api/admin/reload` (or
+  `SIGHUP`, or `agentdb reload`) re-reads env + meta and
+  swaps live values for the slow-query threshold + buffer
+  capacity, tracing filter (`RUST_LOG`), and the tenant-
+  quota registry without a restart
 - **Structured `/health/ready`** body with per-reason `doc_url`
 - **Runbook library** for every REST error code
 

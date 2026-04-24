@@ -116,7 +116,10 @@ pub const DEFAULT_THRESHOLD_MS: u64 = 100;
 /// compare, which is lock-free).
 pub struct SlowQueryBuffer {
     inner: Mutex<Inner>,
-    threshold_ns: u64,
+    /// Threshold in nanoseconds. Atomic so operators can
+    /// bump it live via `POST /api/admin/reload` without a
+    /// restart. Read lock-free on every request.
+    threshold_ns: AtomicU64,
     next_id: AtomicU64,
     /// Running totals by kind. Exported to `/metrics` as
     /// `agentdb_slow_queries_recorded_total{kind="..."}`.
@@ -146,7 +149,7 @@ impl SlowQueryBuffer {
                 records: VecDeque::with_capacity(cap),
                 capacity: cap,
             }),
-            threshold_ns: threshold_ms.saturating_mul(1_000_000),
+            threshold_ns: AtomicU64::new(threshold_ms.saturating_mul(1_000_000)),
             next_id: AtomicU64::new(1),
             recorded_append: AtomicU64::new(0),
             recorded_find: AtomicU64::new(0),
@@ -173,7 +176,37 @@ impl SlowQueryBuffer {
     /// absence of the buffer entirely (via the registry
     /// `OnceLock` staying unset) is the only way to disable.
     pub fn threshold_ms(&self) -> u64 {
-        self.threshold_ns / 1_000_000
+        self.threshold_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
+    /// Runtime setter: change the threshold without restart.
+    /// Reloadable via `POST /api/admin/reload` or SIGHUP.
+    /// Safe to call concurrently with `maybe_record`; the
+    /// atomic load in the hot path picks up the new value
+    /// immediately on the next request.
+    pub fn set_threshold_ms(&self, threshold_ms: u64) {
+        self.threshold_ns.store(
+            threshold_ms.saturating_mul(1_000_000),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Current ring capacity.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().capacity
+    }
+
+    /// Runtime setter: change the ring capacity without
+    /// restart. Shrinking drops the oldest records so the
+    /// current occupancy fits; growing just raises the cap
+    /// (future pushes will fill up to it).
+    pub fn set_capacity(&self, capacity: usize) {
+        let cap = capacity.max(1);
+        let mut inner = self.inner.lock();
+        inner.capacity = cap;
+        while inner.records.len() > cap {
+            inner.records.pop_front();
+        }
     }
 
     /// Record a completed request if it meets the threshold.
@@ -192,7 +225,7 @@ impl SlowQueryBuffer {
         session_id: &str,
         build_detail: F,
     ) {
-        if elapsed_ns < self.threshold_ns {
+        if elapsed_ns < self.threshold_ns.load(Ordering::Relaxed) {
             return;
         }
         let record = SlowQueryRecord {
@@ -446,6 +479,55 @@ mod tests {
         // None limit → default (100), but only 10 records exist
         let r = b.snapshot(&SlowQueryFilter::default());
         assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn set_threshold_ms_takes_effect_on_next_record() {
+        let b = SlowQueryBuffer::new(1000, 16);
+        rec_append(&b, 500_000_000, "t", "s"); // 500ms < 1s → skipped
+        assert_eq!(b.len(), 0);
+        b.set_threshold_ms(100);
+        assert_eq!(b.threshold_ms(), 100);
+        rec_append(&b, 500_000_000, "t", "s"); // now >= 100ms → recorded
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn set_capacity_shrinks_drops_oldest_records() {
+        let b = SlowQueryBuffer::new(0, 8);
+        for i in 0..6u64 {
+            b.maybe_record(
+                SlowQueryKind::Append,
+                1,
+                i as i64,
+                0,
+                &format!("t-{i}"),
+                "s",
+                || "".into(),
+            );
+        }
+        assert_eq!(b.len(), 6);
+        b.set_capacity(2);
+        assert_eq!(b.capacity(), 2);
+        assert_eq!(b.len(), 2, "shrink must evict to fit new cap");
+        let ids: Vec<u64> = b
+            .snapshot(&SlowQueryFilter::default())
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        // Newest two IDs survive.
+        assert_eq!(ids, vec![6, 5]);
+    }
+
+    #[test]
+    fn set_capacity_grow_is_a_no_op_on_existing_records() {
+        let b = SlowQueryBuffer::new(0, 2);
+        for _ in 0..2 {
+            rec_append(&b, 1, "t", "s");
+        }
+        b.set_capacity(100);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.capacity(), 100);
     }
 
     #[test]

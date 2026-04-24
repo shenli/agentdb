@@ -49,6 +49,16 @@ pub struct TenantQuotaView {
     pub deny_count: u64,
 }
 
+/// Return of [`TenantQuotaRegistry::hydrate`]. Enumerates the
+/// tenants that flipped state in the reload. Useful for the
+/// audit log so operators can see "reload added quotas for
+/// {A, B} and removed {C}" in one place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct TenantQuotaRegistry {
     buckets: Mutex<HashMap<String, BucketEntry>>,
@@ -85,6 +95,59 @@ impl TenantQuotaRegistry {
     /// see how often the quota fired before it was removed.
     pub fn clear(&self, tenant_id: &str) -> bool {
         self.buckets.lock().remove(tenant_id).is_some()
+    }
+
+    /// Replace the in-memory bucket set with exactly the
+    /// tenants listed in `rows`, reading from the persistent
+    /// meta table. Existing buckets for tenants no longer in
+    /// `rows` are dropped (matching the "meta is the source
+    /// of truth" contract). Deny counters survive.
+    ///
+    /// Called on server startup (initial hydration) AND on
+    /// `POST /api/admin/reload` — the reload path lets an
+    /// operator edit the `tenant_quotas` table out-of-band
+    /// and pick up the new config without a restart.
+    ///
+    /// Returns `(added, removed)` — populated with tenant
+    /// ids that flipped state across the reload. Useful for
+    /// audit messages.
+    pub fn hydrate(&self, rows: &[(String, TenantQuotaConfig)]) -> ReloadDiff {
+        let incoming: std::collections::HashSet<&str> =
+            rows.iter().map(|(tid, _)| tid.as_str()).collect();
+
+        let mut buckets = self.buckets.lock();
+        // Drop tenants no longer present.
+        let removed: Vec<String> = buckets
+            .keys()
+            .filter(|tid| !incoming.contains(tid.as_str()))
+            .cloned()
+            .collect();
+        for tid in &removed {
+            buckets.remove(tid);
+        }
+        // Upsert every row. New tenants: fresh bucket (full
+        // burst). Existing tenants whose config is unchanged:
+        // preserved as-is (no bucket reset). Changed config:
+        // replace with a fresh bucket.
+        let mut added: Vec<String> = Vec::new();
+        for (tid, cfg) in rows {
+            let entry = buckets.get(tid);
+            let unchanged = entry.map(|e| e.config == *cfg).unwrap_or(false);
+            if unchanged {
+                continue;
+            }
+            if entry.is_none() {
+                added.push(tid.clone());
+            }
+            buckets.insert(
+                tid.clone(),
+                BucketEntry {
+                    config: *cfg,
+                    bucket: TokenBucket::new(cfg.max_qps, cfg.burst),
+                },
+            );
+        }
+        ReloadDiff { added, removed }
     }
 
     /// Check if a request from `tenant_id` is admitted. Tenants
@@ -299,5 +362,51 @@ mod tests {
         );
         let ids: Vec<String> = r.snapshot().into_iter().map(|q| q.tenant_id).collect();
         assert_eq!(ids, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn hydrate_adds_removes_and_preserves_unchanged() {
+        let r = TenantQuotaRegistry::new();
+        // Initial hydration: two tenants, one of them later
+        // kept unchanged, one later replaced.
+        let diff = r.hydrate(&[
+            ("alpha".into(), TenantQuotaConfig { max_qps: 1, burst: 1 }),
+            ("bravo".into(), TenantQuotaConfig { max_qps: 2, burst: 2 }),
+        ]);
+        assert_eq!(diff.added.len(), 2);
+        assert!(diff.removed.is_empty());
+        // Simulate some denies on `bravo` so we can test that
+        // an unchanged reload doesn't reset counters.
+        r.record_deny("bravo");
+        r.record_deny("bravo");
+
+        // Second hydration: alpha unchanged, bravo's config
+        // changes, charlie is new, old "bravo" stays but
+        // fresh bucket, no removal.
+        let diff = r.hydrate(&[
+            ("alpha".into(), TenantQuotaConfig { max_qps: 1, burst: 1 }), // same
+            ("bravo".into(), TenantQuotaConfig { max_qps: 5, burst: 10 }), // changed
+            ("charlie".into(), TenantQuotaConfig { max_qps: 9, burst: 9 }), // added
+        ]);
+        assert_eq!(diff.added, vec!["charlie".to_string()]);
+        assert!(diff.removed.is_empty());
+
+        // Deny counter survives reload (we intentionally
+        // don't reset it; operators want continuity).
+        let denies: std::collections::HashMap<_, _> = r.deny_snapshot().into_iter().collect();
+        assert_eq!(denies.get("bravo").copied(), Some(2));
+
+        // Third hydration: bravo and charlie dropped.
+        let diff = r.hydrate(&[
+            ("alpha".into(), TenantQuotaConfig { max_qps: 1, burst: 1 }),
+        ]);
+        let mut removed = diff.removed.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["bravo".to_string(), "charlie".to_string()]);
+        assert!(diff.added.is_empty());
+
+        // Deny counter still survives the removal.
+        let denies: std::collections::HashMap<_, _> = r.deny_snapshot().into_iter().collect();
+        assert_eq!(denies.get("bravo").copied(), Some(2));
     }
 }

@@ -121,6 +121,18 @@ pub enum Cmd {
     /// `docs/ARCHITECTURE.md § Point-in-time backup`.
     /// HTTP-client wrapper for `POST /api/admin/backup`.
     Backup(BackupOpts),
+    /// Hot-reload reloadable config: slow-query threshold +
+    /// buffer capacity, `RUST_LOG` tracing filter, and the
+    /// tenant-quota registry (re-read from the meta store).
+    /// Same effect as sending SIGHUP to the server process.
+    /// HTTP-client wrapper for `POST /api/admin/reload`.
+    Reload(ReloadOpts),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReloadOpts {
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
 }
 
 #[derive(Args, Debug, Clone)]

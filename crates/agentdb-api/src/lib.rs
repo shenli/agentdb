@@ -10,6 +10,7 @@ pub mod admin_backup;
 pub mod admin_boxes;
 pub mod admin_drain;
 pub mod admin_nodes;
+pub mod admin_reload;
 pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
@@ -107,6 +108,7 @@ impl AppState {
         admin::get_hlc,
         admin_backup::post_backup,
         admin_backup::get_backup_status,
+        admin_reload::post_reload,
         admin_audit::list_audit,
         admin_boxes::list_boxes,
         admin_boxes::get_box,
@@ -153,6 +155,7 @@ impl AppState {
         admin_backup::BackupRequest,
         agentdb_core::BackupManifest,
         agentdb_core::BackupSchedulerStatus,
+        admin_reload::ReloadSummary,
         admin_boxes::BoxListItem,
         admin_boxes::QuotaView,
         admin_boxes::InjectFaultRequest,
@@ -355,6 +358,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/backup/status",
             axum::routing::get(admin_backup::get_backup_status),
+        )
+        .route(
+            "/api/admin/reload",
+            axum::routing::post(admin_reload::post_reload),
         )
         .route(
             "/api/admin/tenant-quotas",
