@@ -7,60 +7,238 @@
     <script defer src="/dashboard/app.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.5/dist/cdn.min.js"></script>
   </head>
-  <body>
+  <body x-data="dashboard()" x-init="init()">
     <header>
-      <h1>AgentDB Dashboard</h1>
-      <div class="controls">
-        <button onclick="demoFork()">Fork demo-parent</button>
-        <button onclick="demoFault(0)">Inject fault box 0</button>
-        <button onclick="demoCold()">Cool demo session</button>
+      <h1>AgentDB</h1>
+      <nav class="tabs">
+        <button :class="{ active: tab === 'overview' }" @click="switchTab('overview')">Overview</button>
+        <button :class="{ active: tab === 'slow' }" @click="switchTab('slow')">Slow queries</button>
+        <button :class="{ active: tab === 'audit' }" @click="switchTab('audit')">Audit log</button>
+        <button :class="{ active: tab === 'tokens' }" @click="switchTab('tokens')">Tokens</button>
+        <button :class="{ active: tab === 'quotas' }" @click="switchTab('quotas')">Tenant quotas</button>
+      </nav>
+      <div class="auth">
+        <input
+          type="password"
+          placeholder="admin bearer token (optional)"
+          x-model="adminToken"
+          @change="saveToken()"
+        />
+        <span class="auth-hint" x-show="adminToken" title="Stored in localStorage for this origin">set</span>
       </div>
     </header>
-    <main x-data="dashboard()" x-init="init()">
-      <section class="top-bar">
-        <div>Boxes: <span x-text="boxes.length"></span></div>
-        <div>Tenants: <span x-text="totalTenants"></span></div>
-        <div>Appends: <span x-text="totalAppends"></span></div>
-        <div>Forks: <span x-text="totalForks"></span></div>
-      </section>
-      <section class="box-grid">
-        <template x-for="b in boxes" :key="b.id">
-          <div class="box-tile" :class="{ fault: b.fault_active }">
-            <header>box #<span x-text="b.id"></span></header>
-            <div class="counts">
-              <span class="warm" x-text="b.warm_sessions || 0"></span> warm
-              /
-              <span class="cold" x-text="b.cold_sessions || 0"></span> cold
-              /
-              <span class="archive" x-text="b.archive_sessions || 0"></span> archive
+
+    <main>
+      <!-- OVERVIEW -->
+      <section x-show="tab === 'overview'">
+        <div class="controls">
+          <button @click="demoFork()">Fork demo-parent</button>
+          <button @click="demoFault(0)">Inject fault box 0</button>
+          <button @click="demoCold()">Cool demo session</button>
+        </div>
+        <section class="top-bar">
+          <div>Boxes: <span x-text="boxes.length"></span></div>
+          <div>Tenants: <span x-text="totalTenants"></span></div>
+          <div>Appends: <span x-text="totalAppends"></span></div>
+          <div>Forks: <span x-text="totalForks"></span></div>
+        </section>
+        <section class="box-grid">
+          <template x-for="b in boxes" :key="b.id">
+            <div class="box-tile" :class="{ fault: b.fault_active }">
+              <header>box #<span x-text="b.id"></span></header>
+              <div class="counts">
+                <span class="warm" x-text="b.warm_sessions || 0"></span> warm
+                /
+                <span class="cold" x-text="b.cold_sessions || 0"></span> cold
+                /
+                <span class="archive" x-text="b.archive_sessions || 0"></span> archive
+              </div>
+              <div class="dots">
+                <template x-for="i in (b.warm_sessions || 0)">
+                  <span class="dot warm"></span>
+                </template>
+                <template x-for="i in (b.cold_sessions || 0)">
+                  <span class="dot cold"></span>
+                </template>
+                <template x-for="i in (b.archive_sessions || 0)">
+                  <span class="dot archive"></span>
+                </template>
+              </div>
+              <div class="counts snapshots" x-text="snapsLine(b)"></div>
+              <div class="counts webhook" x-text="webhookLine(b)"></div>
             </div>
-            <div class="dots">
-              <template x-for="i in (b.warm_sessions || 0)">
-                <span class="dot warm"></span>
-              </template>
-              <template x-for="i in (b.cold_sessions || 0)">
-                <span class="dot cold"></span>
-              </template>
-              <template x-for="i in (b.archive_sessions || 0)">
-                <span class="dot archive"></span>
-              </template>
-            </div>
-            <div class="counts snapshots" x-text="snapsLine(b)"></div>
-            <div class="counts webhook" x-text="webhookLine(b)"></div>
-          </div>
-        </template>
-      </section>
-      <section class="event-feed">
-        <h2>Events</h2>
-        <ul>
-          <template x-for="ev in events.slice(-20).reverse()" :key="ev._id">
-            <li>
-              <span class="ts" x-text="new Date(ev.ts_ms).toLocaleTimeString()"></span>
-              <span class="kind" x-text="ev.event"></span>
-              <span class="detail" x-text="describe(ev)"></span>
-            </li>
           </template>
-        </ul>
+        </section>
+        <section class="event-feed">
+          <h2>Events</h2>
+          <ul>
+            <template x-for="ev in events.slice(-20).reverse()" :key="ev._id">
+              <li>
+                <span class="ts" x-text="new Date(ev.ts_ms).toLocaleTimeString()"></span>
+                <span class="kind" x-text="ev.event"></span>
+                <span class="detail" x-text="describe(ev)"></span>
+              </li>
+            </template>
+          </ul>
+        </section>
+      </section>
+
+      <!-- SLOW QUERIES -->
+      <section x-show="tab === 'slow'">
+        <div class="panel-head">
+          <div class="filters">
+            <label>kind
+              <select x-model="slow.kindFilter" @change="slow.load(tokenHeader())">
+                <option value="">any</option>
+                <option value="append">append</option>
+                <option value="find">find</option>
+                <option value="aggregate">aggregate</option>
+              </select>
+            </label>
+            <label>tenant
+              <input type="text" placeholder="tenant id" x-model="slow.tenantFilter" @change="slow.load(tokenHeader())" />
+            </label>
+            <label>limit
+              <input type="number" min="1" max="500" x-model.number="slow.limit" @change="slow.load(tokenHeader())" />
+            </label>
+            <button @click="slow.load(tokenHeader())">Refresh</button>
+          </div>
+          <span class="panel-err" x-show="slow.err" x-text="slow.err"></span>
+        </div>
+        <table class="data">
+          <thead>
+            <tr>
+              <th>id</th><th>ts</th><th>kind</th><th>box</th>
+              <th>tenant</th><th>session</th><th>latency ms</th><th>detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="r in slow.rows" :key="r.id">
+              <tr>
+                <td x-text="r.id"></td>
+                <td x-text="new Date(r.ts_ms).toLocaleTimeString()"></td>
+                <td x-text="r.kind"></td>
+                <td x-text="r.box_id"></td>
+                <td x-text="r.tenant_id"></td>
+                <td x-text="r.session_id || ''"></td>
+                <td class="num" x-text="r.latency_ms"></td>
+                <td x-text="r.detail"></td>
+              </tr>
+            </template>
+            <tr x-show="slow.rows.length === 0 && !slow.err"><td colspan="8" class="empty">no slow queries recorded (threshold = AGENTDB_SLOW_QUERY_THRESHOLD_MS)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- AUDIT -->
+      <section x-show="tab === 'audit'">
+        <div class="panel-head">
+          <div class="filters">
+            <label>path-prefix
+              <input type="text" placeholder="/api/admin/" x-model="audit.pathPrefix" @change="audit.load(tokenHeader())" />
+            </label>
+            <label>actor
+              <input type="text" placeholder="token id" x-model="audit.actor" @change="audit.load(tokenHeader())" />
+            </label>
+            <label>limit
+              <input type="number" min="1" max="500" x-model.number="audit.limit" @change="audit.load(tokenHeader())" />
+            </label>
+            <button @click="audit.load(tokenHeader())">Refresh</button>
+          </div>
+          <span class="panel-err" x-show="audit.err" x-text="audit.err"></span>
+        </div>
+        <table class="data">
+          <thead>
+            <tr>
+              <th>id</th><th>ts</th><th>actor</th><th>method</th>
+              <th>path</th><th>status</th><th>ip</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="r in audit.rows" :key="r.id">
+              <tr :class="{ 'row-401': r.status === 401, 'row-403': r.status === 403, 'row-5xx': r.status >= 500 }">
+                <td x-text="r.id"></td>
+                <td x-text="new Date(r.ts_ms).toLocaleTimeString()"></td>
+                <td x-text="r.actor_token_id || '—'"></td>
+                <td x-text="r.method"></td>
+                <td x-text="r.query ? r.path + '?' + r.query : r.path"></td>
+                <td class="num" x-text="r.status"></td>
+                <td x-text="r.client_ip || ''"></td>
+              </tr>
+            </template>
+            <tr x-show="audit.rows.length === 0 && !audit.err"><td colspan="7" class="empty">no audit rows (admin auth may be disabled)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- TOKENS -->
+      <section x-show="tab === 'tokens'">
+        <div class="panel-head">
+          <div class="filters">
+            <input type="text" placeholder="description" x-model="tokens.newDesc" />
+            <select x-model="tokens.newScope">
+              <option value="admin">admin</option>
+              <option value="readonly">readonly</option>
+            </select>
+            <button @click="tokens.mint(tokenHeader())">Mint</button>
+            <button @click="tokens.load(tokenHeader())">Refresh</button>
+          </div>
+          <span class="panel-err" x-show="tokens.err" x-text="tokens.err"></span>
+        </div>
+        <div class="minted" x-show="tokens.lastPlaintext" x-cloak>
+          <strong>New token (shown once):</strong>
+          <code x-text="tokens.lastPlaintext"></code>
+          <button class="linky" @click="tokens.lastPlaintext = ''">dismiss</button>
+        </div>
+        <table class="data">
+          <thead>
+            <tr><th>token id</th><th>description</th><th>scope</th><th>created</th><th></th></tr>
+          </thead>
+          <tbody>
+            <template x-for="t in tokens.rows" :key="t.token_id">
+              <tr>
+                <td x-text="t.token_id"></td>
+                <td x-text="t.description"></td>
+                <td><span class="scope" :class="'scope-' + t.scope" x-text="t.scope"></span></td>
+                <td x-text="new Date(t.created_at_ms).toLocaleString()"></td>
+                <td><button class="linky" @click="tokens.revoke(t.token_id, tokenHeader())">revoke</button></td>
+              </tr>
+            </template>
+            <tr x-show="tokens.rows.length === 0 && !tokens.err"><td colspan="5" class="empty">no active tokens</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- TENANT QUOTAS -->
+      <section x-show="tab === 'quotas'">
+        <div class="panel-head">
+          <div class="filters">
+            <input type="text" placeholder="tenant id" x-model="quotas.tenantInput" />
+            <input type="number" min="1" placeholder="max qps" x-model.number="quotas.qpsInput" />
+            <input type="number" min="1" placeholder="burst" x-model.number="quotas.burstInput" />
+            <button @click="quotas.put(tokenHeader())">Set</button>
+            <button @click="quotas.load(tokenHeader())">Refresh</button>
+          </div>
+          <span class="panel-err" x-show="quotas.err" x-text="quotas.err"></span>
+        </div>
+        <table class="data">
+          <thead>
+            <tr><th>tenant</th><th>max qps</th><th>burst</th><th>denies</th><th>updated</th><th></th></tr>
+          </thead>
+          <tbody>
+            <template x-for="q in quotas.rows" :key="q.tenant_id">
+              <tr>
+                <td x-text="q.tenant_id"></td>
+                <td class="num" x-text="q.max_qps"></td>
+                <td class="num" x-text="q.burst"></td>
+                <td class="num" x-text="q.deny_count || 0"></td>
+                <td x-text="new Date(q.updated_at_ms).toLocaleString()"></td>
+                <td><button class="linky" @click="quotas.clear(q.tenant_id, tokenHeader())">clear</button></td>
+              </tr>
+            </template>
+            <tr x-show="quotas.rows.length === 0 && !quotas.err"><td colspan="6" class="empty">no tenant quotas configured</td></tr>
+          </tbody>
+        </table>
       </section>
     </main>
   </body>
