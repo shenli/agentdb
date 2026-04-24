@@ -1365,6 +1365,51 @@ provider is process-wide.
 - **Certificate rotation.** Certs are loaded once at
   startup. SIGHUP reload is follow-up work.
 
+### Mongo CRUD semantics (update + delete)
+
+AgentDB is an event log, so Mongo's `update` and `delete`
+don't literally mutate or remove rows — doing so would
+rewrite history. The Mongo wire handlers translate both
+into appends:
+
+- **`update`** appends a **correction event** per matched
+  event. The correction carries the merged payload (post-
+  `$set` / `$unset` / `$inc`) plus `_update_of: <seq>`,
+  pointing at the original's sequence number. Response
+  shape: `{ok: 1, n: <matched>, nModified: <corrections
+  appended>}`. Drivers that just check `ok` work as
+  expected; drivers that branch on `nModified` get a
+  truthful count of corrections.
+- **`delete`** appends a **tombstone event** per matched
+  event. The tombstone's payload is
+  `{_tombstone_of: <seq>}`. Response shape: `{ok: 1, n:
+  <tombstones appended>}`. Read-side projections may
+  choose to hide events referenced by a later tombstone in
+  the same session; the raw log preserves everything.
+
+Both commands require the filter to carry a top-level
+`session_id` equality. An unscoped
+`updateMany({status: "x"})` would scan every session — a
+subtle performance footgun on an event log at any
+reasonable scale. Scope enforcement is in the handler; no
+way to opt out.
+
+Rejected shapes:
+
+- Replacement documents on `update` (no `$`-operator).
+  Only `$set`, `$unset`, `$inc` are honored; a full
+  replacement doesn't map onto append semantics.
+- `upsert: true`. Inserts go through the `insert` command
+  directly.
+- `delete.limit` values other than `0` (all) or `1`
+  (first). Matches the MongoDB wire protocol's own
+  restriction.
+
+Metrics: `agentdb_updates_total` and
+`agentdb_deletes_total` counters per box, increment on
+every `update` / `delete` command (independent of how
+many events it touches).
+
 ### SCRAM-SHA-256 auth (M19)
 
 Off by default (backward-compatible). Enable with

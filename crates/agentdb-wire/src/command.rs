@@ -252,6 +252,88 @@ async fn dispatch_command_body(
                 Err(e) => error_reply(&e),
             }
         }
+        "update" => {
+            let collection = match body.get_str("update") {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    return error_reply(&crate::error::WireError::Protocol(
+                        "update command missing collection name".into(),
+                    ))
+                }
+            };
+            let seq_docs: Vec<Document> = doc_sequences
+                .iter()
+                .find(|(id, _)| *id == "updates")
+                .map(|(_, docs)| docs.to_vec())
+                .unwrap_or_default();
+            let updates = if !seq_docs.is_empty() {
+                seq_docs
+            } else {
+                body.get_array("updates")
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        Bson::Document(d) => Some(d),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            match crate::handlers::update::update_response(
+                &state.registry,
+                &state.tenants,
+                &state.sessions,
+                db.unwrap_or(""),
+                &collection,
+                &updates,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
+            }
+        }
+        "delete" => {
+            let collection = match body.get_str("delete") {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    return error_reply(&crate::error::WireError::Protocol(
+                        "delete command missing collection name".into(),
+                    ))
+                }
+            };
+            let seq_docs: Vec<Document> = doc_sequences
+                .iter()
+                .find(|(id, _)| *id == "deletes")
+                .map(|(_, docs)| docs.to_vec())
+                .unwrap_or_default();
+            let deletes = if !seq_docs.is_empty() {
+                seq_docs
+            } else {
+                body.get_array("deletes")
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        Bson::Document(d) => Some(d),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            match crate::handlers::delete::delete_response(
+                &state.registry,
+                &state.tenants,
+                &state.sessions,
+                db.unwrap_or(""),
+                &collection,
+                &deletes,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => error_reply(&e),
+            }
+        }
         "aggregate" => {
             let collection = match body.get_str("aggregate") {
                 Ok(s) => s.to_string(),

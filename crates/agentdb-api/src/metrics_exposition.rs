@@ -69,6 +69,16 @@ const METRICS: &[MetricMeta] = &[
         kind: MetricKind::Counter,
     },
     MetricMeta {
+        name: "agentdb_updates_total",
+        help: "Total update commands per box (Mongo wire update; append-on-update semantics)",
+        kind: MetricKind::Counter,
+    },
+    MetricMeta {
+        name: "agentdb_deletes_total",
+        help: "Total delete commands per box (Mongo wire delete; tombstone-on-delete semantics)",
+        kind: MetricKind::Counter,
+    },
+    MetricMeta {
         name: "agentdb_queries_find_total",
         help: "Total Mongo find queries per box",
         kind: MetricKind::Counter,
@@ -423,6 +433,8 @@ fn value_for(name: &str, s: &agentdb_core::MetricsSnapshot) -> u64 {
         "agentdb_appends_total" => s.appends,
         "agentdb_forks_total" => s.forks,
         "agentdb_inserts_total" => s.inserts,
+        "agentdb_updates_total" => s.updates,
+        "agentdb_deletes_total" => s.deletes,
         "agentdb_queries_find_total" => s.queries_find,
         "agentdb_queries_aggregate_total" => s.queries_aggregate,
         "agentdb_tier_transitions_total" => s.tier_transitions,

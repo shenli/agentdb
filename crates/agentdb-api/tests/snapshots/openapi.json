@@ -2639,6 +2639,8 @@
         "type": "object",
         "required": [
           "inserts",
+          "updates",
+          "deletes",
           "queries_find",
           "queries_aggregate",
           "appends",
@@ -2676,6 +2678,11 @@
             "minimum": 0
           },
           "appends": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "deletes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -2804,6 +2811,11 @@
             "minimum": 0
           },
           "tier_transitions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "updates": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
