@@ -6,6 +6,7 @@ use axum::Router;
 
 pub mod admin;
 pub mod admin_audit;
+pub mod admin_backup;
 pub mod admin_boxes;
 pub mod admin_drain;
 pub mod admin_nodes;
@@ -104,6 +105,7 @@ impl AppState {
         fork::fork_handler,
         admin::force_tier,
         admin::get_hlc,
+        admin_backup::post_backup,
         admin_audit::list_audit,
         admin_boxes::list_boxes,
         admin_boxes::get_box,
@@ -147,6 +149,8 @@ impl AppState {
         admin::ForceTierResponse,
         admin::HlcStatus,
         admin_audit::AuditRecordView,
+        admin_backup::BackupRequest,
+        admin_backup::BackupManifest,
         admin_boxes::BoxListItem,
         admin_boxes::QuotaView,
         admin_boxes::InjectFaultRequest,
@@ -340,6 +344,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/slow-queries",
             axum::routing::get(admin_slow_queries::list_slow_queries),
+        )
+        .route(
+            "/api/admin/backup",
+            axum::routing::post(admin_backup::post_backup),
         )
         .route(
             "/api/admin/tenant-quotas",

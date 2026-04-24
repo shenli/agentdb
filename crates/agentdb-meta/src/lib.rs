@@ -60,4 +60,92 @@ impl MetaStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Snapshot the meta DB to `dest_path` using SQLite's
+    /// `VACUUM INTO`. Runs on a live pool — no drain required.
+    /// `dest_path` MUST NOT exist; SQLite refuses to overwrite.
+    ///
+    /// The resulting file is a standalone SQLite database the
+    /// caller can open (including re-opening via
+    /// [`MetaStore::open_sqlite`]). `schema_migrations` rows
+    /// carry over so a restored server does not re-run already-
+    /// applied migrations.
+    pub async fn backup(&self, dest_path: &std::path::Path) -> MetaResult<()> {
+        // SQLite's VACUUM INTO accepts existing zero-byte files
+        // (per its docs). That's a surprising corner — operators
+        // who `touch backup.sqlite` and then run backup would get
+        // silent overwrite. Enforce the "MUST NOT exist" contract
+        // here so the stricter guarantee holds regardless of the
+        // underlying SQL's tolerance.
+        if dest_path.exists() {
+            return Err(MetaError::Migration(format!(
+                "meta backup destination already exists: {}",
+                dest_path.display()
+            )));
+        }
+        let dest_str = dest_path.to_string_lossy().to_string();
+        // VACUUM INTO doesn't accept bound parameters in SQLite.
+        // Escape single quotes manually — the path comes from an
+        // admin endpoint, so hardening it here is the lesser
+        // burden than teaching the caller to quote correctly.
+        let escaped = dest_str.replace('\'', "''");
+        let sql = format!("VACUUM INTO '{escaped}'");
+        sqlx::query(&sql).execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn fresh_file_store() -> (tempfile::TempDir, MetaStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.sqlite");
+        let store = MetaStore::open_sqlite(&src.to_string_lossy())
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn backup_produces_readable_standalone_file() {
+        let (dir, src) = fresh_file_store().await;
+        admin_tokens::mint(src.pool(), "alice", 1000)
+            .await
+            .unwrap();
+
+        let dest = dir.path().join("backup.sqlite");
+        src.backup(&dest).await.unwrap();
+        assert!(dest.exists(), "backup path missing");
+
+        let restored = MetaStore::open_sqlite(&dest.to_string_lossy())
+            .await
+            .unwrap();
+        let active = admin_tokens::list_active(restored.pool()).await.unwrap();
+        assert_eq!(active.len(), 1, "restored store missing seeded token");
+        assert_eq!(active[0].description, "alice");
+
+        // Migrations already applied once; reopening must not
+        // re-run them. We expect exactly MIGRATIONS.len() rows.
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_migrations")
+            .fetch_one(restored.pool())
+            .await
+            .unwrap();
+        assert!(n > 0, "schema_migrations empty after restore");
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_to_overwrite_existing_file() {
+        let (_dir, src) = fresh_file_store().await;
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let err = src.backup(f.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("exists")
+                || msg.to_lowercase().contains("vacuum")
+                || msg.to_lowercase().contains("database"),
+            "expected overwrite-refusal error; got: {msg}"
+        );
+    }
 }

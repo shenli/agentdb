@@ -89,6 +89,48 @@
         }
       }
     },
+    "/api/admin/backup": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "post_backup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Backup complete; manifest returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupManifest"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "out_dir already exists, or is not an absolute path"
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "500": {
+            "description": "Checkpoint or VACUUM INTO failed"
+          },
+          "503": {
+            "description": "Meta store not configured"
+          }
+        }
+      }
+    },
     "/api/admin/boxes": {
       "get": {
         "tags": [
@@ -1681,6 +1723,63 @@
           "ts_ms": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "BackupManifest": {
+        "type": "object",
+        "required": [
+          "version",
+          "created_at_ms",
+          "kv_bytes",
+          "meta_bytes",
+          "kv_path",
+          "meta_path"
+        ],
+        "properties": {
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kv_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kv_path": {
+            "type": "string"
+          },
+          "meta_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "meta_path": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Node id of the process that produced this backup. `None`\nwhen a meta-less test registry produced it (no node\nidentity)."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "BackupRequest": {
+        "type": "object",
+        "required": [
+          "out_dir"
+        ],
+        "properties": {
+          "out_dir": {
+            "type": "string",
+            "description": "Absolute path to a directory that does NOT yet exist.\nThe endpoint creates it and writes `kv/`, `meta.sqlite`,\nand `manifest.json` into it."
           }
         }
       },

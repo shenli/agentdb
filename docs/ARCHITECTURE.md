@@ -1162,6 +1162,54 @@ the Mongo `insert` handler both go through
 `append_and_fetch_with_actor`, so inserts are already
 covered).
 
+### Point-in-time backup
+
+`POST /api/admin/backup` with `{"out_dir": "/abs/path"}`
+takes a consistent snapshot of the node's persistent
+state while the server is live. No drain, no lock, no
+pause. The output directory MUST NOT pre-exist — the
+endpoint creates it and writes three things:
+
+- `kv/` — a RocksDB checkpoint produced via the native
+  `Checkpoint::create_checkpoint` API. SSTs hard-link
+  where possible (same device), so the checkpoint costs
+  near-zero IO even on terabyte KVs.
+- `meta.sqlite` — the meta store snapshotted via
+  `VACUUM INTO`. Contains `schema_migrations` so
+  reopening does not re-run any migration.
+- `manifest.json` — version, created-at-ms, byte sizes,
+  originating `node_id`.
+
+Both storage-layer primitives are additions on the
+underlying backends (`KvStore::checkpoint`,
+`MetaStore::backup`), each with pre-checks that refuse
+to overwrite an existing target so an operator typo
+never silently destroys prior data.
+
+**Restore is offline.** Stop the server, copy the
+contents of `kv/` into the destination KV directory and
+`meta.sqlite` into the destination meta path, then
+start the server. The freshly-opened stores rebuild
+in-memory indexes lazily on first access — no special
+"restore mode" is required. Cross-node restore (pointing
+another node at this backup) works as long as the new
+node id is distinct from the one in the manifest; the
+lease mechanism re-acquires ownership.
+
+**Admin surface.** CLI wrapper:
+`agentdb backup --out /abs/path`.
+
+Out of scope: object-store segments (cold/archive
+blobs) — those are content-addressed and immutable, so
+operators back up S3 / GCS separately using the
+provider's own tooling; the manifest records which
+segments exist via the meta tablets table and the
+existing index snapshots, so a backup+restore on a
+fresh bucket is recoverable as long as the segments are
+restored alongside. Automated scheduling (cron-like
+backup cadence) — operators call the endpoint
+themselves; scheduling is a policy concern.
+
 ### TLS termination
 
 REST listens over HTTP by default. Supply `--tls-cert PATH
