@@ -25,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
             // Tracing init only for the long-running server.
             // Admin CLI subcommands run briefly and print JSON; noisy
             // tracing would drown out their output.
-            let _tracer_guard = tracing_init::init()?;
-            serve::run(opts).await
+            let (_tracer_guard, tracing_reload) = tracing_init::init()?;
+            serve::run(opts, tracing_reload).await
         }
         Cmd::DumpConfig(opts) => dump_config::run(opts),
         Cmd::Drain(opts) => admin::drain(opts).await,
@@ -58,5 +58,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ClearTenantQuota(opts) => admin::clear_tenant_quota(opts).await,
         Cmd::ShowSlowQueries(opts) => admin::show_slow_queries(opts).await,
         Cmd::Backup(opts) => admin::backup(opts).await,
+        Cmd::Reload(opts) => admin::reload(opts).await,
     }
 }

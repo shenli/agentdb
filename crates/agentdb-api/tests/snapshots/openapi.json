@@ -548,6 +548,35 @@
         }
       }
     },
+    "/api/admin/reload": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "post_reload",
+        "responses": {
+          "200": {
+            "description": "Reload successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin auth required"
+          },
+          "500": {
+            "description": "Reload encountered an unrecoverable error (running config preserved)"
+          },
+          "503": {
+            "description": "Reload engine not installed"
+          }
+        }
+      }
+    },
     "/api/admin/scheduler": {
       "get": {
         "tags": [
@@ -3023,6 +3052,51 @@
             ],
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "ReloadSummary": {
+        "type": "object",
+        "required": [
+          "slow_query_threshold_ms",
+          "slow_query_buffer_capacity",
+          "reloaded_at_ms"
+        ],
+        "properties": {
+          "reloaded_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock ms when the reload completed."
+          },
+          "slow_query_buffer_capacity": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current slow-query buffer capacity, post-reload.",
+            "minimum": 0
+          },
+          "slow_query_threshold_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current slow-query threshold in ms, post-reload.",
+            "minimum": 0
+          },
+          "tenant_quotas_added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tenants whose quota was added in this reload (new\nrows in the meta table since the last hydration)."
+          },
+          "tenant_quotas_removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tenants whose quota was removed (deleted from the\nmeta table since the last hydration)."
+          },
+          "tracing_filter": {
+            "type": "string",
+            "description": "Current tracing filter string, post-reload. Empty\nwhen no filter change was applied."
           }
         }
       },

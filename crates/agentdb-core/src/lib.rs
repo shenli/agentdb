@@ -78,7 +78,9 @@ pub use slow_query::{
     DEFAULT_BUFFER_CAPACITY as SLOW_QUERY_DEFAULT_BUFFER_CAPACITY,
     DEFAULT_THRESHOLD_MS as SLOW_QUERY_DEFAULT_THRESHOLD_MS,
 };
-pub use tenant_quota::{TenantQuotaConfig, TenantQuotaRegistry, TenantQuotaView};
+pub use tenant_quota::{
+    ReloadDiff as TenantQuotaReloadDiff, TenantQuotaConfig, TenantQuotaRegistry, TenantQuotaView,
+};
 pub use scheduler::{LeaderElection, LeaderElectionConfig};
 pub use segment::{read_segment, segment_path, write_segment, SegmentFile, SEGMENT_SCHEMA_VERSION};
 pub use segment_gc::{GcRunReporter, SegmentGc, SegmentGcConfig};

@@ -13,6 +13,8 @@
 //! Returns a `TracerGuard` RAII handle that flushes pending spans on
 //! drop — the caller (main) must keep it alive until shutdown.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Context;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
@@ -22,8 +24,35 @@ use opentelemetry_sdk::trace::{Sampler, TracerProvider};
 use opentelemetry_sdk::{runtime, Resource};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Registry};
+
+/// Handle for live-reloading the `EnvFilter` (the thing that
+/// decides which spans/events make it to output). Installed by
+/// `init()`, shared with the admin-reload path. The `Mutex` is
+/// fine at call-site scale — the reload handler is invoked at
+/// most a handful of times per day.
+#[derive(Clone)]
+pub struct TracingReloadHandle {
+    inner: Arc<Mutex<reload::Handle<EnvFilter, Registry>>>,
+}
+
+impl TracingReloadHandle {
+    /// Apply a new `EnvFilter` string (e.g. `"info,agentdb_core=debug"`).
+    /// Invalid syntax returns an error without disturbing the
+    /// running filter.
+    pub fn reload(&self, filter: &str) -> anyhow::Result<()> {
+        let f = EnvFilter::try_new(filter)
+            .with_context(|| format!("parse EnvFilter '{filter}'"))?;
+        self.inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("tracing reload handle poisoned: {e}"))?
+            .reload(f)
+            .context("tracing reload")?;
+        Ok(())
+    }
+}
 
 /// RAII guard that shuts down the tracer provider on drop, flushing
 /// any pending batched spans. Must be held alive for the lifetime of
@@ -54,9 +83,15 @@ impl Drop for TracerGuard {
 ///   `service.name`. Default: `"agentdb"`.
 /// - `RUST_LOG` / `EnvFilter` standard filter syntax, e.g. `info` or
 ///   `agentdb_core=debug,info`.
-pub fn init() -> anyhow::Result<TracerGuard> {
+pub fn init() -> anyhow::Result<(TracerGuard, TracingReloadHandle)> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Wrap the filter in reload::Layer so we can swap it at
+    // runtime via TracingReloadHandle::reload.
+    let (env_filter, reload_handle) = reload::Layer::new(env_filter);
+    let reload_handle = TracingReloadHandle {
+        inner: Arc::new(Mutex::new(reload_handle)),
+    };
 
     let fmt_layer = fmt::layer().with_target(true);
 
@@ -113,5 +148,5 @@ pub fn init() -> anyhow::Result<TracerGuard> {
         TracerGuard { provider: None }
     };
 
-    Ok(guard)
+    Ok((guard, reload_handle))
 }

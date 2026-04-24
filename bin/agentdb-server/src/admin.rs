@@ -19,9 +19,9 @@ use serde_json::Value;
 
 use crate::cli::{
     AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, BackupOpts,
-    ClearTenantQuotaOpts, CreateTabletOpts, MigrateSessionOpts, SetShardOpts, SetTenantQuotaOpts,
-    ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts, ShowTenantQuotaOpts,
-    UserAddOpts, UserDeleteOpts,
+    ClearTenantQuotaOpts, CreateTabletOpts, MigrateSessionOpts, ReloadOpts, SetShardOpts,
+    SetTenantQuotaOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts,
+    ShowTenantQuotaOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -379,6 +379,21 @@ pub async fn clear_tenant_quota(opts: ClearTenantQuotaOpts) -> Result<()> {
         .with_context(|| format!("DELETE {url}"))?;
     // 204 No Content expected; print_json_and_exit_on_failure
     // handles success and error bodies.
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// `POST /api/admin/reload` — hot-reload config.
+pub async fn reload(opts: ReloadOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/reload",
+        opts.server_url.trim_end_matches('/'),
+    );
+    let client = admin_client();
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
     print_json_and_exit_on_failure(resp).await
 }
 

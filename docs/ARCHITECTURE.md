@@ -1123,6 +1123,41 @@ Out of scope: finer-grained scopes (e.g. "tablets only",
 Future scopes can widen the column without another
 migration.
 
+### Config hot-reload
+
+`POST /api/admin/reload` (or `SIGHUP` on Unix, or
+`agentdb reload`) re-reads env + meta and pushes fresh
+values into the live subsystems without a restart.
+
+Currently reloaded:
+
+- `AGENTDB_SLOW_QUERY_THRESHOLD_MS` — `SlowQueryBuffer`
+  stores the threshold in an atomic; update takes effect
+  on the very next request.
+- `AGENTDB_SLOW_QUERY_BUFFER_CAPACITY` — shrinking evicts
+  oldest to fit; growing just raises the cap.
+- `RUST_LOG` — swapped via `tracing_subscriber::reload`.
+  Invalid filters are rejected without disturbing the
+  running filter.
+- `tenant_quotas` meta table — `TenantQuotaRegistry::hydrate`
+  reconciles with `DB is the source of truth`:  new rows
+  get fresh buckets, removed rows drop their bucket,
+  unchanged rows keep their in-memory state (including
+  accumulated deny counters).
+
+Intentionally NOT reloaded:
+
+- `AGENTDB_ADMISSION_CAPACITY` — resizing a running Tokio
+  semaphore mid-flight is a footgun.
+- TLS certs — rotation is a distinct concern (future PR).
+- Meta / KV / object-store backends — not hot-swappable.
+
+The reload target is an `Arc<dyn Fn() -> Future<...>>`
+extension attached to axum. The server binary installs
+the real closure; tests inject a fake. The SIGHUP
+handler shares the same closure so signals and HTTP
+take the same code path.
+
 ### Per-tenant rate limits
 
 Per-box admission already had two token buckets: a global
