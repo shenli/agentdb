@@ -110,6 +110,11 @@ impl LeaseManager {
     /// Acquire an initial lease for `tablet_id`. Side effect:
     /// `tablets` row is created if absent, and `epoch` is bumped by
     /// one as part of `assume_ownership`.
+    #[tracing::instrument(
+        name = "lease.acquire",
+        skip(meta, config, metrics),
+        fields(tablet_id = tablet_id, node_id = %node_id),
+    )]
     pub async fn acquire(
         meta: Arc<MetaStore>,
         tablet_id: i64,
@@ -154,6 +159,11 @@ impl LeaseManager {
     /// and return new expiry. On failure (meta unreachable, epoch
     /// stolen, etc.), leave local state unchanged so `is_live` still
     /// reports true until the old lease expires naturally.
+    #[tracing::instrument(
+        name = "lease.renew",
+        skip(self),
+        fields(tablet_id = self.tablet_id, node_id = %self.node_id),
+    )]
     pub async fn renew(&self) -> Result<i64> {
         let now_ms = now_ms();
         let expected_epoch = self.epoch.load(Ordering::Acquire);

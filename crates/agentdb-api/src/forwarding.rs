@@ -61,6 +61,16 @@ pub const HLC_HEADER: &str = "x-agentdb-hlc";
 /// `path_with_query` must already be percent-encoded; callers
 /// build it via [`urlencode`] + explicit concatenation so the
 /// forwarder isn't second-guessing routing.
+#[tracing::instrument(
+    name = "forward.request",
+    skip(http, body, passthrough),
+    fields(
+        target_node_id = %target.node_id,
+        target_address = %target.address,
+        method = %method,
+        path = %path_with_query,
+    ),
+)]
 pub async fn forward_request(
     http: &Client,
     target: &NodeTarget,
@@ -75,6 +85,12 @@ pub async fn forward_request(
     let mut req = http
         .request(method, &url)
         .header(FORWARDED_HEADER, "1");
+    // W3C Trace Context propagation. Stamps the current span's
+    // traceparent onto the outbound request so the receiving
+    // node's REST handler can root its span tree under ours.
+    // No-op on the (test-only) path that has no OTel layer
+    // installed.
+    req = crate::trace_context::inject_into_request(req);
     if let Some(b) = body {
         req = req
             .header(header::CONTENT_TYPE, "application/json")

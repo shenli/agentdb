@@ -32,6 +32,7 @@ pub mod health;
 pub mod hlc_header;
 pub mod metrics_exposition;
 pub mod stream;
+pub mod trace_context;
 pub mod webhook;
 
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
@@ -401,6 +402,9 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             hlc_header::hlc_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            trace_context::trace_parent_middleware,
         ))
         .with_state(state)
 }

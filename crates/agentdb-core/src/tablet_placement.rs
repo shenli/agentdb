@@ -192,6 +192,13 @@ async fn run_loop(
 /// One placement sweep. Public so the server boot path can run
 /// it synchronously after leader election converges, without
 /// waiting for the periodic loop's first tick.
+#[tracing::instrument(
+    name = "placement.sweep_once",
+    skip(meta, assignments_total, bootstraps_total),
+    fields(
+        bootstrap_target = config.bootstrap_tablets,
+    ),
+)]
 pub async fn sweep_once(
     meta: &MetaStore,
     config: PlacementConfig,

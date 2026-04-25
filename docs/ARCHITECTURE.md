@@ -551,19 +551,35 @@ of the process.
 | `AGENTDB_TRACE_SERVICE_NAME` | `"agentdb"` | OTel resource `service.name` attribute |
 | `RUST_LOG` | `info` | Standard `EnvFilter` syntax (e.g. `info,agentdb_core=debug`) |
 
-**Library-side: no OTel dependency.** Instrumented functions use
-`#[tracing::instrument]` only — no `opentelemetry::` imports in
-`agentdb-core` / `-wire` / `-api`. The OTel pipeline lives entirely in
-the server binary. This keeps the libraries usable with any
-`tracing_subscriber::Layer` (fmt, Jaeger-direct, in-memory test
-recorder — the M15 integration test in
-`crates/agentdb-api/tests/tracing_spans.rs` uses the last).
+**W3C trace-context propagation across nodes.** Every cross-node
+forward emits a `traceparent` header, and an axum middleware on the
+receiving side (`agentdb_api::trace_context::trace_parent_middleware`)
+extracts it and attaches it as the parent of the local
+`rest.request` span. Multi-node `append_and_fetch` and similar
+forwarded paths therefore appear as one connected trace tree spanning
+both nodes, rather than two disconnected ones. The propagator is
+hand-rolled (no extra crate) and covers the standard `00-…` format;
+unknown versions and malformed headers fall through to "this request
+starts a new trace."
 
-**Deferred.** W3C `traceparent` header extract/inject (Task A4 Step
-2+3) is out of scope for this prototype and is a follow-up when
-distributed traces across HTTP clients become valuable. Admin
-endpoints are not yet instrumented — the hot path is covered, and
-admin can gain spans as debugging needs them.
+**Spans added on infrastructure paths.** Beyond the request-tree
+shape above, the following control-plane operations also emit spans:
+`forward.request` (cross-node REST forward, with target node id and
+HTTP status), `placement.sweep_once` and `reconciler.reconcile_once`
+(multi-node tablet placement loops), `lease.acquire` / `lease.renew`
+(per-tablet ownership), and `node_reaper.sweep_once` (membership
+state transitions). When something goes wrong in a multi-node
+deployment these are typically what you want to see first.
+
+**Library-side OTel surface.** `agentdb-api` carries
+`opentelemetry` + `tracing-opentelemetry` solely for the propagator;
+business-logic crates (`agentdb-core`, `agentdb-wire`,
+`agentdb-meta`) still use `#[tracing::instrument]` exclusively. The
+OTel SDK + exporter live entirely in the server binary, so libraries
+remain usable with any `tracing_subscriber::Layer` (fmt,
+Jaeger-direct, in-memory test recorder — see
+`crates/agentdb-api/tests/tracing_spans.rs` and
+`tests/trace_propagation.rs`).
 
 ## Observability (M7)
 

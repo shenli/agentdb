@@ -154,6 +154,13 @@ async fn run_loop(
 /// synchronously before binding the HTTP listener — that way
 /// `/health/ready` reports the post-reconcile box set, not a
 /// transient empty registry.
+#[tracing::instrument(
+    name = "reconciler.reconcile_once",
+    skip(registry, boxes_added_total, errors_total),
+    fields(
+        node_id = registry.self_node_id().unwrap_or("unknown"),
+    ),
+)]
 pub async fn reconcile_once(
     registry: &Arc<BoxRegistry>,
     boxes_added_total: &AtomicU64,
