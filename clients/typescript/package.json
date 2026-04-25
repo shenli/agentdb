@@ -1,0 +1,45 @@
+{
+  "name": "agentdb",
+  "version": "0.1.0",
+  "description": "TypeScript / Node client for AgentDB — agent-native operational database",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/shenli/agentdb",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shenli/agentdb.git",
+    "directory": "clients/typescript"
+  },
+  "keywords": [
+    "agentdb",
+    "agent",
+    "memory",
+    "session",
+    "database"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test 'dist/tests/**/*.js'"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}

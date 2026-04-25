@@ -31,11 +31,15 @@ when you actually build them.
 # 1. Start the server (zero config, ephemeral state)
 cargo run -p agentdb-server -- serve --dev
 
-# 2. In another shell, install the Python SDK
-pip install -e clients/python
+# 2. In another shell, install a client SDK
+pip install -e clients/python                # Python
+# or
+(cd clients/typescript && npm install && npm run build)   # TypeScript
 
 # 3. Run a sample agent loop
 python examples/agents/python/quickstart.py
+# or
+node --experimental-strip-types examples/agents/typescript/quickstart.ts
 ```
 
 You should see three turns of working memory grow, then a fork
@@ -47,7 +51,9 @@ dashboard URL, and a copy-pasteable `curl` so you can poke at
 the REST surface without reading further. Open
 <http://127.0.0.1:7878/dashboard> for the live operator view.
 
-### Five-line Python
+### Five-line client
+
+**Python** ([`clients/python/`](clients/python/README.md)):
 
 ```python
 from agentdb import Client
@@ -58,9 +64,22 @@ result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print("seq:", result.seq, [(e.seq, e.payload) for e in result.recent])
 ```
 
-Full SDK reference: [`clients/python/README.md`](clients/python/README.md).
-Other languages (TypeScript, Go) are tracked as follow-ups; in
-the meantime any MongoDB driver speaks the wire port at
+**TypeScript / Node** ([`clients/typescript/`](clients/typescript/README.md)):
+
+```ts
+import { Client } from "agentdb";
+
+const client = new Client("http://127.0.0.1:7878");
+const session = client.session("agent-1", { tenant: "demo" });
+const result = await session.append(
+  { role: "user", text: "hello" },
+  { fetchLastN: 5 }
+);
+console.log("seq:", result.seq, result.recent.map((e) => e.payload));
+```
+
+Other languages (Go, Rust client crate) are tracked as follow-ups;
+in the meantime any MongoDB driver speaks the wire port at
 `mongodb://127.0.0.1:7879`.
 
 ### Operator subcommands
