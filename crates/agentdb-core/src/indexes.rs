@@ -112,7 +112,13 @@ impl PerBoxIndexes {
                         }
                         out
                     }
-                    Tier::Cold => {
+                    // M26 Phase 4: Archive is metadata-only —
+                    // its segment lives at the same path it
+                    // had as Cold (see `tiering::cold_to_archive`).
+                    // Read it the same way so indexed retrieval
+                    // is archive-complete: text + vector queries
+                    // no longer silently drop archived data.
+                    Tier::Cold | Tier::Archive => {
                         if let Some(path) = &session.segment_path {
                             match read_segment(store, path).await {
                                 Ok(seg) => seg.events,
@@ -120,7 +126,8 @@ impl PerBoxIndexes {
                                     tracing::warn!(
                                         ?err,
                                         session = %session.external_id,
-                                        "skipping cold session with unreadable segment"
+                                        tier = ?session.tier,
+                                        "skipping session with unreadable segment"
                                     );
                                     continue;
                                 }
@@ -129,7 +136,6 @@ impl PerBoxIndexes {
                             continue;
                         }
                     }
-                    Tier::Archive => continue,
                 };
                 for event in events {
                     self.index_event(session.internal_id, &event);
@@ -182,14 +188,12 @@ impl PerBoxIndexes {
                         }
                         out
                     }
-                    Tier::Cold => {
-                        // A cold session's segment was written atomically
-                        // before the snapshot cutoff OR after (never
-                        // partial). If after, we would have seen the
-                        // segment-write HLC; but the snapshot already
-                        // covers the warm events it replaced. Include
-                        // the segment's events only if the post-cutoff
-                        // filter says so.
+                    // M26 Phase 4: archive uses the same segment
+                    // as cold (transition is metadata-only). The
+                    // post-cutoff filter below still applies, so
+                    // events older than the snapshot's HLC don't
+                    // get re-indexed.
+                    Tier::Cold | Tier::Archive => {
                         if let Some(path) = &session.segment_path {
                             match read_segment(store, path).await {
                                 Ok(seg) => seg.events,
@@ -199,7 +203,6 @@ impl PerBoxIndexes {
                             continue;
                         }
                     }
-                    Tier::Archive => continue,
                 };
                 for event in events {
                     if event.hlc_ts > cutoff {
@@ -340,6 +343,135 @@ mod tests {
             .knn("payload.embedding", &[1.0, 0.0, 0.0, 0.0], 10);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].1 > 0.99);
+    }
+
+    #[tokio::test]
+    async fn build_indexes_archived_session_via_segment_so_text_query_still_returns_it() {
+        // M26 Phase 4 contract: an archived session's events
+        // remain queryable via the in-memory text index. Pre-
+        // Phase-4, `PerBoxIndexes::build` skipped Tier::Archive
+        // entirely and unhinted text queries quietly lost
+        // archived data. Here we drive the full
+        // warm → cold → archive transition, rebuild the index,
+        // and assert the text term still hits.
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-arc",
+            "s-arc",
+            json!({"text": "archive should still be queryable"}),
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+
+        // Pull the session and walk it warm → cold → archive.
+        // cold_transition writes the segment; cold_to_archive
+        // is a metadata-only relabel.
+        let box_ = registry.route_tenant("t-arc");
+        let tenant = tenants.get_or_mint(box_.id, "t-arc", 0).unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-arc")
+            .unwrap()
+            .unwrap();
+        let guard = box_.tenant_write_lock("t-arc").lock_owned().await;
+        crate::tiering::cold_transition(
+            registry.kv(),
+            registry.object_store(),
+            &sessions,
+            &guard,
+            &mut session,
+        )
+        .await
+        .unwrap();
+        crate::tiering::cold_to_archive(&sessions, &guard, &mut session)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(session.tier, Tier::Archive);
+        assert!(session.segment_path.is_some());
+
+        // Rebuild the index from scratch and verify the text
+        // search returns the archived event.
+        let store = registry.object_store().clone();
+        let mut idx = PerBoxIndexes::new();
+        idx.build(&kv, &store, &tenants, &sessions, box_.id)
+            .await
+            .unwrap();
+        let hits = idx.text.search("payload.text", "queryable", 10);
+        assert_eq!(
+            hits.len(),
+            1,
+            "text query must still find the archived event; got {hits:?}"
+        );
+        assert_eq!(idx.indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn replay_indexes_archived_session_so_text_query_still_returns_it() {
+        // M26 Phase 4: same contract for the snapshot-replay
+        // path used by `index_snapshot::restore_indexes`.
+        // Pre-Phase-4, `replay_events_after` skipped Archive,
+        // so a server restart with an archived session +
+        // post-snapshot events on it would silently miss them.
+        let (_dir, _obj_dir, kv, registry, tenants, sessions) = setup_with_events().await;
+        crate::primitives::append_and_fetch(
+            &registry,
+            &tenants,
+            &sessions,
+            "t-arc",
+            "s-arc",
+            json!({"text": "replay-after-archive marker"}),
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let box_ = registry.route_tenant("t-arc");
+        let tenant = tenants.get_or_mint(box_.id, "t-arc", 0).unwrap();
+        let mut session = sessions
+            .lookup(box_.id, tenant.internal_id, "s-arc")
+            .unwrap()
+            .unwrap();
+        let guard = box_.tenant_write_lock("t-arc").lock_owned().await;
+        crate::tiering::cold_transition(
+            registry.kv(),
+            registry.object_store(),
+            &sessions,
+            &guard,
+            &mut session,
+        )
+        .await
+        .unwrap();
+        crate::tiering::cold_to_archive(&sessions, &guard, &mut session)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let store = registry.object_store().clone();
+        let mut idx = PerBoxIndexes::new();
+        // HLC cutoff = ZERO so every archived event is past
+        // the cutoff and replays.
+        let replayed = idx
+            .replay_events_after(
+                &kv,
+                &store,
+                &tenants,
+                &sessions,
+                box_.id,
+                crate::hlc::HlcTimestamp::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed, 1);
+        assert!(!idx
+            .text
+            .search("payload.text", "marker", 10)
+            .is_empty());
     }
 
     #[tokio::test]
