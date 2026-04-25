@@ -19,9 +19,9 @@ use serde_json::Value;
 
 use crate::cli::{
     AdminOpts, AdminTokenAddOpts, AdminTokenRevokeOpts, AuditLogOpts, BackupOpts,
-    ClearTenantQuotaOpts, CreateTabletOpts, MigrateSessionOpts, ReloadOpts, SetShardOpts,
-    SetTenantQuotaOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts, ShowSlowQueriesOpts,
-    ShowTenantQuotaOpts, UserAddOpts, UserDeleteOpts,
+    ClearTenantQuotaOpts, CreateTabletOpts, EvictNodeOpts, MigrateSessionOpts, ReloadOpts,
+    SetShardOpts, SetTenantQuotaOpts, ShedTabletOpts, ShowLatencyOpts, ShowShardOpts,
+    ShowSlowQueriesOpts, ShowTenantQuotaOpts, UserAddOpts, UserDeleteOpts,
 };
 
 /// `POST /api/admin/drain`.
@@ -58,6 +58,158 @@ pub async fn show_scheduler(opts: AdminOpts) -> Result<()> {
 pub async fn show_nodes(opts: AdminOpts) -> Result<()> {
     let url = format!("{}/api/admin/nodes", opts.server_url.trim_end_matches('/'));
     fetch_and_print(&url).await
+}
+
+/// `DELETE /api/admin/nodes/:id`.
+pub async fn evict_node(opts: EvictNodeOpts) -> Result<()> {
+    let url = format!(
+        "{}/api/admin/nodes/{}",
+        opts.server_url.trim_end_matches('/'),
+        urlencode(&opts.node_id)
+    );
+    let client = admin_client();
+    let resp = client
+        .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    print_json_and_exit_on_failure(resp).await
+}
+
+/// Composite cluster overview: pulls scheduler / nodes /
+/// tablets and prints a structured human-readable summary.
+/// Useful as the first command to run on an unfamiliar
+/// cluster: in one screen you see the leader, AZ
+/// distribution, per-node tablet counts, and rebalance
+/// activity.
+pub async fn cluster_status(opts: AdminOpts) -> Result<()> {
+    let base = opts.server_url.trim_end_matches('/');
+    let client = admin_client();
+
+    let scheduler: Value = client
+        .get(format!("{base}/api/admin/scheduler"))
+        .send()
+        .await
+        .with_context(|| format!("GET {base}/api/admin/scheduler"))?
+        .error_for_status()
+        .with_context(|| "scheduler endpoint returned non-2xx")?
+        .json()
+        .await
+        .with_context(|| "scheduler body wasn't JSON")?;
+    let nodes: Vec<Value> = client
+        .get(format!("{base}/api/admin/nodes"))
+        .send()
+        .await
+        .with_context(|| format!("GET {base}/api/admin/nodes"))?
+        .error_for_status()
+        .with_context(|| "nodes endpoint returned non-2xx")?
+        .json()
+        .await
+        .with_context(|| "nodes body wasn't JSON")?;
+    let tablets: Vec<Value> = client
+        .get(format!("{base}/api/admin/tablets"))
+        .send()
+        .await
+        .with_context(|| format!("GET {base}/api/admin/tablets"))?
+        .error_for_status()
+        .with_context(|| "tablets endpoint returned non-2xx")?
+        .json()
+        .await
+        .with_context(|| "tablets body wasn't JSON")?;
+    print_cluster_status(&scheduler, &nodes, &tablets);
+    Ok(())
+}
+
+fn print_cluster_status(scheduler: &Value, nodes: &[Value], tablets: &[Value]) {
+    print!("{}", format_cluster_status(scheduler, nodes, tablets));
+}
+
+/// Pure-string variant of [`print_cluster_status`] so tests
+/// can assert structure without piping stdout. Always ends
+/// with a trailing newline so the print path produces a
+/// clean shell prompt afterwards.
+fn format_cluster_status(scheduler: &Value, nodes: &[Value], tablets: &[Value]) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "=== Cluster status ===");
+    let this_node = scheduler.get("this_node_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let is_leader = scheduler
+        .get("this_node_is_leader")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let leader_field = scheduler.get("leader");
+    let leader_id = leader_field
+        .and_then(|l| l.get("node_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(none)");
+    let leader_live = leader_field
+        .and_then(|l| l.get("is_live"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let _ = writeln!(
+        out,
+        "Leader      : {leader_id}{} (this node: {this_node}{})",
+        if leader_live { "" } else { " [stale]" },
+        if is_leader { ", IS leader" } else { "" }
+    );
+
+    let mut by_state: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_az: BTreeMap<String, usize> = BTreeMap::new();
+    for n in nodes {
+        let state = n.get("state").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        *by_state.entry(state).or_insert(0) += 1;
+        let az = n
+            .get("availability_zone")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unset)")
+            .to_string();
+        *by_az.entry(az).or_insert(0) += 1;
+    }
+    let _ = writeln!(out, "Nodes       : {} total", nodes.len());
+    for (state, count) in &by_state {
+        let _ = writeln!(out, "              {count:>3} {state}");
+    }
+    let _ = writeln!(out, "AZs         :");
+    for (az, count) in &by_az {
+        let _ = writeln!(out, "              {count:>3} {az}");
+    }
+
+    let mut owned_by: BTreeMap<String, usize> = BTreeMap::new();
+    let mut orphaned = 0usize;
+    let mut handoff_pending = 0usize;
+    for t in tablets {
+        match t.get("owner_node_id").and_then(|v| v.as_str()) {
+            Some(o) => *owned_by.entry(o.to_string()).or_insert(0) += 1,
+            None => orphaned += 1,
+        }
+        if t.get("handoff_target_node_id")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            handoff_pending += 1;
+        }
+    }
+    let _ = writeln!(out, "Tablets     : {} total ({} orphaned)", tablets.len(), orphaned);
+    for (owner, count) in &owned_by {
+        let _ = writeln!(out, "              {count:>3} owned by {owner}");
+    }
+    if handoff_pending > 0 {
+        let _ = writeln!(out, "Handoff     : {handoff_pending} pending");
+    }
+
+    let counter = |key: &str| scheduler.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "Counters    : reassignments={} placements={} rebalances={} handoffs={} nodes_marked_dead={} nodes_gc_removed={}",
+        counter("reassignments_total"),
+        counter("tablet_placements_total"),
+        counter("tablet_rebalances_total"),
+        counter("tablet_handoffs_completed_total"),
+        counter("nodes_marked_dead_total"),
+        counter("nodes_gc_removed_total"),
+    );
+    out
 }
 
 /// `GET /api/admin/shards?session_id=...`.
@@ -579,5 +731,106 @@ fn exit_code_for(status: StatusCode) -> i32 {
         2
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cluster_status_renders_a_two_az_two_node_summary() {
+        let scheduler = json!({
+            "this_node_id": "n1",
+            "this_node_is_leader": true,
+            "this_node_epoch": 7,
+            "leader": {
+                "node_id": "n1",
+                "epoch": 7,
+                "expires_at_ms": 0_i64,
+                "acquired_at_ms": 0_i64,
+                "is_live": true,
+            },
+            "reassignments_total": 0_u64,
+            "nodes_marked_dead_total": 1_u64,
+            "nodes_gc_removed_total": 0_u64,
+            "tablet_placements_total": 4_u64,
+            "tablet_rebalances_total": 2_u64,
+            "tablet_handoffs_completed_total": 2_u64,
+        });
+        let nodes = vec![
+            json!({
+                "node_id": "n1",
+                "address": "127.0.0.1:7878",
+                "state": "alive",
+                "last_heartbeat_ms": 0_i64,
+                "joined_at_ms": 0_i64,
+                "availability_zone": "us-east-1a",
+                "is_stale": false,
+            }),
+            json!({
+                "node_id": "n2",
+                "address": "127.0.0.1:7879",
+                "state": "alive",
+                "last_heartbeat_ms": 0_i64,
+                "joined_at_ms": 0_i64,
+                "availability_zone": "us-east-1b",
+                "is_stale": false,
+            }),
+        ];
+        let tablets = vec![
+            json!({"tablet_id": 0, "owner_node_id": "n1", "epoch": 1, "lease_expires_at_ms": 9_i64, "created_at_ms": 0}),
+            json!({"tablet_id": 1, "owner_node_id": "n2", "epoch": 1, "lease_expires_at_ms": 9_i64, "created_at_ms": 0}),
+            json!({"tablet_id": 2, "owner_node_id": null,  "epoch": 0, "lease_expires_at_ms": 0_i64,  "created_at_ms": 0}),
+            json!({"tablet_id": 3, "owner_node_id": "n1", "epoch": 1, "lease_expires_at_ms": 9_i64, "created_at_ms": 0,
+                   "handoff_target_node_id": "n2"}),
+        ];
+        let s = format_cluster_status(&scheduler, &nodes, &tablets);
+        // Leader line.
+        assert!(s.contains("Leader      : n1 (this node: n1, IS leader)"), "got:\n{s}");
+        // AZ split.
+        assert!(s.contains("us-east-1a"), "AZ a should appear:\n{s}");
+        assert!(s.contains("us-east-1b"), "AZ b should appear:\n{s}");
+        // 4 tablets, 1 orphaned.
+        assert!(s.contains("Tablets     : 4 total (1 orphaned)"), "got:\n{s}");
+        // Handoff pending count.
+        assert!(s.contains("Handoff     : 1 pending"), "got:\n{s}");
+        // Counters surface.
+        assert!(s.contains("placements=4"), "got:\n{s}");
+        assert!(s.contains("rebalances=2"), "got:\n{s}");
+        assert!(s.contains("handoffs=2"), "got:\n{s}");
+    }
+
+    #[test]
+    fn cluster_status_handles_az_unset_and_no_leader() {
+        // Single-AZ deployment that hasn't declared an AZ
+        // and has never elected a leader.
+        let scheduler = json!({
+            "this_node_id": "solo",
+            "this_node_is_leader": false,
+            "this_node_epoch": 0,
+            "leader": null,
+            "reassignments_total": 0_u64,
+            "nodes_marked_dead_total": 0_u64,
+            "nodes_gc_removed_total": 0_u64,
+            "tablet_placements_total": 0_u64,
+            "tablet_rebalances_total": 0_u64,
+            "tablet_handoffs_completed_total": 0_u64,
+        });
+        let nodes = vec![json!({
+            "node_id": "solo",
+            "address": "127.0.0.1:7878",
+            "state": "alive",
+            "last_heartbeat_ms": 0_i64,
+            "joined_at_ms": 0_i64,
+            "is_stale": false,
+        })];
+        let tablets: Vec<Value> = vec![];
+        let s = format_cluster_status(&scheduler, &nodes, &tablets);
+        assert!(s.contains("Leader      : (none)"), "got:\n{s}");
+        assert!(s.contains("(unset)"), "az unset placeholder should appear:\n{s}");
+        assert!(s.contains("Tablets     : 0 total"), "got:\n{s}");
+        assert!(!s.contains("Handoff     :"), "no handoff line when zero pending:\n{s}");
     }
 }
