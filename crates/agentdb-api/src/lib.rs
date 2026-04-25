@@ -35,6 +35,7 @@ pub mod stream;
 pub mod trace_context;
 pub mod webhook;
 
+pub use auth_middleware::AuthedTenant;
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
@@ -104,6 +105,7 @@ impl AppState {
     ),
     paths(
         handlers::append_and_fetch,
+        handlers::append_and_fetch_session_keyed,
         fork::fork_handler,
         admin::force_tier,
         admin::get_hlc,
@@ -233,12 +235,30 @@ pub struct ApiDoc;
 pub fn router(state: AppState) -> Router {
     // Routes that require Basic auth when AppState::auth is Some.
     // Split into a separate Router so the auth middleware only
-    // sees tenant-scoped paths — admin-plane routes are a
-    // separate subtree below with no auth layer.
-    let tenant_routes: Router<AppState> = Router::new().route(
-        "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
-        axum::routing::post(handlers::append_and_fetch),
-    );
+    // sees mutation paths — admin-plane routes are a separate
+    // subtree below with no auth layer. Both shapes are routed
+    // under the same middleware:
+    //
+    //   - `/api/tenants/{tid}/sessions/{sid}/...` — legacy,
+    //     tenant explicit in path (auth verifies path tenant
+    //     matches credentials).
+    //   - `/api/sessions/{sid}/...` — M26 v2 shape, tenant
+    //     auth-derived. Handlers read `AuthedTenant` from
+    //     request extensions and verify against the session
+    //     locator.
+    let tenant_routes: Router<AppState> = Router::new()
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
+            axum::routing::post(handlers::append_and_fetch),
+        )
+        .route(
+            "/api/sessions/:session_id/append_and_fetch",
+            axum::routing::post(handlers::append_and_fetch_session_keyed),
+        )
+        .route(
+            "/api/sessions/:session_id/fork",
+            axum::routing::post(fork::fork_handler),
+        );
     let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth_middleware::basic_auth_middleware,
@@ -389,10 +409,6 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(tenant_routes)
         .merge(admin_routes)
-        .route(
-            "/api/sessions/:session_id/fork",
-            axum::routing::post(fork::fork_handler),
-        )
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))
         .route("/health/ready", axum::routing::get(health::ready))
