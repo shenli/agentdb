@@ -817,6 +817,34 @@ preserved for diagnostics but is **not** globally meaningful
 NOT cross-cluster stable until the tenant table itself becomes
 the source of truth in a later milestone).
 
+#### Locator-driven write routing
+
+`BoxRegistry::route_session_for_write(tenant, session)` is the
+write-side counterpart to the locator-driven read fanout. It
+asks `session_locators::get(session)` first; if a row with
+`tablet_id` is present, the write is routed to that tablet
+(local box or `RouteDecision::Remote` via `NodeAddressProxy`,
+depending on which node owns it). Locator misses fall through
+to the pre-existing `route_session_for_io` chain — shard
+override (`LocationProxy`) → tenant-hash — so pre-M26 sessions
+and brand-new mints behave exactly as before.
+
+The REST `append_and_fetch` handler and the inner
+`primitives::append_and_fetch_with_actor` both consult the
+same helper, so a write that crosses a node boundary is
+detected once at the API layer (forwards to the peer) and the
+inner routing won't second-guess the decision after a
+concurrent locator update — TOCTOU between the two routing
+calls degrades to the legacy route rather than failing the
+write.
+
+After this lands, both reads (PR #74) and writes go through
+the locator on the hot path. `session_locator` is now the
+canonical "where does session X live" record across the
+entire data path — the v2 promise from `agent-db-v2.md`
+that "writes route by session, not by tenant hash" is
+finally true on the wire, not just on the API surface.
+
 #### Locator-driven fanout (Phase 3)
 
 `session_locators::list_by_tenant_external` enumerates every

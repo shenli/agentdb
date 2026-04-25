@@ -391,12 +391,31 @@ pub async fn append_and_fetch_with_actor(
             });
         }
     }
-    // M20: route by (tenant, session). If a shard override is set
-    // for this session's shard, the write lands on the overridden
-    // tablet's box. Otherwise falls back to tenant-hash routing.
-    // When no LocationProxy is attached (legacy test paths) this
-    // degenerates to `route_tenant`.
-    let box_ = registry.route_session(tenant_external, session_external);
+    // M26 final phase: locator-first routing. The session
+    // locator (populated on every mint, kept current by
+    // cooperative handoff completion) is the v2 canonical
+    // record of where a session lives. Falling back to the
+    // pre-M26 chain (LocationProxy shard override →
+    // tenant-hash) for sessions without locator rows keeps
+    // legacy callers working unchanged.
+    //
+    // Cross-node decisions normally surface at the API
+    // layer (see `agentdb_api::handlers::append_and_fetch`,
+    // which calls `route_session_for_write` directly to get
+    // a `RouteDecision::Remote` and forwards the request).
+    // If a Remote decision still escapes to here it's almost
+    // certainly a TOCTOU with a concurrent locator update —
+    // we degrade to the pre-locator route rather than fail,
+    // matching `route_session_for_io`'s safety posture.
+    let box_ = match registry
+        .route_session_for_write(tenant_external, session_external)
+        .await
+    {
+        crate::box_runtime::RouteDecision::Local(b) => b,
+        crate::box_runtime::RouteDecision::Remote { .. } => {
+            registry.route_session(tenant_external, session_external)
+        }
+    };
     // M21: lease-alive check. If this box has a lease configured
     // (MetaStore-backed registry) and it has expired, fail fast so
     // the caller can retry or be routed to the new owner. When no
