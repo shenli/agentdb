@@ -1024,6 +1024,18 @@ into two:
   writes per box. Waits rather than rejects — complements the QPS
   token bucket, which rejects.
 
+Both lock maps are swept by a periodic background task
+(`agentdb_core::LockGc`, default tick
+`AGENTDB_LOCK_GC_TICK_SECS=60`) that drops entries whose
+`Arc<Mutex>` has no other holders. Re-acquisition after a
+prune is identical to first-touch acquisition — the next
+`session_write_lock`/`tenant_write_lock` call reinserts a
+fresh entry. Without this, the maps grow monotonically with
+every distinct external id ever touched, leaking memory
+proportional to the historical (rather than working) set.
+Counters: `LockGc::session_locks_pruned_total()` and
+`tenant_locks_pruned_total()`.
+
 ### Shard hash + LocationProxy + write-path routing (M20)
 
 `agentdb_core::shard::shard_id(session_external) -> u16` is FNV-1a
