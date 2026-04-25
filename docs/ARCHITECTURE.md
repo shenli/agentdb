@@ -767,6 +767,62 @@ another node clears the rows. Operators get a clean handoff without
 SIGTERM. No un-drain — restart the process to reverse.
 `docs/runbooks/node_draining.md` has the full procedure.
 
+### Tablet placement and reconciliation
+
+The previous version of this section described every node
+hard-claiming `[0..AGENTDB_BOXES)` at boot, which forced
+single-node deployments because two nodes would race on the
+same tablet ids. That changed. Today each `agentdb serve`
+process boots with an empty `BoxRegistry`; the scheduler-leader
+runs `TabletPlacement`, the per-node `TabletReconciler` picks
+up assignments. The split mirrors §2.5 of `agent-db-v2.md`.
+
+```
+control plane:
+  nodes table     ←─ heartbeat        ←─ each agentdb process
+                          │
+  tablets table    ──assign_to──▶  ←── round-robin from leader's
+                          │            TabletPlacement loop
+                          ▼
+  add_box(tablet_id)  ◀── TabletReconciler on each node
+                          │
+                          ▼
+       Box_ + LeaseManager + LeaseRenewalJob
+```
+
+- **Bootstrap.** When the leader's first placement tick finds
+  an empty `tablets` table, it seeds
+  `[0..AGENTDB_BOXES)` rows (env defaults to 4). The same env
+  is now cluster-wide rather than per-process.
+- **Placement.** `AGENTDB_PLACEMENT_TICK_SECS` (default 5s).
+  The leader scans `tablets` for any row whose
+  `owner_node_id IS NULL` and assigns it to an alive node
+  round-robin. `tablets::assign_to` writes only the owner —
+  it does **not** bump the epoch or grant a lease. That
+  responsibility stays with the receiving node.
+- **Reconciliation.** `AGENTDB_RECONCILER_TICK_SECS` (default
+  3s). Each node lists tablets where it's been promised
+  ownership and calls `BoxRegistry::add_box`, which acquires
+  the lease via `LeaseManager::acquire` (epoch++ via
+  `assume_ownership`). Already-running boxes are a no-op.
+- **Failover.** `StaleTabletReaper` clears expired leases
+  (`owner_node_id` → NULL), the next placement tick assigns
+  to a live node, and that node's reconciler picks it up.
+- **Initial sync pass at boot.** The server runs one
+  `placement::sweep_once` (if leader) and one
+  `reconciler::reconcile_once` synchronously before binding
+  the HTTP listener so `/health/ready` reports the
+  post-reconcile box set rather than a transient empty
+  registry.
+
+What's deliberately **not** in this PR: voluntary handoff
+(transferring a healthy tablet between alive nodes without
+waiting for lease expiry) and load-aware placement (the
+current loop is round-robin only). Both are tracked as
+follow-up; today's design covers fresh-cluster bootstrap and
+failover, which is what the docker-compose comment used to
+flag as "not implemented."
+
 ### Per-tenant locking + admission semaphore (M23)
 
 `Box_::write_lock: Mutex<()>` (serializes every tenant) is gone.

@@ -651,6 +651,54 @@ impl BoxRegistry {
         .await
     }
 
+    /// Build a meta-aware registry with **no** boxes. Use this
+    /// when ownership is determined externally — the
+    /// scheduler-leader's [`crate::tablet_placement`] loop
+    /// assigns tablets, and the per-node
+    /// [`crate::tablet_reconciler`] picks them up via
+    /// [`Self::add_box`].
+    ///
+    /// This is the production multi-node boot shape: every
+    /// process starts empty, then converges to whatever the
+    /// control plane has placed on it. Single-node clusters
+    /// converge to the same state in ~one placement tick after
+    /// boot — bootstrap seeds [0..bootstrap_tablets) and the
+    /// reconciler picks them up.
+    ///
+    /// The legacy `new_with_meta*` paths still eager-acquire
+    /// `[0..num_boxes)` at construction; tests and dev fixtures
+    /// stay on that path so they don't have to spin up the
+    /// placement+reconciler scaffolding.
+    pub async fn new_with_meta_empty(
+        kv: Arc<dyn KvStore>,
+        object_store: Arc<dyn ObjectStore>,
+        hlc: Arc<HlcClock>,
+        meta: Arc<agentdb_meta::MetaStore>,
+        node_id: String,
+        capacity: u32,
+    ) -> Result<Self> {
+        let config = crate::lease::LeaseConfig::from_env();
+        Ok(Self {
+            boxes: RwLock::new(Vec::new()),
+            kv,
+            object_store,
+            hlc,
+            node_id: Some(node_id),
+            meta: Some(meta),
+            lease_config: config,
+            admission_capacity: capacity,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            drained_at_ms: Arc::new(std::sync::OnceLock::new()),
+            location: std::sync::OnceLock::new(),
+            node_addr: std::sync::OnceLock::new(),
+            tenant_quotas: std::sync::OnceLock::new(),
+            slow_queries: std::sync::OnceLock::new(),
+            backup_status: std::sync::OnceLock::new(),
+            wire_forwarded_total: std::sync::atomic::AtomicU64::new(0),
+            wire_forward_failures_total: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     /// Like [`Self::new_with_meta`] but with an explicit admission
     /// capacity. The server binary uses this path so operators can
     /// tune `AGENTDB_ADMISSION_CAPACITY` alongside the control-plane
@@ -732,6 +780,27 @@ impl BoxRegistry {
 
     pub fn num_boxes(&self) -> u16 {
         self.boxes.read().len() as u16
+    }
+
+    /// Whether this registry is already running a `Box_` for
+    /// the given tablet id. Cheap (one read-lock + linear scan
+    /// over a typically-small Vec). Used by `TabletReconciler`
+    /// to skip tablets it's already running before calling
+    /// `add_box`.
+    pub fn has_box(&self, tablet_id: BoxId) -> bool {
+        self.boxes.read().iter().any(|b| b.id == tablet_id)
+    }
+
+    /// Owns the meta store this registry was built with, if any.
+    /// `None` under the legacy `new*` paths used by tests.
+    pub fn meta_store(&self) -> Option<Arc<agentdb_meta::MetaStore>> {
+        self.meta.clone()
+    }
+
+    /// Node id this process registered with. `None` on the
+    /// legacy / test construction paths.
+    pub fn self_node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
     }
 
     /// Route a tenant external id to a box using FNV-1a hash mod num_boxes.

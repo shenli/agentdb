@@ -12,8 +12,9 @@ use std::time::Duration;
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
-    LifecycleConfig, LifecycleEngine, NodeReaper, NodeReaperConfig, ReaperConfig, SegmentGc,
-    SegmentGcConfig, SessionRegistry, StaleTabletReaper, TenantRegistry,
+    LifecycleConfig, LifecycleEngine, NodeReaper, NodeReaperConfig, PlacementConfig, ReaperConfig,
+    ReconcilerConfig, SegmentGc, SegmentGcConfig, SessionRegistry, StaleTabletReaper,
+    TabletPlacement, TabletReconciler, TenantRegistry,
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
@@ -515,31 +516,37 @@ pub async fn run(
         meta_path = %cfg.meta_path,
         num_boxes = cfg.num_boxes,
         admission_capacity = cfg.admission_capacity,
-        "acquiring leases for boxes via control plane"
+        "building empty registry; tablets will be claimed via placement+reconciler"
     );
+    // Multi-node-safe boot: registry starts with NO boxes.
+    // The scheduler leader's TabletPlacement loop assigns
+    // tablets to alive nodes; the local TabletReconciler
+    // picks up our assignments via add_box. See
+    // crates/agentdb-core/src/tablet_placement.rs and
+    // tablet_reconciler.rs for the full design rationale.
+    //
+    // Single-node deployments converge to "this process owns
+    // [0..AGENTDB_BOXES)" within ~one placement+reconciler tick;
+    // we run an initial synchronous pass below so /health/ready
+    // and the HTTP listener start with the correct box set.
     let registry = Arc::new(
-        BoxRegistry::new_with_meta_and_capacity(
+        BoxRegistry::new_with_meta_empty(
             kv.clone(),
             object_store.clone(),
-            cfg.num_boxes,
             hlc,
             meta.clone(),
             cfg.node_id.clone(),
             cfg.admission_capacity,
         )
         .await
-        .context("acquire leases via control plane")?,
+        .context("build empty registry")?,
     );
 
-    // Drain-aware renewal loops.
-    let mut renewal_jobs: Vec<LeaseRenewalJob> = Vec::with_capacity(cfg.num_boxes as usize);
+    // Renewal jobs are spawned per box once the reconciler has
+    // populated the registry; see the post-reconcile block
+    // below. Followers and just-joined nodes may have zero
+    // boxes initially, which is fine.
     let drain_flag = registry.draining_flag();
-    for i in 0..cfg.num_boxes {
-        let b = registry.box_by_id(i).expect("box id in range");
-        let lease = b.lease().expect("new_with_meta attaches a lease").clone();
-        renewal_jobs.push(LeaseRenewalJob::start_with_drain(lease, drain_flag.clone()));
-    }
-    std::mem::forget(renewal_jobs);
 
     // Node membership + heartbeat. Advertise BOTH the REST
     // address (for node-to-node REST forwarding) and the
@@ -596,6 +603,73 @@ pub async fn run(
         attempt_secs = election_cfg.attempt_interval.as_secs(),
         "scheduler leader-election loop started"
     );
+
+    // Tablet placement + reconciler. Spawn the periodic loops
+    // first, then run one synchronous pass before binding the
+    // HTTP listener so single-node UX is "boot → ready in one
+    // election round-trip" instead of "boot → ready after the
+    // first periodic tick fires".
+    let placement_cfg = PlacementConfig::from_env();
+    let placement = TabletPlacement::start(meta.clone(), election.clone(), placement_cfg);
+    tracing::info!(
+        tick_secs = placement_cfg.tick.as_secs(),
+        bootstrap_tablets = placement_cfg.bootstrap_tablets,
+        "tablet placement loop started"
+    );
+
+    let reconciler_cfg = ReconcilerConfig::from_env();
+    let reconciler = TabletReconciler::start(registry.clone(), reconciler_cfg);
+    tracing::info!(
+        tick_secs = reconciler_cfg.tick.as_secs(),
+        "tablet reconciler loop started"
+    );
+
+    // Initial synchronous pass: wait briefly for leader-
+    // election to converge, then if we won, run a placement
+    // sweep so the very next reconcile sees something to do.
+    // Both passes are short and avoid an extra round-trip on
+    // single-node `agentdb serve --dev`.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    if election.is_leader() {
+        let assigns = std::sync::atomic::AtomicU64::new(0);
+        let boots = std::sync::atomic::AtomicU64::new(0);
+        agentdb_core::tablet_placement::sweep_once(&meta, placement_cfg, &assigns, &boots).await;
+        tracing::info!(
+            assigned = assigns.load(std::sync::atomic::Ordering::Acquire),
+            bootstrapped = boots.load(std::sync::atomic::Ordering::Acquire) > 0,
+            "initial placement pass complete"
+        );
+    }
+    {
+        let added = std::sync::atomic::AtomicU64::new(0);
+        let errs = std::sync::atomic::AtomicU64::new(0);
+        if let Err(()) =
+            agentdb_core::tablet_reconciler::reconcile_once(&registry, &added, &errs).await
+        {
+            tracing::warn!("initial reconcile pass failed; retrying via periodic loop");
+        } else {
+            tracing::info!(
+                added = added.load(std::sync::atomic::Ordering::Acquire),
+                num_boxes = registry.num_boxes(),
+                "initial reconcile pass complete"
+            );
+        }
+    }
+
+    // Drain-aware renewal loops, one per acquired box.
+    {
+        let mut renewal_jobs: Vec<LeaseRenewalJob> = Vec::new();
+        for b in registry.boxes_snapshot() {
+            if let Some(lease) = b.lease() {
+                renewal_jobs.push(LeaseRenewalJob::start_with_drain(
+                    lease.clone(),
+                    drain_flag.clone(),
+                ));
+            }
+        }
+        // Held forever; lease lifetime equals process lifetime.
+        std::mem::forget(renewal_jobs);
+    }
 
     // M20: seed the shards table (idempotent) and build a
     // LocationProxy that caches shard→tablet assignments. As of
@@ -853,15 +927,21 @@ pub async fn run(
         })
     };
 
-    let mut engines: Vec<LifecycleEngine> = Vec::with_capacity(cfg.num_boxes as usize);
-    for i in 0..cfg.num_boxes {
-        let box_ = registry.box_by_id(i).expect("box id in range");
+    // Lifecycle engines, segment GCs, and index-snapshot jobs
+    // are spawned per-box from the post-reconcile registry
+    // snapshot. Boxes that arrive later via the reconciler's
+    // periodic loop don't get these jobs in this PR — that's
+    // tracked as follow-up; the dominant case (single-node and
+    // bootstrap-on-boot multi-node) is covered.
+    let initial_boxes = registry.boxes_snapshot();
+    let mut engines: Vec<LifecycleEngine> = Vec::with_capacity(initial_boxes.len());
+    for box_ in &initial_boxes {
         engines.push(LifecycleEngine::start(
             kv.clone(),
             object_store.clone(),
             tenants.clone(),
             sessions.clone(),
-            box_,
+            box_.clone(),
             cfg.lifecycle_cfg,
             Some(hook.clone()),
         ));
@@ -880,14 +960,13 @@ pub async fn run(
         })
     };
 
-    let mut gcs: Vec<SegmentGc> = Vec::with_capacity(cfg.num_boxes as usize);
-    for i in 0..cfg.num_boxes {
-        let box_ = registry.box_by_id(i).expect("box id in range");
+    let mut gcs: Vec<SegmentGc> = Vec::with_capacity(initial_boxes.len());
+    for box_ in &initial_boxes {
         gcs.push(SegmentGc::start(
             object_store.clone(),
             tenants.clone(),
             sessions.clone(),
-            box_,
+            box_.clone(),
             cfg.segment_gc_cfg,
             Some(reporter.clone()),
         ));
@@ -896,12 +975,11 @@ pub async fn run(
 
     let snapshot_cfg = agentdb_core::IndexSnapshotJobConfig::from_env();
     let mut snapshot_jobs: Vec<agentdb_core::IndexSnapshotJob> =
-        Vec::with_capacity(cfg.num_boxes as usize);
-    for i in 0..cfg.num_boxes {
-        let box_ = registry.box_by_id(i).expect("box id in range");
+        Vec::with_capacity(initial_boxes.len());
+    for box_ in &initial_boxes {
         snapshot_jobs.push(agentdb_core::IndexSnapshotJob::start(
             object_store.clone(),
-            box_,
+            box_.clone(),
             snapshot_cfg,
         ));
     }
@@ -1091,6 +1169,8 @@ pub async fn run(
         .layer(axum::Extension(election.clone()))
         .layer(axum::Extension(reaper.clone()))
         .layer(axum::Extension(node_reaper.clone()))
+        .layer(axum::Extension(placement.clone()))
+        .layer(axum::Extension(reconciler.clone()))
         .layer(axum::Extension(hot_detector.clone()))
         .layer(axum::Extension(location_proxy.clone()))
         .layer(axum::Extension(reload_handle));

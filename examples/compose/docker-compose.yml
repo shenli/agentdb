@@ -1,11 +1,19 @@
-# AgentDB single-node docker-compose stack with MinIO.
+# AgentDB docker-compose stack with MinIO.
 #
-# Why single-node and not a multi-node cluster: the current
-# architecture acquires a lease for every tablet (0..AGENTDB_BOXES)
-# at boot, and two nodes sharing a meta store would race for the
-# same tablet ids. Multi-node requires the M20 shard/tablet
-# refactor (see docs/agent-db-v2.md §3 and the plan doc) — tracked,
-# not implemented.
+# This file ships a single-node stack by default. Multi-node is
+# now supported — both nodes can share the same meta store and
+# the scheduler-leader's `TabletPlacement` loop spreads the
+# `AGENTDB_BOXES` tablets across alive nodes round-robin. See
+# `docs/ARCHITECTURE.md` ("Tablet placement and reconciliation")
+# for the design and `crates/agentdb-core/src/tablet_placement.rs`
+# for the leader-owned placement loop.
+#
+# To run two nodes against the same Postgres meta store, copy
+# the `agentdb` block, give each node a unique `AGENTDB_NODE_ID`
+# and host port, and point both at the same `AGENTDB_META_URL`.
+# The first node to win leader election seeds the tablets and
+# distributes them; the other reconciler picks up its share
+# within ~one tick.
 #
 # What you get:
 #   * One AgentDB node on :7878 (REST + /dashboard + /metrics)
