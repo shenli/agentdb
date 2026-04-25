@@ -7,8 +7,9 @@ use agentdb_core::{
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
-use crate::bsonx::json_to_bson;
+use crate::bsonx::{doc_to_json, json_to_bson};
 use crate::error::{WireError, WireResult};
+use crate::forward;
 use crate::handlers::filter::Filter;
 
 /// Cap on the locator-fanout list we'll pull from meta in a
@@ -33,18 +34,16 @@ pub async fn find_response(
     raw: bool,
 ) -> WireResult<Document> {
     let started = std::time::Instant::now();
-    // M20 multi-node: if the filter pins a specific session
-    // and that session's shard is owned by another node, the
-    // read is routed wrong and we'd silently return empty
-    // from the tenant-hash box. Fail loudly with a
-    // NotWritablePrimary-shaped error that tells the client
-    // where to reconnect. Mongo-wire cross-node forwarding is
-    // deferred (binary stateful protocol; see plan doc).
-    // If the filter pins a session, respect the shard
-    // override / tablet ownership: remote → cross-node signal
-    // (or forwarding at the connection layer); local but on a
-    // different box than tenant-hash → use the session's box
-    // so a find after an override doesn't silently miss.
+    // M20 multi-node: pinned reads on a peer-owned shard are
+    // forwarded at the connection layer (server.rs, before
+    // dispatch). If the connection layer chose not to forward
+    // (auth-required mode, or no advertised mongo address),
+    // the request reaches us and we still want to fail loudly
+    // with NotWritablePrimary so drivers reconnect to the
+    // owner — better than silently returning empty from the
+    // tenant-hash box. Local-but-on-a-different-box (shard
+    // override) routes to the session's box so a find after
+    // an override doesn't silently miss.
     let pinned_session: Option<String> = Filter::parse(filter_doc)
         .ok()
         .and_then(|f| f.top_level_eq("session_id").and_then(|v| match v {
@@ -95,17 +94,18 @@ pub async fn find_response(
     //
     //   1. **Pinned session**: filter has session_id == "X".
     //      Route to that one session via the existing shard /
-    //      tablet lookup. Cross-node returns the same
-    //      NotWritablePrimary-shaped error as before — full
-    //      cross-node Mongo wire forwarding for reads is the
-    //      explicit Phase 3 follow-up (binary-protocol).
+    //      tablet lookup. Cross-node hits the wire-level
+    //      forwarder in server.rs before us (or surfaces
+    //      NotWritablePrimary in auth-required mode, where
+    //      SASL state can't cross the forward).
     //
     //   2. **Locator fanout** (M26 Phase 3): meta-wired
     //      registries enumerate sessions via
-    //      session_locators::list_by_tenant_external. Each
-    //      session's hosting box is the one whose id matches
-    //      the locator's tablet_id; cross-node sessions are
-    //      skipped with a tracing warn.
+    //      session_locators::list_by_tenant_external. Sessions
+    //      whose tablet is local route to that local box;
+    //      cross-node sessions are queued onto `remote_targets`
+    //      and fanned out via pinned-find OP_MSG forwards
+    //      after the local pass.
     //
     //   3. **Tenant-hash-box-local back-compat**: sessions
     //      created pre-M26 (or pre-locator-population) only
@@ -117,6 +117,11 @@ pub async fn find_response(
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;
     let mut targets: Vec<(Arc<Box_>, String)> = Vec::new();
+    // Cross-node fanout queue: per-peer (mongo_address) →
+    // sessions on that peer. Drained after the local loop into
+    // a series of pinned `find` forwards (one per session).
+    // Sequential v1; concurrent fanout is a follow-up.
+    let mut remote_targets: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     if let Some(s) = pinned_session.as_deref() {
@@ -143,16 +148,57 @@ pub async fn find_response(
             .await
             {
                 Ok(locators) => {
+                    // Tablet locality is decided by the node-
+                    // address proxy when it's attached — every
+                    // node carries local boxes 0..N regardless
+                    // of which tablets the cluster actually
+                    // assigns to it, so `box_by_id` alone would
+                    // mis-classify peer tablets as local in any
+                    // multi-node setup. The proxy is the
+                    // canonical record. Without a proxy (single-
+                    // node tests, simple deploys) we fall back
+                    // to the local-box lookup.
+                    let proxy = registry.node_address_proxy();
                     for loc in locators {
                         let Some(tab) = loc.tablet_id else { continue };
+                        let peer_target = proxy.as_ref().and_then(|p| {
+                            p.target_for_tablet(tab).filter(|t| !p.is_self(t))
+                        });
+                        if let Some(target) = peer_target {
+                            // Cross-node: queue a pinned-find
+                            // forward. If the peer hasn't
+                            // advertised a Mongo wire address
+                            // (pre-advertise build, or wire
+                            // listener disabled), skip with warn
+                            // — same observable behavior as
+                            // before this PR.
+                            let Some(mongo_addr) = target.mongo_address else {
+                                tracing::warn!(
+                                    session_id = %loc.session_id,
+                                    tablet_id = tab,
+                                    "find: cross-node session has no resolvable mongo \
+                                     address; session skipped"
+                                );
+                                continue;
+                            };
+                            if seen.insert(loc.session_id.clone()) {
+                                remote_targets.push((mongo_addr, loc.session_id));
+                            }
+                            continue;
+                        }
+                        // Local — proxy says we own it, or no
+                        // proxy attached. Resolve to a local
+                        // box; if there isn't one (locator
+                        // points at a tablet id outside this
+                        // process's range AND no proxy
+                        // disambiguated), skip with warn.
                         let Some(host) =
                             u16::try_from(tab).ok().and_then(|t| registry.box_by_id(t))
                         else {
                             tracing::warn!(
                                 session_id = %loc.session_id,
                                 tablet_id = tab,
-                                "find: locator points at non-local tablet; cross-node Mongo \
-                                 wire fanout reads are a Phase 3 follow-up — session skipped"
+                                "find: locator points at unknown tablet; session skipped"
                             );
                             continue;
                         };
@@ -260,6 +306,59 @@ pub async fn find_response(
         }
     }
 
+    // Cross-node fanout (M26 Phase 3 final piece). For each
+    // peer-resident session the locator surfaced, send a
+    // synthetic pinned `find` over the wire and merge the
+    // peer's `firstBatch` into our local batch. Per-peer
+    // failures degrade to "warn + skip the session": the
+    // request still succeeds with whatever local + reachable-
+    // peer events we collected — same gracefulness contract as
+    // the locator-query failure branch above.
+    if !remote_targets.is_empty() && batch.len() < cap {
+        for (peer_addr, session_id) in &remote_targets {
+            if batch.len() >= cap {
+                break;
+            }
+            // We never request `raw` from peers because the local
+            // path's `raw` flag governs how WE expose results. The
+            // peer applies its own fold per its dispatcher — which
+            // mirrors the local handler — so the merged shape is
+            // identical to the all-local case.
+            match forward::pinned_find(
+                peer_addr,
+                db,
+                collection,
+                session_id,
+                limit,
+                raw,
+            )
+            .await
+            {
+                Ok(docs) => {
+                    registry.record_wire_forwarded();
+                    for d in docs {
+                        let row = doc_to_json(d);
+                        if filter.matches(&row) {
+                            batch.push(row);
+                            if batch.len() >= cap {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    registry.record_wire_forward_failure();
+                    tracing::warn!(
+                        %err,
+                        peer = %peer_addr,
+                        session_id = %session_id,
+                        "find: cross-node fanout to peer failed; session events skipped"
+                    );
+                }
+            }
+        }
+    }
+
     let first_batch: Vec<Bson> = batch.into_iter().map(json_to_bson).collect();
     let batch_len = first_batch.len();
     let response = doc! {
@@ -328,6 +427,12 @@ fn truncate(s: &str, max: usize) -> String {
 /// interpret it as "reconnect." We include the owning node's
 /// address so a human operator sees it immediately and a
 /// driver that logs errmsg has a breadcrumb.
+///
+/// Reached only when the connection-layer wire forwarder
+/// (server.rs) declined to forward — typically because auth
+/// is required and SASL state can't cross the hop. Pinned
+/// reads/writes in the no-auth path forward via
+/// `forward_op_msg` and never get here.
 pub fn cross_node_error(node_id: &str, address: &str, tablet_id: i64) -> Document {
     doc! {
         "ok": 0.0,
@@ -335,7 +440,7 @@ pub fn cross_node_error(node_id: &str, address: &str, tablet_id: i64) -> Documen
         "codeName": "NotWritablePrimary",
         "errmsg": format!(
             "session shard is owned by node {node_id} at {address} (tablet {tablet_id}); \
-             reconnect there. Cross-node Mongo-wire forwarding is not implemented; \
+             reconnect there. Wire forwarding is disabled in auth-required mode; \
              see docs/ARCHITECTURE.md M20 multi-node section."
         ),
     }

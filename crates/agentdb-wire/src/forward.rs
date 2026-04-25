@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use agentdb_core::{BoxRegistry, RouteDecision};
-use bson::{Bson, Document};
+use bson::{doc, Bson, Document};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,6 +90,73 @@ async fn forward_inner(peer_addr: &str, frame: &[u8]) -> WireResult<Vec<u8>> {
     whole.extend_from_slice(&len_buf);
     whole.extend_from_slice(&rest);
     Ok(whole)
+}
+
+/// Build a synthetic Mongo `find` command pinned to one
+/// session, send it to `peer_mongo_addr`, decode the peer's
+/// response and return `cursor.firstBatch`.
+///
+/// Used by the unpinned-fanout path in `handlers::find` when
+/// the locator says some sessions on the tenant live on peer
+/// nodes. Issuing one pinned find per remote session reuses
+/// the existing wire forwarding machinery (frame round-trip
+/// plus the auth/SASL exemption) without inventing a new
+/// internal protocol; the peer treats the synthetic frame
+/// like any other client connection.
+///
+/// `limit` of `None` means the peer applies no client-cap;
+/// the caller is expected to enforce the merged cap after
+/// stitching peers' results into the local batch.
+pub async fn pinned_find(
+    peer_mongo_addr: &str,
+    db: &str,
+    collection: &str,
+    session_id: &str,
+    limit: Option<i64>,
+    raw: bool,
+) -> WireResult<Vec<Document>> {
+    let mut body = doc! {
+        "find": collection,
+        "$db": db,
+        "filter": { "session_id": session_id },
+    };
+    if let Some(l) = limit {
+        body.insert("limit", l);
+    }
+    if raw {
+        body.insert("raw", true);
+    }
+    let mut frame = Vec::new();
+    // request_id 0 / response_to 0: the peer copies request_id
+    // into response_to anyway, and we throw away the reply
+    // header after decoding the body section.
+    opmsg::encode_body_response(&mut frame, 0, 0, &body)?;
+    let reply = forward_op_msg(peer_mongo_addr, &frame).await?;
+    let msg = opmsg::decode(&reply)?;
+    let body = msg
+        .body()
+        .ok_or_else(|| WireError::Protocol("forwarded find: response had no body".into()))?;
+    if let Ok(ok) = body.get_f64("ok") {
+        if ok != 1.0 {
+            let errmsg = body.get_str("errmsg").unwrap_or("(no errmsg)");
+            return Err(WireError::Protocol(format!(
+                "forwarded find peer rejected: {errmsg}"
+            )));
+        }
+    }
+    let cursor = body.get_document("cursor").map_err(|_| {
+        WireError::Protocol("forwarded find: response missing cursor".into())
+    })?;
+    let batch = cursor.get_array("firstBatch").map_err(|_| {
+        WireError::Protocol("forwarded find: response missing cursor.firstBatch".into())
+    })?;
+    Ok(batch
+        .iter()
+        .filter_map(|b| match b {
+            Bson::Document(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Decide whether an incoming OP_MSG should be forwarded to a
@@ -227,6 +294,7 @@ fn same_session_across<T, F: Fn(&T) -> Option<String>>(
 mod tests {
     use super::*;
     use bson::doc;
+    use std::sync::Arc;
 
     /// Bare-minimum echo server that answers every incoming
     /// OP_MSG with `{ok: 1, echoed_by: addr}`. Used to exercise
@@ -273,6 +341,138 @@ mod tests {
         let msg = opmsg::decode(&reply).unwrap();
         let body = msg.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    }
+
+    /// Peer that captures the request body and answers with
+    /// a canned `cursor.firstBatch` of two events. Used to
+    /// exercise `pinned_find`'s frame construction + response
+    /// decoding without spinning up the full dispatcher.
+    async fn spawn_find_peer() -> (String, Arc<tokio::sync::Mutex<Option<Document>>>) {
+        let captured = Arc::new(tokio::sync::Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cap = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let cap = cap.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if socket.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let total =
+                            ReadBytesExt::read_i32::<LittleEndian>(&mut Cursor::new(&len_buf[..]))
+                                .unwrap() as usize;
+                        let mut rest = vec![0u8; total - 4];
+                        if socket.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        let mut whole = Vec::with_capacity(total);
+                        whole.extend_from_slice(&len_buf);
+                        whole.extend_from_slice(&rest);
+                        let req = opmsg::decode(&whole).unwrap();
+                        if let Some(b) = req.body() {
+                            *cap.lock().await = Some(b.clone());
+                        }
+                        let reply_body = doc! {
+                            "cursor": {
+                                "id": 0_i64,
+                                "ns": "t-fwd.events",
+                                "firstBatch": [
+                                    doc! { "session_id": "s-x", "seq": 1_i64, "ts": 1_i64,
+                                           "payload": { "kind": "from-peer-1" } },
+                                    doc! { "session_id": "s-x", "seq": 2_i64, "ts": 2_i64,
+                                           "payload": { "kind": "from-peer-2" } },
+                                ],
+                            },
+                            "ok": 1.0,
+                        };
+                        let mut reply = Vec::new();
+                        opmsg::encode_body_response(&mut reply, 0, 0, &reply_body).unwrap();
+                        let _ = socket.write_all(&reply).await;
+                    }
+                });
+            }
+        });
+        (addr, captured)
+    }
+
+    #[tokio::test]
+    async fn pinned_find_round_trips_through_a_peer() {
+        let (peer, captured) = spawn_find_peer().await;
+        let docs = pinned_find(&peer, "t-fwd", "events", "s-x", Some(50), false)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+        let kinds: Vec<String> = docs
+            .iter()
+            .map(|d| {
+                d.get_document("payload")
+                    .unwrap()
+                    .get_str("kind")
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(kinds, vec!["from-peer-1", "from-peer-2"]);
+        // Verify the synthetic frame the peer received matches
+        // the contract: pinned filter, $db, find collection, limit.
+        let req = captured.lock().await.clone().unwrap();
+        assert_eq!(req.get_str("find").unwrap(), "events");
+        assert_eq!(req.get_str("$db").unwrap(), "t-fwd");
+        assert_eq!(req.get_i64("limit").unwrap(), 50);
+        let f = req.get_document("filter").unwrap();
+        assert_eq!(f.get_str("session_id").unwrap(), "s-x");
+        assert!(req.get_bool("raw").is_err(), "raw default must be omitted");
+    }
+
+    /// Peer that returns `ok: 0` with an errmsg. `pinned_find`
+    /// must surface this as a `WireError::Protocol` rather than
+    /// silently dropping the events.
+    async fn spawn_error_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    if socket.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let total =
+                        ReadBytesExt::read_i32::<LittleEndian>(&mut Cursor::new(&len_buf[..]))
+                            .unwrap() as usize;
+                    let mut rest = vec![0u8; total - 4];
+                    if socket.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let body = doc! { "ok": 0.0, "errmsg": "synthetic peer error" };
+                    let mut reply = Vec::new();
+                    opmsg::encode_body_response(&mut reply, 0, 0, &body).unwrap();
+                    let _ = socket.write_all(&reply).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn pinned_find_surfaces_peer_errors() {
+        let peer = spawn_error_peer().await;
+        let err = pinned_find(&peer, "db", "events", "s", None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("synthetic peer error"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
