@@ -309,6 +309,10 @@ struct Resolved {
     /// forwarding. Defaults to `mongo_addr.to_string()` when
     /// `AGENTDB_NODE_MONGO_ADDRESS` is unset.
     node_mongo_address: String,
+    /// Availability zone declared via AGENTDB_NODE_AZ. None
+    /// in single-AZ deployments — placement falls back to
+    /// load-only balancing.
+    node_az: Option<String>,
     heartbeat_secs: u64,
     lifecycle_cfg: LifecycleConfig,
     segment_gc_cfg: SegmentGcConfig,
@@ -385,6 +389,9 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
         std::env::var("AGENTDB_NODE_ADDRESS").unwrap_or_else(|_| http_addr.to_string());
     let node_mongo_address = std::env::var("AGENTDB_NODE_MONGO_ADDRESS")
         .unwrap_or_else(|_| mongo_addr.to_string());
+    // Cross-AZ placement (agent-db-v2.md §2.7). NULL = single-AZ
+    // deployment; placement falls back to load-only balancing.
+    let node_az = std::env::var("AGENTDB_NODE_AZ").ok();
     let heartbeat_secs: u64 = std::env::var("AGENTDB_HEARTBEAT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -435,6 +442,7 @@ fn resolve_config(opts: &ServeOpts) -> anyhow::Result<Resolved> {
         node_id,
         node_address,
         node_mongo_address,
+        node_az,
         heartbeat_secs,
         lifecycle_cfg,
         segment_gc_cfg,
@@ -561,12 +569,14 @@ pub async fn run(
         Some(cfg.node_mongo_address.as_str()),
         "alive",
         now_ms_i64(),
+        cfg.node_az.as_deref(),
     )
     .await
     .context("register node in control plane")?;
     tracing::info!(
         node_id = %cfg.node_id,
         node_address = %cfg.node_address,
+        node_az = cfg.node_az.as_deref().unwrap_or("(unset)"),
         heartbeat_secs = cfg.heartbeat_secs,
         "registered node in control plane"
     );

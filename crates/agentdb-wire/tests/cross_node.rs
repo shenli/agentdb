@@ -41,10 +41,10 @@ async fn spawn_node_a_with_peer_b() -> (
     // isn't actually running — we're only testing the error
     // signal when node A receives a mis-routed Mongo query.
     let node_b_addr = "127.0.0.1:65530".to_string();
-    meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:0", None, "alive", 100)
+    meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:0", None, "alive", 100, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "node-b", &node_b_addr, None, "alive", 100)
+    meta_nodes::upsert(meta.pool(), "node-b", &node_b_addr, None, "alive", 100, None)
         .await
         .unwrap();
     for t in 0..4 {

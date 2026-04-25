@@ -163,6 +163,7 @@ async fn pg_listen_notify_delivers_a_node_change() {
         Some("127.0.0.1:2"),
         "alive",
         10,
+        None,
     )
     .await
     .unwrap();

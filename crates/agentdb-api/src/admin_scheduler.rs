@@ -309,11 +309,11 @@ mod tests {
         let meta = Arc::new(MetaStore::open_sqlite(&path).await.unwrap());
         // "stale" is alive but hb is decades-stale (real-time "now"
         // is definitely > 1000 + 1ms dead_after so it'll flip).
-        agentdb_meta::nodes::upsert(meta.pool(), "stale", "a", None, "alive", 1_000)
+        agentdb_meta::nodes::upsert(meta.pool(), "stale", "a", None, "alive", 1_000, None)
             .await
             .unwrap();
         // Pre-flip "ancient" so GC has a candidate without a wait.
-        agentdb_meta::nodes::upsert(meta.pool(), "ancient", "b", None, "alive", 0)
+        agentdb_meta::nodes::upsert(meta.pool(), "ancient", "b", None, "alive", 0, None)
             .await
             .unwrap();
         agentdb_meta::nodes::mark_dead_if_stale(meta.pool(), 50)

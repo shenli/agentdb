@@ -1448,10 +1448,10 @@ mod tests {
         use agentdb_meta::{migrations, nodes as meta_nodes, tablets as meta_tablets, MetaStore};
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
-        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "other", "127.0.0.1:7001", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "other", "127.0.0.1:7001", None, "alive", 100, None)
             .await
             .unwrap();
         for &t in self_tablets {
@@ -1545,7 +1545,7 @@ mod tests {
         let (_dir, _obj_dir, reg) = registry(4);
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
         migrations::apply(meta.pool(), agentdb_meta::MetaDialect::Sqlite).await.unwrap();
-        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "self", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
         // tablet 5 claims a ghost owner that isn't in the nodes table.

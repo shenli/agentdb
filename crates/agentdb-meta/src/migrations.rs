@@ -91,6 +91,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/012_session_locator_external_tenant.sql"),
         include_str!("../migrations/012_session_locator_external_tenant.pg.sql"),
     ),
+    (
+        13,
+        "nodes.availability_zone (cross-AZ failure-domain awareness, agent-db-v2.md §2.7)",
+        include_str!("../migrations/013_nodes_availability_zone.sql"),
+        include_str!("../migrations/013_nodes_availability_zone.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

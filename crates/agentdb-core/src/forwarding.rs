@@ -212,10 +212,10 @@ mod tests {
     async fn refresh_populates_tablet_to_node_mapping() {
         let meta = fresh_meta().await;
         // Register two nodes, one tablet owned by each.
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "node-b", "127.0.0.1:7001", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-b", "127.0.0.1:7001", None, "alive", 100, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 0, 100).await.unwrap();
@@ -248,7 +248,7 @@ mod tests {
         // drop the tablet's entry rather than pointing at a
         // nonexistent node.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 5, 100).await.unwrap();
@@ -264,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_drops_unowned_tablets() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 9, 100).await.unwrap();
@@ -278,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_job_updates_cache_after_new_ownership() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100)
+        meta_nodes::upsert(meta.pool(), "node-a", "127.0.0.1:7000", None, "alive", 100, None)
             .await
             .unwrap();
         let proxy = NodeAddressProxy::new(meta.clone(), "node-a".into())

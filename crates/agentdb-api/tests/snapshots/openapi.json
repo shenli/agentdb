@@ -3044,6 +3044,13 @@
           "address": {
             "type": "string"
           },
+          "availability_zone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Availability zone declared via `AGENTDB_NODE_AZ`. `None`\nfor single-AZ deployments and pre-migration-013 nodes.\nTablet placement prefers cross-AZ targets when this is\npopulated for two or more nodes."
+          },
           "is_stale": {
             "type": "boolean",
             "description": "True when this node's last heartbeat is older than the\nconfigured `stale_threshold_ms` (default 15000). Diagnostic —\nthe scheduler that M22 will add does the actual failover\ndecision; this flag is just for operator visibility."

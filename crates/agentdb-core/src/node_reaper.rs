@@ -263,13 +263,13 @@ mod tests {
         //   stale   hb=500  (old enough to die, but recent enough to
         //                    survive the GC pass; see cfg below)
         //   ancient hb=0    (pre-flipped to dead below; GC'd)
-        meta_nodes::upsert(meta.pool(), "fresh", "a", None, "alive", 1_800)
+        meta_nodes::upsert(meta.pool(), "fresh", "a", None, "alive", 1_800, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "stale", "b", None, "alive", 500)
+        meta_nodes::upsert(meta.pool(), "stale", "b", None, "alive", 500, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "ancient", "c", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "ancient", "c", None, "alive", 0, None)
             .await
             .unwrap();
         // Flip "ancient" to dead directly so the GC pass has a
@@ -327,10 +327,10 @@ mod tests {
         migrations::apply(meta.pool(), MetaDialect::Sqlite)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "bye", "a", None, "leaving", 0)
+        meta_nodes::upsert(meta.pool(), "bye", "a", None, "leaving", 0, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "drain", "b", None, "draining", 0)
+        meta_nodes::upsert(meta.pool(), "drain", "b", None, "draining", 0, None)
             .await
             .unwrap();
 
@@ -372,7 +372,7 @@ mod tests {
         // so its reaper must never mark anything dead — even
         // though the stale node would qualify.
         let (_guard, meta) = file_backed_meta().await;
-        meta_nodes::upsert(meta.pool(), "stale", "a", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "stale", "a", None, "alive", 0, None)
             .await
             .unwrap();
         let cfg = LeaderElectionConfig {
@@ -424,7 +424,7 @@ mod tests {
         // where dead nodes persist long enough for operators to
         // notice them before GC.
         let hb = now_ms() - 60_000;
-        meta_nodes::upsert(meta.pool(), "stale", "a", None, "alive", hb)
+        meta_nodes::upsert(meta.pool(), "stale", "a", None, "alive", hb, None)
             .await
             .unwrap();
         let cfg = LeaderElectionConfig {

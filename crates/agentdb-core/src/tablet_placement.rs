@@ -304,6 +304,15 @@ pub async fn sweep_once(
         // node registering itself in `nodes`.
         return;
     }
+    // Map node_id → its declared AZ (or None for unset).
+    // Cross-AZ-aware placement (agent-db-v2.md §2.7): a
+    // tenant tablet should not concentrate in one AZ if more
+    // than one is represented in the alive set.
+    let az_by_node: std::collections::HashMap<&str, Option<&str>> = nodes
+        .iter()
+        .filter(|n| n.state == "alive")
+        .map(|n| (n.node_id.as_str(), n.availability_zone.as_deref()))
+        .collect();
 
     // 3. Rebalance: signal cooperative handoff on tablets owned
     // by over-loaded alive nodes. The source's TabletReconciler
@@ -315,7 +324,7 @@ pub async fn sweep_once(
     // genuine failover orphans), so the rebalanced row reaches
     // its target through `complete_handoff`, not assign-unowned.
     let mut tablets = tablets;
-    let signals = rebalance_pass(meta, &alive, &tablets).await;
+    let signals = rebalance_pass(meta, &alive, &az_by_node, &tablets).await;
     if !signals.is_empty() {
         rebalances_total.fetch_add(signals.len() as u64, Ordering::Release);
         // No snapshot mutation needed — phase 4 only acts on
@@ -327,20 +336,27 @@ pub async fn sweep_once(
         let _ = (&mut tablets, &signals);
     }
 
-    // 4. Load-aware assign: every unowned tablet goes to the
-    // currently least-loaded alive node, ties broken by
-    // node-id for determinism. This makes the rebalance pass
-    // self-correcting — freshly-relinquished tablets land on
-    // peers, not back on the source. Equivalent to round-robin
-    // when starting from a uniformly-empty load profile.
+    // 4. Load-aware AZ-balanced assign. Every unowned tablet
+    // goes to the alive node whose hosting AZ currently
+    // carries the fewest tablets, ties broken by per-node
+    // load and then by node-id. The AZ-load tier dominates
+    // when more than one AZ is represented; on a single-AZ
+    // cluster (or when no AZs are declared at all) it
+    // collapses to the existing load-only behavior because
+    // every node shares the same AZ key (or `None`).
     let mut load: std::collections::HashMap<&str, usize> = alive
         .iter()
         .map(|n| (*n, 0usize))
         .collect();
+    let mut az_load: std::collections::HashMap<Option<&str>, usize> =
+        std::collections::HashMap::new();
     for t in &tablets {
         if let Some(owner) = t.owner_node_id.as_deref() {
             if let Some(c) = load.get_mut(owner) {
                 *c += 1;
+            }
+            if let Some(az) = az_by_node.get(owner).copied() {
+                *az_load.entry(az).or_insert(0) += 1;
             }
         }
     }
@@ -350,15 +366,22 @@ pub async fn sweep_once(
         if t.owner_node_id.is_some() {
             continue;
         }
-        // Pick the alive node with the lowest current count;
-        // tie-break by node-id alphabetical so two leaders on
-        // the same input (the inevitable transition after
-        // election churn) make the same choice.
+        // Rank: (AZ tablet count, per-node tablet count,
+        // node id). Lower wins on every key.
         let target = alive
             .iter()
-            .map(|n| (*n, *load.get(n).unwrap_or(&0)))
-            .min_by(|(an, ac), (bn, bc)| ac.cmp(bc).then_with(|| an.cmp(bn)))
-            .map(|(n, _)| n);
+            .map(|n| {
+                let az = az_by_node.get(n).copied().unwrap_or(None);
+                let azc = *az_load.get(&az).unwrap_or(&0);
+                let nc = *load.get(n).unwrap_or(&0);
+                (*n, az, azc, nc)
+            })
+            .min_by(|a, b| {
+                a.2.cmp(&b.2)
+                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.0.cmp(b.0))
+            })
+            .map(|(n, _, _, _)| n);
         let Some(target) = target else {
             // alive non-empty was checked at the top of the
             // function, so this branch is unreachable in
@@ -371,9 +394,12 @@ pub async fn sweep_once(
                 if let Some(c) = load.get_mut(target) {
                     *c += 1;
                 }
+                let az = az_by_node.get(target).copied().unwrap_or(None);
+                *az_load.entry(az).or_insert(0) += 1;
                 tracing::info!(
                     tablet_id = t.tablet_id,
                     node_id = target,
+                    az = az.unwrap_or("(unset)"),
                     "tablet placement: assigned unowned tablet to alive node"
                 );
             }
@@ -422,6 +448,7 @@ pub async fn sweep_once(
 async fn rebalance_pass(
     meta: &MetaStore,
     alive: &[&str],
+    az_by_node: &std::collections::HashMap<&str, Option<&str>>,
     tablets: &[agentdb_meta::tablets::Tablet],
 ) -> Vec<(i64, String)> {
     use std::collections::HashMap;
@@ -484,18 +511,32 @@ async fn rebalance_pass(
         // tends to disturb the smallest fraction of hot
         // sessions.
         for tid in &owned[drop_from..] {
-            // Pick the currently-least-loaded peer (by
-            // projected load, excluding the source itself).
+            // Pick the best peer for this tablet:
+            //   1. Prefer a different AZ from the source (so a
+            //      single-AZ outage doesn't take both copies).
+            //   2. Among the preferred set, lowest projected
+            //      load wins.
+            //   3. Tie-break by node-id alphabetical.
+            // If no different-AZ peer exists (single-AZ
+            // cluster, or AZs not declared), the filter
+            // collapses and we fall back to all alive peers.
             let source_id: &str = source;
-            let picked_target = alive
-                .iter()
-                .filter(|n| **n != source_id)
-                .min_by(|a, b| {
-                    let la = projected_load.get(**a).copied().unwrap_or(0);
-                    let lb = projected_load.get(**b).copied().unwrap_or(0);
-                    la.cmp(&lb).then_with(|| a.cmp(b))
-                })
-                .map(|s| (*s).to_string());
+            let source_az = az_by_node.get(source_id).copied().unwrap_or(None);
+            let pick_among = |allow: &dyn Fn(&str) -> bool| -> Option<String> {
+                alive
+                    .iter()
+                    .filter(|n| **n != source_id && allow(n))
+                    .min_by(|a, b| {
+                        let la = projected_load.get(**a).copied().unwrap_or(0);
+                        let lb = projected_load.get(**b).copied().unwrap_or(0);
+                        la.cmp(&lb).then_with(|| a.cmp(b))
+                    })
+                    .map(|s| (*s).to_string())
+            };
+            let picked_target = pick_among(&|n| {
+                az_by_node.get(n).copied().unwrap_or(None) != source_az
+            })
+            .or_else(|| pick_among(&|_| true));
             let Some(picked) = picked_target else {
                 // Only one alive node — nothing to do (and the
                 // earlier max-min guard already skipped).
@@ -573,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_once_bootstraps_empty_cluster() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "n1", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "n1", "addr", None, "alive", 0, None)
             .await
             .unwrap();
         let assigns = Arc::new(AtomicU64::new(0));
@@ -600,7 +641,7 @@ mod tests {
         let meta = fresh_meta().await;
         // Two alive, one dead. Bootstrap 4 tablets.
         for (id, st) in [("a", "alive"), ("b", "alive"), ("c", "dead")] {
-            meta_nodes::upsert(meta.pool(), id, "addr", None, st, 0)
+            meta_nodes::upsert(meta.pool(), id, "addr", None, st, 0, None)
                 .await
                 .unwrap();
         }
@@ -626,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_once_skips_when_no_alive_nodes() {
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "dying", "a", None, "leaving", 0)
+        meta_nodes::upsert(meta.pool(), "dying", "a", None, "leaving", 0, None)
             .await
             .unwrap();
         let assigns = Arc::new(AtomicU64::new(0));
@@ -655,7 +696,7 @@ mod tests {
         // Simulates failover: previous owner died, reaper
         // cleared the row to NULL, placement reassigns.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "alive", "a", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "alive", "a", None, "alive", 0, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 7, 0)
@@ -688,7 +729,7 @@ mod tests {
         // assign anything even though the cluster has unowned
         // tablets and an alive node.
         let (_guard, meta) = file_backed_meta().await;
-        meta_nodes::upsert(meta.pool(), "alive", "a", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "alive", "a", None, "alive", 0, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 0, 0)
@@ -720,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn placement_on_leader_eventually_assigns_unowned_tablets() {
         let (_guard, meta) = file_backed_meta().await;
-        meta_nodes::upsert(meta.pool(), "n1", "a", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "n1", "a", None, "alive", 0, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 0, 0)
@@ -759,7 +800,7 @@ mod tests {
         seeded_owner: &str,
     ) {
         for node in alive_nodes {
-            meta_nodes::upsert(meta.pool(), node, "addr", None, "alive", 0)
+            meta_nodes::upsert(meta.pool(), node, "addr", None, "alive", 0, None)
                 .await
                 .unwrap();
         }
@@ -834,10 +875,10 @@ mod tests {
     async fn rebalance_is_a_noop_on_already_balanced_state() {
         // 4 tablets, 2/2 split. No relinquish should fire.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "b", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "b", "addr", None, "alive", 0, None)
             .await
             .unwrap();
         for (id, owner) in [(0, "a"), (1, "a"), (2, "b"), (3, "b")] {
@@ -884,10 +925,10 @@ mod tests {
         // That's the smallest possible imbalance and not worth
         // shuffling for.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "b", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "b", "addr", None, "alive", 0, None)
             .await
             .unwrap();
         for (id, owner) in [(0, "a"), (1, "a"), (2, "a"), (3, "b"), (4, "b")] {
@@ -926,10 +967,10 @@ mod tests {
         // that's the StaleTabletReaper's job. Placement only
         // counts alive ownership for load.
         let meta = fresh_meta().await;
-        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0, None)
             .await
             .unwrap();
-        meta_nodes::upsert(meta.pool(), "dead", "addr", None, "dead", 0)
+        meta_nodes::upsert(meta.pool(), "dead", "addr", None, "dead", 0, None)
             .await
             .unwrap();
         meta_tablets::get_or_create(meta.pool(), 0, 0).await.unwrap();
@@ -1035,5 +1076,175 @@ mod tests {
         assert_eq!(count_a, 2);
         assert_eq!(count_b, 2);
         assert_eq!(count_c, 2);
+    }
+
+    /// Helper for AZ tests: register a node with a specific
+    /// AZ label.
+    async fn upsert_az(meta: &MetaStore, node_id: &str, az: &str) {
+        meta_nodes::upsert(meta.pool(), node_id, "addr", None, "alive", 0, Some(az))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn assign_unowned_spreads_evenly_across_azs() {
+        // 4 unowned tablets, 2 nodes in az-east + 2 in
+        // az-west. The AZ-load tier dominates ranking, so
+        // each AZ ends up with 2 tablets total — not 3+1
+        // skewed by node-id ordering.
+        let meta = fresh_meta().await;
+        upsert_az(&meta, "ea1", "east").await;
+        upsert_az(&meta, "ea2", "east").await;
+        upsert_az(&meta, "we1", "west").await;
+        upsert_az(&meta, "we2", "west").await;
+        for id in 0..4 {
+            meta_tablets::get_or_create(meta.pool(), id, 0).await.unwrap();
+        }
+        let assigns = Arc::new(AtomicU64::new(0));
+        let boots = Arc::new(AtomicU64::new(0));
+        let rebals = Arc::new(AtomicU64::new(0));
+        sweep_once(
+            &meta,
+            PlacementConfig {
+                tick: Duration::from_secs(1),
+                bootstrap_tablets: 0,
+            },
+            &assigns,
+            &boots,
+            &rebals,
+        )
+        .await;
+        let east_total = meta_tablets::list_owned_by(meta.pool(), "ea1").await.unwrap().len()
+            + meta_tablets::list_owned_by(meta.pool(), "ea2").await.unwrap().len();
+        let west_total = meta_tablets::list_owned_by(meta.pool(), "we1").await.unwrap().len()
+            + meta_tablets::list_owned_by(meta.pool(), "we2").await.unwrap().len();
+        assert_eq!(east_total, 2, "east AZ should hold 2 of 4 tablets");
+        assert_eq!(west_total, 2, "west AZ should hold 2 of 4 tablets");
+    }
+
+    #[tokio::test]
+    async fn rebalance_handoff_prefers_cross_az_target() {
+        // Source `a` (east) is over-loaded with 4 tablets.
+        // Peers `b` (east) and `c` (west) are both empty.
+        // The cross-AZ preference should send the rebalanced
+        // tablets to `c` (west) before `b` (east), even though
+        // their projected loads start equal.
+        let meta = fresh_meta().await;
+        upsert_az(&meta, "a", "east").await;
+        upsert_az(&meta, "b", "east").await;
+        upsert_az(&meta, "c", "west").await;
+        for id in 0..4 {
+            meta_tablets::get_or_create(meta.pool(), id, 0).await.unwrap();
+            meta_tablets::assume_ownership(meta.pool(), id, 0, "a", i64::MAX)
+                .await
+                .unwrap();
+        }
+        let assigns = Arc::new(AtomicU64::new(0));
+        let boots = Arc::new(AtomicU64::new(0));
+        let rebals = Arc::new(AtomicU64::new(0));
+        sweep_once(
+            &meta,
+            PlacementConfig {
+                tick: Duration::from_secs(1),
+                bootstrap_tablets: 0,
+            },
+            &assigns,
+            &boots,
+            &rebals,
+        )
+        .await;
+        // Inspect the signals on a's tablets.
+        let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
+        let signals_to_c = owned_a
+            .iter()
+            .filter(|t| t.handoff_target_node_id.as_deref() == Some("c"))
+            .count();
+        let signals_to_b = owned_a
+            .iter()
+            .filter(|t| t.handoff_target_node_id.as_deref() == Some("b"))
+            .count();
+        // target = ceil(4 / 3) = 2; a relinquishes 2.
+        // First pick: c (cross-AZ, projected_load=0); second
+        // pick: c again (still cross-AZ, projected_load=1
+        // < b's 0... wait, b is east same as a so cross-AZ
+        // filter excludes b). Both go to c.
+        assert_eq!(rebals.load(Ordering::Acquire), 2);
+        assert_eq!(signals_to_c, 2, "both rebalanced tablets must target the west-AZ peer");
+        assert_eq!(signals_to_b, 0, "no tablets should target the same-AZ peer when a cross-AZ option exists");
+    }
+
+    #[tokio::test]
+    async fn rebalance_falls_back_to_same_az_when_no_cross_az_peer() {
+        // Both alive peers are in the same AZ as the source.
+        // The cross-AZ preference filter empties; we must
+        // fall back to "any peer" rather than refuse to
+        // rebalance.
+        let meta = fresh_meta().await;
+        upsert_az(&meta, "a", "east").await;
+        upsert_az(&meta, "b", "east").await;
+        for id in 0..4 {
+            meta_tablets::get_or_create(meta.pool(), id, 0).await.unwrap();
+            meta_tablets::assume_ownership(meta.pool(), id, 0, "a", i64::MAX)
+                .await
+                .unwrap();
+        }
+        let assigns = Arc::new(AtomicU64::new(0));
+        let boots = Arc::new(AtomicU64::new(0));
+        let rebals = Arc::new(AtomicU64::new(0));
+        sweep_once(
+            &meta,
+            PlacementConfig {
+                tick: Duration::from_secs(1),
+                bootstrap_tablets: 0,
+            },
+            &assigns,
+            &boots,
+            &rebals,
+        )
+        .await;
+        // 4 tablets, 2 alive nodes, target=2 → relinquish 2,
+        // all to b (the only peer).
+        assert_eq!(rebals.load(Ordering::Acquire), 2);
+        let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
+        let signals_to_b = owned_a
+            .iter()
+            .filter(|t| t.handoff_target_node_id.as_deref() == Some("b"))
+            .count();
+        assert_eq!(signals_to_b, 2);
+    }
+
+    #[tokio::test]
+    async fn assign_falls_back_to_load_only_when_no_az_declared() {
+        // Single-AZ deployment (or operators just haven't set
+        // AGENTDB_NODE_AZ). The AZ-load tier collapses; the
+        // existing load-only behavior takes over.
+        let meta = fresh_meta().await;
+        meta_nodes::upsert(meta.pool(), "a", "addr", None, "alive", 0, None)
+            .await
+            .unwrap();
+        meta_nodes::upsert(meta.pool(), "b", "addr", None, "alive", 0, None)
+            .await
+            .unwrap();
+        for id in 0..4 {
+            meta_tablets::get_or_create(meta.pool(), id, 0).await.unwrap();
+        }
+        let assigns = Arc::new(AtomicU64::new(0));
+        let boots = Arc::new(AtomicU64::new(0));
+        let rebals = Arc::new(AtomicU64::new(0));
+        sweep_once(
+            &meta,
+            PlacementConfig {
+                tick: Duration::from_secs(1),
+                bootstrap_tablets: 0,
+            },
+            &assigns,
+            &boots,
+            &rebals,
+        )
+        .await;
+        let count_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap().len();
+        let count_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap().len();
+        assert_eq!(count_a, 2);
+        assert_eq!(count_b, 2);
     }
 }
