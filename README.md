@@ -45,12 +45,15 @@ first-time-user walkthrough and for local testing.
 
 ```bash
 # 3. In another shell — hit the admin endpoints through the CLI
+./target/debug/agentdb cluster-status     # leader + nodes + tablets in one call
 ./target/debug/agentdb show-scheduler
 ./target/debug/agentdb show-tablets
 ./target/debug/agentdb show-nodes
 
 # 4. Or gracefully drain before shutdown
 ./target/debug/agentdb drain
+# After a node is down (or drained), evict its row from the control plane:
+./target/debug/agentdb evict-node <node_id>
 
 # 5. See what config the server would run with
 ./target/debug/agentdb dump-config

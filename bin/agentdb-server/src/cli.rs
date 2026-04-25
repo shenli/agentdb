@@ -43,6 +43,17 @@ pub enum Cmd {
     /// List registered cluster nodes. HTTP-client wrapper for
     /// `GET /api/admin/nodes`.
     ShowNodes(AdminOpts),
+    /// High-level cluster overview: leader, node membership
+    /// with AZ breakdown, tablet placement summary, recent
+    /// scheduler counters. Composes the scheduler / nodes /
+    /// tablets admin endpoints so operators can sanity-check
+    /// a deployment in one call.
+    ClusterStatus(AdminOpts),
+    /// Manually evict a node from the control plane. Refuses
+    /// still-`alive` rows with a 409 — drain the node first
+    /// or wait for `NodeReaper` to flip it to `dead`. HTTP-
+    /// client wrapper for `DELETE /api/admin/nodes/:id`.
+    EvictNode(EvictNodeOpts),
     /// Resolve a session id to its shard + tablet assignment.
     /// HTTP-client wrapper for `GET /api/admin/shards?session_id=...`.
     ShowShard(ShowShardOpts),
@@ -477,6 +488,15 @@ pub struct DumpConfigOpts {
     /// look like with `--dev` enabled, without actually running.
     #[arg(long)]
     pub dev: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct EvictNodeOpts {
+    /// Base URL of the server.
+    #[arg(long = "server-url", default_value = "http://127.0.0.1:7878")]
+    pub server_url: String,
+    /// Node id to evict (the value in `nodes.node_id`).
+    pub node_id: String,
 }
 
 #[derive(Args, Debug, Clone)]
