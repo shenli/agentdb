@@ -135,3 +135,59 @@ async fn tenant_write_lock_returns_distinct_arc_per_tenant() {
         "different tenants must have distinct Arc<Mutex>"
     );
 }
+
+#[tokio::test]
+async fn session_write_lock_returns_distinct_arc_per_session() {
+    // M26 Phase 2: same primitive shape as the tenant-lock map,
+    // but keyed on session id. Two sessions of the same tenant
+    // must get distinct Arc<Mutex> so writes against them
+    // proceed in parallel.
+    let (_kv, _obj, reg, _tenants, _sessions) = fixture().await;
+    let box_ = reg.route_tenant("t-A");
+    let lock_s1a = box_.session_write_lock("s-1");
+    let lock_s1b = box_.session_write_lock("s-1");
+    let lock_s2 = box_.session_write_lock("s-2");
+    assert!(Arc::ptr_eq(&lock_s1a, &lock_s1b));
+    assert!(!Arc::ptr_eq(&lock_s1a, &lock_s2));
+}
+
+#[tokio::test]
+async fn writes_to_different_sessions_of_one_tenant_do_not_serialize() {
+    // M26 Phase 2: with per-session locking, holding session
+    // s-A's write lock must not block a write to session s-B,
+    // even when both target the same tenant. We synthesize the
+    // overlap by manually grabbing s-A's lock and then driving
+    // a real append_and_fetch call against s-B; if the
+    // serialization regression were back, the second call
+    // would queue behind the held lock and the test would
+    // hang past its deadline.
+    let (_kv, _obj, reg, tenants, sessions) = fixture().await;
+    let box_ = reg.route_tenant("t-A");
+
+    // Hold s-A's session lock.
+    let _hog = box_.session_write_lock("s-A").lock_owned().await;
+
+    // s-B's append must complete promptly despite s-A being
+    // pinned. Generous deadline (1s) so a slow CI doesn't false-
+    // alarm — but well under the "would block forever" failure
+    // mode the per-tenant lock would produce.
+    let appended = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        append_and_fetch(
+            &reg,
+            &tenants,
+            &sessions,
+            "t-A",
+            "s-B",
+            json!({"x": 1}),
+            0,
+            0,
+        ),
+    )
+    .await;
+    assert!(
+        appended.is_ok(),
+        "s-B append blocked while s-A's lock was held — per-session locking is not in effect"
+    );
+    appended.unwrap().expect("append must succeed");
+}
