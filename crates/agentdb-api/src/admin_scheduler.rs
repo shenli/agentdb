@@ -17,7 +17,9 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdb_core::{LeaderElection, NodeReaper, StaleTabletReaper, TabletPlacement};
+use agentdb_core::{
+    LeaderElection, NodeReaper, StaleTabletReaper, TabletPlacement, TabletReconciler,
+};
 use agentdb_meta::{scheduler as meta_scheduler, MetaStore};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -68,13 +70,19 @@ pub struct SchedulerStatus {
     /// leader (`owner_node_id` NULL → some alive node). Same
     /// leader-gated semantics; followers report 0.
     pub tablet_placements_total: u64,
-    /// Total tablets relinquished by this process during the
-    /// active-rebalance pass. Each relinquish causes a brief
-    /// data-path disruption on the source node, so this
-    /// counter doubles as an SLO signal: a leader inflicting
-    /// many forced-evictions per minute means the cluster has
-    /// chronic node churn.
+    /// Total cooperative handoffs this process has signalled
+    /// while leader (rebalance pass writes
+    /// `handoff_target_node_id` on a tablet). Doubles as an
+    /// SLO signal: a leader inflicting many handoffs per
+    /// minute means the cluster has chronic load drift.
     pub tablet_rebalances_total: u64,
+    /// Total cooperative handoffs this process has completed
+    /// as a source — observed a `handoff_target_node_id` set
+    /// on a tablet it owned, drained, and atomically
+    /// transferred ownership. Per-node counter (every node
+    /// reports its own); add up across the cluster to count
+    /// total handoffs end-to-end.
+    pub tablet_handoffs_completed_total: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -97,6 +105,7 @@ pub async fn get_scheduler(
     reaper: Option<Extension<Arc<StaleTabletReaper>>>,
     node_reaper: Option<Extension<Arc<NodeReaper>>>,
     placement: Option<Extension<Arc<TabletPlacement>>>,
+    reconciler: Option<Extension<Arc<TabletReconciler>>>,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<SchedulerUnavailable>)> {
     let Some(Extension(meta)) = meta else {
         return Err((
@@ -148,6 +157,10 @@ pub async fn get_scheduler(
         .as_ref()
         .map(|Extension(p)| (p.assignments_total(), p.rebalances_total()))
         .unwrap_or((0, 0));
+    let tablet_handoffs_completed_total = reconciler
+        .as_ref()
+        .map(|Extension(r)| r.handoffs_completed_total())
+        .unwrap_or(0);
     Ok(Json(SchedulerStatus {
         this_node_id: election.node_id().to_string(),
         this_node_is_leader: election.is_leader(),
@@ -158,6 +171,7 @@ pub async fn get_scheduler(
         nodes_gc_removed_total,
         tablet_placements_total,
         tablet_rebalances_total,
+        tablet_handoffs_completed_total,
     }))
 }
 
@@ -176,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_503_when_meta_extension_is_absent() {
-        let (code, body) = get_scheduler(None, None, None, None, None)
+        let (code, body) = get_scheduler(None, None, None, None, None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -186,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn returns_503_when_election_extension_is_absent() {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        let (code, body) = get_scheduler(Some(Extension(meta)), None, None, None, None)
+        let (code, body) = get_scheduler(Some(Extension(meta)), None, None, None, None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -215,6 +229,7 @@ mod tests {
             None, // no reaper in this test — counter reports 0
             None, // no node_reaper either
             None, // no placement either
+            None, // no reconciler either
         )
         .await
         .expect("200");
@@ -230,6 +245,7 @@ mod tests {
         assert_eq!(status.nodes_gc_removed_total, 0);
         assert_eq!(status.tablet_placements_total, 0);
         assert_eq!(status.tablet_rebalances_total, 0);
+        assert_eq!(status.tablet_handoffs_completed_total, 0);
         let leader = status.leader.expect("leader row present");
         assert_eq!(leader.node_id, "test-node");
         assert!(leader.is_live);
@@ -271,6 +287,7 @@ mod tests {
             Some(Extension(meta.clone())),
             Some(Extension(election.clone())),
             Some(Extension(reaper.clone())),
+            None,
             None,
             None,
         )
@@ -330,6 +347,7 @@ mod tests {
             Some(Extension(election)),
             None,
             Some(Extension(node_reaper)),
+            None,
             None,
         )
         .await

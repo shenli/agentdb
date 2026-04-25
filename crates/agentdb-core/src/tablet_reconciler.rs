@@ -84,6 +84,7 @@ impl ReconcilerConfig {
 pub struct TabletReconciler {
     config: ReconcilerConfig,
     boxes_added_total: Arc<AtomicU64>,
+    handoffs_completed_total: Arc<AtomicU64>,
     errors_total: Arc<AtomicU64>,
     _handle: JoinHandle<()>,
 }
@@ -93,16 +94,19 @@ impl TabletReconciler {
     /// first tick fires.
     pub fn start(registry: Arc<BoxRegistry>, config: ReconcilerConfig) -> Arc<Self> {
         let boxes_added_total = Arc::new(AtomicU64::new(0));
+        let handoffs_completed_total = Arc::new(AtomicU64::new(0));
         let errors_total = Arc::new(AtomicU64::new(0));
         let handle = tokio::spawn(run_loop(
             registry,
             config,
             boxes_added_total.clone(),
+            handoffs_completed_total.clone(),
             errors_total.clone(),
         ));
         Arc::new(Self {
             config,
             boxes_added_total,
+            handoffs_completed_total,
             errors_total,
             _handle: handle,
         })
@@ -114,6 +118,14 @@ impl TabletReconciler {
     /// control-plane assigned it here.
     pub fn boxes_added_total(&self) -> u64 {
         self.boxes_added_total.load(Ordering::Acquire)
+    }
+
+    /// Total cooperative handoffs this process has completed
+    /// — i.e., observed a `handoff_target_node_id` set on a
+    /// tablet it owns, dropped its local box, and atomically
+    /// transferred ownership to the recorded target.
+    pub fn handoffs_completed_total(&self) -> u64 {
+        self.handoffs_completed_total.load(Ordering::Acquire)
     }
 
     /// Total tick-level errors (meta query failed, or every
@@ -132,6 +144,7 @@ async fn run_loop(
     registry: Arc<BoxRegistry>,
     config: ReconcilerConfig,
     boxes_added_total: Arc<AtomicU64>,
+    handoffs_completed_total: Arc<AtomicU64>,
     errors_total: Arc<AtomicU64>,
 ) {
     let mut interval = tokio::time::interval(config.tick);
@@ -139,7 +152,14 @@ async fn run_loop(
     interval.tick().await;
     loop {
         interval.tick().await;
-        if let Err(()) = reconcile_once(&registry, &boxes_added_total, &errors_total).await {
+        if let Err(()) = reconcile_once_inner(
+            &registry,
+            &boxes_added_total,
+            &handoffs_completed_total,
+            &errors_total,
+        )
+        .await
+        {
             // reconcile_once already logged; just count.
             errors_total.fetch_add(1, Ordering::Release);
         }
@@ -166,6 +186,36 @@ pub async fn reconcile_once(
     boxes_added_total: &AtomicU64,
     errors_total: &AtomicU64,
 ) -> Result<(), ()> {
+    // Backward-compatible shim: callers that don't care about
+    // the handoff counter (existing tests, server boot) can
+    // keep using this signature. The real work is in the inner
+    // function below.
+    let handoffs_local = AtomicU64::new(0);
+    reconcile_once_inner(registry, boxes_added_total, &handoffs_local, errors_total).await
+}
+
+/// Three-phase reconcile pass:
+///
+/// 1. **Handoff completion**: for every owned tablet whose
+///    `handoff_target_node_id` is set to a different node,
+///    drop the local `Box_` then call `complete_handoff` to
+///    atomically transfer ownership in meta. The transfer
+///    bumps the epoch, which fences any in-flight write
+///    against the local lease.
+///
+/// 2. **Add new boxes**: for every tablet now owned by us
+///    that we don't have a `Box_` for, call `add_box`.
+///
+/// Phase 1 runs before phase 2 so a tablet that's both being
+/// handed away and re-pointed at us in the same sweep is
+/// resolved correctly (rare but possible during cluster
+/// churn).
+async fn reconcile_once_inner(
+    registry: &Arc<BoxRegistry>,
+    boxes_added_total: &AtomicU64,
+    handoffs_completed_total: &AtomicU64,
+    errors_total: &AtomicU64,
+) -> Result<(), ()> {
     let Some(meta) = registry.meta_store() else {
         // Reconciler must not run on a meta-less registry. If
         // it's been spawned anyway it's a programmer error;
@@ -188,8 +238,104 @@ pub async fn reconcile_once(
             return Err(());
         }
     };
-    let mut added = 0u64;
+
+    // Phase 1: complete any pending handoffs. Iterating
+    // owned (which we just listed) is a stable snapshot —
+    // even if a concurrent assume_ownership moves the row,
+    // complete_handoff's predicate on owner_node_id catches
+    // the stale state and returns None.
+    let mut handed_off = 0u64;
     let mut errs = 0u64;
+    for t in &owned {
+        let Some(target) = t.handoff_target_node_id.as_deref() else {
+            continue;
+        };
+        if target == node_id {
+            // Self-handoff is a no-op semantically. Clear the
+            // signal so it doesn't keep dragging on.
+            if let Err(err) = meta_tablets::cancel_handoff(meta.pool(), t.tablet_id).await {
+                tracing::warn!(
+                    %err,
+                    tablet_id = t.tablet_id,
+                    "tablet reconciler: cancel self-handoff failed"
+                );
+                errs += 1;
+            }
+            continue;
+        }
+        let id_u16 = match u16::try_from(t.tablet_id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Drop the local Box_ first. Any cloned Arc<Box_> held
+        // by a hot-path reader will continue to operate, but
+        // the moment complete_handoff bumps the epoch the
+        // local lease's renew() will fail and is_live() drops
+        // — at which point the data path returns LeaseLost
+        // rather than overlapping with the new owner.
+        let removed = registry.remove_box(id_u16);
+        match meta_tablets::complete_handoff(meta.pool(), t.tablet_id, &node_id).await {
+            Ok(Some(new_owner)) => {
+                handed_off += 1;
+                tracing::info!(
+                    tablet_id = t.tablet_id,
+                    new_owner = %new_owner,
+                    from = %node_id,
+                    "tablet reconciler: completed cooperative handoff"
+                );
+            }
+            Ok(None) => {
+                // Either the row's owner moved out from under
+                // us, or the signal was cancelled mid-flight.
+                // We've already removed our local Box_; the
+                // worst case is a transient read-side gap that
+                // the next sweep heals via add_box. Log so
+                // operators can see if this becomes frequent.
+                tracing::warn!(
+                    tablet_id = t.tablet_id,
+                    "tablet reconciler: complete_handoff returned None; row state changed mid-sweep"
+                );
+                // If we still seem to be the owner per a fresh
+                // read, re-add the box on the next pass via
+                // phase 2 — we already dropped it.
+                drop(removed);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    tablet_id = t.tablet_id,
+                    "tablet reconciler: complete_handoff failed; will retry next tick"
+                );
+                errs += 1;
+            }
+        }
+    }
+    if handed_off > 0 {
+        handoffs_completed_total.fetch_add(handed_off, Ordering::Release);
+    }
+
+    // Re-list owned tablets after phase 1 — anything we just
+    // handed off is no longer ours, and (rarely) the same
+    // sweep might have absorbed a freshly-assigned tablet
+    // that wasn't in the first listing.
+    let owned = match meta_tablets::list_owned_by(meta.pool(), &node_id).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                node_id = %node_id,
+                "tablet reconciler: re-list after handoff failed; phase 2 skipped"
+            );
+            // Phase 1 already counted; report errors and bail.
+            if errs > 0 {
+                errors_total.fetch_add(errs, Ordering::Release);
+            }
+            return Err(());
+        }
+    };
+
+    // Phase 2: add any newly-assigned boxes.
+    let mut added = 0u64;
     for t in owned {
         let id_u16 = match u16::try_from(t.tablet_id) {
             Ok(v) => v,
@@ -356,5 +502,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(registry.has_box(7));
         assert!(reconciler.boxes_added_total() >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_completes_handoff_drops_box_and_transfers_owner() {
+        // Box 0 is owned by us (constructor took it). The leader
+        // sets handoff_target_node_id=peer. After our next
+        // reconcile, box 0 must be removed from this registry
+        // and meta must show owner=peer.
+        let (registry, meta, _data, _meta_file) = registry_with_shared_meta().await;
+        assert!(registry.has_box(0));
+        meta_tablets::mark_for_handoff(meta.pool(), 0, "peer")
+            .await
+            .unwrap();
+
+        let added = Arc::new(AtomicU64::new(0));
+        let handoffs = Arc::new(AtomicU64::new(0));
+        let errs = Arc::new(AtomicU64::new(0));
+        reconcile_once_inner(&registry, &added, &handoffs, &errs)
+            .await
+            .unwrap();
+        assert_eq!(handoffs.load(Ordering::Acquire), 1);
+        assert!(!registry.has_box(0), "local box must be removed");
+        let row = meta_tablets::get(meta.pool(), 0).await.unwrap().unwrap();
+        assert_eq!(row.owner_node_id.as_deref(), Some("peer"));
+        assert!(row.handoff_target_node_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_cancels_self_handoff_without_dropping_box() {
+        // Edge case: someone wrote a handoff signal pointing
+        // at us (the current owner). It's a no-op semantically;
+        // the reconciler should clear the signal and leave the
+        // local box alone.
+        let (registry, meta, _data, _meta_file) = registry_with_shared_meta().await;
+        assert!(registry.has_box(0));
+        meta_tablets::mark_for_handoff(meta.pool(), 0, "n1")
+            .await
+            .unwrap();
+
+        let added = Arc::new(AtomicU64::new(0));
+        let handoffs = Arc::new(AtomicU64::new(0));
+        let errs = Arc::new(AtomicU64::new(0));
+        reconcile_once_inner(&registry, &added, &handoffs, &errs)
+            .await
+            .unwrap();
+        assert_eq!(
+            handoffs.load(Ordering::Acquire),
+            0,
+            "self-handoff is cancelled, not completed"
+        );
+        assert!(registry.has_box(0), "local box stays put");
+        let row = meta_tablets::get(meta.pool(), 0).await.unwrap().unwrap();
+        assert_eq!(row.owner_node_id.as_deref(), Some("n1"));
+        assert!(row.handoff_target_node_id.is_none());
     }
 }

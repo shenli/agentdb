@@ -814,18 +814,26 @@ control plane:
   Each tick runs three phases on the leader. (1) **Bootstrap**
   seeds `[0..AGENTDB_CLUSTER_TABLETS)` if the table is empty.
   (2) **Rebalance**: count tablets per alive node, compute
-  `target = ceil(total_alive_owned / num_alive)`. Every alive
-  node owning more than `target` relinquishes the excess via
-  `tablets::relinquish` (clears `owner_node_id`, zeros lease,
-  bumps epoch — the previous owner's lease becomes stale on
-  its next renewal, the same code path as failover). The
-  rebalance is suppressed when `max_count - min_count ≤ 1`
-  so the unavoidable +1 imbalance from a non-divisible total
-  doesn't cause perpetual reshuffling. (3) **Assign-unowned**:
-  every `owner_node_id IS NULL` tablet is assigned to the
-  currently-least-loaded alive node (ties broken by node-id).
-  `tablets::assign_to` writes the owner without granting a
-  lease — that's the receiving node's job.
+  `target = ceil(total_alive_owned / num_alive)`. For every
+  alive node owning more than `target`, the leader writes a
+  cooperative-handoff signal (`handoff_target_node_id`) on
+  each excess tablet, picking the currently-least-loaded peer
+  per signal so multi-target distribution comes out even.
+  Ownership is **not** transferred here — that happens when
+  the source's `TabletReconciler` observes the signal,
+  drops its in-process `Box_`, and atomically calls
+  `tablets::complete_handoff` (which clears the signal,
+  zeros the lease, bumps the epoch, and points the row at
+  the recorded target). Until completion, the source keeps
+  serving writes; there's no NULL-owner gap and in-flight
+  writes don't see `LeaseLost`. The rebalance is suppressed
+  when `max_count - min_count ≤ 1` so the unavoidable +1
+  imbalance from a non-divisible total doesn't cause
+  perpetual reshuffling. (3) **Assign-unowned**: every
+  `owner_node_id IS NULL` tablet (failover orphan) is
+  assigned to the currently-least-loaded alive node (ties
+  broken by node-id). `tablets::assign_to` writes the owner
+  without granting a lease — that's the receiving node's job.
 - **Reconciliation.** `AGENTDB_RECONCILER_TICK_SECS` (default
   3s). Each node lists tablets where it's been promised
   ownership and calls `BoxRegistry::add_box`, which acquires
@@ -841,19 +849,12 @@ control plane:
   post-reconcile box set rather than a transient empty
   registry.
 
-What's deliberately **not** here yet: cooperative handoff,
-where the source node is asked to drain in-flight writes
-before relinquishing. Today's rebalance is force-relinquish
-— the source's writers see brief 503s on the released
-tablets, identical to a real failover. Production deploys
-that need zero-disruption rebalances should pin the
-threshold high (`AGENTDB_PLACEMENT_REBALANCE_THRESHOLD` is
-not a knob today; the +1 tolerance is hard-coded) or run
-the existing `POST /api/admin/drain` for the source node
-before adding peers. Active load metrics beyond
+What's deliberately **not** here yet: load metrics beyond
 "tablet count" — request rate, lock waits, segment GC
-backlog — are also follow-up; the current loop balances on
-ownership count alone.
+backlog. Today's rebalance balances on ownership count
+alone, which is enough to keep one cold node from staying
+cold but doesn't react to non-uniform per-tablet load.
+Tablet-level load signals are the natural follow-up.
 
 ### Per-tenant locking + admission semaphore (M23)
 

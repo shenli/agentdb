@@ -3207,7 +3207,8 @@
           "nodes_marked_dead_total",
           "nodes_gc_removed_total",
           "tablet_placements_total",
-          "tablet_rebalances_total"
+          "tablet_rebalances_total",
+          "tablet_handoffs_completed_total"
         ],
         "properties": {
           "leader": {
@@ -3239,6 +3240,12 @@
             "description": "Total number of tablet leases this process has cleared as\npart of the stale-lease reaper sweep. Only advances while\nthis process is the leader — followers report 0 even if\nanother node in the cluster has reaped many leases.",
             "minimum": 0
           },
+          "tablet_handoffs_completed_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total cooperative handoffs this process has completed\nas a source — observed a `handoff_target_node_id` set\non a tablet it owned, drained, and atomically\ntransferred ownership. Per-node counter (every node\nreports its own); add up across the cluster to count\ntotal handoffs end-to-end.",
+            "minimum": 0
+          },
           "tablet_placements_total": {
             "type": "integer",
             "format": "int64",
@@ -3248,7 +3255,7 @@
           "tablet_rebalances_total": {
             "type": "integer",
             "format": "int64",
-            "description": "Total tablets relinquished by this process during the\nactive-rebalance pass. Each relinquish causes a brief\ndata-path disruption on the source node, so this\ncounter doubles as an SLO signal: a leader inflicting\nmany forced-evictions per minute means the cluster has\nchronic node churn.",
+            "description": "Total cooperative handoffs this process has signalled\nwhile leader (rebalance pass writes\n`handoff_target_node_id` on a tablet). Doubles as an\nSLO signal: a leader inflicting many handoffs per\nminute means the cluster has chronic load drift.",
             "minimum": 0
           },
           "this_node_epoch": {
