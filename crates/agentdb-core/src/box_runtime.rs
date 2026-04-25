@@ -248,11 +248,58 @@ impl Box_ {
     }
 
     /// Snapshot of the number of session locks tracked. Cheap
-    /// read used by metrics + tests; the lock map grows
-    /// monotonically until the box is dropped (idle-cleanup is
-    /// follow-up work).
+    /// read used by metrics + tests.
     pub fn session_lock_count(&self) -> usize {
         self.session_locks.read().len()
+    }
+
+    /// Snapshot of the number of tenant locks tracked.
+    pub fn tenant_lock_count(&self) -> usize {
+        self.tenant_locks.read().len()
+    }
+
+    /// Drop entries from the per-session lock map whose
+    /// `Arc<Mutex>` has no other holders — i.e., no in-flight
+    /// writer is using or waiting on the lock. Returns the
+    /// number of entries removed.
+    ///
+    /// Why this is safe: every writer obtains a lock by
+    /// calling [`Self::session_write_lock`], which clones the
+    /// `Arc<Mutex>` out of the map. From that point until the
+    /// `OwnedMutexGuard` is dropped, the writer holds a
+    /// strong reference. Re-acquisition by a fresh writer
+    /// after we prune the entry is identical to acquisition
+    /// for a brand-new session: the next call to
+    /// `session_write_lock` reinserts the entry. There is no
+    /// fairness or queue state we'd lose; the lock is
+    /// stateless beyond "held / not held."
+    ///
+    /// We take the WRITE lock on the map so the prune is
+    /// atomic with respect to concurrent
+    /// `session_write_lock` callers — without that, a caller
+    /// could see strong_count==1 just before grabbing a
+    /// second clone, and we'd erase the entry it was about
+    /// to use, forcing it onto a different `Arc` than later
+    /// writers see. With the write lock, any concurrent
+    /// `session_write_lock` waits behind the prune.
+    pub fn prune_idle_session_locks(&self) -> usize {
+        let mut map = self.session_locks.write();
+        let before = map.len();
+        map.retain(|_, arc| Arc::strong_count(arc) > 1);
+        before - map.len()
+    }
+
+    /// Drop idle entries from the per-tenant lock map.
+    /// Same shape as [`Self::prune_idle_session_locks`] —
+    /// the post-M26 tenant lock is held only briefly across
+    /// the get-or-mint critical section, so most entries
+    /// will be prunable on every tick once the tenant goes
+    /// idle.
+    pub fn prune_idle_tenant_locks(&self) -> usize {
+        let mut map = self.tenant_locks.write();
+        let before = map.len();
+        map.retain(|_, arc| Arc::strong_count(arc) > 1);
+        before - map.len()
     }
 
     /// Lease manager for this box, if one was configured at registry
@@ -814,6 +861,27 @@ impl BoxRegistry {
 
     pub fn num_boxes(&self) -> u16 {
         self.boxes.read().len() as u16
+    }
+
+    /// Sweep idle entries from every box's
+    /// `session_locks` + `tenant_locks` maps. Returns
+    /// `(pruned_session_locks, pruned_tenant_locks)`
+    /// across all boxes — operators can graph this against
+    /// the per-box `session_lock_count()` to detect leaks.
+    ///
+    /// Called from a periodic background task in the server
+    /// binary (default tick `AGENTDB_LOCK_GC_TICK_SECS=60`).
+    /// Cheap: one `RwLock::write` per box per call, plus
+    /// `Arc::strong_count` for each map entry.
+    pub fn prune_idle_locks(&self) -> (usize, usize) {
+        let boxes = self.boxes.read().clone();
+        let mut sess_pruned = 0usize;
+        let mut ten_pruned = 0usize;
+        for b in boxes {
+            sess_pruned += b.prune_idle_session_locks();
+            ten_pruned += b.prune_idle_tenant_locks();
+        }
+        (sess_pruned, ten_pruned)
     }
 
     /// Whether this registry is already running a `Box_` for

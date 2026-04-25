@@ -12,9 +12,9 @@ use std::time::Duration;
 use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
-    LifecycleConfig, LifecycleEngine, NodeReaper, NodeReaperConfig, PlacementConfig, ReaperConfig,
-    ReconcilerConfig, SegmentGc, SegmentGcConfig, SessionRegistry, StaleTabletReaper,
-    TabletPlacement, TabletReconciler, TenantRegistry,
+    LifecycleConfig, LifecycleEngine, LockGc, LockGcConfig, NodeReaper, NodeReaperConfig,
+    PlacementConfig, ReaperConfig, ReconcilerConfig, SegmentGc, SegmentGcConfig, SessionRegistry,
+    StaleTabletReaper, TabletPlacement, TabletReconciler, TenantRegistry,
 };
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore, SlateKvStore};
@@ -851,6 +851,19 @@ pub async fn run(
         gc_after_secs = node_reaper_cfg.gc_after.as_secs(),
         "node-lifecycle reaper started"
     );
+
+    // Periodic GC for the per-session and per-tenant lock
+    // maps. Both grow monotonically as new external ids are
+    // touched; this loop drops entries with no active
+    // holder so memory tracks the working set rather than
+    // the historical set.
+    let lock_gc_cfg = LockGcConfig::from_env();
+    let _lock_gc = LockGc::start(registry.clone(), lock_gc_cfg);
+    tracing::info!(
+        tick_secs = lock_gc_cfg.tick.as_secs(),
+        "lock-map GC loop started"
+    );
+    std::mem::forget(_lock_gc);
 
     // Change-notifier: when the meta store signals a change to
     // the `nodes` or `shards` tables (pg_notify on Postgres; inert

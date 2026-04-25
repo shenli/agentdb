@@ -18,6 +18,7 @@ pub mod index_snapshot_job;
 pub mod indexes;
 pub mod lease;
 pub mod lifecycle;
+pub mod lock_gc;
 pub(crate) mod meta;
 pub mod metrics;
 pub mod node_reaper;
@@ -68,6 +69,7 @@ pub use index_snapshot_job::{snapshot_once, IndexSnapshotJob, IndexSnapshotJobCo
 pub use indexes::PerBoxIndexes;
 pub use lease::{LeaseConfig, LeaseManager, LeaseRenewalJob};
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
+pub use lock_gc::{LockGc, LockGcConfig};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};
 pub use node_reaper::{NodeReaper, NodeReaperConfig};
 pub use tablet_placement::{PlacementConfig, TabletPlacement};
