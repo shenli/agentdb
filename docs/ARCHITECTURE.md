@@ -858,13 +858,24 @@ is read against the box that actually hosts it, so an unpinned
 `find` after a shard override or tablet handoff still returns
 events from every relevant box on this node.
 
-Cross-node sessions (locator points at a tablet whose box
-isn't in this process's registry) are skipped with a tracing
-warn — wire-level cross-node Mongo forwarding for read traffic
-is the explicit Phase 3 follow-up. Pinned-session queries that
-target a peer-owned shard still produce
-`NotWritablePrimary` (code 10107) so drivers reconnect to the
-right peer.
+Cross-node sessions (locator points at a tablet owned by a
+peer per `NodeAddressProxy`) are queued onto a remote-targets
+list during target building and fanned out after the local
+pass. For each peer-resident session, `find_response` calls
+`forward::pinned_find` — a synthetic `find` OP_MSG pinned to
+that one session, sent over the existing wire forwarder, with
+the peer's `cursor.firstBatch` merged into the local batch.
+Per-peer failures degrade to "warn + skip the session": the
+request still succeeds with whatever local + reachable-peer
+events were collected. Tablet locality is decided by the
+node-address proxy when attached, not by `box_by_id` — every
+node carries a local box index `0..N` regardless of cluster
+ownership, so the proxy is the canonical record. Pinned-
+session queries that target a peer-owned shard are forwarded
+at the connection layer (server.rs) before dispatch; only in
+auth-required mode (where SASL state can't cross the wire
+forward) do they fall back to `NotWritablePrimary` (code
+10107).
 
 Populated by `agentdb_core::primitives::populate_session_locator`
 on every newly-minted session: REST `append_and_fetch`,
@@ -1145,8 +1156,9 @@ extends reads and generalizes the helper.
 | `/api/tenants/:tid/sessions/:sid/append_and_fetch` | POST | forwarded |
 | `/api/admin/sessions/:sid?tenant_id=...` | GET | forwarded |
 | `/api/sessions/:sid/fork` | POST | forwarded |
-| Mongo `find` with `{session_id: S}` filter | — | 421-equivalent: `code: 10107 NotWritablePrimary` with owner address |
-| Mongo `aggregate` pinning `session_id = S` | — | same as find |
+| Mongo `find` / `update` / `delete` / `insert` pinning `session_id = S` | — | wire forwarded via `forward_op_msg`. In auth-required mode, falls back to `code: 10107 NotWritablePrimary` with owner address (SASL state can't cross the hop) |
+| Mongo unpinned `find` (no `session_id` filter) | — | locator fanout: local sessions read locally, peer sessions fanned out one pinned-find per session via `forward::pinned_find` |
+| Mongo `aggregate` pinning `session_id = S` | — | same as pinned find |
 
 **Metrics** (per box, credited to box 0 on the originating
 node):
@@ -1157,15 +1169,21 @@ node):
 
 **Scope limits (still out):**
 
-- **Mongo wire forwarding.** Binary, stateful per-connection
-  protocol — SASL state doesn't transfer across a forwarded
-  hop without an inter-node trust model. Mongo clients get
-  `code: 10107` with the owner's address and reconnect;
-  real forwarding is future work.
-- **Tenant-wide reads** (`find` without a session filter,
-  `listDatabases`, `listCollections`). Still tenant-hash
-  routed. An override moves one session, not the whole
-  tenant.
+- **Auth-mode wire forwarding.** When
+  `AGENTDB_REQUIRE_AUTH=true`, the wire forward path falls
+  back to `NotWritablePrimary` because SASL state is per-
+  connection and doesn't transfer across the hop. Drivers
+  reconnect to the owner's address. Inter-node SASL trust is
+  future work.
+- **`listDatabases` / `listCollections`.** Still tenant-hash
+  routed and not fanned out across peers — the database/
+  collection list is uniform per tenant in this prototype, so
+  the loss is largely cosmetic, but a multi-node deployment
+  with strict tenant isolation may want to merge.
+- **Per-peer batching.** The current cross-node fanout sends
+  one OP_MSG per remote session (sequential). A peer-batched
+  RPC (one frame, N session ids) is a natural follow-up when
+  the per-RTT cost shows up under load.
 - **Child-inherits-parent-box.** A forked child session
   lives on whatever box its parent was on; the child's
   `session_id` hashes to a potentially different shard, so
