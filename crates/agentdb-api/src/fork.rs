@@ -137,6 +137,26 @@ pub async fn fork_handler(
         Err(e) => return ApiError::Core(e).into_response(),
     };
     drop(guard);
+    // M26 Phase 1: register the child session in the locator
+    // table so subsequent session-scoped lookups can route to
+    // it directly. Idempotent — `INSERT OR IGNORE` is the
+    // only side effect, so no harm if the locator already
+    // exists from a prior partial-failure retry.
+    if let Some(meta) = state.registry.meta_store() {
+        // Resolve the tenant_internal_id we just used inside
+        // fork_session — re-querying tenants is fine (cheap KV
+        // read) and avoids leaking the value out of the lock.
+        if let Ok(Some(tenant)) = state.tenants.lookup(box_.id, &parsed.tenant_id) {
+            agentdb_core::primitives::populate_session_locator(
+                meta.as_ref(),
+                &child.external_id,
+                tenant.internal_id,
+                box_.id,
+                now_millis(),
+            )
+            .await;
+        }
+    }
     let fork = child
         .forked_from
         .expect("fork_session always sets forked_from");

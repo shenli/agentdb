@@ -656,6 +656,7 @@ Tables both backends carry:
 | `admin_tokens` | Admin bearer tokens + their RBAC scope. |
 | `admin_audit` | Append-only log of every `/api/admin/*` request. |
 | `tenant_quotas` | Global per-tenant rate limits. |
+| `session_locators` | Canonical session lookup record (M26 Phase 1): one row per external session id pointing at the tenant + tablet + shard. Populated on mint; not yet consulted on the routing path — see "Session locator (M26 Phase 1)" below. |
 
 Migrations are hand-rolled (`migrations.rs`), idempotent,
 forward-only, and carry **two SQL variants side-by-side** —
@@ -782,6 +783,54 @@ renewing, so after the lease duration + safety margin the reaper on
 another node clears the rows. Operators get a clean handoff without
 SIGTERM. No un-drain — restart the process to reverse.
 `docs/runbooks/node_draining.md` has the full procedure.
+
+### Session locator (M26 Phase 1)
+
+The 2026-04-24 design review flagged that session identity is
+still effectively `(box_id, tenant_id, session_external)` —
+tenant is load-bearing, which contradicts the v2 commitment to
+*sessions are globally unique* and *tenant is auth-bound*. The
+`session_locators` table is the first concrete step away from
+that:
+
+```
+session_locators(
+  session_id          PRIMARY KEY,    -- the globally-unique external id
+  tenant_internal_id,                 -- which tenant owns it (resolved at mint)
+  tablet_id,                          -- where it currently lives (NULL = unplaced)
+  shard_id,                           -- denormalised FNV(session_id) % SHARD_COUNT
+  created_at_ms
+)
+```
+
+Populated by `agentdb_core::primitives::populate_session_locator`
+on every newly-minted session: REST `append_and_fetch`,
+Mongo wire writes (which go through the same primitive), and
+the REST `/api/sessions/:id/fork` handler all populate the
+child's locator before returning. The upsert is
+`INSERT OR IGNORE`, so repeat traffic is one cheap meta
+roundtrip; the first call wins, leaving `update_tablet`
+(handoff/migration) as the only path that retargets a row.
+
+This PR populates locators but does NOT yet consult them on
+the routing path. That's deliberate: the populate→consume
+split lets each follow-up M26 phase land in isolation. Future
+phases (per
+`docs/2026-04-24-next-step-design.md`):
+
+- **Phase 2**: per-session lock map keyed on session id, replacing
+  the per-tenant write lock that's currently the dominant
+  intra-tenant concurrency bottleneck.
+- **Phase 3**: route session-scoped reads via the locator;
+  cross-tablet `find` / `aggregate` fans out across the tenant's
+  locator-listed tablets and merges.
+- **Phase 4**: include archive-tier segments in indexed
+  retrieval so unhinted text/vector queries don't quietly drop
+  archived data.
+
+A locator is a control-plane record; it's purposely small so
+that even "tens of millions of sessions" fits comfortably in
+the existing meta store.
 
 ### Tablet placement and reconciliation
 
