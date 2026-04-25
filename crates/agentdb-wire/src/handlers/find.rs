@@ -1,5 +1,8 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use agentdb_core::{
-    scan_session_all_tiers, BoxRegistry, Event, ReadCtx, SessionRegistry, TenantRegistry,
+    scan_session_all_tiers, BoxRegistry, Box_, Event, ReadCtx, SessionRegistry, TenantRegistry,
 };
 use bson::{doc, Bson, Document};
 use serde_json::Value;
@@ -7,6 +10,13 @@ use serde_json::Value;
 use crate::bsonx::json_to_bson;
 use crate::error::{WireError, WireResult};
 use crate::handlers::filter::Filter;
+
+/// Cap on the locator-fanout list we'll pull from meta in a
+/// single sweep. The query is paginated, so this isn't a hard
+/// limit on tenant size — it's just the per-call batch.
+/// Sized so a tenant with thousands of sessions still fits in
+/// one round-trip.
+const FANOUT_LOCATOR_LIMIT: i64 = 10_000;
 
 /// `raw: true` returns un-folded events (corrections +
 /// tombstones visible). Default is `false` so clients that
@@ -41,57 +51,164 @@ pub async fn find_response(
             Value::String(s) => Some(s.clone()),
             _ => None,
         }));
-    let box_ = if let Some(s) = pinned_session.as_deref() {
-        match registry.route_session_for_io(db, s) {
-            agentdb_core::RouteDecision::Remote { target, tablet_id } => {
-                return Ok(cross_node_error(&target.node_id, &target.address, tablet_id));
-            }
-            agentdb_core::RouteDecision::Local(b) => b,
+
+    // Cross-node early return for pinned sessions whose shard
+    // is owned by a peer. Has to fire before any tenant
+    // lookup: a peer-owned session whose tenant has never
+    // been materialised on this node still needs to surface
+    // NotWritablePrimary so the client reconnects to the
+    // right peer (rather than seeing an empty batch).
+    if let Some(s) = pinned_session.as_deref() {
+        if let agentdb_core::RouteDecision::Remote { target, tablet_id } =
+            registry.route_session_for_io(db, s)
+        {
+            return Ok(cross_node_error(&target.node_id, &target.address, tablet_id));
         }
-    } else {
-        registry.route_tenant(db)
-    };
-    box_.metrics.record_query_find();
-    let tenant_opt = tenants.lookup(box_.id, db)?;
-    // Admit unconditionally: unknown tenants still pay the per-box gate
-    // via sentinel 0 (skips the per-tenant gate). Prevents spam against
-    // random db names from bypassing rate limits.
-    let admit_id = tenant_opt.as_ref().map(|t| t.internal_id).unwrap_or(0);
-    box_.admit(admit_id)
+    }
+
+    // Rate-limit + metrics bookkeeping anchors on the
+    // tenant-hash box even when the actual read fans out
+    // across multiple boxes. This keeps QPS gating semantics
+    // unchanged across the M26 transition: one client request
+    // counts as one regardless of how many tablets it
+    // ultimately touches.
+    let admit_box = registry.route_tenant(db);
+    admit_box.metrics.record_query_find();
+    let admit_tenant = tenants.lookup(admit_box.id, db)?;
+    let admit_id = admit_tenant.as_ref().map(|t| t.internal_id).unwrap_or(0);
+    admit_box
+        .admit(admit_id)
         .map_err(|d| agentdb_core::Error::TooManyRequests {
             scope: d.scope,
             retry_after_ms: 1000,
         })?;
-    let tenant = match tenant_opt {
-        Some(t) => t,
-        None => return Ok(empty_batch(db, collection)),
-    };
+    // Don't early-return on `admit_tenant.is_none()`: even
+    // when the tenant has no row on the tenant-hash box, the
+    // pinned-session path (or the locator fanout below) may
+    // still resolve to a different local box that DOES have
+    // the tenant. The targets vec ends up empty in the truly-
+    // unknown case, which produces an empty batch naturally
+    // at the end of the function.
+
+    // Build the list of (host_box, session_external) targets.
+    // Three sources:
+    //
+    //   1. **Pinned session**: filter has session_id == "X".
+    //      Route to that one session via the existing shard /
+    //      tablet lookup. Cross-node returns the same
+    //      NotWritablePrimary-shaped error as before — full
+    //      cross-node Mongo wire forwarding for reads is the
+    //      explicit Phase 3 follow-up (binary-protocol).
+    //
+    //   2. **Locator fanout** (M26 Phase 3): meta-wired
+    //      registries enumerate sessions via
+    //      session_locators::list_by_tenant_external. Each
+    //      session's hosting box is the one whose id matches
+    //      the locator's tablet_id; cross-node sessions are
+    //      skipped with a tracing warn.
+    //
+    //   3. **Tenant-hash-box-local back-compat**: sessions
+    //      created pre-M26 (or pre-locator-population) only
+    //      exist in the tenant-hash box's local KV. Union
+    //      these in so the read coverage is the strict
+    //      superset of the pre-M26 behavior.
     let filter = Filter::parse(filter_doc)?;
-    let ctx = ReadCtx::open(&box_, registry.kv())?;
     let store = registry.object_store();
     let mut batch: Vec<Value> = Vec::new();
     let cap = limit.unwrap_or(i64::MAX).max(0) as usize;
+    let mut targets: Vec<(Arc<Box_>, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if let Some(s) = pinned_session.as_deref() {
+        // Local-only at this point — the cross-node case
+        // returned above. `route_session_for_io` resolves the
+        // shard override (or tenant-hash fallback) to a
+        // local box.
+        let box_ = match registry.route_session_for_io(db, s) {
+            agentdb_core::RouteDecision::Remote { .. } => unreachable!(
+                "remote pin already handled above the admit block"
+            ),
+            agentdb_core::RouteDecision::Local(b) => b,
+        };
+        seen.insert(s.to_string());
+        targets.push((box_, s.to_string()));
+    } else {
+        if let Some(meta) = registry.meta_store() {
+            match agentdb_meta::session_locators::list_by_tenant_external(
+                meta.pool(),
+                db,
+                None,
+                FANOUT_LOCATOR_LIMIT,
+            )
+            .await
+            {
+                Ok(locators) => {
+                    for loc in locators {
+                        let Some(tab) = loc.tablet_id else { continue };
+                        let Some(host) =
+                            u16::try_from(tab).ok().and_then(|t| registry.box_by_id(t))
+                        else {
+                            tracing::warn!(
+                                session_id = %loc.session_id,
+                                tablet_id = tab,
+                                "find: locator points at non-local tablet; cross-node Mongo \
+                                 wire fanout reads are a Phase 3 follow-up — session skipped"
+                            );
+                            continue;
+                        };
+                        if seen.insert(loc.session_id.clone()) {
+                            targets.push((host, loc.session_id));
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "find: locator fanout query failed; falling back to tenant-hash box only"
+                    );
+                }
+            }
+        }
+        // Back-compat: include tenant-hash-box-local sessions
+        // that the locator hasn't captured yet (pre-M26 or
+        // pre-populate-on-mint sessions). Union semantics —
+        // dedup via `seen`.
+        if let Some(t) = &admit_tenant {
+            for s_ext in sessions.list_in_tenant(admit_box.id, t.internal_id)? {
+                if seen.insert(s_ext.clone()) {
+                    targets.push((admit_box.clone(), s_ext));
+                }
+            }
+        }
+    }
+
+    // Per-box memoised ReadCtx + tenant_internal_id. Avoids
+    // re-opening the same box's snapshot when several sessions
+    // happen to share a host (the common case post-M26 once
+    // placement settles).
+    let mut box_caches: HashMap<u16, (ReadCtx, Option<u64>)> = HashMap::new();
+    let kv = registry.kv();
 
     match collection {
         "events" => {
-            let session_externals = sessions.list_in_tenant(tenant.box_id, tenant.internal_id)?;
-            // If the filter targets a specific session, only scan that one.
-            let scoped: Vec<String> = match filter.top_level_eq("session_id") {
-                Some(Value::String(s)) => vec![s.clone()],
-                _ => session_externals,
-            };
-            for s_ext in scoped {
-                let Some(session) = ctx.session(sessions, tenant.internal_id, &s_ext)? else {
+            for (host, s_ext) in &targets {
+                let entry = match box_caches.get(&host.id) {
+                    Some(e) => e,
+                    None => {
+                        let ctx = ReadCtx::open(host, kv)?;
+                        let tenant_internal = tenants.lookup(host.id, db)?.map(|t| t.internal_id);
+                        box_caches.insert(host.id, (ctx, tenant_internal));
+                        box_caches
+                            .get(&host.id)
+                            .expect("just inserted")
+                    }
+                };
+                let (ctx, tenant_internal) = entry;
+                let Some(tenant_internal_id) = *tenant_internal else { continue };
+                let Some(session) = ctx.session(sessions, tenant_internal_id, s_ext)? else {
                     continue;
                 };
-                // M17: tier-aware scan. Warm goes through the KV
-                // snapshot; cold/archive read through the segment with
-                // per-tier hedge delay.
-                let mut events = scan_session_all_tiers(&ctx, store, &session).await?;
-                // Default: fold correction + tombstone events
-                // into a latest-wins view so clients that
-                // wrote via `update` / `delete` see the
-                // expected result. `raw: true` opts out.
+                let mut events = scan_session_all_tiers(ctx, store, &session).await?;
                 if !raw {
                     events = agentdb_core::fold_events(events);
                 }
@@ -110,9 +227,21 @@ pub async fn find_response(
             }
         }
         "sessions" => {
-            let session_externals = sessions.list_in_tenant(tenant.box_id, tenant.internal_id)?;
-            for s_ext in session_externals {
-                let Some(session) = ctx.session(sessions, tenant.internal_id, &s_ext)? else {
+            for (host, s_ext) in &targets {
+                let entry = match box_caches.get(&host.id) {
+                    Some(e) => e,
+                    None => {
+                        let ctx = ReadCtx::open(host, kv)?;
+                        let tenant_internal = tenants.lookup(host.id, db)?.map(|t| t.internal_id);
+                        box_caches.insert(host.id, (ctx, tenant_internal));
+                        box_caches
+                            .get(&host.id)
+                            .expect("just inserted")
+                    }
+                };
+                let (ctx, tenant_internal) = entry;
+                let Some(tenant_internal_id) = *tenant_internal else { continue };
+                let Some(session) = ctx.session(sessions, tenant_internal_id, s_ext)? else {
                     continue;
                 };
                 let row = serde_json::to_value(&session)?;
@@ -160,7 +289,7 @@ pub async fn find_response(
             agentdb_core::slow_query::SlowQueryKind::Find,
             ns,
             wall_ms(),
-            box_.id,
+            admit_box.id,
             db,
             &pinned_session,
             || {
@@ -190,17 +319,6 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out = s[..max].to_string();
         out.push('…');
         out
-    }
-}
-
-fn empty_batch(db: &str, collection: &str) -> Document {
-    doc! {
-        "cursor": {
-            "id": 0_i64,
-            "ns": format!("{}.{}", db, collection),
-            "firstBatch": Bson::Array(vec![]),
-        },
-        "ok": 1.0,
     }
 }
 

@@ -812,6 +812,27 @@ preserved for diagnostics but is **not** globally meaningful
 NOT cross-cluster stable until the tenant table itself becomes
 the source of truth in a later milestone).
 
+#### Locator-driven fanout (Phase 3)
+
+`session_locators::list_by_tenant_external` enumerates every
+session of a tenant regardless of which local box hosts it.
+The Mongo wire `find` handler uses this to fan out unpinned
+queries: the targets are computed as the union of the
+locator-listed sessions on local tablets and the tenant-hash
+box's local-KV-listed sessions (the latter for back-compat
+with sessions that predate locator population). Each session
+is read against the box that actually hosts it, so an unpinned
+`find` after a shard override or tablet handoff still returns
+events from every relevant box on this node.
+
+Cross-node sessions (locator points at a tablet whose box
+isn't in this process's registry) are skipped with a tracing
+warn — wire-level cross-node Mongo forwarding for read traffic
+is the explicit Phase 3 follow-up. Pinned-session queries that
+target a peer-owned shard still produce
+`NotWritablePrimary` (code 10107) so drivers reconnect to the
+right peer.
+
 Populated by `agentdb_core::primitives::populate_session_locator`
 on every newly-minted session: REST `append_and_fetch`,
 Mongo wire writes (which go through the same primitive), and

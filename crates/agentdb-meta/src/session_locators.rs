@@ -140,14 +140,57 @@ pub async fn delete(pool: &AnyPool, session_id: &str) -> MetaResult<bool> {
     Ok(rows > 0)
 }
 
+/// Cursor-style listing keyed on the **external** tenant id.
+/// Auth-bound and cross-cluster stable; the variant the wire
+/// find handler uses for multi-tablet fanout (M26 Phase 3).
+///
+/// Older locator rows that predate migration 012 have a NULL
+/// `tenant_external_id` and are deliberately skipped here —
+/// the caller should fall back to box-local enumeration when
+/// it sees an empty result on a known-non-empty tenant.
+pub async fn list_by_tenant_external(
+    pool: &AnyPool,
+    tenant_external_id: &str,
+    after_session_id: Option<&str>,
+    limit: i64,
+) -> MetaResult<Vec<SessionLocator>> {
+    let limit = limit.max(1);
+    let rows: Vec<LocatorRow> = match after_session_id {
+        Some(after) => sqlx::query_as(
+            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
+                FROM session_locators \
+                WHERE tenant_external_id = ? AND session_id > ? \
+                ORDER BY session_id ASC \
+                LIMIT ?",
+        )
+        .bind(tenant_external_id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+        None => sqlx::query_as(
+            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
+                FROM session_locators \
+                WHERE tenant_external_id = ? \
+                ORDER BY session_id ASC \
+                LIMIT ?",
+        )
+        .bind(tenant_external_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?,
+    };
+    Ok(rows.into_iter().map(into_locator).collect())
+}
+
 /// Cursor-style listing: every locator owned by `tenant`,
 /// ordered by `session_id`, with optional resumption after
 /// `after_session_id` (exclusive). Caps at `limit` rows.
 ///
-/// Used by the fanout-read path that lands in a follow-up PR
-/// (Phase 3 of M26 Cross-tablet reads). The cursor lets the
-/// caller paginate a large tenant's session set without
-/// holding a single statement open.
+/// **Note**: this variant uses `tenant_internal_id`, which is
+/// the per-process registry id and is NOT cross-cluster
+/// stable. Prefer [`list_by_tenant_external`] in production
+/// code paths; this remains for diagnostics.
 pub async fn list_by_tenant(
     pool: &AnyPool,
     tenant_internal_id: i64,
@@ -286,6 +329,34 @@ mod tests {
         let mine = list_by_tenant(&p, 1, None, 100).await.unwrap();
         let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
         assert_eq!(ids, ["s-a", "s-b", "s-c"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_tenant_external_filters_to_one_tenant() {
+        let p = pool().await;
+        upsert(&p, "s-c", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-a", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-b", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0).await.unwrap();
+        let mine = list_by_tenant_external(&p, "t-1", None, 100).await.unwrap();
+        let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-a", "s-b", "s-c"]);
+    }
+
+    #[tokio::test]
+    async fn list_by_tenant_external_paginates_via_after_cursor() {
+        let p = pool().await;
+        for id in ["s-a", "s-b", "s-c", "s-d"] {
+            upsert(&p, id, 1, "t-1", Some(0), 0, 0).await.unwrap();
+        }
+        let page1 = list_by_tenant_external(&p, "t-1", None, 2).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].session_id, "s-a");
+        let page2 = list_by_tenant_external(&p, "t-1", Some("s-b"), 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].session_id, "s-c");
     }
 
     #[tokio::test]
