@@ -633,10 +633,19 @@ pub async fn run(
     if election.is_leader() {
         let assigns = std::sync::atomic::AtomicU64::new(0);
         let boots = std::sync::atomic::AtomicU64::new(0);
-        agentdb_core::tablet_placement::sweep_once(&meta, placement_cfg, &assigns, &boots).await;
+        let rebals = std::sync::atomic::AtomicU64::new(0);
+        agentdb_core::tablet_placement::sweep_once(
+            &meta,
+            placement_cfg,
+            &assigns,
+            &boots,
+            &rebals,
+        )
+        .await;
         tracing::info!(
             assigned = assigns.load(std::sync::atomic::Ordering::Acquire),
             bootstrapped = boots.load(std::sync::atomic::Ordering::Acquire) > 0,
+            rebalanced = rebals.load(std::sync::atomic::Ordering::Acquire),
             "initial placement pass complete"
         );
     }

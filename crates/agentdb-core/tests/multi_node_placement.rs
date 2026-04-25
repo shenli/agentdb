@@ -99,11 +99,12 @@ async fn fresh_cluster_bootstrap_distributes_tablets_across_two_nodes() {
 
     let assigns = AtomicU64::new(0);
     let boots = AtomicU64::new(0);
+    let rebals = AtomicU64::new(0);
     let placement_cfg = PlacementConfig {
         tick: Duration::from_secs(1),
         bootstrap_tablets: 4,
     };
-    tablet_placement::sweep_once(&meta, placement_cfg, &assigns, &boots).await;
+    tablet_placement::sweep_once(&meta, placement_cfg, &assigns, &boots, &rebals).await;
 
     // Bootstrap created 4 tablets; round-robin gave 2 to each node.
     assert_eq!(boots.load(Ordering::Acquire), 1);
@@ -204,6 +205,7 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
     // Now placement reassigns the orphaned tablets to b.
     let assigns = AtomicU64::new(0);
     let boots = AtomicU64::new(0);
+    let rebals = AtomicU64::new(0);
     tablet_placement::sweep_once(
         &meta,
         PlacementConfig {
@@ -212,6 +214,7 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
         },
         &assigns,
         &boots,
+        &rebals,
     )
     .await;
     let owned_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap();
@@ -227,6 +230,67 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
     assert_eq!(node_b.registry.num_boxes(), 4);
     assert_eq!(added.load(Ordering::Acquire), 4);
     assert_eq!(errs.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn rebalance_redistributes_when_a_node_joins_a_full_cluster() {
+    // Pre-state: node-a runs 4 tablets and is happily serving;
+    // node-b boots cold and registers in `nodes`. Today's
+    // active-rebalance pass takes 2 tablets back from a and
+    // hands them to b in the same sweep, then b's reconciler
+    // turns them into live boxes.
+    let (_meta_file, meta) = fresh_meta().await;
+    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0)
+        .await
+        .unwrap();
+    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0)
+        .await
+        .unwrap();
+    for id in [0, 1, 2, 3] {
+        meta_tablets::get_or_create(meta.pool(), id, 0).await.unwrap();
+        meta_tablets::assume_ownership(meta.pool(), id, 0, "a", i64::MAX)
+            .await
+            .unwrap();
+    }
+    let node_b = build_node(meta.clone(), "b").await;
+    assert_eq!(node_b.registry.num_boxes(), 0);
+
+    let leader = LeaderElection::start(meta.clone(), "a".into(), fast_election());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(leader.is_leader());
+
+    let assigns = AtomicU64::new(0);
+    let boots = AtomicU64::new(0);
+    let rebals = AtomicU64::new(0);
+    tablet_placement::sweep_once(
+        &meta,
+        PlacementConfig {
+            tick: Duration::from_secs(1),
+            bootstrap_tablets: 0,
+        },
+        &assigns,
+        &boots,
+        &rebals,
+    )
+    .await;
+    assert_eq!(
+        rebals.load(Ordering::Acquire),
+        2,
+        "two tablets should have been relinquished from a"
+    );
+
+    let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
+    let owned_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap();
+    assert_eq!(owned_a.len(), 2);
+    assert_eq!(owned_b.len(), 2);
+
+    // b's reconciler picks up the new assignments.
+    let added = AtomicU64::new(0);
+    let errs = AtomicU64::new(0);
+    tablet_reconciler::reconcile_once(&node_b.registry, &added, &errs)
+        .await
+        .unwrap();
+    assert_eq!(node_b.registry.num_boxes(), 2);
 }
 
 #[tokio::test]
@@ -284,6 +348,7 @@ async fn node_reaper_marks_silent_node_dead_unblocking_placement() {
     meta_tablets::get_or_create(meta.pool(), 0, 0).await.unwrap();
     let assigns = AtomicU64::new(0);
     let boots = AtomicU64::new(0);
+    let rebals = AtomicU64::new(0);
     tablet_placement::sweep_once(
         &meta,
         PlacementConfig {
@@ -292,6 +357,7 @@ async fn node_reaper_marks_silent_node_dead_unblocking_placement() {
         },
         &assigns,
         &boots,
+        &rebals,
     )
     .await;
     let t = meta_tablets::get(meta.pool(), 0).await.unwrap().unwrap();

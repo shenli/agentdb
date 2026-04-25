@@ -3205,7 +3205,9 @@
           "this_node_epoch",
           "reassignments_total",
           "nodes_marked_dead_total",
-          "nodes_gc_removed_total"
+          "nodes_gc_removed_total",
+          "tablet_placements_total",
+          "tablet_rebalances_total"
         ],
         "properties": {
           "leader": {
@@ -3235,6 +3237,18 @@
             "type": "integer",
             "format": "int64",
             "description": "Total number of tablet leases this process has cleared as\npart of the stale-lease reaper sweep. Only advances while\nthis process is the leader — followers report 0 even if\nanother node in the cluster has reaped many leases.",
+            "minimum": 0
+          },
+          "tablet_placements_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total tablet placements made by this process while\nleader (`owner_node_id` NULL → some alive node). Same\nleader-gated semantics; followers report 0.",
+            "minimum": 0
+          },
+          "tablet_rebalances_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total tablets relinquished by this process during the\nactive-rebalance pass. Each relinquish causes a brief\ndata-path disruption on the source node, so this\ncounter doubles as an SLO signal: a leader inflicting\nmany forced-evictions per minute means the cluster has\nchronic node churn.",
             "minimum": 0
           },
           "this_node_epoch": {

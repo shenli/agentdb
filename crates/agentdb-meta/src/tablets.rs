@@ -151,6 +151,38 @@ pub async fn clear_expired_ownership(
     Ok(ids)
 }
 
+/// Forcibly relinquish a single tablet — clear `owner_node_id`,
+/// zero `lease_expires_at_ms`, and bump `epoch`. Returns `true`
+/// when the row was relinquished by this call, `false` when the
+/// row was already unowned (the call was a no-op) or absent.
+///
+/// Used by the leader's active-rebalance pass to take a tablet
+/// away from an over-loaded alive node so the placement pass
+/// can hand it to an under-loaded one. The previous owner's
+/// in-memory lease becomes stale on its next renewal — the
+/// epoch bump means `assume_ownership` returns `Conflict`,
+/// which the lease machinery surfaces as `LeaseLost` to the
+/// data path. In-flight writes against the relinquished tablet
+/// fail fast with a 503; that is the same behavior as a real
+/// failover, just operator-triggered.
+///
+/// Cooperative ("please give up") handoff is explicit follow-up
+/// work; today's loop uses force-relinquish because the
+/// blast radius is bounded and the code path is shared with
+/// the existing failover mechanism.
+pub async fn relinquish(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> {
+    let rows = sqlx::query(
+        "UPDATE tablets \
+            SET owner_node_id = NULL, lease_expires_at_ms = 0, epoch = epoch + 1 \
+            WHERE tablet_id = ? AND owner_node_id IS NOT NULL",
+    )
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 /// Pre-claim an unowned tablet for `node_id` without granting a
 /// lease. Returns `true` when the row was assigned by this call,
 /// `false` when it was already owned (by anyone — including us)
@@ -289,6 +321,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MetaError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn relinquish_clears_owner_zeros_lease_and_bumps_epoch() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        // Owner+lease in place at epoch 1.
+        let claimed = assume_ownership(&p, 7, 0, "node-a", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(claimed.epoch, 1);
+        assert_eq!(claimed.owner_node_id.as_deref(), Some("node-a"));
+
+        assert!(relinquish(&p, 7).await.unwrap());
+        let after = get(&p, 7).await.unwrap().unwrap();
+        assert!(after.owner_node_id.is_none(), "owner must be cleared");
+        assert_eq!(after.lease_expires_at_ms, 0);
+        assert_eq!(after.epoch, 2, "epoch must monotonically advance");
+        // The previous owner's `assume_ownership(expected_epoch=1)`
+        // would now fail — locked-out semantics, same as failover.
+        let err = assume_ownership(&p, 7, 1, "node-a", 9_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn relinquish_is_idempotent_and_skips_unowned_or_unknown() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        // Unowned row — no-op.
+        assert!(!relinquish(&p, 7).await.unwrap());
+        // Unknown id — no-op.
+        assert!(!relinquish(&p, 999).await.unwrap());
+        // Now claim and relinquish twice; second call is no-op.
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        assert!(relinquish(&p, 7).await.unwrap());
+        assert!(!relinquish(&p, 7).await.unwrap());
     }
 
     #[tokio::test]
