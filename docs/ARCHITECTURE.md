@@ -886,20 +886,23 @@ child's locator before returning. The upsert is
 roundtrip; the first call wins, leaving `update_tablet`
 (handoff/migration) as the only path that retargets a row.
 
-This PR populates locators but does NOT yet consult them on
-the routing path. That's deliberate: the populate→consume
-split lets each follow-up M26 phase land in isolation. Future
-phases (per
-`docs/2026-04-24-next-step-design.md`):
+All four M26 phases per `docs/2026-04-24-next-step-design.md`
+are now landed:
 
-- **Phase 2**: per-session lock map keyed on session id, replacing
-  the per-tenant write lock that's currently the dominant
-  intra-tenant concurrency bottleneck.
-- **Phase 3**: route session-scoped reads via the locator;
-  cross-tablet `find` / `aggregate` fans out across the tenant's
-  locator-listed tablets and merges.
-- **Phase 4**: include archive-tier segments in indexed
-  retrieval so unhinted text/vector queries don't quietly drop
+- **Phase 1**: `session_locators` populated on mint; routing
+  helpers consult it. Closeout: `/api/sessions/:sid/fork` and
+  the new `/api/sessions/:sid/append_and_fetch` are both
+  auth-bound; tenant identity is auth-derived (`AuthedTenant`
+  extension), no longer client-supplied. The legacy
+  `/api/tenants/:tid/...` path stays as compat alias.
+- **Phase 2**: per-session lock map keyed on session id,
+  replacing the per-tenant write lock as the dominant intra-
+  tenant concurrency boundary.
+- **Phase 3**: locator-driven reads. Mongo `find` fans out
+  across local boxes for unpinned queries and forwards to peer
+  nodes via `forward::pinned_find` for cross-node sessions.
+- **Phase 4**: archive-tier segments included in indexed
+  retrieval so unhinted text/vector queries don't drop
   archived data.
 
 A locator is a control-plane record; it's purposely small so
@@ -1889,12 +1892,27 @@ Off by default (backward-compatible). Enable with
   allowed) — cross-tenant access returns `code: 13
   Unauthorized`.
 
-- **REST.** A Basic-Auth middleware layers only on
-  `/api/tenants/*`. Admin-plane routes (`/api/admin/*`,
-  `/health/*`, `/metrics`) stay open — the threat model
-  assumes operators run admin behind network isolation.
-  PBKDF2 runs per request (~5–10 ms @ 4096 iters); a future
-  PR adds a short-TTL cache.
+- **REST.** A Basic-Auth middleware layers on every tenant-
+  bound mutation route — both legacy `/api/tenants/{tid}/...`
+  shapes and the M26-closeout session-keyed shapes
+  (`/api/sessions/{sid}/append_and_fetch`,
+  `/api/sessions/{sid}/fork`). Admin-plane routes
+  (`/api/admin/*`, `/health/*`, `/metrics`) stay open — the
+  threat model assumes operators run admin behind network
+  isolation. PBKDF2 runs per request (~5–10 ms @ 4096
+  iters); a future PR adds a short-TTL cache.
+
+  After auth succeeds, the middleware injects an
+  `AuthedTenant { external_id, user_id }` into the request
+  extensions. Handlers consume this via `Extension<AuthedTenant>`
+  and use it as the **canonical** tenant identity — the
+  v2 contract says tenant is auth-bound, not client-supplied.
+  Source-of-truth precedence in handlers:
+
+  1. `AuthedTenant` (when auth is enabled)
+  2. Session locator (cross-checked against #1; mismatch → 403)
+  3. Path/body tenant (legacy fallback for no-auth single-process
+     deployments; cross-checked against #1; mismatch → 400)
 
 - **Admin endpoints.** `POST /api/admin/users` (create),
   `GET /api/admin/users` (list, summaries only), `DELETE

@@ -1567,6 +1567,100 @@
         }
       }
     },
+    "/api/sessions/{session_id}/append_and_fetch": {
+      "post": {
+        "tags": [
+          "primitives"
+        ],
+        "operationId": "append_and_fetch_session_keyed",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "External session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppendAndFetchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Event appended; last N events returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppendAndFetchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or tenant cannot be resolved (no auth, no locator)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Authorization header (when auth is enabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated tenant doesn't own this session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "Routing drift on a forwarded request"
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Fault injected, forwarding failed, or node draining",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/fork": {
       "post": {
         "tags": [
@@ -1703,6 +1797,16 @@
           },
           "400": {
             "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated tenant disagrees with path tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2426,7 +2530,7 @@
       },
       "ForkRequest": {
         "type": "object",
-        "description": "Body shape for `POST /api/sessions/{session_id}/fork`.\n\n`tenant_id` is **deprecated** as of M26 Phase 1b. The\ncanonical resolution path is now:\n\n1. `session_locators::get(parent_session_id)` returns the\n   parent's `tenant_internal_id`.\n2. `tenants::get_by_internal` recovers the external string\n   used by the per-box `TenantRegistry` and `tenant_write_lock`.\n\nBody `tenant_id` is honored when supplied, both for\nbackward compatibility (clients written against the\npre-locator API) and to recover from the rare bootstrap\ncase where a session minted before the locator table existed\ngets forked. If the body and the locator disagree the\nhandler returns 400 — silently overruling the client would\nhide configuration drift.",
+        "description": "Body shape for `POST /api/sessions/{session_id}/fork`.\n\n`tenant_id` is **deprecated** as of M26 Phase 1b and will\nreject mismatching values when auth is enabled. The\ncanonical resolution path is now:\n\n1. `AuthedTenant` extension (M26 closeout). When auth is\n   enabled, the tenant is taken from credentials and\n   cross-checked against the locator.\n2. `session_locators::get(parent_session_id)` returns the\n   parent's `tenant_external_id`.\n3. Body `tenant_id`, kept for back-compat in single-process\n   no-auth deployments and the rare pre-locator session.\n\nWhen several sources supply a tenant and they disagree, the\nhandler returns 400/403 — silently overruling the client\nwould hide configuration drift.",
         "required": [
           "new_session_id"
         ],
@@ -2439,7 +2543,7 @@
               "string",
               "null"
             ],
-            "description": "Deprecated as of M26 Phase 1b. When omitted, the tenant\nis derived from the parent session's locator. Supply\nonly for backward compat with pre-M26 clients."
+            "description": "Deprecated as of M26 Phase 1b. When omitted, the tenant\nis derived from credentials (auth) and/or the parent\nsession's locator. Supply only for backward compat with\npre-M26 clients in no-auth mode."
           }
         }
       },

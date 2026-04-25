@@ -2,10 +2,11 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use crate::auth_middleware::AuthedTenant;
 use crate::dto::{AppendAndFetchRequest, AppendAndFetchResponse, EventDto};
 use crate::error::{ApiError, ErrorResponse};
 use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
@@ -23,6 +24,7 @@ use crate::AppState;
     responses(
         (status = 200, description = "Event appended; last N events returned", body = AppendAndFetchResponse),
         (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 403, description = "Authenticated tenant disagrees with path tenant", body = ErrorResponse),
         (status = 421, description = "Routing drift on a forwarded request"),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
         (status = 503, description = "Fault injected, forwarding failed, or node draining", body = ErrorResponse),
@@ -30,7 +32,7 @@ use crate::AppState;
 )]
 #[tracing::instrument(
     name = "rest.append_and_fetch",
-    skip(state, headers, body),
+    skip(state, headers, body, authed),
     fields(
         tenant = %tenant,
         session = %session,
@@ -40,6 +42,111 @@ use crate::AppState;
 pub async fn append_and_fetch(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+    body: Bytes,
+) -> Response {
+    // Auth-vs-path cross-check (M26 closeout). The middleware
+    // already verified path tenant matches credentials, but
+    // belt-and-braces: if for any reason an unauthed request
+    // reached us with a path tenant we can't trust, the
+    // handlers' own auth-derived view stays the source of
+    // truth. Match → fall through; mismatch → 403.
+    if let Some(Extension(authed)) = &authed {
+        if authed.external_id != tenant {
+            return ApiError::Forbidden(format!(
+                "user {} is bound to tenant {} but path targets {tenant}",
+                authed.user_id, authed.external_id
+            ))
+            .into_response();
+        }
+    }
+    do_append_and_fetch(state, tenant, session, headers, body).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{session_id}/append_and_fetch",
+    tag = "primitives",
+    params(
+        ("session_id" = String, Path, description = "External session id"),
+    ),
+    request_body = AppendAndFetchRequest,
+    responses(
+        (status = 200, description = "Event appended; last N events returned", body = AppendAndFetchResponse),
+        (status = 400, description = "Malformed request, or tenant cannot be resolved (no auth, no locator)", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid Authorization header (when auth is enabled)", body = ErrorResponse),
+        (status = 403, description = "Authenticated tenant doesn't own this session", body = ErrorResponse),
+        (status = 421, description = "Routing drift on a forwarded request"),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 503, description = "Fault injected, forwarding failed, or node draining", body = ErrorResponse),
+    ),
+)]
+#[tracing::instrument(
+    name = "rest.append_and_fetch_session_keyed",
+    skip(state, headers, body, authed),
+    fields(
+        session = %session,
+        forwarded = headers.contains_key(FORWARDED_HEADER),
+    ),
+)]
+pub async fn append_and_fetch_session_keyed(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+    body: Bytes,
+) -> Response {
+    // M26 v2 contract: tenant is derived from auth (canonical
+    // when present) and cross-checked against the session
+    // locator. No tenant in the path or body — silent client
+    // attempts to spoof tenant get a 403, not a confused
+    // routing decision.
+    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
+    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response()
+            }
+        },
+        None => None,
+    };
+    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
+        (Some(a), Some(l)) if a != l => {
+            return ApiError::Forbidden(format!(
+                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
+                authed_user.unwrap_or("?")
+            ))
+            .into_response();
+        }
+        (Some(a), _) => a.to_string(),
+        (None, Some(l)) => l.to_string(),
+        (None, None) => {
+            return ApiError::Core(agentdb_core::Error::Invalid {
+                field: Some("tenant".into()),
+                message: format!(
+                    "cannot resolve tenant for session {session}: no Authorization header, \
+                     no session locator. Use /api/tenants/<tid>/sessions/<sid>/append_and_fetch \
+                     for pre-M26 sessions, or enable auth"
+                ),
+            })
+            .into_response()
+        }
+    };
+    do_append_and_fetch(state, tenant, session, headers, body).await
+}
+
+async fn do_append_and_fetch(
+    state: AppState,
+    tenant: String,
+    session: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {

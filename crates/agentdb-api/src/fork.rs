@@ -3,12 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdb_core::fork::fork_session;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::auth_middleware::AuthedTenant;
 use crate::error::{ApiError, ErrorResponse};
 use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::stream::StreamEvent;
@@ -16,26 +17,27 @@ use crate::AppState;
 
 /// Body shape for `POST /api/sessions/{session_id}/fork`.
 ///
-/// `tenant_id` is **deprecated** as of M26 Phase 1b. The
+/// `tenant_id` is **deprecated** as of M26 Phase 1b and will
+/// reject mismatching values when auth is enabled. The
 /// canonical resolution path is now:
 ///
-/// 1. `session_locators::get(parent_session_id)` returns the
-///    parent's `tenant_internal_id`.
-/// 2. `tenants::get_by_internal` recovers the external string
-///    used by the per-box `TenantRegistry` and `tenant_write_lock`.
+/// 1. `AuthedTenant` extension (M26 closeout). When auth is
+///    enabled, the tenant is taken from credentials and
+///    cross-checked against the locator.
+/// 2. `session_locators::get(parent_session_id)` returns the
+///    parent's `tenant_external_id`.
+/// 3. Body `tenant_id`, kept for back-compat in single-process
+///    no-auth deployments and the rare pre-locator session.
 ///
-/// Body `tenant_id` is honored when supplied, both for
-/// backward compatibility (clients written against the
-/// pre-locator API) and to recover from the rare bootstrap
-/// case where a session minted before the locator table existed
-/// gets forked. If the body and the locator disagree the
-/// handler returns 400 — silently overruling the client would
-/// hide configuration drift.
+/// When several sources supply a tenant and they disagree, the
+/// handler returns 400/403 — silently overruling the client
+/// would hide configuration drift.
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForkRequest {
     /// Deprecated as of M26 Phase 1b. When omitted, the tenant
-    /// is derived from the parent session's locator. Supply
-    /// only for backward compat with pre-M26 clients.
+    /// is derived from credentials (auth) and/or the parent
+    /// session's locator. Supply only for backward compat with
+    /// pre-M26 clients in no-auth mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     pub new_session_id: String,
@@ -66,6 +68,7 @@ pub async fn fork_handler(
     State(state): State<AppState>,
     Path(parent_session_id): Path<String>,
     headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
     body: Bytes,
 ) -> Response {
     let parsed: ForkRequest = match serde_json::from_slice(&body) {
@@ -79,13 +82,14 @@ pub async fn fork_handler(
         }
     };
 
-    // Resolve the effective tenant. Locator first; body
-    // second (back-compat); error if neither path produces a
-    // tenant id.
+    // Resolve the effective tenant. Auth first (M26 closeout);
+    // locator second; body third (back-compat). Mismatches
+    // surface 400/403 rather than silently overruling.
     let tenant_id = match resolve_fork_tenant(
         &state,
         &parent_session_id,
         parsed.tenant_id.as_deref(),
+        authed.as_deref(),
     )
     .await
     {
@@ -205,21 +209,24 @@ pub async fn fork_handler(
 
 /// Resolve the effective tenant for a fork request.
 ///
-/// Source priority:
-/// 1. **Session locator** (M26 path). One meta query against
-///    `session_locators` keyed by parent_session_id; on hit,
-///    one more against `tenants` to recover the external id.
-/// 2. **Request body** (legacy / back-compat). Used when the
-///    locator is absent (the parent was minted pre-M26) or
-///    when no MetaStore is wired (legacy single-process tests).
+/// Source priority (M26 closeout):
 ///
-/// When both supply a tenant and they disagree, return 400 —
-/// silently overruling the client would mask drift between
-/// the locator and a stale client config.
+/// 1. **`AuthedTenant`** (auth-bound). When present, this is
+///    authoritative — it's the credential identity, not a
+///    client claim. Locator and body must agree if supplied;
+///    disagreement returns 403 (auth-vs-locator) or 400
+///    (auth-vs-body) so misconfigured clients are visible.
+/// 2. **Session locator**. The canonical record of which
+///    tenant owns the parent session. Cross-checked against
+///    auth above; used standalone when auth is disabled.
+/// 3. **Request body** (legacy / back-compat). Used only when
+///    auth is disabled AND the locator is absent (pre-M26
+///    sessions, single-process no-auth tests).
 async fn resolve_fork_tenant(
     state: &AppState,
     parent_session_id: &str,
     body_tenant: Option<&str>,
+    authed: Option<&AuthedTenant>,
 ) -> Result<String, Response> {
     let locator_tenant = match state.registry.meta_store() {
         Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), parent_session_id)
@@ -237,6 +244,39 @@ async fn resolve_fork_tenant(
         },
         None => None,
     };
+
+    // Cross-checks. Auth-vs-locator drifts to 403 because the
+    // credentialed user genuinely doesn't own the parent
+    // session — that's an authorization failure, not a request
+    // shape error. Auth-vs-body drifts to 400 because the body
+    // is just a stale client claim.
+    if let Some(authed) = authed {
+        if let Some(locator) = locator_tenant.as_deref() {
+            if locator != authed.external_id {
+                return Err(ApiError::Forbidden(format!(
+                    "user {} is bound to tenant {} but session {parent_session_id} \
+                     belongs to tenant {locator}",
+                    authed.user_id, authed.external_id
+                ))
+                .into_response());
+            }
+        }
+        if let Some(body) = body_tenant {
+            if body != authed.external_id {
+                return Err(ApiError::Core(agentdb_core::Error::Invalid {
+                    field: Some("tenant_id".into()),
+                    message: format!(
+                        "request body tenant_id '{body}' disagrees with the authenticated \
+                         tenant '{}'; omit tenant_id or update the client",
+                        authed.external_id
+                    ),
+                })
+                .into_response());
+            }
+        }
+        return Ok(authed.external_id.clone());
+    }
+
     match (locator_tenant, body_tenant) {
         (Some(locator), Some(body)) if locator != body => Err(ApiError::Core(
             agentdb_core::Error::Invalid {

@@ -1,7 +1,11 @@
-//! M19: HTTP Basic Auth middleware for `/api/tenants/:tid/*`.
+//! M19: HTTP Basic Auth middleware for tenant-bound mutation
+//! routes. Originally tenant-only; M26 closeout extended it
+//! to cover session-keyed routes (`/api/sessions/:sid/...`)
+//! whose tenant is auth-derived rather than path-supplied.
 //!
 //! When auth is disabled (AppState::auth is None), this is a
-//! straight pass-through. When auth is enabled:
+//! straight pass-through and downstream handlers see no
+//! `AuthedTenant` extension. When auth is enabled:
 //!
 //! 1. Read `Authorization: Basic <b64>`; 401 if absent/malformed.
 //! 2. Decode to `(username, password)`; 401 if not UTF-8.
@@ -9,8 +13,14 @@
 //! 4. Derive SaltedPassword with the stored salt + iterations,
 //!    compare the resulting StoredKey in constant time; 401 on
 //!    mismatch.
-//! 5. Extract `:tenant_id` from the path; 403 if it doesn't
-//!    match the authenticated user's tenant.
+//! 5. If the path is `/api/tenants/{tid}/...`, verify
+//!    `tid == user.tenant_external`; 403 on mismatch. (The
+//!    `/api/sessions/{sid}/...` shapes have no path tenant —
+//!    handlers do the locator-vs-authed-tenant check there
+//!    because they already need to look the session up.)
+//! 6. Insert [`AuthedTenant`] into request extensions so
+//!    handlers can derive tenant from auth instead of trusting
+//!    the path or body.
 //!
 //! PBKDF2 per-request is ~5–10 ms on commodity hardware. For
 //! hot paths that's noticeable; a later PR can add a short-TTL
@@ -31,15 +41,37 @@ use subtle::ConstantTimeEq;
 use crate::error::ApiError;
 use crate::AppState;
 
-/// Axum middleware entry point. Registered on the `/api/tenants/*`
-/// subtree only; admin-plane routes and health endpoints skip it.
+/// Auth-derived tenant identity. Inserted into request
+/// extensions by [`basic_auth_middleware`] when auth succeeds.
+/// Handlers consume this via `Extension<AuthedTenant>` to derive
+/// tenant from credentials rather than from path/body, which is
+/// the M26 acceptance contract: tenant identity is auth-bound,
+/// not client-supplied.
+///
+/// Absence of the extension means auth was disabled (or the
+/// route is mounted outside the auth boundary, which is a bug);
+/// handlers fall back to legacy path/body tenant resolution in
+/// that case so single-process tests and pre-auth deployments
+/// keep working.
+#[derive(Debug, Clone)]
+pub struct AuthedTenant {
+    pub external_id: String,
+    pub user_id: String,
+}
+
+/// Axum middleware entry point. Registered on every tenant-
+/// bound mutation subtree (`/api/tenants/:tid/*` AND
+/// `/api/sessions/:sid/*`); admin-plane routes and health
+/// endpoints skip it.
 pub async fn basic_auth_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let Some(auth_cfg) = &state.auth else {
-        // No auth configured — pass through unchanged.
+        // No auth configured — pass through unchanged. Handlers
+        // see no AuthedTenant extension and fall back to legacy
+        // tenant resolution.
         return next.run(req).await;
     };
     let meta = match &auth_cfg.meta {
@@ -47,7 +79,9 @@ pub async fn basic_auth_middleware(
         None => return ApiError::Internal("auth configured without meta store".into()).into_response(),
     };
 
-    // Path form: /api/tenants/{tenant_id}/...
+    // Path form: /api/tenants/{tenant_id}/... — only this
+    // shape carries a path tenant; /api/sessions/... shapes
+    // do not, and handlers verify tenant from the locator.
     let path = req.uri().path().to_string();
     let tenant_from_path = extract_tenant_id(&path);
 
@@ -80,9 +114,14 @@ pub async fn basic_auth_middleware(
             .into_response();
         }
     }
-    // Auth succeeded. Pass through; downstream handlers don't
-    // need the user identity (the tenant in the path is now
-    // trusted because we verified it matches).
+    // Auth succeeded. Hand the tenant identity to downstream
+    // handlers via an extension so they don't have to re-derive
+    // it from the path. Path-tenant verification (above) is
+    // belt-and-braces with the handlers' own checks.
+    req.extensions_mut().insert(AuthedTenant {
+        external_id: user.tenant_external.clone(),
+        user_id,
+    });
     next.run(req).await
 }
 
