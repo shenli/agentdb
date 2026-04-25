@@ -1088,6 +1088,81 @@ impl BoxRegistry {
         }
     }
 
+    /// Locator-first routing for writes (M26 final phase).
+    ///
+    /// Before consulting `LocationProxy`'s shard table or
+    /// falling through to tenant-hash, this helper asks the
+    /// `session_locators` table where the session lives. The
+    /// locator is the canonical record per the v2 design and
+    /// the population path (PR #71) keeps it current on every
+    /// new mint and every cooperative handoff completion (PR
+    /// #70). Reading it first means writes go to the same
+    /// box that subsequent reads (PR #74) will find them
+    /// on, even when shard-override / tablet-handoff state is
+    /// briefly out of sync.
+    ///
+    /// Locator misses fall through to
+    /// [`Self::route_session_for_io`] unchanged — pre-M26
+    /// sessions and brand-new mints are covered by the same
+    /// shard-override + tenant-hash logic as before.
+    ///
+    /// Cross-node tablets surface as `RouteDecision::Remote`
+    /// using the `NodeAddressProxy`, identical to the sync
+    /// route's contract. This helper is async because the
+    /// locator lookup is a meta query; it's only used from
+    /// async write callers (REST `append_and_fetch`, fork's
+    /// child-mint flow, Mongo wire write handlers — all
+    /// already async).
+    pub async fn route_session_for_write(
+        &self,
+        tenant_external: &str,
+        session_external: &str,
+    ) -> RouteDecision {
+        let Some(meta) = self.meta.as_ref() else {
+            return self.route_session_for_io(tenant_external, session_external);
+        };
+        let locator =
+            match agentdb_meta::session_locators::get(meta.pool(), session_external).await {
+                Ok(Some(loc)) => loc,
+                Ok(None) | Err(_) => {
+                    // No row, or transient meta hiccup — fall
+                    // through to the existing routing logic.
+                    // Errors are logged via `tracing::warn!`
+                    // inside the locator-fanout helpers used
+                    // by reads; for writes we accept the
+                    // tenant-hash fallback silently because the
+                    // append still lands somewhere durable.
+                    return self.route_session_for_io(tenant_external, session_external);
+                }
+            };
+        let Some(tablet_id) = locator.tablet_id else {
+            // Session known but unplaced (rare — usually only
+            // during a tenant-bootstrap window). Behave as if
+            // there were no locator row.
+            return self.route_session_for_io(tenant_external, session_external);
+        };
+        if let Some(addr_proxy) = self.node_addr.get() {
+            if let Some(target) = addr_proxy.target_for_tablet(tablet_id) {
+                if !addr_proxy.is_self(&target) {
+                    return RouteDecision::Remote { target, tablet_id };
+                }
+                // is_self → fall through to local lookup.
+            }
+        }
+        // Local: find the box for this tablet. If we can't
+        // (e.g., tablet_id refers to a box this process doesn't
+        // host AND no node-addr-proxy is wired so we couldn't
+        // route remote either), fall back rather than panic
+        // — same posture as `route_session_for_io`.
+        let boxes = self.boxes.read();
+        if let Some(b) = boxes.iter().find(|b| b.id as i64 == tablet_id) {
+            RouteDecision::Local(b.clone())
+        } else {
+            drop(boxes);
+            self.route_session_for_io(tenant_external, session_external)
+        }
+    }
+
     /// Look up an `Arc<Box_>` by index. Used by the server binary to start
     /// one `LifecycleEngine` per box at process startup.
     pub fn box_by_id(&self, id: BoxId) -> Option<Arc<Box_>> {
@@ -1525,6 +1600,109 @@ mod tests {
             .unwrap(),
         );
         (dir, obj_dir, meta_file, reg)
+    }
+
+    /// M26 final phase: build a meta-backed registry, then
+    /// expose the meta store too so tests can write locator
+    /// rows directly. Reuses meta_registry's wiring.
+    async fn meta_registry_with_meta(
+        num_boxes: u16,
+    ) -> (
+        TempDir,
+        TempDir,
+        tempfile::NamedTempFile,
+        Arc<BoxRegistry>,
+        Arc<agentdb_meta::MetaStore>,
+    ) {
+        let meta_file = tempfile::NamedTempFile::new().unwrap();
+        let meta_path = meta_file.path().to_string_lossy().to_string();
+        let meta = Arc::new(
+            agentdb_meta::MetaStore::open_sqlite(&meta_path)
+                .await
+                .unwrap(),
+        );
+        let dir = TempDir::new().unwrap();
+        let obj_dir = TempDir::new().unwrap();
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+        let reg = Arc::new(
+            BoxRegistry::new_with_meta(
+                kv,
+                store,
+                num_boxes,
+                Arc::new(HlcClock::default()),
+                meta.clone(),
+                "self".into(),
+            )
+            .await
+            .unwrap(),
+        );
+        (dir, obj_dir, meta_file, reg, meta)
+    }
+
+    #[tokio::test]
+    async fn route_for_write_uses_locator_when_present() {
+        // Locator pins "s-1" to tablet 3. Tenant-hash for
+        // "t-1" lands on a different box (whatever the FNV
+        // produces). The locator-first path must beat the
+        // tenant-hash fallback.
+        let (_d, _o, _m, reg, meta) = meta_registry_with_meta(4).await;
+        let fallback = reg.route_tenant("t-1").id;
+        let target_tablet: i64 = ((fallback as i64) + 1) % 4;
+        agentdb_meta::session_locators::upsert(
+            meta.pool(),
+            "s-1",
+            7,
+            "t-1",
+            Some(target_tablet),
+            crate::shard::shard_id("s-1") as i32,
+            0,
+        )
+        .await
+        .unwrap();
+
+        match reg.route_session_for_write("t-1", "s-1").await {
+            RouteDecision::Local(b) => assert_eq!(b.id as i64, target_tablet),
+            RouteDecision::Remote { .. } => panic!("expected Local for self-owned tablet"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_for_write_falls_back_when_no_locator_row() {
+        // No locator row → the helper degenerates to
+        // route_session_for_io's existing logic. With no
+        // shard override either, that's tenant-hash.
+        let (_d, _o, _m, reg, _meta) = meta_registry_with_meta(4).await;
+        let fallback = reg.route_tenant("t-1").id;
+        match reg.route_session_for_write("t-1", "s-no-loc").await {
+            RouteDecision::Local(b) => assert_eq!(b.id, fallback),
+            RouteDecision::Remote { .. } => panic!("no locator + no override must stay local"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_for_write_locator_with_null_tablet_falls_back() {
+        // A session with a locator row but `tablet_id IS NULL`
+        // (created-before-placed; rare). Behave as if the row
+        // weren't there at all.
+        let (_d, _o, _m, reg, meta) = meta_registry_with_meta(4).await;
+        agentdb_meta::session_locators::upsert(
+            meta.pool(),
+            "s-pending",
+            1,
+            "t-1",
+            None,
+            crate::shard::shard_id("s-pending") as i32,
+            0,
+        )
+        .await
+        .unwrap();
+        let fallback = reg.route_tenant("t-1").id;
+        match reg.route_session_for_write("t-1", "s-pending").await {
+            RouteDecision::Local(b) => assert_eq!(b.id, fallback),
+            RouteDecision::Remote { .. } => panic!("null tablet_id must fall back, not forward"),
+        }
     }
 
     #[tokio::test]

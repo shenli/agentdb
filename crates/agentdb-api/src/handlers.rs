@@ -46,7 +46,15 @@ pub async fn append_and_fetch(
     // M20 multi-node: decide whether to write locally or
     // forward before we deserialize, so we can ship the original
     // bytes to the peer without a round-trip through JSON.
-    let decision = state.registry.route_session_for_io(&tenant, &session);
+    //
+    // M26 final phase: route via the locator (where the
+    // session canonically lives) before falling back to
+    // shard-override / tenant-hash — keeps writes aligned
+    // with the locator-driven reads from PR #74.
+    let decision = state
+        .registry
+        .route_session_for_write(&tenant, &session)
+        .await;
     let already_forwarded = headers.contains_key(FORWARDED_HEADER);
 
     if let agentdb_core::RouteDecision::Remote { target, tablet_id } = &decision {
