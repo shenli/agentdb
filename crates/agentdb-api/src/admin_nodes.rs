@@ -39,6 +39,12 @@ pub struct NodeView {
     pub state: String,
     pub last_heartbeat_ms: i64,
     pub joined_at_ms: i64,
+    /// Availability zone declared via `AGENTDB_NODE_AZ`. `None`
+    /// for single-AZ deployments and pre-migration-013 nodes.
+    /// Tablet placement prefers cross-AZ targets when this is
+    /// populated for two or more nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_zone: Option<String>,
     /// True when this node's last heartbeat is older than the
     /// configured `stale_threshold_ms` (default 15000). Diagnostic —
     /// the scheduler that M22 will add does the actual failover
@@ -96,6 +102,7 @@ pub async fn list_nodes(
                         state: n.state,
                         last_heartbeat_ms: n.last_heartbeat_ms,
                         joined_at_ms: n.joined_at_ms,
+                        availability_zone: n.availability_zone,
                         is_stale,
                     }
                 })
@@ -206,7 +213,7 @@ mod tests {
     async fn meta_with(rows: &[(&str, &str, &str, i64)]) -> Arc<MetaStore> {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
         for (id, addr, state, ts) in rows {
-            nodes::upsert(meta.pool(), id, addr, None, state, *ts)
+            nodes::upsert(meta.pool(), id, addr, None, state, *ts, None)
                 .await
                 .unwrap();
         }
@@ -290,7 +297,7 @@ mod tests {
     async fn delete_removes_dead_node_and_reports_true() {
         let now = now_ms();
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        nodes::upsert(meta.pool(), "gone", "a", None, "dead", now)
+        nodes::upsert(meta.pool(), "gone", "a", None, "dead", now, None)
             .await
             .unwrap();
         let Json(resp) = delete_node(Some(Extension(meta.clone())), Path("gone".into()))
@@ -320,7 +327,7 @@ mod tests {
         let now = now_ms();
         for state in ["draining", "leaving", "dead"] {
             let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-            nodes::upsert(meta.pool(), "n", "addr", None, state, now)
+            nodes::upsert(meta.pool(), "n", "addr", None, state, now, None)
                 .await
                 .unwrap();
             let Json(resp) = delete_node(Some(Extension(meta)), Path("n".into()))

@@ -81,10 +81,10 @@ async fn fresh_cluster_bootstrap_distributes_tablets_across_two_nodes() {
     let (_meta_file, meta) = fresh_meta().await;
     // Both nodes register before placement runs — the leader's
     // first placement tick sees both and round-robins.
-    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0, None)
         .await
         .unwrap();
     let node_a = build_node(meta.clone(), "a").await;
@@ -155,10 +155,10 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
     // Pre-seed: two nodes, two tablets each on A. Lease is
     // already expired in this seed (lease_expires_at_ms in the
     // past) so the reaper can clear immediately.
-    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0, None)
         .await
         .unwrap();
     for id in [0, 1, 2, 3] {
@@ -172,7 +172,7 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
             .unwrap();
     }
     // Mark A dead so placement won't reassign it back.
-    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "dead", 0)
+    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "dead", 0, None)
         .await
         .unwrap();
 
@@ -244,10 +244,10 @@ async fn cooperative_rebalance_handshake_redistributes_to_new_node() {
     //   4. b's TabletReconciler picks up the new ownership and
     //      starts serving the moved tablets.
     let (_meta_file, meta) = fresh_meta().await;
-    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0)
+    meta_nodes::upsert(meta.pool(), "b", "addr-b", None, "alive", 0, None)
         .await
         .unwrap();
     for id in [0, 1, 2, 3] {
@@ -349,10 +349,10 @@ async fn node_reaper_marks_silent_node_dead_unblocking_placement() {
         .unwrap()
         .as_millis() as i64
         - 60_000;
-    meta_nodes::upsert(meta.pool(), "alive", "addr-a", None, "alive", hb + 60_000)
+    meta_nodes::upsert(meta.pool(), "alive", "addr-a", None, "alive", hb + 60_000, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "silent", "addr-b", None, "alive", hb)
+    meta_nodes::upsert(meta.pool(), "silent", "addr-b", None, "alive", hb, None)
         .await
         .unwrap();
 

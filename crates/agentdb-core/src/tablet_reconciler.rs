@@ -410,7 +410,7 @@ mod tests {
         let meta_file = tempfile::NamedTempFile::new().unwrap();
         let meta_path = meta_file.path().to_string_lossy().to_string();
         let meta = Arc::new(MetaStore::open_sqlite(&meta_path).await.unwrap());
-        meta_nodes::upsert(meta.pool(), "n1", "addr", None, "alive", 0)
+        meta_nodes::upsert(meta.pool(), "n1", "addr", None, "alive", 0, None)
             .await
             .unwrap();
         let registry = Arc::new(

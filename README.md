@@ -211,6 +211,7 @@ contract.
 | `AGENTDB_NODE_REAPER_TICK_SECS` | `10` | How often the leader scans `nodes` for failure + GC |
 | `AGENTDB_NODE_DEAD_AFTER_SECS` | `30` | Stale `alive` rows older than this flip to `dead` |
 | `AGENTDB_NODE_GC_AFTER_SECS` | `3600` | `dead` rows older than this are removed from `nodes` |
+| `AGENTDB_NODE_AZ` | — | Availability zone label (e.g. `us-east-1a`). Placement prefers cross-AZ targets when two or more AZs are declared |
 | `AGENTDB_PLACEMENT_TICK_SECS` | `5` | How often the leader scans `tablets` for unowned rows to assign |
 | `AGENTDB_RECONCILER_TICK_SECS` | `3` | How often each node picks up new placements via `add_box` |
 | `AGENTDB_CLUSTER_TABLETS` | `AGENTDB_BOXES` | Tablets to seed on a fresh cluster (cluster-wide, not per-process) |

@@ -88,6 +88,7 @@ async fn insert_via_node_a_is_forwarded_to_owner_node_b() {
         Some(addr_a.as_str()),
         "alive",
         100,
+        None,
     )
     .await
     .unwrap();
@@ -98,6 +99,7 @@ async fn insert_via_node_a_is_forwarded_to_owner_node_b() {
         Some(addr_b.as_str()),
         "alive",
         100,
+        None,
     )
     .await
     .unwrap();

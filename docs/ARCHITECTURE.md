@@ -968,6 +968,33 @@ alone, which is enough to keep one cold node from staying
 cold but doesn't react to non-uniform per-tablet load.
 Tablet-level load signals are the natural follow-up.
 
+#### Cross-AZ failure-domain awareness
+
+Per `agent-db-v2.md` §2.7, each node declares its AZ at boot
+via `AGENTDB_NODE_AZ` (written into `nodes.availability_zone`,
+migration 013). Two scheduler-policy hooks read it:
+
+- **Assign-unowned**: ranks alive nodes by `(AZ tablet
+  count, per-node tablet count, node-id)`. Lower wins on
+  every key. With more than one AZ represented, the
+  AZ-load tier dominates, so unowned tablets spread
+  evenly across AZs.
+- **Rebalance handoff target picker**: filters peers to
+  those in a *different* AZ from the source first. Among
+  that set, the existing lowest-projected-load logic
+  picks. If no cross-AZ peer exists (single-AZ cluster, or
+  no AZs declared at all), the filter empties and the
+  picker falls back to "any alive peer" — single-AZ
+  behavior is unchanged.
+
+Net effect: a single-AZ outage's blast radius drops from
+"every tablet in that AZ loses its writer until the AZ
+recovers" to "every tablet in that AZ loses its writer for
+the failover window" (target p95 < 30s, design doc §5.2).
+No quorum writes, no Paxos — durability stays anchored on
+the multi-AZ object store, and the scheduler picks
+diverse failover candidates as a matter of policy.
+
 ### Per-session locking + admission semaphore
 
 The 2026-04-24 design review flagged that even with the M23

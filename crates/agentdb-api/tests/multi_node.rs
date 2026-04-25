@@ -52,10 +52,10 @@ async fn spawn_two_nodes() -> (tempfile::NamedTempFile, Arc<MetaStore>, Node, No
     let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr_b = listener_b.local_addr().unwrap();
 
-    meta_nodes::upsert(meta.pool(), "node-a", &addr_a.to_string(), None, "alive", 100)
+    meta_nodes::upsert(meta.pool(), "node-a", &addr_a.to_string(), None, "alive", 100, None)
         .await
         .unwrap();
-    meta_nodes::upsert(meta.pool(), "node-b", &addr_b.to_string(), None, "alive", 100)
+    meta_nodes::upsert(meta.pool(), "node-b", &addr_b.to_string(), None, "alive", 100, None)
         .await
         .unwrap();
 
