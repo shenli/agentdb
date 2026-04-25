@@ -1,21 +1,31 @@
 # AgentDB compose example
 
-Single-node AgentDB + MinIO stack. The AgentDB process runs the
-production-shape storage path: SlateDB-backed KV over an S3-
-compatible bucket (MinIO here).
+Single-node-by-default AgentDB + MinIO stack. The AgentDB process
+runs the production-shape storage path: SlateDB-backed KV over an
+S3-compatible bucket (MinIO here).
 
-## Why not multi-node?
+For local development the fastest path is
+`cargo run -p agentdb-server -- serve --dev` — zero config,
+ephemeral state, ready in seconds. This compose stack is for
+operators evaluating the production shape without provisioning
+real S3.
 
-The current architecture acquires a lease for every tablet
-(`0..AGENTDB_BOXES`) at boot. Two nodes pointing at the same meta
-store would race for tablet 0. Multi-node is blocked on the M20
-shard/tablet refactor — tracked in
-[`docs/superpowers/plans/2026-04-21-v2-design-implementation.md`](../../docs/superpowers/plans/2026-04-21-v2-design-implementation.md)
-§M20.
+## Multi-node
 
-For local development you usually want `agentdb serve --dev`
-directly; this compose example exists for operators evaluating the
-production shape without provisioning real S3.
+Multi-node has worked since the M20 shard/tablet refactor (PR
+trail under `docs/superpowers/plans/2026-04-21-v2-design-implementation.md`).
+To add a peer:
+
+1. Copy the `agentdb` service block in `docker-compose.yml`,
+   give the copy a unique `AGENTDB_NODE_ID` and `ports:` mapping,
+   and point both nodes at the same `AGENTDB_META_URL`
+   (Postgres) or share the bind-mounted SQLite file.
+2. The first node to win leader election seeds the tablets and
+   the placement loop spreads them round-robin across alive
+   nodes; the second reconciler picks up its share within
+   ~one tick (~3s).
+3. `docker compose exec agentdb agentdb cluster-status` confirms
+   both nodes are alive and tablets are spread.
 
 ## Bring up
 
@@ -53,13 +63,17 @@ open http://localhost:9001   # user minio / password minio123
 ## Drive some traffic
 
 ```bash
-# Mongo wire
+# Python SDK — recommended for application code
+pip install -e clients/python
+python examples/agents/python/quickstart.py
+
+# Mongo wire — works with any MongoDB driver
 mongosh "mongodb://localhost:7879" --eval '
   db.getSiblingDB("t-1").events.insertOne({session_id:"s-1",payload:"hello"});
   db.getSiblingDB("t-1").events.find({}).limit(5).toArray();
 '
 
-# REST
+# REST — easy from any HTTP client
 curl -s -XPOST http://localhost:7878/api/tenants/t-1/sessions/s-1/append_and_fetch \
   -H 'Content-Type: application/json' \
   -d '{"event":{"text":"from curl"}}' | jq

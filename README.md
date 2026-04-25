@@ -25,40 +25,59 @@ when you actually build them.
 
 ---
 
-## Quickstart
-
-The `agentdb` binary has a clap CLI with subcommands. `agentdb serve`
-runs the server; a handful of admin subcommands wrap the operator
-endpoints so you don't have to curl them manually.
+## Quickstart — your first agent in three commands
 
 ```bash
-# 1. Build once
-cargo build -p agentdb-server
+# 1. Start the server (zero config, ephemeral state)
+cargo run -p agentdb-server -- serve --dev
 
-# 2. Dev mode — ephemeral tempdirs, zero-config launch
-./target/debug/agentdb serve --dev
+# 2. In another shell, install the Python SDK
+pip install -e clients/python
+
+# 3. Run a sample agent loop
+python examples/agents/python/quickstart.py
 ```
 
-Dev mode uses a fresh temp directory for RocksDB + object store +
-meta SQLite; state doesn't persist across restart. Perfect for a
-first-time-user walkthrough and for local testing.
+You should see three turns of working memory grow, then a fork
+that branches the session. That's the canonical AgentDB shape:
+write one event, read the recent N back in the same round trip.
+
+The `serve --dev` startup banner prints listen addresses,
+dashboard URL, and a copy-pasteable `curl` so you can poke at
+the REST surface without reading further. Open
+<http://127.0.0.1:7878/dashboard> for the live operator view.
+
+### Five-line Python
+
+```python
+from agentdb import Client
+
+client = Client("http://127.0.0.1:7878")
+session = client.session("agent-1", tenant="demo")
+result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
+print("seq:", result.seq, [(e.seq, e.payload) for e in result.recent])
+```
+
+Full SDK reference: [`clients/python/README.md`](clients/python/README.md).
+Other languages (TypeScript, Go) are tracked as follow-ups; in
+the meantime any MongoDB driver speaks the wire port at
+`mongodb://127.0.0.1:7879`.
+
+### Operator subcommands
+
+Once the server is up, the same `agentdb` binary doubles as an
+admin CLI for the running process:
 
 ```bash
-# 3. In another shell — hit the admin endpoints through the CLI
-./target/debug/agentdb cluster-status     # leader + nodes + tablets in one call
-./target/debug/agentdb show-scheduler
-./target/debug/agentdb show-tablets
-./target/debug/agentdb show-nodes
+agentdb cluster-status     # leader + nodes + tablets in one call
+agentdb show-scheduler
+agentdb show-tablets
+agentdb show-nodes
 
-# 4. Or gracefully drain before shutdown
-./target/debug/agentdb drain
-# After a node is down (or drained), evict its row from the control plane:
-./target/debug/agentdb evict-node <node_id>
+agentdb drain              # graceful shutdown
+agentdb evict-node <node>  # remove a dead node from the control plane
 
-# 5. See what config the server would run with
-./target/debug/agentdb dump-config
-
-# 6. Dashboard at http://127.0.0.1:7878/dashboard
+agentdb dump-config        # what the server would run with
 ```
 
 For production-shaped config, run `agentdb serve` without `--dev`
@@ -88,10 +107,11 @@ docker compose up --build
 docker compose exec agentdb agentdb show-scheduler
 ```
 
-The compose stack is single-node — multi-node is blocked on the
-M20 shard/tablet refactor. Use `agentdb serve --dev` for local
-development; the compose stack is for operators evaluating the
-production storage path without provisioning real S3.
+Single-node by default; multi-node works since the M20 shard/
+tablet refactor (see the compose `README.md` for how to add a
+peer). Use `agentdb serve --dev` for the fastest local dev loop;
+the compose stack is for operators evaluating the production
+storage path without provisioning real S3.
 
 ### Prometheus metrics
 
