@@ -173,6 +173,14 @@ async fn run_loop(
     }
 }
 
+#[tracing::instrument(
+    name = "node_reaper.sweep_once",
+    skip(meta, marked_dead_total, gc_removed_total),
+    fields(
+        dead_after_ms = config.dead_after.as_millis() as i64,
+        gc_after_ms = config.gc_after.as_millis() as i64,
+    ),
+)]
 async fn sweep_once(
     meta: &MetaStore,
     now_ms: i64,
