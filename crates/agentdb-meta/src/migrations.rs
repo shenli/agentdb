@@ -73,6 +73,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/009_pg_notify_triggers.sql"),
         include_str!("../migrations/009_pg_notify_triggers.pg.sql"),
     ),
+    (
+        10,
+        "tablets.handoff_target_node_id for cooperative handoff",
+        include_str!("../migrations/010_tablet_handoff.sql"),
+        include_str!("../migrations/010_tablet_handoff.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

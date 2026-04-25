@@ -233,12 +233,16 @@ async fn failover_reassigns_dead_node_tablets_to_survivor() {
 }
 
 #[tokio::test]
-async fn rebalance_redistributes_when_a_node_joins_a_full_cluster() {
-    // Pre-state: node-a runs 4 tablets and is happily serving;
-    // node-b boots cold and registers in `nodes`. Today's
-    // active-rebalance pass takes 2 tablets back from a and
-    // hands them to b in the same sweep, then b's reconciler
-    // turns them into live boxes.
+async fn cooperative_rebalance_handshake_redistributes_to_new_node() {
+    // End-to-end exercise of the cooperative-handoff machinery:
+    //   1. Pre-state: node-a runs 4 tablets, node-b just joined.
+    //   2. Leader's placement sweep signals 2 handoffs on a.
+    //      Ownership in meta is unchanged at this point — a is
+    //      still serving every tablet.
+    //   3. a's TabletReconciler observes the signals, drops its
+    //      local boxes, and atomically transfers ownership.
+    //   4. b's TabletReconciler picks up the new ownership and
+    //      starts serving the moved tablets.
     let (_meta_file, meta) = fresh_meta().await;
     meta_nodes::upsert(meta.pool(), "a", "addr-a", None, "alive", 0)
         .await
@@ -252,6 +256,17 @@ async fn rebalance_redistributes_when_a_node_joins_a_full_cluster() {
             .await
             .unwrap();
     }
+
+    // Build both nodes' BoxRegistries. node-a's registry needs
+    // to have boxes for tablets 0..3 already running so the
+    // reconciler has something to remove during handoff. We
+    // add them via add_box after constructing an empty
+    // registry — same path the real boot uses.
+    let node_a = build_node(meta.clone(), "a").await;
+    for id in [0u16, 1, 2, 3] {
+        node_a.registry.add_box(id).await.unwrap();
+    }
+    assert_eq!(node_a.registry.num_boxes(), 4);
     let node_b = build_node(meta.clone(), "b").await;
     assert_eq!(node_b.registry.num_boxes(), 0);
 
@@ -259,6 +274,7 @@ async fn rebalance_redistributes_when_a_node_joins_a_full_cluster() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(leader.is_leader());
 
+    // Step 2: leader signals.
     let assigns = AtomicU64::new(0);
     let boots = AtomicU64::new(0);
     let rebals = AtomicU64::new(0);
@@ -276,21 +292,48 @@ async fn rebalance_redistributes_when_a_node_joins_a_full_cluster() {
     assert_eq!(
         rebals.load(Ordering::Acquire),
         2,
-        "two tablets should have been relinquished from a"
+        "two cooperative handoffs should have been signalled"
+    );
+    // Ownership unchanged — a still has all 4 tablets.
+    assert_eq!(
+        meta_tablets::list_owned_by(meta.pool(), "a")
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(node_a.registry.num_boxes(), 4);
+    assert_eq!(node_b.registry.num_boxes(), 0);
+
+    // Step 3: a's reconciler picks up the signals, drops the
+    // boxes, and completes the handoff.
+    let added_a = AtomicU64::new(0);
+    let errs_a = AtomicU64::new(0);
+    tablet_reconciler::reconcile_once(&node_a.registry, &added_a, &errs_a)
+        .await
+        .unwrap();
+    assert_eq!(
+        node_a.registry.num_boxes(),
+        2,
+        "a should have dropped 2 boxes during handoff"
+    );
+    assert_eq!(
+        meta_tablets::list_owned_by(meta.pool(), "b")
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "ownership should have transferred to b in meta"
     );
 
-    let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
-    let owned_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap();
-    assert_eq!(owned_a.len(), 2);
-    assert_eq!(owned_b.len(), 2);
-
-    // b's reconciler picks up the new assignments.
-    let added = AtomicU64::new(0);
-    let errs = AtomicU64::new(0);
-    tablet_reconciler::reconcile_once(&node_b.registry, &added, &errs)
+    // Step 4: b's reconciler activates the moved tablets.
+    let added_b = AtomicU64::new(0);
+    let errs_b = AtomicU64::new(0);
+    tablet_reconciler::reconcile_once(&node_b.registry, &added_b, &errs_b)
         .await
         .unwrap();
     assert_eq!(node_b.registry.num_boxes(), 2);
+    assert_eq!(added_b.load(Ordering::Acquire), 2);
 }
 
 #[tokio::test]

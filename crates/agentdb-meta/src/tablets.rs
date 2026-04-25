@@ -9,6 +9,13 @@ use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
+/// (tablet_id, owner_node_id, epoch, lease_expires_at_ms,
+/// created_at_ms, handoff_target_node_id) — the on-disk shape
+/// of every `tablets` SELECT in this module. Aliased so the
+/// `query_as` annotations don't have to spell the tuple six
+/// times (once per call site).
+type TabletRow = (i64, Option<String>, i64, i64, i64, Option<String>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tablet {
     pub tablet_id: i64,
@@ -16,6 +23,14 @@ pub struct Tablet {
     pub epoch: i64,
     pub lease_expires_at_ms: i64,
     pub created_at_ms: i64,
+    /// Set by the leader when it wants the current owner to
+    /// hand the tablet off cooperatively. Owner reads this
+    /// in its TabletReconciler, drains its in-process box,
+    /// then atomically transfers ownership via
+    /// `complete_handoff` (which clears this column).
+    /// Persisted across same-owner renewals so a slow
+    /// reconciler doesn't lose the leader's intent.
+    pub handoff_target_node_id: Option<String>,
 }
 
 /// Idempotent create: insert the tablet row if absent; do nothing if
@@ -37,19 +52,20 @@ pub async fn get_or_create(pool: &AnyPool, tablet_id: i64, now_ms: i64) -> MetaR
 }
 
 pub async fn get(pool: &AnyPool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
-    let row: Option<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+    let row: Option<TabletRow> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
          FROM tablets WHERE tablet_id = ?",
     )
     .bind(tablet_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, owner, epoch, lease, created)| Tablet {
+    Ok(row.map(|(id, owner, epoch, lease, created, handoff)| Tablet {
         tablet_id: id,
         owner_node_id: owner,
         epoch,
         lease_expires_at_ms: lease,
         created_at_ms: created,
+        handoff_target_node_id: handoff,
     }))
 }
 
@@ -214,8 +230,8 @@ pub async fn assign_to(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaRes
 /// per-node reconciler to discover tablets it should be running
 /// (see `agentdb_core::tablet_reconciler`).
 pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tablet>> {
-    let rows: Vec<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+    let rows: Vec<TabletRow> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
            FROM tablets WHERE owner_node_id = ? ORDER BY tablet_id",
     )
     .bind(node_id)
@@ -223,12 +239,13 @@ pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tabl
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, owner, epoch, lease, created)| Tablet {
+        .map(|(id, owner, epoch, lease, created, handoff)| Tablet {
             tablet_id: id,
             owner_node_id: owner,
             epoch,
             lease_expires_at_ms: lease,
             created_at_ms: created,
+            handoff_target_node_id: handoff,
         })
         .collect())
 }
@@ -238,22 +255,131 @@ pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tabl
 /// it. Used by `GET /api/admin/tablets` and by the scheduler when it
 /// needs a cluster-wide view of which tablets exist.
 pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Tablet>> {
-    let rows: Vec<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+    let rows: Vec<TabletRow> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
            FROM tablets ORDER BY tablet_id",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, owner, epoch, lease, created)| Tablet {
+        .map(|(id, owner, epoch, lease, created, handoff)| Tablet {
             tablet_id: id,
             owner_node_id: owner,
             epoch,
             lease_expires_at_ms: lease,
             created_at_ms: created,
+            handoff_target_node_id: handoff,
         })
         .collect())
+}
+
+/// Mark a still-owned tablet for cooperative handoff to
+/// `target_node_id`. Returns `true` when the row had its
+/// signal set (or already pointed at the same target — the
+/// call is idempotent), `false` when the tablet has no
+/// current owner (no point asking for a handoff) or the row
+/// is absent.
+///
+/// Pairs with `complete_handoff`: the source's
+/// `TabletReconciler` reads this column, drains, and calls
+/// the completion. Until completion, the row's `owner` and
+/// `epoch` stay put — the source is still serving writes
+/// for the tablet.
+pub async fn mark_for_handoff(
+    pool: &AnyPool,
+    tablet_id: i64,
+    target_node_id: &str,
+) -> MetaResult<bool> {
+    let rows = sqlx::query(
+        "UPDATE tablets \
+            SET handoff_target_node_id = ? \
+            WHERE tablet_id = ? AND owner_node_id IS NOT NULL",
+    )
+    .bind(target_node_id)
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Atomically transfer ownership from the current owner
+/// (`expected_source`) to whatever node id was previously
+/// recorded in `handoff_target_node_id`. Clears the handoff
+/// signal, zeros the lease, and bumps the epoch in one
+/// statement.
+///
+/// Returns `Some(new_owner)` on success and `None` when:
+///   * the row's owner was someone other than
+///     `expected_source` (a takeover happened mid-handoff);
+///   * the row had no `handoff_target_node_id` set (the
+///     leader cancelled, or this is just a stale read).
+///
+/// Called by the source's `TabletReconciler` after it has
+/// drained its in-process box.
+pub async fn complete_handoff(
+    pool: &AnyPool,
+    tablet_id: i64,
+    expected_source: &str,
+) -> MetaResult<Option<String>> {
+    // Read first so we can return the new owner. Then UPDATE
+    // with a stricter predicate so a concurrent admin DELETE
+    // or another node's `assume_ownership` doesn't get
+    // clobbered. Race-free under one transaction.
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT owner_node_id, handoff_target_node_id \
+            FROM tablets WHERE tablet_id = ?",
+    )
+    .bind(tablet_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((owner, target)) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let (Some(owner), Some(target)) = (owner, target) else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    if owner != expected_source {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let updated = sqlx::query(
+        "UPDATE tablets \
+            SET owner_node_id = ?, \
+                handoff_target_node_id = NULL, \
+                lease_expires_at_ms = 0, \
+                epoch = epoch + 1 \
+            WHERE tablet_id = ? AND owner_node_id = ? AND handoff_target_node_id = ?",
+    )
+    .bind(&target)
+    .bind(tablet_id)
+    .bind(&owner)
+    .bind(&target)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok((updated > 0).then_some(target))
+}
+
+/// Drop the handoff signal without changing ownership. Used
+/// by the leader to retract a previously-issued handoff
+/// (e.g., the original target died before the source
+/// completed).
+pub async fn cancel_handoff(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> {
+    let rows = sqlx::query(
+        "UPDATE tablets SET handoff_target_node_id = NULL \
+            WHERE tablet_id = ? AND handoff_target_node_id IS NOT NULL",
+    )
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 #[cfg(test)]
@@ -321,6 +447,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MetaError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn mark_for_handoff_only_acts_on_owned_rows() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        // Unowned → no-op.
+        assert!(!mark_for_handoff(&p, 7, "node-b").await.unwrap());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert!(t.handoff_target_node_id.is_none());
+        // Now claim and re-mark — should write.
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        assert!(mark_for_handoff(&p, 7, "node-b").await.unwrap());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.handoff_target_node_id.as_deref(), Some("node-b"));
+        // Owner and epoch are NOT touched — source is still
+        // serving writes for this tablet until it acknowledges.
+        assert_eq!(t.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(t.epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn complete_handoff_atomically_transfers_clears_signal_and_bumps_epoch() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        mark_for_handoff(&p, 7, "node-b").await.unwrap();
+
+        let new_owner = complete_handoff(&p, 7, "node-a").await.unwrap();
+        assert_eq!(new_owner.as_deref(), Some("node-b"));
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.owner_node_id.as_deref(), Some("node-b"));
+        assert!(t.handoff_target_node_id.is_none());
+        assert_eq!(t.lease_expires_at_ms, 0, "lease must be reset");
+        assert_eq!(t.epoch, 2, "epoch must advance so the source's lease is fenced");
+    }
+
+    #[tokio::test]
+    async fn complete_handoff_returns_none_when_source_does_not_match() {
+        // A takeover happened mid-handoff (e.g., source died,
+        // reaper cleared and a new node took over). The expected
+        // source no longer matches; complete_handoff must NOT
+        // overwrite the new ownership.
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assume_ownership(&p, 7, 0, "current-owner", 5_000)
+            .await
+            .unwrap();
+        mark_for_handoff(&p, 7, "node-b").await.unwrap();
+
+        let result = complete_handoff(&p, 7, "stale-owner").await.unwrap();
+        assert!(result.is_none());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(
+            t.owner_node_id.as_deref(),
+            Some("current-owner"),
+            "row must be untouched when expected_source mismatches"
+        );
+        assert_eq!(t.handoff_target_node_id.as_deref(), Some("node-b"));
+    }
+
+    #[tokio::test]
+    async fn complete_handoff_returns_none_when_no_signal_was_set() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        // No mark_for_handoff call.
+        let result = complete_handoff(&p, 7, "node-a").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_handoff_clears_signal_idempotently() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        mark_for_handoff(&p, 7, "node-b").await.unwrap();
+        assert!(cancel_handoff(&p, 7).await.unwrap());
+        // Owner stays put; only the signal goes away.
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.owner_node_id.as_deref(), Some("node-a"));
+        assert!(t.handoff_target_node_id.is_none());
+        // Second call is a no-op.
+        assert!(!cancel_handoff(&p, 7).await.unwrap());
     }
 
     #[tokio::test]

@@ -305,21 +305,26 @@ pub async fn sweep_once(
         return;
     }
 
-    // 3. Rebalance: relinquish from over-loaded alive nodes
-    // back to the unowned pool. Phase 4 picks them up.
+    // 3. Rebalance: signal cooperative handoff on tablets owned
+    // by over-loaded alive nodes. The source's TabletReconciler
+    // observes the signal, drops its in-process box, then
+    // atomically transfers ownership in meta. Until completion,
+    // the source keeps serving — there is no NULL-owner gap and
+    // no LeaseLost on in-flight writes. Phase 4 below only sees
+    // tablets the source has already finished handing off (or
+    // genuine failover orphans), so the rebalanced row reaches
+    // its target through `complete_handoff`, not assign-unowned.
     let mut tablets = tablets;
-    let relinquished = rebalance_pass(meta, &alive, &tablets).await;
-    if !relinquished.is_empty() {
-        rebalances_total.fetch_add(relinquished.len() as u64, Ordering::Release);
-        // Patch the in-memory snapshot so the assign loop sees
-        // the just-relinquished rows as unowned, instead of
-        // having to re-query meta.
-        for t in &mut tablets {
-            if relinquished.contains(&t.tablet_id) {
-                t.owner_node_id = None;
-                t.lease_expires_at_ms = 0;
-            }
-        }
+    let signals = rebalance_pass(meta, &alive, &tablets).await;
+    if !signals.is_empty() {
+        rebalances_total.fetch_add(signals.len() as u64, Ordering::Release);
+        // No snapshot mutation needed — phase 4 only acts on
+        // `owner_node_id IS NULL` rows, which our signalled
+        // tablets are NOT (their source is still the owner).
+        // When the source's reconciler completes the handoff,
+        // a future placement tick may need to act on whatever
+        // state results, but that's a separate sweep.
+        let _ = (&mut tablets, &signals);
     }
 
     // 4. Load-aware assign: every unowned tablet goes to the
@@ -394,29 +399,31 @@ pub async fn sweep_once(
     }
 }
 
-/// Active-rebalance pass. Returns the set of tablets that were
-/// relinquished — the caller updates its in-memory snapshot
-/// with that set so phase 4 sees them as unowned without a
-/// re-query.
+/// Active-rebalance pass via cooperative handoff. Returns the
+/// list of (tablet_id, picked_target) pairs the leader has now
+/// signalled. Ownership has NOT yet transferred — the source's
+/// `TabletReconciler` will pick up each signal, drop its local
+/// box, and call `complete_handoff` to atomically move
+/// ownership.
 ///
 /// Algorithm:
-/// 1. Count tablets per alive node. Tablets owned by a non-
-///    alive node (e.g., dead/leaving) are intentionally NOT
-///    counted toward any alive node — the failover path
-///    (StaleTabletReaper + assign-unowned) handles those.
-/// 2. Skip if `max_count - min_count <= 1`. The +1 is the
-///    unavoidable rounding when total isn't divisible by the
-///    number of alive nodes; treating it as imbalance would
-///    cause perpetual reshuffling between two equally
-///    "balanced" states.
+/// 1. Build per-alive-node load. Tablets owned by non-alive
+///    nodes don't count — those go through the failover path
+///    (StaleTabletReaper + assign-unowned).
+/// 2. Skip when `max - min <= 1` so the unavoidable +1 rounding
+///    doesn't cause perpetual reshuffling.
 /// 3. Compute `target = ceil(total_alive_owned / num_alive)`.
-///    Every alive node owning > target relinquishes the excess
-///    (smallest tablet ids first, for determinism).
+///    For every alive node owning more than `target`, pick the
+///    excess (highest tablet ids first — keep low ids stable
+///    for hot-cluster predictability) and signal a handoff to
+///    the currently-least-loaded peer (excluding self). The
+///    projected load updates per signal so the next-picked
+///    target also accounts for the in-flight handoff.
 async fn rebalance_pass(
     meta: &MetaStore,
     alive: &[&str],
     tablets: &[agentdb_meta::tablets::Tablet],
-) -> Vec<i64> {
+) -> Vec<(i64, String)> {
     use std::collections::HashMap;
 
     // Build per-alive-node ownership map. Owned-by-dead/leaving
@@ -451,57 +458,80 @@ async fn rebalance_pass(
         // Already balanced (within unavoidable rounding).
         return Vec::new();
     }
-    // ceil(total / num_alive)
-    let target = total_owned.div_ceil(num_alive);
+    let target_count = total_owned.div_ceil(num_alive);
 
-    let mut to_relinquish: Vec<i64> = Vec::new();
-    // Iterate alive nodes in stable order so the choice of
-    // which tablets to move is deterministic across runs.
-    let mut sorted_nodes: Vec<&&str> = owned_by_alive.keys().collect();
-    sorted_nodes.sort();
-    for node_id in sorted_nodes {
-        let mut owned = owned_by_alive.get(*node_id).cloned().unwrap_or_default();
-        if owned.len() <= target {
+    // Projected load: starts at the current count and updates
+    // as we issue handoff signals so that the next pick reflects
+    // the in-flight transfer.
+    let mut projected_load: HashMap<String, usize> = owned_by_alive
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.len()))
+        .collect();
+
+    let mut signals: Vec<(i64, String)> = Vec::new();
+    // Iterate sources in stable order for determinism.
+    let mut sorted_sources: Vec<&&str> = owned_by_alive.keys().collect();
+    sorted_sources.sort();
+    for source in sorted_sources {
+        let mut owned = owned_by_alive.get(*source).cloned().unwrap_or_default();
+        if owned.len() <= target_count {
             continue;
         }
         owned.sort();
-        let excess = owned.len() - target;
-        // Take the highest tablet ids — by convention bootstrap
-        // tablets cluster at the low end and applications tend
-        // to map "important" sessions to early shards via FNV.
-        // Releasing the high end first minimises hot-cluster
-        // disruption.
+        let excess = owned.len() - target_count;
         let drop_from = owned.len() - excess;
+        // Highest ids first — releasing late-allocated tablets
+        // tends to disturb the smallest fraction of hot
+        // sessions.
         for tid in &owned[drop_from..] {
-            to_relinquish.push(*tid);
+            // Pick the currently-least-loaded peer (by
+            // projected load, excluding the source itself).
+            let source_id: &str = source;
+            let picked_target = alive
+                .iter()
+                .filter(|n| **n != source_id)
+                .min_by(|a, b| {
+                    let la = projected_load.get(**a).copied().unwrap_or(0);
+                    let lb = projected_load.get(**b).copied().unwrap_or(0);
+                    la.cmp(&lb).then_with(|| a.cmp(b))
+                })
+                .map(|s| (*s).to_string());
+            let Some(picked) = picked_target else {
+                // Only one alive node — nothing to do (and the
+                // earlier max-min guard already skipped).
+                break;
+            };
+            match meta_tablets::mark_for_handoff(meta.pool(), *tid, &picked).await {
+                Ok(true) => {
+                    // Projected load: source loses one, target
+                    // gains one. Use this for the next pick.
+                    if let Some(c) = projected_load.get_mut(*source as &str) {
+                        *c = c.saturating_sub(1);
+                    }
+                    *projected_load.entry(picked.clone()).or_insert(0) += 1;
+                    signals.push((*tid, picked.clone()));
+                    tracing::info!(
+                        tablet_id = *tid,
+                        source = %source,
+                        target = %picked,
+                        "tablet placement: signalled cooperative handoff"
+                    );
+                }
+                Ok(false) => {
+                    // Source is no longer the owner (a takeover
+                    // happened mid-sweep) — skip silently.
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        tablet_id = *tid,
+                        "tablet placement: mark_for_handoff failed; will retry next tick"
+                    );
+                }
+            }
         }
     }
-
-    let mut actually_relinquished = Vec::with_capacity(to_relinquish.len());
-    for tid in to_relinquish {
-        match meta_tablets::relinquish(meta.pool(), tid).await {
-            Ok(true) => {
-                actually_relinquished.push(tid);
-                tracing::info!(
-                    tablet_id = tid,
-                    "tablet placement: relinquished tablet from over-loaded alive node"
-                );
-            }
-            Ok(false) => {
-                // Row was unowned by the time we got there —
-                // someone else relinquished or the row was
-                // deleted. Skip silently.
-            }
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    tablet_id = tid,
-                    "tablet placement: relinquish failed; will retry next tick"
-                );
-            }
-        }
-    }
-    actually_relinquished
+    signals
 }
 
 fn now_ms() -> i64 {
@@ -742,9 +772,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebalance_redistributes_when_a_new_node_joins_an_already_full_cluster() {
+    async fn rebalance_signals_handoff_then_completion_redistributes() {
         // Pre-state: node-a owns all 4 tablets, node-b just
-        // joined. After one sweep, both nodes should hold 2.
+        // joined. The leader's sweep should set handoff
+        // signals on 2 of a's tablets pointing at b. Ownership
+        // does not yet transfer — that happens when a's
+        // TabletReconciler calls complete_handoff. We simulate
+        // that step here directly to keep the test single-
+        // process.
         let meta = fresh_meta().await;
         seed_imbalanced(&meta, &["a", "b"], 4, "a").await;
         let assigns = Arc::new(AtomicU64::new(0));
@@ -756,23 +791,41 @@ mod tests {
         };
         sweep_once(&meta, cfg, &assigns, &boots, &rebals).await;
 
+        // Two signals issued; ownership unchanged.
+        assert_eq!(rebals.load(Ordering::Acquire), 2, "two handoff signals");
+        assert_eq!(assigns.load(Ordering::Acquire), 0);
         let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
         let owned_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap();
-        assert_eq!(owned_a.len(), 2, "a should retain 2 of 4 tablets");
-        assert_eq!(owned_b.len(), 2, "b should pick up the released 2");
-        assert_eq!(rebals.load(Ordering::Acquire), 2, "two relinquishes");
-        assert_eq!(assigns.load(Ordering::Acquire), 2, "two reassigns");
+        assert_eq!(owned_a.len(), 4, "ownership unchanged until source completes");
+        assert!(owned_b.is_empty());
+        let signalled: Vec<i64> = owned_a
+            .iter()
+            .filter(|t| t.handoff_target_node_id.as_deref() == Some("b"))
+            .map(|t| t.tablet_id)
+            .collect();
+        assert_eq!(signalled.len(), 2, "exactly two tablets carry the signal");
+        // High-ids first per the rebalance policy.
+        assert_eq!(signalled, vec![2, 3]);
 
-        // Epoch on the moved tablets must have advanced.
-        // (relinquish bumps once, assign_to writes nothing,
-        // and the receiving node's lease.acquire will bump
-        // again — but at this point in the test that hasn't
-        // happened yet, so we expect epoch=2: 1 from the
-        // original assume_ownership, +1 from relinquish.)
+        // Source completes the handoff.
+        for tid in &signalled {
+            let new_owner = meta_tablets::complete_handoff(meta.pool(), *tid, "a")
+                .await
+                .unwrap();
+            assert_eq!(new_owner.as_deref(), Some("b"));
+        }
+        let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
+        let owned_b = meta_tablets::list_owned_by(meta.pool(), "b").await.unwrap();
+        assert_eq!(owned_a.len(), 2);
+        assert_eq!(owned_b.len(), 2);
         for t in &owned_b {
+            assert!(
+                t.handoff_target_node_id.is_none(),
+                "completion clears the signal"
+            );
             assert_eq!(
                 t.epoch, 2,
-                "moved tablet's epoch should reflect relinquish"
+                "epoch advanced via complete_handoff (1 from claim + 1 from completion)"
             );
         }
     }
@@ -921,8 +974,10 @@ mod tests {
     #[tokio::test]
     async fn rebalance_distributes_extras_evenly_across_three_nodes() {
         // Pre-state: a owns 6, b/c just joined. target =
-        // ceil(6/3) = 2. a should release 4 tablets; b and c
-        // each pick up 2.
+        // ceil(6/3) = 2. a should signal 4 handoffs split
+        // across b and c (2 each, via projected-load
+        // tracking). After source completes them, each node
+        // owns 2.
         let meta = fresh_meta().await;
         seed_imbalanced(&meta, &["a", "b", "c"], 6, "a").await;
         let assigns = Arc::new(AtomicU64::new(0));
@@ -939,6 +994,31 @@ mod tests {
             &rebals,
         )
         .await;
+        assert_eq!(rebals.load(Ordering::Acquire), 4);
+
+        // Inspect signals: 2 should target b, 2 should target c.
+        let owned_a = meta_tablets::list_owned_by(meta.pool(), "a").await.unwrap();
+        assert_eq!(owned_a.len(), 6);
+        let signals: Vec<(i64, String)> = owned_a
+            .iter()
+            .filter_map(|t| {
+                t.handoff_target_node_id
+                    .as_ref()
+                    .map(|tg| (t.tablet_id, tg.clone()))
+            })
+            .collect();
+        assert_eq!(signals.len(), 4);
+        let signalled_to_b = signals.iter().filter(|(_, tg)| tg == "b").count();
+        let signalled_to_c = signals.iter().filter(|(_, tg)| tg == "c").count();
+        assert_eq!(signalled_to_b, 2);
+        assert_eq!(signalled_to_c, 2);
+
+        // Complete each handoff and check final distribution.
+        for (tid, _) in &signals {
+            meta_tablets::complete_handoff(meta.pool(), *tid, "a")
+                .await
+                .unwrap();
+        }
         let count_a = meta_tablets::list_owned_by(meta.pool(), "a")
             .await
             .unwrap()
@@ -955,6 +1035,5 @@ mod tests {
         assert_eq!(count_a, 2);
         assert_eq!(count_b, 2);
         assert_eq!(count_c, 2);
-        assert_eq!(rebals.load(Ordering::Acquire), 4);
     }
 }

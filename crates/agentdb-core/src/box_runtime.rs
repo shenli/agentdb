@@ -791,6 +791,29 @@ impl BoxRegistry {
         self.boxes.read().iter().any(|b| b.id == tablet_id)
     }
 
+    /// Drop a `Box_` from the registry. Returns `Some(arc)` of
+    /// the removed box (so the caller can drain or inspect
+    /// metrics) or `None` when no such box was running on this
+    /// process. Used by `TabletReconciler` during cooperative
+    /// handoff: once the leader signals "give up tablet 7,"
+    /// this is how the reconciler tears down the local
+    /// `Box_` + lease before atomically transferring ownership
+    /// in meta.
+    ///
+    /// Hot-path readers may hold a clone of the dropped
+    /// `Arc<Box_>` and continue to operate on it — that's
+    /// fine because the lease's `is_live()` check will start
+    /// failing as soon as `complete_handoff` bumps the epoch
+    /// (the local `LeaseManager` stops being able to renew).
+    /// Writes against a removed-but-still-clone'd box thus
+    /// fail fast with `LeaseLost` rather than silently
+    /// double-writing alongside the new owner.
+    pub fn remove_box(&self, tablet_id: BoxId) -> Option<Arc<Box_>> {
+        let mut boxes = self.boxes.write();
+        let pos = boxes.iter().position(|b| b.id == tablet_id)?;
+        Some(boxes.remove(pos))
+    }
+
     /// Owns the meta store this registry was built with, if any.
     /// `None` under the legacy `new*` paths used by tests.
     pub fn meta_store(&self) -> Option<Arc<agentdb_meta::MetaStore>> {
