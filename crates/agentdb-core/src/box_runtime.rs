@@ -86,13 +86,22 @@ impl std::fmt::Debug for RouteDecision {
 pub struct Box_ {
     pub id: BoxId,
     /// Per-tenant write lock. Keyed by the external tenant id.
-    /// Entries are created lazily on first acquire and retained for
-    /// the box's lifetime — LRU eviction is a follow-up PR. Two
-    /// callers targeting the same tenant share the `Arc<Mutex<()>>`
-    /// and serialize; two callers targeting different tenants get
-    /// distinct locks and proceed in parallel. Replaced the box-wide
-    /// `write_lock: Mutex<()>` that serialized every tenant.
+    /// Used solely as a **mint serialization** lock as of M26
+    /// Phase 2: the `get_or_mint` flow touches per-tenant
+    /// `next_session_id` state in the local KV, and concurrent
+    /// mints would race on that counter without it. Hot-path
+    /// appends do NOT take this lock — that's the
+    /// `session_locks` map below.
     tenant_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-session write lock. Keyed by external session id
+    /// (globally unique per the v2 contract / M26 Phase 1).
+    /// Held for the duration of an append + index update so
+    /// that two writes to the same session serialize, while
+    /// writes to different sessions of the same tenant (or
+    /// different tenants) proceed in parallel. Closes the
+    /// "one tenant's many sessions can't run concurrently"
+    /// bottleneck the 2026-04-24 design review flagged.
+    session_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     /// Bounded-concurrency admission gate. Complements the QPS
     /// token bucket (`admit`): token bucket controls sustained rate,
     /// semaphore controls instantaneous concurrency. Write-path
@@ -134,6 +143,7 @@ impl Box_ {
         Self {
             id,
             tenant_locks: RwLock::new(HashMap::new()),
+            session_locks: RwLock::new(HashMap::new()),
             admission: Arc::new(Semaphore::new(cap as usize)),
             admission_capacity: cap,
             indexes: tokio::sync::RwLock::new(None),
@@ -219,6 +229,30 @@ impl Box_ {
         map.entry(tenant_external.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Get (or lazily create) the write lock for
+    /// `session_external`. Two callers for the same session
+    /// share the `Arc<Mutex<()>>` and serialize; two callers
+    /// for different sessions get distinct locks. Replaces the
+    /// per-tenant lock as the hot-path write serialization
+    /// boundary (M26 Phase 2).
+    pub fn session_write_lock(&self, session_external: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.session_locks.read().get(session_external) {
+            return lock.clone();
+        }
+        let mut map = self.session_locks.write();
+        map.entry(session_external.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Snapshot of the number of session locks tracked. Cheap
+    /// read used by metrics + tests; the lock map grows
+    /// monotonically until the box is dropped (idle-cleanup is
+    /// follow-up work).
+    pub fn session_lock_count(&self) -> usize {
+        self.session_locks.read().len()
     }
 
     /// Lease manager for this box, if one was configured at registry

@@ -469,16 +469,47 @@ pub async fn append_and_fetch_with_actor(
             }
         }
     }
-    let guard = box_.tenant_write_lock(tenant_external).lock_owned().await;
+    // M26 Phase 2: two-phase locking.
+    //
+    // Phase 1 (mint): hold the tenant lock briefly while we
+    // get-or-mint the tenant + session. The mint flow touches
+    // per-tenant `next_session_id` state that two concurrent
+    // first-time mints would otherwise race on. Drop the lock
+    // immediately after.
     let kv = registry.kv().clone();
-    let tenant = tenants.get_or_mint(box_.id, tenant_external, now_millis)?;
-    let newly_minted = sessions
-        .lookup(box_.id, tenant.internal_id, session_external)?
-        .is_none();
-    let mut session =
-        sessions.get_or_mint(box_.id, tenant.internal_id, session_external, now_millis)?;
-    if newly_minted {
-        box_.metrics.bump_tier(session.tier);
+    let (tenant, mut session, newly_minted) = {
+        let _mint_guard = box_.tenant_write_lock(tenant_external).lock_owned().await;
+        let tenant = tenants.get_or_mint(box_.id, tenant_external, now_millis)?;
+        let already = sessions.lookup(box_.id, tenant.internal_id, session_external)?;
+        let newly_minted = already.is_none();
+        let session = sessions.get_or_mint(
+            box_.id,
+            tenant.internal_id,
+            session_external,
+            now_millis,
+        )?;
+        if newly_minted {
+            box_.metrics.bump_tier(session.tier);
+        }
+        (tenant, session, newly_minted)
+    };
+    // Phase 2 (write): per-session lock for the actual append +
+    // index update. Two writes to the same session serialize
+    // here, but writes to different sessions of the same tenant
+    // run concurrently — closing the bottleneck the design
+    // review flagged.
+    let guard = box_
+        .session_write_lock(session_external)
+        .lock_owned()
+        .await;
+    // Re-fetch the session under the session lock so we pick up
+    // any concurrent appender's `next_seq` advance. Without
+    // this, two appends on the same session that both pass
+    // through phase 1 then queue on phase 2 would each read the
+    // stale next_seq snapshotted in phase 1 and the second
+    // would silently overwrite the first's seq=N event.
+    if let Some(fresh) = sessions.lookup(box_.id, tenant.internal_id, session_external)? {
+        session = fresh;
     }
     // Allocate the HLC inside the session lock, just before `seq`, so that
     // (seq, hlc_ts) within one session is strictly monotonic. See
@@ -499,8 +530,8 @@ pub async fn append_and_fetch_with_actor(
         .record("hlc_physical_ns", hlc_ts.physical_ns);
     box_.metrics.record_append();
     // M16 Phase C: keep the live index current. Lock order is always
-    // `tenant_write_lock -> indexes.write` — this call obeys it
-    // because we still hold `guard` (the tenant lock) and
+    // `session_write_lock -> indexes.write` — this call obeys it
+    // because we still hold `guard` (the session lock) and
     // `Box_::index_event` takes only the indexes write lock internally.
     box_.index_event(
         &kv,

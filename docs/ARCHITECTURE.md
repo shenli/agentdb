@@ -53,9 +53,10 @@ serialized but different boxes run in parallel.
 `Box_` (`crates/agentdb-core/src/box_runtime.rs`) is the unit of
 physical isolation described in §3.5 of the design doc. Each box owns:
 
-- a **per-tenant lock map** (`tenant_locks`) so different tenants on
-  one box run in parallel while preserving ordering within each
-  tenant (M23; replaced the original single `write_lock` mutex)
+- a **per-session lock map** (`session_locks`) on the hot
+  path so different sessions of one tenant run in parallel
+  (M26 Phase 2; the prior per-tenant lock now narrowly
+  serializes only the get_or_mint flow)
 - an **admission semaphore** bounding in-flight writes to
   `AGENTDB_ADMISSION_CAPACITY` (default 64), complementing the QPS
   token bucket
@@ -913,15 +914,30 @@ alone, which is enough to keep one cold node from staying
 cold but doesn't react to non-uniform per-tablet load.
 Tablet-level load signals are the natural follow-up.
 
-### Per-tenant locking + admission semaphore (M23)
+### Per-session locking + admission semaphore
 
-`Box_::write_lock: Mutex<()>` (serializes every tenant) is gone.
-Replaced by:
+The 2026-04-24 design review flagged that even with the M23
+per-tenant lock map, one tenant's many concurrent sessions
+all serialized on the same lock — a structural bottleneck
+for agent workloads where a single tenant routinely drives
+hundreds of in-flight sessions. M26 Phase 2 splits that lock
+into two:
 
-- **Per-tenant lock map** (`tenant_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>`)
-  keyed by external tenant id. Different tenants on one box run in
-  parallel; a single tenant still serializes. Preserves the
-  mint-race invariant that the old single mutex provided.
+- **`tenant_locks`** (`RwLock<HashMap<String, Arc<Mutex<()>>>>`)
+  is now narrowly the **mint serialization** lock. The
+  `get_or_mint` flow advances per-tenant `next_session_id`
+  state in the local KV; two concurrent first-time mints
+  would race on that counter without it. Held only across
+  the get-or-mint phase of each write.
+- **`session_locks`** (same shape, keyed by external session
+  id) is the **hot-path write lock**. Held for the duration
+  of the append + index update. Two writes to the same
+  session serialize; writes to different sessions of the
+  same tenant proceed in parallel. The append flow is
+  two-phase: `tenant_locks → drop → session_locks`, with a
+  re-fetch of the session row under the session lock so
+  concurrent appenders that both passed phase 1 don't
+  overwrite each other's `next_seq`.
 - **Admission semaphore** (`tokio::sync::Semaphore`, cap via
   `AGENTDB_ADMISSION_CAPACITY`, default 64) bounding concurrent
   writes per box. Waits rather than rejects — complements the QPS
