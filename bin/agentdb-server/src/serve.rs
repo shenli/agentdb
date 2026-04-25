@@ -634,12 +634,19 @@ pub async fn run(
         "tablet reconciler loop started"
     );
 
-    // Initial synchronous pass: wait briefly for leader-
-    // election to converge, then if we won, run a placement
-    // sweep so the very next reconcile sees something to do.
-    // Both passes are short and avoid an extra round-trip on
-    // single-node `agentdb serve --dev`.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Initial synchronous pass: wait for leader-election to
+    // converge, then if we won, run a placement sweep so the
+    // very next reconcile sees something to do. In `--dev` we
+    // additionally block until at least one box has been
+    // claimed locally — otherwise the first request after the
+    // listener opens would hit `route_tenant` against an empty
+    // box list and panic. Multi-node followers serve traffic
+    // before owning local tablets (the leader is on another
+    // node), so the box-claim wait only kicks in for dev mode.
+    let leader_wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !election.is_leader() && std::time::Instant::now() < leader_wait_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if election.is_leader() {
         let assigns = std::sync::atomic::AtomicU64::new(0);
         let boots = std::sync::atomic::AtomicU64::new(0);
@@ -673,6 +680,31 @@ pub async fn run(
                 "initial reconcile pass complete"
             );
         }
+    }
+    // Dev-mode safety net: don't open listeners on an empty
+    // registry — the very first request would panic in
+    // `route_tenant`. Poll for up to 15s; if nothing converges,
+    // surface a clear error rather than a runtime panic.
+    if opts.dev && registry.num_boxes() == 0 {
+        let dev_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while registry.num_boxes() == 0 && std::time::Instant::now() < dev_deadline {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let added = std::sync::atomic::AtomicU64::new(0);
+            let errs = std::sync::atomic::AtomicU64::new(0);
+            let _ =
+                agentdb_core::tablet_reconciler::reconcile_once(&registry, &added, &errs).await;
+        }
+        if registry.num_boxes() == 0 {
+            anyhow::bail!(
+                "dev mode failed to claim any tablets within 15s; \
+                 leader election or placement is stuck. Check meta-store \
+                 connectivity and `RUST_LOG=debug` for details"
+            );
+        }
+        tracing::info!(
+            num_boxes = registry.num_boxes(),
+            "dev mode bootstrap complete"
+        );
     }
 
     // Drain-aware renewal loops, one per acquired box.
@@ -1224,6 +1256,15 @@ pub async fn run(
         mongo_tls = mongo_tls_cfg.is_some(),
         "agentdb listening"
     );
+    // Dev-mode welcome panel — printed once at startup so a
+    // first-time user sees the URLs, the auth posture, and a
+    // copy-pasteable curl that immediately works. Suppressed
+    // outside `--dev` because production operators see the
+    // same info via tracing/metrics and don't want banner spam
+    // in their journald.
+    if opts.dev {
+        print_dev_banner(&cfg, tls_cfg.is_some(), mongo_tls_cfg.is_some());
+    }
 
     let http_task = if let Some(rustls_cfg) = tls_cfg {
         // TLS path. axum_server owns its own listener, so we
@@ -1286,6 +1327,52 @@ pub async fn run(
         }
     };
     Ok(())
+}
+
+/// One-screen welcome panel printed when `--dev` is set. Lists
+/// the listen addresses, the dashboard, the auth posture, a
+/// copy-pasteable curl that immediately works, and pointers to
+/// the Python SDK + quickstart example. Newcomers see this and
+/// get to "round-trip an event" without reading docs first.
+fn print_dev_banner(cfg: &Resolved, rest_tls: bool, mongo_tls: bool) {
+    let rest_scheme = if rest_tls { "https" } else { "http" };
+    let rest_url = format!("{rest_scheme}://{}", cfg.http_addr);
+    let mongo_scheme = if mongo_tls { "mongodb+srv" } else { "mongodb" };
+    let mongo_url = format!("{mongo_scheme}://{}", cfg.mongo_addr);
+    let auth_required = std::env::var("AGENTDB_REQUIRE_AUTH")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let auth_line = if auth_required {
+        "enabled (set AGENTDB_REQUIRE_AUTH=false for fully open dev mode)"
+    } else {
+        "disabled (dev default — open to whoever can reach the listener)"
+    };
+    let bar = "─".repeat(64);
+    println!();
+    println!("{bar}");
+    println!("  AgentDB ready (dev mode)");
+    println!("{bar}");
+    println!("  REST       {rest_url}");
+    println!("  Dashboard  {rest_url}/dashboard");
+    println!("  Metrics    {rest_url}/metrics");
+    println!("  Mongo wire {mongo_url}");
+    println!();
+    println!("  Auth       {auth_line}");
+    println!("  Storage    ephemeral — state is wiped on restart");
+    println!();
+    println!("  Quickstart (one round trip):");
+    println!(
+        "    curl -X POST {rest_url}/api/tenants/demo/sessions/agent-1/append_and_fetch \\"
+    );
+    println!("         -H 'Content-Type: application/json' \\");
+    println!(
+        "         -d '{{\"event\":{{\"role\":\"user\",\"text\":\"hello\"}},\"fetch_last_n\":5}}'"
+    );
+    println!();
+    println!("  Python SDK:  pip install -e clients/python");
+    println!("  Example:     python examples/agents/python/quickstart.py");
+    println!("{bar}");
+    println!();
 }
 
 /// Wait for SIGTERM or SIGINT and return the signal name.
