@@ -151,6 +151,56 @@ pub async fn clear_expired_ownership(
     Ok(ids)
 }
 
+/// Pre-claim an unowned tablet for `node_id` without granting a
+/// lease. Returns `true` when the row was assigned by this call,
+/// `false` when it was already owned (by anyone — including us)
+/// and the call was a no-op.
+///
+/// This is the placement primitive used by `TabletPlacement` on
+/// the scheduler leader. It deliberately does **not** bump the
+/// epoch — the receiving node will bump it when it acquires its
+/// lease via `assume_ownership`. Until then the row is "promised
+/// to" but not "owned by" the target node, with
+/// `lease_expires_at_ms` left untouched (typically 0). Callers
+/// that route via `LocationProxy` must therefore continue to
+/// treat `lease_expires_at_ms < now` as "not authoritatively
+/// owned".
+pub async fn assign_to(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult<bool> {
+    let rows = sqlx::query(
+        "UPDATE tablets SET owner_node_id = ? \
+           WHERE tablet_id = ? AND owner_node_id IS NULL",
+    )
+    .bind(node_id)
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Every tablet currently owned by `node_id`. Used by the
+/// per-node reconciler to discover tablets it should be running
+/// (see `agentdb_core::tablet_reconciler`).
+pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tablet>> {
+    let rows: Vec<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms
+           FROM tablets WHERE owner_node_id = ? ORDER BY tablet_id",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, owner, epoch, lease, created)| Tablet {
+            tablet_id: id,
+            owner_node_id: owner,
+            epoch,
+            lease_expires_at_ms: lease,
+            created_at_ms: created,
+        })
+        .collect())
+}
+
 /// Every tablet row, ordered by `tablet_id`. Point-in-time snapshot —
 /// ownership can change between this return and the caller acting on
 /// it. Used by `GET /api/admin/tablets` and by the scheduler when it
@@ -239,6 +289,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MetaError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn assign_to_claims_unowned_only() {
+        let p = pool().await;
+        get_or_create(&p, 1, 100).await.unwrap();
+        get_or_create(&p, 2, 100).await.unwrap();
+        // Tablet 1 is unowned → assign succeeds.
+        assert!(assign_to(&p, 1, "node-a").await.unwrap());
+        let t1 = get(&p, 1).await.unwrap().unwrap();
+        assert_eq!(t1.owner_node_id.as_deref(), Some("node-a"));
+        // Epoch and lease must NOT change — the row is "promised
+        // to" node-a, not "owned by" node-a until it acquires.
+        assert_eq!(t1.epoch, 0);
+        assert_eq!(t1.lease_expires_at_ms, 0);
+        // Already-owned tablet → no-op.
+        assume_ownership(&p, 2, 0, "node-b", 5_000).await.unwrap();
+        assert!(!assign_to(&p, 2, "node-c").await.unwrap());
+        let t2 = get(&p, 2).await.unwrap().unwrap();
+        assert_eq!(t2.owner_node_id.as_deref(), Some("node-b"));
+    }
+
+    #[tokio::test]
+    async fn assign_to_unknown_tablet_is_a_noop() {
+        // Predicate doesn't match → 0 rows affected → false.
+        // Idempotent: useful when callers list candidates and a
+        // race deleted the row between list and assign.
+        let p = pool().await;
+        assert!(!assign_to(&p, 999, "node-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_owned_by_filters_to_one_node() {
+        let p = pool().await;
+        for id in [1, 2, 3, 4] {
+            get_or_create(&p, id, 100).await.unwrap();
+        }
+        assume_ownership(&p, 1, 0, "node-a", 500).await.unwrap();
+        assume_ownership(&p, 3, 0, "node-a", 500).await.unwrap();
+        assume_ownership(&p, 2, 0, "node-b", 500).await.unwrap();
+        // Tablet 4 stays unowned.
+
+        let mine = list_owned_by(&p, "node-a").await.unwrap();
+        let ids: Vec<_> = mine.iter().map(|t| t.tablet_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+
+        let theirs = list_owned_by(&p, "node-b").await.unwrap();
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].tablet_id, 2);
+
+        let none = list_owned_by(&p, "ghost").await.unwrap();
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

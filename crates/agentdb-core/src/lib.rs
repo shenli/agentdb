@@ -22,6 +22,8 @@ pub(crate) mod meta;
 pub mod metrics;
 pub mod node_reaper;
 pub mod planner;
+pub mod tablet_placement;
+pub mod tablet_reconciler;
 pub mod primitives;
 pub mod rate_window;
 pub mod read_ctx;
@@ -68,6 +70,8 @@ pub use lease::{LeaseConfig, LeaseManager, LeaseRenewalJob};
 pub use lifecycle::{LifecycleConfig, LifecycleEngine};
 pub use metrics::{BoxMetrics, GaugeSnapshot, MetricsSnapshot};
 pub use node_reaper::{NodeReaper, NodeReaperConfig};
+pub use tablet_placement::{PlacementConfig, TabletPlacement};
+pub use tablet_reconciler::{ReconcilerConfig, TabletReconciler};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
 pub use primitives::{
     append_and_fetch, append_and_fetch_with_actor, append_event, fetch_last_n, fetch_last_n_merged,
