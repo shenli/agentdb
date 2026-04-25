@@ -90,6 +90,9 @@ async fn first_append_populates_session_locator() {
         .expect("locator row written on first append");
     assert_eq!(locator.session_id, "s-mint");
     assert!(locator.tablet_id.is_some());
+    // M26 Phase 1b: external tenant id is the authoritative
+    // identity recorded on the locator.
+    assert_eq!(locator.tenant_external_id.as_deref(), Some("tenant-a"));
     // Shard id should be FNV("s-mint") % SHARD_COUNT — recompute
     // to confirm the helper used the same hash.
     assert_eq!(
@@ -183,6 +186,7 @@ async fn fork_then_explicit_populate_writes_child_locator() {
         env.meta.as_ref(),
         &child.external_id,
         tenant.internal_id,
+        "tenant-a",
         box_.id,
         200,
     )

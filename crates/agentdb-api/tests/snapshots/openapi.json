@@ -1606,7 +1606,7 @@
             }
           },
           "400": {
-            "description": "Malformed request",
+            "description": "Malformed request, missing tenant resolution, or body/locator mismatch",
             "content": {
               "application/json": {
                 "schema": {
@@ -2426,8 +2426,8 @@
       },
       "ForkRequest": {
         "type": "object",
+        "description": "Body shape for `POST /api/sessions/{session_id}/fork`.\n\n`tenant_id` is **deprecated** as of M26 Phase 1b. The\ncanonical resolution path is now:\n\n1. `session_locators::get(parent_session_id)` returns the\n   parent's `tenant_internal_id`.\n2. `tenants::get_by_internal` recovers the external string\n   used by the per-box `TenantRegistry` and `tenant_write_lock`.\n\nBody `tenant_id` is honored when supplied, both for\nbackward compatibility (clients written against the\npre-locator API) and to recover from the rare bootstrap\ncase where a session minted before the locator table existed\ngets forked. If the body and the locator disagree the\nhandler returns 400 — silently overruling the client would\nhide configuration drift.",
         "required": [
-          "tenant_id",
           "new_session_id"
         ],
         "properties": {
@@ -2435,7 +2435,11 @@
             "type": "string"
           },
           "tenant_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deprecated as of M26 Phase 1b. When omitted, the tenant\nis derived from the parent session's locator. Supply\nonly for backward compat with pre-M26 clients."
           }
         }
       },

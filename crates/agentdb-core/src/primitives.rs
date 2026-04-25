@@ -25,6 +25,7 @@ pub async fn populate_session_locator(
     meta: &agentdb_meta::MetaStore,
     session_external: &str,
     tenant_internal_id: u64,
+    tenant_external_id: &str,
     tablet_id: u16,
     now_millis: u64,
 ) {
@@ -37,6 +38,7 @@ pub async fn populate_session_locator(
         meta.pool(),
         session_external,
         tenant_internal_id as i64,
+        tenant_external_id,
         Some(tablet_id as i64),
         shard_id,
         now_millis as i64,
@@ -522,6 +524,7 @@ pub async fn append_and_fetch_with_actor(
                 meta.as_ref(),
                 session_external,
                 tenant.internal_id,
+                tenant_external,
                 box_.id,
                 now_millis,
             )

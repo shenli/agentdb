@@ -796,12 +796,20 @@ that:
 ```
 session_locators(
   session_id          PRIMARY KEY,    -- the globally-unique external id
-  tenant_internal_id,                 -- which tenant owns it (resolved at mint)
+  tenant_external_id,                 -- auth-bound tenant identity (M26 Phase 1b)
+  tenant_internal_id,                 -- per-process registry id (informational)
   tablet_id,                          -- where it currently lives (NULL = unplaced)
   shard_id,                           -- denormalised FNV(session_id) % SHARD_COUNT
   created_at_ms
 )
 ```
+
+`tenant_external_id` is the authoritative tenant identity used
+by `fork`'s tenant-resolution path; `tenant_internal_id` is
+preserved for diagnostics but is **not** globally meaningful
+(it's the per-process `TenantRegistry`'s local id, which is
+NOT cross-cluster stable until the tenant table itself becomes
+the source of truth in a later milestone).
 
 Populated by `agentdb_core::primitives::populate_session_locator`
 on every newly-minted session: REST `append_and_fetch`,

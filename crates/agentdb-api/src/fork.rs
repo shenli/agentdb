@@ -14,9 +14,30 @@ use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::stream::StreamEvent;
 use crate::AppState;
 
+/// Body shape for `POST /api/sessions/{session_id}/fork`.
+///
+/// `tenant_id` is **deprecated** as of M26 Phase 1b. The
+/// canonical resolution path is now:
+///
+/// 1. `session_locators::get(parent_session_id)` returns the
+///    parent's `tenant_internal_id`.
+/// 2. `tenants::get_by_internal` recovers the external string
+///    used by the per-box `TenantRegistry` and `tenant_write_lock`.
+///
+/// Body `tenant_id` is honored when supplied, both for
+/// backward compatibility (clients written against the
+/// pre-locator API) and to recover from the rare bootstrap
+/// case where a session minted before the locator table existed
+/// gets forked. If the body and the locator disagree the
+/// handler returns 400 — silently overruling the client would
+/// hide configuration drift.
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ForkRequest {
-    pub tenant_id: String,
+    /// Deprecated as of M26 Phase 1b. When omitted, the tenant
+    /// is derived from the parent session's locator. Supply
+    /// only for backward compat with pre-M26 clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     pub new_session_id: String,
 }
 
@@ -35,7 +56,7 @@ pub struct ForkResponse {
     request_body = ForkRequest,
     responses(
         (status = 200, description = "Child session created", body = ForkResponse),
-        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 400, description = "Malformed request, missing tenant resolution, or body/locator mismatch", body = ErrorResponse),
         (status = 404, description = "Parent tenant/session not found", body = ErrorResponse),
         (status = 421, description = "Routing drift on a forwarded request"),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
@@ -47,10 +68,6 @@ pub async fn fork_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Decode the body early so we can pull tenant_id for
-    // routing. The decoded struct isn't used on the forward
-    // path, only on local — but we need the tenant_id to
-    // decide where to route.
     let parsed: ForkRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -62,9 +79,23 @@ pub async fn fork_handler(
         }
     };
 
+    // Resolve the effective tenant. Locator first; body
+    // second (back-compat); error if neither path produces a
+    // tenant id.
+    let tenant_id = match resolve_fork_tenant(
+        &state,
+        &parent_session_id,
+        parsed.tenant_id.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
     let decision = state
         .registry
-        .route_session_for_io(&parsed.tenant_id, &parent_session_id);
+        .route_session_for_io(&tenant_id, &parent_session_id);
     let already_forwarded = headers.contains_key(FORWARDED_HEADER);
 
     if let agentdb_core::RouteDecision::Remote { target, tablet_id } = &decision {
@@ -105,13 +136,13 @@ pub async fn fork_handler(
         agentdb_core::RouteDecision::Local(b) => b,
         agentdb_core::RouteDecision::Remote { .. } => unreachable!(),
     };
-    let guard = box_.tenant_write_lock(&parsed.tenant_id).lock_owned().await;
+    let guard = box_.tenant_write_lock(&tenant_id).lock_owned().await;
     let child = match fork_session(
         &state.registry,
         &state.tenants,
         &state.sessions,
         &guard,
-        &parsed.tenant_id,
+        &tenant_id,
         &parent_session_id,
         &parsed.new_session_id,
         now_millis(),
@@ -126,7 +157,7 @@ pub async fn fork_handler(
                 ts_ms: crate::stream::now_ms(),
                 box_id,
                 kind: scope.as_str().to_string(),
-                tenant: Some(parsed.tenant_id.clone()),
+                tenant: Some(tenant_id.clone()),
             });
             return ApiError::Core(agentdb_core::Error::TooManyRequests {
                 scope,
@@ -143,14 +174,12 @@ pub async fn fork_handler(
     // only side effect, so no harm if the locator already
     // exists from a prior partial-failure retry.
     if let Some(meta) = state.registry.meta_store() {
-        // Resolve the tenant_internal_id we just used inside
-        // fork_session — re-querying tenants is fine (cheap KV
-        // read) and avoids leaking the value out of the lock.
-        if let Ok(Some(tenant)) = state.tenants.lookup(box_.id, &parsed.tenant_id) {
+        if let Ok(Some(tenant)) = state.tenants.lookup(box_.id, &tenant_id) {
             agentdb_core::primitives::populate_session_locator(
                 meta.as_ref(),
                 &child.external_id,
                 tenant.internal_id,
+                &tenant_id,
                 box_.id,
                 now_millis(),
             )
@@ -172,6 +201,63 @@ pub async fn fork_handler(
         parent_seq_at_fork: fork.parent_seq_at_fork,
     })
     .into_response()
+}
+
+/// Resolve the effective tenant for a fork request.
+///
+/// Source priority:
+/// 1. **Session locator** (M26 path). One meta query against
+///    `session_locators` keyed by parent_session_id; on hit,
+///    one more against `tenants` to recover the external id.
+/// 2. **Request body** (legacy / back-compat). Used when the
+///    locator is absent (the parent was minted pre-M26) or
+///    when no MetaStore is wired (legacy single-process tests).
+///
+/// When both supply a tenant and they disagree, return 400 —
+/// silently overruling the client would mask drift between
+/// the locator and a stale client config.
+async fn resolve_fork_tenant(
+    state: &AppState,
+    parent_session_id: &str,
+    body_tenant: Option<&str>,
+) -> Result<String, Response> {
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), parent_session_id)
+            .await
+        {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return Err(ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response());
+            }
+        },
+        None => None,
+    };
+    match (locator_tenant, body_tenant) {
+        (Some(locator), Some(body)) if locator != body => Err(ApiError::Core(
+            agentdb_core::Error::Invalid {
+                field: Some("tenant_id".into()),
+                message: format!(
+                    "request tenant_id '{body}' disagrees with parent session's locator (tenant '{locator}'); \
+                     either omit tenant_id or update the client"
+                ),
+            },
+        )
+        .into_response()),
+        (Some(locator), _) => Ok(locator),
+        (None, Some(body)) => Ok(body.to_string()),
+        (None, None) => Err(ApiError::Core(agentdb_core::Error::Invalid {
+            field: Some("tenant_id".into()),
+            message: "tenant_id is required when the parent session has no locator (pre-M26 \
+                      session); omit it once the parent has been touched on M26 or later"
+                .into(),
+        })
+        .into_response()),
+    }
 }
 
 fn now_millis() -> u64 {

@@ -22,14 +22,24 @@ use sqlx::AnyPool;
 use crate::error::MetaResult;
 
 /// (session_id, tenant_internal_id, tablet_id, shard_id,
-/// created_at_ms). Aliased so the `query_as` annotations don't
-/// have to spell the tuple at every call site.
-type LocatorRow = (String, i64, Option<i64>, i32, i64);
+/// created_at_ms, tenant_external_id). Aliased so the
+/// `query_as` annotations don't have to spell the tuple at
+/// every call site.
+type LocatorRow = (String, i64, Option<i64>, i32, i64, Option<String>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLocator {
     pub session_id: String,
+    /// **Informational only as of migration 012.** This is the
+    /// per-process `TenantRegistry`'s local id and not
+    /// guaranteed to be globally meaningful. Use
+    /// `tenant_external_id` for routing and auth.
     pub tenant_internal_id: i64,
+    /// Globally-unique external tenant identity. Added by
+    /// migration 012 (M26 Phase 1b) and populated on mint
+    /// going forward; older rows have `None` and callers
+    /// should fall back to body-supplied `tenant_id` for those.
+    pub tenant_external_id: Option<String>,
     /// `None` when the session is registered before its
     /// hosting tablet is recorded (rare; typically only during
     /// migration). Routing must fall back to tenant-hash when
@@ -57,17 +67,19 @@ pub async fn upsert(
     pool: &AnyPool,
     session_id: &str,
     tenant_internal_id: i64,
+    tenant_external_id: &str,
     tablet_id: Option<i64>,
     shard_id: i32,
     created_at_ms: i64,
 ) -> MetaResult<bool> {
     let rows = sqlx::query(
         "INSERT OR IGNORE INTO session_locators \
-            (session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms) \
-            VALUES (?, ?, ?, ?, ?)",
+            (session_id, tenant_internal_id, tenant_external_id, tablet_id, shard_id, created_at_ms) \
+            VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id)
     .bind(tenant_internal_id)
+    .bind(tenant_external_id)
     .bind(tablet_id)
     .bind(shard_id)
     .bind(created_at_ms)
@@ -83,7 +95,7 @@ pub async fn upsert(
 /// pre-locator path.
 pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionLocator>> {
     let row: Option<LocatorRow> = sqlx::query_as(
-        "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms \
+        "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
             FROM session_locators WHERE session_id = ?",
     )
     .bind(session_id)
@@ -145,7 +157,7 @@ pub async fn list_by_tenant(
     let limit = limit.max(1);
     let rows: Vec<LocatorRow> = match after_session_id {
         Some(after) => sqlx::query_as(
-            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms \
+            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
                 WHERE tenant_internal_id = ? AND session_id > ? \
                 ORDER BY session_id ASC \
@@ -157,7 +169,7 @@ pub async fn list_by_tenant(
         .fetch_all(pool)
         .await?,
         None => sqlx::query_as(
-            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms \
+            "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
                 WHERE tenant_internal_id = ? \
                 ORDER BY session_id ASC \
@@ -172,10 +184,18 @@ pub async fn list_by_tenant(
 }
 
 fn into_locator(row: LocatorRow) -> SessionLocator {
-    let (session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms) = row;
+    let (
+        session_id,
+        tenant_internal_id,
+        tablet_id,
+        shard_id,
+        created_at_ms,
+        tenant_external_id,
+    ) = row;
     SessionLocator {
         session_id,
         tenant_internal_id,
+        tenant_external_id,
         tablet_id,
         shard_id,
         created_at_ms,
@@ -193,10 +213,11 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_get_round_trips() {
         let p = pool().await;
-        assert!(upsert(&p, "s-1", 7, Some(3), 42, 1_000).await.unwrap());
+        assert!(upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap());
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.session_id, "s-1");
         assert_eq!(l.tenant_internal_id, 7);
+        assert_eq!(l.tenant_external_id.as_deref(), Some("tenant-7"));
         assert_eq!(l.tablet_id, Some(3));
         assert_eq!(l.shard_id, 42);
         assert_eq!(l.created_at_ms, 1_000);
@@ -205,14 +226,14 @@ mod tests {
     #[tokio::test]
     async fn upsert_is_idempotent_and_does_not_overwrite_tablet_id() {
         let p = pool().await;
-        upsert(&p, "s-1", 7, Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
         // Simulate a handoff completion having moved this
         // session: tablet 3 → tablet 9 via update_tablet.
         update_tablet(&p, "s-1", 9).await.unwrap();
         // A subsequent populate-on-write must NOT clobber the
         // updated tablet_id. The old code's "first call wins"
         // semantics is what keeps the locator authoritative.
-        let inserted = upsert(&p, "s-1", 7, Some(3), 42, 2_000).await.unwrap();
+        let inserted = upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 2_000).await.unwrap();
         assert!(!inserted, "second upsert returns false — row already present");
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.tablet_id, Some(9), "update_tablet wins over re-upsert");
@@ -225,7 +246,7 @@ mod tests {
         // hosting tablet isn't yet known. Must round-trip
         // None and not violate any constraint.
         let p = pool().await;
-        upsert(&p, "s-pending", 1, None, 0, 100).await.unwrap();
+        upsert(&p, "s-pending", 1, "tenant-1", None, 0, 100).await.unwrap();
         let l = get(&p, "s-pending").await.unwrap().unwrap();
         assert!(l.tablet_id.is_none());
     }
@@ -236,7 +257,7 @@ mod tests {
         // Unknown session id → false.
         assert!(!update_tablet(&p, "s-ghost", 9).await.unwrap());
         // Known session → true.
-        upsert(&p, "s-1", 7, Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
         assert!(update_tablet(&p, "s-1", 9).await.unwrap());
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.tablet_id, Some(9));
@@ -246,7 +267,7 @@ mod tests {
     async fn delete_reports_whether_row_existed() {
         let p = pool().await;
         assert!(!delete(&p, "s-ghost").await.unwrap());
-        upsert(&p, "s-1", 7, Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
         assert!(delete(&p, "s-1").await.unwrap());
         assert!(get(&p, "s-1").await.unwrap().is_none());
         // Idempotent second delete.
@@ -256,11 +277,11 @@ mod tests {
     #[tokio::test]
     async fn list_by_tenant_returns_locators_ordered_by_id() {
         let p = pool().await;
-        upsert(&p, "s-c", 1, Some(0), 0, 0).await.unwrap();
-        upsert(&p, "s-a", 1, Some(0), 0, 0).await.unwrap();
-        upsert(&p, "s-b", 1, Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-c", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-a", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-b", 1, "t-1", Some(0), 0, 0).await.unwrap();
         // Different tenant — must NOT show up.
-        upsert(&p, "s-other", 2, Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0).await.unwrap();
 
         let mine = list_by_tenant(&p, 1, None, 100).await.unwrap();
         let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
@@ -271,7 +292,7 @@ mod tests {
     async fn list_by_tenant_paginates_via_after_cursor() {
         let p = pool().await;
         for id in ["s-a", "s-b", "s-c", "s-d"] {
-            upsert(&p, id, 1, Some(0), 0, 0).await.unwrap();
+            upsert(&p, id, 1, "t-1", Some(0), 0, 0).await.unwrap();
         }
         let page1 = list_by_tenant(&p, 1, None, 2).await.unwrap();
         assert_eq!(page1.len(), 2);

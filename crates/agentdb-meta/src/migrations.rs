@@ -85,6 +85,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/011_session_locators.sql"),
         include_str!("../migrations/011_session_locators.pg.sql"),
     ),
+    (
+        12,
+        "session_locators.tenant_external_id (M26 Phase 1b: skip the internal-id round-trip)",
+        include_str!("../migrations/012_session_locator_external_tenant.sql"),
+        include_str!("../migrations/012_session_locator_external_tenant.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
