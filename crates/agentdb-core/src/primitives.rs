@@ -12,6 +12,45 @@ use crate::types::{Event, Session, Tier};
 /// Default branch id for sessions that have never been forked. Fork arrives in M6.
 pub const DEFAULT_BRANCH_ID: u32 = 0;
 
+/// M26 Phase 1: populate the canonical session locator on
+/// session creation. Idempotent — repeat calls for the same
+/// session id are no-ops.
+///
+/// Errors are logged and swallowed: a transient meta hiccup
+/// must not block a write that already succeeded against the
+/// data plane. The locator can be backfilled lazily on the
+/// next append for the same session, since `INSERT OR IGNORE`
+/// makes that safe.
+pub async fn populate_session_locator(
+    meta: &agentdb_meta::MetaStore,
+    session_external: &str,
+    tenant_internal_id: u64,
+    tablet_id: u16,
+    now_millis: u64,
+) {
+    // Shard id is FNV(session_external) mod SHARD_COUNT — the
+    // same hash the LocationProxy uses on the routing path so
+    // the recorded shard slot matches what the rest of the
+    // system would derive from session_external alone.
+    let shard_id = crate::shard::shard_id(session_external) as i32;
+    let result = agentdb_meta::session_locators::upsert(
+        meta.pool(),
+        session_external,
+        tenant_internal_id as i64,
+        Some(tablet_id as i64),
+        shard_id,
+        now_millis as i64,
+    )
+    .await;
+    if let Err(err) = result {
+        tracing::warn!(
+            %err,
+            session_external,
+            "session_locator upsert failed; will backfill on next mint attempt"
+        );
+    }
+}
+
 /// Append one event to a session, atomically bumping its `next_seq` and
 /// `last_active_at`. Must be called while holding the tenant's write
 /// lock (demonstrated by the OwnedMutexGuard reference).
@@ -471,6 +510,24 @@ pub async fn append_and_fetch_with_actor(
     )
     .await?;
     drop(guard);
+    // M26 Phase 1: populate the canonical session locator
+    // outside the tenant write lock. Idempotent upsert — only
+    // the first write per session id actually inserts, so this
+    // is cheap on repeat traffic to the same session. Scoped to
+    // newly-minted sessions to keep meta write rate proportional
+    // to mint rate, not append rate.
+    if newly_minted {
+        if let Some(meta) = registry.meta_store() {
+            populate_session_locator(
+                meta.as_ref(),
+                session_external,
+                tenant.internal_id,
+                box_.id,
+                now_millis,
+            )
+            .await;
+        }
+    }
     // M9: read through a freshly opened ReadCtx so fetch sees a consistent
     // snapshot including the write we just committed. The snapshot opens
     // AFTER the box write lock is dropped, so RocksDB picks up our batch.

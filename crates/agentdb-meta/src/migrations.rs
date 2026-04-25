@@ -79,6 +79,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/010_tablet_handoff.sql"),
         include_str!("../migrations/010_tablet_handoff.pg.sql"),
     ),
+    (
+        11,
+        "session_locators (M26 Phase 1: session-centric identity)",
+        include_str!("../migrations/011_session_locators.sql"),
+        include_str!("../migrations/011_session_locators.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
