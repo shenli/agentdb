@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentdb_core::{LeaderElection, NodeReaper, StaleTabletReaper};
+use agentdb_core::{LeaderElection, NodeReaper, StaleTabletReaper, TabletPlacement};
 use agentdb_meta::{scheduler as meta_scheduler, MetaStore};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -64,6 +64,17 @@ pub struct SchedulerStatus {
     /// Total long-dead node rows this process has GC'd from the
     /// meta table as leader.
     pub nodes_gc_removed_total: u64,
+    /// Total tablet placements made by this process while
+    /// leader (`owner_node_id` NULL → some alive node). Same
+    /// leader-gated semantics; followers report 0.
+    pub tablet_placements_total: u64,
+    /// Total tablets relinquished by this process during the
+    /// active-rebalance pass. Each relinquish causes a brief
+    /// data-path disruption on the source node, so this
+    /// counter doubles as an SLO signal: a leader inflicting
+    /// many forced-evictions per minute means the cluster has
+    /// chronic node churn.
+    pub tablet_rebalances_total: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -85,6 +96,7 @@ pub async fn get_scheduler(
     election: Option<Extension<Arc<LeaderElection>>>,
     reaper: Option<Extension<Arc<StaleTabletReaper>>>,
     node_reaper: Option<Extension<Arc<NodeReaper>>>,
+    placement: Option<Extension<Arc<TabletPlacement>>>,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<SchedulerUnavailable>)> {
     let Some(Extension(meta)) = meta else {
         return Err((
@@ -132,6 +144,10 @@ pub async fn get_scheduler(
         .as_ref()
         .map(|Extension(r)| (r.marked_dead_total(), r.gc_removed_total()))
         .unwrap_or((0, 0));
+    let (tablet_placements_total, tablet_rebalances_total) = placement
+        .as_ref()
+        .map(|Extension(p)| (p.assignments_total(), p.rebalances_total()))
+        .unwrap_or((0, 0));
     Ok(Json(SchedulerStatus {
         this_node_id: election.node_id().to_string(),
         this_node_is_leader: election.is_leader(),
@@ -140,6 +156,8 @@ pub async fn get_scheduler(
         reassignments_total,
         nodes_marked_dead_total,
         nodes_gc_removed_total,
+        tablet_placements_total,
+        tablet_rebalances_total,
     }))
 }
 
@@ -158,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_503_when_meta_extension_is_absent() {
-        let (code, body) = get_scheduler(None, None, None, None)
+        let (code, body) = get_scheduler(None, None, None, None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -168,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn returns_503_when_election_extension_is_absent() {
         let meta = Arc::new(MetaStore::open_sqlite(":memory:").await.unwrap());
-        let (code, body) = get_scheduler(Some(Extension(meta)), None, None, None)
+        let (code, body) = get_scheduler(Some(Extension(meta)), None, None, None, None)
             .await
             .expect_err("503");
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -196,6 +214,7 @@ mod tests {
             Some(Extension(election.clone())),
             None, // no reaper in this test — counter reports 0
             None, // no node_reaper either
+            None, // no placement either
         )
         .await
         .expect("200");
@@ -209,6 +228,8 @@ mod tests {
         );
         assert_eq!(status.nodes_marked_dead_total, 0);
         assert_eq!(status.nodes_gc_removed_total, 0);
+        assert_eq!(status.tablet_placements_total, 0);
+        assert_eq!(status.tablet_rebalances_total, 0);
         let leader = status.leader.expect("leader row present");
         assert_eq!(leader.node_id, "test-node");
         assert!(leader.is_live);
@@ -250,6 +271,7 @@ mod tests {
             Some(Extension(meta.clone())),
             Some(Extension(election.clone())),
             Some(Extension(reaper.clone())),
+            None,
             None,
         )
         .await
@@ -308,6 +330,7 @@ mod tests {
             Some(Extension(election)),
             None,
             Some(Extension(node_reaper)),
+            None,
         )
         .await
         .expect("200");
