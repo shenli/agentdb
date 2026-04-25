@@ -1,0 +1,83 @@
+# Docker image pipeline. Builds a multi-arch image (linux/amd64
+# + linux/arm64) and pushes to GitHub Container Registry. Two
+# trigger paths:
+#
+#   * Push to main → `:edge` and `:edge-<short-sha>` tags. Lets
+#     someone run the latest committed code without waiting for
+#     a release: `docker run -p 7878:7878 -p 7879:7879 \
+#                  ghcr.io/<org>/agentdb:edge serve --dev`.
+#
+#   * Tag push (`v*.*.*`) → `:vX.Y.Z` and `:latest`. The
+#     canonical user-facing tags.
+#
+# `workflow_dispatch` runs an arbitrary build for testing the
+# pipeline without merging.
+
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # ghcr.io push
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (cross-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tags computed by docker/metadata-action:
+          #   * `:edge` for default-branch push
+          #   * `:edge-<sha-7>` always carries the commit
+          #   * `:vX.Y.Z` from a semver tag
+          #   * `:latest` from a semver tag
+          tags: |
+            type=ref,event=branch,prefix=edge-,suffix=,enable={{is_default_branch}}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=sha,prefix=edge-,format=short,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA-cache for the buildx cross-arch build. First
+          # build is slow (Rust release compile under QEMU);
+          # subsequent builds reuse the dep layer.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

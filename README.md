@@ -25,11 +25,32 @@ when you actually build them.
 
 ---
 
+## Install
+
+Three options, fastest first:
+
+```bash
+# A. Precompiled binary (Linux + macOS, x86_64 + aarch64).
+#    Detects platform, downloads from GitHub Releases, installs to
+#    ~/.local/bin (override with AGENTDB_PREFIX=/usr/local/bin).
+curl -sSL https://raw.githubusercontent.com/shenli/agentdb/main/scripts/install.sh | sh
+
+# B. Docker — multi-arch image on GHCR.
+docker run --rm -p 7878:7878 -p 7879:7879 ghcr.io/shenli/agentdb:latest serve --dev
+
+# C. From source (requires Rust 1.84+).
+cargo install --git https://github.com/shenli/agentdb agentdb-server
+```
+
+Option A and B require a published release; until v0.1.0 ships,
+use option C or build from a clone (`cargo build -p agentdb-server`).
+
 ## Quickstart — your first agent in three commands
 
 ```bash
 # 1. Start the server (zero config, ephemeral state)
-cargo run -p agentdb-server -- serve --dev
+agentdb serve --dev
+# (or: cargo run -p agentdb-server -- serve --dev)
 
 # 2. In another shell, install a client SDK
 pip install -e clients/python                # Python

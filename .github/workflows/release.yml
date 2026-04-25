@@ -1,0 +1,146 @@
+# Release pipeline: build precompiled binaries for the four
+# common platforms and attach them to a GitHub Release. Fires
+# on tag push (`v*`) so the canonical release flow is:
+#
+#   1. Bump versions in Cargo.toml + clients/python/pyproject.toml + clients/typescript/package.json
+#   2. git tag -a vX.Y.Z -m "AgentDB X.Y.Z"
+#   3. git push origin vX.Y.Z
+#
+# `workflow_dispatch` is provided so a maintainer can dry-run
+# the build matrix from the GitHub Actions UI without pushing
+# a tag.
+#
+# Out of scope here: PyPI publish (clients/python), npm publish
+# (clients/typescript), Homebrew tap maintenance. Those land in
+# follow-up workflows once a publishing identity is set up.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to dry-run against (e.g. v0.1.0). Skipped on real tag pushes."
+        required: false
+        type: string
+
+permissions:
+  contents: write   # upload assets to the GH Release
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # Cross-compile via the gcc-aarch64 toolchain. Fast
+            # enough on a Linux runner; avoids paying for an arm64
+            # runner just for one binary.
+            linker: aarch64-linux-gnu-gcc
+            apt-packages: gcc-aarch64-linux-gnu
+          - platform: darwin-x86_64
+            runner: macos-13     # Intel runners are deprecated;
+            # macos-13 is the last with x86_64 support.
+            target: x86_64-apple-darwin
+          - platform: darwin-aarch64
+            runner: macos-latest # Apple Silicon by default.
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile linker (Linux aarch64 only)
+        if: matrix.apt-packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt-packages }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ matrix.target }}-
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          cargo build --release --locked -p agentdb-server --target ${{ matrix.target }}
+
+      - name: Strip + package
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+            if [ -z "$tag" ]; then tag="dev-$(date -u +%Y%m%d%H%M%S)"; fi
+          fi
+          stage="agentdb-${tag}-${{ matrix.platform }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/agentdb" "$stage/agentdb"
+          # `strip` is best-effort. Linux uses GNU strip; macOS
+          # uses the system `strip`. Don't fail the build if it
+          # doesn't shrink the binary.
+          strip "$stage/agentdb" || true
+          cp README.md LICENSE "$stage/" 2>/dev/null || true
+          tar -C "$(dirname "$stage")" -czf "${stage}.tar.gz" "$(basename "$stage")"
+          shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          echo "asset=${stage}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${stage}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.checksum }}
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.checksum }}
+          draft: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  # Single-job summary: useful as a status check + makes the
+  # release "ready" state observable from the PR view.
+  finalize:
+    name: release-finalize
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "All build jobs finished."
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Ref:     ${{ github.ref }}"
