@@ -171,11 +171,16 @@ path via `primitives::scan_session_all_tiers`: a tier match selects
 either the KV prefix scan (warm) or a hedged segment read
 (`read_segment_hedged`, per-tier delay — 50 ms cold / 200 ms archive).
 M12 initially shipped archive as partial; M17 closed the three
-remaining gaps so that `fetch_last_n_merged` on a forked-archived
-parent, `plan_locality_bound` on an archived session, and Mongo wire
-`find` on archived sessions all return semantically-correct results.
-The archive tier now affects **latency**, not **semantics** — which is
-exactly the contract in `docs/agent-db-v2.md` §6.
+session-scoped read gaps; **M26 Phase 4** closes the last one — the
+in-memory text/vector indexes' `build` and `replay_events_after`
+paths now treat `Tier::Archive` identically to `Tier::Cold`,
+reading the same segment via `read_segment` instead of skipping the
+session. After this, `fetch_last_n_merged` on a forked-archived
+parent, `plan_locality_bound` on an archived session, Mongo wire
+`find` on archived sessions, and unhinted text/vector retrieval all
+return semantically-correct results. The archive tier now affects
+**latency**, not **semantics** — which is exactly the contract in
+`docs/agent-db-v2.md` §6.
 
 An admin endpoint `POST /api/admin/tier/force` can force any tier
 transition (warm↔cold↔archive). Multi-step transitions (warm→archive
