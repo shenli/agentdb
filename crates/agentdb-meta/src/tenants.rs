@@ -28,6 +28,25 @@ pub async fn get_by_external(pool: &AnyPool, external_id: &str) -> MetaResult<Op
     }))
 }
 
+/// Reverse lookup: by internal id. Returns the external id that
+/// the routing layer / auth layer needs to hand back to the
+/// (currently external-id-keyed) per-box `TenantRegistry`. Used
+/// by the M26 session-locator path to recover an external
+/// tenant identity from the locator's `tenant_internal_id`.
+pub async fn get_by_internal(pool: &AnyPool, internal_id: i64) -> MetaResult<Option<Tenant>> {
+    let row: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE internal_id = ?",
+    )
+    .bind(internal_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(i, e, t)| Tenant {
+        internal_id: i,
+        external_id: e,
+        created_at_ms: t,
+    }))
+}
+
 /// Create a new tenant. Errors with [`MetaError::Conflict`] if one
 /// already exists under this external id. Use [`get_or_create`] if you
 /// want idempotent creation.
@@ -125,6 +144,23 @@ mod tests {
         // Returned tenant should carry the original created_at_ms, not
         // the second call's `now`.
         assert_eq!(b.created_at_ms, 100);
+    }
+
+    #[tokio::test]
+    async fn get_by_internal_round_trips() {
+        let p = pool().await;
+        let created = create(&p, "alpha", 100).await.unwrap();
+        let back = get_by_internal(&p, created.internal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(back, created);
+    }
+
+    #[tokio::test]
+    async fn get_by_internal_returns_none_for_unknown_id() {
+        let p = pool().await;
+        assert!(get_by_internal(&p, 999).await.unwrap().is_none());
     }
 
     #[tokio::test]
