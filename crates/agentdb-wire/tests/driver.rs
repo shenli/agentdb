@@ -51,6 +51,7 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: agentdb_api::StreamBus::default(),
+        event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,

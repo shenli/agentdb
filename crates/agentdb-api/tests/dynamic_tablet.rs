@@ -87,6 +87,7 @@ async fn spawn_dynamic_node() -> (
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
+        event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,

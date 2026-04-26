@@ -534,6 +534,7 @@ mod tests {
                 tenants,
                 sessions,
                 stream,
+                event_bus: crate::event_bus::EventBus::default(),
                 http,
                 auth: None,
         admin_auth: None,

@@ -38,6 +38,7 @@ pub mod webhook;
 
 pub use auth_middleware::AuthedTenant;
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
+pub use event_bus::EventBus;
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
 #[derive(Clone)]
@@ -46,6 +47,11 @@ pub struct AppState {
     pub tenants: Arc<agentdb_core::TenantRegistry>,
     pub sessions: Arc<agentdb_core::SessionRegistry>,
     pub stream: StreamBus,
+    /// Process-wide pub/sub bus for appended events. Subscribers
+    /// (SSE handlers in later pub/sub tasks) fan out envelopes
+    /// emitted from the success path of `append_and_fetch`. See
+    /// `docs/superpowers/specs/2026-04-25-pubsub-design.md` §6.7.
+    pub event_bus: EventBus,
     pub http: reqwest::Client,
     /// M19 auth config. `None` → no auth required; the Basic
     /// Auth middleware is a no-op. `Some` → `/api/tenants/*`
@@ -81,6 +87,7 @@ impl AppState {
         tenants: Arc<agentdb_core::TenantRegistry>,
         sessions: Arc<agentdb_core::SessionRegistry>,
         stream: StreamBus,
+        event_bus: EventBus,
         http: reqwest::Client,
     ) -> Self {
         Self {
@@ -88,6 +95,7 @@ impl AppState {
             tenants,
             sessions,
             stream,
+            event_bus,
             http,
             auth: None,
             admin_auth: None,

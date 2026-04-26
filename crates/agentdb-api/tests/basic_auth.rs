@@ -34,6 +34,7 @@ async fn spawn_with_auth() -> (TempDir, TempDir, tempfile::NamedTempFile, String
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
+        event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: Some(AuthConfig {
             meta: Some(meta.clone()),

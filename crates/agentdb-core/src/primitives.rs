@@ -315,6 +315,11 @@ pub struct AppendFetchOutput {
     pub new_seq: u64,
     pub recent: Vec<Event>,
     pub session: Session,
+    /// The event that was just appended. Carries the assigned
+    /// HLC + actor + payload so callers (e.g. the API layer's
+    /// pub/sub bus emitter) can build a fully-populated envelope
+    /// without a follow-up fetch. See pub/sub design §6.7.
+    pub appended: Event,
 }
 
 /// Append one event and return the last N events of the session in a
@@ -622,6 +627,7 @@ pub async fn append_and_fetch_with_actor(
         new_seq: event.seq,
         recent,
         session,
+        appended: event,
     })
 }
 

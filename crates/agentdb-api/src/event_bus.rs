@@ -24,6 +24,7 @@ impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (mut tx, rx) = async_broadcast::broadcast(capacity);
         tx.set_overflow(true);
+        // Keep a receiver alive so the channel doesn't close when no subscribers are connected.
         std::mem::forget(rx);
         Self { tx }
     }
@@ -124,5 +125,32 @@ mod tests {
         let s = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(env, back);
+    }
+
+    fn make_event(payload: serde_json::Value) -> agentdb_core::types::Event {
+        agentdb_core::types::Event {
+            seq: 1,
+            ts: 1_000,
+            hlc_ts: agentdb_core::hlc::HlcTimestamp {
+                physical_ns: 0,
+                logical: 0,
+            },
+            actor_id: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn envelope_from_event_extracts_kind_from_payload() {
+        let evt = make_event(serde_json::json!({"kind": "message", "text": "hi"}));
+        let env = envelope_from_event("t-1", "s-1", &evt);
+        assert_eq!(env.kind, Some("message".into()));
+    }
+
+    #[test]
+    fn envelope_from_event_kind_is_none_when_payload_has_no_kind() {
+        let evt = make_event(serde_json::json!({"text": "hi"}));
+        let env = envelope_from_event("t-1", "s-1", &evt);
+        assert_eq!(env.kind, None);
     }
 }

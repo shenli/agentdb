@@ -260,6 +260,16 @@ async fn do_append_and_fetch(
         }
         Err(e) => return ApiError::Core(e).into_response(),
     };
+    // Pub/sub fan-out. Spec §6.7: emit AFTER the durable write
+    // succeeds (we are past `append_and_fetch_with_actor` Ok) and
+    // BEFORE the response is built, so subscribers never see an
+    // event we wouldn't actually return on read. Fire-and-forget;
+    // backpressure is absorbed by the bus's overflow policy.
+    state.event_bus.emit(crate::event_bus::envelope_from_event(
+        &tenant,
+        &session,
+        &out.appended,
+    ));
     let recent = out.recent.into_iter().map(EventDto::from).collect();
     axum::Json(AppendAndFetchResponse {
         seq: out.new_seq,

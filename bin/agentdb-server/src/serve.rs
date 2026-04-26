@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
+use agentdb_api::{now_ms, router, AppState, EventBus, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
     LifecycleConfig, LifecycleEngine, LockGc, LockGcConfig, NodeReaper, NodeReaperConfig,
@@ -960,6 +960,7 @@ pub async fn run(
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
     let stream = StreamBus::default();
+    let event_bus = EventBus::default();
     let http_client = agentdb_api::webhook::new_client();
 
     let hook: agentdb_core::lifecycle::TierChangeHook = {
@@ -1072,6 +1073,7 @@ pub async fn run(
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: stream.clone(),
+        event_bus: event_bus.clone(),
         http: http_client.clone(),
         auth: if require_auth {
             Some(agentdb_api::AuthConfig {
