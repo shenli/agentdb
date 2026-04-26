@@ -76,8 +76,9 @@ pub use tablet_placement::{PlacementConfig, TabletPlacement};
 pub use tablet_reconciler::{ReconcilerConfig, TabletReconciler};
 pub use planner::{Hit, HybridPlanner, PlanOutput, Source, Strategy};
 pub use primitives::{
-    append_and_fetch, append_and_fetch_with_actor, append_event, fetch_last_n, fetch_last_n_merged,
-    scan_session_all_tiers, scan_session_events, AppendFetchOutput, DEFAULT_BRANCH_ID,
+    append_and_fetch, append_and_fetch_with_actor, append_event, fetch_events_from_seq,
+    fetch_last_n, fetch_last_n_merged, scan_session_all_tiers, scan_session_events,
+    AppendFetchOutput, DEFAULT_BRANCH_ID,
 };
 pub use rate_window::{RateSnapshot, RateWindow};
 pub use read_ctx::ReadCtx;
