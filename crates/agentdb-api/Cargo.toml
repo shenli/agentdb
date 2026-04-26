@@ -20,6 +20,9 @@ axum-extra = { version = "0.9", features = ["query"] }
 base64 = { workspace = true }
 subtle = { workspace = true }
 futures-util = "0.3"
+# Phase-1 pub/sub Task 9a: JWT verification for browser-direct
+# subscribers. HS256 in this task; RS256/ES256 via JWKS in 9b.
+jsonwebtoken = "9"
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

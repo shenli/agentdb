@@ -31,6 +31,7 @@ pub mod forwarding;
 pub mod handlers;
 pub mod health;
 pub mod hlc_header;
+pub mod jwt;
 pub mod metrics_exposition;
 pub mod stream;
 pub mod subscribe;
