@@ -25,14 +25,20 @@ use tempfile::TempDir;
 /// field is the same `AppState` the router was built with — tests
 /// can call `state.event_bus.subscribe()` and observe envelopes
 /// emitted by handler invocations on this server.
+///
+/// `Clone` so race-style tests can move a handle into a spawned
+/// task that hits the same server in parallel. Tempdirs are
+/// `Arc`-wrapped so all clones share lifetime — the dirs only
+/// drop after the last clone goes away.
+#[derive(Clone)]
 pub struct TestServer {
     pub state: AppState,
     pub base: String,
     /// Held until drop so RocksDB + object-store dirs survive
     /// for the test's lifetime. `_` prefixed because tests don't
-    /// touch them directly.
-    _kv_dir: TempDir,
-    _obj_dir: TempDir,
+    /// touch them directly. `Arc` so clones share lifetime.
+    _kv_dir: Arc<TempDir>,
+    _obj_dir: Arc<TempDir>,
 }
 
 impl TestServer {
@@ -63,8 +69,8 @@ impl TestServer {
         Self {
             state,
             base: format!("http://{addr}"),
-            _kv_dir: kv_dir,
-            _obj_dir: obj_dir,
+            _kv_dir: Arc::new(kv_dir),
+            _obj_dir: Arc::new(obj_dir),
         }
     }
 

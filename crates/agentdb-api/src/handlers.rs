@@ -25,7 +25,11 @@ use crate::AppState;
 /// been minted yet (a subscriber may legitimately attach before
 /// the very first append). Transient KV errors are also collapsed
 /// to `None` — Phase 1 callers want a "best effort" cursor and
-/// emit `live_seq: 0` in that case.
+/// emit `live_seq: 0` in that case — but errors are logged via
+/// `tracing::warn!` so infra issues show up in logs instead of
+/// silently turning into `live_seq=0`. Task 5's catch-up replay
+/// depends on this distinction: legitimate "not yet minted" should
+/// stay quiet, real KV failures should be visible.
 pub async fn resolve_session_next_seq(
     state: &AppState,
     tenant_external: &str,
@@ -34,17 +38,84 @@ pub async fn resolve_session_next_seq(
     let box_ = state
         .registry
         .route_session(tenant_external, session_external);
-    let tenant = state
-        .tenants
-        .lookup(box_.id, tenant_external)
-        .ok()
-        .flatten()?;
-    let session = state
+    let tenant = match state.tenants.lookup(box_.id, tenant_external) {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant = tenant_external,
+                "resolve_session_next_seq: tenant lookup error",
+            );
+            return None;
+        }
+    };
+    let session = match state
         .sessions
         .lookup(box_.id, tenant.internal_id, session_external)
-        .ok()
-        .flatten()?;
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant = tenant_external,
+                session = session_external,
+                "resolve_session_next_seq: session lookup error",
+            );
+            return None;
+        }
+    };
     Some(session.next_seq)
+}
+
+/// Catch-up scan helper. Resolves the (tenant, session) pair the
+/// same way [`resolve_session_next_seq`] does, opens a `ReadCtx`
+/// against the box, and delegates to
+/// [`agentdb_core::fetch_events_from_seq`] for the half-open range
+/// `[from_seq, end_seq)`.
+///
+/// Returns `Ok(empty vec)` if the tenant or session does not exist
+/// yet (subscriber attached before any append). Returns
+/// `Err(ApiError::Internal)` on KV / snapshot errors so the caller
+/// can log them — at the SSE handler boundary we degrade to "no
+/// catch-up" rather than dropping the whole subscription, but the
+/// error path stays distinguishable from "no events to replay".
+pub async fn scan_events_from_seq(
+    state: &AppState,
+    tenant_external: &str,
+    session_external: &str,
+    from_seq: u64,
+    end_seq: u64,
+) -> Result<Vec<agentdb_core::types::Event>, ApiError> {
+    let box_ = state
+        .registry
+        .route_session(tenant_external, session_external);
+    let tenant = match state.tenants.lookup(box_.id, tenant_external) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "scan_events_from_seq: tenant lookup: {e}"
+            )))
+        }
+    };
+    let session = match state
+        .sessions
+        .lookup(box_.id, tenant.internal_id, session_external)
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "scan_events_from_seq: session lookup: {e}"
+            )))
+        }
+    };
+    let ctx = agentdb_core::ReadCtx::open(&box_, state.registry.kv())
+        .map_err(|e| ApiError::Internal(format!("scan_events_from_seq: open ReadCtx: {e}")))?;
+    agentdb_core::fetch_events_from_seq(&ctx, &session, from_seq, end_seq)
+        .map_err(|e| ApiError::Internal(format!("scan_events_from_seq: fetch: {e}")))
 }
 
 #[utoipa::path(
