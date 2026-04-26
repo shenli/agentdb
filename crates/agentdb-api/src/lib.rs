@@ -6,21 +6,21 @@ use axum::Router;
 
 pub mod admin;
 pub mod admin_audit;
+pub mod admin_auth_middleware;
 pub mod admin_backup;
 pub mod admin_boxes;
 pub mod admin_drain;
+pub mod admin_hot_tablets;
 pub mod admin_nodes;
 pub mod admin_reload;
 pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
-pub mod admin_hot_tablets;
 pub mod admin_slow_queries;
 pub mod admin_tablets;
 pub mod admin_tenant_quotas;
-pub mod admin_users;
-pub mod admin_auth_middleware;
 pub mod admin_tokens;
+pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
 pub mod dto;
@@ -33,6 +33,7 @@ pub mod health;
 pub mod hlc_header;
 pub mod metrics_exposition;
 pub mod stream;
+pub mod subscribe;
 pub mod trace_context;
 pub mod webhook;
 
@@ -267,6 +268,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
+            axum::routing::get(subscribe::subscribe_session),
         );
     let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -364,8 +369,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/users",
-            axum::routing::post(admin_users::create_user)
-                .get(admin_users::list_users),
+            axum::routing::post(admin_users::create_user).get(admin_users::list_users),
         )
         .route(
             "/api/admin/users/:user_id",
@@ -373,8 +377,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/tokens",
-            axum::routing::post(admin_tokens::mint_token)
-                .get(admin_tokens::list_tokens),
+            axum::routing::post(admin_tokens::mint_token).get(admin_tokens::list_tokens),
         )
         .route(
             "/api/admin/tokens/:token_id",

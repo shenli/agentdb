@@ -11,6 +11,12 @@ agentdb-dashboard = { path = "../agentdb-dashboard" }
 agentdb-meta = { path = "../agentdb-meta" }
 async-broadcast = { workspace = true }
 axum = { workspace = true }
+# Phase-1 pub/sub Task 4: `Query` from axum-extra uses
+# `serde_html_form` and decodes repeated keys
+# (`?kind=a&kind=b`) into `Vec<String>`. The default
+# axum `Query` (`serde_urlencoded`) cannot. Pinned to the
+# 0.9 line — it tracks axum 0.7.
+axum-extra = { version = "0.9", features = ["query"] }
 base64 = { workspace = true }
 subtle = { workspace = true }
 futures-util = "0.3"

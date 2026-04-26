@@ -12,6 +12,41 @@ use crate::error::{ApiError, ErrorResponse};
 use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::AppState;
 
+/// Resolve the current `next_seq` for an external (tenant, session)
+/// pair without doing any of the write-path work (admission,
+/// quotas, fault injection). Used by subscribe handlers to pin a
+/// "live as of T" cursor before they start tailing the bus.
+///
+/// Routing matches `append_and_fetch`'s local path: pick the box
+/// via `route_session`, look up the tenant in that box, then look
+/// up the session under that tenant.
+///
+/// Returns `None` when either the tenant or the session has not
+/// been minted yet (a subscriber may legitimately attach before
+/// the very first append). Transient KV errors are also collapsed
+/// to `None` — Phase 1 callers want a "best effort" cursor and
+/// emit `live_seq: 0` in that case.
+pub async fn resolve_session_next_seq(
+    state: &AppState,
+    tenant_external: &str,
+    session_external: &str,
+) -> Option<u64> {
+    let box_ = state
+        .registry
+        .route_session(tenant_external, session_external);
+    let tenant = state
+        .tenants
+        .lookup(box_.id, tenant_external)
+        .ok()
+        .flatten()?;
+    let session = state
+        .sessions
+        .lookup(box_.id, tenant.internal_id, session_external)
+        .ok()
+        .flatten()?;
+    Some(session.next_seq)
+}
+
 #[utoipa::path(
     post,
     path = "/api/tenants/{tenant_id}/sessions/{session_id}/append_and_fetch",
@@ -170,11 +205,7 @@ async fn do_append_and_fetch(
             // says Remote. Routing drift between nodes — surface
             // 421 so operators see it in logs rather than a
             // silent infinite loop.
-            let local_node = state
-                .registry
-                .node_id()
-                .unwrap_or("unknown")
-                .to_string();
+            let local_node = state.registry.node_id().unwrap_or("unknown").to_string();
             return forwarding::misdirected_reply(&local_node, *tablet_id);
         }
         // Count the forward attempt on box 0 (admin-chosen
@@ -182,7 +213,9 @@ async fn do_append_and_fetch(
         // box, so there's no natural local box to attribute to).
         let box_for_metrics = state.registry.box_by_id(0);
         if let Some(ref b) = box_for_metrics {
-            b.metrics.forwarded_writes_total.fetch_add(1, Ordering::Relaxed);
+            b.metrics
+                .forwarded_writes_total
+                .fetch_add(1, Ordering::Relaxed);
         }
         let passthrough = PassthroughHeaders::from_headers(&headers);
         match forwarding::forward_append_and_fetch(

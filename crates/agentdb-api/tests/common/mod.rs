@@ -39,12 +39,9 @@ impl TestServer {
     pub async fn start() -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
-        let kv: Arc<dyn KvStore> = Arc::new(
-            RocksKvStore::open(kv_dir.path()).expect("rocks open"),
-        );
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(obj_dir.path()).expect("local fs"),
-        );
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).expect("local fs"));
         let state = AppState {
             registry: Arc::new(BoxRegistry::new(kv.clone(), store, 4).expect("registry")),
             tenants: Arc::new(TenantRegistry::new(kv.clone())),
@@ -82,4 +79,92 @@ impl TestServer {
             .await
             .expect("send")
     }
+
+    /// Open an SSE stream against `path`. Asserts a 200 status so
+    /// callers can dive into frame parsing without re-checking.
+    pub async fn open_sse(&self, path: &str) -> SseStream {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{}", self.base, path))
+            .send()
+            .await
+            .expect("send sse open");
+        assert_eq!(resp.status(), 200, "SSE open failed: {}", resp.status());
+        SseStream {
+            body: resp,
+            buf: String::new(),
+        }
+    }
+}
+
+/// Buffered Server-Sent Events stream. Holds the raw `reqwest`
+/// response and a UTF-8 buffer; calls to [`SseStream::next_event`]
+/// pull more chunks as needed. axum emits keep-alive comment
+/// frames (`":\n\n"`) — those are silently skipped here so tests
+/// only see real events.
+pub struct SseStream {
+    body: reqwest::Response,
+    buf: String,
+}
+
+/// One parsed SSE frame. `event_name` is `Some` only when the
+/// frame includes an `event:` line (axum sets this for the
+/// `subscribed` control frame); regular envelope frames have no
+/// `event:` line and so come through as `None`.
+pub struct SseFrame {
+    pub event_name: Option<String>,
+    pub data: String,
+}
+
+impl SseStream {
+    /// Read the next event frame, blocking until one is available.
+    /// Skips comment-only keep-alive frames so callers see real
+    /// payloads only. Panics if the underlying stream ends — the
+    /// test should observe an event before the server closes.
+    pub async fn next_event(&mut self) -> SseFrame {
+        loop {
+            if let Some(idx) = self.buf.find("\n\n") {
+                let block = self.buf[..idx].to_string();
+                self.buf.drain(..idx + 2);
+                let frame = parse_sse_block(&block);
+                if frame.event_name.is_none() && frame.data.is_empty() {
+                    continue;
+                }
+                return frame;
+            }
+            let chunk = self
+                .body
+                .chunk()
+                .await
+                .expect("sse chunk")
+                .expect("sse stream ended");
+            self.buf
+                .push_str(std::str::from_utf8(&chunk).expect("utf8"));
+        }
+    }
+
+    /// Convenience for tests that don't care about the initial
+    /// `subscribed` control event.
+    pub async fn skip_subscribed_event(&mut self) {
+        let _ = self.next_event().await;
+    }
+}
+
+fn parse_sse_block(block: &str) -> SseFrame {
+    let mut event_name = None;
+    let mut data = String::new();
+    for line in block.lines() {
+        if line.starts_with(':') {
+            // Comment line (axum keep-alive uses `:`).
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    SseFrame { event_name, data }
 }
