@@ -36,10 +36,16 @@ see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## 🤖 For AI agents using AgentDB
 
 If you're an LLM-driven agent reading this repo to learn the
-API, jump straight to **[`AGENTS.md`](AGENTS.md)** — a
-single-page manual designed to be ingested in one shot. It
-covers the five operations you'll actually use, the request /
-response shapes, and the common mistakes.
+API, jump straight to **[`LLMS.md`](LLMS.md)** — a single-page
+manual designed to be ingested in one shot. It covers the five
+operations you'll actually use, the request / response shapes,
+and the common mistakes.
+
+(Naming: `AGENTS.md` at the repo root is the established
+Claude Code / Cursor convention for "how to *develop in* this
+repo" — build commands, crate layout, MSRV. The runtime-API
+manual lives separately in `LLMS.md` so the two audiences
+don't trip over the same filename.)
 
 ---
 

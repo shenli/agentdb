@@ -1,4 +1,4 @@
-# AGENTS.md — AgentDB for LLM agents
+# LLMS.md — AgentDB for LLM agents
 
 This file is written for an LLM agent that's learning AgentDB
 in one ingest. Sections are short, copy-pasteable, and ordered
@@ -7,6 +7,13 @@ by how often a working agent needs them. Human devs may prefer
 
 If you (the agent) only read one section: go to **§3 The five
 operations**.
+
+> **Why not `AGENTS.md`?** That filename is the established
+> Claude Code / Cursor convention for "instructions to an LLM
+> coding *in* this repo" (build commands, crate layout, etc.).
+> Runtime-API instructions for an LLM *using* AgentDB live
+> here in `LLMS.md` so both can coexist without overloading
+> one filename with two audiences.
 
 ---
 
