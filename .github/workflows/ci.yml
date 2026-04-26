@@ -140,9 +140,11 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python SDK + test deps
+        # `[async]` pulls httpx so the AsyncClient smoke tests
+        # run; without the extra, those tests are skipped.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e clients/python pytest
+          python -m pip install -e 'clients/python[async]' pytest
 
       - name: pytest (Python SDK smoke)
         run: pytest clients/python -q

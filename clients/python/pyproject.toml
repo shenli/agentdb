@@ -27,8 +27,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+async = [
+    "httpx>=0.27",
+]
 test = [
     "pytest>=7.0",
+    # Async smoke tests `import httpx` directly via AsyncClient,
+    # so `[test]` needs httpx too. Picks up the same constraint
+    # as the runtime extra.
+    "httpx>=0.27",
 ]
 
 [project.urls]
