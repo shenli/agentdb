@@ -1,0 +1,168 @@
+# Pull-request CI. The first project-wide automated check —
+# previously every PR landed without verification and the human
+# reviewer had to remember to `cargo test`.
+#
+# Linux-only by design. macOS minutes on GH Actions are 10×
+# Linux minutes; we don't need OS coverage for build correctness
+# (the release workflow handles cross-platform binaries on tag
+# push). Linux fast-fails any logic / API regression cheaply.
+#
+# Two jobs run in parallel:
+#
+#   * `cargo` — fmt, clippy, full workspace test. The bulk of
+#     PR signal.
+#   * `sdks` — Python + TypeScript SDK smoke tests against
+#     `agentdb serve --dev`. Ensures the public client surface
+#     keeps working as the server changes.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel an in-flight run when a new push lands on the same PR
+# branch — saves runner time on noisy PRs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # Reduce log noise from rocksdb's spammy debug output.
+  RUST_LOG: warn
+  # Strip debug info from dev + test builds. The workspace
+  # depends on rocksdb; with full debug info the `target/`
+  # directory clears 14 GB on a clean compile and the GH
+  # Actions ubuntu-latest runner only has ~14 GB free out of
+  # the box. Stripping debuginfo + flipping incremental off
+  # keeps the build well under the cap; CI doesn't need a
+  # debugger and `RUST_BACKTRACE=short` still prints frames.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  cargo:
+    name: cargo (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reclaim disk on the runner. ubuntu-latest ships ~30 GB
+      # of pre-installed tooling we don't need (Android SDK,
+      # .NET, Haskell, prebuilt CodeQL DBs); leaving them in
+      # place + a clean Rust workspace target/ has been enough
+      # to ENOSPC mid-compile. Frees ~25 GB in <10s.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      # Install the toolchain pinned in `rust-toolchain.toml`.
+      # `rustup show` reads that file and installs the exact
+      # channel + components, which keeps local-dev and CI on
+      # the same Rust version (no more "the new clippy stable
+      # caught a lint on Friday afternoon" surprises).
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-ci-${{ runner.os }}-
+
+      # `cargo fmt --check` is intentionally not enabled yet —
+      # the workspace has pre-existing drift across many files
+      # and a one-shot `cargo fmt --all` cleanup is a separate
+      # follow-up PR (so the diff stays scoped). Re-enable here
+      # once that runs.
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --tests -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  sdks:
+    name: SDK smoke (Python + TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same disk reclaim as the cargo job; agentdb-server's
+      # debug build is the heaviest single artifact we produce
+      # in this job and easily fills the runner without it.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-sdks-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-sdks-${{ runner.os }}-
+            cargo-ci-${{ runner.os }}-
+
+      # The SDK smoke tests each spawn `agentdb serve --dev`
+      # as a subprocess — they need the debug binary present.
+      - name: cargo build (server only)
+        run: cargo build -p agentdb-server --locked
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python SDK + test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e clients/python pytest
+
+      - name: pytest (Python SDK smoke)
+        run: pytest clients/python -q
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: clients/typescript/package-lock.json
+
+      - name: Install TS SDK deps + build
+        working-directory: clients/typescript
+        run: |
+          npm ci
+          npm run build
+
+      - name: npm test (TS SDK smoke)
+        working-directory: clients/typescript
+        # `npm test` re-runs the build inside the script; that's
+        # fast on the warm cache and ensures the test runs
+        # against the just-built dist/.
+        run: npm test

@@ -1,3 +1,15 @@
+# Pinned toolchain — single source of truth for both local
+# development and CI. CI workflows (`.github/workflows/*.yml`)
+# install Rust via `rustup show`, which reads this file and
+# materializes exactly this version.
+#
+# Bump procedure:
+#   1. Edit `channel` here.
+#   2. Run `cargo clippy --workspace --tests -- -D warnings`
+#      and `cargo test --workspace` locally with the new
+#      toolchain to catch any newly-strict lints or breakage.
+#   3. Open a PR; CI auto-picks up the new version on the
+#      first job run.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
