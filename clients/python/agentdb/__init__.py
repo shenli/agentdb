@@ -20,7 +20,27 @@ In auth mode the tenant is implicit (derived from credentials):
     session = client.session("agent-1")  # tenant comes from auth
     session.append({"role": "tool", "text": "did a thing"})
 
-See `examples/agents/python/quickstart.py` for a working agent loop.
+For async code (LangChain, LlamaIndex, the Anthropic / OpenAI
+SDKs, etc.) install the optional `[async]` extra and use
+`AsyncClient`:
+
+    pip install 'agentdb[async]'
+
+    import asyncio
+    from agentdb import AsyncClient
+
+    async def main():
+        async with AsyncClient("http://127.0.0.1:7878") as client:
+            session = client.session("agent-1", tenant="demo")
+            result = await session.append({"role": "user", "text": "hi"},
+                                          fetch_last_n=5)
+            print(result.seq)
+
+    asyncio.run(main())
+
+See `examples/agents/python/quickstart.py` (sync) and
+`examples/agents/python/async_quickstart.py` (async) for
+working agent loops.
 """
 
 from .client import Client, Session, AppendResult, Event
@@ -41,6 +61,8 @@ __all__ = [
     "Session",
     "AppendResult",
     "Event",
+    "AsyncClient",
+    "AsyncSession",
     "AgentDBError",
     "BadRequest",
     "Unauthorized",
@@ -51,5 +73,22 @@ __all__ = [
     "ServerError",
     "Misdirected",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy import of the async surface.
+
+    Why lazy: `AsyncClient` depends on `httpx`, which is an
+    optional extra. A user who does `pip install agentdb` (no
+    extra) and `from agentdb import Client` shouldn't trigger
+    an import error from never-touched async code. The error
+    fires only when someone actually references AsyncClient,
+    and the message points at the right install command.
+    """
+    if name in ("AsyncClient", "AsyncSession"):
+        from . import _async_client
+
+        return getattr(_async_client, name)
+    raise AttributeError(f"module 'agentdb' has no attribute {name!r}")
 
 __version__ = "0.1.0"

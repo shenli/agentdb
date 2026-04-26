@@ -74,7 +74,7 @@ the REST surface without reading further. Open
 
 ### Five-line client
 
-**Python** ([`clients/python/`](clients/python/README.md)):
+**Python** ([`clients/python/`](clients/python/README.md)) — sync:
 
 ```python
 from agentdb import Client
@@ -83,6 +83,18 @@ client = Client("http://127.0.0.1:7878")
 session = client.session("agent-1", tenant="demo")
 result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print("seq:", result.seq, [(e.seq, e.payload) for e in result.recent])
+```
+
+…or async (`pip install 'agentdb[async]'`) for agent frameworks
+that are async-first:
+
+```python
+from agentdb import AsyncClient
+
+async with AsyncClient("http://127.0.0.1:7878") as client:
+    session = client.session("agent-1", tenant="demo")
+    result = await session.append({"role": "user", "text": "hello"},
+                                  fetch_last_n=5)
 ```
 
 **TypeScript / Node** ([`clients/typescript/`](clients/typescript/README.md)):

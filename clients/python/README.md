@@ -8,7 +8,8 @@ operational database.
 From source (recommended while AgentDB is pre-1.0):
 
 ```bash
-pip install -e clients/python
+pip install -e clients/python              # sync client only
+pip install -e 'clients/python[async]'     # also installs httpx for AsyncClient
 ```
 
 PyPI publish lands once the server hits 0.1.0 stable.
@@ -34,6 +35,44 @@ for ev in result.recent:
     print(ev.seq, ev.payload)
 ```
 
+## Async (`AsyncClient`)
+
+Modern agent code (LangChain, LlamaIndex, the Anthropic / OpenAI
+SDKs) is async-first. Install with the `[async]` extra and
+import `AsyncClient` instead of `Client`:
+
+```python
+import asyncio
+from agentdb import AsyncClient
+
+async def main():
+    async with AsyncClient("http://127.0.0.1:7878") as client:
+        session = client.session("agent-1", tenant="demo")
+        result = await session.append(
+            {"role": "user", "text": "hello"},
+            fetch_last_n=5,
+        )
+        print(result.seq, [e.payload for e in result.recent])
+
+asyncio.run(main())
+```
+
+The async surface mirrors the sync one method-for-method. The
+real payoff is parallelism — write to many sessions at once via
+`asyncio.gather`:
+
+```python
+results = await asyncio.gather(
+    client.session("agent-a").append({"i": 0}),
+    client.session("agent-b").append({"i": 1}),
+    client.session("agent-c").append({"i": 2}),
+)
+```
+
+`AsyncClient` is built on `httpx` and keeps a connection pool;
+construct one per app and reuse. `async with` (or an explicit
+`await client.aclose()`) drains the pool on shutdown.
+
 ## Auth mode
 
 When the server is started with `AGENTDB_REQUIRE_AUTH=true`, supply
@@ -44,6 +83,11 @@ no need to pass it explicitly.
 client = Client("https://prod.example.com", user="alice", password="hunter2")
 session = client.session("agent-1")  # tenant auth-derived
 session.append({"role": "tool", "text": "did a thing"})
+
+# AsyncClient takes the same auth args.
+async with AsyncClient("https://prod.example.com",
+                       user="alice", password="hunter2") as client:
+    await client.session("agent-1").append({"role": "tool", "text": "..."})
 ```
 
 ## Fork
