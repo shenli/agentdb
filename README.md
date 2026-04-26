@@ -350,12 +350,20 @@ docs/                        design, architecture, performance, S3 guide
 
 ## Reading order
 
+- **Whether AgentDB is the right tool for your workload**:
+  [`docs/when-to-use.md`](docs/when-to-use.md) — honest
+  positioning, "Postgres is enough" thresholds, decision
+  flowchart, migration path
 - **What the prototype is supposed to be**:
   [`docs/agent-db.md`](docs/agent-db.md) — requirements, design
   principles, architecture, implementation trade-offs
 - **What the code actually does today**:
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate layout,
   request flow, storage layout, per-milestone additions
+- **What gaps we know about**:
+  [`docs/follow-ups.md`](docs/follow-ups.md) — RRF for hybrid
+  search, selective indexing, operational-data integration
+  patterns
 - **How fast it runs**:
   [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — laptop numbers
   for throughput, vector search, tier transitions, admission
