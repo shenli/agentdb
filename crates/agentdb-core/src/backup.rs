@@ -140,7 +140,7 @@ pub fn list_backup_dirs(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             .unwrap_or(std::time::UNIX_EPOCH);
         out.push((path, mtime));
     }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out.sort_by_key(|a| a.1);
     Ok(out.into_iter().map(|(p, _)| p).collect())
 }
 
