@@ -56,7 +56,7 @@ use axum::extract::{Path, State};
 // `kind=foo&kind=bar` parameters are OR'd."
 use axum_extra::extract::Query;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::stream::{self, Stream, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 
 use crate::event_bus::EventEnvelope;
@@ -103,7 +103,24 @@ pub async fn subscribe_session(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
     Query(q): Query<SubscribeQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Multi-node 421 redirect (spec §6.8). Phase 1 doesn't proxy
+    // SSE across nodes — if the owning tablet is on a peer, return
+    // 421 with the owner's address so the SDK reconnects directly.
+    // Mirrors `append_and_fetch`'s routing pattern but tells the
+    // client to redirect rather than forwarding the request.
+    if let agentdb_core::RouteDecision::Remote { target, .. } =
+        state.registry.route_session_for_io(&tenant, &session)
+    {
+        let path = format!(
+            "/api/tenants/{}/sessions/{}/subscribe",
+            tenant, session
+        );
+        return crate::forwarding::subscribe_not_owner_reply(&target, &path);
+    }
+
     // Subscribe FIRST so any event appended between here and the
     // `live_seq` snapshot is buffered for us — closes the
     // attach-vs-append race that gap-free reconnect needs to win
@@ -168,9 +185,10 @@ pub async fn subscribe_session(
                     serde_json::json!({"from_seq": from_seq, "live_seq": live_seq}),
                 );
                 let err_stream = stream::once(async move { Ok::<_, Infallible>(err) });
-                let combined = subscribed_evt.chain(err_stream).left_stream();
+                let combined = subscribed_evt.chain(err_stream);
                 return Sse::new(combined)
-                    .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)));
+                    .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
+                    .into_response();
             }
         }
     } else {
@@ -275,8 +293,9 @@ pub async fn subscribe_session(
     });
 
     let combined = subscribed_evt.chain(catchup_stream).chain(live);
-    Sse::new(combined.right_stream())
+    Sse::new(combined)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
+        .into_response()
 }
 
 /// Live-tail iterator state carried through `stream::unfold`.
@@ -437,11 +456,6 @@ pub async fn subscribe_tenant(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    // Subscribe FIRST so any envelope appended between here and
-    // the per-session `live_seq` snapshots is buffered (same race
-    // closure as the per-session endpoint).
-    let rx = state.event_bus.subscribe();
-
     let kind_filter = normalize_kind_filter(q.kind);
     let session_whitelist: Option<HashSet<String>> = if q.session.is_empty() {
         None
@@ -450,6 +464,41 @@ pub async fn subscribe_tenant(
     };
     let from_seq_map = parse_from_seq_per_session(q.from_seq_per_session.as_deref());
     let keepalive_secs = q.heartbeat_secs.unwrap_or(20);
+
+    // Multi-node 421 redirect (spec §6.8). The tenant-wide stream
+    // can't be served for sessions on peer nodes — Phase 1 doesn't
+    // proxy SSE. We only check sessions the client explicitly
+    // named (whitelist or per-session catch-up cursor); enumerating
+    // every session in a tenant would be expensive and racy. If
+    // the client gave no specific sessions, we serve locally and
+    // accept the gap (envelopes from peer-owned sessions don't
+    // reach this node's bus, so the client just sees an empty
+    // stream — correct given Phase 1's no-cross-node-fanout).
+    let mut sessions_to_check: HashSet<&String> = HashSet::new();
+    if let Some(ws) = &session_whitelist {
+        sessions_to_check.extend(ws.iter());
+    }
+    sessions_to_check.extend(from_seq_map.keys());
+    if !sessions_to_check.is_empty() {
+        let mut remote_owners: HashSet<String> = HashSet::new();
+        for sid in &sessions_to_check {
+            if let agentdb_core::RouteDecision::Remote { target, .. } =
+                state.registry.route_session_for_io(&tenant, sid)
+            {
+                remote_owners.insert(target.address);
+            }
+        }
+        if !remote_owners.is_empty() {
+            let mut addrs: Vec<String> = remote_owners.into_iter().collect();
+            addrs.sort();
+            return crate::forwarding::subscribe_not_owner_multi_reply(addrs);
+        }
+    }
+
+    // Subscribe FIRST so any envelope appended between here and
+    // the per-session `live_seq` snapshots is buffered (same race
+    // closure as the per-session endpoint).
+    let rx = state.event_bus.subscribe();
 
     // Resolve a `live_seq` per requested catch-up session and
     // accumulate catch-up envelopes. Tenant-wide is multi-session,

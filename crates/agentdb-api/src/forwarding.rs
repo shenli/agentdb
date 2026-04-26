@@ -210,6 +210,50 @@ pub async fn forward_fork(
     .await
 }
 
+/// 421 Misdirected Request for the subscribe path. Phase 1
+/// doesn't proxy SSE across nodes (spec §6.8) — instead, when a
+/// subscribe arrives on a node that doesn't own the session, we
+/// return 421 with the owner's address so the SDK reconnects
+/// directly. Single-owner shape (`owner_addr`); the tenant-wide
+/// equivalent uses [`subscribe_not_owner_multi_reply`].
+pub fn subscribe_not_owner_reply(target: &NodeTarget, location_path: &str) -> Response {
+    let base = normalize_base(&target.address);
+    let location = format!("{base}{location_path}");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "code": "not_owner",
+        "type": "api_error",
+        "message": "this node does not own the requested session; reconnect to the owner",
+        "owner_addr": target.address,
+        "owner_node_id": target.node_id,
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::MISDIRECTED_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::LOCATION, location)
+        .body(axum::body::Body::from(body))
+        .expect("static not_owner reply builds")
+}
+
+/// 421 Misdirected Request for the tenant-wide subscribe path.
+/// The tenant's sessions may live on multiple peers; the SDK
+/// opens one connection per `owner_addrs` entry. No `Location`
+/// header — there's no single redirect target.
+pub fn subscribe_not_owner_multi_reply(owner_addrs: Vec<String>) -> Response {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "code": "not_owner",
+        "type": "api_error",
+        "message": "this node does not own all sessions in the tenant subscribe set; reconnect to each owner",
+        "owner_addrs": owner_addrs,
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::MISDIRECTED_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .expect("static not_owner_multi reply builds")
+}
+
 /// 421 Misdirected Request. Used when a forwarded request
 /// arrives and the receiving node's own routing table still
 /// says it should be forwarded (cross-node state drift).
@@ -375,5 +419,24 @@ mod tests {
     fn misdirected_reply_carries_421() {
         let r = misdirected_reply("node-a", 7);
         assert_eq!(r.status().as_u16(), 421);
+    }
+
+    #[test]
+    fn subscribe_not_owner_reply_carries_421_and_location() {
+        let target = NodeTarget {
+            node_id: "node-b".into(),
+            address: "127.0.0.1:9999".into(),
+        };
+        let r = subscribe_not_owner_reply(&target, "/api/tenants/t-1/sessions/s-1/subscribe");
+        assert_eq!(r.status().as_u16(), 421);
+        let loc = r.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert_eq!(loc, "http://127.0.0.1:9999/api/tenants/t-1/sessions/s-1/subscribe");
+    }
+
+    #[test]
+    fn subscribe_not_owner_multi_reply_carries_421_no_location() {
+        let r = subscribe_not_owner_multi_reply(vec!["a:1".into(), "b:2".into()]);
+        assert_eq!(r.status().as_u16(), 421);
+        assert!(r.headers().get(header::LOCATION).is_none());
     }
 }
