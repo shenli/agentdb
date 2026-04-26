@@ -17,10 +17,30 @@
 
 name: ci
 
+# Skip CI on docs-only changes. Docs can't break the build,
+# so the ~5–10 minutes of cargo + Mongo wire tests is wasted
+# heat (and runner-disk pressure) for a Markdown edit.
+#
+# `paths-ignore` is OR'd against the trigger: a PR that touches
+# any non-listed path runs CI normally; a PR that touches ONLY
+# listed paths skips the whole workflow.
+#
+# Workflow files themselves (`.github/workflows/**`) stay
+# unfiltered — a CI change must be CI-tested. README, AGENTS,
+# LLMS, ARCHITECTURE, runbooks, and per-SDK READMEs are all
+# safe to skip.
 on:
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
 
 # Cancel an in-flight run when a new push lands on the same PR
 # branch — saves runner time on noisy PRs.
