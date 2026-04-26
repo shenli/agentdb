@@ -49,6 +49,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 // `axum_extra::extract::Query` uses `serde_html_form` and decodes
 // repeated query keys (`?kind=a&kind=b`) into `Vec<String>`. The
 // default axum `Query` (backed by `serde_urlencoded`) cannot, so
@@ -87,6 +88,11 @@ pub struct SubscribeQuery {
     /// without a long sleep; production clients leave it default.
     #[serde(default)]
     pub heartbeat_secs: Option<u64>,
+    /// JWT-as-query-param for browser EventSource clients which
+    /// can't set custom headers (spec §6.13). Mutually exclusive
+    /// with `Authorization: Bearer …`; both supplied ⇒ 400.
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 /// Drop empty / whitespace-only entries so a stray `?kind=` (or
@@ -103,6 +109,7 @@ pub async fn subscribe_session(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
     Query(q): Query<SubscribeQuery>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -119,6 +126,33 @@ pub async fn subscribe_session(
             tenant, session
         );
         return crate::forwarding::subscribe_not_owner_reply(&target, &path);
+    }
+
+    // JWT enforcement (spec §6.13). Returns Ok(None) if the tenant
+    // has no JWT config — falls through to whatever auth the route's
+    // middleware applies (typically Basic). Otherwise Some(claims) on
+    // verify success, or an ApiError on dual-auth / missing / invalid /
+    // expired token.
+    let jwt_claims = match crate::subscribe_auth::extract_subscribe_jwt(
+        &state,
+        &headers,
+        q.access_token.as_deref(),
+        &tenant,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(claims) = &jwt_claims {
+        if !claims.sessions.allows(&session) {
+            return crate::error::ApiError::Coded(
+                axum::http::StatusCode::FORBIDDEN,
+                crate::error::ErrorCode::SessionNotInJwt,
+                format!("jwt sessions claim does not allow session {session}"),
+            )
+            .into_response();
+        }
     }
 
     // Subscribe FIRST so any event appended between here and the
@@ -384,6 +418,11 @@ pub struct TenantSubscribeQuery {
     /// semantics as the per-session endpoint.
     #[serde(default)]
     pub heartbeat_secs: Option<u64>,
+    /// JWT-as-query-param for browser EventSource clients which
+    /// can't set custom headers (spec §6.13). Mutually exclusive
+    /// with `Authorization: Bearer …`; both supplied ⇒ 400.
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 /// Multi-session live-tail state. Mirrors [`LiveState`] but tracks
@@ -453,6 +492,7 @@ pub async fn subscribe_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
     Query(q): Query<TenantSubscribeQuery>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -492,6 +532,58 @@ pub async fn subscribe_tenant(
             let mut addrs: Vec<String> = remote_owners.into_iter().collect();
             addrs.sort();
             return crate::forwarding::subscribe_not_owner_multi_reply(addrs);
+        }
+    }
+
+    // JWT enforcement (spec §6.13). Same fall-through-on-no-config
+    // semantics as the per-session endpoint. For tenant-wide we then
+    // cross-check the claim against every session the client named
+    // (whitelist or per-session catch-up cursor); if no specific
+    // sessions were named the claim must be `sessions: "*"`,
+    // otherwise the subscriber would silently see no events for
+    // sessions outside its claim — better to fail loud.
+    let jwt_claims = match crate::subscribe_auth::extract_subscribe_jwt(
+        &state,
+        &headers,
+        q.access_token.as_deref(),
+        &tenant,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(claims) = &jwt_claims {
+        let mut named: HashSet<&str> = q.session.iter().map(String::as_str).collect();
+        for k in from_seq_map.keys() {
+            named.insert(k.as_str());
+        }
+        if named.is_empty() {
+            // No explicit session list → require wildcard claim.
+            let is_wildcard = matches!(
+                claims.sessions,
+                crate::jwt::SessionsClaim::Wildcard(ref s) if s == "*"
+            );
+            if !is_wildcard {
+                return crate::error::ApiError::Coded(
+                    axum::http::StatusCode::FORBIDDEN,
+                    crate::error::ErrorCode::SessionNotInJwt,
+                    "tenant-wide subscribe without specific sessions requires sessions=\"*\""
+                        .into(),
+                )
+                .into_response();
+            }
+        } else {
+            for sid in &named {
+                if !claims.sessions.allows(sid) {
+                    return crate::error::ApiError::Coded(
+                        axum::http::StatusCode::FORBIDDEN,
+                        crate::error::ErrorCode::SessionNotInJwt,
+                        format!("jwt sessions claim does not allow session {sid}"),
+                    )
+                    .into_response();
+                }
+            }
         }
     }
 
