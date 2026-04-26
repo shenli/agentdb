@@ -43,6 +43,18 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> Self {
+        Self::start_with_event_bus(EventBus::default()).await
+    }
+
+    /// Like `start()` but constructs the underlying `EventBus` with
+    /// the given capacity. Used by the lag-too-far test to force
+    /// overflow under a small capacity instead of waiting for the
+    /// production default (16384) to fill.
+    pub async fn start_with_event_bus_capacity(cap: usize) -> Self {
+        Self::start_with_event_bus(EventBus::new(cap)).await
+    }
+
+    async fn start_with_event_bus(event_bus: EventBus) -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
@@ -53,7 +65,7 @@ impl TestServer {
             tenants: Arc::new(TenantRegistry::new(kv.clone())),
             sessions: Arc::new(SessionRegistry::new(kv)),
             stream: StreamBus::default(),
-            event_bus: EventBus::default(),
+            event_bus,
             http: agentdb_api::webhook::new_client(),
             auth: None,
             admin_auth: None,
@@ -152,6 +164,40 @@ impl SseStream {
     /// `subscribed` control event.
     pub async fn skip_subscribed_event(&mut self) {
         let _ = self.next_event().await;
+    }
+
+    /// Like [`SseStream::next_event`] but returns `None` on EOF or
+    /// transport error instead of panicking. Tests asserting that
+    /// the server *closes* the stream (e.g. after a `lag_too_far`
+    /// error frame) need to distinguish "got another frame" from
+    /// "server hung up", which `next_event`'s panic-on-end behavior
+    /// hides.
+    pub async fn try_next_event(&mut self) -> Option<SseFrame> {
+        loop {
+            if let Some(idx) = self.buf.find("\n\n") {
+                let block = self.buf[..idx].to_string();
+                self.buf.drain(..idx + 2);
+                let frame = parse_sse_block(&block);
+                if frame.event_name.is_none() && frame.data.is_empty() {
+                    continue;
+                }
+                return Some(frame);
+            }
+            match self.body.chunk().await {
+                Ok(Some(chunk)) => {
+                    // EOF and transport error legitimately resolve
+                    // to `None` (the server may close after an
+                    // error frame); a non-UTF-8 chunk is *not* a
+                    // clean close — masking it as one would hide a
+                    // real serialization bug. Mirror `next_event`
+                    // and panic loudly.
+                    let s = std::str::from_utf8(&chunk)
+                        .expect("sse chunk must be valid utf-8");
+                    self.buf.push_str(s);
+                }
+                _ => return None,
+            }
+        }
     }
 }
 

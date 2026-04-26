@@ -78,9 +78,27 @@ pub async fn resolve_session_next_seq(
 /// Returns `Ok(empty vec)` if the tenant or session does not exist
 /// yet (subscriber attached before any append). Returns
 /// `Err(ApiError::Internal)` on KV / snapshot errors so the caller
-/// can log them — at the SSE handler boundary we degrade to "no
-/// catch-up" rather than dropping the whole subscription, but the
-/// error path stays distinguishable from "no events to replay".
+/// can log them — at the SSE handler boundary we surface those as
+/// a `catchup_failed` close frame so the client can reconnect with
+/// a refreshed cursor instead of silently flipping to live tail
+/// across an unfilled `[from_seq, live_seq)` gap.
+///
+/// **Snapshot consistency note.** Subscribe callers snapshot
+/// `live_seq = session.next_seq` via [`resolve_session_next_seq`]
+/// *before* invoking this helper, then pass that snapshot in as
+/// `end_seq`. We re-resolve the [`agentdb_core::Session`] here to
+/// get a storage handle for [`agentdb_core::ReadCtx`], which means
+/// the `Session.next_seq` we read on this call may be **larger**
+/// than the caller's `live_seq` (more appends landed in between).
+/// That is safe: `next_seq` is monotonically non-decreasing for a
+/// session — only [`agentdb_core::primitives::append_event`]
+/// modifies it, and it always sets `next_seq = seq + 1` (verified
+/// in `crates/agentdb-core/src/primitives.rs`). New session/fork
+/// records start at `next_seq = 1`. So the inner
+/// `clamped_end = end_seq.min(session.next_seq)` in
+/// [`agentdb_core::fetch_events_from_seq`] is at worst `end_seq`
+/// itself — never lower — and the catch-up window
+/// `[from_seq, live_seq)` is always returned in full. No gap.
 pub async fn scan_events_from_seq(
     state: &AppState,
     tenant_external: &str,
@@ -100,6 +118,10 @@ pub async fn scan_events_from_seq(
             )))
         }
     };
+    // Re-resolve the Session for its storage handle. `next_seq` is
+    // monotonic, so reading it here may return a value `>=` the
+    // caller's `live_seq` snapshot — never lower. See the rustdoc
+    // above for why that keeps the catch-up window gap-free.
     let session = match state
         .sessions
         .lookup(box_.id, tenant.internal_id, session_external)

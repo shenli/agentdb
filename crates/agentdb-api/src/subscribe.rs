@@ -1,4 +1,4 @@
-//! Phase 1 Tasks 4 + 5: per-session subscribe SSE endpoint.
+//! Phase 1 Tasks 4 + 5 + 6: per-session subscribe SSE endpoint.
 //!
 //! Connects the on-process [`crate::EventBus`] to an HTTP SSE
 //! response. Per spec §6.1/§6.2/§6.3/§6.4:
@@ -23,8 +23,26 @@
 //! bus subscribe happened before the `live_seq` snapshot, which
 //! it does (step 1 before step 2).
 //!
-//! The lag-too-far error frame, multi-node 421, JWT, and CORS are
-//! all later tasks — this file deliberately stays small.
+//! ## Error frames
+//!
+//! Two error conditions terminate the stream with an explicit
+//! `event: error` frame so the SDK can reconnect gap-free instead
+//! of guessing what happened (spec §6.6):
+//!
+//! - **`lag_too_far`** — the subscriber fell behind the bus
+//!   capacity. We capture the last successfully delivered `seq`
+//!   and emit it so the client reconnects with
+//!   `from_seq = last_delivered_seq + 1`.
+//! - **`catchup_failed`** — the durable-log scan in
+//!   `[from_seq, live_seq)` returned a KV/snapshot error. Failing
+//!   loud is preferable to silently switching to live tail and
+//!   leaving a gap in `[from_seq, live_seq)`.
+//!
+//! Both reuse [`error_frame`] for a consistent wire shape. Task 9d
+//! (`jwt_expired`) plugs into the same helper.
+//!
+//! Multi-node 421, JWT, and CORS are still later tasks — this file
+//! stays focused on the per-session subscribe path.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -94,40 +112,6 @@ pub async fn subscribe_session(
         .await
         .unwrap_or(0);
 
-    // Catch-up phase. `from_seq < live_seq` ⇒ the client missed
-    // events in `[from_seq, live_seq)`; replay them from the
-    // durable log. `from_seq` defaults to `live_seq` so an absent
-    // query parameter is "pure live tail, no catch-up".
-    //
-    // On scan failure we degrade to "live tail only" with a warn —
-    // dropping the whole subscription would be worse than a
-    // potential gap, and the client can still reconnect. The
-    // resolve helper's warn covers most KV-error cases too.
-    let from_seq = q.from_seq.unwrap_or(live_seq);
-    let catchup_envs: Vec<EventEnvelope> = if from_seq < live_seq {
-        match crate::handlers::scan_events_from_seq(&state, &tenant, &session, from_seq, live_seq)
-            .await
-        {
-            Ok(events) => events
-                .into_iter()
-                .map(|ev| crate::event_bus::envelope_from_event(&tenant, &session, &ev))
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    tenant = %tenant,
-                    session = %session,
-                    from_seq,
-                    live_seq,
-                    "subscribe catch-up scan failed; falling back to live tail",
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
     let subscribed_payload = serde_json::json!({
         "tenant": tenant,
         "session": session,
@@ -142,6 +126,56 @@ pub async fn subscribe_session(
     });
 
     let kind_filter = normalize_kind_filter(q.kind);
+
+    // Catch-up phase. `from_seq < live_seq` ⇒ the client missed
+    // events in `[from_seq, live_seq)`; replay them from the
+    // durable log. `from_seq` defaults to `live_seq` so an absent
+    // query parameter is "pure live tail, no catch-up".
+    //
+    // Spec §6.6: on scan failure we send `catchup_failed` and
+    // close, rather than silently degrading to live tail (which
+    // would leave the client with a gap in `[from_seq, live_seq)`
+    // that nothing on the wire signals).
+    let from_seq = q.from_seq.unwrap_or(live_seq);
+    let keepalive_secs = q.heartbeat_secs.unwrap_or(20);
+
+    let catchup_envs: Vec<EventEnvelope> = if from_seq < live_seq {
+        match crate::handlers::scan_events_from_seq(&state, &tenant, &session, from_seq, live_seq)
+            .await
+        {
+            Ok(events) => events
+                .into_iter()
+                .map(|ev| crate::event_bus::envelope_from_event(&tenant, &session, &ev))
+                .collect(),
+            Err(e) => {
+                // Spec §6.6: catch-up failure is loud — we emit a
+                // `subscribed` (so the client sees the cursor we
+                // tried for) followed by an `error: catchup_failed`
+                // frame, then close. Silently degrading to live tail
+                // would leave a gap in `[from_seq, live_seq)` that
+                // the wire doesn't signal.
+                tracing::warn!(
+                    error = ?e,
+                    tenant = %tenant,
+                    session = %session,
+                    from_seq,
+                    live_seq,
+                    "subscribe catch-up scan failed; closing with catchup_failed",
+                );
+                let err = error_frame(
+                    "catchup_failed",
+                    serde_json::json!({"from_seq": from_seq, "live_seq": live_seq}),
+                );
+                let err_stream = stream::once(async move { Ok::<_, Infallible>(err) });
+                let combined = subscribed_evt.chain(err_stream).left_stream();
+                return Sse::new(combined)
+                    .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)));
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let kind_filter_for_catchup = kind_filter.clone();
     let catchup_stream = stream::iter(catchup_envs.into_iter().filter_map(move |env| {
         if !kind_matches(&env, &kind_filter_for_catchup) {
@@ -153,22 +187,49 @@ pub async fn subscribe_session(
 
     let want_tenant = tenant.clone();
     let want_session = session.clone();
+    // `last_delivered_seq` reflects the highest seq the client has
+    // actually received via this SSE stream when the live phase
+    // begins. If catch-up ran (`from_seq < live_seq`), the catch-up
+    // phase delivered all events with `seq < live_seq`, so the
+    // high-water mark is `live_seq - 1`. If catch-up didn't run
+    // (`from_seq >= live_seq`, pure live tail), nothing has been
+    // delivered yet. Spec §6.6: the close frame on `lag_too_far`
+    // tells the client to reconnect with
+    // `from_seq = last_delivered_seq + 1`; if we left this at 0
+    // after a non-empty catch-up, the SDK would replay the entire
+    // `[0, live_seq)` window on reconnect.
+    let initial_last_delivered_seq = if from_seq < live_seq {
+        live_seq.saturating_sub(1)
+    } else {
+        0
+    };
+    let initial = LiveState {
+        rx,
+        live_seq,
+        last_delivered_seq: initial_last_delivered_seq,
+        closed_after_error: false,
+    };
     // Subscriber-side filtering. Spec §6.7: Phase 1 uses a single
     // bus and accepts O(n_subs × n_events). Per-(tenant, session)
     // keyed buses are the upgrade path when this becomes the
     // bottleneck.
-    let live = stream::unfold((rx, live_seq), move |(mut rx, live_seq)| {
+    let live = stream::unfold(initial, move |mut state| {
         let kind_filter = kind_filter.clone();
         let want_tenant = want_tenant.clone();
         let want_session = want_session.clone();
         async move {
+            // Previous iteration emitted the lag_too_far frame;
+            // close the stream now.
+            if state.closed_after_error {
+                return None;
+            }
             loop {
-                match rx.recv().await {
+                match state.rx.recv().await {
                     Ok(env) => {
                         if env.tenant != want_tenant || env.session != want_session {
                             continue;
                         }
-                        if env.seq < live_seq {
+                        if env.seq < state.live_seq {
                             // Already delivered via catch-up scan
                             // (or would have been if from_seq
                             // covered it). Drop to keep the
@@ -179,20 +240,88 @@ pub async fn subscribe_session(
                             continue;
                         }
                         let payload = serde_json::to_string(&env).unwrap_or_else(|_| "{}".into());
-                        return Some((Ok(Event::default().data(payload)), (rx, live_seq)));
+                        state.last_delivered_seq = env.seq;
+                        return Some((Ok(Event::default().data(payload)), state));
                     }
-                    // Sender dropped or stream closed. End the
-                    // SSE response cleanly — clients reconnect
-                    // with the EventSource retry policy.
-                    Err(_) => return None,
+                    Err(async_broadcast::RecvError::Overflowed(missed)) => {
+                        // Client fell behind. Tell them what the
+                        // last seq we delivered was so they can
+                        // reconnect with `from_seq = N + 1` and
+                        // recover gap-free.
+                        tracing::warn!(
+                            tenant = %want_tenant,
+                            session = %want_session,
+                            missed,
+                            last_delivered_seq = state.last_delivered_seq,
+                            "subscribe lag_too_far; closing stream",
+                        );
+                        let frame = error_frame(
+                            "lag_too_far",
+                            serde_json::json!({
+                                "last_delivered_seq": state.last_delivered_seq,
+                            }),
+                        );
+                        state.closed_after_error = true;
+                        return Some((Ok(frame), state));
+                    }
+                    // Bus shut down. End the SSE response cleanly —
+                    // clients reconnect with the EventSource retry
+                    // policy.
+                    Err(async_broadcast::RecvError::Closed) => return None,
                 }
             }
         }
     });
 
-    let stream = subscribed_evt.chain(catchup_stream).chain(live);
-    let keepalive_secs = q.heartbeat_secs.unwrap_or(20);
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
+    let combined = subscribed_evt.chain(catchup_stream).chain(live);
+    Sse::new(combined.right_stream())
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
+}
+
+/// Live-tail iterator state carried through `stream::unfold`.
+///
+/// `last_delivered_seq` is the seq of the most recent envelope
+/// returned to the client (zero before the first delivery), so the
+/// `lag_too_far` close frame can tell the client where to resume
+/// from. `closed_after_error` is the one-shot flag that makes
+/// `unfold` end the stream after emitting the error frame: SSE has
+/// no graceful "send this frame then close" primitive, so we hand
+/// out the error envelope, mark the state, and return `None` on
+/// the next poll.
+struct LiveState {
+    rx: async_broadcast::Receiver<EventEnvelope>,
+    live_seq: u64,
+    last_delivered_seq: u64,
+    closed_after_error: bool,
+}
+
+/// Build the JSON body for an error frame: `{"error": <error>,
+/// ...extras}`. Split out from [`error_frame`] so the body shape is
+/// unit-testable without an SSE round-trip — `axum::response::sse::Event`
+/// doesn't expose its event/data fields. Non-object `extras` is
+/// ignored so callers can pass `serde_json::Value::Null` for the
+/// no-extras case.
+fn build_error_body(error: &str, extras: serde_json::Value) -> String {
+    let mut body = serde_json::json!({"error": error});
+    if let serde_json::Value::Object(map) = extras {
+        for (k, v) in map {
+            body[k] = v;
+        }
+    }
+    body.to_string()
+}
+
+/// Build an `event: error` frame with `data:` set to a JSON object
+/// `{"error": <error>, ...extras}`. Shared by `lag_too_far` and
+/// `catchup_failed`; the next planned reuse is Task 9d
+/// (`jwt_expired`). `extras` is merged into the body — pass an
+/// `Object` like `json!({"last_delivered_seq": 7})` and its keys
+/// land alongside `error`. Non-object `extras` is ignored so callers
+/// can pass `serde_json::Value::Null` when there are no extras.
+fn error_frame(error: &str, extras: serde_json::Value) -> Event {
+    Event::default()
+        .event("error")
+        .data(build_error_body(error, extras))
 }
 
 /// Empty filter ⇒ deliver everything. Otherwise the envelope's
@@ -240,6 +369,40 @@ mod tests {
         assert!(kind_matches(&env(Some("keep")), &f));
         assert!(!kind_matches(&env(Some("skip")), &f));
         assert!(!kind_matches(&env(None), &f));
+    }
+
+    #[test]
+    fn build_error_body_merges_extras() {
+        let s = build_error_body(
+            "catchup_failed",
+            serde_json::json!({"from_seq": 5, "live_seq": 10}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "catchup_failed");
+        assert_eq!(v["from_seq"], 5);
+        assert_eq!(v["live_seq"], 10);
+    }
+
+    #[test]
+    fn build_error_body_handles_lag_too_far_shape() {
+        let s = build_error_body(
+            "lag_too_far",
+            serde_json::json!({"last_delivered_seq": 42}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "lag_too_far");
+        assert_eq!(v["last_delivered_seq"], 42);
+    }
+
+    #[test]
+    fn build_error_body_ignores_non_object_extras() {
+        // Defensive: callers may pass `Value::Null` when no extras
+        // apply; that should yield just `{"error": ...}` rather
+        // than failing or producing a malformed body.
+        let s = build_error_body("some_err", serde_json::Value::Null);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"], "some_err");
+        assert!(v.as_object().unwrap().len() == 1);
     }
 
     #[test]
