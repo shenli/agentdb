@@ -53,14 +53,14 @@ agentdb serve --dev
 # (or: cargo run -p agentdb-server -- serve --dev)
 
 # 2. In another shell, install a client SDK
-pip install -e clients/python                # Python
-# or
-(cd clients/typescript && npm install && npm run build)   # TypeScript
+pip install -e clients/python                                          # Python
+(cd clients/typescript && npm install && npm run build)                # TypeScript
+(cd examples/agents/go && go build .)                                  # Go (uses local replace)
 
-# 3. Run a sample agent loop
+# 3. Run a sample agent loop in your language of choice
 python examples/agents/python/quickstart.py
-# or
 node --experimental-strip-types examples/agents/typescript/quickstart.ts
+(cd examples/agents/go && go run .)
 ```
 
 You should see three turns of working memory grow, then a fork
@@ -99,8 +99,22 @@ const result = await session.append(
 console.log("seq:", result.seq, result.recent.map((e) => e.payload));
 ```
 
-Other languages (Go, Rust client crate) are tracked as follow-ups;
-in the meantime any MongoDB driver speaks the wire port at
+**Go** ([`clients/go/`](clients/go/README.md)):
+
+```go
+import "github.com/shenli/agentdb/clients/go/agentdb"
+
+client := agentdb.New("http://127.0.0.1:7878",
+    agentdb.WithDefaultTenant("demo"))
+sess := client.Session("agent-1")
+res, _ := sess.Append(ctx,
+    map[string]any{"role": "user", "text": "hello"},
+    agentdb.AppendOptions{FetchLastN: 5})
+fmt.Println("seq:", res.Seq, "recent:", len(res.Recent))
+```
+
+A Rust client crate is the natural follow-up; in the meantime
+any MongoDB driver speaks the wire port at
 `mongodb://127.0.0.1:7879`.
 
 ### Operator subcommands

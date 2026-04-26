@@ -97,7 +97,7 @@ jobs:
         run: cargo test --workspace --locked
 
   sdks:
-    name: SDK smoke (Python + TypeScript)
+    name: SDK smoke (Python + TypeScript + Go)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -166,3 +166,18 @@ jobs:
         # fast on the warm cache and ensures the test runs
         # against the just-built dist/.
         run: npm test
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          # `cache-dependency-path` intentionally omitted —
+          # the SDK has no third-party deps so there's no
+          # `go.sum` to cache against. Re-add when deps land.
+          cache: false
+
+      - name: go test (Go SDK smoke)
+        working-directory: clients/go
+        # The smoke test spawns the just-built `agentdb` binary
+        # (cargo build step above) and round-trips events.
+        run: go test ./...
