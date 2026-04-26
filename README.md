@@ -1,27 +1,45 @@
 # AgentDB
 
-A prototype **agent-native operational database**. The premise and
-design rationale live in [`docs/agent-db.md`](docs/agent-db.md); this
-repo is the showcase-grade prototype of what the primitives look like
-when you actually build them.
+The **agent-native operational database**. AgentDB stores your
+agent's events (thoughts, tool calls, user turns) in sessions,
+and serves the retrieval the agent needs at the next turn —
+text + vector search — over the same events. One system, one
+wire, no separate vector store.
 
-> AgentDB is a prototype. It's a single process with a pluggable
-> storage backend, not a distributed system. The goal is to prove the
-> agent-native primitives compose — not to replace your Postgres.
+🚀 [Install](#install) · 🏃 [Quickstart](#quickstart--your-first-agent-in-three-commands) · 🤖 [For AI agents](#-for-ai-agents-using-agentdb) · 🏗 [Architecture](docs/ARCHITECTURE.md)
 
 ---
 
-## What it does differently
+## What it gives you
 
-| | |
-|---|---|
-| **`append_and_fetch`** | Write one event and return the last N in the same round trip — the hot-path primitive for an agent scribbling context between tool calls. |
-| **Session fork** | Cross-session parent pointer so children see a frozen snapshot of the parent's events at fork time, without copying. MVCC-backed. |
-| **Hybrid retrieval** | BM25 text + HNSW cosine vector search, planned together with a tenant/session filter in one query. |
-| **3-tier lifecycle** | Warm → cold → archive, with a pluggable object store underneath. Tier transitions emit webhooks so you can fan out derived data (summaries, embeddings, archival copies). |
-| **Per-box isolation** | Tenants FNV-route to boxes. Each box has its own metrics, quota, token-bucket admission control, fault injection, webhook URL. |
-| **Pluggable KV** | RocksDB (local disk) or SlateDB (object store — S3 / MinIO). Swap via one env var. |
-| **Live dashboard** | Tabbed Alpine.js page at `/dashboard`: overview (box grid + SSE event feed), slow queries, audit log, token mint/revoke, tenant-quota editor. Takes an admin bearer token in the header input and stores it in `localStorage`. |
+- **`append_and_fetch`** — write one event, get the last N
+  back in the same round trip. The hot path of every agent
+  loop, in one HTTP request.
+- **Session fork** — branch a session into "what if" timelines
+  without copying events. MVCC-backed.
+- **Hybrid retrieval** — BM25 text search and HNSW cosine
+  vector search over the event log, with tenant + session
+  filters. Same database, same wire.
+- **Three-tier lifecycle** — warm → cold → archive,
+  transparent to readers. Tier transitions emit webhooks so
+  you can fan out summaries, embeddings, or archival copies.
+- **Multi-tenant by default** — per-tenant quota, admission
+  control, and isolation; HTTP Basic Auth + SCRAM-SHA-256 for
+  the Mongo wire when enabled.
+
+Operator-grade extras (live dashboard, Prometheus metrics,
+S3-backed storage, multi-node replication) live alongside —
+see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## 🤖 For AI agents using AgentDB
+
+If you're an LLM-driven agent reading this repo to learn the
+API, jump straight to **[`AGENTS.md`](AGENTS.md)** — a
+single-page manual designed to be ingested in one shot. It
+covers the five operations you'll actually use, the request /
+response shapes, and the common mistakes.
 
 ---
 
@@ -38,7 +56,8 @@ curl -sSL https://raw.githubusercontent.com/shenli/agentdb/main/scripts/install.
 # B. Docker — multi-arch image on GHCR.
 docker run --rm -p 7878:7878 -p 7879:7879 ghcr.io/shenli/agentdb:latest serve --dev
 
-# C. From source (requires Rust 1.84+).
+# C. From source. `rust-toolchain.toml` pins the version, so
+#    rustup auto-installs the right toolchain on first build.
 cargo install --git https://github.com/shenli/agentdb agentdb-server
 ```
 
@@ -374,10 +393,15 @@ cargo bench -p agentdb-index --bench vector_bench     # HNSW vs brute-force vect
 
 ## Status
 
-Prototype with a working control plane. Every single-process agent-
-native primitive is implemented (append-and-fetch, fork, hybrid
-retrieval, three-tier lifecycle, box isolation, admission control,
-lifecycle webhooks, MVCC snapshot reads, HLC, pluggable KV). The
+> AgentDB is an open-source prototype. It runs as a single
+> process or a small multi-node cluster, with a pluggable
+> storage backend. The goal is to prove the agent-native
+> primitives compose — not to replace your Postgres.
+
+Every single-process agent-native primitive is implemented
+(append-and-fetch, fork, hybrid retrieval, three-tier
+lifecycle, box isolation, admission control, lifecycle
+webhooks, MVCC snapshot reads, HLC, pluggable KV). The
 M18+ milestones added:
 
 - **SQLite control plane** (tenants, nodes, tablets, shards, scheduler leader)
