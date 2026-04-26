@@ -2320,7 +2320,11 @@
           "forbidden",
           "conflict",
           "service_unavailable",
-          "internal"
+          "internal",
+          "jwt_invalid",
+          "jwt_expired",
+          "session_not_in_jwt",
+          "bad_request_dual_auth"
         ]
       },
       "ErrorKind": {

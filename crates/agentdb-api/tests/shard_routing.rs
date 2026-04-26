@@ -67,6 +67,7 @@ async fn spawn() -> (
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
     let app = router(state)
         .layer(axum::Extension(meta.clone()))

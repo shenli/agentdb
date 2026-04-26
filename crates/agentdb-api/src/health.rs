@@ -167,6 +167,7 @@ mod tests {
                 http,
                 auth: None,
         admin_auth: None,
+                jwt_config: crate::jwt::JwtConfig::default(),
             },
         )
     }
@@ -205,6 +206,7 @@ mod tests {
                 http: crate::webhook::new_client(),
                 auth: None,
         admin_auth: None,
+                jwt_config: crate::jwt::JwtConfig::default(),
             },
         )
     }

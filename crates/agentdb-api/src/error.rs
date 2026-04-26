@@ -32,6 +32,14 @@ pub enum ApiError {
     /// strip these.
     #[error("internal: {0}")]
     Internal(String),
+    /// Escape hatch for handlers that need to return an arbitrary
+    /// `(http_status, error_code, message)` triple without minting
+    /// a new variant. Body shape stays the standard
+    /// `{code, type, message}`. Used by Task 9c subscribe-auth
+    /// extraction so JWT errors map cleanly to HTTP without
+    /// growing the top-level `ApiError` enum.
+    #[error("{2}")]
+    Coded(StatusCode, ErrorCode, String),
 }
 
 /// The JSON body we emit for every REST error. Always carries
@@ -103,6 +111,20 @@ pub enum ErrorCode {
     ServiceUnavailable,
     /// 500 — unexpected internal failure. Message in body.
     Internal,
+    /// Task 9c: JWT signature, claim shape, issuer, or tenant
+    /// mismatch on a subscribe request. 401.
+    JwtInvalid,
+    /// Task 9c: JWT was syntactically valid but past `exp`. 401.
+    /// Distinguished from `JwtInvalid` so SDKs can refresh-then-
+    /// reconnect instead of bubbling auth-failed to the user.
+    JwtExpired,
+    /// Task 9c: JWT verified but the path session is not in the
+    /// `sessions` claim (and the claim isn't `"*"`). 403.
+    SessionNotInJwt,
+    /// Task 9c: caller sent both Basic auth and a JWT bearer on
+    /// the same subscribe request. We refuse to guess which one
+    /// the caller meant. 400.
+    BadRequestDualAuth,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -146,6 +168,10 @@ impl ApiError {
             ApiError::Internal(msg) => {
                 let body = auth_error_body(ErrorCode::Internal, msg);
                 return (StatusCode::INTERNAL_SERVER_ERROR, HeaderMap::new(), body);
+            }
+            ApiError::Coded(status, code, msg) => {
+                let body = auth_error_body(*code, msg);
+                return (*status, HeaderMap::new(), body);
             }
         };
         let message = err.to_string();
@@ -378,7 +404,11 @@ pub fn doc_url_for(code: ErrorCode) -> Option<&'static str> {
         | ErrorCode::Forbidden
         | ErrorCode::Conflict
         | ErrorCode::ServiceUnavailable
-        | ErrorCode::Internal => None,
+        | ErrorCode::Internal
+        | ErrorCode::JwtInvalid
+        | ErrorCode::JwtExpired
+        | ErrorCode::SessionNotInJwt
+        | ErrorCode::BadRequestDualAuth => None,
     }
 }
 

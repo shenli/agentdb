@@ -91,6 +91,7 @@ async fn spawn_dynamic_node() -> (
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
     let app = router(state)
         .layer(Extension(meta.clone()))

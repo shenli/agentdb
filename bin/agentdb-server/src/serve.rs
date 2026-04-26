@@ -1089,6 +1089,7 @@ pub async fn run(
         } else {
             None
         },
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
 
     // Auto-shed scheduler (post-M25 operator ergonomics).

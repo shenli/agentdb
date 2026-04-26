@@ -538,6 +538,7 @@ mod tests {
                 http,
                 auth: None,
         admin_auth: None,
+                jwt_config: crate::jwt::JwtConfig::default(),
             },
         )
     }

@@ -55,6 +55,7 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
 
     tokio::spawn(async move {

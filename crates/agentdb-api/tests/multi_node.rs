@@ -120,6 +120,7 @@ async fn build_node(
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
     let app = router(state);
     tokio::spawn(async move {

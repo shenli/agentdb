@@ -40,6 +40,7 @@ async fn spawn_with_auth() -> (TempDir, TempDir, tempfile::NamedTempFile, String
             meta: Some(meta.clone()),
         }),
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
     };
     let app = router(state).layer(axum::Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -35,6 +35,7 @@ pub mod jwt;
 pub mod metrics_exposition;
 pub mod stream;
 pub mod subscribe;
+pub mod subscribe_auth;
 pub mod trace_context;
 pub mod webhook;
 
@@ -67,6 +68,13 @@ pub struct AppState {
     /// exception: the first `POST /api/admin/tokens` is
     /// allowed without auth when no active tokens exist.
     pub admin_auth: Option<admin_auth_middleware::AdminAuthConfig>,
+    /// Task 9c JWT subscribe-auth config. Per-tenant verifier
+    /// settings (HMAC secret or JWKS URL). Empty `per_tenant`
+    /// map means "no JWT auth configured" — the subscribe
+    /// middleware still falls back to Basic auth on those
+    /// tenants. See `docs/superpowers/specs/2026-04-25-pubsub-design.md`
+    /// §6.13.
+    pub jwt_config: jwt::JwtConfig,
 }
 
 #[derive(Clone)]
@@ -101,6 +109,7 @@ impl AppState {
             http,
             auth: None,
             admin_auth: None,
+            jwt_config: jwt::JwtConfig::default(),
         }
     }
 }
