@@ -44,6 +44,7 @@
 //! Multi-node 421, JWT, and CORS are still later tasks — this file
 //! stays focused on the per-session subscribe path.
 
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -336,6 +337,289 @@ fn kind_matches(env: &EventEnvelope, kind_filter: &[String]) -> bool {
         .is_some_and(|k| kind_filter.iter().any(|f| f == k))
 }
 
+/// Query string for `GET /api/tenants/{tenant_id}/subscribe`. All
+/// fields are optional (spec §6.5).
+///
+/// `session` and `kind` are repeated-key vectors decoded via
+/// `serde_html_form` (matching [`SubscribeQuery`]). `session` is a
+/// whitelist — empty ⇒ no whitelist, every session of the tenant.
+/// `kind` is OR'd. `from_seq_per_session` encodes a per-session
+/// catch-up cursor as a comma-separated `id:seq` list (e.g.
+/// `s-1:42,s-2:7`); session ids must not contain `,` or `:`.
+#[derive(Debug, Deserialize)]
+pub struct TenantSubscribeQuery {
+    /// Repeated-key whitelist of session ids. Empty vec ⇒ deliver
+    /// every session of the tenant.
+    #[serde(default)]
+    pub session: Vec<String>,
+    /// Repeated-key kind filter. Empty vec ⇒ deliver every kind.
+    #[serde(default)]
+    pub kind: Vec<String>,
+    /// Per-session catch-up cursor map encoded as
+    /// `s-1:42,s-2:7`. Sessions not in the map get pure live
+    /// tail (no replay). Sessions in the map but not in the
+    /// `session` whitelist (when present) are dropped.
+    #[serde(default)]
+    pub from_seq_per_session: Option<String>,
+    /// Override the keep-alive interval (default 20s). Same
+    /// semantics as the per-session endpoint.
+    #[serde(default)]
+    pub heartbeat_secs: Option<u64>,
+}
+
+/// Multi-session live-tail state. Mirrors [`LiveState`] but tracks
+/// per-session cursors instead of a single `live_seq`/`last_delivered_seq`
+/// pair: catch-up may have run for several sessions independently,
+/// and the `lag_too_far` close frame needs to report a *map* of
+/// reconnect cursors (`last_delivered_seq_by_session`) so the SDK
+/// can resume each session at the right point.
+struct TenantLiveState {
+    rx: async_broadcast::Receiver<EventEnvelope>,
+    /// Snapshotted `live_seq` per session at attach time. Live
+    /// envelopes with `seq < live_seq` for that session are dropped
+    /// — they were already delivered via catch-up. Sessions absent
+    /// from this map either had no catch-up cursor or had their
+    /// catch-up scan fail (degraded to live-only).
+    live_seq_by_session: HashMap<String, u64>,
+    /// Highest seq delivered to the client for each session. Sent
+    /// in the `lag_too_far` body so the SDK can reconnect with a
+    /// `from_seq_per_session` cursor that resumes gap-free.
+    last_delivered_seq_by_session: HashMap<String, u64>,
+    /// One-shot flag: previous iteration emitted the `lag_too_far`
+    /// frame, so the next poll ends the stream.
+    closed_after_error: bool,
+}
+
+/// Decode the `from_seq_per_session=s-1:42,s-2:7` query parameter
+/// into a `{session_id: from_seq}` map. Malformed pairs are
+/// silently dropped (better lenient than 400-on-typo for an
+/// optional cursor). Session ids containing `,` or `:` are out of
+/// scope — the spec constrains ids to safe chars.
+fn parse_from_seq_per_session(s: Option<&str>) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let Some(s) = s else { return out };
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once(':') {
+            if let Ok(seq) = v.trim().parse::<u64>() {
+                out.insert(k.trim().to_string(), seq);
+            }
+        }
+    }
+    out
+}
+
+/// Build the JSON body for the tenant-wide `subscribed` control
+/// frame. `catchup_failed_sessions` is omitted entirely when empty
+/// so happy-path clients see exactly the same shape as before.
+fn build_subscribed_payload(
+    tenant: &str,
+    live_seq_by_session: &HashMap<String, u64>,
+    catchup_failed_sessions: &[String],
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "tenant": tenant,
+        "live_seq_by_session": live_seq_by_session,
+    });
+    if !catchup_failed_sessions.is_empty() {
+        payload["catchup_failed_sessions"] = serde_json::json!(catchup_failed_sessions);
+    }
+    payload
+}
+
+pub async fn subscribe_tenant(
+    State(state): State<AppState>,
+    Path(tenant): Path<String>,
+    Query(q): Query<TenantSubscribeQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Subscribe FIRST so any envelope appended between here and
+    // the per-session `live_seq` snapshots is buffered (same race
+    // closure as the per-session endpoint).
+    let rx = state.event_bus.subscribe();
+
+    let kind_filter = normalize_kind_filter(q.kind);
+    let session_whitelist: Option<HashSet<String>> = if q.session.is_empty() {
+        None
+    } else {
+        Some(q.session.iter().cloned().collect())
+    };
+    let from_seq_map = parse_from_seq_per_session(q.from_seq_per_session.as_deref());
+    let keepalive_secs = q.heartbeat_secs.unwrap_or(20);
+
+    // Resolve a `live_seq` per requested catch-up session and
+    // accumulate catch-up envelopes. Tenant-wide is multi-session,
+    // so we degrade lenient: a per-session scan failure logs and
+    // skips that session's replay (rather than tearing down the
+    // whole stream the way the single-session endpoint does).
+    let mut live_seq_by_session: HashMap<String, u64> = HashMap::new();
+    let mut catchup: Vec<EventEnvelope> = Vec::new();
+    // Sessions whose catch-up scan returned an error. We surface
+    // these to the client in the `subscribed` frame so the SDK can
+    // distinguish "no events yet" from "we have a gap, please
+    // re-subscribe with a different `from_seq`."
+    let mut catchup_failed_sessions: Vec<String> = Vec::new();
+    for (session_id, from_seq) in &from_seq_map {
+        if let Some(whitelist) = &session_whitelist {
+            if !whitelist.contains(session_id) {
+                continue;
+            }
+        }
+        let live_seq = crate::handlers::resolve_session_next_seq(&state, &tenant, session_id)
+            .await
+            .unwrap_or(0);
+        live_seq_by_session.insert(session_id.clone(), live_seq);
+        if *from_seq < live_seq {
+            match crate::handlers::scan_events_from_seq(
+                &state, &tenant, session_id, *from_seq, live_seq,
+            )
+            .await
+            {
+                Ok(events) => {
+                    for ev in events {
+                        catchup.push(crate::event_bus::envelope_from_event(
+                            &tenant, session_id, &ev,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        tenant = %tenant,
+                        session = %session_id,
+                        "tenant catch-up scan failed; degrading to live-only for this session",
+                    );
+                    // Drop the snapshot entirely so live-tail dedup
+                    // (`live_seq_by_session.get(...)`) defaults to
+                    // "no snapshot → no dedup" and delivers every
+                    // matching live envelope. This also keeps the
+                    // `subscribed` frame from claiming a fake
+                    // `live_seq=0` for the failed session.
+                    live_seq_by_session.remove(session_id);
+                    catchup_failed_sessions.push(session_id.clone());
+                }
+            }
+        }
+    }
+
+    // `subscribed` control frame. Multi-session shape: report the
+    // snapshotted `live_seq` for every session we resolved, plus a
+    // (possibly omitted) list of sessions whose catch-up scan
+    // failed so the client can react explicitly.
+    let subscribed_payload =
+        build_subscribed_payload(&tenant, &live_seq_by_session, &catchup_failed_sessions);
+    let subscribed_evt = stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("subscribed")
+                .data(subscribed_payload.to_string()),
+        )
+    });
+
+    // Sort catch-up by `(session, seq)` so frames within a session
+    // are ordered and inter-session interleaving is deterministic.
+    catchup.sort_by(|a, b| (a.session.as_str(), a.seq).cmp(&(b.session.as_str(), b.seq)));
+    // Pre-seed `last_delivered_seq_by_session` with `live_seq - 1`
+    // for sessions where catch-up actually ran, so a `lag_too_far`
+    // immediately after attach still reports a cursor that lets
+    // the SDK resume gap-free.
+    let mut initial_last_delivered: HashMap<String, u64> = HashMap::new();
+    for (session_id, &live_seq) in &live_seq_by_session {
+        if let Some(&from_seq) = from_seq_map.get(session_id) {
+            if from_seq < live_seq && live_seq > 0 {
+                initial_last_delivered.insert(session_id.clone(), live_seq - 1);
+            }
+        }
+    }
+
+    let kind_filter_for_catchup = kind_filter.clone();
+    let catchup_stream = stream::iter(catchup.into_iter().filter_map(move |env| {
+        if !kind_matches(&env, &kind_filter_for_catchup) {
+            return None;
+        }
+        let payload = serde_json::to_string(&env).ok()?;
+        Some(Ok::<_, Infallible>(Event::default().data(payload)))
+    }));
+
+    let want_tenant = tenant.clone();
+    let want_sessions = session_whitelist.clone();
+    let kind_filter_for_live = kind_filter.clone();
+    let initial = TenantLiveState {
+        rx,
+        live_seq_by_session: live_seq_by_session.clone(),
+        last_delivered_seq_by_session: initial_last_delivered,
+        closed_after_error: false,
+    };
+
+    let live = stream::unfold(initial, move |mut state| {
+        let kind_filter = kind_filter_for_live.clone();
+        let want_tenant = want_tenant.clone();
+        let want_sessions = want_sessions.clone();
+        async move {
+            if state.closed_after_error {
+                return None;
+            }
+            loop {
+                match state.rx.recv().await {
+                    Ok(env) => {
+                        if env.tenant != want_tenant {
+                            continue;
+                        }
+                        if let Some(ws) = &want_sessions {
+                            if !ws.contains(&env.session) {
+                                continue;
+                            }
+                        }
+                        if let Some(&live_seq) = state.live_seq_by_session.get(&env.session) {
+                            if env.seq < live_seq {
+                                // Already delivered via catch-up.
+                                continue;
+                            }
+                        }
+                        if !kind_matches(&env, &kind_filter) {
+                            continue;
+                        }
+                        let payload = match serde_json::to_string(&env) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        state
+                            .last_delivered_seq_by_session
+                            .insert(env.session.clone(), env.seq);
+                        return Some((Ok(Event::default().data(payload)), state));
+                    }
+                    Err(async_broadcast::RecvError::Overflowed(missed)) => {
+                        tracing::warn!(
+                            tenant = %want_tenant,
+                            missed,
+                            "tenant subscribe lag_too_far; closing stream",
+                        );
+                        let frame = error_frame(
+                            "lag_too_far",
+                            serde_json::json!({
+                                "last_delivered_seq_by_session":
+                                    &state.last_delivered_seq_by_session,
+                            }),
+                        );
+                        state.closed_after_error = true;
+                        return Some((Ok(frame), state));
+                    }
+                    Err(async_broadcast::RecvError::Closed) => return None,
+                }
+            }
+        }
+    });
+
+    let combined = subscribed_evt.chain(catchup_stream).chain(live);
+    Sse::new(combined)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +687,58 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error"], "some_err");
         assert!(v.as_object().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn parse_from_seq_per_session_decodes_pairs() {
+        let m = parse_from_seq_per_session(Some("s-1:42,s-2:7"));
+        assert_eq!(m.get("s-1"), Some(&42));
+        assert_eq!(m.get("s-2"), Some(&7));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn parse_from_seq_per_session_handles_none_and_empty() {
+        assert!(parse_from_seq_per_session(None).is_empty());
+        assert!(parse_from_seq_per_session(Some("")).is_empty());
+        assert!(parse_from_seq_per_session(Some(",,")).is_empty());
+    }
+
+    #[test]
+    fn parse_from_seq_per_session_drops_malformed() {
+        // Missing colon and non-numeric seq are silently dropped —
+        // an optional cursor is better degraded leniently than 400'd.
+        let m = parse_from_seq_per_session(Some("missingcolon,s-1:abc,s-2:5"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("s-2"), Some(&5));
+    }
+
+    #[test]
+    fn parse_from_seq_per_session_trims_whitespace() {
+        let m = parse_from_seq_per_session(Some(" s-1 : 42 , s-2 : 7 "));
+        assert_eq!(m.get("s-1"), Some(&42));
+        assert_eq!(m.get("s-2"), Some(&7));
+    }
+
+    #[test]
+    fn build_subscribed_payload_omits_empty_failed_sessions() {
+        let mut map = HashMap::new();
+        map.insert("s-1".to_string(), 5);
+        let payload = build_subscribed_payload("t-1", &map, &[]);
+        assert_eq!(payload["tenant"], "t-1");
+        assert_eq!(payload["live_seq_by_session"]["s-1"], 5);
+        assert!(payload.get("catchup_failed_sessions").is_none());
+    }
+
+    #[test]
+    fn build_subscribed_payload_includes_non_empty_failed_sessions() {
+        let map = HashMap::new();
+        let failed = vec!["s-3".to_string(), "s-4".to_string()];
+        let payload = build_subscribed_payload("t-1", &map, &failed);
+        let arr = payload["catchup_failed_sessions"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "s-3");
+        assert_eq!(arr[1], "s-4");
     }
 
     #[test]
