@@ -60,10 +60,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # Install the channel pinned in `rust-toolchain.toml`,
+      # then add the cross-compile target for this matrix
+      # entry. Keeping the channel in one place means a
+      # toolchain bump is a one-line edit, not a sweep across
+      # workflow files.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install cross-compile linker (Linux aarch64 only)
         if: matrix.apt-packages
