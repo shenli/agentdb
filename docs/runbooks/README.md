@@ -44,8 +44,9 @@ Every `ErrorCode` the REST API can emit has a published runbook:
 | `serialization_error` | [serialization_error.md](./serialization_error.md) |
 | `node_draining` | [node_draining.md](./node_draining.md) |
 
-The subscribe endpoints emit additional codes — three as
-mid-stream SSE error frames, two as HTTP error responses at
+The subscribe endpoints (Phase 1 session subscribe, Phase 2
+broadcast publish/subscribe) emit additional codes — three as
+mid-stream SSE error frames, three as HTTP error responses at
 subscribe time:
 
 | Code | Surface | Runbook |
@@ -55,6 +56,7 @@ subscribe time:
 | `jwt_expired` | SSE error frame | [jwt_expired.md](./jwt_expired.md) |
 | `jwt_invalid` | HTTP 401 | [jwt_invalid.md](./jwt_invalid.md) |
 | `session_not_in_jwt` | HTTP 403 | [session_not_in_jwt.md](./session_not_in_jwt.md) |
+| `channel_not_in_jwt` | HTTP 403 | [channel_not_in_jwt.md](./channel_not_in_jwt.md) |
 
 When a new `ErrorCode` variant is added to
 [`crates/agentdb-api/src/error.rs`](../../crates/agentdb-api/src/error.rs),

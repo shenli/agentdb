@@ -397,6 +397,65 @@ or `["s-1", ...]`), `exp`. The official SDKs auto-reconnect with
 See [`examples/browser/`](examples/browser/) for a runnable demo
 (static HTML + EventSource + a tiny `mint_token.py` helper).
 
+#### Ephemeral broadcast (Phase 2)
+
+For transient signals (typing indicators, cursor positions, agent-status
+pings) that should NOT be persisted in the session log, use the broadcast
+endpoints:
+
+```
+POST /api/tenants/{tenant}/channels/{channel}/publish
+GET  /api/tenants/{tenant}/channels/{channel}/subscribe
+```
+
+Tenant-scoped channels, in-memory fan-out. No durability, no replay — slow
+subscribers silently drop messages. Per-channel JWT auth via the `channels`
+claim (alongside `sessions`):
+
+```json
+{ "tenant": "t-1", "sessions": "*", "channels": ["room:42", "room:43"] }
+```
+
+**SDKs:**
+
+```ts
+import { Client } from "agentdb";
+
+const client = new Client("https://agentdb.example.com", { tenant: "t-1" });
+
+await client.broadcast({ channel: "room:42", payload: { kind: "typing" } });
+for await (const msg of client.subscribeChannel({ channel: "room:42" })) {
+  handle(msg);
+}
+```
+
+```python
+from agentdb import Client
+
+client = Client("http://127.0.0.1:7878", tenant="t-1")
+
+client.broadcast(channel="room:42", payload={"kind": "typing"})
+for msg in client.subscribe_channel(channel="room:42"):
+    print(msg.payload)
+```
+
+```go
+import "github.com/shenli/agentdb/clients/go/agentdb"
+
+client := agentdb.New("http://127.0.0.1:7878",
+    agentdb.WithDefaultTenant("t-1"))
+
+_ = client.Broadcast(ctx, "room:42", payload)
+msgs, errs := client.SubscribeChannel(ctx, "room:42")
+for msg := range msgs { handle(msg) }
+if err := <-errs; err != nil { /* transport error */ }
+```
+
+If you need durability or replay, use `append_and_fetch` + Phase 1
+subscribe instead — the two paths intentionally don't blur.
+
+See [`examples/agents/typescript/broadcast_typing.ts`](examples/agents/typescript/broadcast_typing.ts) for a runnable typing-indicator demo.
+
 ---
 
 ## Configuration (env vars)

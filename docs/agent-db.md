@@ -493,6 +493,12 @@ Per the query-shape analysis in §2.5, the minimal primitive set:
   Lag-too-far closes with `last_delivered_seq` so clients
   reconnect gap-free via `from_seq`. See README "Real-time
   subscriptions".
+- **Ephemeral broadcast** (`POST .../publish`, `GET .../subscribe`):
+  tenant-scoped channels for typing indicators, cursors, and other
+  transient signals. In-memory only — no durability, no replay. JWT
+  `channels` claim controls per-channel access. See README
+  "Ephemeral broadcast" and spec
+  `docs/superpowers/specs/2026-04-26-pubsub-phase2-design.md`.
 
 Hybrid retrieval is the most differentiated of these. The difficulty
 lies in the interaction between vector search and structured filter.
