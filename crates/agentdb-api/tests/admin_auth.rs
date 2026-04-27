@@ -43,6 +43,7 @@ async fn spawn_admin_auth_node() -> (TempDir, TempDir, tempfile::NamedTempFile, 
             meta: Some(meta.clone()),
         }),
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
+        cors_config: agentdb_api::cors::CorsConfig::default(),
     };
     let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -222,6 +223,7 @@ async fn admin_auth_off_is_pass_through() {
         auth: None,
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
+        cors_config: agentdb_api::cors::CorsConfig::default(),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

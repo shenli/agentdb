@@ -1159,6 +1159,7 @@ pub async fn run(
             None
         },
         jwt_config: jwt_config_from_env(),
+        cors_config: agentdb_api::cors::CorsConfig::default(),
     };
 
     // Auto-shed scheduler (post-M25 operator ergonomics).

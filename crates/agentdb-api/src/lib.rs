@@ -23,6 +23,7 @@ pub mod admin_tokens;
 pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
+pub mod cors;
 pub mod dto;
 pub mod error;
 pub mod event_bus;
@@ -75,6 +76,14 @@ pub struct AppState {
     /// tenants. See `docs/superpowers/specs/2026-04-25-pubsub-design.md`
     /// §6.13.
     pub jwt_config: jwt::JwtConfig,
+    /// Task 10 per-tenant CORS config for browser-direct
+    /// subscribers. Empty `per_tenant` map means "no CORS
+    /// configured" — the middleware omits CORS headers on
+    /// those tenants (browser blocks cross-origin requests).
+    /// Wired into the subscribe router in Task 10-2. See
+    /// `docs/superpowers/specs/2026-04-25-pubsub-design.md`
+    /// §6.13.
+    pub cors_config: cors::CorsConfig,
 }
 
 #[derive(Clone)]
@@ -110,6 +119,7 @@ impl AppState {
             auth: None,
             admin_auth: None,
             jwt_config: jwt::JwtConfig::default(),
+            cors_config: cors::CorsConfig::default(),
         }
     }
 }

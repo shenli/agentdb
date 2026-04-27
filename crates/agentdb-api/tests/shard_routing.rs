@@ -68,6 +68,7 @@ async fn spawn() -> (
         auth: None,
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
+        cors_config: agentdb_api::cors::CorsConfig::default(),
     };
     let app = router(state)
         .layer(axum::Extension(meta.clone()))

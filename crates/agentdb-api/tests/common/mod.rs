@@ -96,6 +96,7 @@ impl TestServer {
             auth: None,
             admin_auth: None,
             jwt_config,
+            cors_config: agentdb_api::cors::CorsConfig::default(),
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
