@@ -37,9 +37,16 @@
 //!   `[from_seq, live_seq)` returned a KV/snapshot error. Failing
 //!   loud is preferable to silently switching to live tail and
 //!   leaving a gap in `[from_seq, live_seq)`.
+//! - **`jwt_expired`** — the JWT's `exp` was reached after the
+//!   stream opened (Task 9d). Spec §6.13 step 5: emit the close
+//!   frame with the current high-water mark so the SDK reconnects
+//!   gap-free with a refreshed token. Checked once per delivery
+//!   (no background timer): if events are flowing the close fires
+//!   on the next post-`exp` event; if no events flow, the
+//!   keep-alive comments hold the connection open until one does.
+//!   Phase 1 doesn't promise sub-second precision on the close.
 //!
-//! Both reuse [`error_frame`] for a consistent wire shape. Task 9d
-//! (`jwt_expired`) plugs into the same helper.
+//! All three reuse [`error_frame`] for a consistent wire shape.
 //!
 //! Multi-node 421, JWT, and CORS are still later tasks — this file
 //! stays focused on the per-session subscribe path.
@@ -261,6 +268,7 @@ pub async fn subscribe_session(
         live_seq,
         last_delivered_seq: initial_last_delivered_seq,
         closed_after_error: false,
+        jwt_exp_secs: jwt_claims.as_ref().map(|c| c.exp),
     };
     // Subscriber-side filtering. Spec §6.7: Phase 1 uses a single
     // bus and accepts O(n_subs × n_events). Per-(tenant, session)
@@ -291,6 +299,33 @@ pub async fn subscribe_session(
                         }
                         if !kind_matches(&env, &kind_filter) {
                             continue;
+                        }
+                        // Spec §6.13 step 5: token may have expired
+                        // mid-stream. Checked AFTER all filters so a
+                        // dropped envelope doesn't trigger a spurious
+                        // close, and BEFORE delivery so the post-`exp`
+                        // event is replaced by the close frame rather
+                        // than leaking past the expiry boundary.
+                        if let Some(exp) = state.jwt_exp_secs {
+                            if now_secs() >= exp {
+                                tracing::info!(
+                                    tenant = %want_tenant,
+                                    session = %want_session,
+                                    last_delivered_seq = state.last_delivered_seq,
+                                    "subscribe jwt_expired; closing stream",
+                                );
+                                let body = build_error_body(
+                                    "jwt_expired",
+                                    serde_json::json!({
+                                        "last_seq": state.last_delivered_seq,
+                                    }),
+                                );
+                                state.closed_after_error = true;
+                                return Some((
+                                    Ok(Event::default().event("error").data(body)),
+                                    state,
+                                ));
+                            }
                         }
                         let payload = serde_json::to_string(&env).unwrap_or_else(|_| "{}".into());
                         state.last_delivered_seq = env.seq;
@@ -347,6 +382,22 @@ struct LiveState {
     live_seq: u64,
     last_delivered_seq: u64,
     closed_after_error: bool,
+    /// JWT `exp` claim (UNIX seconds), or `None` if the tenant
+    /// requires no JWT. When present and `now_secs() >= exp` on a
+    /// post-filter delivery, the unfold emits a `jwt_expired` close
+    /// frame in place of the next envelope (spec §6.13 step 5).
+    jwt_exp_secs: Option<u64>,
+}
+
+/// Wall-clock UNIX seconds. Used for mid-stream JWT expiry checks
+/// (spec §6.13 step 5). A clock before the epoch is impossible on
+/// real hardware; the saturating fallback keeps us from panicking
+/// even in the pathological case.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Build the JSON body for an error frame: `{"error": <error>,
@@ -446,6 +497,12 @@ struct TenantLiveState {
     /// One-shot flag: previous iteration emitted the `lag_too_far`
     /// frame, so the next poll ends the stream.
     closed_after_error: bool,
+    /// JWT `exp` claim (UNIX seconds), or `None` if the tenant
+    /// requires no JWT. Same semantics as [`LiveState::jwt_exp_secs`]
+    /// but checked per-envelope on the tenant-wide stream; the close
+    /// body uses the per-session high-water-mark map so reconnect
+    /// resumes every session gap-free.
+    jwt_exp_secs: Option<u64>,
 }
 
 /// Decode the `from_seq_per_session=s-1:42,s-2:7` query parameter
@@ -694,6 +751,7 @@ pub async fn subscribe_tenant(
         live_seq_by_session: live_seq_by_session.clone(),
         last_delivered_seq_by_session: initial_last_delivered,
         closed_after_error: false,
+        jwt_exp_secs: jwt_claims.as_ref().map(|c| c.exp),
     };
 
     let live = stream::unfold(initial, move |mut state| {
@@ -723,6 +781,32 @@ pub async fn subscribe_tenant(
                         }
                         if !kind_matches(&env, &kind_filter) {
                             continue;
+                        }
+                        // Spec §6.13 step 5: token expired mid-stream.
+                        // Same post-filter / pre-deliver placement as
+                        // the per-session endpoint; close body carries
+                        // the per-session high-water-mark map so the
+                        // SDK reconnects every session gap-free with
+                        // a refreshed token.
+                        if let Some(exp) = state.jwt_exp_secs {
+                            if now_secs() >= exp {
+                                tracing::info!(
+                                    tenant = %want_tenant,
+                                    "tenant subscribe jwt_expired; closing stream",
+                                );
+                                let body = build_error_body(
+                                    "jwt_expired",
+                                    serde_json::json!({
+                                        "last_delivered_seq_by_session":
+                                            &state.last_delivered_seq_by_session,
+                                    }),
+                                );
+                                state.closed_after_error = true;
+                                return Some((
+                                    Ok(Event::default().event("error").data(body)),
+                                    state,
+                                ));
+                            }
                         }
                         let payload = match serde_json::to_string(&env) {
                             Ok(s) => s,

@@ -123,6 +123,103 @@ async fn both_header_and_query_param_returns_400() {
     assert_eq!(body["code"], "bad_request_dual_auth", "body: {body}");
 }
 
+/// Task 9d: a JWT minted with a 2-second TTL must close the live
+/// stream with a `jwt_expired` error frame after `exp` is reached.
+/// Spec §6.13 step 5. We open SSE with a short token, append an
+/// event so we know the live tail is healthy, then keep pumping
+/// appends past expiry until the close frame arrives. The pump is
+/// what triggers the per-yield expiry check; without it the stream
+/// would stay parked on `recv()` and only the keep-alive comments
+/// would flow.
+#[tokio::test]
+async fn jwt_expires_mid_stream_sends_error_and_closes() {
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token(b"secret", "t-1", "*", 2);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "{}/api/tenants/t-1/sessions/s-1/subscribe",
+            server.base
+        ))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("send sse open");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Drive at least one event through the stream up front so we
+    // know the live tail wired correctly before we assert on the
+    // expiry path.
+    client
+        .post(format!(
+            "{}/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            server.base
+        ))
+        .json(&serde_json::json!({"event": {"kind": "msg"}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .expect("first append");
+
+    use futures_util::StreamExt;
+    let mut buf = String::new();
+    let mut bytes_stream = resp.bytes_stream();
+    let mut got_first_event = false;
+    let mut got_jwt_expired = false;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let chunk = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bytes_stream.next(),
+        )
+        .await;
+        match chunk {
+            Ok(Some(Ok(bytes))) => {
+                buf.push_str(std::str::from_utf8(&bytes).expect("utf8"));
+                while let Some(idx) = buf.find("\n\n") {
+                    let block = buf[..idx].to_string();
+                    buf.drain(..idx + 2);
+                    if block.contains("event: subscribed") {
+                        // Initial control frame; skip.
+                    } else if block.contains("\"jwt_expired\"") {
+                        got_jwt_expired = true;
+                    } else if block.contains("\"seq\":") {
+                        got_first_event = true;
+                    }
+                }
+                if got_jwt_expired {
+                    break;
+                }
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => {
+                // Timed out waiting for a chunk — the live tail is
+                // parked on recv() and the per-yield expiry check
+                // only fires on the next event. Keep poking the bus
+                // so the close frame eventually arrives.
+                client
+                    .post(format!(
+                        "{}/api/tenants/t-1/sessions/s-1/append_and_fetch",
+                        server.base
+                    ))
+                    .json(&serde_json::json!({"event": {"kind": "msg"}, "fetch_last_n": 0}))
+                    .send()
+                    .await
+                    .expect("pump append");
+            }
+        }
+    }
+    assert!(
+        got_first_event,
+        "expected at least one envelope before expiry"
+    );
+    assert!(
+        got_jwt_expired,
+        "expected jwt_expired error frame after exp",
+    );
+}
+
 #[tokio::test]
 async fn no_jwt_config_falls_back_without_jwt() {
     // `TestServer::start()` boots with `jwt_config: default()` and
