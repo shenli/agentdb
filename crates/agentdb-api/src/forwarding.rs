@@ -426,6 +426,7 @@ mod tests {
         let target = NodeTarget {
             node_id: "node-b".into(),
             address: "127.0.0.1:9999".into(),
+            mongo_address: None,
         };
         let r = subscribe_not_owner_reply(&target, "/api/tenants/t-1/sessions/s-1/subscribe");
         assert_eq!(r.status().as_u16(), 421);
