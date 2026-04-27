@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence
 
 import requests
 
+from ._broadcast import BroadcastMessage
 from ._sse import parse_lines
 from .errors import AgentDBError, SubscriptionClosed, from_response
 
@@ -200,6 +201,130 @@ class Client:
             from_seq=from_seq,
             from_seq_per_session=from_seq_per_session,
         )
+
+    def broadcast(
+        self,
+        *,
+        channel: str,
+        payload: Any,
+        tenant: Optional[str] = None,
+    ) -> None:
+        """Publish an ephemeral broadcast message to a channel.
+
+        Phase 2 pub/sub. Broadcast is **ephemeral** — no durability,
+        no replay, no per-subscriber acks. Use it for transient
+        signals like typing indicators, cursor positions, or
+        agent-status pings. If you need durability, use
+        `Session.append` + `Session.subscribe()` on a session
+        instead.
+
+        `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server
+        rejects malformed names with `channel_name_invalid`.
+        `payload` is any JSON-serializable value.
+
+        Tenant resolution mirrors the rest of the SDK: pass
+        `tenant=` to override, otherwise the client default is used.
+        Returns `None` on success (HTTP 204).
+        """
+        tid = tenant or self._tenant
+        if tid is None:
+            raise ValueError(
+                "`tenant` must be set on Client(...) or passed to "
+                "broadcast(tenant=...) — the channels endpoint is "
+                "tenant-explicit."
+            )
+        path = (
+            f"/api/tenants/{_quote(tid)}"
+            f"/channels/{_quote(channel)}/publish"
+        )
+        kwargs: dict = {"timeout": self.timeout, "json": payload}
+        headers: dict = {}
+        token = self._bearer_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if headers:
+            kwargs["headers"] = headers
+        if self._auth is not None and "Authorization" not in headers:
+            kwargs["auth"] = self._auth
+        resp = self._http.request(
+            "POST", f"{self.base_url}{path}", **kwargs
+        )
+        if resp.status_code == 204:
+            return
+        # Non-204 → decode + raise typed error. `_decode` expects a
+        # JSON dict body; channel-publish errors return one.
+        _ = _decode(resp)
+
+    def subscribe_channel(
+        self,
+        *,
+        channel: str,
+        tenant: Optional[str] = None,
+        no_echo: bool = False,
+    ) -> Iterator["BroadcastMessage"]:
+        """Subscribe to a channel; yield [`BroadcastMessage`] objects.
+
+        Counterpart to [`broadcast`]. The iterator runs until the
+        caller breaks out of the loop or the server closes the
+        connection.
+
+        Unlike per-session [`subscribe`], there is **no JWT
+        auto-reconnect on expiry** — broadcast is ephemeral by
+        design (spec § 5.5), so loss on disconnect is acceptable.
+        Callers that need durability use `Session.subscribe()`
+        instead.
+
+        `no_echo=True` asks the server to drop envelopes whose
+        `sender` matches this subscriber's JWT `sub` claim. Only
+        effective with JWT auth — Basic-auth publishers emit
+        `sender: None` and never match.
+        """
+        tid = tenant or self._tenant
+        if tid is None:
+            raise ValueError(
+                "`tenant` must be set on Client(...) or passed to "
+                "subscribe_channel(tenant=...) — the channels "
+                "endpoint is tenant-explicit."
+            )
+        path = (
+            f"/api/tenants/{_quote(tid)}"
+            f"/channels/{_quote(channel)}/subscribe"
+        )
+        params: List[tuple] = []
+        if no_echo:
+            params.append(("no_echo", "true"))
+        headers: dict = {"Accept": "text/event-stream"}
+        token = self._bearer_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        kwargs: dict = {
+            "params": params,
+            "headers": headers,
+            "stream": True,
+            "timeout": (self.timeout, None),
+        }
+        if self._auth is not None and "Authorization" not in headers:
+            kwargs["auth"] = self._auth
+        resp = self._http.request(
+            "GET", f"{self.base_url}{path}", **kwargs
+        )
+        try:
+            if resp.status_code != 200:
+                _ = _decode(resp)
+            for frame in parse_lines(resp.iter_lines(decode_unicode=True)):
+                # Phase 2's stream uses no named event for envelopes,
+                # only `:keepalive` comments (which the parser drops)
+                # and the data frames themselves. Tolerate a
+                # `subscribed` ack the same way as per-session
+                # subscribe in case the server adds one later.
+                if frame.event == "subscribed":
+                    continue
+                if not frame.data:
+                    continue
+                env = json.loads(frame.data)
+                yield BroadcastMessage.from_envelope(env)
+        finally:
+            resp.close()
 
     # --- internal helpers ---
 

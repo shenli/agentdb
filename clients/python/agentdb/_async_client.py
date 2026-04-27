@@ -50,6 +50,7 @@ except ImportError as e:
         "(or `pip install httpx` if you want to manage the dep yourself.)"
     ) from e
 
+from ._broadcast import BroadcastMessage
 from ._sse import parse_lines_async
 from .client import AppendResult, Event
 from .errors import AgentDBError, SubscriptionClosed, from_response
@@ -61,6 +62,8 @@ _FORK_PATH = "/api/sessions/{sid}/fork"
 _HEALTH_PATH = "/health/ready"
 _TENANT_SUB_PATH = "/api/tenants/{tid}/subscribe"
 _SESSION_SUB_PATH = "/api/tenants/{tid}/sessions/{sid}/subscribe"
+_CHANNEL_PUBLISH_PATH = "/api/tenants/{tid}/channels/{channel}/publish"
+_CHANNEL_SUB_PATH = "/api/tenants/{tid}/channels/{channel}/subscribe"
 
 
 # A token provider may be sync (returns a string) or async (returns
@@ -173,6 +176,88 @@ class AsyncClient:
             from_seq_per_session=from_seq_per_session,
         ):
             yield evt
+
+    async def broadcast(
+        self,
+        *,
+        channel: str,
+        payload: Any,
+        tenant: Optional[str] = None,
+    ) -> None:
+        """Async counterpart of [`Client.broadcast`].
+
+        Publish an ephemeral broadcast to a channel — no durability,
+        no replay. Use the per-session `append` + `subscribe` pair
+        when you need durability.
+        """
+        tid = tenant or self._tenant
+        if tid is None:
+            raise ValueError(
+                "`tenant` must be set on AsyncClient(...) or passed to "
+                "broadcast(tenant=...) — the channels endpoint is "
+                "tenant-explicit."
+            )
+        path = _CHANNEL_PUBLISH_PATH.format(
+            tid=_quote(tid), channel=_quote(channel)
+        )
+        kwargs: dict = {"json": payload}
+        headers: dict = {}
+        token = await self._bearer_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if headers:
+            kwargs["headers"] = headers
+        if self._auth is not None and "Authorization" not in headers:
+            kwargs["auth"] = self._auth
+        resp = await self._http.request("POST", path, **kwargs)
+        if resp.status_code == 204:
+            return
+        _ = _decode(resp)
+
+    async def subscribe_channel(
+        self,
+        *,
+        channel: str,
+        tenant: Optional[str] = None,
+        no_echo: bool = False,
+    ) -> AsyncIterator["BroadcastMessage"]:
+        """Async counterpart of [`Client.subscribe_channel`].
+
+        No JWT auto-reconnect: broadcast is ephemeral by design, so
+        on disconnect the iterator ends rather than recovering.
+        """
+        tid = tenant or self._tenant
+        if tid is None:
+            raise ValueError(
+                "`tenant` must be set on AsyncClient(...) or passed to "
+                "subscribe_channel(tenant=...) — the channels "
+                "endpoint is tenant-explicit."
+            )
+        path = _CHANNEL_SUB_PATH.format(
+            tid=_quote(tid), channel=_quote(channel)
+        )
+        params: List[tuple] = []
+        if no_echo:
+            params.append(("no_echo", "true"))
+        headers: dict = {"Accept": "text/event-stream"}
+        token = await self._bearer_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        kwargs: dict = {"params": params, "headers": headers}
+        kwargs["timeout"] = httpx.Timeout(self.timeout, read=None)
+        if self._auth is not None and "Authorization" not in headers:
+            kwargs["auth"] = self._auth
+        async with self._http.stream("GET", path, **kwargs) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                _ = _decode(resp)
+            async for frame in parse_lines_async(resp.aiter_lines()):
+                if frame.event == "subscribed":
+                    continue
+                if not frame.data:
+                    continue
+                env = json.loads(frame.data)
+                yield BroadcastMessage.from_envelope(env)
 
     # --- internal ---
 

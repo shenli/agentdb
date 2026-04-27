@@ -43,6 +43,7 @@ See `examples/agents/python/quickstart.py` (sync) and
 working agent loops.
 """
 
+from ._broadcast import BroadcastMessage
 from .client import Client, Session, AppendResult, Event
 from .errors import (
     AgentDBError,
@@ -64,6 +65,7 @@ __all__ = [
     "Event",
     "AsyncClient",
     "AsyncSession",
+    "BroadcastMessage",
     "AgentDBError",
     "BadRequest",
     "Unauthorized",
