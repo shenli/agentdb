@@ -8,11 +8,7 @@
     "lib": ["ES2022"],
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "skipLibCheck": true,
-    "baseUrl": ".",
-    "paths": {
-      "agentdb": ["../../../../clients/typescript/src/index.ts"]
-    }
+    "skipLibCheck": true
   },
   "include": ["src/**/*", "tests/**/*"]
 }
