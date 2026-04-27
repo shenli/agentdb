@@ -200,7 +200,7 @@ export class Client {
   /**
    * Publish an ephemeral broadcast message to a channel.
    *
-   * Phase 2 pub/sub. Broadcast is **ephemeral** — no durability, no
+   * Broadcast is **ephemeral** — no durability, no
    * replay, no per-subscriber acks. Use it for transient signals
    * like typing indicators, cursor positions, or agent-status pings.
    * If you need durability, use `Session.append` + `Session.subscribe`
@@ -321,7 +321,7 @@ export class Client {
     const reader = resp.body.getReader();
     try {
       for await (const frame of parseSse(reader)) {
-        // Phase 2's stream uses no named event for envelopes; only
+        // The broadcast stream uses no named event for envelopes; only
         // `:keepalive` comments (which the parser drops) and the
         // data frames themselves. Tolerate a `subscribed` ack the
         // same way as per-session subscribe in case the server adds

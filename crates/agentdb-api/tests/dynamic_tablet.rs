@@ -68,8 +68,16 @@ async fn spawn_dynamic_node() -> (
             attempt_interval: Duration::from_millis(50),
         },
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(election.is_leader());
+    // Poll up to 3s for leader election. Single-node election with a 50ms
+    // attempt interval should win within ~100ms locally, but CI runners
+    // under cargo build pressure can be 10x slower; the prior fixed 200ms
+    // sleep flaked on CI. The wall-clock cap keeps a real failure from
+    // hanging the test indefinitely.
+    let leader_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !election.is_leader() && std::time::Instant::now() < leader_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(election.is_leader(), "leader election did not converge within 3s");
 
     let detector = HotTabletDetector::start(
         registry.clone(),

@@ -56,16 +56,13 @@ async fn slow_subscriber_loses_messages_but_stream_stays_open() {
     // closed (no error frame, no EOF). The 200ms-per-iter quiet window
     // drains any backlog the SSE writer has buffered before we move on.
     let mut received = 0;
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            sse.try_next_event(),
-        )
-        .await
-        {
-            Ok(Some(_)) => received += 1,
-            _ => break,
-        }
+    while let Ok(Some(_)) = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        sse.try_next_event(),
+    )
+    .await
+    {
+        received += 1;
     }
     assert!(received > 0, "expected some messages to be delivered");
     assert!(

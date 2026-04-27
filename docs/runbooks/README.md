@@ -44,7 +44,7 @@ Every `ErrorCode` the REST API can emit has a published runbook:
 | `serialization_error` | [serialization_error.md](./serialization_error.md) |
 | `node_draining` | [node_draining.md](./node_draining.md) |
 
-The subscribe endpoints (Phase 1 session subscribe, Phase 2
+The subscribe endpoints (durable session subscribe, ephemeral
 broadcast publish/subscribe) emit additional codes — three as
 mid-stream SSE error frames, three as HTTP error responses at
 subscribe time:

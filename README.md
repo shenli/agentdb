@@ -417,7 +417,7 @@ or `["s-1", ...]`), `exp`. The official SDKs auto-reconnect with
 See [`examples/browser/`](examples/browser/) for a runnable demo
 (static HTML + EventSource + a tiny `mint_token.py` helper).
 
-#### Ephemeral broadcast (Phase 2)
+#### Ephemeral broadcast channels
 
 For transient signals (typing indicators, cursor positions, agent-status
 pings) that should NOT be persisted in the session log, use the broadcast
@@ -471,8 +471,8 @@ for msg := range msgs { handle(msg) }
 if err := <-errs; err != nil { /* transport error */ }
 ```
 
-If you need durability or replay, use `append_and_fetch` + Phase 1
-subscribe instead — the two paths intentionally don't blur.
+If you need durability or replay, use `append_and_fetch` + the durable
+session subscribe instead — the two paths intentionally don't blur.
 
 See [`examples/agents/typescript/broadcast_typing.ts`](examples/agents/typescript/broadcast_typing.ts) for a runnable typing-indicator demo.
 

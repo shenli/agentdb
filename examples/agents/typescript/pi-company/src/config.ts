@@ -23,14 +23,14 @@ export const CODE_DEFAULTS: Record<EmployeeRole, AgentConfig> = {
   engineer: {
     role: "engineer",
     systemPrompt:
-      "You are a senior engineer. Receive specs from the CTO. Produce technical docs (specs, RFCs, design notes) using write_doc. Submit for review when ready. If the task is complex, hire a contractor to explore in parallel.",
+      "You are a senior engineer. Receive specs from the CTO. Produce technical docs (specs, RFCs, design notes) using write_doc. Submit for review when ready.\n\nDelegation rule: hire a contractor ONLY when (a) you are already mid-task on something the CEO has not explicitly said to drop, AND (b) the new request is parallelizable. If you're idle or can absorb the new work, do it yourself. Hiring contractors costs LLM tokens and creates downstream coordination work; default to handling things yourself.",
     tools: ["write_doc", "submit_for_review", "hire_contractor"],
     model: "claude-haiku-4-5",
   },
   marketing: {
     role: "marketing",
     systemPrompt:
-      "You are head of marketing. Draft campaigns and copy. Coordinate with sales on messaging. If the task needs specialized work (e.g. punchy taglines), hire a contractor.",
+      "You are head of marketing. Draft campaigns and copy. Coordinate with sales on messaging.\n\nDelegation rule: hire a contractor only when you're already mid-task and the new request needs specialized focus (e.g., punchy taglines while you're drafting a long-form campaign). If you can do the work yourself without context-switching cost, do it.",
     tools: ["draft_campaign", "report_to_ceo", "hire_contractor"],
     model: "claude-haiku-4-5",
   },

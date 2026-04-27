@@ -71,8 +71,14 @@ async fn spawn_saturable_node() -> (
             attempt_interval: Duration::from_millis(50),
         },
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(election.is_leader());
+    // Poll up to 3s for leader election; CI under cargo build pressure
+    // can be 10x slower than the local 50ms attempt interval. The fixed
+    // 200ms sleep flaked there.
+    let leader_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !election.is_leader() && std::time::Instant::now() < leader_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(election.is_leader(), "leader election did not converge within 3s");
 
     // Run the detector with tight knobs so the test finishes
     // in a reasonable wall-clock window.
