@@ -260,9 +260,10 @@ exceptions. The ones an agent should know:
   is a 60-line three-turn agent loop;
   [`examples/agents/python/async_quickstart.py`](examples/agents/python/async_quickstart.py)
   shows the async variant with parallel writes.
-- **Full architecture** (for human devs):
+- **Why this database exists** (motivation, requirements,
+  principles): [`docs/agent-db.md`](docs/agent-db.md).
+- **What the architecture commits to** (identity, layering,
+  real-time, deployment): [`docs/DESIGN.md`](docs/DESIGN.md).
+- **What the code does today**:
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-- **Design rationale**: [`docs/agent-db.md`](docs/agent-db.md)
-  explains *why* an agent-native database differs from an
-  OLTP DB.
 - **OpenAPI spec**: `GET /openapi.json` on a running server.

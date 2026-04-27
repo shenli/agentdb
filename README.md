@@ -517,12 +517,15 @@ docs/                        design, architecture, performance, S3 guide
 
 ## Reading order
 
-- **What the prototype is supposed to be**:
-  [`docs/agent-db.md`](docs/agent-db.md) — requirements, design
-  principles, architecture, implementation trade-offs
-- **What the code actually does today**:
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate layout,
-  request flow, storage layout, per-milestone additions
+- **Why this database exists** (motivation, workload requirements,
+  design principles):
+  [`docs/agent-db.md`](docs/agent-db.md)
+- **What the architecture commits to** (identity model, layering,
+  clock, failure model, real-time, deployment, operability):
+  [`docs/DESIGN.md`](docs/DESIGN.md)
+- **What the code actually does today** (crate layout, request
+  flow, storage layout, per-milestone additions):
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **How fast it runs**:
   [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — laptop numbers
   for throughput, vector search, tier transitions, admission
