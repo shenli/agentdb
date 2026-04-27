@@ -34,8 +34,10 @@ export type {
   AppendOptions,
   AppendResult,
   ClientOptions,
+  ClientSubscribeOptions,
   Event,
   SessionOptions,
+  SubscribeOptions,
 } from "./client.js";
 
 export {
@@ -48,6 +50,10 @@ export {
   Misdirected,
   RateLimited,
   ServerError,
+  SubscriptionClosed,
   fromResponse,
 } from "./errors.js";
 export type { ServerErrorBody, AgentDBErrorOptions } from "./errors.js";
+
+export { parseBlock, parseSse } from "./sse.js";
+export type { SseFrame } from "./sse.js";
