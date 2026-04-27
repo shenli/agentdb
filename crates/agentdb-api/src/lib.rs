@@ -23,6 +23,7 @@ pub mod admin_tokens;
 pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
+pub mod broadcast_bus;
 pub mod cors;
 pub mod dto;
 pub mod error;
