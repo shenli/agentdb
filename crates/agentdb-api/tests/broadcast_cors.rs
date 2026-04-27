@@ -78,8 +78,8 @@ async fn options_preflight_returns_204_with_methods_and_headers() {
         .to_str()
         .unwrap();
     assert!(
-        methods.contains("POST") || methods.contains("GET"),
-        "expected ACAM to mention POST or GET, got: {}",
+        methods.contains("POST"),
+        "expected ACAM to include POST for channel publish, got: {}",
         methods
     );
 }
