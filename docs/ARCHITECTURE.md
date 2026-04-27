@@ -1,9 +1,12 @@
 # AgentDB Architecture
 
-AgentDB is a prototype agent-native operational database. Its design
-goals are spelled out at length in [agent-db.md](./agent-db.md); this
-document maps the design concepts to the code you can actually read and
-poke.
+AgentDB is a prototype agent-native operational database. The
+**why** (motivation, requirements, principles) lives in
+[`agent-db.md`](./agent-db.md); the **what** (current
+architectural commitments — identity model, layering, real-time,
+deployment) lives in [`DESIGN.md`](./DESIGN.md); this document
+maps those design concepts to the code you can actually read
+and poke.
 
 ## Crate layout
 
@@ -180,7 +183,7 @@ parent, `plan_locality_bound` on an archived session, Mongo wire
 `find` on archived sessions, and unhinted text/vector retrieval all
 return semantically-correct results. The archive tier now affects
 **latency**, not **semantics** — which is exactly the contract in
-`docs/agent-db-v2.md` §6.
+`docs/DESIGN.md` §5.
 
 An admin endpoint `POST /api/admin/tier/force` can force any tier
 transition (warm↔cold↔archive). Multi-step transitions (warm→archive
@@ -236,7 +239,7 @@ planner post-filters hits by snapshot-visible `next_seq`).
 AgentDB carries a process-global **Hybrid Logical Clock** (`HlcClock`,
 `crates/agentdb-core/src/hlc.rs`) that assigns a causality-respecting
 timestamp to every event. Design rationale lives in
-`docs/agent-db-v2.md` §4 and
+`docs/DESIGN.md` §3 and
 `docs/superpowers/notes/2026-04-21-hlc-clock-decision.md`; this section
 documents what the prototype actually does.
 
@@ -282,7 +285,7 @@ monitoring must fix the cause.
 ## Agent schema (M15)
 
 Agent attribution is a schema feature, not a first-class API resource.
-Design rationale in `docs/agent-db-v2.md` §2.3; this section documents
+Design rationale in `docs/DESIGN.md` §1.3; this section documents
 what the prototype does.
 
 **Fields.**
@@ -841,7 +844,7 @@ write.
 After this lands, both reads (PR #74) and writes go through
 the locator on the hot path. `session_locator` is now the
 canonical "where does session X live" record across the
-entire data path — the v2 promise from `agent-db-v2.md`
+entire data path — the design promise from `docs/DESIGN.md`
 that "writes route by session, not by tenant hash" is
 finally true on the wire, not just on the API surface.
 
@@ -917,7 +920,7 @@ single-node deployments because two nodes would race on the
 same tablet ids. That changed. Today each `agentdb serve`
 process boots with an empty `BoxRegistry`; the scheduler-leader
 runs `TabletPlacement`, the per-node `TabletReconciler` picks
-up assignments. The split mirrors §2.5 of `agent-db-v2.md`.
+up assignments. The split mirrors §1.5 of `docs/DESIGN.md`.
 
 ```
 control plane:
@@ -984,7 +987,7 @@ Tablet-level load signals are the natural follow-up.
 
 #### Cross-AZ failure-domain awareness
 
-Per `agent-db-v2.md` §2.7, each node declares its AZ at boot
+Per `docs/DESIGN.md` §1.7, each node declares its AZ at boot
 via `AGENTDB_NODE_AZ` (written into `nodes.availability_zone`,
 migration 013). Two scheduler-policy hooks read it:
 
