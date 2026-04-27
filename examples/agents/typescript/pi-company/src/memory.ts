@@ -12,20 +12,34 @@ export interface MemoryEvent {
  * log IS the agent's working memory. Forking the session produces a
  * contractor child that inherits the full parent history at fork
  * time (MVCC).
+ *
+ * The optional `sessionNameOverride` constructor arg lets a caller
+ * (specifically `hire_contractor` — Task 8) point a fresh `Memory`
+ * at an already-forked child session like
+ * `r-1:engineer:contractor-feature-x` instead of the auto-derived
+ * `{runId}:{role}` name. Without it we'd have to mutate private
+ * state, which leaks the abstraction.
  */
 export class Memory {
   readonly run: RunIdentity;
   readonly role: AgentRole;
+  private readonly _sessionName: string;
   private readonly _session: Session;
 
-  constructor(client: Client, run: RunIdentity, role: AgentRole) {
+  constructor(
+    client: Client,
+    run: RunIdentity,
+    role: AgentRole,
+    sessionNameOverride?: string,
+  ) {
     this.run = run;
     this.role = role;
-    this._session = client.session(`${run.runId}:${role}`, { tenant: run.tenant });
+    this._sessionName = sessionNameOverride ?? `${run.runId}:${role}`;
+    this._session = client.session(this._sessionName, { tenant: run.tenant });
   }
 
   get sessionName(): string {
-    return `${this.run.runId}:${this.role}`;
+    return this._sessionName;
   }
 
   /** Append one event; don't read back. Hot-path write. */
