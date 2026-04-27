@@ -57,3 +57,6 @@ export type { ServerErrorBody, AgentDBErrorOptions } from "./errors.js";
 
 export { parseBlock, parseSse } from "./sse.js";
 export type { SseFrame } from "./sse.js";
+
+export { parseBroadcastEnvelope } from "./broadcast.js";
+export type { BroadcastMessage } from "./broadcast.js";
