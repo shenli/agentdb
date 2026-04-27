@@ -29,8 +29,8 @@ decision notes that produced this design, see:
 - `docs/superpowers/notes/2026-04-20-tablet-unit-review-response.md`
 - `docs/superpowers/notes/2026-04-21-architecture-review-decision-matrix.md`
 - `docs/superpowers/notes/2026-04-21-hlc-clock-decision.md`
-- `docs/superpowers/specs/2026-04-25-pubsub-design.md` (real-time Phase 1)
-- `docs/superpowers/specs/2026-04-26-pubsub-phase2-design.md` (real-time Phase 2)
+- `docs/superpowers/specs/2026-04-25-pubsub-design.md` (durable session-event subscribe)
+- `docs/superpowers/specs/2026-04-26-pubsub-phase2-design.md` (ephemeral broadcast channels)
 
 ---
 
@@ -441,7 +441,7 @@ agent-B reacts to agent-A's writes, an audit indexer that
 ships events to a downstream pipeline. AgentDB exposes this
 directly, with two complementary primitives.
 
-### 6.1 Phase 1 — Durable, replayable session-event stream
+### 6.1 Durable, replayable session-event stream
 
 `GET /api/tenants/{t}/subscribe` and
 `GET /api/tenants/{t}/sessions/{s}/subscribe` open a
@@ -497,13 +497,13 @@ Supabase Realtime concepts, latency profile) lives in the
 preparatory spec at
 `docs/superpowers/specs/2026-04-25-pubsub-design.md`.
 
-### 6.2 Phase 2 — Ephemeral broadcast channels
+### 6.2 Ephemeral broadcast channels
 
 Some signals shouldn't be persisted: typing indicators,
 cursor positions, presence pings, "agent X is alive" beats.
 Writing those into the durable event log inflates storage,
 forces compaction, and pollutes session retrieval with noise.
-Phase 2 adds a separate, **ephemeral** primitive for them:
+A separate **ephemeral** primitive serves them:
 
 - `POST /api/tenants/{t}/channels/{c}/publish` — fire-and-
   forget. Any JSON payload. Returns 204 on success; nothing
@@ -535,7 +535,7 @@ same channel they publish on; the SDK can pass
 own publishes (correlated by a per-connection id), avoiding
 echo-loop traffic in collaborative-editing-style designs.
 
-**Multi-node.** Phase 2 broadcasts are in-process per node.
+**Multi-node.** Ephemeral broadcasts are in-process per node.
 A publisher and subscriber on different nodes do not see
 each other's traffic. This is acceptable for the target
 use cases (typing indicators are user-local; cursor
@@ -549,19 +549,19 @@ pubsub backbone).
 like `room:42`, `presence:agent-7`, or `cursor:doc-id` are
 recommended; the server doesn't interpret the name.
 
-The full Phase 2 design lives at
+The full broadcast design lives at
 `docs/superpowers/specs/2026-04-26-pubsub-phase2-design.md`.
 
 ### 6.3 When to use which
 
-| Property | Phase 1 (subscribe) | Phase 2 (broadcast) |
+| Property | Durable subscribe | Ephemeral broadcast |
 |---|---|---|
 | Durable | yes | no |
 | Replayable | yes (`from_seq`) | no |
 | Gap-free | yes | no (lag → drop) |
 | Per-session ordered | yes | n/a |
 | Auth scope | per-tenant + per-session | per-channel JWT claim |
-| Multi-node fanout | yes | no (Phase 2) |
+| Multi-node fanout | yes | no |
 | Use case | tool-call results, audit, agent reactors | typing, cursors, presence pings |
 
 The two are deliberately separate primitives. Sending a
@@ -570,14 +570,14 @@ of-magnitude space waste; persisting a tool-call result as
 a broadcast would lose the audit trail. Picking the right
 one is a design choice the writer makes per-event.
 
-### 6.4 Phase 3 — Presence (deferred)
+### 6.4 Presence (deferred)
 
 Presence ("which agents/users are currently subscribed to
 this session?") is the natural extension of broadcast. It
 needs a different consistency model — last-write-wins state
 synchronization across subscribers, with TTL-based
 expiry — and is sketched as a future-work appendix in the
-Phase 2 spec. Not in scope yet.
+broadcast spec. Not in scope yet.
 
 ---
 
@@ -723,17 +723,17 @@ Agent registration endpoints, per-agent quota, agent lifecycle. Deferred pending
 
 Session-creation-time tablet hint for workloads with natural cross-session coordination. P2; revisit after benchmark workload produces evidence.
 
-### 10.6 Pub/sub Phase 3 — presence
+### 10.6 Presence (real-time follow-up)
 
 Last-write-wins, TTL-expiring presence state ("which agents
 are subscribed to this session right now?"). Different
-consistency model from Phase 1 / Phase 2; sketched as a
+consistency model from durable subscribe / ephemeral broadcast; sketched as a
 future-work appendix in
 `docs/superpowers/specs/2026-04-26-pubsub-phase2-design.md`.
 
 ### 10.7 Cross-node ephemeral broadcast
 
-Phase 2 broadcasts (§6.2) are in-process per node — a
+Ephemeral broadcasts (§6.2) are in-process per node — a
 publisher and subscriber on different nodes don't see each
 other's traffic. Acceptable for the launch use cases (typing
 indicators, presence pings — usually the same user's

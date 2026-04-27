@@ -679,8 +679,54 @@ latency in the planned-shutdown case.
 ## Real-time
 
 Two complementary primitives, each with a dedicated subsystem.
+Both terminate as Server-Sent Events streams; the difference
+is whether the stream is **durable + replayable** (built on
+the event log) or **ephemeral** (an in-process pub/sub bus).
 
-### Phase 1 — Durable session-event subscribe (`agentdb-api::stream`)
+```
+                   Publishers                              Subscribers
+                       │                                       ▲
+                       │                                       │ SSE
+        ┌──────────────┴───────────┐                           │
+        ▼                          ▼                ┌──────────┴──────────┐
+  ┌──────────────┐            ┌──────────────┐      │                     │
+  │  append /    │            │   POST       │      │  GET /subscribe     │
+  │  append_and_ │            │   /channels/ │      │  (durable session   │
+  │  fetch       │            │   :c/publish │      │   event stream)     │
+  └──────┬───────┘            └──────┬───────┘      │                     │
+         │                           │              │  GET /channels/     │
+         │   1. persist              │              │  :c/subscribe       │
+         ▼                           │              │  (ephemeral)        │
+  ┌──────────────┐                   │              └──────▲──────▲───────┘
+  │  KV  +       │                   │                     │      │
+  │  segments    │                   │                     │      │
+  └──────┬───────┘                   │                     │      │
+         │   2. notify               │                     │      │
+         ▼                           ▼                     │      │
+  ┌─────────────────────────────────────────┐              │      │
+  │           BroadcastBus (in-proc)         │              │      │
+  │   ┌────────────────┐  ┌────────────────┐ │              │      │
+  │   │ session events │  │ ephemeral      │ │──────────────┘      │
+  │   │ (per tenant +  │  │ channels       │ │─────────────────────┘
+  │   │  per session)  │  │                │ │
+  │   └────────────────┘  └────────────────┘ │
+  └─────────────────────────────────────────┘
+
+         Durable path:                    Ephemeral path:
+         from_seq replays from              no replay,
+         KV/segments → joins live           drop-on-overflow,
+         tail at the seamless               in-process per node
+         transition point
+```
+
+**Durable** subscribers see every appended event in seq order,
+gap-free across reconnects; **ephemeral** subscribers see
+only what's in flight while they're connected, with the
+server dropping oldest queued messages if a slow subscriber
+falls behind. The two never share a channel — pick the right
+one per use case.
+
+### Durable session-event subscribe (`agentdb-api::stream`)
 
 `GET /api/tenants/:t/subscribe` and
 `GET /api/tenants/:t/sessions/:s/subscribe` open a
@@ -713,7 +759,7 @@ errors → terminal `catchup_failed`.
 node's stream handler forwards the subscribe to the tablet's
 owning node when the request targets a peer-owned session.
 
-### Phase 2 — Ephemeral broadcast (`agentdb-api::broadcast`)
+### Ephemeral broadcast channels (`agentdb-api::broadcast`)
 
 `POST /api/tenants/:t/channels/:c/publish` and
 `GET /api/tenants/:t/channels/:c/subscribe`. Channels are
@@ -738,7 +784,7 @@ same channel they publish on; the SDK can pass `?no_echo=1`
 so the server filters out the subscriber's own publishes
 (per-connection id correlation), avoiding echo loops.
 
-**Multi-node.** Phase 2 broadcasts are in-process per node;
+**Multi-node.** Ephemeral broadcasts are in-process per node;
 a publisher and subscriber on different nodes don't see each
 other's traffic. Acceptable for the launch use cases (typing
 indicators, presence pings tend to be co-located). Cross-
@@ -746,7 +792,7 @@ node broadcast is a documented follow-up (DESIGN.md §10.7).
 
 ### When to use which
 
-| Property | Phase 1 (subscribe) | Phase 2 (broadcast) |
+| Property | Durable subscribe | Ephemeral broadcast |
 |---|---|---|
 | Durable | yes | no |
 | Replayable | yes (`from_seq`) | no |
@@ -1086,7 +1132,7 @@ What's missing or partial today (with intent to ship):
 - **Hybrid retrieval rank fusion (RRF) on the server.**
   Client-side merge today; server-side `$rankFusion` is a
   documented follow-up.
-- **Cross-node ephemeral broadcast.** Phase 2 broadcasts
+- **Cross-node ephemeral broadcast.** Ephemeral broadcasts
   are in-process per node.
 - **ANN at 100M+ vectors per node.** HNSW is single-node,
   in-process; vertical ceiling per tablet.

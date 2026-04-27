@@ -32,6 +32,90 @@ implementation state), see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ---
 
+## What AgentDB is, by elimination
+
+To position AgentDB precisely, it helps to distinguish three
+kinds of stores an AI agent actually needs. They have
+different shapes, different access patterns, and different
+vendors. Most production agent stacks end up running all
+three.
+
+```
+       ┌────────────────────────────────────────────┐
+       │              An AI agent                   │
+       └─────────────┬──────────┬─────────┬─────────┘
+                     │          │         │
+                     ▼          ▼         ▼
+              ┌──────────┐  ┌────────┐  ┌──────────┐
+              │   1.     │  │  2.    │  │   3.     │
+              │ Memory / │  │Runtime │  │ App OLTP │
+              │knowledge │  │/ state │  │          │
+              │  store   │  │/context│  │ Postgres │
+              │          │  │        │  │ MySQL    │
+              │ MemGPT   │  │AgentDB │  │ MongoDB  │
+              │ Mem0     │  │        │  │ DynamoDB │
+              │ Letta    │  │        │  │          │
+              │ LangChain│  │        │  │          │
+              │  memory  │  │        │  │          │
+              └──────────┘  └────────┘  └──────────┘
+              "what should  "what just  "the user's
+               I remember"   happened"   business data"
+```
+
+**1. Memory / knowledge store.** Not a pure database — a
+memory and knowledge management layer. Cumulative facts the
+agent has learned, distilled summaries of past sessions,
+semantic indices over a corpus, retrieval-augmented context.
+Often involves LLM-driven summarization, episodic-to-semantic
+distillation, importance scoring, and compression. Examples:
+LangChain memory, MemGPT, Mem0, Letta. The hard problem here
+is *what to remember and how to compress it* — the schema is
+light; the intelligence is heavy.
+
+**2. Runtime / state / context store.** The agent's working
+memory during execution: every event of every session — user
+turns, model outputs, tool calls, tool results, observations.
+Append-heavy, retrievable by recency + similarity, scoped per
+session, branchable via fork, with a lifecycle from active to
+archive. **This is AgentDB's scope.** The hard problem here
+is *throughput, multi-tenant isolation, and cheap storage at
+scale* — the schema is mostly fixed; the volume and operational
+shape are what matter.
+
+**3. The application's own database.** The product an agent
+operates inside still has rows: users, accounts, orders,
+calendar events, documents, CRM records. Apps built on
+Lovable, Replit, Vercel, etc. need a general-purpose OLTP
+database for that — Postgres, MySQL, MongoDB, DynamoDB. The
+hard problem here is *transactions, joins, schema evolution* —
+exactly what general-purpose databases solve.
+
+These three overlap at the edges (a memory system may be
+backed by a vector DB; a runtime store can persist
+LLM-generated summaries; an OLTP database can serve session
+state for a small app), but the workload shapes are distinct
+enough that one system rarely serves all three well at scale.
+
+AgentDB lives in slot #2. It does not try to:
+
+- **Replace memory frameworks (#1).** AgentDB stores raw
+  events; it does not decide what's worth remembering or how
+  to summarize. A memory system layered above AgentDB writes
+  its distilled artifacts back as events, with retrieval
+  scoped to the session.
+- **Replace your application's OLTP database (#3).** AgentDB
+  is event-log-shaped, not row-mutation-shaped. CRM updates,
+  payment records, multi-row ACID transactions belong on
+  Postgres / MySQL / MongoDB. AgentDB sits alongside,
+  capturing what the agent did and why.
+
+The motivation that follows in §1 is specifically about the
+runtime / state / context workload — why agent-driven traffic
+is structurally different from human-driven OLTP at *that*
+layer.
+
+---
+
 ## 1. Motivation: Why Now
 
 The case for an agent-native database rests on a single empirical
