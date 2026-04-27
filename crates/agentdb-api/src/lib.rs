@@ -295,22 +295,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),
-        )
-        // Phase 2 ephemeral broadcast publish (spec § 5.1). Mounted
-        // here under the Basic-auth subtree as a temporary home;
-        // Task 6 moves channel routes into a CORS-layered subtree
-        // alongside the SSE subscribe handler.
-        .route(
-            "/api/tenants/:tenant_id/channels/:channel/publish",
-            axum::routing::post(broadcast::publish),
-        )
-        // Phase 2 ephemeral broadcast subscribe (spec § 5.1). Same
-        // temporary mount story as `publish` above — Task 6 hoists
-        // both into the CORS-layered subtree alongside session
-        // subscribe routes.
-        .route(
-            "/api/tenants/:tenant_id/channels/:channel/subscribe",
-            axum::routing::get(broadcast::subscribe_channel),
         );
     let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -336,6 +320,26 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             auth_middleware::basic_auth_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cors::cors_middleware,
+        ));
+
+    // Phase 2 ephemeral broadcast routes (spec § 5.1). Sibling of
+    // `subscribe_routes`: same CORS layer (so browsers get preflight
+    // + ACAO echo), but auth runs inside the handlers via
+    // `extract_subscribe_jwt` rather than a Basic-auth middleware.
+    // Kept distinct from `subscribe_routes` for grep-ability —
+    // durable session subs vs ephemeral channel broadcast.
+    let channel_routes: Router<AppState> = Router::new()
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/publish",
+            axum::routing::post(broadcast::publish),
+        )
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/subscribe",
+            axum::routing::get(broadcast::subscribe_channel),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             cors::cors_middleware,
@@ -484,6 +488,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(tenant_routes)
         .merge(subscribe_routes)
+        .merge(channel_routes)
         .merge(admin_routes)
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))
