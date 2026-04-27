@@ -2048,6 +2048,111 @@ the relevant file. The structure is always Symptom → Diagnose →
 Verify → Remediate → Prevent so operators skimming one runbook
 know the shape of every other.
 
+The SSE error frames emitted by the subscribe endpoints
+(`jwt_expired`, `jwt_invalid`, `session_not_in_jwt`,
+`lag_too_far`, `catchup_failed`) each have a runbook under the
+same directory so the operator-skim contract carries over to
+streaming errors.
+
+## Pub/Sub (Phase 1)
+
+A live change feed sits next to `append_and_fetch`. Because
+`append_and_fetch` already writes a durable, seq-numbered event,
+the subscribe endpoint just tails that log: every successful
+write fans out to an in-process broadcast bus, and SSE
+subscribers tail the bus with optional `from_seq=N` replay so
+reconnects are gap-free. No replication slot, no auxiliary
+fan-out table.
+
+Surface:
+
+- `GET /api/tenants/{tenant}/sessions/{session}/subscribe` —
+  per-session tail.
+- `GET /api/tenants/{tenant}/subscribe` — tenant-wide tail
+  (optional `?session=` whitelist, `?from_seq_per_session=`
+  for per-session catch-up cursors).
+
+Both accept `?from_seq=`, repeatable `?kind=` filters,
+`?heartbeat_secs=`, and either `Authorization: Bearer <jwt>` or
+`?access_token=<jwt>` for browser EventSource. With JWT unset
+on a tenant, the route falls through to existing Basic auth.
+
+#### EventBus
+
+`crates/agentdb-api/src/event_bus.rs` defines a process-wide
+`EventBus` (separate from the system-event `StreamBus` so
+user-event volume doesn't compete with system-event buffer).
+After every successful `append_event`,
+`crates/agentdb-api/src/handlers.rs` emits an
+`EventEnvelope { tenant, session, seq, ts_ms, hlc_ts, actor_id,
+kind, payload }` to the bus. Capacity is 16384 with
+`set_overflow(true)` — slow subscribers receive
+`RecvError::Overflowed` rather than silently lost messages.
+
+#### Subscribe handler
+
+`crates/agentdb-api/src/subscribe.rs` serves both endpoints. The
+race-safe pattern (spec § 6.3):
+
+1. Subscribe to the bus FIRST (events appended after this line
+   buffer in the broadcast channel).
+2. Snapshot `live_seq = session.next_seq`.
+3. Catch-up scan via `agentdb_core::fetch_events_from_seq`
+   over `[from_seq, live_seq)`.
+4. Live tail; drop any envelope with `seq < live_seq` (already
+   delivered via catch-up).
+
+This three-phase shape (subscribe → snapshot → catch-up →
+filtered live tail) is what guarantees no events lost and no
+duplicates across the boundary.
+
+#### Error frames
+
+When the live tail can't continue, the handler emits an SSE
+`event: error` frame and closes the connection. Callers reconnect
+with `from_seq = last_delivered_seq + 1`; the durable log makes
+the reconnect gap-free.
+
+| Code | When | Body |
+|---|---|---|
+| `lag_too_far` | EventBus receiver overflowed (slow subscriber). | `{last_delivered_seq}` (per-session) or `{last_delivered_seq_by_session}` (tenant-wide). |
+| `catchup_failed` | `fetch_events_from_seq` errored. | `{from_seq, live_seq}`. Per-session endpoint closes; tenant-wide degrades the failed session and continues for the rest. |
+| `jwt_expired` | Token's `exp` passed during the live tail. | `{last_seq}` (per-session) or `{last_delivered_seq_by_session}`. |
+| `jwt_invalid` | Token rejected at subscribe time (signature, claims, format). | HTTP 401 (not an SSE frame). |
+| `session_not_in_jwt` | Token valid but `sessions` claim doesn't authorize the requested session. | HTTP 403. |
+
+#### JWT verification
+
+`crates/agentdb-api/src/jwt.rs` verifies tenant-configured HMAC
+or JWKS. JWKS keys are TTL-cached (10 minutes). An algorithm
+allowlist prevents the alg=HS256-with-JWKS-public-key confusion
+attack. The extractor in
+`crates/agentdb-api/src/subscribe_auth.rs` accepts either
+`Authorization: Bearer ...` or `?access_token=...` (both
+supplied returns 400). When the tenant has no JWT config the
+extractor returns `Ok(None)` and the route falls through to the
+existing Basic auth.
+
+#### CORS
+
+`crates/agentdb-api/src/cors.rs` is a per-tenant origin-echo
+middleware applied only to subscribe routes (separate router
+subtree in `lib.rs`, layered above Basic auth so OPTIONS
+preflight short-circuits). Origins are configured via
+`AGENTDB_TENANT_<id>_CORS_ORIGINS=<comma-separated>`. The
+middleware omits the CORS header on disallowed origins — the
+browser does the rejection, so there is no
+`origin_not_allowed` error on the wire.
+
+#### Multi-node
+
+`crates/agentdb-api/src/forwarding.rs::subscribe_not_owner_reply`
+returns HTTP 421 with `{owner_addr, owner_node_id}` when a
+session is owned by a peer. The tenant-wide endpoint returns
+`subscribe_not_owner_multi_reply` with `owner_addrs: [...]`.
+Phase 1 does NOT proxy SSE across nodes — clients reconnect to
+the owner. SDKs follow the 421 transparently.
+
 ## What the prototype does NOT do
 
 The design doc describes a much larger system. The prototype

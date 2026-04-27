@@ -484,6 +484,15 @@ Per the query-shape analysis in §2.5, the minimal primitive set:
 - **Append-and-fetch-last-N** — the highest-frequency atomic
   operation. Writes one event and returns the last N in a single
   round trip.
+- **Real-time subscribe** (`GET .../subscribe`) — SSE tail of
+  session events with optional `from_seq` replay. The change
+  feed is the durable event log itself: no replication slot, no
+  auxiliary table, the same primitive that serves the write
+  serves the live read. JWT auth (HMAC or JWKS) for
+  browser-direct subscribers; Basic auth for backend.
+  Lag-too-far closes with `last_delivered_seq` so clients
+  reconnect gap-free via `from_seq`. See README "Real-time
+  subscriptions".
 
 Hybrid retrieval is the most differentiated of these. The difficulty
 lies in the interaction between vector search and structured filter.

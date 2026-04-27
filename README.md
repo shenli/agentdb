@@ -295,6 +295,108 @@ opts out and returns the un-folded log. See
 `docs/ARCHITECTURE.md § Mongo CRUD semantics` for the full
 contract.
 
+### Real-time subscriptions (SSE)
+
+Server-Sent Events stream of events appended to a session, with
+`from_seq` replay for gap-free reconnect. Browser-direct via JWT
+(no application backend in the loop); backend-direct via Basic
+auth.
+
+```
+GET /api/tenants/{tenant}/sessions/{session}/subscribe
+       ?from_seq=<u64>            # optional; default = "live tail only"
+       &kind=<string>             # optional; repeatable kind filter (OR'd)
+       &heartbeat_secs=<u64>      # optional; SSE keepalive interval (default 20)
+       &access_token=<jwt>        # browsers using EventSource
+
+GET /api/tenants/{tenant}/subscribe
+       ?session=<id>              # optional; repeatable session whitelist
+       &kind=<kind>               # optional; repeatable kind filter
+       &from_seq_per_session=s-1:42,s-2:7   # optional; per-session catch-up
+       &heartbeat_secs=<u64>
+       &access_token=<jwt>
+```
+
+**TypeScript** (browser-direct, `getToken` refreshes on every
+reconnect so `jwt_expired` is recovered transparently):
+
+```ts
+import { Client } from "agentdb";
+
+const client = new Client("https://agentdb.example.com", {
+  tenant: "t-1",
+  getToken: async () => await myAuth.getJwt(),
+});
+const session = client.session("s-1");
+
+let lastSeen: number | undefined;
+for await (const event of session.subscribe({ fromSeq: lastSeen })) {
+  ui.render(event);
+  lastSeen = event.seq;
+}
+```
+
+**Python** (sync; backend or scripts):
+
+```python
+from agentdb import Client
+
+client = Client("http://127.0.0.1:7878", tenant="t-1")
+session = client.session("s-1")
+for event in session.subscribe(from_seq=42):
+    handle(event)
+```
+
+**Go**:
+
+```go
+import "github.com/shenli/agentdb/clients/go/agentdb"
+
+client := agentdb.New("http://127.0.0.1:7878",
+    agentdb.WithDefaultTenant("t-1"))
+sess := client.Session("s-1")
+events, errs := sess.Subscribe(ctx, agentdb.SessionSubscribeOptions{})
+for evt := range events {
+    handle(evt)
+}
+if err := <-errs; err != nil { /* SubscriptionClosed or transport error */ }
+```
+
+#### Why this exists, and why it's free
+
+`append_and_fetch` already writes a durable, seq-numbered event to
+the session log. The subscribe endpoint just tails that log live
+(in-process broadcast bus → SSE) with `from_seq=N` for gap-free
+reconnect. No replication slot, no separate fanout cluster, no
+auxiliary table. The same primitive serves the write and the
+change feed.
+
+Comparison with Supabase Realtime's Postgres Changes:
+
+- Supabase: 4-hop pipeline (table → WAL → logical decode →
+  Realtime cluster → WS) at separate billing.
+- AgentDB: 1-hop (append → bus → SSE) in the database process.
+- AgentDB has gap-free `from_seq` replay; Supabase doesn't.
+
+#### JWT browser-direct
+
+Set per-tenant JWT and CORS via env vars at server boot:
+
+```
+AGENTDB_TENANT_T_1_JWT_HMAC_SECRET=<secret>          # OR
+AGENTDB_TENANT_T_1_JWT_JWKS_URL=https://auth.example.com/.well-known/jwks.json
+AGENTDB_TENANT_T_1_JWT_ISSUER=https://auth.example.com
+AGENTDB_TENANT_T_1_JWT_AUDIENCE=agentdb              # optional
+AGENTDB_TENANT_T_1_CORS_ORIGINS=https://app.example.com,https://staging.example.com
+```
+
+JWT claims required: `iss`, `sub`, `tenant`, `sessions` (`"*"`
+or `["s-1", ...]`), `exp`. The official SDKs auto-reconnect with
+`from_seq` on `jwt_expired` — gap-free across token refresh.
+
+See [`examples/browser/`](examples/browser/) for a runnable demo
+(static HTML + EventSource + a tiny `mint_token.py` helper).
+
 ---
 
 ## Configuration (env vars)

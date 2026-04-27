@@ -54,6 +54,7 @@ from .errors import (
     RateLimited,
     ServerError,
     Misdirected,
+    SubscriptionClosed,
 )
 
 __all__ = [
@@ -72,6 +73,7 @@ __all__ = [
     "RateLimited",
     "ServerError",
     "Misdirected",
+    "SubscriptionClosed",
 ]
 
 

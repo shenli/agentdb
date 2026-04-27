@@ -73,6 +73,45 @@ export class RateLimited extends AgentDBError {
  */
 export class ServerError extends AgentDBError {}
 
+/**
+ * Raised when the server closes a `subscribe()` stream with a
+ * terminal `event: error` frame.
+ *
+ * The body of those frames carries `{"error": "<code>", "last_seq":
+ * <number?>}`. The `errorCode` field decides whether the client
+ * reconnects:
+ *
+ * - `jwt_expired`: when a token provider is configured the SDK
+ *   transparently refreshes and reconnects with `fromSeq =
+ *   lastSeq + 1`. Callers don't see this exception unless they
+ *   passed neither `jwt` nor `getToken`.
+ * - `lag_too_far` / `catchup_failed`: surfaced as-is. Callers can
+ *   choose to reconnect from a fresher seq or give up.
+ *
+ * `lastSeq`, when present, is the sequence number of the last
+ * event the server delivered before closing — use it to pick a
+ * gap-free resume point.
+ *
+ * The HTTP status was 200 when the stream opened and the close is
+ * mid-stream, so `statusCode` is set to 0.
+ */
+export class SubscriptionClosed extends AgentDBError {
+  /** Server-provided machine code, e.g. `lag_too_far`. */
+  readonly errorCode: string;
+  /** Last delivered seq, when the server reported one. */
+  readonly lastSeq?: number;
+
+  constructor(errorCode: string, opts: { lastSeq?: number; message?: string } = {}) {
+    super(opts.message ?? `subscription closed: ${errorCode}`, {
+      statusCode: 0,
+      code: errorCode,
+      body: { error: errorCode, last_seq: opts.lastSeq },
+    });
+    this.errorCode = errorCode;
+    this.lastSeq = opts.lastSeq;
+  }
+}
+
 const CODE_FOR_STATUS: Record<number, typeof AgentDBError> = {
   400: BadRequest,
   401: Unauthorized,

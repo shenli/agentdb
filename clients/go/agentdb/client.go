@@ -24,6 +24,12 @@ type Client struct {
 	tenant     string
 	timeout    time.Duration
 	httpClient *http.Client
+	// Subscribe-side bearer auth. JWT is the static form;
+	// getToken is the refreshable form (called fresh on every
+	// subscribe reconnect so a server-side jwt_expired close
+	// recovers transparently).
+	jwt      string
+	getToken func() (string, error)
 }
 
 // Option configures a Client at construction time. Use the
@@ -63,6 +69,23 @@ func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) { c.httpClient = h }
 }
 
+// WithJWT sets a static bearer token used by [Client.Subscribe] /
+// [Session.Subscribe]. Mutually exclusive with [WithTokenProvider]
+// — pass exactly one when the server requires auth on the
+// subscribe path.
+func WithJWT(token string) Option {
+	return func(c *Client) { c.jwt = token }
+}
+
+// WithTokenProvider sets a callback that returns the current
+// bearer token. Called fresh on every reconnect, which is what
+// makes the SDK's `jwt_expired` auto-resume transparent — rotate
+// once in the provider and the next reconnect picks it up
+// without restarting the goroutine.
+func WithTokenProvider(fn func() (string, error)) Option {
+	return func(c *Client) { c.getToken = fn }
+}
+
 // New constructs a Client.
 //
 //	client := agentdb.New("http://127.0.0.1:7878",
@@ -90,6 +113,9 @@ func New(baseURL string, opts ...Option) *Client {
 		// Callers control this input directly so a panic is
 		// fine — the alternative is silent auth misconfig.
 		panic("agentdb: WithBasicAuth requires both user and password")
+	}
+	if c.jwt != "" && c.getToken != nil {
+		panic("agentdb: pass WithJWT or WithTokenProvider, not both")
 	}
 	return c
 }

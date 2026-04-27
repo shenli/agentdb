@@ -139,9 +139,12 @@ mod tests {
                 tenants: Arc::new(TenantRegistry::new(kv.clone())),
                 sessions: Arc::new(SessionRegistry::new(kv)),
                 stream: crate::stream::StreamBus::default(),
+                event_bus: crate::event_bus::EventBus::default(),
                 http: crate::webhook::new_client(),
                 auth: None,
         admin_auth: None,
+                jwt_config: crate::jwt::JwtConfig::default(),
+                cors_config: crate::cors::CorsConfig::default(),
             },
         )
     }
@@ -161,9 +164,12 @@ mod tests {
                 tenants: Arc::new(TenantRegistry::new(kv.clone())),
                 sessions: Arc::new(SessionRegistry::new(kv)),
                 stream: crate::stream::StreamBus::default(),
+                event_bus: crate::event_bus::EventBus::default(),
                 http: crate::webhook::new_client(),
                 auth: None,
         admin_auth: None,
+                jwt_config: crate::jwt::JwtConfig::default(),
+                cors_config: crate::cors::CorsConfig::default(),
             },
         )
     }

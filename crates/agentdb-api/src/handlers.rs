@@ -12,6 +12,134 @@ use crate::error::{ApiError, ErrorResponse};
 use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::AppState;
 
+/// Resolve the current `next_seq` for an external (tenant, session)
+/// pair without doing any of the write-path work (admission,
+/// quotas, fault injection). Used by subscribe handlers to pin a
+/// "live as of T" cursor before they start tailing the bus.
+///
+/// Routing matches `append_and_fetch`'s local path: pick the box
+/// via `route_session`, look up the tenant in that box, then look
+/// up the session under that tenant.
+///
+/// Returns `None` when either the tenant or the session has not
+/// been minted yet (a subscriber may legitimately attach before
+/// the very first append). Transient KV errors are also collapsed
+/// to `None` — Phase 1 callers want a "best effort" cursor and
+/// emit `live_seq: 0` in that case — but errors are logged via
+/// `tracing::warn!` so infra issues show up in logs instead of
+/// silently turning into `live_seq=0`. Task 5's catch-up replay
+/// depends on this distinction: legitimate "not yet minted" should
+/// stay quiet, real KV failures should be visible.
+pub async fn resolve_session_next_seq(
+    state: &AppState,
+    tenant_external: &str,
+    session_external: &str,
+) -> Option<u64> {
+    let box_ = state
+        .registry
+        .route_session(tenant_external, session_external);
+    let tenant = match state.tenants.lookup(box_.id, tenant_external) {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant = tenant_external,
+                "resolve_session_next_seq: tenant lookup error",
+            );
+            return None;
+        }
+    };
+    let session = match state
+        .sessions
+        .lookup(box_.id, tenant.internal_id, session_external)
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tenant = tenant_external,
+                session = session_external,
+                "resolve_session_next_seq: session lookup error",
+            );
+            return None;
+        }
+    };
+    Some(session.next_seq)
+}
+
+/// Catch-up scan helper. Resolves the (tenant, session) pair the
+/// same way [`resolve_session_next_seq`] does, opens a `ReadCtx`
+/// against the box, and delegates to
+/// [`agentdb_core::fetch_events_from_seq`] for the half-open range
+/// `[from_seq, end_seq)`.
+///
+/// Returns `Ok(empty vec)` if the tenant or session does not exist
+/// yet (subscriber attached before any append). Returns
+/// `Err(ApiError::Internal)` on KV / snapshot errors so the caller
+/// can log them — at the SSE handler boundary we surface those as
+/// a `catchup_failed` close frame so the client can reconnect with
+/// a refreshed cursor instead of silently flipping to live tail
+/// across an unfilled `[from_seq, live_seq)` gap.
+///
+/// **Snapshot consistency note.** Subscribe callers snapshot
+/// `live_seq = session.next_seq` via [`resolve_session_next_seq`]
+/// *before* invoking this helper, then pass that snapshot in as
+/// `end_seq`. We re-resolve the [`agentdb_core::Session`] here to
+/// get a storage handle for [`agentdb_core::ReadCtx`], which means
+/// the `Session.next_seq` we read on this call may be **larger**
+/// than the caller's `live_seq` (more appends landed in between).
+/// That is safe: `next_seq` is monotonically non-decreasing for a
+/// session — only [`agentdb_core::primitives::append_event`]
+/// modifies it, and it always sets `next_seq = seq + 1` (verified
+/// in `crates/agentdb-core/src/primitives.rs`). New session/fork
+/// records start at `next_seq = 1`. So the inner
+/// `clamped_end = end_seq.min(session.next_seq)` in
+/// [`agentdb_core::fetch_events_from_seq`] is at worst `end_seq`
+/// itself — never lower — and the catch-up window
+/// `[from_seq, live_seq)` is always returned in full. No gap.
+pub async fn scan_events_from_seq(
+    state: &AppState,
+    tenant_external: &str,
+    session_external: &str,
+    from_seq: u64,
+    end_seq: u64,
+) -> Result<Vec<agentdb_core::types::Event>, ApiError> {
+    let box_ = state
+        .registry
+        .route_session(tenant_external, session_external);
+    let tenant = match state.tenants.lookup(box_.id, tenant_external) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "scan_events_from_seq: tenant lookup: {e}"
+            )))
+        }
+    };
+    // Re-resolve the Session for its storage handle. `next_seq` is
+    // monotonic, so reading it here may return a value `>=` the
+    // caller's `live_seq` snapshot — never lower. See the rustdoc
+    // above for why that keeps the catch-up window gap-free.
+    let session = match state
+        .sessions
+        .lookup(box_.id, tenant.internal_id, session_external)
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "scan_events_from_seq: session lookup: {e}"
+            )))
+        }
+    };
+    let ctx = agentdb_core::ReadCtx::open(&box_, state.registry.kv())
+        .map_err(|e| ApiError::Internal(format!("scan_events_from_seq: open ReadCtx: {e}")))?;
+    agentdb_core::fetch_events_from_seq(&ctx, &session, from_seq, end_seq)
+        .map_err(|e| ApiError::Internal(format!("scan_events_from_seq: fetch: {e}")))
+}
+
 #[utoipa::path(
     post,
     path = "/api/tenants/{tenant_id}/sessions/{session_id}/append_and_fetch",
@@ -170,11 +298,7 @@ async fn do_append_and_fetch(
             // says Remote. Routing drift between nodes — surface
             // 421 so operators see it in logs rather than a
             // silent infinite loop.
-            let local_node = state
-                .registry
-                .node_id()
-                .unwrap_or("unknown")
-                .to_string();
+            let local_node = state.registry.node_id().unwrap_or("unknown").to_string();
             return forwarding::misdirected_reply(&local_node, *tablet_id);
         }
         // Count the forward attempt on box 0 (admin-chosen
@@ -182,7 +306,9 @@ async fn do_append_and_fetch(
         // box, so there's no natural local box to attribute to).
         let box_for_metrics = state.registry.box_by_id(0);
         if let Some(ref b) = box_for_metrics {
-            b.metrics.forwarded_writes_total.fetch_add(1, Ordering::Relaxed);
+            b.metrics
+                .forwarded_writes_total
+                .fetch_add(1, Ordering::Relaxed);
         }
         let passthrough = PassthroughHeaders::from_headers(&headers);
         match forwarding::forward_append_and_fetch(
@@ -260,6 +386,16 @@ async fn do_append_and_fetch(
         }
         Err(e) => return ApiError::Core(e).into_response(),
     };
+    // Pub/sub fan-out. Spec §6.7: emit AFTER the durable write
+    // succeeds (we are past `append_and_fetch_with_actor` Ok) and
+    // BEFORE the response is built, so subscribers never see an
+    // event we wouldn't actually return on read. Fire-and-forget;
+    // backpressure is absorbed by the bus's overflow policy.
+    state.event_bus.emit(crate::event_bus::envelope_from_event(
+        &tenant,
+        &session,
+        &out.appended,
+    ));
     let recent = out.recent.into_iter().map(EventDto::from).collect();
     axum::Json(AppendAndFetchResponse {
         seq: out.new_seq,

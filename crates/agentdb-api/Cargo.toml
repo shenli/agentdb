@@ -11,9 +11,23 @@ agentdb-dashboard = { path = "../agentdb-dashboard" }
 agentdb-meta = { path = "../agentdb-meta" }
 async-broadcast = { workspace = true }
 axum = { workspace = true }
+# Phase-1 pub/sub Task 4: `Query` from axum-extra uses
+# `serde_html_form` and decodes repeated keys
+# (`?kind=a&kind=b`) into `Vec<String>`. The default
+# axum `Query` (`serde_urlencoded`) cannot. Pinned to the
+# 0.9 line — it tracks axum 0.7.
+axum-extra = { version = "0.9", features = ["query"] }
 base64 = { workspace = true }
 subtle = { workspace = true }
 futures-util = "0.3"
+# Phase-1 pub/sub Task 9a: JWT verification for browser-direct
+# subscribers. HS256 in this task; RS256/ES256 via JWKS in 9b.
+jsonwebtoken = "9"
+# Phase-1 pub/sub Task 9b: JWKS keyset cache uses a process-global
+# `Lazy<JwksCache>` keyed by URL. `once_cell` is the standard
+# crate; `std::sync::OnceLock` would also work but `Lazy` reads
+# cleaner for this shape.
+once_cell = "1"
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
@@ -30,6 +44,18 @@ utoipa-axum = { workspace = true }
 agentdb-storage = { path = "../agentdb-storage" }
 anyhow = { workspace = true }
 object_store = { workspace = true }
+# Task 9b JWKS test mints an RSA-signed JWT against a local stub
+# server. `rsa` here is dev-only — runtime verification uses
+# `jsonwebtoken::DecodingKey::from_rsa_components`. `base64` is
+# already a runtime dep (Task 5 catch-up scan), so reused here.
+rsa = "0.9"
+rand = { workspace = true }
+# Phase-1 pub/sub Task 9c-3: integration tests for the JWT-protected
+# subscribe path mint HS256 tokens against the same secret the test
+# server is configured with. Runtime verification already pulls
+# `jsonwebtoken` via `[dependencies]`; integration tests are a
+# separate crate, so list it explicitly here too.
+jsonwebtoken = "9"
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -6,37 +6,43 @@ use axum::Router;
 
 pub mod admin;
 pub mod admin_audit;
+pub mod admin_auth_middleware;
 pub mod admin_backup;
 pub mod admin_boxes;
 pub mod admin_drain;
+pub mod admin_hot_tablets;
 pub mod admin_nodes;
 pub mod admin_reload;
 pub mod admin_scheduler;
 pub mod admin_sessions;
 pub mod admin_shards;
-pub mod admin_hot_tablets;
 pub mod admin_slow_queries;
 pub mod admin_tablets;
 pub mod admin_tenant_quotas;
-pub mod admin_users;
-pub mod admin_auth_middleware;
 pub mod admin_tokens;
+pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
+pub mod cors;
 pub mod dto;
 pub mod error;
+pub mod event_bus;
 pub mod fork;
 pub mod forwarding;
 pub mod handlers;
 pub mod health;
 pub mod hlc_header;
+pub mod jwt;
 pub mod metrics_exposition;
 pub mod stream;
+pub mod subscribe;
+pub mod subscribe_auth;
 pub mod trace_context;
 pub mod webhook;
 
 pub use auth_middleware::AuthedTenant;
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
+pub use event_bus::EventBus;
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
 
 #[derive(Clone)]
@@ -45,6 +51,11 @@ pub struct AppState {
     pub tenants: Arc<agentdb_core::TenantRegistry>,
     pub sessions: Arc<agentdb_core::SessionRegistry>,
     pub stream: StreamBus,
+    /// Process-wide pub/sub bus for appended events. Subscribers
+    /// (SSE handlers in later pub/sub tasks) fan out envelopes
+    /// emitted from the success path of `append_and_fetch`. See
+    /// `docs/superpowers/specs/2026-04-25-pubsub-design.md` §6.7.
+    pub event_bus: EventBus,
     pub http: reqwest::Client,
     /// M19 auth config. `None` → no auth required; the Basic
     /// Auth middleware is a no-op. `Some` → `/api/tenants/*`
@@ -58,6 +69,21 @@ pub struct AppState {
     /// exception: the first `POST /api/admin/tokens` is
     /// allowed without auth when no active tokens exist.
     pub admin_auth: Option<admin_auth_middleware::AdminAuthConfig>,
+    /// Task 9c JWT subscribe-auth config. Per-tenant verifier
+    /// settings (HMAC secret or JWKS URL). Empty `per_tenant`
+    /// map means "no JWT auth configured" — the subscribe
+    /// middleware still falls back to Basic auth on those
+    /// tenants. See `docs/superpowers/specs/2026-04-25-pubsub-design.md`
+    /// §6.13.
+    pub jwt_config: jwt::JwtConfig,
+    /// Task 10 per-tenant CORS config for browser-direct
+    /// subscribers. Empty `per_tenant` map means "no CORS
+    /// configured" — the middleware omits CORS headers on
+    /// those tenants (browser blocks cross-origin requests).
+    /// Wired into the subscribe router in Task 10-2. See
+    /// `docs/superpowers/specs/2026-04-25-pubsub-design.md`
+    /// §6.13.
+    pub cors_config: cors::CorsConfig,
 }
 
 #[derive(Clone)]
@@ -80,6 +106,7 @@ impl AppState {
         tenants: Arc<agentdb_core::TenantRegistry>,
         sessions: Arc<agentdb_core::SessionRegistry>,
         stream: StreamBus,
+        event_bus: EventBus,
         http: reqwest::Client,
     ) -> Self {
         Self {
@@ -87,9 +114,12 @@ impl AppState {
             tenants,
             sessions,
             stream,
+            event_bus,
             http,
             auth: None,
             admin_auth: None,
+            jwt_config: jwt::JwtConfig::default(),
+            cors_config: cors::CorsConfig::default(),
         }
     }
 }
@@ -264,6 +294,30 @@ pub fn router(state: AppState) -> Router {
         auth_middleware::basic_auth_middleware,
     ));
 
+    // Subscribe routes carry CORS plus Basic auth. CORS goes
+    // *outside* Basic auth so the OPTIONS preflight short-circuits
+    // before the auth layer demands credentials (browsers do not
+    // include `Authorization` on preflight). Basic auth still
+    // protects the actual GET when the JWT subscribe-auth path
+    // isn't engaged for this tenant.
+    let subscribe_routes: Router<AppState> = Router::new()
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
+            axum::routing::get(subscribe::subscribe_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/subscribe",
+            axum::routing::get(subscribe::subscribe_tenant),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::basic_auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cors::cors_middleware,
+        ));
+
     // Admin-plane routes. Every `/api/admin/*` endpoint goes
     // here; the bearer-token middleware layers over the
     // subtree so health/metrics/dashboard stay open.
@@ -355,8 +409,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/users",
-            axum::routing::post(admin_users::create_user)
-                .get(admin_users::list_users),
+            axum::routing::post(admin_users::create_user).get(admin_users::list_users),
         )
         .route(
             "/api/admin/users/:user_id",
@@ -364,8 +417,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/tokens",
-            axum::routing::post(admin_tokens::mint_token)
-                .get(admin_tokens::list_tokens),
+            axum::routing::post(admin_tokens::mint_token).get(admin_tokens::list_tokens),
         )
         .route(
             "/api/admin/tokens/:token_id",
@@ -408,6 +460,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .merge(tenant_routes)
+        .merge(subscribe_routes)
         .merge(admin_routes)
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentdb_api::{now_ms, router, AppState, StreamBus, StreamEvent, TickBox};
+use agentdb_api::{now_ms, router, AppState, EventBus, StreamBus, StreamEvent, TickBox};
 use agentdb_core::{
     BoxRegistry, GcRunReporter, HlcClock, LeaderElection, LeaderElectionConfig, LeaseRenewalJob,
     LifecycleConfig, LifecycleEngine, LockGc, LockGcConfig, NodeReaper, NodeReaperConfig,
@@ -33,6 +33,111 @@ fn resolve_string(flag: Option<&str>, env_key: &str, default: impl FnOnce() -> S
         return v.to_string();
     }
     std::env::var(env_key).unwrap_or_else(|_| default())
+}
+
+/// Build per-tenant JWT verification config from env vars.
+///
+/// Each tenant is configured by a `secret` or `jwks_url` var plus
+/// optional `issuer`/`audience`. Recognized var shapes:
+///
+///   AGENTDB_TENANT_<TENANT>_JWT_HMAC_SECRET=<bytes>
+///   AGENTDB_TENANT_<TENANT>_JWT_JWKS_URL=<https://…/jwks>
+///   AGENTDB_TENANT_<TENANT>_JWT_ISSUER=<iss>      (required)
+///   AGENTDB_TENANT_<TENANT>_JWT_AUDIENCE=<aud>    (optional)
+///
+/// `<TENANT>` is uppercased and uses `_` as a delimiter; the actual
+/// tenant id is the lowercased form with `_` rewritten to `-` —
+/// `AGENTDB_TENANT_T_1_JWT_HMAC_SECRET` configures tenant `t-1`.
+/// Tenant ids that themselves contain underscores are not
+/// representable via env (the convention can't disambiguate) — those
+/// deployments must register tenants through the meta store and
+/// surface the secret via a future config-file path.
+///
+/// HMAC and JWKS are mutually exclusive per tenant; setting both
+/// vars makes HMAC win (it's iterated first). Tenants absent from
+/// env have no JWT config and the subscribe middleware falls
+/// through to whatever auth the route already applies.
+fn jwt_config_from_env() -> agentdb_api::jwt::JwtConfig {
+    use std::collections::HashMap;
+    let mut per_tenant = HashMap::new();
+    for (k, v) in std::env::vars() {
+        let Some(rest) = k.strip_prefix("AGENTDB_TENANT_") else {
+            continue;
+        };
+        if let Some(tenant_upper) = rest.strip_suffix("_JWT_HMAC_SECRET") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            let issuer = std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_ISSUER"))
+                .unwrap_or_default();
+            let audience =
+                std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_AUDIENCE")).ok();
+            per_tenant.insert(
+                tenant_id,
+                agentdb_api::jwt::TenantJwtConfig::Hmac {
+                    secret: v.into_bytes(),
+                    issuer,
+                    audience,
+                },
+            );
+        } else if let Some(tenant_upper) = rest.strip_suffix("_JWT_JWKS_URL") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            // Skip if HMAC already won — same tenant configured
+            // both ways gets HMAC (iteration order is stable but
+            // unspecified across processes; we make the precedence
+            // explicit here).
+            if per_tenant.contains_key(&tenant_id) {
+                continue;
+            }
+            let issuer = std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_ISSUER"))
+                .unwrap_or_default();
+            let audience =
+                std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_AUDIENCE")).ok();
+            per_tenant.insert(
+                tenant_id,
+                agentdb_api::jwt::TenantJwtConfig::Jwks {
+                    url: v,
+                    issuer,
+                    audience,
+                },
+            );
+        }
+    }
+    agentdb_api::jwt::JwtConfig { per_tenant }
+}
+
+/// Build per-tenant CORS config from env vars.
+///
+/// Recognized var shape:
+///
+///   AGENTDB_TENANT_<TENANT>_CORS_ORIGINS=<origin1>,<origin2>,...
+///
+/// `<TENANT>` follows the same convention as the JWT envs:
+/// uppercased tenant id with `-` rewritten to `_`. The value is a
+/// comma-separated list of exact-match origins (e.g.
+/// `https://app.example.com`); whitespace around commas is trimmed.
+/// Wildcard `*` is accepted by the parser but the middleware does
+/// not honor it — credentialed requests need a concrete origin.
+///
+/// Tenants absent from env have no CORS config; the middleware
+/// then omits `Access-Control-Allow-Origin` and browsers block
+/// cross-origin requests.
+fn cors_config_from_env() -> agentdb_api::cors::CorsConfig {
+    use std::collections::HashMap;
+    let mut per_tenant = HashMap::new();
+    for (k, v) in std::env::vars() {
+        let Some(rest) = k.strip_prefix("AGENTDB_TENANT_") else {
+            continue;
+        };
+        if let Some(tenant_upper) = rest.strip_suffix("_CORS_ORIGINS") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            let origins: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            per_tenant.insert(tenant_id, origins);
+        }
+    }
+    agentdb_api::cors::CorsConfig { per_tenant }
 }
 
 /// Build the object store chosen by `AGENTDB_OBJECT_STORE` (`local` default,
@@ -960,6 +1065,7 @@ pub async fn run(
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv.clone()));
     let stream = StreamBus::default();
+    let event_bus = EventBus::default();
     let http_client = agentdb_api::webhook::new_client();
 
     let hook: agentdb_core::lifecycle::TierChangeHook = {
@@ -1072,6 +1178,7 @@ pub async fn run(
         tenants: tenants.clone(),
         sessions: sessions.clone(),
         stream: stream.clone(),
+        event_bus: event_bus.clone(),
         http: http_client.clone(),
         auth: if require_auth {
             Some(agentdb_api::AuthConfig {
@@ -1087,6 +1194,8 @@ pub async fn run(
         } else {
             None
         },
+        jwt_config: jwt_config_from_env(),
+        cors_config: cors_config_from_env(),
     };
 
     // Auto-shed scheduler (post-M25 operator ergonomics).

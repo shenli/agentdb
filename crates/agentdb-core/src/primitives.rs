@@ -157,6 +157,53 @@ pub fn fetch_last_n(
     Ok(ring.into())
 }
 
+/// Return events with `seq ∈ [from_seq, end_seq)` in ascending order.
+///
+/// `end_seq` is clamped to `session.next_seq` so callers can pass `u64::MAX`
+/// to mean "everything currently visible". Returns an empty vec if
+/// `from_seq >= clamped_end`.
+///
+/// Reads through the pinned snapshot held by `ctx` — writes committed after
+/// the ReadCtx opened are invisible. The same `seq < session.next_seq` and
+/// `hlc_ts <= cutoff` guards as `fetch_last_n` apply.
+pub fn fetch_events_from_seq(
+    ctx: &crate::read_ctx::ReadCtx,
+    session: &Session,
+    from_seq: u64,
+    end_seq: u64,
+) -> Result<Vec<Event>> {
+    let clamped_end = end_seq.min(session.next_seq);
+    if from_seq >= clamped_end {
+        return Ok(Vec::new());
+    }
+    let prefix = agentdb_storage::prefix_for_session_branch(
+        Namespace::Events,
+        session.box_id,
+        session.tenant_internal_id,
+        session.internal_id,
+        DEFAULT_BRANCH_ID,
+    );
+    let cutoff = ctx.hlc_cutoff();
+    let mut out: Vec<Event> = Vec::new();
+    for res in ctx.scan_prefix(&prefix)? {
+        let (_k, v) = res?;
+        let ev: Event = serde_json::from_slice(&v)?;
+        if ev.seq < from_seq {
+            continue;
+        }
+        if ev.seq >= clamped_end {
+            // Events are stored in seq-ascending order (encode_key puts seq
+            // last), so once we pass the upper bound there is nothing left.
+            break;
+        }
+        if ev.hlc_ts > cutoff {
+            continue;
+        }
+        out.push(ev);
+    }
+    Ok(out)
+}
+
 /// Scan all events of a session in seq order (no bound). Used by wire-protocol
 /// `find`. Streams through the pinned snapshot's prefix iterator; eager-collect
 /// because the caller typically applies a filter and limit.
@@ -315,6 +362,11 @@ pub struct AppendFetchOutput {
     pub new_seq: u64,
     pub recent: Vec<Event>,
     pub session: Session,
+    /// The event that was just appended. Carries the assigned
+    /// HLC + actor + payload so callers (e.g. the API layer's
+    /// pub/sub bus emitter) can build a fully-populated envelope
+    /// without a follow-up fetch. See pub/sub design §6.7.
+    pub appended: Event,
 }
 
 /// Append one event and return the last N events of the session in a
@@ -622,6 +674,7 @@ pub async fn append_and_fetch_with_actor(
         new_seq: event.seq,
         recent,
         session,
+        appended: event,
     })
 }
 
@@ -1288,6 +1341,165 @@ mod tests {
             tss,
             std::collections::BTreeSet::from([10, 20, 30, 100]),
             "archived parent must still surface all pre-fork events"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_events_from_seq_returns_half_open_range() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Arc::new(Mutex::new(()));
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=10u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                lock.clone(),
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let got = fetch_events_from_seq(&ctx, &session, 3, 7).unwrap();
+        let seqs: Vec<u64> = got.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn fetch_events_from_seq_empty_when_lower_eq_upper() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Arc::new(Mutex::new(()));
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=5u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                lock.clone(),
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let got = fetch_events_from_seq(&ctx, &session, 3, 3).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_events_from_seq_clamps_upper_to_next_seq() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Arc::new(Mutex::new(()));
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=5u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                lock.clone(),
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let got = fetch_events_from_seq(&ctx, &session, 1, u64::MAX).unwrap();
+        let seqs: Vec<u64> = got.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn fetch_events_from_seq_returns_empty_for_lower_above_next_seq() {
+        let (_dir, kv, tenants, sessions) = setup();
+        let lock = Arc::new(Mutex::new(()));
+        let t = tenants.get_or_mint(0, "t", 0).unwrap();
+        for i in 1..=3u64 {
+            open_and_append(
+                kv.clone(),
+                &sessions,
+                lock.clone(),
+                0,
+                t.internal_id,
+                "s-1",
+                json!({"i": i}),
+                i,
+            )
+            .await
+            .unwrap();
+        }
+        let session = sessions.lookup(0, t.internal_id, "s-1").unwrap().unwrap();
+        let (_obj, ctx) = ephemeral_box_ctx(&kv);
+        let got = fetch_events_from_seq(&ctx, &session, 100, u64::MAX).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_events_from_seq_via_read_ctx_is_isolated_from_new_appends() {
+        // Task 5's catch-up scan opens a ReadCtx, then races against fresh
+        // appends. The pinned snapshot must hide events committed after open
+        // so the catch-up window is exactly `[from_seq, next_seq_at_open)`.
+        use crate::read_ctx::ReadCtx;
+        let (_dir, _obj_dir, registry, tenants, sessions) = context();
+        for i in 1..=3u64 {
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+        let box_ = registry.route_tenant("t-1");
+        let tenant = tenants.get_or_mint(box_.id, "t-1", 0).unwrap();
+        let session_at_open = sessions
+            .lookup(box_.id, tenant.internal_id, "s-1")
+            .unwrap()
+            .unwrap();
+
+        let ctx = ReadCtx::open(&box_, registry.kv()).unwrap();
+
+        // Write more events after the ReadCtx opens.
+        for i in 4..=6u64 {
+            append_and_fetch(
+                &registry,
+                &tenants,
+                &sessions,
+                "t-1",
+                "s-1",
+                json!({"i": i}),
+                0,
+                i * 10,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Even with `end_seq = u64::MAX`, the snapshot must clip to the
+        // session as-of-open: only seqs 1..=3 are visible.
+        let got = fetch_events_from_seq(&ctx, &session_at_open, 1, u64::MAX).unwrap();
+        let seqs: Vec<u64> = got.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "snapshot should see only events visible at open"
         );
     }
 

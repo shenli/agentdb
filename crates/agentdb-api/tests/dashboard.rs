@@ -24,9 +24,12 @@ async fn spawn() -> (TempDir, TempDir, String) {
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
+        event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
         auth: None,
         admin_auth: None,
+        jwt_config: agentdb_api::jwt::JwtConfig::default(),
+        cors_config: agentdb_api::cors::CorsConfig::default(),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

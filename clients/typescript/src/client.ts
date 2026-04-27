@@ -12,7 +12,8 @@
  * Uses Node's built-in `fetch` (Node 20+). Zero runtime deps.
  */
 
-import { AgentDBError, fromResponse } from "./errors.js";
+import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
+import { parseSse } from "./sse.js";
 
 export interface ClientOptions {
   /** HTTP Basic Auth username. Required together with `password`. */
@@ -28,6 +29,18 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Inject a custom fetch (test mocks, instrumented clients). */
   fetch?: typeof globalThis.fetch;
+  /**
+   * Static JWT used for `subscribe()` bearer auth. Mutually
+   * exclusive with `getToken`. Use `getToken` for tokens that
+   * rotate.
+   */
+  jwt?: string;
+  /**
+   * Token provider for `subscribe()` bearer auth. Called fresh on
+   * every reconnect, so a server-side `jwt_expired` close is
+   * recovered transparently. May return a string or a Promise.
+   */
+  getToken?: () => string | Promise<string>;
 }
 
 export interface Event {
@@ -35,6 +48,35 @@ export interface Event {
   tsMs: number;
   payload: unknown;
   actorId?: number;
+  /** Set on events that came from `subscribe()`. */
+  tenant?: string;
+  /** Set on events that came from `subscribe()`. */
+  session?: string;
+  /** Set on events that came from `subscribe()` (when the server tagged a kind). */
+  kind?: string;
+}
+
+export interface SubscribeOptions {
+  /** Filter by event kind(s). */
+  kind?: string[];
+  /**
+   * Replay from this sequence number first, then transition into
+   * live tail without dropping events. Inclusive lower bound.
+   */
+  fromSeq?: number;
+}
+
+export interface ClientSubscribeOptions extends SubscribeOptions {
+  /** Override the client's default tenant. */
+  tenant?: string;
+  /** Filter to one or more session ids. */
+  session?: string[];
+  /**
+   * Per-session catch-up cursors for tenant-wide subscribe.
+   * The map key is the session id; the value is a `from_seq`.
+   * Sent as `from_seq_per_session=sid:seq,sid:seq,...`.
+   */
+  fromSeqPerSession?: Record<string, number>;
 }
 
 export interface AppendResult {
@@ -72,6 +114,8 @@ export class Client {
   private readonly _auth?: { user: string; password: string };
   private readonly _tenant?: string;
   private readonly _fetch: typeof globalThis.fetch;
+  private readonly _jwt?: string;
+  private readonly _getToken?: () => string | Promise<string>;
 
   constructor(baseUrl: string, opts: ClientOptions = {}) {
     if (opts.user !== undefined && opts.password === undefined) {
@@ -80,6 +124,9 @@ export class Client {
     if (opts.password !== undefined && opts.user === undefined) {
       throw new Error("`user` is required when `password` is set");
     }
+    if (opts.jwt !== undefined && opts.getToken !== undefined) {
+      throw new Error("pass `jwt` or `getToken`, not both");
+    }
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     if (opts.user !== undefined) {
@@ -87,6 +134,8 @@ export class Client {
     }
     this._tenant = opts.tenant;
     this._fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
+    this._jwt = opts.jwt;
+    this._getToken = opts.getToken;
   }
 
   get authenticated(): boolean {
@@ -109,6 +158,193 @@ export class Client {
       return resp.status === 200;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Tenant-wide event subscription.
+   *
+   * Yields envelopes from `/api/tenants/{t}/subscribe` — every
+   * appended event in the tenant, optionally filtered by session id
+   * and/or kind. AsyncIterable: consume with `for await`.
+   *
+   * On a `jwt_expired` close frame the client transparently
+   * refreshes the token (via `getToken`, if provided) and reconnects
+   * with `fromSeq = lastSeen + 1` so the consumer never sees a gap.
+   * Other terminal frames raise [`SubscriptionClosed`] for the
+   * caller to handle.
+   *
+   * Use this for fan-out reactors that watch many sessions; for
+   * single-session tailing, `session.subscribe()` is cheaper.
+   */
+  async *subscribe(opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
+    const tenant = opts.tenant ?? this._tenant;
+    if (tenant === undefined) {
+      throw new Error(
+        "`tenant` must be set on Client(...) or passed to " +
+          "subscribe({ tenant: '...' }) — there is no auth-derived " +
+          "default for the tenant-wide subscribe endpoint."
+      );
+    }
+    const path = `/api/tenants/${encodePathSegment(tenant)}/subscribe`;
+    yield* this._subscribeImpl({
+      path,
+      session: opts.session,
+      kind: opts.kind,
+      fromSeq: opts.fromSeq,
+      fromSeqPerSession: opts.fromSeqPerSession,
+    });
+  }
+
+  /** @internal */
+  async _bearerToken(): Promise<string | undefined> {
+    if (this._getToken !== undefined) {
+      return await this._getToken();
+    }
+    return this._jwt;
+  }
+
+  /** @internal */
+  async *_subscribeImpl(args: {
+    path: string;
+    session?: string[];
+    kind?: string[];
+    fromSeq?: number;
+    fromSeqPerSession?: Record<string, number>;
+  }): AsyncGenerator<Event> {
+    let cursor = args.fromSeq;
+    const perSessionCursor: Record<string, number> | undefined =
+      args.fromSeqPerSession ? { ...args.fromSeqPerSession } : undefined;
+    for (;;) {
+      let lastSeen: number | undefined;
+      try {
+        for await (const evt of this._streamOnce({
+          path: args.path,
+          session: args.session,
+          kind: args.kind,
+          fromSeq: cursor,
+          fromSeqPerSession: perSessionCursor,
+        })) {
+          lastSeen = evt.seq;
+          if (perSessionCursor && evt.session) {
+            perSessionCursor[evt.session] = evt.seq;
+          }
+          yield evt;
+        }
+        return; // server closed cleanly
+      } catch (e) {
+        if (
+          e instanceof SubscriptionClosed &&
+          e.errorCode === "jwt_expired" &&
+          (this._getToken !== undefined || this._jwt !== undefined)
+        ) {
+          const fallback = e.lastSeq ?? lastSeen;
+          if (fallback !== undefined) {
+            cursor = fallback + 1;
+          }
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+
+  private async *_streamOnce(args: {
+    path: string;
+    session?: string[];
+    kind?: string[];
+    fromSeq?: number;
+    fromSeqPerSession?: Record<string, number>;
+  }): AsyncGenerator<Event> {
+    const url = new URL(`${this.baseUrl}${args.path}`);
+    if (args.fromSeq !== undefined) {
+      url.searchParams.set("from_seq", String(args.fromSeq));
+    }
+    if (args.fromSeqPerSession && Object.keys(args.fromSeqPerSession).length > 0) {
+      const joined = Object.entries(args.fromSeqPerSession)
+        .map(([sid, seq]) => `${sid}:${seq}`)
+        .join(",");
+      url.searchParams.set("from_seq_per_session", joined);
+    }
+    for (const s of args.session ?? []) {
+      url.searchParams.append("session", s);
+    }
+    for (const k of args.kind ?? []) {
+      url.searchParams.append("kind", k);
+    }
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    const token = await this._bearerToken();
+    if (token !== undefined) {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else if (this._auth) {
+      const t = Buffer.from(
+        `${this._auth.user}:${this._auth.password}`
+      ).toString("base64");
+      headers["Authorization"] = `Basic ${t}`;
+    }
+    // SSE is long-lived; no AbortController timeout — caller
+    // controls cancellation by breaking out of the `for await`.
+    const resp = await this._fetch(url, { headers });
+    if (!resp.ok) {
+      let body: unknown = null;
+      const text = await resp.text();
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = text;
+        }
+      }
+      throw fromResponse(resp.status, body);
+    }
+    if (!resp.body) {
+      throw new AgentDBError("subscribe response has no body", {
+        statusCode: resp.status,
+      });
+    }
+    const reader = resp.body.getReader();
+    try {
+      for await (const frame of parseSse(reader)) {
+        if (frame.event === "subscribed") {
+          // Acknowledgement — informational live_seq, no event payload.
+          continue;
+        }
+        if (frame.event === "error") {
+          let body: { error?: string; last_seq?: number } = {};
+          try {
+            body = frame.data ? JSON.parse(frame.data) : {};
+          } catch {
+            // Server should always emit valid JSON; if not, surface
+            // the raw text in the error code so debugging isn't
+            // entirely opaque.
+          }
+          throw new SubscriptionClosed(body.error ?? "unknown", {
+            lastSeq: body.last_seq,
+          });
+        }
+        if (!frame.data) continue;
+        const env = JSON.parse(frame.data) as Record<string, unknown>;
+        const evt: Event = {
+          seq: Number(env.seq),
+          tsMs: Number(env.ts_ms ?? env.ts ?? 0),
+          payload: env.payload,
+        };
+        if (env.tenant !== undefined) evt.tenant = String(env.tenant);
+        if (env.session !== undefined) evt.session = String(env.session);
+        if (env.kind !== undefined && env.kind !== null) {
+          evt.kind = String(env.kind);
+        }
+        if (env.actor_id !== undefined && env.actor_id !== null) {
+          evt.actorId = Number(env.actor_id);
+        }
+        yield evt;
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* lock already released on stream close */
+      }
     }
   }
 
@@ -203,6 +439,36 @@ export class Session {
       ? d.recent.map(eventFromDict)
       : [];
     return { seq: Number(d.seq), recent };
+  }
+
+  /**
+   * Stream events for this session via SSE.
+   *
+   * AsyncIterable: consume with `for await`. Use `fromSeq` to
+   * replay from a known cursor; the server transitions from
+   * catch-up to live tail without dropping events. Use `kind` to
+   * filter on the server side.
+   *
+   * Reconnect / error semantics mirror [`Client.subscribe`]:
+   * `jwt_expired` is auto-recovered when a token provider is set;
+   * other terminal close frames raise [`SubscriptionClosed`].
+   */
+  async *subscribe(opts: SubscribeOptions = {}): AsyncIterable<Event> {
+    if (this.tenant === undefined) {
+      throw new Error(
+        "`tenant` must be set on the Client or Session when subscribing — " +
+          "auth-derived tenants on the subscribe path aren't supported yet. " +
+          "Pass tenant: 'demo' (or your tenant id) to Client(...) or Client.session()."
+      );
+    }
+    const path =
+      `/api/tenants/${encodePathSegment(this.tenant)}` +
+      `/sessions/${encodePathSegment(this.sessionId)}/subscribe`;
+    yield* this._client._subscribeImpl({
+      path,
+      kind: opts.kind,
+      fromSeq: opts.fromSeq,
+    });
   }
 
   /**
