@@ -677,6 +677,72 @@ validation strategy is itself an open question.
 
 ---
 
+## Recommended pattern: config-as-events
+
+AgentDB doesn't ship a configuration store. Instead, it provides the
+primitives to put configuration *in AgentDB sessions* and reduce-over-events
+at read time. This pattern works well for agent platforms, multi-tenant
+SaaS overrides, and any case where "configuration changes are themselves
+historical data worth keeping."
+
+### Convention
+
+- Each tenant has a session named `_config:<scope>` (e.g., `_config:agents`).
+- Each event in the session has `kind: "<scope>_override"` plus the
+  override target and a patch.
+- Code holds the *defaults*. The session events hold the *overrides*.
+- At read time, fold the events in seq order onto the code defaults.
+
+### Example
+
+```ts
+async function loadAgentConfig(client, tenant, role) {
+  const defaults = CODE_DEFAULTS[role];
+  const session = client.session("_config:agents", { tenant });
+  const resp = await session.append({ kind: "_noop" }, { fetchLastN: 1024 });
+  const events = resp.recent.filter((e) => e.payload?.kind !== "_noop");
+  const patch = events
+    .filter((e) => e.payload?.kind === "agent_override" && e.payload?.role === role)
+    .reduce((acc, e) => ({ ...acc, ...e.payload.patch }), {});
+  return { ...defaults, ...patch };
+}
+
+// Append an override:
+await session.append(
+  { kind: "agent_override", role: "engineer", patch: { systemPromptSuffix: "be terse" } },
+  { fetchLastN: 0 },
+);
+```
+
+### Why this is good
+
+- **Event-sourced.** Free history of every config change. Roll back by reading older events.
+- **No new database.** Same primitives as everything else.
+- **Multi-tenant clean.** Each tenant's config lives inside that tenant — no cross-tenant access.
+- **Hot-reloadable.** Reload config at the start of each agent iteration; new overrides take effect immediately.
+- **Inspectable.** Just events; can be queried, replayed, exported.
+
+### Trade-offs
+
+- "Current value" is reduce-over-events, slower than a key-value `GET`.
+  At AgentDB-typical config session sizes (tens to low-hundreds of events),
+  this is negligible. For huge config sessions, periodic snapshotting can
+  be added.
+- The `_noop` append-and-fetch trick used to read the session log writes a
+  small placeholder event each time. Fine at human-update frequency; for
+  high-frequency reloads, consider a dedicated `fetch` helper at the SDK
+  layer.
+- No schema enforcement. Up to the application to validate patches.
+
+### Reference implementation
+
+- Sample app using this pattern:
+  [`examples/agents/typescript/pi-company/`](../examples/agents/typescript/pi-company/) —
+  see `src/config.ts` (the loader) and `src/tools/update_agent_config.ts`
+  (the CEO tool that appends overrides).
+
+---
+
 ## References
 
 - Ankur Goyal. [AI observability is a database problem: how
