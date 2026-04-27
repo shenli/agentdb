@@ -8,8 +8,8 @@ import { draftOutreach } from "./draft_outreach.ts";
 import { hireContractor } from "./hire_contractor.ts";
 import { reportToCeo } from "./report_to_ceo.ts";
 import { submitForReview } from "./submit_for_review.ts";
+import { updateAgentConfig } from "./update_agent_config.ts";
 import { writeDoc } from "./write_doc.ts";
-// update_agent_config (Task 9) added later.
 
 /**
  * The complete tool registry, keyed by canonical tool name. Alphabetical so
@@ -28,6 +28,7 @@ export const ALL_TOOLS: Record<string, CompanyTool> = {
   hire_contractor: hireContractor,
   report_to_ceo: reportToCeo,
   submit_for_review: submitForReview,
+  update_agent_config: updateAgentConfig,
   write_doc: writeDoc,
 };
 
