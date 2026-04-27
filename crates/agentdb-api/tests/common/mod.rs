@@ -12,11 +12,14 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use agentdb_api::jwt::{AgentDbClaims, JwtConfig, SessionsClaim, TenantJwtConfig};
 use agentdb_api::{router, AppState, EventBus, StreamBus};
 use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tempfile::TempDir;
@@ -55,6 +58,29 @@ impl TestServer {
     }
 
     async fn start_with_event_bus(event_bus: EventBus) -> Self {
+        Self::start_inner(event_bus, JwtConfig::default()).await
+    }
+
+    /// Boot a TestServer where tenant `t-1` requires HMAC-signed JWTs
+    /// using the given secret. Issuer is `https://auth.test`, no
+    /// audience. Other tenants have no JWT config and the subscribe
+    /// middleware falls through to whatever auth the route already
+    /// applies (here: none, since `auth` is `None`). Used by the
+    /// Task 9c-3 integration tests.
+    pub async fn start_with_jwt_hmac(secret: &[u8]) -> Self {
+        let mut per_tenant = HashMap::new();
+        per_tenant.insert(
+            "t-1".to_string(),
+            TenantJwtConfig::Hmac {
+                secret: secret.to_vec(),
+                issuer: "https://auth.test".into(),
+                audience: None,
+            },
+        );
+        Self::start_inner(EventBus::default(), JwtConfig { per_tenant }).await
+    }
+
+    async fn start_inner(event_bus: EventBus, jwt_config: JwtConfig) -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
@@ -69,7 +95,7 @@ impl TestServer {
             http: agentdb_api::webhook::new_client(),
             auth: None,
             admin_auth: None,
-            jwt_config: agentdb_api::jwt::JwtConfig::default(),
+            jwt_config,
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -200,6 +226,68 @@ impl SseStream {
             }
         }
     }
+}
+
+/// Wall-clock seconds since the UNIX epoch. Used by the JWT helpers
+/// to compute `exp`. Panics on a clock before the epoch — fine for
+/// tests; not a path that should ever fire on real hardware.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
+}
+
+/// Mint an HS256 JWT shaped like an AgentDB subscribe token.
+///
+/// `sessions == "*"` produces a `Wildcard` claim; any other string
+/// produces a `List` with that single session id. Issuer is fixed
+/// to `https://auth.test` to match `start_with_jwt_hmac`. `ttl_secs`
+/// is added to `now_secs()` to set `exp`.
+pub fn mint_hmac_token(secret: &[u8], tenant: &str, sessions: &str, ttl_secs: u64) -> String {
+    let claims = AgentDbClaims {
+        iss: "https://auth.test".into(),
+        aud: None,
+        sub: "test-user".into(),
+        tenant: tenant.into(),
+        sessions: if sessions == "*" {
+            SessionsClaim::Wildcard("*".into())
+        } else {
+            SessionsClaim::List(vec![sessions.into()])
+        },
+        exp: now_secs() + ttl_secs,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret),
+    )
+    .expect("encode hmac jwt for test")
+}
+
+/// Same shape as [`mint_hmac_token`] but takes an explicit list of
+/// allowed session ids. Used by tests that need to verify
+/// "session not in claim → 403" without ambiguity.
+pub fn mint_hmac_token_for_sessions(
+    secret: &[u8],
+    tenant: &str,
+    sessions: &[&str],
+    ttl_secs: u64,
+) -> String {
+    let claims = AgentDbClaims {
+        iss: "https://auth.test".into(),
+        aud: None,
+        sub: "test-user".into(),
+        tenant: tenant.into(),
+        sessions: SessionsClaim::List(sessions.iter().map(|s| (*s).to_string()).collect()),
+        exp: now_secs() + ttl_secs,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret),
+    )
+    .expect("encode hmac jwt for test")
 }
 
 fn parse_sse_block(block: &str) -> SseFrame {

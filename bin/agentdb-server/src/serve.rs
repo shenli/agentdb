@@ -35,6 +35,75 @@ fn resolve_string(flag: Option<&str>, env_key: &str, default: impl FnOnce() -> S
     std::env::var(env_key).unwrap_or_else(|_| default())
 }
 
+/// Build per-tenant JWT verification config from env vars.
+///
+/// Each tenant is configured by a `secret` or `jwks_url` var plus
+/// optional `issuer`/`audience`. Recognized var shapes:
+///
+///   AGENTDB_TENANT_<TENANT>_JWT_HMAC_SECRET=<bytes>
+///   AGENTDB_TENANT_<TENANT>_JWT_JWKS_URL=<https://…/jwks>
+///   AGENTDB_TENANT_<TENANT>_JWT_ISSUER=<iss>      (required)
+///   AGENTDB_TENANT_<TENANT>_JWT_AUDIENCE=<aud>    (optional)
+///
+/// `<TENANT>` is uppercased and uses `_` as a delimiter; the actual
+/// tenant id is the lowercased form with `_` rewritten to `-` —
+/// `AGENTDB_TENANT_T_1_JWT_HMAC_SECRET` configures tenant `t-1`.
+/// Tenant ids that themselves contain underscores are not
+/// representable via env (the convention can't disambiguate) — those
+/// deployments must register tenants through the meta store and
+/// surface the secret via a future config-file path.
+///
+/// HMAC and JWKS are mutually exclusive per tenant; setting both
+/// vars makes HMAC win (it's iterated first). Tenants absent from
+/// env have no JWT config and the subscribe middleware falls
+/// through to whatever auth the route already applies.
+fn jwt_config_from_env() -> agentdb_api::jwt::JwtConfig {
+    use std::collections::HashMap;
+    let mut per_tenant = HashMap::new();
+    for (k, v) in std::env::vars() {
+        let Some(rest) = k.strip_prefix("AGENTDB_TENANT_") else {
+            continue;
+        };
+        if let Some(tenant_upper) = rest.strip_suffix("_JWT_HMAC_SECRET") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            let issuer = std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_ISSUER"))
+                .unwrap_or_default();
+            let audience =
+                std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_AUDIENCE")).ok();
+            per_tenant.insert(
+                tenant_id,
+                agentdb_api::jwt::TenantJwtConfig::Hmac {
+                    secret: v.into_bytes(),
+                    issuer,
+                    audience,
+                },
+            );
+        } else if let Some(tenant_upper) = rest.strip_suffix("_JWT_JWKS_URL") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            // Skip if HMAC already won — same tenant configured
+            // both ways gets HMAC (iteration order is stable but
+            // unspecified across processes; we make the precedence
+            // explicit here).
+            if per_tenant.contains_key(&tenant_id) {
+                continue;
+            }
+            let issuer = std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_ISSUER"))
+                .unwrap_or_default();
+            let audience =
+                std::env::var(format!("AGENTDB_TENANT_{tenant_upper}_JWT_AUDIENCE")).ok();
+            per_tenant.insert(
+                tenant_id,
+                agentdb_api::jwt::TenantJwtConfig::Jwks {
+                    url: v,
+                    issuer,
+                    audience,
+                },
+            );
+        }
+    }
+    agentdb_api::jwt::JwtConfig { per_tenant }
+}
+
 /// Build the object store chosen by `AGENTDB_OBJECT_STORE` (`local` default,
 /// `s3` opt-in).
 async fn build_object_store(objects_dir: &std::path::Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -1089,7 +1158,7 @@ pub async fn run(
         } else {
             None
         },
-        jwt_config: agentdb_api::jwt::JwtConfig::default(),
+        jwt_config: jwt_config_from_env(),
     };
 
     // Auto-shed scheduler (post-M25 operator ergonomics).

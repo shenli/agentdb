@@ -50,6 +50,12 @@ object_store = { workspace = true }
 # already a runtime dep (Task 5 catch-up scan), so reused here.
 rsa = "0.9"
 rand = { workspace = true }
+# Phase-1 pub/sub Task 9c-3: integration tests for the JWT-protected
+# subscribe path mint HS256 tokens against the same secret the test
+# server is configured with. Runtime verification already pulls
+# `jsonwebtoken` via `[dependencies]`; integration tests are a
+# separate crate, so list it explicitly here too.
+jsonwebtoken = "9"
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 tracing-subscriber = { workspace = true }
