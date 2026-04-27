@@ -303,6 +303,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/tenants/:tenant_id/channels/:channel/publish",
             axum::routing::post(broadcast::publish),
+        )
+        // Phase 2 ephemeral broadcast subscribe (spec § 5.1). Same
+        // temporary mount story as `publish` above — Task 6 hoists
+        // both into the CORS-layered subtree alongside session
+        // subscribe routes.
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/subscribe",
+            axum::routing::get(broadcast::subscribe_channel),
         );
     let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
