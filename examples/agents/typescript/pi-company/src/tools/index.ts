@@ -5,10 +5,11 @@ import { delegateToEngineer } from "./delegate_to_engineer.ts";
 import { directMessage } from "./direct_message.ts";
 import { draftCampaign } from "./draft_campaign.ts";
 import { draftOutreach } from "./draft_outreach.ts";
+import { hireContractor } from "./hire_contractor.ts";
 import { reportToCeo } from "./report_to_ceo.ts";
 import { submitForReview } from "./submit_for_review.ts";
 import { writeDoc } from "./write_doc.ts";
-// hire_contractor (Task 8) and update_agent_config (Task 9) added later.
+// update_agent_config (Task 9) added later.
 
 /**
  * The complete tool registry, keyed by canonical tool name. Alphabetical so
@@ -24,6 +25,7 @@ export const ALL_TOOLS: Record<string, CompanyTool> = {
   direct_message: directMessage,
   draft_campaign: draftCampaign,
   draft_outreach: draftOutreach,
+  hire_contractor: hireContractor,
   report_to_ceo: reportToCeo,
   submit_for_review: submitForReview,
   write_doc: writeDoc,

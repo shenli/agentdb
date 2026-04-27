@@ -164,6 +164,28 @@ export class Agent {
     this.stopped = true;
   }
 
+  /**
+   * Synthesize one self-prompted iteration with a task brief. Used by
+   * `hire_contractor` (Task 8) to wake a freshly-forked contractor that
+   * has no real channel subscriptions: we feed the brief through the same
+   * `handleIncoming` path a peer message would take, so the contractor
+   * thinks about its task and produces output via its (narrow) tool set.
+   *
+   * Returns a promise that resolves when the bootstrap turn completes.
+   * Callers may fire-and-forget so the parent doesn't block on the
+   * contractor's run.
+   */
+  async bootstrapTask(taskBrief: string): Promise<void> {
+    const synthetic: BroadcastMessage = {
+      tenant: this.deps.run.tenant,
+      channel: "(bootstrap)",
+      ts_ms: Date.now(),
+      sender: "system",
+      payload: { kind: "task_brief", from: "system", text: taskBrief },
+    };
+    await this.handleIncoming("(bootstrap)", synthetic);
+  }
+
   private async runSubscriptionLoop(channelName: string): Promise<void> {
     for await (const msg of this.deps.channels.subscribe(channelName)) {
       if (this.stopped) break;
