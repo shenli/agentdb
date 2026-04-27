@@ -23,6 +23,7 @@ pub mod admin_tokens;
 pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
+pub mod broadcast;
 pub mod broadcast_bus;
 pub mod cors;
 pub mod dto;
@@ -294,6 +295,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),
+        )
+        // Phase 2 ephemeral broadcast publish (spec § 5.1). Mounted
+        // here under the Basic-auth subtree as a temporary home;
+        // Task 6 moves channel routes into a CORS-layered subtree
+        // alongside the SSE subscribe handler.
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/publish",
+            axum::routing::post(broadcast::publish),
         );
     let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
