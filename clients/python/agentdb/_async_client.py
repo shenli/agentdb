@@ -38,7 +38,8 @@ error fires only at first use.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, List, Optional
+import json
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Union
 
 try:
     import httpx
@@ -49,14 +50,24 @@ except ImportError as e:
         "(or `pip install httpx` if you want to manage the dep yourself.)"
     ) from e
 
+from ._sse import parse_lines_async
 from .client import AppendResult, Event
-from .errors import AgentDBError, from_response
+from .errors import AgentDBError, SubscriptionClosed, from_response
 
 
 _SESSION_PATH = "/api/sessions/{sid}/append_and_fetch"
 _TENANT_PATH = "/api/tenants/{tid}/sessions/{sid}/append_and_fetch"
 _FORK_PATH = "/api/sessions/{sid}/fork"
 _HEALTH_PATH = "/health/ready"
+_TENANT_SUB_PATH = "/api/tenants/{tid}/subscribe"
+_SESSION_SUB_PATH = "/api/tenants/{tid}/sessions/{sid}/subscribe"
+
+
+# A token provider may be sync (returns a string) or async (returns
+# a coroutine). The latter fits frameworks where token rotation
+# itself requires I/O — e.g. an OAuth refresh against a separate
+# auth server.
+TokenProvider = Callable[[], Union[str, Awaitable[str]]]
 
 
 class AsyncClient:
@@ -78,11 +89,15 @@ class AsyncClient:
         tenant: Optional[str] = None,
         timeout: float = 30.0,
         client: Optional[httpx.AsyncClient] = None,
+        jwt: Optional[str] = None,
+        get_token: Optional[TokenProvider] = None,
     ) -> None:
         if user is not None and password is None:
             raise ValueError("`password` is required when `user` is set")
         if password is not None and user is None:
             raise ValueError("`user` is required when `password` is set")
+        if jwt is not None and get_token is not None:
+            raise ValueError("pass `jwt` or `get_token`, not both")
         self.base_url = base_url.rstrip("/")
         self._auth = (user, password) if user is not None else None
         self._tenant = tenant
@@ -95,6 +110,10 @@ class AsyncClient:
             base_url=self.base_url,
             timeout=timeout,
         )
+        # Subscribe-side bearer auth — see Client.__init__ for the
+        # rationale; sync + async share semantics.
+        self._jwt = jwt
+        self._get_token = get_token
 
     @property
     def authenticated(self) -> bool:
@@ -124,6 +143,37 @@ class AsyncClient:
     async def __aexit__(self, *_exc: Any) -> None:
         await self.aclose()
 
+    async def subscribe(
+        self,
+        *,
+        tenant: Optional[str] = None,
+        session: Optional[Sequence[str]] = None,
+        kind: Optional[Sequence[str]] = None,
+        from_seq: Optional[int] = None,
+        from_seq_per_session: Optional[dict] = None,
+    ) -> AsyncIterator[Event]:
+        """Tenant-wide async event subscription.
+
+        Counterpart to [`Client.subscribe`]; same semantics, but
+        async-iterable. Use `async for evt in client.subscribe(...)`.
+        """
+        tid = tenant or self._tenant
+        if tid is None:
+            raise ValueError(
+                "`tenant` must be set on AsyncClient(...) or passed to "
+                "subscribe(tenant=...) — no auth-derived default for "
+                "the tenant-wide subscribe endpoint."
+            )
+        path = _TENANT_SUB_PATH.format(tid=_quote(tid))
+        async for evt in self._subscribe_impl(
+            path=path,
+            session=list(session) if session else None,
+            kind=list(kind) if kind else None,
+            from_seq=from_seq,
+            from_seq_per_session=from_seq_per_session,
+        ):
+            yield evt
+
     # --- internal ---
 
     async def _request(
@@ -136,6 +186,109 @@ class AsyncClient:
             kwargs["json"] = json
         resp = await self._http.request(method, path, **kwargs)
         return _decode(resp)
+
+    async def _bearer_token(self) -> Optional[str]:
+        """Fetch the current bearer token, awaiting `get_token` when
+        it returns a coroutine. Called fresh on each reconnect."""
+        if self._get_token is None:
+            return self._jwt
+        result = self._get_token()
+        if hasattr(result, "__await__"):
+            return await result  # type: ignore[no-any-return]
+        return result  # type: ignore[return-value]
+
+    async def _subscribe_impl(
+        self,
+        *,
+        path: str,
+        session: Optional[List[str]] = None,
+        kind: Optional[List[str]] = None,
+        from_seq: Optional[int] = None,
+        from_seq_per_session: Optional[dict] = None,
+    ) -> AsyncIterator[Event]:
+        """Async connect-and-stream loop with JWT-expiry auto-resume.
+
+        Mirrors the sync `Client._subscribe_impl`. The shape is the
+        same so the contract is identical from the caller's POV.
+        """
+        cursor = from_seq
+        per_session_cursor = (
+            dict(from_seq_per_session) if from_seq_per_session else None
+        )
+        while True:
+            last_seen: Optional[int] = None
+            try:
+                async for evt in self._stream_once(
+                    path=path,
+                    session=session,
+                    kind=kind,
+                    from_seq=cursor,
+                    from_seq_per_session=per_session_cursor,
+                ):
+                    last_seen = evt.seq
+                    if per_session_cursor is not None and evt.session:
+                        per_session_cursor[evt.session] = evt.seq
+                    yield evt
+                return
+            except SubscriptionClosed as e:
+                if e.error_code == "jwt_expired" and (
+                    self._get_token is not None or self._jwt is not None
+                ):
+                    if e.last_seq is not None:
+                        cursor = e.last_seq + 1
+                    elif last_seen is not None:
+                        cursor = last_seen + 1
+                    continue
+                raise
+
+    async def _stream_once(
+        self,
+        *,
+        path: str,
+        session: Optional[List[str]],
+        kind: Optional[List[str]],
+        from_seq: Optional[int],
+        from_seq_per_session: Optional[dict],
+    ) -> AsyncIterator[Event]:
+        params: List[tuple] = []
+        if from_seq is not None:
+            params.append(("from_seq", str(from_seq)))
+        if from_seq_per_session:
+            joined = ",".join(
+                f"{sid}:{seq}" for sid, seq in from_seq_per_session.items()
+            )
+            params.append(("from_seq_per_session", joined))
+        for s in session or []:
+            params.append(("session", s))
+        for k in kind or []:
+            params.append(("kind", k))
+        headers: dict = {"Accept": "text/event-stream"}
+        token = await self._bearer_token()
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        kwargs: dict = {"params": params, "headers": headers}
+        # SSE streams are long-lived; disable httpx's read timeout
+        # for the stream while keeping connect/write bounded.
+        kwargs["timeout"] = httpx.Timeout(self.timeout, read=None)
+        if self._auth is not None and "Authorization" not in headers:
+            kwargs["auth"] = self._auth
+        async with self._http.stream("GET", path, **kwargs) as resp:
+            if resp.status_code != 200:
+                # Drain body so error decode has the JSON.
+                await resp.aread()
+                _ = _decode(resp)
+            async for frame in parse_lines_async(resp.aiter_lines()):
+                if frame.event == "subscribed":
+                    continue
+                if frame.event == "error":
+                    body = json.loads(frame.data) if frame.data else {}
+                    raise SubscriptionClosed(
+                        body.get("error", "unknown"),
+                        last_seq=body.get("last_seq"),
+                    )
+                if not frame.data:
+                    continue
+                yield Event.from_dict(json.loads(frame.data))
 
 
 def _decode(resp: httpx.Response) -> dict:
@@ -188,6 +341,35 @@ class AsyncSession:
         path = self._append_path()
         d = await self._client._request("POST", path, json=body)
         return AppendResult.from_dict(d)
+
+    async def subscribe(
+        self,
+        *,
+        kind: Optional[Sequence[str]] = None,
+        from_seq: Optional[int] = None,
+    ) -> AsyncIterator[Event]:
+        """Stream events for this session via SSE (async).
+
+        Mirrors the sync `Session.subscribe`. JWT-expiry auto-
+        reconnect, kind filter, and `from_seq` replay all behave
+        the same — see the sync docstring for details.
+        """
+        if self.tenant is None:
+            raise ValueError(
+                "`tenant` must be set on the AsyncClient or AsyncSession when "
+                "subscribing — auth-derived tenants on the subscribe path "
+                "aren't supported yet. Pass tenant='demo' (or your tenant id) "
+                "to AsyncClient(...) or .session()."
+            )
+        path = _SESSION_SUB_PATH.format(
+            tid=_quote(self.tenant), sid=_quote(self.session_id)
+        )
+        async for evt in self._client._subscribe_impl(
+            path=path,
+            kind=list(kind) if kind else None,
+            from_seq=from_seq,
+        ):
+            yield evt
 
     async def fork(self, child_session_id: str) -> "AsyncSession":
         body: dict = {"new_session_id": child_session_id}

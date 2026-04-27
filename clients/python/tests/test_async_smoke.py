@@ -172,3 +172,24 @@ def test_async_unpaired_credentials_raise():
         AsyncClient("http://127.0.0.1:7878", user="alice")
     with pytest.raises(ValueError, match="user"):
         AsyncClient("http://127.0.0.1:7878", password="pencil")
+
+
+def test_async_session_subscribe_replay(server):
+    """Async per-session subscribe replays seeded events via
+    `from_seq=1`, then exits the loop after the third event. Mirrors
+    the sync `test_subscribe_replays_from_seq` but exercises the
+    httpx-backed async path."""
+
+    async def run():
+        async with AsyncClient(server, tenant="t-async-sub") as client:
+            sess = client.session("s-replay-async")
+            for _ in range(3):
+                await sess.append({"kind": "x"})
+            seqs = []
+            async for evt in sess.subscribe(from_seq=1):
+                seqs.append(evt.seq)
+                if len(seqs) >= 3:
+                    break
+            assert seqs == [1, 2, 3]
+
+    asyncio.run(run())
