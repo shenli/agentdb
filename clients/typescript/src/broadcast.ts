@@ -1,5 +1,5 @@
 /**
- * Phase 2 broadcast message type + envelope parser.
+ * Ephemeral broadcast message type + envelope parser.
  *
  * Ephemeral pub/sub messages — sent via `Client.broadcast()` and
  * streamed back via `Client.subscribeChannel()`. Distinct from the

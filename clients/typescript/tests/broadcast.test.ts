@@ -1,5 +1,5 @@
 /**
- * Tests for Phase 2 `broadcast()` and `subscribeChannel()`.
+ * Tests for `broadcast()` and `subscribeChannel()`.
  *
  * Two layers (mirrors `subscribe.test.ts`):
  *

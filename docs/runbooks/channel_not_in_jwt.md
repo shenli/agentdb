@@ -36,9 +36,9 @@ on the bus.
    `/api/tenants/{tenant}/channels/{channel}/...` must be in
    the array (or the claim must be `"*"`).
 3. If the claim is missing entirely, this is **not** rejected as
-   `jwt_invalid` — Phase 2 broadcast access is opt-in per token,
-   so an absent `channels` claim still parses cleanly and just
-   denies every channel.
+   `jwt_invalid` — broadcast access is opt-in per token, so an
+   absent `channels` claim still parses cleanly and just denies
+   every channel.
 
 ## Verify
 
@@ -102,4 +102,4 @@ on the bus.
 - [`jwt_expired`](./jwt_expired.md) — mid-stream auth close
   on a token whose `exp` ran out.
 - [`session_not_in_jwt`](./session_not_in_jwt.md) — parallel
-  error for Phase 1 session subscribe.
+  error for session subscribe.

@@ -16,8 +16,8 @@ session, inheriting full context for free, running in parallel.
 |---|---|
 | **Sessions** | One per agent (`{runId}:{role}`). Persistent across runs (`--resume=<run-id>`). The session log IS the agent's memory. |
 | **Fork (the headline)** | Every employee has a `hire_contractor` tool. Forking the agent's session is O(1); the contractor inherits the parent's full context. Three narratives — hard-task handoff, speculative parallel exploration, specialist delegation — all map to this single primitive. |
-| **Phase 1 subscribe** | The TUI subscribes to all 3 channels with durable SSE. |
-| **Phase 2 broadcast** | Three ephemeral channels: `announcements` (CEO ↔ all), `engineering` (CTO ↔ Engineer), `gtm` (Marketing ↔ Sales). Typing-indicator-style status pings; not durable. |
+| **Real-time event subscriptions** | The TUI subscribes to all 3 channels with durable SSE. |
+| **Ephemeral broadcast channels** | Three channels: `announcements` (CEO ↔ all), `engineering` (CTO ↔ Engineer), `gtm` (Marketing ↔ Sales). In-memory fan-out; not durable. |
 | **Config-as-events** | Agent definitions live in code (`src/agents/*.ts`). Runtime overrides go in a `_config:agents` session. The CEO's `update_agent_config` tool appends overrides; agents reload config every loop iteration. Hot-tunable, event-sourced, free history. See [`docs/agent-db.md` § Recommended pattern: config-as-events](../../../../docs/agent-db.md#recommended-pattern-config-as-events). |
 
 ## Setup

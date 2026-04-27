@@ -94,12 +94,12 @@ where the SDK exposes that lower-level signal.
 - Monitor consumer lag end-to-end (publisher seq vs.
   subscriber's last-rendered seq). A growing gap predicts
   `lag_too_far` minutes before it fires.
-- Phase 1 fixes the broadcast buffer at 16384. If a workload
-  is structurally over that ceiling and the consumer truly
-  can't be sped up, raising it requires a code change today
-  (Phase 2 will make it configurable). Sizing it past a
-  bursty producer is wasted memory if the consumer stays
-  slow — it just delays the close.
+- The broadcast buffer is currently fixed at 16384. If a
+  workload is structurally over that ceiling and the consumer
+  truly can't be sped up, raising it requires a code change
+  today (a future release may make it configurable). Sizing
+  it past a bursty producer is wasted memory if the consumer
+  stays slow — it just delays the close.
 
 ## Related
 

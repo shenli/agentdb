@@ -91,7 +91,7 @@ remaining sessions.
   on every reconnect) rather than buffering enormous gaps in
   the client. Smaller catch-up windows fail less often and
   recover faster when they do.
-- Phase 1 does not retry the scan internally. If reliability
+- The server does not retry the scan internally. If reliability
   matters more than fail-fast for a particular consumer,
   wrap the SDK's subscribe call in an exponential-backoff
   retry on `catchup_failed` — but with a ceiling, since a
