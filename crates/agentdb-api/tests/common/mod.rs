@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use agentdb_api::cors::CorsConfig;
 use agentdb_api::jwt::{AgentDbClaims, JwtConfig, SessionsClaim, TenantJwtConfig};
-use agentdb_api::{router, AppState, EventBus, StreamBus};
+use agentdb_api::{router, AppState, BroadcastBus, EventBus, StreamBus};
 use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -59,7 +59,13 @@ impl TestServer {
     }
 
     async fn start_with_event_bus(event_bus: EventBus) -> Self {
-        Self::start_inner(event_bus, JwtConfig::default(), CorsConfig::default()).await
+        Self::start_inner(
+            event_bus,
+            JwtConfig::default(),
+            CorsConfig::default(),
+            BroadcastBus::default(),
+        )
+        .await
     }
 
     /// Boot a TestServer where tenant `t-1` requires HMAC-signed JWTs
@@ -82,6 +88,7 @@ impl TestServer {
             EventBus::default(),
             JwtConfig { per_tenant },
             CorsConfig::default(),
+            BroadcastBus::default(),
         )
         .await
     }
@@ -101,6 +108,7 @@ impl TestServer {
             EventBus::default(),
             JwtConfig::default(),
             CorsConfig { per_tenant },
+            BroadcastBus::default(),
         )
         .await
     }
@@ -109,6 +117,7 @@ impl TestServer {
         event_bus: EventBus,
         jwt_config: JwtConfig,
         cors_config: CorsConfig,
+        broadcast_bus: BroadcastBus,
     ) -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
@@ -126,6 +135,7 @@ impl TestServer {
             admin_auth: None,
             jwt_config,
             cors_config,
+            broadcast_bus,
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -285,6 +295,52 @@ pub fn mint_hmac_token(secret: &[u8], tenant: &str, sessions: &str, ttl_secs: u6
         } else {
             SessionsClaim::List(vec![sessions.into()])
         },
+        channels: None,
+        exp: now_secs() + ttl_secs,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret),
+    )
+    .expect("encode hmac jwt for test")
+}
+
+/// Same shape as [`mint_hmac_token`] but lets the caller specify a
+/// `channels` claim too. Used by Task 8 to drive the Phase 2 broadcast
+/// JWT path: wildcard, explicit list, and missing-claim cases all
+/// share this helper. Passing `None` for `channels` yields a token
+/// without a `channels` field (publishes/subscribes against any
+/// channel will hit `channel_not_in_jwt`).
+///
+/// `sessions == "*"` produces a `Wildcard` claim; any other string
+/// produces a `List` with that single session id. `channels` follows
+/// the same convention: `Some(&["*"])` is a wildcard, anything else
+/// is a `List`.
+pub fn mint_hmac_token_with_channels(
+    secret: &[u8],
+    tenant: &str,
+    sessions: &str,
+    channels: Option<&[&str]>,
+    ttl_secs: u64,
+) -> String {
+    let claims = AgentDbClaims {
+        iss: "https://auth.test".into(),
+        aud: None,
+        sub: "test-user".into(),
+        tenant: tenant.into(),
+        sessions: if sessions == "*" {
+            SessionsClaim::Wildcard("*".into())
+        } else {
+            SessionsClaim::List(vec![sessions.into()])
+        },
+        channels: channels.map(|chs| {
+            if chs == ["*"] {
+                SessionsClaim::Wildcard("*".into())
+            } else {
+                SessionsClaim::List(chs.iter().map(|s| (*s).to_string()).collect())
+            }
+        }),
         exp: now_secs() + ttl_secs,
     };
     encode(
@@ -310,6 +366,7 @@ pub fn mint_hmac_token_for_sessions(
         sub: "test-user".into(),
         tenant: tenant.into(),
         sessions: SessionsClaim::List(sessions.iter().map(|s| (*s).to_string()).collect()),
+        channels: None,
         exp: now_secs() + ttl_secs,
     };
     encode(

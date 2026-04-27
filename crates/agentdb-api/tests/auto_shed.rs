@@ -86,6 +86,7 @@ async fn spawn_with_autoshed() -> (
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
     let app = router(state.clone())
         .layer(Extension(meta.clone()))

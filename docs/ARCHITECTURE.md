@@ -2153,6 +2153,48 @@ session is owned by a peer. The tenant-wide endpoint returns
 Phase 1 does NOT proxy SSE across nodes — clients reconnect to
 the owner. SDKs follow the 421 transparently.
 
+### Phase 2: ephemeral broadcast
+
+`crates/agentdb-api/src/broadcast_bus.rs` defines a process-wide
+`BroadcastBus` keyed by `(tenant, channel)`. Per-channel buffer is
+256 (small — broadcast is for high-frequency small payloads, not bulk
+data). Lazy-allocated on first publish or subscribe; GC'd by a 30s
+sweep task that drops entries with zero subscribers and no publish in
+60s. The sweep task is spawned from `bin/agentdb-server/src/serve.rs`
+at startup; without it, idle channel entries would accumulate.
+
+`crates/agentdb-api/src/broadcast.rs` serves `POST /publish` and
+`GET /subscribe` on `/api/tenants/{tenant}/channels/{channel}/...`.
+Both go through Phase 1's `extract_subscribe_jwt`; authorization
+checks `claims.channels.allows(channel)` (a new `channels` claim
+alongside `sessions`).
+
+Lag policy: when `async_broadcast::RecvError::Overflowed` fires, the
+SSE handler silently skips the lost messages and continues — no error
+frame, no close. Phase 2 is ephemeral by design; there's no durable
+log to replay from.
+
+Multi-node: per-node local. Publishers and subscribers on different
+nodes for the same channel won't see each other's messages. Documented
+gotcha. Cross-node forwarding is deferred (would need hash-shard +
+421 redirect, mirroring Phase 1's session routing).
+
+Body cap: 16 KiB per publish (spec § 5.5). Larger payloads belong in
+sessions or object storage, not broadcast.
+
+Channel-name validation: `^[a-zA-Z0-9._:-]{1,256}$`. Slashes excluded
+to keep URL parsing unambiguous; colons allowed for namespacing
+conventions (`room:42`, `presence:doc-7`).
+
+Self-echo: the publisher receives their own broadcast by default. Add
+`?no_echo=true` (or set `noEcho: true` / `no_echo=True` in the SDKs)
+to drop messages where `sender == subscriber's JWT sub`. Only
+effective when both publisher and subscriber use JWT auth.
+
+The channel routes share the same CORS subtree and middleware as
+Phase 1's subscribe routes, so `Access-Control-Allow-Methods: GET,
+POST, OPTIONS` works for both.
+
 ## What the prototype does NOT do
 
 The design doc describes a much larger system. The prototype

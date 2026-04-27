@@ -125,6 +125,11 @@ pub enum ErrorCode {
     /// the same subscribe request. We refuse to guess which one
     /// the caller meant. 400.
     BadRequestDualAuth,
+    /// Phase 2: token's `channels` claim does not allow the
+    /// requested channel. 403.
+    ChannelNotInJwt,
+    /// Phase 2: channel name fails validation (spec § 5.7). 400.
+    ChannelNameInvalid,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -408,7 +413,9 @@ pub fn doc_url_for(code: ErrorCode) -> Option<&'static str> {
         | ErrorCode::JwtInvalid
         | ErrorCode::JwtExpired
         | ErrorCode::SessionNotInJwt
-        | ErrorCode::BadRequestDualAuth => None,
+        | ErrorCode::BadRequestDualAuth
+        | ErrorCode::ChannelNotInJwt
+        | ErrorCode::ChannelNameInvalid => None,
     }
 }
 

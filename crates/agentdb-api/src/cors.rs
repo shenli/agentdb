@@ -71,7 +71,7 @@ pub async fn cors_middleware(
             }
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_METHODS,
-                HeaderValue::from_static("GET, OPTIONS"),
+                HeaderValue::from_static("GET, POST, OPTIONS"),
             );
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,

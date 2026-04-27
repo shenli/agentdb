@@ -23,6 +23,8 @@ pub mod admin_tokens;
 pub mod admin_users;
 pub mod auth_middleware;
 pub mod auto_shed;
+pub mod broadcast;
+pub mod broadcast_bus;
 pub mod cors;
 pub mod dto;
 pub mod error;
@@ -41,6 +43,7 @@ pub mod trace_context;
 pub mod webhook;
 
 pub use auth_middleware::AuthedTenant;
+pub use broadcast_bus::{BroadcastBus, BroadcastEnvelope, ChannelKey};
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
 pub use event_bus::EventBus;
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
@@ -84,6 +87,9 @@ pub struct AppState {
     /// `docs/superpowers/specs/2026-04-25-pubsub-design.md`
     /// §6.13.
     pub cors_config: cors::CorsConfig,
+    /// Phase 2 ephemeral broadcast bus (spec § 5.4). `default()` is empty;
+    /// the GC sweep is spawned in `agentdb-server`'s startup (Task 7).
+    pub broadcast_bus: BroadcastBus,
 }
 
 #[derive(Clone)]
@@ -120,6 +126,7 @@ impl AppState {
             admin_auth: None,
             jwt_config: jwt::JwtConfig::default(),
             cors_config: cors::CorsConfig::default(),
+            broadcast_bus: BroadcastBus::default(),
         }
     }
 }
@@ -318,6 +325,26 @@ pub fn router(state: AppState) -> Router {
             cors::cors_middleware,
         ));
 
+    // Phase 2 ephemeral broadcast routes (spec § 5.1). Sibling of
+    // `subscribe_routes`: same CORS layer (so browsers get preflight
+    // + ACAO echo), but auth runs inside the handlers via
+    // `extract_subscribe_jwt` rather than a Basic-auth middleware.
+    // Kept distinct from `subscribe_routes` for grep-ability —
+    // durable session subs vs ephemeral channel broadcast.
+    let channel_routes: Router<AppState> = Router::new()
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/publish",
+            axum::routing::post(broadcast::publish),
+        )
+        .route(
+            "/api/tenants/:tenant_id/channels/:channel/subscribe",
+            axum::routing::get(broadcast::subscribe_channel),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cors::cors_middleware,
+        ));
+
     // Admin-plane routes. Every `/api/admin/*` endpoint goes
     // here; the bearer-token middleware layers over the
     // subtree so health/metrics/dashboard stay open.
@@ -461,6 +488,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(tenant_routes)
         .merge(subscribe_routes)
+        .merge(channel_routes)
         .merge(admin_routes)
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

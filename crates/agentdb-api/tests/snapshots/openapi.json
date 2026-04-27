@@ -2324,7 +2324,9 @@
           "jwt_invalid",
           "jwt_expired",
           "session_not_in_jwt",
-          "bad_request_dual_auth"
+          "bad_request_dual_auth",
+          "channel_not_in_jwt",
+          "channel_name_invalid"
         ]
       },
       "ErrorKind": {

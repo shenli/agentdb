@@ -12,6 +12,7 @@
  * Uses Node's built-in `fetch` (Node 20+). Zero runtime deps.
  */
 
+import { BroadcastMessage, parseBroadcastEnvelope } from "./broadcast.js";
 import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
 import { parseSse } from "./sse.js";
 
@@ -194,6 +195,170 @@ export class Client {
       fromSeq: opts.fromSeq,
       fromSeqPerSession: opts.fromSeqPerSession,
     });
+  }
+
+  /**
+   * Publish an ephemeral broadcast message to a channel.
+   *
+   * Phase 2 pub/sub. Broadcast is **ephemeral** — no durability, no
+   * replay, no per-subscriber acks. Use it for transient signals
+   * like typing indicators, cursor positions, or agent-status pings.
+   * If you need durability, use `Session.append` + `Session.subscribe`
+   * on a session instead.
+   *
+   * `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server
+   * rejects malformed names with `channel_name_invalid`. `payload`
+   * is any JSON-serializable value.
+   *
+   * Tenant resolution mirrors the rest of the SDK: pass `tenant` to
+   * override, otherwise the client default is used. Resolves on 204.
+   */
+  async broadcast(opts: {
+    channel: string;
+    payload: unknown;
+    tenant?: string;
+  }): Promise<void> {
+    const tenant = opts.tenant ?? this._tenant;
+    if (tenant === undefined) {
+      throw new Error(
+        "`tenant` must be set on Client(...) or passed to " +
+          "broadcast({ tenant: '...' }) — the channels endpoint is " +
+          "tenant-explicit."
+      );
+    }
+    const path =
+      `/api/tenants/${encodePathSegment(tenant)}` +
+      `/channels/${encodePathSegment(opts.channel)}/publish`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    await this._applyAuthHeaders(headers);
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), this.timeoutMs);
+    let resp: Response;
+    try {
+      resp = await this._fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(opts.payload),
+        signal: ctl.signal,
+      });
+    } finally {
+      clearTimeout(t);
+    }
+    if (resp.status === 204) return;
+    let body: unknown = null;
+    const text = await resp.text();
+    if (text.length > 0) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+    }
+    throw fromResponse(resp.status, body);
+  }
+
+  /**
+   * Subscribe to a channel; yield [`BroadcastMessage`] envelopes.
+   *
+   * Counterpart to [`broadcast`]. AsyncIterable: consume with
+   * `for await`. The generator runs until the caller breaks out of
+   * the loop or the server closes the connection.
+   *
+   * Unlike per-session [`subscribe`], there is **no JWT
+   * auto-reconnect on expiry** — broadcast is ephemeral by design
+   * (spec § 5.5), so loss on disconnect is acceptable. Callers that
+   * need durability use `Session.subscribe()` instead.
+   *
+   * `noEcho: true` asks the server to drop envelopes whose `sender`
+   * matches this subscriber's JWT `sub` claim. Only effective with
+   * JWT auth — Basic-auth publishers emit no `sender` and never
+   * match.
+   */
+  async *subscribeChannel(opts: {
+    channel: string;
+    tenant?: string;
+    noEcho?: boolean;
+  }): AsyncIterable<BroadcastMessage> {
+    const tenant = opts.tenant ?? this._tenant;
+    if (tenant === undefined) {
+      throw new Error(
+        "`tenant` must be set on Client(...) or passed to " +
+          "subscribeChannel({ tenant: '...' }) — the channels " +
+          "endpoint is tenant-explicit."
+      );
+    }
+    const url = new URL(
+      `${this.baseUrl}/api/tenants/${encodePathSegment(tenant)}` +
+        `/channels/${encodePathSegment(opts.channel)}/subscribe`
+    );
+    if (opts.noEcho) {
+      url.searchParams.set("no_echo", "true");
+    }
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    await this._applyAuthHeaders(headers);
+    // SSE is long-lived; no AbortController timeout — the consumer
+    // controls cancellation by breaking out of the `for await`.
+    const resp = await this._fetch(url, { headers });
+    if (!resp.ok) {
+      let body: unknown = null;
+      const text = await resp.text();
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = text;
+        }
+      }
+      throw fromResponse(resp.status, body);
+    }
+    if (!resp.body) {
+      throw new AgentDBError("subscribeChannel response has no body", {
+        statusCode: resp.status,
+      });
+    }
+    const reader = resp.body.getReader();
+    try {
+      for await (const frame of parseSse(reader)) {
+        // Phase 2's stream uses no named event for envelopes; only
+        // `:keepalive` comments (which the parser drops) and the
+        // data frames themselves. Tolerate a `subscribed` ack the
+        // same way as per-session subscribe in case the server adds
+        // one later.
+        if (frame.event && frame.event !== "message") continue;
+        if (!frame.data) continue;
+        yield parseBroadcastEnvelope(frame.data);
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        /* lock already released on stream close */
+      }
+    }
+  }
+
+  /**
+   * Apply Bearer (preferred) or Basic auth onto a header map. Used
+   * by `broadcast` / `subscribeChannel` which both need the same
+   * "JWT first, fall back to Basic" plumbing as `subscribe`.
+   * @internal
+   */
+  private async _applyAuthHeaders(
+    headers: Record<string, string>
+  ): Promise<void> {
+    const token = await this._bearerToken();
+    if (token !== undefined) {
+      headers["Authorization"] = `Bearer ${token}`;
+      return;
+    }
+    if (this._auth) {
+      const t = Buffer.from(
+        `${this._auth.user}:${this._auth.password}`
+      ).toString("base64");
+      headers["Authorization"] = `Basic ${t}`;
+    }
   }
 
   /** @internal */

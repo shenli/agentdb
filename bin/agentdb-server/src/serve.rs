@@ -1179,6 +1179,7 @@ pub async fn run(
         sessions: sessions.clone(),
         stream: stream.clone(),
         event_bus: event_bus.clone(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
         http: http_client.clone(),
         auth: if require_auth {
             Some(agentdb_api::AuthConfig {
@@ -1227,6 +1228,23 @@ pub async fn run(
     if let Some(job) = _auto_shed_job {
         std::mem::forget(job);
     }
+
+    // Phase 2 broadcast GC: every 30s, drop channels with 0 subs and no
+    // publish in the last 60s. Spec § 5.4 / § 9 #3.
+    {
+        let bus = http_state.broadcast_bus.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            // First tick fires immediately by default — skip it so we don't gc
+            // a brand-new bus on startup.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let _ = bus.gc(60_000).await;
+            }
+        });
+    }
+
     let wire_state = if require_auth {
         WireState::with_auth(
             registry.clone(),
