@@ -295,6 +295,7 @@ pub fn mint_hmac_token(secret: &[u8], tenant: &str, sessions: &str, ttl_secs: u6
         } else {
             SessionsClaim::List(vec![sessions.into()])
         },
+        channels: None,
         exp: now_secs() + ttl_secs,
     };
     encode(
@@ -320,6 +321,7 @@ pub fn mint_hmac_token_for_sessions(
         sub: "test-user".into(),
         tenant: tenant.into(),
         sessions: SessionsClaim::List(sessions.iter().map(|s| (*s).to_string()).collect()),
+        channels: None,
         exp: now_secs() + ttl_secs,
     };
     encode(

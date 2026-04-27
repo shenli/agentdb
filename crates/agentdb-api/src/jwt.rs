@@ -54,6 +54,13 @@ pub struct AgentDbClaims {
     pub sub: String,
     pub tenant: String,
     pub sessions: SessionsClaim,
+    /// Phase 2: channel access for ephemeral broadcast.
+    /// `None` (claim absent) — token has no broadcast access.
+    /// `Some(Wildcard("*"))` — any channel in the tenant.
+    /// `Some(List([...]))` — whitelist of channel names.
+    /// See spec § 5.3.
+    #[serde(default)]
+    pub channels: Option<SessionsClaim>,
     pub exp: u64,
 }
 
@@ -336,6 +343,7 @@ mod tests {
             sub: "user-1".into(),
             tenant: "t-1".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() + 3600,
         };
         let token = mint(secret, &claims);
@@ -359,6 +367,7 @@ mod tests {
             sub: "u".into(),
             tenant: "t-1".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() - 3600,
         };
         let token = mint(secret, &claims);
@@ -378,6 +387,7 @@ mod tests {
             sub: "u".into(),
             tenant: "t-1".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() + 3600,
         };
         let token = mint(secret, &claims);
@@ -400,6 +410,7 @@ mod tests {
             sub: "u".into(),
             tenant: "t-2".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() + 3600,
         };
         let token = mint(secret, &claims);
@@ -426,6 +437,44 @@ mod tests {
         assert!(s.allows("s-1"));
         assert!(s.allows("s-2"));
         assert!(!s.allows("s-3"));
+    }
+
+    #[test]
+    fn channels_claim_defaults_to_none() {
+        let raw = r#"{
+            "iss": "https://auth.test",
+            "sub": "u",
+            "tenant": "t-1",
+            "sessions": "*",
+            "exp": 9999999999
+        }"#;
+        let claims: AgentDbClaims = serde_json::from_str(raw).unwrap();
+        assert!(claims.channels.is_none());
+    }
+
+    #[test]
+    fn channels_claim_wildcard_parses() {
+        let raw = r#"{
+            "iss": "i", "sub": "s", "tenant": "t-1",
+            "sessions": "*", "channels": "*", "exp": 9999999999
+        }"#;
+        let claims: AgentDbClaims = serde_json::from_str(raw).unwrap();
+        let ch = claims.channels.unwrap();
+        assert!(matches!(ch, SessionsClaim::Wildcard(ref s) if s == "*"));
+        assert!(ch.allows("anything"));
+    }
+
+    #[test]
+    fn channels_claim_list_parses_and_filters() {
+        let raw = r#"{
+            "iss": "i", "sub": "s", "tenant": "t-1",
+            "sessions": "*", "channels": ["a", "b"], "exp": 9999999999
+        }"#;
+        let claims: AgentDbClaims = serde_json::from_str(raw).unwrap();
+        let ch = claims.channels.unwrap();
+        assert!(ch.allows("a"));
+        assert!(ch.allows("b"));
+        assert!(!ch.allows("c"));
     }
 
     #[tokio::test]
@@ -521,6 +570,7 @@ mod tests {
             sub: "u".into(),
             tenant: "t-1".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() + 3600,
         };
         let token = mint_rs256(&pem, &kid, &claims);
@@ -595,6 +645,7 @@ mod tests {
             sub: "u".into(),
             tenant: "t-cache".into(),
             sessions: SessionsClaim::Wildcard("*".into()),
+            channels: None,
             exp: now_secs() + 3600,
         };
         let token = mint_rs256(&pem, "k1", &claims);
