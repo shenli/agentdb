@@ -288,7 +288,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/fork",
             axum::routing::post(fork::fork_handler),
-        )
+        );
+    let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware::basic_auth_middleware,
+    ));
+
+    // Subscribe routes carry CORS plus Basic auth. CORS goes
+    // *outside* Basic auth so the OPTIONS preflight short-circuits
+    // before the auth layer demands credentials (browsers do not
+    // include `Authorization` on preflight). Basic auth still
+    // protects the actual GET when the JWT subscribe-auth path
+    // isn't engaged for this tenant.
+    let subscribe_routes: Router<AppState> = Router::new()
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
             axum::routing::get(subscribe::subscribe_session),
@@ -296,11 +308,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/tenants/:tenant_id/subscribe",
             axum::routing::get(subscribe::subscribe_tenant),
-        );
-    let tenant_routes = tenant_routes.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth_middleware::basic_auth_middleware,
-    ));
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::basic_auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cors::cors_middleware,
+        ));
 
     // Admin-plane routes. Every `/api/admin/*` endpoint goes
     // here; the bearer-token middleware layers over the
@@ -444,6 +460,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .merge(tenant_routes)
+        .merge(subscribe_routes)
         .merge(admin_routes)
         .route("/api/stream", axum::routing::get(stream::sse_handler))
         .route("/health/live", axum::routing::get(health::live))

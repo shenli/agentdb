@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agentdb_api::cors::CorsConfig;
 use agentdb_api::jwt::{AgentDbClaims, JwtConfig, SessionsClaim, TenantJwtConfig};
 use agentdb_api::{router, AppState, EventBus, StreamBus};
 use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
@@ -58,7 +59,7 @@ impl TestServer {
     }
 
     async fn start_with_event_bus(event_bus: EventBus) -> Self {
-        Self::start_inner(event_bus, JwtConfig::default()).await
+        Self::start_inner(event_bus, JwtConfig::default(), CorsConfig::default()).await
     }
 
     /// Boot a TestServer where tenant `t-1` requires HMAC-signed JWTs
@@ -77,10 +78,38 @@ impl TestServer {
                 audience: None,
             },
         );
-        Self::start_inner(EventBus::default(), JwtConfig { per_tenant }).await
+        Self::start_inner(
+            EventBus::default(),
+            JwtConfig { per_tenant },
+            CorsConfig::default(),
+        )
+        .await
     }
 
-    async fn start_inner(event_bus: EventBus, jwt_config: JwtConfig) -> Self {
+    /// Boot a TestServer where the given tenant has CORS configured
+    /// with the given allowlisted origins. Other tenants have no
+    /// CORS config and the middleware passes their responses through
+    /// without `Access-Control-Allow-Origin`. Used by the Task 10-2
+    /// integration tests.
+    pub async fn start_with_cors(tenant: &str, origins: &[&str]) -> Self {
+        let mut per_tenant = HashMap::new();
+        per_tenant.insert(
+            tenant.to_string(),
+            origins.iter().map(|s| (*s).to_string()).collect(),
+        );
+        Self::start_inner(
+            EventBus::default(),
+            JwtConfig::default(),
+            CorsConfig { per_tenant },
+        )
+        .await
+    }
+
+    async fn start_inner(
+        event_bus: EventBus,
+        jwt_config: JwtConfig,
+        cors_config: CorsConfig,
+    ) -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
         let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
@@ -96,7 +125,7 @@ impl TestServer {
             auth: None,
             admin_auth: None,
             jwt_config,
-            cors_config: agentdb_api::cors::CorsConfig::default(),
+            cors_config,
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

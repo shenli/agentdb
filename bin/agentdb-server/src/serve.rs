@@ -104,6 +104,42 @@ fn jwt_config_from_env() -> agentdb_api::jwt::JwtConfig {
     agentdb_api::jwt::JwtConfig { per_tenant }
 }
 
+/// Build per-tenant CORS config from env vars.
+///
+/// Recognized var shape:
+///
+///   AGENTDB_TENANT_<TENANT>_CORS_ORIGINS=<origin1>,<origin2>,...
+///
+/// `<TENANT>` follows the same convention as the JWT envs:
+/// uppercased tenant id with `-` rewritten to `_`. The value is a
+/// comma-separated list of exact-match origins (e.g.
+/// `https://app.example.com`); whitespace around commas is trimmed.
+/// Wildcard `*` is accepted by the parser but the middleware does
+/// not honor it — credentialed requests need a concrete origin.
+///
+/// Tenants absent from env have no CORS config; the middleware
+/// then omits `Access-Control-Allow-Origin` and browsers block
+/// cross-origin requests.
+fn cors_config_from_env() -> agentdb_api::cors::CorsConfig {
+    use std::collections::HashMap;
+    let mut per_tenant = HashMap::new();
+    for (k, v) in std::env::vars() {
+        let Some(rest) = k.strip_prefix("AGENTDB_TENANT_") else {
+            continue;
+        };
+        if let Some(tenant_upper) = rest.strip_suffix("_CORS_ORIGINS") {
+            let tenant_id = tenant_upper.to_lowercase().replace('_', "-");
+            let origins: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            per_tenant.insert(tenant_id, origins);
+        }
+    }
+    agentdb_api::cors::CorsConfig { per_tenant }
+}
+
 /// Build the object store chosen by `AGENTDB_OBJECT_STORE` (`local` default,
 /// `s3` opt-in).
 async fn build_object_store(objects_dir: &std::path::Path) -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -1159,7 +1195,7 @@ pub async fn run(
             None
         },
         jwt_config: jwt_config_from_env(),
-        cors_config: agentdb_api::cors::CorsConfig::default(),
+        cors_config: cors_config_from_env(),
     };
 
     // Auto-shed scheduler (post-M25 operator ergonomics).
