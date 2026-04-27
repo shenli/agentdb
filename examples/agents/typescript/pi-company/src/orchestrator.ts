@@ -18,10 +18,10 @@ const META_SESSION_NAME = "_meta";
  * See `Channels.subscribe` in `channels.ts`.
  */
 const ROLE_SUBSCRIPTIONS: Record<Exclude<AgentRole, "ceo" | "contractor">, string[]> = {
-  cto: ["announcements", "engineering"],
-  engineer: ["announcements", "engineering"],
-  marketing: ["announcements", "gtm"],
-  sales: ["announcements", "gtm"],
+  cto: ["announcements", "engineering", "directs:cto"],
+  engineer: ["announcements", "engineering", "directs:engineer"],
+  marketing: ["announcements", "gtm", "directs:marketing"],
+  sales: ["announcements", "gtm", "directs:sales"],
 };
 
 type EmployeeRole = keyof typeof ROLE_SUBSCRIPTIONS;
