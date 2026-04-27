@@ -39,6 +39,7 @@ async fn spawn() -> (TempDir, TempDir, tempfile::NamedTempFile, Arc<MetaStore>, 
         }),
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
     let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

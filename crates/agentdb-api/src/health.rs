@@ -169,6 +169,7 @@ mod tests {
         admin_auth: None,
                 jwt_config: crate::jwt::JwtConfig::default(),
                 cors_config: crate::cors::CorsConfig::default(),
+                broadcast_bus: crate::BroadcastBus::default(),
             },
         )
     }
@@ -209,6 +210,7 @@ mod tests {
         admin_auth: None,
                 jwt_config: crate::jwt::JwtConfig::default(),
                 cors_config: crate::cors::CorsConfig::default(),
+                broadcast_bus: crate::BroadcastBus::default(),
             },
         )
     }

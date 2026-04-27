@@ -42,6 +42,7 @@ pub mod trace_context;
 pub mod webhook;
 
 pub use auth_middleware::AuthedTenant;
+pub use broadcast_bus::{BroadcastBus, BroadcastEnvelope, ChannelKey};
 pub use error::{ApiError, ErrorCode, ErrorKind, ErrorResponse};
 pub use event_bus::EventBus;
 pub use stream::{now_ms, StreamBus, StreamEvent, TickBox};
@@ -85,6 +86,9 @@ pub struct AppState {
     /// `docs/superpowers/specs/2026-04-25-pubsub-design.md`
     /// §6.13.
     pub cors_config: cors::CorsConfig,
+    /// Phase 2 ephemeral broadcast bus (spec § 5.4). `default()` is empty;
+    /// the GC sweep is spawned in `agentdb-server`'s startup (Task 7).
+    pub broadcast_bus: BroadcastBus,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,7 @@ impl AppState {
             admin_auth: None,
             jwt_config: jwt::JwtConfig::default(),
             cors_config: cors::CorsConfig::default(),
+            broadcast_bus: BroadcastBus::default(),
         }
     }
 }

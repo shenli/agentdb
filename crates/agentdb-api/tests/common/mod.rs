@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use agentdb_api::cors::CorsConfig;
 use agentdb_api::jwt::{AgentDbClaims, JwtConfig, SessionsClaim, TenantJwtConfig};
-use agentdb_api::{router, AppState, EventBus, StreamBus};
+use agentdb_api::{router, AppState, BroadcastBus, EventBus, StreamBus};
 use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -59,7 +59,13 @@ impl TestServer {
     }
 
     async fn start_with_event_bus(event_bus: EventBus) -> Self {
-        Self::start_inner(event_bus, JwtConfig::default(), CorsConfig::default()).await
+        Self::start_inner(
+            event_bus,
+            JwtConfig::default(),
+            CorsConfig::default(),
+            BroadcastBus::default(),
+        )
+        .await
     }
 
     /// Boot a TestServer where tenant `t-1` requires HMAC-signed JWTs
@@ -82,6 +88,7 @@ impl TestServer {
             EventBus::default(),
             JwtConfig { per_tenant },
             CorsConfig::default(),
+            BroadcastBus::default(),
         )
         .await
     }
@@ -101,6 +108,7 @@ impl TestServer {
             EventBus::default(),
             JwtConfig::default(),
             CorsConfig { per_tenant },
+            BroadcastBus::default(),
         )
         .await
     }
@@ -109,6 +117,7 @@ impl TestServer {
         event_bus: EventBus,
         jwt_config: JwtConfig,
         cors_config: CorsConfig,
+        broadcast_bus: BroadcastBus,
     ) -> Self {
         let kv_dir = TempDir::new().expect("kv tempdir");
         let obj_dir = TempDir::new().expect("obj tempdir");
@@ -126,6 +135,7 @@ impl TestServer {
             admin_auth: None,
             jwt_config,
             cors_config,
+            broadcast_bus,
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

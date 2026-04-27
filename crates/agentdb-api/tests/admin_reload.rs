@@ -37,6 +37,7 @@ fn make_state() -> (TempDir, TempDir, AppState) {
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
     (dir, obj_dir, state)
 }

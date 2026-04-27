@@ -1179,6 +1179,7 @@ pub async fn run(
         sessions: sessions.clone(),
         stream: stream.clone(),
         event_bus: event_bus.clone(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
         http: http_client.clone(),
         auth: if require_auth {
             Some(agentdb_api::AuthConfig {

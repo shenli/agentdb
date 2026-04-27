@@ -39,6 +39,7 @@ async fn spawn(threshold_ms: u64, capacity: usize) -> (TempDir, TempDir, String,
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -135,6 +136,7 @@ async fn endpoint_returns_empty_array_when_no_buffer_attached() {
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
+        broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
