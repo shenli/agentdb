@@ -10,26 +10,46 @@ wire, no separate vector store.
 
 ---
 
-## What it gives you
+## What it's for
 
-- **`append_and_fetch`** — write one event, get the last N
-  back in the same round trip. The hot path of every agent
-  loop, in one HTTP request.
-- **Session fork** — branch a session into "what if" timelines
-  without copying events. MVCC-backed.
-- **Hybrid retrieval** — BM25 text search and HNSW cosine
-  vector search over the event log, with tenant + session
-  filters. Same database, same wire.
-- **Three-tier lifecycle** — warm → cold → archive,
-  transparent to readers. Tier transitions emit webhooks so
-  you can fan out summaries, embeddings, or archival copies.
-- **Multi-tenant by default** — per-tenant quota, admission
-  control, and isolation; HTTP Basic Auth + SCRAM-SHA-256 for
-  the Mongo wire when enabled.
+You're building agents — chatbots, research assistants, sales
+bots, multi-step automations. Each agent session emits a
+stream of events: user turns, model outputs, tool calls,
+observations. You need a place to store that stream durably,
+retrieve past events as context for the next turn, scale to
+many concurrent agents, and react to other agents' events in
+real time.
 
-Operator-grade extras (live dashboard, Prometheus metrics,
-S3-backed storage, multi-node replication) live alongside —
-see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Most teams glue this together: Postgres for events, pgvector
+for vectors, Redis for the session cache, an event-bus for
+real-time. AgentDB is one system that does all of it.
+
+## What's different
+
+- **Sessions, not rows.** A session is the agent's working
+  memory — an append-only event log with a built-in lifecycle
+  (warm → cold → archive) and copy-free fork ("what if I
+  tried this branch instead?"). Retrieval is scoped to a
+  session by default.
+- **Hybrid retrieval over your own log.** BM25 text + HNSW
+  vector search across the events you appended. One write,
+  two indexes; no second database to sync.
+- **Multi-tenant from the start.** Per-tenant isolation,
+  quotas, and admission control are baked in. Built for
+  platforms that host many users' agents — not retrofitted
+  from "single Postgres per team."
+- **Real-time event subscriptions.** Stream a session's
+  events to a browser or service as they land, with
+  replay-from-seq + gap-free reconnection. Plus a separate
+  ephemeral broadcast channel for transient signals (typing
+  indicators, presence pings).
+- **One-round-trip primitives.** Operations like
+  `append_and_fetch` (write an event AND read the last N for
+  context, in one call) match the agent loop's actual shape.
+
+Operator-grade extras — live dashboard, Prometheus metrics,
+S3-backed storage, multi-node clustering, structured audit
+log — live alongside. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
@@ -198,11 +218,11 @@ docker compose up --build
 docker compose exec agentdb agentdb show-scheduler
 ```
 
-Single-node by default; multi-node works since the M20 shard/
-tablet refactor (see the compose `README.md` for how to add a
-peer). Use `agentdb serve --dev` for the fastest local dev loop;
-the compose stack is for operators evaluating the production
-storage path without provisioning real S3.
+Single-node by default; multi-node works (see the compose
+`README.md` for how to add a peer). Use `agentdb serve --dev`
+for the fastest local dev loop; the compose stack is for
+operators evaluating the production storage path without
+provisioning real S3.
 
 ### Prometheus metrics
 
@@ -524,7 +544,7 @@ docs/                        design, architecture, performance, S3 guide
   clock, failure model, real-time, deployment, operability):
   [`docs/DESIGN.md`](docs/DESIGN.md)
 - **What the code actually does today** (crate layout, request
-  flow, storage layout, per-milestone additions):
+  flow, storage layout):
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **How fast it runs**:
   [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — laptop numbers
@@ -568,177 +588,100 @@ cargo bench -p agentdb-index --bench vector_bench     # HNSW vs brute-force vect
 > storage backend. The goal is to prove the agent-native
 > primitives compose — not to replace your Postgres.
 
-Every single-process agent-native primitive is implemented
-(append-and-fetch, fork, hybrid retrieval, three-tier
-lifecycle, box isolation, admission control, lifecycle
-webhooks, MVCC snapshot reads, HLC, pluggable KV). The
-M18+ milestones added:
+### What works today
 
-- **SQLite control plane** (tenants, nodes, tablets, shards, scheduler leader)
-- **Tablet leases** with fencing-token epoch — writes fail fast on lease loss
-- **Node membership + heartbeat** with stale-node detection
-- **Scheduler leader election** via singleton lease (SQLite
-  equivalent of `pg_advisory_lock`)
-- **Stale-lease reaper** — the elected leader cleans up dead
-  owners' tablet rows
-- **Node drain** (`POST /api/admin/drain`) with drain-aware lease
-  renewal for clean handoff without SIGTERM
-- **Per-tenant locking** + per-box admission semaphore
-- **Shard hash + `LocationProxy`** with operator-visible
-  assignment management (admin endpoint + CLI)
-- **M20 session-shard write routing** — `POST /api/admin/shards/:id`
-  actually moves future writes to the targeted box
-- **M22 reaper-driven shard reassignment** — when a tablet's lease
-  expires, its orphaned shards round-robin to surviving tablets
-- **M20 multi-node forwarding** — both writes (POST
-  append_and_fetch, POST fork) and session-scoped reads (GET
-  admin session detail) forward to the tablet's owning node
-  via HTTP, preserving auth and HLC, with a loop-guard
-  (`X-AgentDB-Forwarded` → 421 on routing drift). Mongo
-  `find`/`aggregate` with a pinned `session_id` return
-  `code: 10107 NotWritablePrimary` with the owning node's
-  address (real forwarding deferred — see Architecture)
-- **M19 SCRAM-SHA-256 auth** (optional, `AGENTDB_REQUIRE_AUTH=true`)
-  — Mongo wire advertises SCRAM; REST `/api/tenants/*` requires
-  Basic auth; user→tenant ACL; `agentdb user add|list|delete`
-- **Admin-plane bearer auth** (optional,
-  `AGENTDB_REQUIRE_ADMIN_AUTH=true`) — `/api/admin/*` requires
-  `Authorization: Bearer <token>`. Health/metrics stay open.
-  First-mint bootstrap exception lets operators obtain the
-  initial token without out-of-band DB access.
-  `agentdb admin-token add|list|revoke`; admin CLI
-  subcommands pick up `$AGENTDB_ADMIN_TOKEN` automatically.
-  Tokens carry an RBAC scope: `admin` (default) or
-  `readonly` (GET-only; mutations return 403). Scope-403s
-  show up in the audit log with the actor_token_id
-- **TLS termination** (both ports) — REST
-  (`--tls-cert` / `--tls-key` + env pair) terminates
-  HTTPS via rustls + axum-server. Mongo wire
-  (`--mongo-tls-cert` / `--mongo-tls-key`) terminates
-  TLS via tokio-rustls; `AGENTDB_MONGO_TLS_REUSE_REST=1`
-  reuses the REST cert so operators don't provision two.
-  `agentdb serve --dev-tls` generates one ephemeral cert
-  for both ports
-- **M25 hot-tablet detection + shed + dynamic tablet
-  creation** — sliding rate window on every box;
-  scheduler-leader detector flags saturated tablets;
-  `POST /api/admin/tablets/:id/shed` redistributes shards
-  between existing tablets;
-  `POST /api/admin/tablets/create` grows the box pool at
-  runtime (no process restart). Full relief loop:
-  `show-hot-tablets` → `create-tablet` → `shed-tablet
-  <hot> --to <new>`
-- **Warm-session data handoff** — per-session via
-  `POST /api/admin/sessions/:sid/migrate`, or bulk via
-  `shed-tablet --migrate-data` which chains the routing
-  move with a per-session warm rekey for every session
-  on the moved shards (cold/archive + fork parents
-  reported in `skipped_sessions`)
-- **Auto-shed scheduler** (optional,
-  `AGENTDB_AUTO_SHED_ENABLED=true`) — background task
-  fires shed-with-migrate against the least-loaded
-  sibling whenever the hot-tablet detector flags a
-  tablet; per-tablet cooldown
-  (`AGENTDB_AUTO_SHED_COOLDOWN_SECS`) prevents thrash
-- **Full admin CLI** (`agentdb serve --dev`, `drain`, `show-*`,
-  `set-shard`, `user *`, `shed-tablet [--migrate-data]`,
-  `create-tablet`, `admin-token *`, `migrate-session`,
-  `dump-config`)
-- **Docker packaging** (multi-stage `Dockerfile`, compose stack
-  with MinIO)
-- **Prometheus `/metrics`** exposition
-- **Per-box latency histograms** (append, admission-wait) on
-  `/metrics` and via `GET /api/admin/boxes/:id/latency` +
-  `agentdb show-latency <box>`
-- **Admin audit log** — every `/api/admin/*` request
-  (including 401 attempts) persists to the meta store.
-  Query via `GET /api/admin/audit` or `agentdb audit-log`
-  with actor / path-prefix / time-window filters
-- **Global per-tenant rate limits** — cap a tenant's
-  aggregate QPS across every box on this node.
-  `PUT /api/admin/tenant-quotas/:id` or
-  `agentdb set-tenant-quota <id> --max-qps N --burst M`.
-  Denials surface as `429` with `scope: "tenant_global"`
-  and as `agentdb_tenant_quota_denies_total{tenant="..."}`
-  on `/metrics`
-- **Slow-query log** — bounded ring buffer of every
-  append / find / aggregate that exceeds
-  `AGENTDB_SLOW_QUERY_THRESHOLD_MS`. Records carry
-  tenant, session, latency and a short detail. Surfaced
-  via `GET /api/admin/slow-queries` and
-  `agentdb show-slow-queries`;
-  `agentdb_slow_queries_recorded_total{kind="..."}` on
-  `/metrics`
-- **Point-in-time backup** — live RocksDB checkpoint +
-  SQLite VACUUM INTO into a destination directory.
-  `POST /api/admin/backup` or
-  `agentdb backup --out /abs/path`. Restore is offline —
-  copy the files into the target dirs and restart.
-  Optional scheduler via `AGENTDB_BACKUP_INTERVAL_SECS`
-  + `AGENTDB_BACKUP_DIR` + `AGENTDB_BACKUP_RETAIN` runs
-  leader-gated periodic backups and prunes older copies.
-  Status + counters on `GET /api/admin/backup/status`
-  and `agentdb_backup_runs_total{failures,…}` on
-  `/metrics`
-- **Config hot-reload** — `POST /api/admin/reload` (or
-  `SIGHUP`, or `agentdb reload`) re-reads env + meta and
-  swaps live values for the slow-query threshold + buffer
-  capacity, tracing filter (`RUST_LOG`), and the tenant-
-  quota registry without a restart
-- **Structured `/health/ready`** body with per-reason `doc_url`
-- **Runbook library** for every REST error code
+The agent-native primitives (append-and-fetch, fork, hybrid
+retrieval, three-tier lifecycle, MVCC snapshot reads, HLC,
+pluggable KV) are all implemented. Around them, the project
+has grown the platform pieces a real deployment needs:
 
-**Still out of scope:**
+- **Multi-node clustering.** SQLite or Postgres control plane
+  (tenants, nodes, tablets, shards, scheduler leader). Tablet
+  leases with fencing tokens; scheduler-driven placement +
+  reconciliation; cross-AZ-aware assignment. Cross-node
+  request forwarding for both REST and Mongo wire.
+- **Auth & isolation.** Optional SCRAM-SHA-256 on the Mongo
+  wire and HTTP Basic on REST, with auth-bound tenant
+  identity. Optional admin-plane bearer auth with RBAC
+  scopes (`admin` / `readonly`) and an audit log of every
+  admin request. TLS termination on both ports (or
+  `--dev-tls` for ephemeral self-signed).
+- **Real-time pub/sub.** Durable, replayable session-event
+  SSE with `from_seq` replay + gap-free reconnect, plus an
+  ephemeral broadcast channel for transient signals
+  (typing, cursor positions, presence pings).
+- **Hot-tablet handling.** Sliding rate-window detector,
+  manual or automatic shed (`AGENTDB_AUTO_SHED_ENABLED=true`)
+  that chains routing with per-session warm-data migration,
+  dynamic tablet creation at runtime.
+- **Operability.** Live dashboard, Prometheus `/metrics`
+  with per-box latency histograms, structured
+  `/health/ready` with runbook URLs, point-in-time backup
+  (manual + leader-gated periodic), config hot-reload,
+  slow-query log, global per-tenant rate limits, full
+  admin CLI.
+- **Packaging.** Multi-stage `Dockerfile`, compose stack
+  with MinIO, release pipeline producing per-platform
+  binaries, install script.
+- **Client SDKs.** Python (sync + async), TypeScript / Node,
+  Go — all stdlib-only or single-dep, with a matching
+  quickstart example each.
 
-- **Cross-node Mongo wire forwarding under auth.** With
-  auth off (the default), node-A forwards session-pinned
-  Mongo commands to the owning peer and relays the reply
-  end-to-end (counters:
-  `agentdb_wire_forwarded_total` /
-  `agentdb_wire_forward_failures_total`). With
+### Explicit non-goals
+
+These will not be added — by design — and the wrong adopter
+should choose a different tool:
+
+- **Cross-box (distributed) transactions.** The design is
+  single-tablet, 2PC-free.
+- **LLM / embedding generation.** Caller's responsibility;
+  AgentDB stores the events and serves retrieval.
+- **General-purpose search.** The BM25 indexer is
+  intentionally vanilla (whitespace + lowercase, no
+  language models). Use Elasticsearch / Tantivy / Lucene
+  for real search workloads.
+
+### Known limitations
+
+What's missing or partial in the current prototype, with
+honest framing:
+
+- **Cross-node Mongo wire forwarding under auth.** Cross-node
+  forwarding works in unauth mode (the dev default). With
   `AGENTDB_REQUIRE_AUTH=true`, SASL session state can't
-  cross a forward, so the handler returns
-  `code: 10107 NotWritablePrimary` with the peer's
-  address — the driver reconnects there. Auth-aware
-  forwarding needs a shared-secret / mTLS inter-node
-  trust model; future PR.
-- **Tenant-wide reads.** `find` without a session filter,
-  `listDatabases`, `listCollections` still route by tenant
-  hash. An override moves one session, not the whole tenant.
-- **Child-inherits-parent-box.** A forked child lives on
-  whatever box its parent was on; the child's `session_id`
-  hashes independently and reads routed by that hash may
-  miss it.
-- **Automatic data handoff on shed.** `shed` moves future
-  routing; operators call `migrate-session` per affected
-  session to move the already-written events. Coupling the
-  two is future work.
-- **Cross-node / cold-session handoff.** `migrate-session`
-  is warm-only and intra-process (shared KV). Cross-node
-  would need snapshot shipping; cold/archive needs
+  cross a hop, so the handler returns
+  `NotWritablePrimary` with the owning peer's address and
+  the driver reconnects. Auth-aware forwarding needs an
+  inter-node trust model.
+- **Cross-node / cold-session warm migration.**
+  `migrate-session` (and `shed --migrate-data`) handle
+  warm sessions co-located in the same process's KV.
+  Cross-node migration of warm sessions, and migration of
+  cold/archive sessions, would need snapshot shipping +
   object-store path rewrites.
-- **Admin-plane mTLS.** Bearer-token auth + RBAC scopes
-  ship; mTLS-based admin auth is a follow-up.
-- **M22 sophisticated placement policy** — cross-AZ
-  preference, anti-affinity, node-weight awareness.
-  Current reassignment is round-robin across live
-  tablets.
 - **Cross-node `create-tablet`.** The admin endpoint
-  creates the tablet on the node receiving the call. To
-  spawn a tablet on a different node, post to that node's
-  admin URL. Automatic placement is future work.
+  creates the tablet on the node receiving the call.
+  Spawning on a specific peer requires posting to that
+  peer's admin URL; automatic placement-aware creation
+  is future work.
+- **Placement policy beyond cross-AZ.** Cross-AZ
+  preference works. Anti-affinity (don't co-locate
+  tablets X and Y) and node-weight awareness
+  (heterogeneous hardware) are not yet implemented.
 - **Tablet deletion / shrink.** Once created, a tablet
-  stays. Shrinking requires data migration.
-- **Cross-box (distributed) transactions** — design is
-  single-box, 2PC-free.
-- **Real ANN at 100M+ vectors** — HNSW is single-node,
-  in-process.
-- **LLM / embedding generation** — caller's responsibility;
-  webhook signal only.
+  stays. Shrinking the pool would require data migration.
+- **Admin-plane mTLS.** Bearer-token auth + RBAC ships;
+  mTLS-based admin auth is a follow-up.
+- **`listDatabases` / `listCollections` cross-tenant
+  fanout.** Still tenant-hash routed in a multi-node
+  cluster. Most agent workloads don't hit this.
+- **ANN at 100M+ vectors per node.** HNSW is single-node,
+  in-process. Vertical scaling within a single tablet
+  has a ceiling.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Control plane
-(M18 and later)" and "What the prototype does NOT do" for the full
-picture.
+The full picture lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+("What the prototype does NOT do") and [`docs/DESIGN.md`](docs/DESIGN.md)
+(§9 explicit non-goals, §10 open questions).
 
 ---
 
