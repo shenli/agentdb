@@ -237,7 +237,7 @@ curl -s http://127.0.0.1:7878/metrics | grep agentdb_appends_total
 
 Point Prometheus / Grafana Agent / VictoriaMetrics at it — no
 extra config needed. See
-[`docs/ARCHITECTURE.md` § Prometheus exposition](docs/ARCHITECTURE.md#prometheus-exposition-m27-piece)
+[`docs/ARCHITECTURE.md` § Observability](docs/ARCHITECTURE.md#observability)
 for the full metric catalog.
 
 Per-box latency histograms (`agentdb_append_latency_seconds`,
