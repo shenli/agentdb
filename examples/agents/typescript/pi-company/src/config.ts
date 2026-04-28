@@ -89,11 +89,8 @@ export async function loadAgentConfig(
   role: EmployeeRole,
 ): Promise<AgentConfig> {
   const defaults = CODE_DEFAULTS[role];
-  // Same `_noop` append-and-fetch trick that Memory uses: the SDK's only
-  // event-read path is `append({fetchLastN})`, and a `_noop` write on a
-  // fresh session implicitly creates it.
   const session = client.session(CONFIG_SESSION, { tenant });
-  const resp = await session.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
+  const resp = await session.fetchRecent(1024);
   const recent = (resp.recent ?? []) as AgentEvent[];
   const patch = reduceConfigEvents(recent, role);
   return mergePatch(defaults, patch);

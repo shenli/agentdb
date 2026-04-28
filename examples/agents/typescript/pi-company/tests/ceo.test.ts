@@ -8,9 +8,11 @@ class FakeSession {
   recent: any[] = [];
   async append(event: any, _opts: any) {
     this.appended.push(event);
-    if (event.kind === "_noop") return { seq: this.appended.length, recent: this.recent };
     this.recent.push({ payload: event, ts_ms: Date.now() });
     return { seq: this.appended.length, recent: [] };
+  }
+  async fetchRecent(n: number) {
+    return { recent: this.recent.slice(-n) };
   }
 }
 class FakeClient {

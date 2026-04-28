@@ -42,7 +42,7 @@ test(
 
       // Verify _meta contains a run_ended event with a known cause
       const metaSess = client.session(`${runId}:_meta`, { tenant: TENANT });
-      const resp = await (metaSess as any).append({ kind: "_noop" }, { fetchLastN: 1024 });
+      const resp = await metaSess.fetchRecent(1024);
       const ended = (resp.recent ?? []).find(
         (e: any) => (e.payload?.kind ?? e.kind) === "run_ended",
       );

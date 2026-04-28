@@ -135,6 +135,33 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
     assert.equal((last.payload as { i: number }).i, 99);
   });
 
+  await t.test("fetchRecent on empty session returns empty array", async () => {
+    const client = new Client(baseUrl, { tenant: "demo" });
+    const sess = client.session("agent-smoke-fetch-empty");
+    const result = await sess.fetchRecent(5);
+    assert.deepEqual(result.recent, []);
+  });
+
+  await t.test("fetchRecent after 3 appends returns last 2 in order", async () => {
+    const client = new Client(baseUrl, { tenant: "demo" });
+    const sess = client.session("agent-smoke-fetch-3");
+    await sess.append({ i: 1 });
+    await sess.append({ i: 2 });
+    await sess.append({ i: 3 });
+    const result = await sess.fetchRecent(2);
+    assert.equal(result.recent.length, 2);
+    const payloads = result.recent.map((e) => (e.payload as { i: number }).i);
+    assert.deepEqual(payloads, [2, 3]);
+  });
+
+  await t.test("fetchRecent(0) returns empty array", async () => {
+    const client = new Client(baseUrl, { tenant: "demo" });
+    const sess = client.session("agent-smoke-fetch-zero");
+    await sess.append({ x: 1 });
+    const result = await sess.fetchRecent(0);
+    assert.deepEqual(result.recent, []);
+  });
+
   await t.test(
     "session without tenant or auth throws on append",
     async () => {

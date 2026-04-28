@@ -592,40 +592,41 @@ cargo bench -p agentdb-index --bench vector_bench     # HNSW vs brute-force vect
 
 The agent-native primitives (append-and-fetch, fork, hybrid
 retrieval, three-tier lifecycle, MVCC snapshot reads, HLC,
-pluggable KV) are all implemented. Around them, the project
-has grown the platform pieces a real deployment needs:
+pluggable KV) are all implemented `[implemented]`. Around them,
+the project has grown the platform pieces a real deployment needs:
 
-- **Multi-node clustering.** SQLite or Postgres control plane
-  (tenants, nodes, tablets, shards, scheduler leader). Tablet
-  leases with fencing tokens; scheduler-driven placement +
-  reconciliation; cross-AZ-aware assignment. Cross-node
-  request forwarding for both REST and Mongo wire.
-- **Auth & isolation.** Optional SCRAM-SHA-256 on the Mongo
-  wire and HTTP Basic on REST, with auth-bound tenant
-  identity. Optional admin-plane bearer auth with RBAC
+- **Multi-node clustering.** `[not battle-tested]` SQLite or
+  Postgres control plane (tenants, nodes, tablets, shards,
+  scheduler leader). Tablet leases with fencing tokens;
+  scheduler-driven placement + reconciliation; cross-AZ-aware
+  assignment. Cross-node request forwarding for both REST and
+  Mongo wire.
+- **Auth & isolation.** `[implemented]` Optional SCRAM-SHA-256
+  on the Mongo wire and HTTP Basic on REST, with auth-bound
+  tenant identity. Optional admin-plane bearer auth with RBAC
   scopes (`admin` / `readonly`) and an audit log of every
   admin request. TLS termination on both ports (or
   `--dev-tls` for ephemeral self-signed).
-- **Real-time pub/sub.** Durable, replayable session-event
-  SSE with `from_seq` replay + gap-free reconnect, plus an
-  ephemeral broadcast channel for transient signals
-  (typing, cursor positions, presence pings).
-- **Hot-tablet handling.** Sliding rate-window detector,
-  manual or automatic shed (`AGENTDB_AUTO_SHED_ENABLED=true`)
-  that chains routing with per-session warm-data migration,
-  dynamic tablet creation at runtime.
-- **Operability.** Live dashboard, Prometheus `/metrics`
-  with per-box latency histograms, structured
-  `/health/ready` with runbook URLs, point-in-time backup
-  (manual + leader-gated periodic), config hot-reload,
-  slow-query log, global per-tenant rate limits, full
-  admin CLI.
-- **Packaging.** Multi-stage `Dockerfile`, compose stack
-  with MinIO, release pipeline producing per-platform
-  binaries, install script.
-- **Client SDKs.** Python (sync + async), TypeScript / Node,
-  Go — all stdlib-only or single-dep, with a matching
-  quickstart example each.
+- **Real-time pub/sub.** `[implemented]` Durable, replayable
+  session-event SSE with `from_seq` replay + gap-free
+  reconnect, plus an ephemeral broadcast channel for transient
+  signals (typing, cursor positions, presence pings).
+- **Hot-tablet handling.** `[not battle-tested]` Sliding
+  rate-window detector, manual or automatic shed
+  (`AGENTDB_AUTO_SHED_ENABLED=true`) that chains routing with
+  per-session warm-data migration, dynamic tablet creation at
+  runtime.
+- **Operability.** `[not battle-tested]` Live dashboard,
+  Prometheus `/metrics` with per-box latency histograms,
+  structured `/health/ready` with runbook URLs, point-in-time
+  backup (manual + leader-gated periodic), config hot-reload,
+  slow-query log, global per-tenant rate limits, full admin CLI.
+- **Packaging.** `[not battle-tested]` Multi-stage `Dockerfile`,
+  compose stack with MinIO, release pipeline producing
+  per-platform binaries, install script.
+- **Client SDKs.** `[implemented]` Python (sync + async),
+  TypeScript / Node, Go — all stdlib-only or single-dep, with
+  a matching quickstart example each.
 
 ### Explicit non-goals
 

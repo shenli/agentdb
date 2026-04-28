@@ -38,3 +38,13 @@ impl From<agentdb_core::Event> for EventDto {
         }
     }
 }
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct FetchRecentRequest {
+    pub n: usize,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct FetchRecentResponse {
+    pub recent: Vec<EventDto>,
+}

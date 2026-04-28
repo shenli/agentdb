@@ -203,8 +203,8 @@ export async function appendStepTimeout(
 }
 
 /**
- * Read all events on `{runId}:_plan` (via the same _noop append+fetch trick
- * Memory uses), reduce, and truncate the observations to the last N.
+ * Read all events on `{runId}:_plan` via the server's pure-read
+ * `fetch_recent` endpoint, reduce, and truncate the observations to the last N.
  *
  * `observationWindow` defaults to 20.
  */
@@ -214,11 +214,8 @@ export async function loadCurrentPlan(
   observationWindow: number = 20,
 ): Promise<PlanState> {
   const sess = client.session(planSessionName(run), { tenant: run.tenant });
-  const resp = await sess.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
-  const recent = (resp.recent ?? []).filter((e: any) => {
-    const p = e.payload ?? e;
-    return p?.kind && p.kind !== "_noop";
-  }) as AgentEvent[];
+  const resp = await sess.fetchRecent(1024);
+  const recent = (resp.recent ?? []) as AgentEvent[];
   const state = reducePlanEvents(recent);
   if (state.observations.length > observationWindow) {
     return { ...state, observations: state.observations.slice(-observationWindow) };

@@ -143,6 +143,8 @@ impl AppState {
     paths(
         handlers::append_and_fetch,
         handlers::append_and_fetch_session_keyed,
+        handlers::fetch_recent,
+        handlers::fetch_recent_session_keyed,
         fork::fork_handler,
         admin::force_tier,
         admin::get_hlc,
@@ -189,6 +191,8 @@ impl AppState {
         dto::AppendAndFetchRequest,
         dto::AppendAndFetchResponse,
         dto::EventDto,
+        dto::FetchRecentRequest,
+        dto::FetchRecentResponse,
         admin::ForceTierRequest,
         admin::ForceTierResponse,
         admin::HlcStatus,
@@ -291,6 +295,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/sessions/:session_id/append_and_fetch",
             axum::routing::post(handlers::append_and_fetch_session_keyed),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/fetch_recent",
+            axum::routing::post(handlers::fetch_recent),
+        )
+        .route(
+            "/api/sessions/:session_id/fetch_recent",
+            axum::routing::post(handlers::fetch_recent_session_keyed),
         )
         .route(
             "/api/sessions/:session_id/fork",
