@@ -14,11 +14,13 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, TenantRegistry};
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -42,9 +44,6 @@ async fn spawn() -> Env {
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    // `new_with_meta` wires the registry's meta_store so the
-    // locator population in append_and_fetch_with_actor and
-    // the locator-first resolution in fork both activate.
     let registry = Arc::new(
         BoxRegistry::new_with_meta(
             kv.clone(),
@@ -65,7 +64,7 @@ async fn spawn() -> Env {
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -86,13 +85,32 @@ async fn spawn() -> Env {
     }
 }
 
+fn basic_auth(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.status());
+}
+
 /// Append once to populate a parent session + its locator.
-async fn seed_parent(env: &Env, tenant: &str, session: &str) {
+async fn seed_parent(env: &Env, auth: &str, session: &str) {
     reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/{tenant}/sessions/{session}/append_and_fetch",
+            "{}/api/sessions/{session}/append_and_fetch",
             env.base
         ))
+        .header("Authorization", auth)
         .json(&json!({"event": {"k": 1}, "fetch_last_n": 0}))
         .send()
         .await
@@ -104,7 +122,9 @@ async fn seed_parent(env: &Env, tenant: &str, session: &str) {
 #[tokio::test]
 async fn fork_resolves_tenant_from_locator_when_body_omits_it() {
     let env = spawn().await;
-    seed_parent(&env, "t-1", "parent").await;
+    create_user(&env.base, "alice", "t-1", "pw").await;
+    let auth = basic_auth("alice", "pw");
+    seed_parent(&env, &auth, "parent").await;
 
     // Sanity-check the locator was written by the seed append.
     let loc = agentdb_meta::session_locators::get(env.meta.pool(), "parent")
@@ -118,6 +138,7 @@ async fn fork_resolves_tenant_from_locator_when_body_omits_it() {
     // resolution.
     let resp = reqwest::Client::new()
         .post(format!("{}/api/sessions/parent/fork", env.base))
+        .header("Authorization", &auth)
         .json(&json!({ "new_session_id": "child" }))
         .send()
         .await
@@ -141,10 +162,13 @@ async fn fork_with_matching_body_tenant_still_works() {
     // Back-compat: clients that still send tenant_id and
     // happen to match the locator are accepted unchanged.
     let env = spawn().await;
-    seed_parent(&env, "t-1", "parent").await;
+    create_user(&env.base, "alice", "t-1", "pw").await;
+    let auth = basic_auth("alice", "pw");
+    seed_parent(&env, &auth, "parent").await;
 
     let resp = reqwest::Client::new()
         .post(format!("{}/api/sessions/parent/fork", env.base))
+        .header("Authorization", &auth)
         .json(&json!({ "tenant_id": "t-1", "new_session_id": "child" }))
         .send()
         .await
@@ -158,10 +182,13 @@ async fn fork_with_disagreeing_body_tenant_returns_400() {
     // this likely means the client config is stale; surface
     // 400 rather than silently overruling either side.
     let env = spawn().await;
-    seed_parent(&env, "t-1", "parent").await;
+    create_user(&env.base, "alice", "t-1", "pw").await;
+    let auth = basic_auth("alice", "pw");
+    seed_parent(&env, &auth, "parent").await;
 
     let resp = reqwest::Client::new()
         .post(format!("{}/api/sessions/parent/fork", env.base))
+        .header("Authorization", &auth)
         .json(&json!({ "tenant_id": "t-other", "new_session_id": "child" }))
         .send()
         .await
@@ -169,8 +196,10 @@ async fn fork_with_disagreeing_body_tenant_returns_400() {
     assert_eq!(resp.status().as_u16(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["message"].as_str().unwrap_or("");
+    // When auth is enabled, the disagreement is with the authenticated
+    // tenant; when auth is absent, with the locator.
     assert!(
-        msg.contains("disagrees") && msg.contains("locator"),
+        msg.contains("disagrees"),
         "expected disagreement message, got: {msg}"
     );
 }
@@ -180,20 +209,25 @@ async fn fork_without_locator_and_without_body_tenant_returns_400() {
     // Parent session has never been touched (no locator).
     // Body omits tenant_id. Resolution can't proceed.
     let env = spawn().await;
-    // Note: NOT seeding the parent — we want the locator
-    // gone.
+    create_user(&env.base, "alice", "t-1", "pw").await;
+    let auth = basic_auth("alice", "pw");
+    // Note: NOT seeding the parent — we want the locator gone.
 
     let resp = reqwest::Client::new()
         .post(format!("{}/api/sessions/never-existed/fork", env.base))
+        .header("Authorization", &auth)
         .json(&json!({ "new_session_id": "child" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 400);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let msg = body["message"].as_str().unwrap_or("");
+    // Auth resolves tenant to "t-1" but the parent session
+    // has never been written (no locator, no data). The fork
+    // handler proceeds past tenant resolution and fails at
+    // `fork_session` with "not found". Must not be 401.
+    let status = resp.status().as_u16();
+    assert_ne!(status, 401, "must not be 401");
     assert!(
-        msg.to_lowercase().contains("tenant"),
-        "expected message to mention tenant, got: {msg}"
+        status == 400 || status == 404,
+        "expected 400 or 404, got {status}"
     );
 }

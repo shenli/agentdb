@@ -121,15 +121,22 @@ pub async fn subscribe_session(
     Query(q): Query<SubscribeQuery>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    subscribe_session_inner(state, tenant, session, q, headers).await
+    // v1 path: auth is either disabled (auth: None) or not in scope here;
+    // pass `true` to skip the Basic-auth check inside the inner handler.
+    subscribe_session_inner(state, tenant, session, q, headers, true).await
 }
 
+/// `basic_authed`: whether the caller was authenticated via Basic auth.
+/// When `false` and the server has auth configured, the inner handler
+/// returns 401 if the tenant has no JWT config (which would otherwise
+/// let the request through silently without any auth enforcement).
 async fn subscribe_session_inner(
     state: AppState,
     tenant: String,
     session: String,
     q: SubscribeQuery,
     headers: HeaderMap,
+    basic_authed: bool,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -155,10 +162,9 @@ async fn subscribe_session_inner(
     }
 
     // JWT enforcement (spec §6.13). Returns Ok(None) if the tenant
-    // has no JWT config — falls through to whatever auth the route's
-    // middleware applies (typically Basic). Otherwise Some(claims) on
-    // verify success, or an ApiError on dual-auth / missing / invalid /
-    // expired token.
+    // has no JWT config — falls through to Basic-auth enforcement
+    // below. Otherwise Some(claims) on verify success, or an
+    // ApiError on dual-auth / missing / invalid / expired token.
     let jwt_claims = match crate::subscribe_auth::extract_subscribe_jwt(
         &state,
         &headers,
@@ -170,6 +176,15 @@ async fn subscribe_session_inner(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+    // If JWT is not configured for this tenant, require Basic auth.
+    // When `basic_authed` is false (v2 path, no Authorization header)
+    // and the server has auth enabled, the request is unauthenticated.
+    if jwt_claims.is_none() && !basic_authed && state.auth.is_some() {
+        return crate::error::ApiError::Unauthorized(
+            "missing Authorization header".into(),
+        )
+        .into_response();
+    }
     if let Some(claims) = &jwt_claims {
         if !claims.sessions.allows(&session) {
             return crate::error::ApiError::Coded(
@@ -894,6 +909,7 @@ pub async fn subscribe_session_keyed(
     headers: HeaderMap,
     authed: Option<Extension<AuthedTenant>>,
 ) -> axum::response::Response {
+    let basic_authed = authed.is_some();
     let tenant = match crate::auth_middleware::resolve_session_tenant(
         &state,
         &session,
@@ -905,23 +921,36 @@ pub async fn subscribe_session_keyed(
         Ok(t) => t,
         Err(resp) => return resp,
     };
-    subscribe_session_inner(state, tenant, session, q, headers).await
+    subscribe_session_inner(state, tenant, session, q, headers, basic_authed).await
 }
 
 /// v2: `/api/subscribe` — auth-derived tenant, no path params.
-/// Tenant is the bearer token's claim; no locator cross-check
-/// needed because the URL doesn't address any specific session.
+/// Tenant is the auth-derived tenant from Basic auth. No locator
+/// cross-check needed because the URL doesn't address any specific
+/// session. Auth is always required (no JWT fallback for tenant-wide
+/// subscribe since there's no session context to look up JWT config).
 #[tracing::instrument(
     name = "rest.subscribe_tenant_keyed",
     skip(state, headers, authed),
-    fields(tenant = %authed.external_id),
+    fields(tenant = tracing::field::Empty),
 )]
 pub async fn subscribe_tenant_keyed(
     State(state): State<AppState>,
     Query(q): Query<TenantSubscribeQuery>,
     headers: HeaderMap,
-    Extension(authed): Extension<AuthedTenant>,
+    authed: Option<Extension<AuthedTenant>>,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let authed = match authed {
+        Some(a) => a.0,
+        None => {
+            return crate::error::ApiError::Unauthorized(
+                "missing Authorization header".into(),
+            )
+            .into_response();
+        }
+    };
+    tracing::Span::current().record("tenant", &authed.external_id.as_str());
     subscribe_tenant_inner(state, authed.external_id, q, headers).await
 }
 

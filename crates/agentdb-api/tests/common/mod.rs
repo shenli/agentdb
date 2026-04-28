@@ -17,9 +17,12 @@ use std::sync::Arc;
 
 use agentdb_api::cors::CorsConfig;
 use agentdb_api::jwt::{AgentDbClaims, JwtConfig, SessionsClaim, TenantJwtConfig};
-use agentdb_api::{router, AppState, BroadcastBus, EventBus, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_api::{router, AppState, AuthConfig, BroadcastBus, EventBus, StreamBus};
+use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, TenantRegistry};
+use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -144,6 +147,150 @@ impl TestServer {
         .await
     }
 
+    /// Boot a TestServer with Basic auth enabled and a meta-backed
+    /// registry. Use for v2 session/subscribe tests that need
+    /// auth-derived tenant resolution. admin_auth is None so
+    /// /api/admin/users is open for seeding test users.
+    pub async fn start_with_basic_auth() -> Self {
+        Self::start_with_basic_auth_and_event_bus(EventBus::default()).await
+    }
+
+    /// Like `start_with_basic_auth` but with a custom EventBus capacity.
+    pub async fn start_with_basic_auth_and_event_bus_capacity(cap: usize) -> Self {
+        Self::start_with_basic_auth_and_event_bus(EventBus::new(cap)).await
+    }
+
+    async fn start_with_basic_auth_and_event_bus(event_bus: EventBus) -> Self {
+        let kv_dir = TempDir::new().expect("kv tempdir");
+        let obj_dir = TempDir::new().expect("obj tempdir");
+        let meta_file = tempfile::NamedTempFile::new().expect("meta tempfile");
+        let meta_path = meta_file.path().to_string_lossy().to_string();
+        let meta = Arc::new(
+            MetaStore::open_sqlite(&meta_path)
+                .await
+                .expect("meta open"),
+        );
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).expect("local fs"));
+        let registry = Arc::new(
+            BoxRegistry::new_with_meta(
+                kv.clone(),
+                store,
+                4,
+                Arc::new(HlcClock::default()),
+                meta.clone(),
+                "test-node".into(),
+            )
+            .await
+            .expect("registry with meta"),
+        );
+        let state = AppState {
+            registry,
+            tenants: Arc::new(TenantRegistry::new(kv.clone())),
+            sessions: Arc::new(SessionRegistry::new(kv)),
+            stream: StreamBus::default(),
+            event_bus,
+            http: agentdb_api::webhook::new_client(),
+            auth: Some(AuthConfig { meta: Some(meta.clone()) }),
+            admin_auth: None,
+            jwt_config: JwtConfig::default(),
+            cors_config: CorsConfig::default(),
+            broadcast_bus: BroadcastBus::default(),
+        };
+        let app = router(state.clone())
+            .layer(axum::Extension(meta));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        // Keep meta_file alive through the server's lifetime by moving
+        // it into the spawned task's capture. We can't store it in Self
+        // without adding a new field, so we hold it as a move-captured
+        // local instead. The task runs until the test drops the server,
+        // at which point the tempfile also drops.
+        let _meta_file = meta_file;
+        tokio::spawn(async move {
+            let _meta_file = _meta_file; // keep alive
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Self {
+            state,
+            base: format!("http://{addr}"),
+            _kv_dir: Arc::new(kv_dir),
+            _obj_dir: Arc::new(obj_dir),
+        }
+    }
+
+    /// Boot with Basic auth + meta + a per-tenant HMAC JWT config.
+    /// Use for v2 subscribe tests that test JWT auth behavior.
+    /// Caller must seed a session first (so the locator exists) before
+    /// trying JWT subscribe on the v2 path.
+    pub async fn start_with_basic_auth_and_jwt_hmac(tenant: &str, secret: &[u8]) -> Self {
+        let mut per_tenant = HashMap::new();
+        per_tenant.insert(
+            tenant.to_string(),
+            TenantJwtConfig::Hmac {
+                secret: secret.to_vec(),
+                issuer: "https://auth.test".into(),
+                audience: None,
+            },
+        );
+        let kv_dir = TempDir::new().expect("kv tempdir");
+        let obj_dir = TempDir::new().expect("obj tempdir");
+        let meta_file = tempfile::NamedTempFile::new().expect("meta tempfile");
+        let meta_path = meta_file.path().to_string_lossy().to_string();
+        let meta = Arc::new(
+            MetaStore::open_sqlite(&meta_path)
+                .await
+                .expect("meta open"),
+        );
+        let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).expect("rocks open"));
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).expect("local fs"));
+        let registry = Arc::new(
+            BoxRegistry::new_with_meta(
+                kv.clone(),
+                store,
+                4,
+                Arc::new(HlcClock::default()),
+                meta.clone(),
+                "test-node".into(),
+            )
+            .await
+            .expect("registry with meta"),
+        );
+        let state = AppState {
+            registry,
+            tenants: Arc::new(TenantRegistry::new(kv.clone())),
+            sessions: Arc::new(SessionRegistry::new(kv)),
+            stream: StreamBus::default(),
+            event_bus: EventBus::default(),
+            http: agentdb_api::webhook::new_client(),
+            auth: Some(AuthConfig { meta: Some(meta.clone()) }),
+            admin_auth: None,
+            jwt_config: JwtConfig { per_tenant },
+            cors_config: CorsConfig::default(),
+            broadcast_bus: BroadcastBus::default(),
+        };
+        let app = router(state.clone()).layer(axum::Extension(meta));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let _meta_file = meta_file;
+        tokio::spawn(async move {
+            let _meta_file = _meta_file;
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Self {
+            state,
+            base: format!("http://{addr}"),
+            _kv_dir: Arc::new(kv_dir),
+            _obj_dir: Arc::new(obj_dir),
+        }
+    }
+
     async fn start_inner(
         event_bus: EventBus,
         jwt_config: JwtConfig,
@@ -181,6 +328,39 @@ impl TestServer {
             base: format!("http://{addr}"),
             _kv_dir: Arc::new(kv_dir),
             _obj_dir: Arc::new(obj_dir),
+        }
+    }
+
+    /// POST a JSON body to a path, adding `Authorization: Basic <cred>`.
+    /// Used by v2 session tests that require Basic-auth.
+    pub async fn post_json_basic(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        auth: &str,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}{}", self.base, path))
+            .header("Authorization", auth)
+            .json(&body)
+            .send()
+            .await
+            .expect("send")
+    }
+
+    /// Open an SSE stream, adding `Authorization: Basic <cred>`.
+    /// Used by v2 subscribe tests that require Basic-auth.
+    pub async fn open_sse_with_basic(&self, path: &str, auth: &str) -> SseStream {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{}", self.base, path))
+            .header("Authorization", auth)
+            .send()
+            .await
+            .expect("send sse open");
+        assert_eq!(resp.status(), 200, "SSE open failed: {}", resp.status());
+        SseStream {
+            body: resp,
+            buf: String::new(),
         }
     }
 
@@ -243,6 +423,28 @@ impl TestServer {
             .await
             .expect("send")
     }
+}
+
+/// Create a test user via `/api/admin/users` and return the
+/// `Authorization: Basic …` header value for that user. Intended
+/// for use with `TestServer::start_with_basic_auth()` servers.
+pub async fn seed_basic_user(server: &TestServer, user: &str, tenant: &str, password: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/admin/users", server.base))
+        .json(&serde_json::json!({
+            "user_id": user,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("create user");
+    assert!(
+        resp.status().is_success(),
+        "seed_basic_user failed: {}",
+        resp.text().await.unwrap()
+    );
+    format!("Basic {}", B64.encode(format!("{user}:{password}").as_bytes()))
 }
 
 /// Buffered Server-Sent Events stream. Holds the raw `reqwest`
