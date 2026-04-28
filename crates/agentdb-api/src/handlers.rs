@@ -167,6 +167,11 @@ pub async fn scan_events_from_seq(
         forwarded = headers.contains_key(FORWARDED_HEADER),
     ),
 )]
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/append_and_fetch \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn append_and_fetch(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
@@ -273,6 +278,11 @@ pub async fn append_and_fetch_session_keyed(
         session = %session,
         forwarded = headers.contains_key(FORWARDED_HEADER),
     ),
+)]
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/fetch_recent \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
 )]
 pub async fn fetch_recent(
     State(state): State<AppState>,

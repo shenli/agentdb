@@ -64,6 +64,11 @@ fn check_channel_claim(
 /// Spec § 5.1, § 5.3, § 5.5, § 5.7. Validation order is fail-cheapest-
 /// first: channel-name check, body-size cap, JWT verification, JSON
 /// parse, then enqueue + 204.
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/channels/{c}/publish \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn publish(
     State(state): State<AppState>,
     Path((tenant, channel)): Path<(String, String)>,
@@ -186,6 +191,11 @@ pub struct SubscribeChannelQuery {
 /// `RecvError::Overflowed(_)` is silently skipped (the subscriber
 /// missed the older messages — there's nothing to recover, only
 /// fresher ones to keep delivering). No `lag_too_far` close frame.
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/channels/{c}/subscribe \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn subscribe_channel(
     State(state): State<AppState>,
     Path((tenant, channel)): Path<(String, String)>,

@@ -274,6 +274,17 @@ impl AppState {
 pub struct ApiDoc;
 
 pub fn router(state: AppState) -> Router {
+    // ---------------------------------------------------------------
+    // User-facing route registrations.
+    //
+    // M27 introduced v2 auth-derived routes (/api/sessions/{s}/...,
+    // /api/subscribe, /api/channels/{c}/...). The v1 routes
+    // (/api/tenants/{t}/...) are still registered for compatibility
+    // with infrastructure tests that use auth: None setups; the v1
+    // handlers are #[deprecated] in their respective modules. v1
+    // removal + remaining test migrations are tracked as M28.
+    // ---------------------------------------------------------------
+
     // Routes that require Basic auth when AppState::auth is Some.
     // Split into a separate Router so the auth middleware only
     // sees mutation paths — admin-plane routes are a separate
@@ -287,6 +298,7 @@ pub fn router(state: AppState) -> Router {
     //     auth-derived. Handlers read `AuthedTenant` from
     //     request extensions and verify against the session
     //     locator.
+    #[allow(deprecated)]
     let tenant_routes: Router<AppState> = Router::new()
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
@@ -319,6 +331,7 @@ pub fn router(state: AppState) -> Router {
     // include `Authorization` on preflight). Basic auth still
     // protects the actual GET when the JWT subscribe-auth path
     // isn't engaged for this tenant.
+    #[allow(deprecated)]
     let subscribe_routes: Router<AppState> = Router::new()
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
@@ -351,6 +364,7 @@ pub fn router(state: AppState) -> Router {
     // `extract_subscribe_jwt` rather than a Basic-auth middleware.
     // Kept distinct from `subscribe_routes` for grep-ability —
     // durable session subs vs ephemeral channel broadcast.
+    #[allow(deprecated)]
     let channel_routes: Router<AppState> = Router::new()
         .route(
             "/api/tenants/:tenant_id/channels/:channel/publish",

@@ -115,6 +115,11 @@ fn normalize_kind_filter(raw: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/subscribe \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn subscribe_session(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
@@ -579,6 +584,11 @@ fn build_subscribed_payload(
     payload
 }
 
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/subscribe \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn subscribe_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
