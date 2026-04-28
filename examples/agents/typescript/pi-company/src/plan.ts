@@ -108,6 +108,11 @@ function planSessionName(run: RunIdentity): string {
   return `${run.runId}:${PLAN_SESSION_SUFFIX}`;
 }
 
+/**
+ * Append a `plan_revised` event to `{runId}:_plan`. Replaces the prior
+ * step list at read time (the reducer applies last-write-wins on the
+ * latest `plan_revised`).
+ */
 export async function appendPlanRevised(
   client: Client,
   run: RunIdentity,
@@ -121,6 +126,11 @@ export async function appendPlanRevised(
   );
 }
 
+/**
+ * Append a `step_dispatched` event to `{runId}:_plan`. Call this when a
+ * step is handed off to a sub-agent; the reducer flips the step's status
+ * to `in_progress`.
+ */
 export async function appendStepDispatched(
   client: Client,
   run: RunIdentity,
@@ -135,6 +145,11 @@ export async function appendStepDispatched(
   );
 }
 
+/**
+ * Append a `step_completed` event to `{runId}:_plan`. Call this when a
+ * sub-agent finishes a step; the reducer maps the outcome status to a
+ * terminal `StepStatus` (`done`, `failed`, or `cancelled`).
+ */
 export async function appendStepCompleted(
   client: Client,
   run: RunIdentity,
@@ -150,6 +165,11 @@ export async function appendStepCompleted(
   );
 }
 
+/**
+ * Append an `observation` event to `{runId}:_plan`. Call this after any
+ * tool call to record what a sub-agent produced; observations accumulate
+ * and are surfaced to the CEO via `loadCurrentPlan`.
+ */
 export async function appendObservation(
   client: Client,
   run: RunIdentity,
@@ -165,6 +185,11 @@ export async function appendObservation(
   );
 }
 
+/**
+ * Append a `step_timeout` event to `{runId}:_plan`. Call this when the
+ * CEO's timeout watchdog fires; the reducer marks the step `failed` if
+ * it is still `in_progress`.
+ */
 export async function appendStepTimeout(
   client: Client,
   run: RunIdentity,
@@ -181,12 +206,12 @@ export async function appendStepTimeout(
  * Read all events on `{runId}:_plan` (via the same _noop append+fetch trick
  * Memory uses), reduce, and truncate the observations to the last N.
  *
- * `observation_window` defaults to 20.
+ * `observationWindow` defaults to 20.
  */
 export async function loadCurrentPlan(
   client: Client,
   run: RunIdentity,
-  observation_window: number = 20,
+  observationWindow: number = 20,
 ): Promise<PlanState> {
   const sess = client.session(planSessionName(run), { tenant: run.tenant });
   const resp = await sess.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
@@ -195,8 +220,8 @@ export async function loadCurrentPlan(
     return p?.kind && p.kind !== "_noop";
   }) as AgentEvent[];
   const state = reducePlanEvents(recent);
-  if (state.observations.length > observation_window) {
-    state.observations = state.observations.slice(-observation_window);
+  if (state.observations.length > observationWindow) {
+    return { ...state, observations: state.observations.slice(-observationWindow) };
   }
   return state;
 }

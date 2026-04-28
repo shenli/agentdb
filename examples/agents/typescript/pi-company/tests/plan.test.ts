@@ -137,6 +137,7 @@ import {
   appendStepDispatched,
   appendStepCompleted,
   appendObservation,
+  appendStepTimeout,
   loadCurrentPlan,
   PLAN_SESSION_SUFFIX,
 } from "../src/plan.ts";
@@ -193,6 +194,15 @@ test("appendObservation includes relates_to_step when provided", async () => {
   const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
   assert.equal(sess.appended[0].event.kind, "observation");
   assert.equal(sess.appended[0].event.relates_to_step, "s1");
+});
+
+test("appendStepTimeout writes a step_timeout event to {runId}:_plan", async () => {
+  const client = new FakeClient();
+  await appendStepTimeout(client as any, { tenant: "t", runId: "r1" }, "s1");
+  const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
+  assert.equal(sess.appended.length, 1);
+  assert.equal(sess.appended[0].event.kind, "step_timeout");
+  assert.equal(sess.appended[0].event.step_id, "s1");
 });
 
 test("loadCurrentPlan reduces session events and truncates observations", async () => {
