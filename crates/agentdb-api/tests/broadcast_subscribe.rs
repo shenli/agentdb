@@ -5,13 +5,15 @@
 //! tests come later (Tasks 8 / 9).
 
 mod common;
-use common::TestServer;
+use common::{mint_hmac_token_with_channels, TestServer};
 
 #[tokio::test]
 async fn multiple_subscribers_each_receive_every_publish() {
-    let server = TestServer::start().await;
-    let mut s1 = server.open_sse("/api/tenants/t-1/channels/c-1/subscribe").await;
-    let mut s2 = server.open_sse("/api/tenants/t-1/channels/c-1/subscribe").await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
+
+    let mut s1 = server.open_sse_with_bearer("/api/channels/c-1/subscribe", &token).await;
+    let mut s2 = server.open_sse_with_bearer("/api/channels/c-1/subscribe", &token).await;
 
     // Brief settle so both subscribers are attached to the bus
     // before the first publish — open_sse returns once the response
@@ -19,18 +21,20 @@ async fn multiple_subscribers_each_receive_every_publish() {
     // yet.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"i": 1}))
-        .send()
-        .await
-        .unwrap();
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"i": 2}))
-        .send()
-        .await
-        .unwrap();
+    server
+        .post_json_bearer(
+            "/api/channels/c-1/publish",
+            serde_json::json!({"i": 1}),
+            &token,
+        )
+        .await;
+    server
+        .post_json_bearer(
+            "/api/channels/c-1/publish",
+            serde_json::json!({"i": 2}),
+            &token,
+        )
+        .await;
 
     for sub in [&mut s1, &mut s2] {
         let mut got = vec![];
@@ -46,26 +50,30 @@ async fn multiple_subscribers_each_receive_every_publish() {
 
 #[tokio::test]
 async fn subscribers_on_different_channels_are_isolated() {
-    let server = TestServer::start().await;
-    let mut s = server.open_sse("/api/tenants/t-1/channels/c-1/subscribe").await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
+
+    let mut s = server.open_sse_with_bearer("/api/channels/c-1/subscribe", &token).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Publish to c-2 — s (subscribed to c-1) must NOT see it.
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-2/publish", server.base))
-        .json(&serde_json::json!({"x": 1}))
-        .send()
-        .await
-        .unwrap();
+    server
+        .post_json_bearer(
+            "/api/channels/c-2/publish",
+            serde_json::json!({"x": 1}),
+            &token,
+        )
+        .await;
 
     // Then publish to c-1 — s sees it.
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"x": 2}))
-        .send()
-        .await
-        .unwrap();
+    server
+        .post_json_bearer(
+            "/api/channels/c-1/publish",
+            serde_json::json!({"x": 2}),
+            &token,
+        )
+        .await;
 
     let frame = s.next_event().await;
     let env: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
@@ -74,23 +82,43 @@ async fn subscribers_on_different_channels_are_isolated() {
 
 #[tokio::test]
 async fn cross_tenant_isolation_holds() {
-    let server = TestServer::start().await;
-    let mut s = server.open_sse("/api/tenants/t-1/channels/c-1/subscribe").await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token_t1 = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
+
+    let mut s = server.open_sse_with_bearer("/api/channels/c-1/subscribe", &token_t1).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-other/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"leak": true}))
-        .send()
-        .await
-        .unwrap();
-    reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"leak": false}))
-        .send()
-        .await
-        .unwrap();
+    // Inject a cross-tenant envelope directly onto the bus — the HTTP
+    // v2 publish route requires a JWT whose tenant claim resolves to a
+    // configured tenant (t-other has no JWT config in this server), so
+    // we bypass HTTP for the "t-other" injection.
+    let key_other = agentdb_api::ChannelKey {
+        tenant: "t-other".into(),
+        channel: "c-1".into(),
+    };
+    server
+        .state
+        .broadcast_bus
+        .publish(
+            &key_other,
+            agentdb_api::BroadcastEnvelope {
+                tenant: "t-other".into(),
+                channel: "c-1".into(),
+                ts_ms: 1,
+                sender: None,
+                payload: serde_json::json!({"leak": true}),
+            },
+        )
+        .await;
+
+    server
+        .post_json_bearer(
+            "/api/channels/c-1/publish",
+            serde_json::json!({"leak": false}),
+            &token_t1,
+        )
+        .await;
 
     let frame = s.next_event().await;
     let env: serde_json::Value = serde_json::from_str(&frame.data).unwrap();

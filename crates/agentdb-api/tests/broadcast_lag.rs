@@ -9,13 +9,14 @@
 
 mod common;
 use agentdb_api::{BroadcastEnvelope, ChannelKey};
-use common::TestServer;
+use common::{mint_hmac_token_with_channels, TestServer};
 
 #[tokio::test]
 async fn slow_subscriber_loses_messages_but_stream_stays_open() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
     let mut sse = server
-        .open_sse("/api/tenants/t-1/channels/c-1/subscribe")
+        .open_sse_with_bearer("/api/channels/c-1/subscribe", &token)
         .await;
 
     // Pump well over per-channel capacity (256). Bypass HTTP for speed:

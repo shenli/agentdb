@@ -113,6 +113,37 @@ impl TestServer {
         .await
     }
 
+    /// Boot a TestServer with both HMAC JWT (for the given tenant) and
+    /// CORS (for the given tenant + origins) configured. Used by v2
+    /// broadcast CORS tests that require JWT auth on channel routes.
+    pub async fn start_with_jwt_hmac_and_cors(
+        tenant: &str,
+        secret: &[u8],
+        origins: &[&str],
+    ) -> Self {
+        let mut jwt_per_tenant = HashMap::new();
+        jwt_per_tenant.insert(
+            tenant.to_string(),
+            TenantJwtConfig::Hmac {
+                secret: secret.to_vec(),
+                issuer: "https://auth.test".into(),
+                audience: None,
+            },
+        );
+        let mut cors_per_tenant = HashMap::new();
+        cors_per_tenant.insert(
+            tenant.to_string(),
+            origins.iter().map(|s| (*s).to_string()).collect(),
+        );
+        Self::start_inner(
+            EventBus::default(),
+            JwtConfig { per_tenant: jwt_per_tenant },
+            CorsConfig { per_tenant: cors_per_tenant },
+            BroadcastBus::default(),
+        )
+        .await
+    }
+
     async fn start_inner(
         event_bus: EventBus,
         jwt_config: JwtConfig,
@@ -178,6 +209,39 @@ impl TestServer {
             body: resp,
             buf: String::new(),
         }
+    }
+
+    /// Like [`open_sse`] but adds `Authorization: Bearer <token>` to the
+    /// request. Used by v2 channel subscribe tests where JWT is required.
+    pub async fn open_sse_with_bearer(&self, path: &str, token: &str) -> SseStream {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{}", self.base, path))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("send sse open");
+        assert_eq!(resp.status(), 200, "SSE open failed: {}", resp.status());
+        SseStream {
+            body: resp,
+            buf: String::new(),
+        }
+    }
+
+    /// POST a JSON body to a path, adding `Authorization: Bearer <token>`.
+    /// Used by v2 channel publish tests where JWT is required.
+    pub async fn post_json_bearer(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        token: &str,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}{}", self.base, path))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send")
     }
 }
 
