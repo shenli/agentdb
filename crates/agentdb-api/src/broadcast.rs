@@ -9,7 +9,7 @@
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::broadcast_bus::{validate_channel_name, BroadcastEnvelope, ChannelKey};
 use crate::error::{ApiError, ErrorCode};
+use crate::jwt::AgentDbClaims;
 use crate::AppState;
 
 /// 16 KiB cap on broadcast bodies (spec § 5.5).
@@ -30,6 +31,32 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Channels-claim authorization check shared by v1 and v2 channel
+/// handlers. v1 callers pass `Some(claims)` only when JWT is
+/// configured for the tenant — `None` means "no enforcement, pass
+/// through" (Basic-auth fallback still applies). v2 callers always
+/// pass `Some(claims)` because v2 requires JWT; the `None` arg
+/// shape is preserved for v1 compatibility.
+///
+/// `claims_with_no_channels` policy: deny. A JWT lacking a
+/// `channels` claim does not grant access to any channel.
+fn check_channel_claim(
+    claims: Option<&AgentDbClaims>,
+    channel: &str,
+) -> Result<(), axum::response::Response> {
+    let Some(c) = claims else { return Ok(()); };
+    let allowed = c.channels.as_ref().map(|ch| ch.allows(channel)).unwrap_or(false);
+    if !allowed {
+        return Err(ApiError::Coded(
+            StatusCode::FORBIDDEN,
+            ErrorCode::ChannelNotInJwt,
+            format!("jwt channels claim does not allow channel {channel}"),
+        )
+        .into_response());
+    }
+    Ok(())
 }
 
 /// `POST /api/tenants/:tenant_id/channels/:channel/publish` (v1).
@@ -52,49 +79,6 @@ pub async fn publish(
         .into_response();
     }
 
-    // JWT enforcement (only when tenant has JWT config).
-    // `?access_token=` query support is reserved for the SSE GET in
-    // Task 5; publish is header-only because senders aren't browsers
-    // hitting EventSource.
-    let claims = match crate::subscribe_auth::extract_subscribe_jwt(
-        &state, &headers, None, &tenant,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    if let Some(c) = &claims {
-        let allowed = c
-            .channels
-            .as_ref()
-            .map(|ch| ch.allows(&channel))
-            .unwrap_or(false);
-        if !allowed {
-            return ApiError::Coded(
-                StatusCode::FORBIDDEN,
-                ErrorCode::ChannelNotInJwt,
-                format!("jwt channels claim does not allow channel {channel}"),
-            )
-            .into_response();
-        }
-    }
-
-    publish_inner(state, tenant, channel, headers, body, claims).await
-}
-
-/// Shared publish body: body-size cap, JSON parse, enqueue + 204.
-/// `claims` is `Some` when auth was enforced (JWT path); `None` when
-/// the tenant has no JWT config and Basic auth handled the outer
-/// middleware.
-async fn publish_inner(
-    state: AppState,
-    tenant: String,
-    channel: String,
-    _headers: HeaderMap,
-    body: axum::body::Bytes,
-    claims: Option<crate::jwt::AgentDbClaims>,
-) -> Response {
     if body.len() > MAX_BODY_BYTES {
         // TODO(Task 14): mint a dedicated `BodyTooLarge` ErrorCode +
         // runbook. `InvalidRequest` is the closest existing variant
@@ -107,6 +91,37 @@ async fn publish_inner(
         .into_response();
     }
 
+    // JWT enforcement (only when tenant has JWT config).
+    // `?access_token=` query support is reserved for the SSE GET in
+    // Task 5; publish is header-only because senders aren't browsers
+    // hitting EventSource.
+    let claims = match crate::subscribe_auth::extract_subscribe_jwt(
+        &state, &headers, None, &tenant,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(resp) = check_channel_claim(claims.as_ref(), &channel) {
+        return resp;
+    }
+
+    publish_inner(state, tenant, channel, headers, body, claims).await
+}
+
+/// Shared publish body: JSON parse, enqueue + 204.
+/// `claims` is `Some` when auth was enforced (JWT path); `None` when
+/// the tenant has no JWT config and Basic auth handled the outer
+/// middleware.
+async fn publish_inner(
+    state: AppState,
+    tenant: String,
+    channel: String,
+    _headers: HeaderMap,
+    body: axum::body::Bytes,
+    claims: Option<crate::jwt::AgentDbClaims>,
+) -> Response {
     // Parse body as JSON. Empty body is accepted as JSON `null`
     // would be — but reqwest's `.json(&{})` always sends `{}`, and
     // a missing body is a malformed broadcast either way.
@@ -197,20 +212,8 @@ pub async fn subscribe_channel(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    if let Some(c) = &claims {
-        let allowed = c
-            .channels
-            .as_ref()
-            .map(|ch| ch.allows(&channel))
-            .unwrap_or(false);
-        if !allowed {
-            return ApiError::Coded(
-                StatusCode::FORBIDDEN,
-                ErrorCode::ChannelNotInJwt,
-                format!("jwt channels claim does not allow channel {channel}"),
-            )
-            .into_response();
-        }
+    if let Err(resp) = check_channel_claim(claims.as_ref(), &channel) {
+        return resp;
     }
 
     subscribe_channel_inner(state, tenant, channel, q, headers, claims).await
@@ -306,6 +309,19 @@ pub async fn publish_keyed(
         )
         .into_response();
     }
+
+    if body.len() > MAX_BODY_BYTES {
+        // TODO(Task 14): mint a dedicated `BodyTooLarge` ErrorCode +
+        // runbook. `InvalidRequest` is the closest existing variant
+        // while we're still in Phase 2 plumbing.
+        return ApiError::Coded(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::InvalidRequest,
+            format!("body exceeds {MAX_BODY_BYTES} bytes"),
+        )
+        .into_response();
+    }
+
     let claims = match crate::subscribe_auth::extract_subscribe_jwt_no_tenant(
         &state, &headers, None,
     )
@@ -314,23 +330,11 @@ pub async fn publish_keyed(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    if let Some(ch_claim) = &claims.channels {
-        if !ch_claim.allows(&channel) {
-            return ApiError::Coded(
-                StatusCode::FORBIDDEN,
-                ErrorCode::ChannelNotInJwt,
-                format!("jwt channels claim does not allow channel {channel}"),
-            )
-            .into_response();
-        }
-    } else {
-        // No channels claim — deny all channels.
-        return ApiError::Coded(
-            StatusCode::FORBIDDEN,
-            ErrorCode::ChannelNotInJwt,
-            format!("jwt channels claim does not allow channel {channel}"),
-        )
-        .into_response();
+    // v2 policy: a JWT without a `channels` claim grants no channel
+    // access. v1 falls through here (Basic-auth fallback can still
+    // authorize), but v2 has no fallback — JWT is the only auth.
+    if let Err(resp) = check_channel_claim(Some(&claims), &channel) {
+        return resp;
     }
     let tenant = claims.tenant.clone();
     publish_inner(state, tenant, channel, headers, body, Some(claims)).await
@@ -345,9 +349,18 @@ pub async fn publish_keyed(
 pub async fn subscribe_channel_keyed(
     State(state): State<AppState>,
     Path(channel): Path<String>,
-    Query(q): Query<SubscribeChannelQuery>,
+    axum_extra::extract::Query(q): axum_extra::extract::Query<SubscribeChannelQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if !validate_channel_name(&channel) {
+        return ApiError::Coded(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::ChannelNameInvalid,
+            "channel name fails validation".into(),
+        )
+        .into_response();
+    }
+
     let claims = match crate::subscribe_auth::extract_subscribe_jwt_no_tenant(
         &state,
         &headers,
@@ -358,23 +371,11 @@ pub async fn subscribe_channel_keyed(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
-    if let Some(ch_claim) = &claims.channels {
-        if !ch_claim.allows(&channel) {
-            return ApiError::Coded(
-                StatusCode::FORBIDDEN,
-                ErrorCode::ChannelNotInJwt,
-                format!("jwt channels claim does not allow channel {channel}"),
-            )
-            .into_response();
-        }
-    } else {
-        // No channels claim — deny all channels.
-        return ApiError::Coded(
-            StatusCode::FORBIDDEN,
-            ErrorCode::ChannelNotInJwt,
-            format!("jwt channels claim does not allow channel {channel}"),
-        )
-        .into_response();
+    // v2 policy: a JWT without a `channels` claim grants no channel
+    // access. v1 falls through here (Basic-auth fallback can still
+    // authorize), but v2 has no fallback — JWT is the only auth.
+    if let Err(resp) = check_channel_claim(Some(&claims), &channel) {
+        return resp;
     }
     let tenant = claims.tenant.clone();
     subscribe_channel_inner(state, tenant, channel, q, headers, Some(claims)).await
