@@ -36,15 +36,40 @@ decision notes that produced this design, see:
 
 ## 1. Identity model
 
-### 1.1 Tenant — logical boundary, dual identity mechanisms
+### 1.1 Tenant — logical boundary, auth-derived identity
 
-A tenant is a logical boundary for quota, isolation, and billing. Tenant identity is established at request time by one of two mechanisms:
+A tenant is a logical boundary for quota, isolation, and billing.
+Tenant identity is established at request time by the bearer token's
+claim — never by URL, body, or header.
 
-- **Auth-derived (M26 v2 contract, recommended):** the bearer token's claim is the canonical tenant. Endpoints like `POST /api/sessions/{s}/append_and_fetch` carry no tenant in the path; the server resolves it from auth (cross-checked against the session locator). Tenant identity is not present in request payloads.
-- **Path-carried (legacy / pre-M26 sessions):** `POST /api/tenants/{t}/sessions/{s}/append_and_fetch` accepts an explicit tenant in the URL. The auth middleware verifies the path tenant matches the bearer token (mismatch → 403).
-- **Mongo wire:** SCRAM-authenticated user maps 1:1 to a tenant. The Mongo `$db` field is a sub-namespace *inside* the tenant, not the tenant selector itself.
+- **REST sessions/subscribe routes (Basic auth).** Endpoints carry
+  no tenant in the path: `POST /api/sessions/{s}/append_and_fetch`,
+  `POST /api/sessions/{s}/fetch_recent`, `GET /api/sessions/{s}/subscribe`,
+  `GET /api/subscribe`. The Basic-auth middleware injects `AuthedTenant`
+  into request extensions; handlers cross-check against the session
+  locator to ensure a user can't act on another tenant's session.
+- **REST channel routes (JWT).** `POST /api/channels/{c}/publish`,
+  `GET /api/channels/{c}/subscribe`. Tenant is the JWT claim's `tenant`
+  field — `verify_jwt` decodes the token first to read the claim, then
+  verifies the signature against the resolved per-tenant config.
+  Browser SSE clients pass the JWT via `?access_token=`.
+- **Mongo wire.** SCRAM-authenticated user maps 1:1 to a tenant.
+  The Mongo `$db` field is a sub-namespace inside the tenant.
+- **Admin plane.** `/api/admin/...` routes are tenant-explicit by
+  necessity — operator commands like "set tenant-quota for tenant-foo"
+  name tenants directly. Admin routes use a separate bearer-token
+  middleware.
 
-Tenant identity is **not** present in request payloads — only in the URL (legacy) or derived from auth (v2). Internal code paths thread `tenant_id` for quota attribution, isolation checks, and billing accounting.
+Tenant identity is **not** present in user-facing request payloads
+or URLs. Internal code paths thread `tenant_id` for quota
+attribution, isolation checks, and billing.
+
+> **Legacy v1 surface (`/api/tenants/{t}/...`).** The v1 user
+> routes are still registered (some infrastructure tests use
+> `auth: None` setups that don't fit the v2 auth-required pattern),
+> but their handlers are `#[deprecated]` and should not appear in
+> SDK code or new application examples. v1 deletion is tracked
+> as M28.
 
 ### 1.2 Session — the core data unit
 
@@ -444,8 +469,8 @@ directly, with two complementary primitives.
 
 ### 6.1 Durable, replayable session-event stream
 
-`GET /api/tenants/{t}/subscribe` and
-`GET /api/tenants/{t}/sessions/{s}/subscribe` open a
+`GET /api/subscribe` and
+`GET /api/sessions/{s}/subscribe` open a
 long-lived **Server-Sent Events** stream. Each SSE message
 carries one event envelope: `{tenant, session, seq, ts_ms,
 payload, kind?, actor_id?}`. The stream is **gap-free**: every
@@ -506,10 +531,10 @@ Writing those into the durable event log inflates storage,
 forces compaction, and pollutes session retrieval with noise.
 A separate **ephemeral** primitive serves them:
 
-- `POST /api/tenants/{t}/channels/{c}/publish` — fire-and-
+- `POST /api/channels/{c}/publish` — fire-and-
   forget. Any JSON payload. Returns 204 on success; nothing
   is stored.
-- `GET /api/tenants/{t}/channels/{c}/subscribe` — SSE stream
+- `GET /api/channels/{c}/subscribe` — SSE stream
   of broadcasts on that channel. No replay (there's nothing
   to replay), no `from_seq`, no durability.
 
@@ -599,11 +624,26 @@ Primitives (each a single call):
 - `broadcast` + `subscribe_channel` — ephemeral pub/sub for transient signals (typing, cursors, presence pings); see §6.2.
 - `admin/*` — tier transitions, metrics, HLC inspection, webhook configuration.
 
+REST URL shapes (v2, canonical):
+
+- `POST /api/sessions/{s}/append_and_fetch`
+- `POST /api/sessions/{s}/fetch_recent`
+- `GET  /api/sessions/{s}/subscribe`
+- `GET  /api/subscribe`
+- `POST /api/channels/{c}/publish`
+- `GET  /api/channels/{c}/subscribe`
+- `POST /api/sessions/{s}/fork`
+- `GET  /api/admin/...`
+
 Request conventions:
 
-- Tenant is **never** in the request body.
-- Authorization header carries the tenant-bound token.
+- Tenant is **never** in the request path or body — always derived from auth.
+- Authorization header carries the tenant-bound token (Basic for session/subscribe routes; Bearer JWT for channel routes).
 - `X-AgentDB-HLC` header carries the caller's HLC for causal-consistency propagation (mirroring Mongo `$clusterTime`).
+
+> **Legacy v1 note.** The v1 `/api/tenants/{t}/...` route shapes are still
+> registered as deprecated aliases. New SDKs and application examples must
+> use the v2 shapes above. v1 deletion is tracked as M28.
 
 ### 7.2 Mongo wire (short-term adoption)
 

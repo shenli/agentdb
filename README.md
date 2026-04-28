@@ -124,8 +124,8 @@ the REST surface without reading further. Open
 ```python
 from agentdb import Client
 
-client = Client("http://127.0.0.1:7878")
-session = client.session("agent-1", tenant="demo")
+client = Client("http://127.0.0.1:7878", user="alice", password="hunter2")
+session = client.session("agent-1")
 result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print("seq:", result.seq, [(e.seq, e.payload) for e in result.recent])
 ```
@@ -136,8 +136,9 @@ that are async-first:
 ```python
 from agentdb import AsyncClient
 
-async with AsyncClient("http://127.0.0.1:7878") as client:
-    session = client.session("agent-1", tenant="demo")
+async with AsyncClient("http://127.0.0.1:7878",
+                       user="alice", password="hunter2") as client:
+    session = client.session("agent-1")
     result = await session.append({"role": "user", "text": "hello"},
                                   fetch_last_n=5)
 ```
@@ -148,7 +149,7 @@ async with AsyncClient("http://127.0.0.1:7878") as client:
 import { Client } from "agentdb";
 
 const client = new Client("http://127.0.0.1:7878");
-const session = client.session("agent-1", { tenant: "demo" });
+const session = client.session("agent-1");
 const result = await session.append(
   { role: "user", text: "hello" },
   { fetchLastN: 5 }
@@ -162,7 +163,7 @@ console.log("seq:", result.seq, result.recent.map((e) => e.payload));
 import "github.com/shenli/agentdb/clients/go/agentdb"
 
 client := agentdb.New("http://127.0.0.1:7878",
-    agentdb.WithDefaultTenant("demo"))
+    agentdb.WithBasicAuth("alice", "hunter2"))
 sess := client.Session("agent-1")
 res, _ := sess.Append(ctx,
     map[string]any{"role": "user", "text": "hello"},
@@ -267,8 +268,13 @@ See [`docs/S3.md`](docs/S3.md) for the full MinIO / S3 recipe.
 ### REST (native)
 
 ```
-POST /api/tenants/{tenant}/sessions/{session}/append_and_fetch
+POST /api/sessions/{session}/append_and_fetch
+POST /api/sessions/{session}/fetch_recent
 POST /api/sessions/{session}/fork
+POST /api/channels/{channel}/publish
+GET  /api/channels/{channel}/subscribe
+GET  /api/sessions/{session}/subscribe    # durable per-session SSE
+GET  /api/subscribe                       # durable tenant-wide SSE
 POST /api/admin/tier/force                # target: "warm"|"cold"|"archive"
 POST /api/admin/boxes/:id/inject_fault
 POST /api/admin/boxes/:id/quota           # max_qps, max_tenant_qps, burst, max_warm_sessions
@@ -278,6 +284,10 @@ GET  /api/admin/boxes/:id
 GET  /api/admin/sessions/:session_id?tenant_id=...
 GET  /api/stream                          # SSE live event feed
 ```
+
+> **Legacy v1 note.** The `/api/tenants/{tenant}/...` route family is still
+> registered as deprecated aliases for backward compatibility. New code must
+> use the v2 shapes above. v1 deletion is planned for M28.
 
 ### MongoDB wire protocol (OP_MSG subset)
 
@@ -323,13 +333,13 @@ Server-Sent Events stream of events appended to a session, with
 auth.
 
 ```
-GET /api/tenants/{tenant}/sessions/{session}/subscribe
+GET /api/sessions/{session}/subscribe
        ?from_seq=<u64>            # optional; default = "live tail only"
        &kind=<string>             # optional; repeatable kind filter (OR'd)
        &heartbeat_secs=<u64>      # optional; SSE keepalive interval (default 20)
        &access_token=<jwt>        # browsers using EventSource
 
-GET /api/tenants/{tenant}/subscribe
+GET /api/subscribe
        ?session=<id>              # optional; repeatable session whitelist
        &kind=<kind>               # optional; repeatable kind filter
        &from_seq_per_session=s-1:42,s-2:7   # optional; per-session catch-up
@@ -344,7 +354,6 @@ reconnect so `jwt_expired` is recovered transparently):
 import { Client } from "agentdb";
 
 const client = new Client("https://agentdb.example.com", {
-  tenant: "t-1",
   getToken: async () => await myAuth.getJwt(),
 });
 const session = client.session("s-1");
@@ -361,7 +370,7 @@ for await (const event of session.subscribe({ fromSeq: lastSeen })) {
 ```python
 from agentdb import Client
 
-client = Client("http://127.0.0.1:7878", tenant="t-1")
+client = Client("http://127.0.0.1:7878", user="alice", password="hunter2")
 session = client.session("s-1")
 for event in session.subscribe(from_seq=42):
     handle(event)
@@ -373,7 +382,7 @@ for event in session.subscribe(from_seq=42):
 import "github.com/shenli/agentdb/clients/go/agentdb"
 
 client := agentdb.New("http://127.0.0.1:7878",
-    agentdb.WithDefaultTenant("t-1"))
+    agentdb.WithBasicAuth("alice", "hunter2"))
 sess := client.Session("s-1")
 events, errs := sess.Subscribe(ctx, agentdb.SessionSubscribeOptions{})
 for evt := range events {
@@ -424,8 +433,8 @@ pings) that should NOT be persisted in the session log, use the broadcast
 endpoints:
 
 ```
-POST /api/tenants/{tenant}/channels/{channel}/publish
-GET  /api/tenants/{tenant}/channels/{channel}/subscribe
+POST /api/channels/{channel}/publish
+GET  /api/channels/{channel}/subscribe
 ```
 
 Tenant-scoped channels, in-memory fan-out. No durability, no replay — slow
@@ -441,7 +450,9 @@ claim (alongside `sessions`):
 ```ts
 import { Client } from "agentdb";
 
-const client = new Client("https://agentdb.example.com", { tenant: "t-1" });
+const client = new Client("https://agentdb.example.com", {
+  getToken: async () => await myAuth.getJwt(),
+});
 
 await client.broadcast({ channel: "room:42", payload: { kind: "typing" } });
 for await (const msg of client.subscribeChannel({ channel: "room:42" })) {
@@ -452,7 +463,7 @@ for await (const msg of client.subscribeChannel({ channel: "room:42" })) {
 ```python
 from agentdb import Client
 
-client = Client("http://127.0.0.1:7878", tenant="t-1")
+client = Client("http://127.0.0.1:7878", bearer_token=my_jwt)
 
 client.broadcast(channel="room:42", payload={"kind": "typing"})
 for msg in client.subscribe_channel(channel="room:42"):
@@ -463,7 +474,7 @@ for msg in client.subscribe_channel(channel="room:42"):
 import "github.com/shenli/agentdb/clients/go/agentdb"
 
 client := agentdb.New("http://127.0.0.1:7878",
-    agentdb.WithDefaultTenant("t-1"))
+    agentdb.WithBearerToken(myJwt))
 
 _ = client.Broadcast(ctx, "room:42", payload)
 msgs, errs := client.SubscribeChannel(ctx, "room:42")
