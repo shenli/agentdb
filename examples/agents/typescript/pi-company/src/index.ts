@@ -5,35 +5,64 @@ import { CompanyTUI } from "./tui.ts";
 import { startAgentDBServer } from "./server.ts";
 import { launchScenario, runScenario } from "./scenarios/launch.ts";
 import { assertApiKeyAvailable } from "./llm.ts";
+import { DEFAULT_BUDGETS, type Budgets } from "./ceo.ts";
 
 const TENANT = "pi-company";
 
 interface ParsedArgs {
   scenario?: string;
   resumeRunId?: string;
+  goal?: string;
+  budgets: Budgets;
 }
 
-/**
- * Minimal flag parser. Only supports `--scenario=NAME` and `--resume=ID`
- * (KEY=VALUE form). Plain space-separated `--scenario NAME` is rejected
- * with a clear error so the user doesn't silently get an undefined arg.
- */
+function parseFlag(a: string, prefix: string): string | undefined {
+  return a.startsWith(prefix) ? a.slice(prefix.length) : undefined;
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
-  const out: ParsedArgs = {};
+  const out: ParsedArgs = { budgets: { ...DEFAULT_BUDGETS } };
   for (const a of argv) {
-    if (a.startsWith("--scenario=")) {
-      out.scenario = a.split("=")[1];
+    let v: string | undefined;
+    if ((v = parseFlag(a, "--scenario=")) !== undefined) {
+      out.scenario = v;
     } else if (a === "--scenario") {
       throw new Error("Use --scenario=NAME (e.g., --scenario=launch)");
-    } else if (a.startsWith("--resume=")) {
-      out.resumeRunId = a.split("=")[1];
+    } else if ((v = parseFlag(a, "--resume=")) !== undefined) {
+      out.resumeRunId = v;
+    } else if ((v = parseFlag(a, "--goal=")) !== undefined) {
+      out.goal = v;
+    } else if (a === "--goal") {
+      throw new Error("Use --goal=\"<text>\" (KEY=VALUE form)");
+    } else if ((v = parseFlag(a, "--max-revisions=")) !== undefined) {
+      out.budgets.maxRevisions = parseIntOrThrow(v, "--max-revisions");
+    } else if ((v = parseFlag(a, "--max-minutes=")) !== undefined) {
+      out.budgets.maxMinutes = parseFloatOrThrow(v, "--max-minutes");
+    } else if ((v = parseFlag(a, "--max-llm-calls=")) !== undefined) {
+      out.budgets.maxLlmCalls = parseIntOrThrow(v, "--max-llm-calls");
+    } else if ((v = parseFlag(a, "--step-timeout=")) !== undefined) {
+      out.budgets.stepTimeoutSec = parseFloatOrThrow(v, "--step-timeout");
     }
+  }
+  if (out.goal && out.scenario) {
+    throw new Error("--goal and --scenario are mutually exclusive");
   }
   return out;
 }
 
+function parseIntOrThrow(v: string, flag: string): number {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive integer (got '${v}')`);
+  return n;
+}
+
+function parseFloatOrThrow(v: string, flag: string): number {
+  const n = Number.parseFloat(v);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive number (got '${v}')`);
+  return n;
+}
+
 async function main(): Promise<void> {
-  // Fail fast if no API key — before spawning cargo.
   assertApiKeyAvailable();
 
   const args = parseArgs(process.argv.slice(2));
@@ -41,22 +70,30 @@ async function main(): Promise<void> {
   const run = { tenant: TENANT, runId };
 
   console.log(`pi-company starting (run-id: ${runId})...`);
-
   const server = await startAgentDBServer();
   console.log(`AgentDB ready at ${server.baseUrl}`);
-
   const client = new Client(server.baseUrl, { tenant: TENANT });
   const orchestrator = new Orchestrator(client, run);
+
+  if (args.goal) {
+    console.log(`Autonomous mode (goal: ${args.goal.slice(0, 80)})...`);
+    try {
+      await orchestrator.startAutonomous(args.goal, args.budgets);
+    } finally {
+      await orchestrator.stop("autonomous_complete");
+    }
+    server.shutdown();
+    process.exit(0);
+  }
+
   await orchestrator.startCompany();
   console.log("All 5 agents joined.");
-
   const channels = new Channels(client, run);
 
   if (args.scenario === "launch") {
     console.log(`Running scripted scenario 'launch' (run-id: ${runId})...`);
     try {
       await runScenario(launchScenario, channels, client, TENANT);
-      // Give agents a few seconds to drain after the last directive.
       console.log("Scenario complete. Draining for 20s...");
       await new Promise((r) => setTimeout(r, 20_000));
     } finally {
@@ -69,7 +106,6 @@ async function main(): Promise<void> {
     server.shutdown();
     process.exit(2);
   } else {
-    // Interactive mode: TUI prompt drives CEO directives.
     const tui = new CompanyTUI({
       channels,
       onCeoInput: async (text: string) => {
@@ -77,8 +113,6 @@ async function main(): Promise<void> {
       },
     });
     await tui.start();
-    // tui.start() returns once subscriptions are wired up; wait() blocks
-    // until the channel loops settle (i.e. process is shutting down).
     await tui.wait();
     await orchestrator.stop("user_quit");
     server.shutdown();
