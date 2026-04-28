@@ -3,12 +3,16 @@ import { addProspect } from "./add_prospect.ts";
 import { announce } from "./announce.ts";
 import { delegateToEngineer } from "./delegate_to_engineer.ts";
 import { directMessage } from "./direct_message.ts";
+import { dispatchStep } from "./dispatch_step.ts";
 import { draftCampaign } from "./draft_campaign.ts";
 import { draftOutreach } from "./draft_outreach.ts";
 import { hireContractor } from "./hire_contractor.ts";
+import { markStep } from "./mark_step.ts";
 import { reportToCeo } from "./report_to_ceo.ts";
 import { submitForReview } from "./submit_for_review.ts";
 import { updateAgentConfig } from "./update_agent_config.ts";
+import { updatePlan } from "./update_plan.ts";
+import { wrapUp } from "./wrap_up.ts";
 import { writeDoc } from "./write_doc.ts";
 
 /**
@@ -23,12 +27,16 @@ export const ALL_TOOLS: Record<string, CompanyTool> = {
   announce,
   delegate_to_engineer: delegateToEngineer,
   direct_message: directMessage,
+  dispatch_step: dispatchStep,
   draft_campaign: draftCampaign,
   draft_outreach: draftOutreach,
   hire_contractor: hireContractor,
+  mark_step: markStep,
   report_to_ceo: reportToCeo,
   submit_for_review: submitForReview,
   update_agent_config: updateAgentConfig,
+  update_plan: updatePlan,
+  wrap_up: wrapUp,
   write_doc: writeDoc,
 };
 
@@ -47,6 +55,20 @@ export const ROLE_TOOLS: Record<string, string[]> = {
   sales: ["add_prospect", "draft_outreach", "report_to_ceo"],
   contractor: ["write_doc", "report_to_ceo"],
 };
+
+/**
+ * Tool list for the autonomous CEO. Includes the four new plan-as-events
+ * tools plus the existing CEO-level tools. Used by `Orchestrator.startAutonomous`.
+ */
+export const CEO_AUTONOMOUS_TOOLS: string[] = [
+  "update_plan",
+  "dispatch_step",
+  "mark_step",
+  "wrap_up",
+  "announce",
+  "direct_message",
+  "update_agent_config",
+];
 
 /**
  * Subset the registry to a known role's tool set. Names absent from
