@@ -230,43 +230,16 @@ pub async fn append_and_fetch_session_keyed(
     // locator. No tenant in the path or body — silent client
     // attempts to spoof tenant get a 403, not a confused
     // routing decision.
-    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
-    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
-    let locator_tenant = match state.registry.meta_store() {
-        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
-            Ok(Some(loc)) => loc.tenant_external_id,
-            Ok(None) => None,
-            Err(e) => {
-                return ApiError::Core(agentdb_core::Error::Invalid {
-                    field: None,
-                    message: format!("session locator lookup failed: {e}"),
-                })
-                .into_response()
-            }
-        },
-        None => None,
-    };
-    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
-        (Some(a), Some(l)) if a != l => {
-            return ApiError::Forbidden(format!(
-                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
-                authed_user.unwrap_or("?")
-            ))
-            .into_response();
-        }
-        (Some(a), _) => a.to_string(),
-        (None, Some(l)) => l.to_string(),
-        (None, None) => {
-            return ApiError::Core(agentdb_core::Error::Invalid {
-                field: Some("tenant".into()),
-                message: format!(
-                    "cannot resolve tenant for session {session}: no Authorization header, \
-                     no session locator. Use /api/tenants/<tid>/sessions/<sid>/append_and_fetch \
-                     for pre-M26 sessions, or enable auth"
-                ),
-            })
-            .into_response()
-        }
+    let tenant = match crate::auth_middleware::resolve_session_tenant(
+        &state,
+        &session,
+        authed.as_deref(),
+        "append_and_fetch",
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     do_append_and_fetch(state, tenant, session, headers, body).await
 }
@@ -352,43 +325,16 @@ pub async fn fetch_recent_session_keyed(
     authed: Option<Extension<AuthedTenant>>,
     body: Bytes,
 ) -> Response {
-    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
-    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
-    let locator_tenant = match state.registry.meta_store() {
-        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
-            Ok(Some(loc)) => loc.tenant_external_id,
-            Ok(None) => None,
-            Err(e) => {
-                return ApiError::Core(agentdb_core::Error::Invalid {
-                    field: None,
-                    message: format!("session locator lookup failed: {e}"),
-                })
-                .into_response()
-            }
-        },
-        None => None,
-    };
-    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
-        (Some(a), Some(l)) if a != l => {
-            return ApiError::Forbidden(format!(
-                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
-                authed_user.unwrap_or("?")
-            ))
-            .into_response();
-        }
-        (Some(a), _) => a.to_string(),
-        (None, Some(l)) => l.to_string(),
-        (None, None) => {
-            return ApiError::Core(agentdb_core::Error::Invalid {
-                field: Some("tenant".into()),
-                message: format!(
-                    "cannot resolve tenant for session {session}: no Authorization header, \
-                     no session locator. Use /api/tenants/<tid>/sessions/<sid>/fetch_recent \
-                     for pre-M26 sessions, or enable auth"
-                ),
-            })
-            .into_response()
-        }
+    let tenant = match crate::auth_middleware::resolve_session_tenant(
+        &state,
+        &session,
+        authed.as_deref(),
+        "fetch_recent",
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     do_fetch_recent(state, tenant, session, headers, body).await
 }

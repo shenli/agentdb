@@ -164,6 +164,64 @@ fn extract_tenant_id(path: &str) -> Option<&str> {
     }
 }
 
+/// Resolves the tenant for a session-keyed v2 route by combining the
+/// auth-derived tenant (when present) and the session locator's
+/// recorded tenant. Used by `append_and_fetch_session_keyed`,
+/// `fetch_recent_session_keyed`, `subscribe_session_keyed`, and
+/// (M27 Task 4) the v2 channel handlers.
+///
+/// `route_hint` is woven into the 400 error message's recovery hint
+/// (e.g., `"append_and_fetch"`, `"fetch_recent"`, `"subscribe"`) so a
+/// developer hitting a pre-M26 session sees a path forward.
+///
+/// Returns `Ok(tenant_external_id)` on success, or `Err(Response)`
+/// on the 400 / 403 / 500 error paths.
+pub async fn resolve_session_tenant(
+    state: &AppState,
+    session: &str,
+    authed: Option<&AuthedTenant>,
+    route_hint: &'static str,
+) -> Result<String, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let authed_tenant = authed.map(|a| a.external_id.as_str());
+    let authed_user = authed.map(|a| a.user_id.as_str());
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), session).await {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return Err(ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response());
+            }
+        },
+        None => None,
+    };
+    match (authed_tenant, locator_tenant.as_deref()) {
+        (Some(a), Some(l)) if a != l => {
+            Err(ApiError::Forbidden(format!(
+                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
+                authed_user.unwrap_or("?")
+            ))
+            .into_response())
+        }
+        (Some(a), _) => Ok(a.to_string()),
+        (None, Some(l)) => Ok(l.to_string()),
+        (None, None) => Err(ApiError::Core(agentdb_core::Error::Invalid {
+            field: Some("tenant".into()),
+            message: format!(
+                "cannot resolve tenant for session {session}: no Authorization header, \
+                 no session locator. Use /api/tenants/<tid>/sessions/<sid>/{route_hint} \
+                 for pre-M26 sessions, or enable auth"
+            ),
+        })
+        .into_response()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

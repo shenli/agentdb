@@ -141,6 +141,12 @@ async fn subscribe_session_inner(
     if let agentdb_core::RouteDecision::Remote { target, .. } =
         state.registry.route_session_for_io(&tenant, &session)
     {
+        // TODO(M27 Task 5): once /api/tenants/{t}/.../subscribe is deleted,
+        // this redirect should target the v2 URL `/api/sessions/{s}/subscribe`.
+        // Both v1 and v2 callers funnel through this inner helper, so we'd
+        // also need to thread the caller's route shape into the inner if we
+        // want path fidelity per call. For now the redirect uses the v1 URL
+        // because v1 still exists for both shapes during the transition.
         let path = format!(
             "/api/tenants/{}/sessions/{}/subscribe",
             tenant, session
@@ -868,9 +874,19 @@ async fn subscribe_tenant_inner(
 }
 
 /// v2: `/api/sessions/{session_id}/subscribe` — auth-derived tenant.
-/// Mirrors `append_and_fetch_session_keyed` (in `handlers.rs`):
-/// resolves tenant from `AuthedTenant` extension, cross-checks
-/// against the session locator, and forwards to the inner helper.
+///
+/// Mirrors `append_and_fetch_session_keyed`'s shape: takes
+/// `Option<Extension<AuthedTenant>>` rather than the non-optional
+/// form so the `(None, Some(locator))` branch in
+/// `resolve_session_tenant` can fall back to the locator's tenant
+/// when the request has no auth header. The tenant-wide v2
+/// counterpart `subscribe_tenant_keyed` uses the non-optional form
+/// because there's no per-session locator to fall back to.
+#[tracing::instrument(
+    name = "rest.subscribe_session_keyed",
+    skip(state, headers, authed),
+    fields(session = %session),
+)]
 pub async fn subscribe_session_keyed(
     State(state): State<AppState>,
     Path(session): Path<String>,
@@ -878,45 +894,16 @@ pub async fn subscribe_session_keyed(
     headers: HeaderMap,
     authed: Option<Extension<AuthedTenant>>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    // Resolve tenant from auth, with locator cross-check.
-    // Mirrors handlers::append_and_fetch_session_keyed (lines ~221–272 of handlers.rs).
-    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
-    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
-    let locator_tenant = match state.registry.meta_store() {
-        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
-            Ok(Some(loc)) => loc.tenant_external_id,
-            Ok(None) => None,
-            Err(e) => {
-                return crate::error::ApiError::Core(agentdb_core::Error::Invalid {
-                    field: None,
-                    message: format!("session locator lookup failed: {e}"),
-                })
-                .into_response();
-            }
-        },
-        None => None,
-    };
-    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
-        (Some(a), Some(l)) if a != l => {
-            return crate::error::ApiError::Forbidden(format!(
-                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
-                authed_user.unwrap_or("?")
-            ))
-            .into_response();
-        }
-        (Some(a), _) => a.to_string(),
-        (None, Some(l)) => l.to_string(),
-        (None, None) => {
-            return crate::error::ApiError::Core(agentdb_core::Error::Invalid {
-                field: Some("tenant".into()),
-                message: format!(
-                    "cannot resolve tenant for session {session}: no Authorization header, no session locator"
-                ),
-            })
-            .into_response();
-        }
+    let tenant = match crate::auth_middleware::resolve_session_tenant(
+        &state,
+        &session,
+        authed.as_deref(),
+        "subscribe",
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     subscribe_session_inner(state, tenant, session, q, headers).await
 }
@@ -924,6 +911,11 @@ pub async fn subscribe_session_keyed(
 /// v2: `/api/subscribe` — auth-derived tenant, no path params.
 /// Tenant is the bearer token's claim; no locator cross-check
 /// needed because the URL doesn't address any specific session.
+#[tracing::instrument(
+    name = "rest.subscribe_tenant_keyed",
+    skip(state, headers, authed),
+    fields(tenant = %authed.external_id),
+)]
 pub async fn subscribe_tenant_keyed(
     State(state): State<AppState>,
     Query(q): Query<TenantSubscribeQuery>,
