@@ -26,8 +26,8 @@ type BroadcastMessage struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// Broadcast publishes an ephemeral message to a tenant-scoped
-// channel. Returns nil on 204; a typed error otherwise.
+// Broadcast publishes an ephemeral message to a channel. Returns
+// nil on 204; a typed error otherwise.
 //
 // No durability, no replay — for transient signals (typing
 // indicators, cursor positions, agent-status pings). If you need
@@ -37,25 +37,16 @@ type BroadcastMessage struct {
 // `payload` is marshalled to JSON and sent as the request body. The
 // server wraps it in a [BroadcastMessage] envelope before fan-out.
 //
-// Tenant is taken from the client's [WithDefaultTenant]. Channels
-// have no auth-derived tenant fallback — the server only mounts
-// tenant-explicit routes — so the client must be configured with
-// one.
+// Tenant is derived server-side from the Bearer JWT supplied via
+// [WithBearerToken] or [WithTokenProvider].
 func (c *Client) Broadcast(ctx context.Context, channel string, payload any) error {
-	if c.tenant == "" {
-		return errors.New(
-			"agentdb: tenant must be set on the client for broadcast " +
-				"(use WithDefaultTenant; channels have no auth-derived " +
-				"tenant fallback)",
-		)
-	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("agentdb: marshal broadcast payload: %w", err)
 	}
 	endpoint := fmt.Sprintf(
-		"%s/api/tenants/%s/channels/%s/publish",
-		c.baseURL, url.PathEscape(c.tenant), url.PathEscape(channel),
+		"%s/api/channels/%s/publish",
+		c.baseURL, url.PathEscape(channel),
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -77,16 +68,15 @@ func (c *Client) Broadcast(ctx context.Context, channel string, payload any) err
 	return errorFromResponse(resp.StatusCode, raw, decodeJSONOrEmpty(raw))
 }
 
-// SubscribeChannel opens an SSE subscription to a tenant-scoped
-// channel. Returns a receive-only channel of [BroadcastMessage]
-// (closed when the stream ends) and a buffered error channel sized
-// 1 (receives at most one terminal error before closing).
+// SubscribeChannel opens an SSE subscription to a channel. Returns a
+// receive-only channel of [BroadcastMessage] (closed when the stream
+// ends) and a buffered error channel sized 1 (receives at most one
+// terminal error before closing).
 //
-// Phase 2 semantics: ephemeral, no replay, no JWT auto-reconnect on
-// expiry. A `jwt_expired` close flows out as a [SubscriptionClosed]
-// error; the caller decides whether to reconnect. Callers that need
-// durability or transparent JWT rotation use [Session.Subscribe] on
-// a session.
+// Ephemeral, no replay, no JWT auto-reconnect on expiry. A
+// `jwt_expired` close flows out as a [SubscriptionClosed] error; the
+// caller decides whether to reconnect. Callers that need durability
+// or transparent JWT rotation use [Session.Subscribe] on a session.
 //
 // `ctx` controls cancellation: cancel it to tear the stream down.
 func (c *Client) SubscribeChannel(ctx context.Context, channel string) (<-chan BroadcastMessage, <-chan error) {
@@ -95,17 +85,9 @@ func (c *Client) SubscribeChannel(ctx context.Context, channel string) (<-chan B
 	go func() {
 		defer close(msgs)
 		defer close(errs)
-		if c.tenant == "" {
-			errs <- errors.New(
-				"agentdb: tenant must be set on the client for SubscribeChannel " +
-					"(use WithDefaultTenant; channels have no auth-derived " +
-					"tenant fallback)",
-			)
-			return
-		}
 		endpoint := fmt.Sprintf(
-			"%s/api/tenants/%s/channels/%s/subscribe",
-			c.baseURL, url.PathEscape(c.tenant), url.PathEscape(channel),
+			"%s/api/channels/%s/subscribe",
+			c.baseURL, url.PathEscape(channel),
 		)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {

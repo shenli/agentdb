@@ -1,5 +1,6 @@
 // End-to-end smoke test for the Go SDK. Spawns
-// `agentdb serve --dev` as a subprocess on an ephemeral port,
+// `agentdb serve --dev` as a subprocess on an ephemeral port with
+// AGENTDB_REQUIRE_AUTH=true, creates a test user via the admin API,
 // waits for /health/ready, and exercises the SDK against it.
 //
 // Run with:
@@ -10,9 +11,14 @@
 package agentdb
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +26,12 @@ import (
 	"strconv"
 	"testing"
 	"time"
+)
+
+const (
+	smokeUser     = "go-smoke-user"
+	smokePassword = "go-smoke-pass-123"
+	smokeTenant   = "go-smoke-tenant"
 )
 
 func freePort(t *testing.T) int {
@@ -33,7 +45,8 @@ func freePort(t *testing.T) int {
 }
 
 // repoRoot walks up from this test file to the repo root.
-//   clients/go/agentdb/smoke_test.go → 3 levels up
+//
+//	clients/go/agentdb/smoke_test.go → 3 levels up
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -43,9 +56,10 @@ func repoRoot(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "..")
 }
 
-// startServer spawns `agentdb serve --dev` on free ports and
-// returns the base URL once /health/ready returns 200. The
-// returned cleanup func kills the process and waits for exit.
+// startServer spawns `agentdb serve --dev` with AGENTDB_REQUIRE_AUTH=true
+// on free ports, creates a test user via the admin API, and returns the base
+// URL once /health/ready returns 200. The returned cleanup func kills the
+// process and waits for exit.
 func startServer(t *testing.T) (baseURL string, cleanup func()) {
 	t.Helper()
 	root := repoRoot(t)
@@ -60,18 +74,22 @@ func startServer(t *testing.T) (baseURL string, cleanup func()) {
 		"--addr", "127.0.0.1:"+strconv.Itoa(rest),
 		"--mongo-addr", "127.0.0.1:"+strconv.Itoa(mongo),
 	)
-	cmd.Env = append(os.Environ(), "RUST_LOG=warn")
+	cmd.Env = append(os.Environ(),
+		"RUST_LOG=warn",
+		"AGENTDB_REQUIRE_AUTH=true",
+	)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
 	baseURL = "http://127.0.0.1:" + strconv.Itoa(rest)
 
-	client := New(baseURL)
+	// Wait for /health/ready — no auth needed for this endpoint.
+	healthClient := New(baseURL)
 	deadline := time.Now().Add(15 * time.Second)
 	ready := false
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		err := client.HealthReady(ctx)
+		err := healthClient.HealthReady(ctx)
 		cancel()
 		if err == nil {
 			ready = true
@@ -88,6 +106,13 @@ func startServer(t *testing.T) (baseURL string, cleanup func()) {
 		t.Fatalf("server didn't become ready within 15s")
 	}
 
+	// Create a test user via the admin API. No admin auth in dev mode.
+	if err := createSmokeUser(baseURL); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		t.Fatalf("create smoke user: %v", err)
+	}
+
 	cleanup = func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
@@ -95,10 +120,35 @@ func startServer(t *testing.T) (baseURL string, cleanup func()) {
 	return baseURL, cleanup
 }
 
+// createSmokeUser POSTs to /api/admin/users to register the smoke-test
+// credentials. 201 (created) and 409 (already exists) are both treated as
+// success so tests are repeatable against a persistent dev instance.
+func createSmokeUser(baseURL string) error {
+	body, _ := json.Marshal(map[string]string{
+		"user_id":          smokeUser,
+		"tenant_external":  smokeTenant,
+		"password":         smokePassword,
+	})
+	resp, err := http.Post(
+		baseURL+"/api/admin/users",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fmt.Errorf("POST admin/users: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusConflict {
+		return nil
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("POST admin/users: HTTP %d: %s", resp.StatusCode, raw)
+}
+
 func TestAppendRoundTrips(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
-	client := New(base, WithDefaultTenant("demo"))
+	client := New(base, WithBasicAuth(smokeUser, smokePassword))
 	sess := client.Session("agent-smoke-1")
 
 	res, err := sess.Append(context.Background(),
@@ -119,7 +169,7 @@ func TestAppendRoundTrips(t *testing.T) {
 func TestMultipleAppendsAccumulateInOrder(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
-	client := New(base, WithDefaultTenant("demo"))
+	client := New(base, WithBasicAuth(smokeUser, smokePassword))
 	sess := client.Session("agent-smoke-2")
 
 	ctx := context.Background()
@@ -141,7 +191,7 @@ func TestMultipleAppendsAccumulateInOrder(t *testing.T) {
 func TestForkCreatesAChildThatInheritsParentEvents(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
-	client := New(base, WithDefaultTenant("demo"))
+	client := New(base, WithBasicAuth(smokeUser, smokePassword))
 	parent := client.Session("agent-smoke-fork-parent")
 	ctx := context.Background()
 
@@ -164,22 +214,6 @@ func TestForkCreatesAChildThatInheritsParentEvents(t *testing.T) {
 	}
 	if got := len(res.Recent); got < 1 {
 		t.Errorf("expected child to see events; got %d", got)
-	}
-}
-
-func TestSessionWithoutTenantOrAuthErrorsBeforeRequest(t *testing.T) {
-	base, stop := startServer(t)
-	defer stop()
-	// No tenant on client, no auth — Append must refuse to
-	// construct a path rather than send a 4xx-bound request.
-	client := New(base)
-	sess := client.Session("agent-smoke-3")
-	_, err := sess.Append(context.Background(), map[string]any{"x": 1})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !contains(err.Error(), "tenant") {
-		t.Errorf("error should mention tenant, got: %v", err)
 	}
 }
 

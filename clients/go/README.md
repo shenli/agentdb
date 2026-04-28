@@ -26,37 +26,39 @@ package main
 import (
     "context"
     "fmt"
+    "log"
 
     "github.com/shenli/agentdb/clients/go/agentdb"
 )
 
 func main() {
     client := agentdb.New("http://127.0.0.1:7878",
-        agentdb.WithDefaultTenant("demo"))
+        agentdb.WithBasicAuth("alice", "hunter2"))
+
     sess := client.Session("agent-1")
     res, err := sess.Append(context.Background(),
         map[string]any{"role": "user", "text": "hello"},
         agentdb.AppendOptions{FetchLastN: 5},
     )
     if err != nil {
-        panic(err)
+        log.Fatal(err)
     }
     fmt.Println("seq:", res.Seq, "recent:", len(res.Recent))
 }
 ```
 
-## Auth mode
+Tenant is derived server-side from the Basic-auth user's record —
+there is no client-side tenant argument.
 
-When the server is started with `AGENTDB_REQUIRE_AUTH=true`,
-supply credentials at construction. Tenant comes from
-credentials — no need to pass it explicitly.
+## Auth model
 
-```go
-client := agentdb.New("https://prod.example.com",
-    agentdb.WithBasicAuth("alice", "hunter2"))
-sess := client.Session("agent-1")  // tenant auth-derived
-sess.Append(ctx, map[string]any{"role": "tool", "text": "did a thing"})
-```
+| Route type | Auth option |
+|---|---|
+| Session / subscribe | `WithBasicAuth(user, password)` |
+| Channel (broadcast / subscribe) | `WithBearerToken(token)` or `WithTokenProvider(fn)` |
+
+Both can be supplied together — Basic auth covers session routes;
+Bearer covers channel routes.
 
 ## Fork
 
