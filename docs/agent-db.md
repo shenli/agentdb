@@ -743,6 +743,49 @@ await session.append(
 
 ---
 
+## Recommended pattern: plan-as-events
+
+Plans are mutable. A real agent revises its plan as it learns what
+works and what doesn't. Storing a plan as a row you `UPDATE` loses the
+*reason* a step changed, the *order* steps completed, the *observations*
+the agent made along the way. Storing it as an event log keeps all of
+that.
+
+The pattern: dedicate one session per run (e.g., `{runId}:_plan`) and
+append four kinds of events.
+
+| Event kind        | Producer            | Payload                                                              |
+|-------------------|---------------------|----------------------------------------------------------------------|
+| `plan_revised`    | The planner agent   | `{ steps, reason }` — the entire step list, replaced wholesale.      |
+| `step_dispatched` | The planner agent   | `{ step_id, assigned, text }` — handing the step off.                |
+| `step_completed`  | The executing agent | `{ step_id, status, summary, from }` — outcome.                      |
+| `observation`     | Auto-emitted        | `{ from, toolName, payload, relates_to_step? }` — any tool-call ran. |
+
+Read time: reduce events into a `{ steps, observations }` snapshot. The
+latest `plan_revised` defines the step list; later `step_dispatched` and
+`step_completed` events flip individual step statuses. `observation`
+events accumulate but don't change steps — they're the planner's
+context for re-planning.
+
+Why event-sourced plans:
+
+  - **Replay**: every run produces a self-contained log. Step through it.
+  - **Resume**: a process restart loads `_plan`, reduces, and the planner
+    continues exactly where it left off.
+  - **Fork**: `forkSession("{runId}:_plan", "alt-strategy")` creates an
+    O(1) copy-on-write branch — explore an alternate plan without
+    disturbing the main run.
+  - **Observability**: tool calls auto-emit observation events into the
+    same log. The plan session reads like an executive briefing.
+
+A 150-line reference implementation:
+[`examples/agents/typescript/pi-company/src/plan.ts`](../examples/agents/typescript/pi-company/src/plan.ts).
+The autonomous-CEO loop in
+[`pi-company/src/ceo.ts`](../examples/agents/typescript/pi-company/src/ceo.ts)
+shows the read-reduce-revise loop end to end.
+
+---
+
 ## References
 
 - Ankur Goyal. [AI observability is a database problem: how

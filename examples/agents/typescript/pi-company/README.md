@@ -119,6 +119,38 @@ src/
 └── scenarios/launch.ts # 6-step canned directive sequence
 ```
 
+## Autonomous mode
+
+The default scripted demo (`--scenario=launch`) runs a fixed sequence: deterministic, polished, marketing-friendly. For a real agentic experience, give the CEO a goal and let it generate its own plan:
+
+    pnpm start --goal="ship a meditation app and land 3 pilot customers"
+
+In autonomous mode the CEO is an LLM agent. It will:
+
+  1. Generate a 3-7 step plan from your goal.
+  2. Dispatch one step at a time to an employee.
+  3. Wait until the employee reports back (`report_to_ceo` with the step id).
+  4. Re-read the plan + accumulated observations.
+  5. Either dispatch the next step, revise the plan, or wrap up.
+
+Plans live in a per-run session named `{runId}:_plan`. Every revision, dispatch, and report appends an event. Every employee tool call appends an `observation` event. The CEO's wake prompt is built by reducing those events. Resume any run with `--resume=<run-id>` and the CEO continues from where it left off.
+
+### Budgets
+
+Autonomous runs are bounded — same primitives, same goal, but no timer means no demo. The defaults:
+
+    --max-revisions=8       Plan revisions before the run terminates.
+    --max-minutes=15        Wallclock cap.
+    --max-llm-calls=50      CEO LLM-turn cap.
+    --step-timeout=180      Seconds without a step_completed before the
+                            CEO is woken with a synthesized step_timeout.
+
+Whichever fires first wins. The cause is recorded as `run_ended.cause` in `{runId}:_meta`.
+
+### Determinism
+
+Scripted mode is deterministic — replays the same scenario every time. Autonomous mode is not — same goal, different runs, different plans. For marketing recordings, prefer scripted. For exploring how AgentDB primitives compose into something genuinely agentic, use autonomous.
+
 ## License
 
 Same as the parent agentdb project.

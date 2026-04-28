@@ -83,6 +83,13 @@ export interface AgentDeps {
   sessionNameOverride?: string;
   /** For contractors: the parent's session, threaded into ToolContext. */
   parentSession?: string;
+  /**
+   * Optional per-tool wrapper applied at registration time. Used by the
+   * autonomous-mode orchestrator to install `wrapToolForObservation` on
+   * every employee tool so the autonomous CEO sees observation events.
+   * Identity-default (no-op) when undefined.
+   */
+  wrapTool?: (tool: CompanyTool) => CompanyTool;
 }
 
 /**
@@ -235,9 +242,11 @@ export class Agent {
     // Filter the registry by this role's tool names. Missing names log
     // (best-effort) but don't fail — config drift between roles + registry
     // is a common edit and shouldn't crash the agent.
+    const wrap = this.deps.wrapTool ?? ((t: CompanyTool) => t);
     const tools = this.config.tools
       .map((name) => this.deps.toolRegistry[name])
-      .filter((t): t is CompanyTool => t !== undefined);
+      .filter((t): t is CompanyTool => t !== undefined)
+      .map(wrap);
 
     if (tools.length !== this.config.tools.length) {
       const missing = this.config.tools.filter((n) => !this.deps.toolRegistry[n]);
