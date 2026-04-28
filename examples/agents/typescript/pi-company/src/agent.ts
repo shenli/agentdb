@@ -138,7 +138,7 @@ export class Agent {
     );
 
     this.config = this.deps.configOverride
-      ?? (await loadAgentConfig(this.deps.client, this.deps.run.tenant, this.deps.role));
+      ?? (await loadAgentConfig(this.deps.client, this.deps.role));
 
     if (this.deps.taskBrief) {
       await this.memory.recordEvent({ kind: "task_brief", text: this.deps.taskBrief });
@@ -184,7 +184,6 @@ export class Agent {
    */
   async bootstrapTask(taskBrief: string): Promise<void> {
     const synthetic: BroadcastMessage = {
-      tenant: this.deps.run.tenant,
       channel: "(bootstrap)",
       ts_ms: Date.now(),
       sender: "system",
@@ -226,7 +225,6 @@ export class Agent {
     if (!this.deps.configOverride) {
       this.config = await loadAgentConfig(
         this.deps.client,
-        this.deps.run.tenant,
         this.deps.role,
       );
     }

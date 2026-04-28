@@ -23,15 +23,15 @@ class FakeClient {
 function makeCtx(client: FakeClient, role: any = "engineer") {
   return {
     client: client as any,
-    run: { tenant: "t", runId: "r1" },
+    run: { runId: "r1" },
     role,
     memory: { recordEvent: async () => {}, sessionName: `r1:${role}` } as any,
     channels: {
       publish: async (name: string, payload: any) => {
-        await client.broadcast({ channel: `r1:${name}`, payload, tenant: "t" });
+        await client.broadcast({ channel: `r1:${name}`, payload });
       },
       subscribe: () => ({ async *[Symbol.asyncIterator]() {} }),
-      run: { tenant: "t", runId: "r1" },
+      run: { runId: "r1" },
     } as any,
   };
 }

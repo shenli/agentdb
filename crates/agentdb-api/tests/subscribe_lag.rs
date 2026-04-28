@@ -1,17 +1,6 @@
 //! Per-session subscribe lag-too-far close behavior. Spec §6.6.
 //!
-//! Phase 1 Task 6: when a slow subscriber falls behind the
-//! `EventBus` capacity, `async_broadcast` returns
-//! `RecvError::Overflowed(_)`. The server must emit a final SSE
-//! frame
-//!
-//! ```text
-//! event: error
-//! data: {"error":"lag_too_far","last_delivered_seq":<N>}
-//! ```
-//!
-//! and close the stream. The client SDK reconnects with
-//! `from_seq = last_delivered_seq + 1` to recover gap-free.
+//! Migrated to v2 route `/api/sessions/{s}/subscribe` with Basic auth.
 
 mod common;
 
@@ -19,7 +8,7 @@ use std::time::Duration;
 
 use agentdb_api::event_bus::EventEnvelope;
 use agentdb_core::hlc::HlcTimestamp;
-use common::TestServer;
+use common::{seed_basic_user, TestServer};
 
 fn synthetic_env(seq: u64) -> EventEnvelope {
     EventEnvelope {
@@ -43,10 +32,11 @@ async fn slow_subscriber_receives_lag_too_far_then_close() {
     // overflow-mode broadcast (drop-oldest), so once we push past
     // `cap` envelopes faster than the subscriber drains them, the
     // next `recv()` returns `RecvError::Overflowed`.
-    let server = TestServer::start_with_event_bus_capacity(4).await;
+    let server = TestServer::start_with_basic_auth_and_event_bus_capacity(4).await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
 
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe", &auth)
         .await;
     sse.skip_subscribed_event().await;
 

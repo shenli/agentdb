@@ -82,7 +82,7 @@ async fn missing_auth_header_is_401() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "{base}/api/tenants/t-1/sessions/s/append_and_fetch"
+            "{base}/api/sessions/s/append_and_fetch"
         ))
         .json(&json!({"event": {"text": "hi"}, "fetch_last_n": 0}))
         .send()
@@ -103,7 +103,7 @@ async fn wrong_password_is_401() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "{base}/api/tenants/t-alice/sessions/s/append_and_fetch"
+            "{base}/api/sessions/s/append_and_fetch"
         ))
         .header("Authorization", basic("alice", "WRONG"))
         .json(&json!({"event": {"text": "hi"}, "fetch_last_n": 0}))
@@ -121,7 +121,7 @@ async fn correct_auth_matching_tenant_is_200() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "{base}/api/tenants/t-alice/sessions/s/append_and_fetch"
+            "{base}/api/sessions/s/append_and_fetch"
         ))
         .header("Authorization", basic("alice", "pencil"))
         .json(&json!({"event": {"text": "hi"}, "fetch_last_n": 0}))

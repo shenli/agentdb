@@ -7,11 +7,12 @@
 mod common;
 
 use agentdb_api::broadcast_bus::ChannelKey;
-use common::TestServer;
+use common::{mint_hmac_token_with_channels, TestServer};
 
 #[tokio::test]
 async fn publish_returns_204_and_emits_to_bus() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
     let mut sub = server
         .state
         .broadcast_bus
@@ -21,12 +22,13 @@ async fn publish_returns_204_and_emits_to_bus() {
         })
         .await;
 
-    let resp = reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"kind": "typing"}))
-        .send()
-        .await
-        .unwrap();
+    let resp = server
+        .post_json_bearer(
+            "/api/channels/c-1/publish",
+            serde_json::json!({"kind": "typing"}),
+            &token,
+        )
+        .await;
     assert_eq!(resp.status(), 204);
 
     let env = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv())
@@ -36,7 +38,6 @@ async fn publish_returns_204_and_emits_to_bus() {
     assert_eq!(env.tenant, "t-1");
     assert_eq!(env.channel, "c-1");
     assert_eq!(env.payload["kind"], "typing");
-    assert!(env.sender.is_none()); // no JWT, no sub
 }
 
 #[tokio::test]
@@ -44,12 +45,14 @@ async fn publish_with_invalid_channel_name_returns_400() {
     // Channel names with spaces are invalid per spec § 5.7.
     // Use percent-encoded space (%20) so the URL parses but the decoded
     // path fails validation.
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/t-1/channels/with%20space/publish",
+            "{}/api/channels/with%20space/publish",
             server.base
         ))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -61,10 +64,12 @@ async fn publish_with_invalid_channel_name_returns_400() {
 
 #[tokio::test]
 async fn publish_too_large_returns_413() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_jwt_hmac(b"secret").await;
+    let token = mint_hmac_token_with_channels(b"secret", "t-1", "*", Some(&["*"]), 60);
     let big = "x".repeat(20 * 1024); // 20 KiB > 16 KiB cap
     let resp = reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
+        .post(format!("{}/api/channels/c-1/publish", server.base))
+        .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({"data": big}))
         .send()
         .await
@@ -75,7 +80,7 @@ async fn publish_too_large_returns_413() {
 #[tokio::test]
 async fn publish_with_basic_auth_falls_through_no_jwt_no_sender() {
     // TestServer::start() has no JWT config — extractor returns Ok(None);
-    // sender stays None.
+    // sender stays None. This is v1-specific behaviour (no JWT required).
     let server = TestServer::start().await;
     let resp = reqwest::Client::new()
         .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))

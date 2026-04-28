@@ -4,14 +4,11 @@
  * Two layers (mirrors `subscribe.test.ts`):
  *
  * 1. Pure-TS unit tests (always run on `npm test`). Cover envelope
- *    parsing + the public-API guards (tenant required, etc.) — no
- *    network, no server.
+ *    parsing + the public-API surface — no network, no server.
  *
- * 2. End-to-end smoke against a live `agentdb serve --dev`. Skipped
- *    automatically when the server binary hasn't been built so a
- *    fresh checkout's `npm test` doesn't fail on missing cargo
- *    output. Reuses the same spawn helper pattern as
- *    `subscribe.test.ts`.
+ * 2. End-to-end smoke against a live `agentdb serve --dev` with auth.
+ *    Skipped automatically when the server binary hasn't been built.
+ *    Reuses the same spawn helper pattern as `subscribe.test.ts`.
  */
 
 import test from "node:test";
@@ -75,27 +72,6 @@ test("parseBroadcastEnvelope preserves arbitrary payload shapes", () => {
   assert.deepEqual(msg.payload, [1, 2, "three", { nested: true }]);
 });
 
-// --- Public API surface (no network) -------------------------------
-
-test("client.broadcast() throws when tenant unset", async () => {
-  const client = new Client("http://127.0.0.1:7878"); // no tenant, no auth
-  await assert.rejects(
-    () => client.broadcast({ channel: "c-1", payload: { x: 1 } }),
-    /tenant/
-  );
-});
-
-test("client.subscribeChannel() throws when tenant unset", async () => {
-  const client = new Client("http://127.0.0.1:7878");
-  await assert.rejects(async () => {
-    // The async generator runs the validation on the first .next()
-    // before any network I/O.
-    for await (const _ of client.subscribeChannel({ channel: "c-1" })) {
-      break;
-    }
-  }, /tenant/);
-});
-
 // --- End-to-end smoke (gated by server binary) ---------------------
 
 async function freePort(): Promise<number> {
@@ -134,7 +110,7 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
     }
   );
   const baseUrl = `http://127.0.0.1:${restPort}`;
-  const client = new Client(baseUrl);
+  const client = new Client({ baseUrl });
   const deadline = Date.now() + 15_000;
   let ready = false;
   while (Date.now() < deadline) {
@@ -154,9 +130,14 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
   return { baseUrl, proc };
 }
 
+// Channel subscribe/publish requires JWT auth on the v2 routes.
+// Skip the live smoke if either the server binary is missing OR
+// a JWT secret isn't configured (AGENTDB_JWT_SECRET env var).
 const skipReason = !existsSync(SERVER_BIN)
   ? `server binary not found at ${SERVER_BIN}; run \`cargo build -p agentdb-server\` first`
-  : undefined;
+  : process.env["AGENTDB_JWT_SECRET"] === undefined
+    ? "AGENTDB_JWT_SECRET not set; v2 channel routes require JWT auth — set it to run broadcast e2e"
+    : undefined;
 
 test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
   const { baseUrl, proc } = await spawnServer();
@@ -165,7 +146,7 @@ test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("publish + subscribe delivers payloads in order", async () => {
-    const subscriber = new Client(baseUrl, { tenant: "t-bcast-ts" });
+    const subscriber = new Client({ baseUrl });
     const seen: { i: number }[] = [];
     const iter = subscriber.subscribeChannel({ channel: "c-rt" });
     const consumer = (async () => {
@@ -178,7 +159,7 @@ test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
     // publish before the subscribe lands would be silently dropped.
     await new Promise((r) => setTimeout(r, 500));
 
-    const publisher = new Client(baseUrl, { tenant: "t-bcast-ts" });
+    const publisher = new Client({ baseUrl });
     await publisher.broadcast({ channel: "c-rt", payload: { i: 1 } });
     await publisher.broadcast({ channel: "c-rt", payload: { i: 2 } });
 
@@ -193,8 +174,8 @@ test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
     assert.deepEqual(ints, [1, 2]);
   });
 
-  await t.test("envelope carries tenant + channel and no sender on Basic-auth", async () => {
-    const subscriber = new Client(baseUrl, { tenant: "t-bcast-ts" });
+  await t.test("envelope carries channel and no sender on unauthenticated publish", async () => {
+    const subscriber = new Client({ baseUrl });
     const iter = subscriber.subscribeChannel({ channel: "c-meta" });
     const promise = (async () => {
       for await (const msg of iter) return msg;
@@ -202,7 +183,7 @@ test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
     })();
     await new Promise((r) => setTimeout(r, 500));
 
-    const publisher = new Client(baseUrl, { tenant: "t-bcast-ts" });
+    const publisher = new Client({ baseUrl });
     await publisher.broadcast({ channel: "c-meta", payload: { hi: true } });
 
     const msg = await Promise.race([
@@ -212,7 +193,6 @@ test("broadcast() round-trip end-to-end", { skip: skipReason }, async (t) => {
       ),
     ]);
     assert.ok(msg, "expected at least one envelope");
-    assert.equal(msg!.tenant, "t-bcast-ts");
     assert.equal(msg!.channel, "c-meta");
     assert.equal(msg!.sender, undefined); // dev mode = no JWT, no `sub`
     assert.equal(typeof msg!.ts_ms, "number");

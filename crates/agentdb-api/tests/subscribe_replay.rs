@@ -1,19 +1,13 @@
 //! Per-session subscribe with `?from_seq=N`. Spec §4.1, §6.3.
 //!
-//! Phase 1 Task 5: gap-free replay. When a client passes
-//! `from_seq=N`, the server first streams events from the
-//! durable log in `[N, live_seq)`, then switches to live tail
-//! while dropping any envelope with `seq < live_seq` to avoid
-//! duplicates.
-//!
-//! These tests cover the headline differentiator vs Supabase
-//! Realtime: gap-free reconnect.
+//! Migrated to v2 routes: `/api/sessions/{s}/subscribe` and
+//! `/api/sessions/{s}/append_and_fetch`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::TestServer;
+use common::{seed_basic_user, TestServer};
 
 /// Wrap each `next_event()` in a 5s timeout: a missed wake-up
 /// turns into an assertion miss rather than a hung CI run.
@@ -25,20 +19,22 @@ async fn next_with_timeout(sse: &mut common::SseStream) -> common::SseFrame {
 
 #[tokio::test]
 async fn from_seq_replays_then_tails_with_no_gap() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
 
     for i in 1..=5 {
         let resp = server
-            .post_json(
-                "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            .post_json_basic(
+                "/api/sessions/s-1/append_and_fetch",
                 serde_json::json!({"event": {"kind": "msg", "n": i}, "fetch_last_n": 0}),
+                &auth,
             )
             .await;
         assert!(resp.status().is_success(), "append failed: {}", resp.status());
     }
 
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe?from_seq=3")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe?from_seq=3", &auth)
         .await;
     let first = next_with_timeout(&mut sse).await;
     assert_eq!(first.event_name.as_deref(), Some("subscribed"));
@@ -57,9 +53,10 @@ async fn from_seq_replays_then_tails_with_no_gap() {
     // Append 2 more — must arrive via live tail.
     for i in 6..=7 {
         let resp = server
-            .post_json(
-                "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            .post_json_basic(
+                "/api/sessions/s-1/append_and_fetch",
                 serde_json::json!({"event": {"kind": "msg", "n": i}, "fetch_last_n": 0}),
+                &auth,
             )
             .await;
         assert!(resp.status().is_success());
@@ -73,30 +70,34 @@ async fn from_seq_replays_then_tails_with_no_gap() {
 
 #[tokio::test]
 async fn race_between_catchup_and_live_does_not_duplicate_or_drop() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
 
     for i in 1..=3 {
         let resp = server
-            .post_json(
-                "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            .post_json_basic(
+                "/api/sessions/s-1/append_and_fetch",
                 serde_json::json!({"event": {"kind": "msg", "n": i}, "fetch_last_n": 0}),
+                &auth,
             )
             .await;
         assert!(resp.status().is_success());
     }
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe?from_seq=1")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe?from_seq=1", &auth)
         .await;
     sse.skip_subscribed_event().await;
 
     let post_handle = {
         let server = server.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
             for i in 4..=5 {
                 server
-                    .post_json(
-                        "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+                    .post_json_basic(
+                        "/api/sessions/s-1/append_and_fetch",
                         serde_json::json!({"event": {"kind": "msg", "n": i}, "fetch_last_n": 0}),
+                        &auth,
                     )
                     .await;
             }
@@ -116,22 +117,26 @@ async fn race_between_catchup_and_live_does_not_duplicate_or_drop() {
 
 #[tokio::test]
 async fn from_seq_above_live_seq_is_pure_live_tail() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
+
     let resp = server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             serde_json::json!({"event": {"kind": "msg"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     assert!(resp.status().is_success());
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe?from_seq=999")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe?from_seq=999", &auth)
         .await;
     sse.skip_subscribed_event().await;
     let resp = server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             serde_json::json!({"event": {"kind": "msg"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     assert!(resp.status().is_success());

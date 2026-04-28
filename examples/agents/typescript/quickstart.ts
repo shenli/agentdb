@@ -39,7 +39,8 @@
 import { Client } from "../../../clients/typescript/dist/src/index.js";
 
 const SERVER_URL = process.env.AGENTDB_URL ?? "http://127.0.0.1:7878";
-const TENANT = process.env.AGENTDB_TENANT ?? "demo";
+const USER = process.env.AGENTDB_USER ?? "demo";
+const PASSWORD = process.env.AGENTDB_PASSWORD ?? "demo-secret";
 const SESSION_ID = "quickstart-agent-ts";
 
 interface ChatPayload {
@@ -69,7 +70,10 @@ function thoughtForTurn(turn: number, recentTexts: string[]): ChatPayload {
 }
 
 async function main(): Promise<void> {
-  const client = new Client(SERVER_URL, { tenant: TENANT });
+  const client = new Client({
+    baseUrl: SERVER_URL,
+    auth: { user: USER, password: PASSWORD },
+  });
   if (!(await client.healthReady())) {
     console.error(
       `AgentDB not ready at ${SERVER_URL}. Start it with:\n` +
@@ -80,7 +84,6 @@ async function main(): Promise<void> {
 
   const sess = client.session(SESSION_ID);
   console.log(`# Session: ${sess.toString()}`);
-  console.log(`# Tenant:  ${TENANT}\n`);
 
   for (let turn = 0; turn < 3; turn++) {
     const newEvent = thoughtForTurn(turn, []);

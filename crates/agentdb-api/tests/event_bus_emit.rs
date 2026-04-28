@@ -2,6 +2,8 @@
 //! `append_and_fetch` writes one envelope to the process-wide
 //! `EventBus`. Subscribers must see the same `seq`, `tenant`,
 //! `session`, `kind`, and payload as the durable record.
+//!
+//! Migrated to v2 route `/api/sessions/{s}/append_and_fetch`.
 
 use std::time::Duration;
 
@@ -9,18 +11,20 @@ use serde_json::json;
 use serial_test::serial;
 
 mod common;
-use common::TestServer;
+use common::{seed_basic_user, TestServer};
 
 #[tokio::test]
 #[serial]
 async fn append_emits_envelope_with_matching_seq_and_payload() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
     let mut rx = server.state.event_bus.subscribe();
 
     let resp = server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             json!({"event": {"kind": "message", "text": "hi"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     assert_eq!(resp.status(), 200);
@@ -48,21 +52,24 @@ async fn append_emits_envelope_with_matching_seq_and_payload() {
 #[tokio::test]
 #[serial]
 async fn emission_happens_after_durable_write() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
     let mut rx = server.state.event_bus.subscribe();
 
     server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             json!({"event": {"kind": "x"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     let env = rx.recv().await.expect("recv ok");
 
     let resp = server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             json!({"event": {"kind": "probe"}, "fetch_last_n": 10}),
+            &auth,
         )
         .await;
     let body: serde_json::Value = resp.json().await.expect("json");

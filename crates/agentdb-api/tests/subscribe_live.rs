@@ -1,20 +1,18 @@
 //! Per-session subscribe (live tail). Spec §6.1, §6.2, §6.4.
 //!
-//! Phase 1 Task 4: connect to `GET
-//! /api/tenants/{t}/sessions/{s}/subscribe`, expect a `subscribed`
-//! control event, then receive every appended event in seq order.
-//! Replay/lag/JWT/CORS land in later tasks.
+//! Migrated to v2 routes: `/api/sessions/{s}/subscribe` and
+//! `/api/sessions/{s}/append_and_fetch`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::TestServer;
+use common::{seed_basic_user, TestServer};
 
 /// The harness uses a fresh `reqwest::Client` per call inside
-/// `post_json` and `open_sse`, so we wrap each `next_event()` in
-/// a 5s timeout: a missed wake-up turns into an assertion miss
-/// rather than a hung CI run.
+/// `post_json_basic` and `open_sse_with_basic`, so we wrap each
+/// `next_event()` in a 5s timeout: a missed wake-up turns into an
+/// assertion miss rather than a hung CI run.
 async fn next_with_timeout(sse: &mut common::SseStream) -> common::SseFrame {
     tokio::time::timeout(Duration::from_secs(5), sse.next_event())
         .await
@@ -23,10 +21,11 @@ async fn next_with_timeout(sse: &mut common::SseStream) -> common::SseFrame {
 
 #[tokio::test]
 async fn subscribe_receives_appended_events_in_order() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
 
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe", &auth)
         .await;
 
     let first = next_with_timeout(&mut sse).await;
@@ -34,9 +33,10 @@ async fn subscribe_receives_appended_events_in_order() {
 
     for i in 1..=3 {
         let resp = server
-            .post_json(
-                "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            .post_json_basic(
+                "/api/sessions/s-1/append_and_fetch",
                 serde_json::json!({"event": {"kind": "msg", "n": i}, "fetch_last_n": 0}),
+                &auth,
             )
             .await;
         assert!(
@@ -57,22 +57,26 @@ async fn subscribe_receives_appended_events_in_order() {
 
 #[tokio::test]
 async fn subscribe_filters_by_kind() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
+
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe?kind=keep")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe?kind=keep", &auth)
         .await;
     sse.skip_subscribed_event().await;
 
     server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             serde_json::json!({"event": {"kind": "skip"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     server
-        .post_json(
-            "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+        .post_json_basic(
+            "/api/sessions/s-1/append_and_fetch",
             serde_json::json!({"event": {"kind": "keep"}, "fetch_last_n": 0}),
+            &auth,
         )
         .await;
     let evt = next_with_timeout(&mut sse).await;
@@ -86,17 +90,20 @@ async fn subscribe_filters_by_kind() {
 /// in-between `c` event but delivers `a` (seq 1) and `b` (seq 3).
 #[tokio::test]
 async fn subscribe_kind_filter_accepts_multiple_values() {
-    let server = TestServer::start().await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "alice", "t-1", "pw").await;
+
     let mut sse = server
-        .open_sse("/api/tenants/t-1/sessions/s-1/subscribe?kind=a&kind=b")
+        .open_sse_with_basic("/api/sessions/s-1/subscribe?kind=a&kind=b", &auth)
         .await;
     sse.skip_subscribed_event().await;
 
     for k in ["a", "c", "b"] {
         let resp = server
-            .post_json(
-                "/api/tenants/t-1/sessions/s-1/append_and_fetch",
+            .post_json_basic(
+                "/api/sessions/s-1/append_and_fetch",
                 serde_json::json!({"event": {"kind": k}, "fetch_last_n": 0}),
+                &auth,
             )
             .await;
         assert!(resp.status().is_success(), "append failed: {}", resp.status());

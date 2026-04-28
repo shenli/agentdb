@@ -29,20 +29,24 @@ impl CorsConfig {
     }
 }
 
-/// Per-tenant CORS middleware for the subscribe routes. Reads the
-/// `Origin` header on the request, looks up the tenant from the
-/// path (`/api/tenants/:tenant_id/...`), and — if the origin is in
-/// the per-tenant allowlist — echoes the origin back via
-/// `Access-Control-Allow-Origin` plus a `Vary: Origin` hint.
+/// Per-tenant CORS middleware for subscribe and channel routes.
 ///
-/// `OPTIONS` requests are short-circuited with a 204 preflight
-/// response carrying the CORS headers (when the origin is allowed).
-/// The inner subscribe handler is never invoked on preflights.
+/// **v1 paths** (`/api/tenants/:tenant_id/...`): reads the tenant from
+/// the URL and checks it against the per-tenant CORS allowlist in
+/// `CorsConfig`. Only allowlisted origins receive the
+/// `Access-Control-Allow-Origin` header.
 ///
-/// Requests with no `Origin` header pass through untouched (no
-/// CORS headers added). Same for tenants with no CORS config:
-/// browsers without an allowlisted origin block the response, but
-/// non-browser clients (CLI, server-to-server) are unaffected.
+/// **v2 paths** (anything else under `/api/`, e.g.
+/// `/api/sessions/:sid/subscribe`, `/api/channels/:c/publish`): the
+/// tenant cannot be extracted from the URL (it comes from auth/JWT,
+/// which runs *after* this middleware). For v2 paths the middleware
+/// applies default-permissive CORS: it echoes back whatever `Origin`
+/// header the browser sent, without consulting per-tenant config.
+/// This is intentionally broad for v2 until a v2-specific tenant
+/// lookup strategy is designed (tracked in Task 5b follow-up).
+///
+/// `OPTIONS` preflight requests are short-circuited with 204 in both
+/// cases. Requests with no `Origin` header pass through untouched.
 pub async fn cors_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -53,9 +57,19 @@ pub async fn cors_middleware(
         .get(header::ORIGIN)
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
-    let tenant = extract_tenant_from_path(req.uri().path());
+
+    let path = req.uri().path().to_string();
+    let tenant = extract_tenant_from_path(&path);
+
+    // For v1 paths: check per-tenant allowlist.
+    // For v2 paths (no tenant in URL): echo origin unconditionally
+    // when an Origin header is present (default-permissive).
     let allowed = match (origin.as_deref(), tenant.as_deref()) {
         (Some(o), Some(t)) => state.cors_config.allowed_origin(t, o),
+        (Some(o), None) => {
+            // v2 path — no tenant in URL; echo origin unconditionally.
+            Some(o.to_string())
+        }
         _ => None,
     };
 

@@ -1,9 +1,9 @@
 /**
  * End-to-end smoke test for the agentdb TypeScript SDK.
  *
- * Spawns `agentdb serve --dev` as a subprocess on an ephemeral
- * port, waits for `/health/ready`, and exercises the SDK against
- * it. Run with:
+ * Spawns `agentdb serve --dev` as a subprocess on an ephemeral port
+ * with `AGENTDB_REQUIRE_AUTH=true`, creates a test user via the admin
+ * API, then exercises the SDK against it. Run with:
  *
  *   npm test
  *
@@ -48,7 +48,13 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
+async function spawnServer(): Promise<{
+  baseUrl: string;
+  proc: ChildProcess;
+  testUser: string;
+  testPassword: string;
+  testTenant: string;
+}> {
   const restPort = await freePort();
   const mongoPort = await freePort();
   const proc = spawn(
@@ -63,16 +69,20 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
     ],
     {
       stdio: ["ignore", "ignore", "ignore"],
-      env: { ...process.env, RUST_LOG: "warn" },
+      env: {
+        ...process.env,
+        RUST_LOG: "warn",
+        AGENTDB_REQUIRE_AUTH: "true",
+      },
     }
   );
   const baseUrl = `http://127.0.0.1:${restPort}`;
-  const client = new Client(baseUrl);
+  const healthClient = new Client({ baseUrl });
   // Poll readiness for up to 15 seconds (cold cargo build can be slow).
   const deadline = Date.now() + 15_000;
   let ready = false;
   while (Date.now() < deadline) {
-    if (await client.healthReady()) {
+    if (await healthClient.healthReady()) {
       ready = true;
       break;
     }
@@ -85,7 +95,26 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
     proc.kill();
     throw new Error("server didn't become ready within 15s");
   }
-  return { baseUrl, proc };
+
+  // Create a test user via the admin API (no admin auth required in dev mode).
+  const testUser = "smoke-test-user";
+  const testPassword = "smoke-password-123";
+  const testTenant = "smoke-tenant";
+  const resp = await fetch(`${baseUrl}/api/admin/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: testUser,
+      tenant_external: testTenant,
+      password: testPassword,
+    }),
+  });
+  if (resp.status !== 201 && resp.status !== 409) {
+    const body = await resp.text();
+    throw new Error(`Failed to create test user: ${resp.status} ${body}`);
+  }
+
+  return { baseUrl, proc, testUser, testPassword, testTenant };
 }
 
 const skipReason = !existsSync(SERVER_BIN)
@@ -93,13 +122,15 @@ const skipReason = !existsSync(SERVER_BIN)
   : undefined;
 
 test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
-  const { baseUrl, proc } = await spawnServer();
+  const { baseUrl, proc, testUser, testPassword } = await spawnServer();
   t.after(() => {
     proc.kill();
   });
 
+  const auth = { user: testUser, password: testPassword };
+
   await t.test("append round-trips a single event", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("agent-smoke-1");
     const result = await sess.append(
       { role: "user", text: "hello" },
@@ -113,7 +144,7 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("multiple appends accumulate in order", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("agent-smoke-2");
     await sess.append({ i: 1 });
     await sess.append({ i: 2 });
@@ -123,7 +154,7 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("fork creates a child that inherits parent events", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const parent = client.session("agent-smoke-fork-parent");
     await parent.append({ i: 1 });
     await parent.append({ i: 2 });
@@ -136,14 +167,14 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("fetchRecent on empty session returns empty array", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("agent-smoke-fetch-empty");
     const result = await sess.fetchRecent(5);
     assert.deepEqual(result.recent, []);
   });
 
   await t.test("fetchRecent after 3 appends returns last 2 in order", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("agent-smoke-fetch-3");
     await sess.append({ i: 1 });
     await sess.append({ i: 2 });
@@ -155,43 +186,22 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("fetchRecent(0) returns empty array", async () => {
-    const client = new Client(baseUrl, { tenant: "demo" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("agent-smoke-fetch-zero");
     await sess.append({ x: 1 });
     const result = await sess.fetchRecent(0);
     assert.deepEqual(result.recent, []);
   });
 
-  await t.test(
-    "session without tenant or auth throws on append",
-    async () => {
-      // No tenant on client, no auth — append should refuse to
-      // construct a path rather than send a 4xx-bound request.
-      const client = new Client(baseUrl);
-      const sess = client.session("agent-smoke-3");
-      await assert.rejects(
-        () => sess.append({ x: 1 }),
-        /tenant/
-      );
-    }
-  );
-
   await t.test("health_ready probe returns true when up", async () => {
-    const client = new Client(baseUrl);
+    const client = new Client({ baseUrl });
     assert.equal(await client.healthReady(), true);
   });
 });
 
-test("constructing a Client with user but no password throws", () => {
+test("constructing a Client with token and getToken combined throws", () => {
   assert.throws(
-    () => new Client("http://127.0.0.1:7878", { user: "alice" }),
-    /password/
-  );
-});
-
-test("constructing a Client with password but no user throws", () => {
-  assert.throws(
-    () => new Client("http://127.0.0.1:7878", { password: "pencil" }),
-    /user/
+    () => new Client({ baseUrl: "http://127.0.0.1:7878", token: "x", getToken: () => "y" }),
+    /token.*getToken/
   );
 });

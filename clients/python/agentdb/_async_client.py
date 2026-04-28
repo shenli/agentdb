@@ -11,23 +11,23 @@ Usage:
     from agentdb import AsyncClient
 
     async def main():
-        client = AsyncClient("http://127.0.0.1:7878")
-        try:
-            session = client.session("agent-1", tenant="demo")
-            result = await session.append(
-                {"role": "user", "text": "hello"},
-                fetch_last_n=5,
-            )
+        async with AsyncClient(
+            base_url="http://127.0.0.1:7878",
+            auth=("alice", "hunter2"),
+        ) as client:
+            session = client.session("agent-1")
+            result = await session.append({"role": "user", "text": "hello"})
             print(result.seq, [(e.seq, e.payload) for e in result.recent])
-        finally:
-            await client.aclose()
 
     asyncio.run(main())
 
-Or with `async with`:
+Tenant is derived from auth credentials server-side. No `tenant`
+arg on the client or per-method calls.
 
-    async with AsyncClient("http://127.0.0.1:7878") as client:
-        ...
+Auth model:
+  - Session/subscribe routes: HTTP Basic auth via `auth=("user", "password")`.
+  - Channel routes: JWT Bearer auth via `token="..."` or `get_token=...`.
+  - Both can be supplied simultaneously.
 
 Imported lazily from `agentdb` only when the user actually
 references `AsyncClient` — that way `pip install agentdb`
@@ -56,14 +56,14 @@ from .client import AppendResult, Event
 from .errors import AgentDBError, SubscriptionClosed, from_response
 
 
-_SESSION_PATH = "/api/sessions/{sid}/append_and_fetch"
-_TENANT_PATH = "/api/tenants/{tid}/sessions/{sid}/append_and_fetch"
+_APPEND_PATH = "/api/sessions/{sid}/append_and_fetch"
+_FETCH_RECENT_PATH = "/api/sessions/{sid}/fetch_recent"
 _FORK_PATH = "/api/sessions/{sid}/fork"
 _HEALTH_PATH = "/health/ready"
-_TENANT_SUB_PATH = "/api/tenants/{tid}/subscribe"
-_SESSION_SUB_PATH = "/api/tenants/{tid}/sessions/{sid}/subscribe"
-_CHANNEL_PUBLISH_PATH = "/api/tenants/{tid}/channels/{channel}/publish"
-_CHANNEL_SUB_PATH = "/api/tenants/{tid}/channels/{channel}/subscribe"
+_TENANT_SUB_PATH = "/api/subscribe"
+_SESSION_SUB_PATH = "/api/sessions/{sid}/subscribe"
+_CHANNEL_PUBLISH_PATH = "/api/channels/{channel}/publish"
+_CHANNEL_SUB_PATH = "/api/channels/{channel}/subscribe"
 
 
 # A token provider may be sync (returns a string) or async (returns
@@ -81,51 +81,46 @@ class AsyncClient:
     `httpx.AsyncClient` keeps a connection pool. Use
     `async with` (or call `aclose()` explicitly) so the pool
     drains cleanly on shutdown.
+
+    Auth model:
+      - `auth=("user", "password")` — HTTP Basic auth for session/subscribe routes.
+      - `token="..."` or `get_token=...` — JWT Bearer for channel routes.
     """
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str = "",
         *,
-        user: Optional[str] = None,
-        password: Optional[str] = None,
-        tenant: Optional[str] = None,
+        auth: Optional[tuple] = None,           # (user, password) for Basic
+        token: Optional[str] = None,             # static JWT for channel routes
+        get_token: Optional[TokenProvider] = None,  # rotating JWT provider
         timeout: float = 30.0,
-        client: Optional[httpx.AsyncClient] = None,
-        jwt: Optional[str] = None,
-        get_token: Optional[TokenProvider] = None,
+        _client: Optional[httpx.AsyncClient] = None,
     ) -> None:
-        if user is not None and password is None:
-            raise ValueError("`password` is required when `user` is set")
-        if password is not None and user is None:
-            raise ValueError("`user` is required when `password` is set")
-        if jwt is not None and get_token is not None:
-            raise ValueError("pass `jwt` or `get_token`, not both")
+        if token is not None and get_token is not None:
+            raise ValueError("pass `token` or `get_token`, not both")
         self.base_url = base_url.rstrip("/")
-        self._auth = (user, password) if user is not None else None
-        self._tenant = tenant
+        self._auth = auth  # tuple (user, password) or None
+        self._token = token
+        self._get_token = get_token
         self.timeout = timeout
         # Allow injection for tests / instrumentation. When the
         # caller supplies one, we don't own it — they're
         # responsible for closing.
-        self._owns_client = client is None
-        self._http: httpx.AsyncClient = client or httpx.AsyncClient(
+        self._owns_client = _client is None
+        self._http: httpx.AsyncClient = _client or httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
         )
-        # Subscribe-side bearer auth — see Client.__init__ for the
-        # rationale; sync + async share semantics.
-        self._jwt = jwt
-        self._get_token = get_token
 
     @property
     def authenticated(self) -> bool:
+        """True when Basic-auth credentials are configured."""
         return self._auth is not None
 
-    def session(
-        self, session_id: str, *, tenant: Optional[str] = None
-    ) -> "AsyncSession":
-        return AsyncSession(self, session_id, tenant=tenant or self._tenant)
+    def session(self, session_id: str) -> "AsyncSession":
+        """Open a handle to one session. Tenant is derived from auth server-side."""
+        return AsyncSession(self, session_id)
 
     async def health_ready(self) -> bool:
         try:
@@ -149,7 +144,6 @@ class AsyncClient:
     async def subscribe(
         self,
         *,
-        tenant: Optional[str] = None,
         session: Optional[Sequence[str]] = None,
         kind: Optional[Sequence[str]] = None,
         from_seq: Optional[int] = None,
@@ -157,17 +151,11 @@ class AsyncClient:
     ) -> AsyncIterator[Event]:
         """Tenant-wide async event subscription.
 
-        Counterpart to [`Client.subscribe`]; same semantics, but
-        async-iterable. Use `async for evt in client.subscribe(...)`.
+        Yields envelopes from `/api/subscribe`. Tenant is derived from
+        the Basic-auth user's record server-side.
+        Use `async for evt in client.subscribe(...)`.
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on AsyncClient(...) or passed to "
-                "subscribe(tenant=...) — no auth-derived default for "
-                "the tenant-wide subscribe endpoint."
-            )
-        path = _TENANT_SUB_PATH.format(tid=_quote(tid))
+        path = _TENANT_SUB_PATH
         async for evt in self._subscribe_impl(
             path=path,
             session=list(session) if session else None,
@@ -182,24 +170,14 @@ class AsyncClient:
         *,
         channel: str,
         payload: Any,
-        tenant: Optional[str] = None,
     ) -> None:
         """Async counterpart of [`Client.broadcast`].
 
         Publish an ephemeral broadcast to a channel — no durability,
         no replay. Use the per-session `append` + `subscribe` pair
-        when you need durability.
+        when you need durability. Tenant is resolved server-side via JWT.
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on AsyncClient(...) or passed to "
-                "broadcast(tenant=...) — the channels endpoint is "
-                "tenant-explicit."
-            )
-        path = _CHANNEL_PUBLISH_PATH.format(
-            tid=_quote(tid), channel=_quote(channel)
-        )
+        path = _CHANNEL_PUBLISH_PATH.format(channel=_quote(channel))
         kwargs: dict = {"json": payload}
         headers: dict = {}
         token = await self._bearer_token()
@@ -218,7 +196,6 @@ class AsyncClient:
         self,
         *,
         channel: str,
-        tenant: Optional[str] = None,
         no_echo: bool = False,
     ) -> AsyncIterator["BroadcastMessage"]:
         """Async counterpart of [`Client.subscribe_channel`].
@@ -226,16 +203,7 @@ class AsyncClient:
         No JWT auto-reconnect: broadcast is ephemeral by design, so
         on disconnect the iterator ends rather than recovering.
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on AsyncClient(...) or passed to "
-                "subscribe_channel(tenant=...) — the channels "
-                "endpoint is tenant-explicit."
-            )
-        path = _CHANNEL_SUB_PATH.format(
-            tid=_quote(tid), channel=_quote(channel)
-        )
+        path = _CHANNEL_SUB_PATH.format(channel=_quote(channel))
         params: List[tuple] = []
         if no_echo:
             params.append(("no_echo", "true"))
@@ -276,7 +244,7 @@ class AsyncClient:
         """Fetch the current bearer token, awaiting `get_token` when
         it returns a coroutine. Called fresh on each reconnect."""
         if self._get_token is None:
-            return self._jwt
+            return self._token
         result = self._get_token()
         if hasattr(result, "__await__"):
             return await result  # type: ignore[no-any-return]
@@ -291,11 +259,7 @@ class AsyncClient:
         from_seq: Optional[int] = None,
         from_seq_per_session: Optional[dict] = None,
     ) -> AsyncIterator[Event]:
-        """Async connect-and-stream loop with JWT-expiry auto-resume.
-
-        Mirrors the sync `Client._subscribe_impl`. The shape is the
-        same so the contract is identical from the caller's POV.
-        """
+        """Async connect-and-stream loop with JWT-expiry auto-resume."""
         cursor = from_seq
         per_session_cursor = (
             dict(from_seq_per_session) if from_seq_per_session else None
@@ -317,7 +281,7 @@ class AsyncClient:
                 return
             except SubscriptionClosed as e:
                 if e.error_code == "jwt_expired" and (
-                    self._get_token is not None or self._jwt is not None
+                    self._get_token is not None or self._token is not None
                 ):
                     if e.last_seq is not None:
                         cursor = e.last_seq + 1
@@ -352,14 +316,11 @@ class AsyncClient:
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
         kwargs: dict = {"params": params, "headers": headers}
-        # SSE streams are long-lived; disable httpx's read timeout
-        # for the stream while keeping connect/write bounded.
         kwargs["timeout"] = httpx.Timeout(self.timeout, read=None)
         if self._auth is not None and "Authorization" not in headers:
             kwargs["auth"] = self._auth
         async with self._http.stream("GET", path, **kwargs) as resp:
             if resp.status_code != 200:
-                # Drain body so error decode has the JSON.
                 await resp.aread()
                 _ = _decode(resp)
             async for frame in parse_lines_async(resp.aiter_lines()):
@@ -400,32 +361,37 @@ class AsyncSession:
 
     _client: AsyncClient
     session_id: str
-    tenant: Optional[str]
 
-    def __init__(
-        self, client: AsyncClient, session_id: str, *, tenant: Optional[str]
-    ) -> None:
+    def __init__(self, client: AsyncClient, session_id: str) -> None:
         self._client = client
         self.session_id = session_id
-        self.tenant = tenant
 
     def __repr__(self) -> str:
-        t = f", tenant={self.tenant!r}" if self.tenant else ""
-        return f"AsyncSession(id={self.session_id!r}{t})"
+        return f"AsyncSession(id={self.session_id!r})"
 
     async def append(
         self,
-        event: Any,
+        payload: Any = None,
         *,
+        event: Any = None,
         fetch_last_n: int = 0,
         actor_id: Optional[int] = None,
     ) -> AppendResult:
-        body: dict = {"event": event, "fetch_last_n": fetch_last_n}
+        """Append one event. `payload` (or `event` for backward compat) is
+        any JSON-serializable value."""
+        data = payload if payload is not None else event
+        body: dict = {"event": data, "fetch_last_n": fetch_last_n}
         if actor_id is not None:
             body["actor_id"] = actor_id
-        path = self._append_path()
+        path = _APPEND_PATH.format(sid=_quote(self.session_id))
         d = await self._client._request("POST", path, json=body)
         return AppendResult.from_dict(d)
+
+    async def fetch_recent(self, *, last_n: int = 10) -> List[Event]:
+        """Read the last N events without writing. Pure read."""
+        path = _FETCH_RECENT_PATH.format(sid=_quote(self.session_id))
+        d = await self._client._request("POST", path, json={"last_n": last_n})
+        return [Event.from_dict(e) for e in d.get("events") or []]
 
     async def subscribe(
         self,
@@ -437,18 +403,9 @@ class AsyncSession:
 
         Mirrors the sync `Session.subscribe`. JWT-expiry auto-
         reconnect, kind filter, and `from_seq` replay all behave
-        the same — see the sync docstring for details.
+        the same.
         """
-        if self.tenant is None:
-            raise ValueError(
-                "`tenant` must be set on the AsyncClient or AsyncSession when "
-                "subscribing — auth-derived tenants on the subscribe path "
-                "aren't supported yet. Pass tenant='demo' (or your tenant id) "
-                "to AsyncClient(...) or .session()."
-            )
-        path = _SESSION_SUB_PATH.format(
-            tid=_quote(self.tenant), sid=_quote(self.session_id)
-        )
+        path = _SESSION_SUB_PATH.format(sid=_quote(self.session_id))
         async for evt in self._client._subscribe_impl(
             path=path,
             kind=list(kind) if kind else None,
@@ -457,28 +414,16 @@ class AsyncSession:
             yield evt
 
     async def fork(self, child_session_id: str) -> "AsyncSession":
+        """Fork this session into a child. Returns an `AsyncSession` handle."""
         body: dict = {"new_session_id": child_session_id}
-        if self.tenant is not None and not self._client.authenticated:
-            body["tenant_id"] = self.tenant
         await self._client._request(
             "POST", _FORK_PATH.format(sid=_quote(self.session_id)), json=body
         )
-        return AsyncSession(
-            self._client, child_session_id, tenant=self.tenant
-        )
+        return AsyncSession(self._client, child_session_id)
 
-    def _append_path(self) -> str:
-        if self._client.authenticated and self.tenant is None:
-            return _SESSION_PATH.format(sid=_quote(self.session_id))
-        if self.tenant is None:
-            raise ValueError(
-                "`tenant` must be set on the AsyncClient or AsyncSession when "
-                "no auth credentials are configured. Pass tenant='demo' (or "
-                "your actual tenant id) to AsyncClient(...) or .session(...)."
-            )
-        return _TENANT_PATH.format(
-            tid=_quote(self.tenant), sid=_quote(self.session_id)
-        )
+    def _subscribe_path(self) -> str:
+        """Return the SSE subscribe URL for this session."""
+        return _SESSION_SUB_PATH.format(sid=_quote(self.session_id))
 
 
 def _quote(s: str) -> str:

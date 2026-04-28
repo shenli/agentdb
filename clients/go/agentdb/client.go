@@ -21,10 +21,9 @@ type Client struct {
 	baseURL    string
 	user       string
 	password   string
-	tenant     string
 	timeout    time.Duration
 	httpClient *http.Client
-	// Subscribe-side bearer auth. JWT is the static form;
+	// Channel-route bearer auth. jwt is the static form;
 	// getToken is the refreshable form (called fresh on every
 	// subscribe reconnect so a server-side jwt_expired close
 	// recovers transparently).
@@ -36,10 +35,10 @@ type Client struct {
 // With* helpers; do not construct these directly.
 type Option func(*Client)
 
-// WithBasicAuth enables HTTP Basic auth on every request.
-// `user` and `password` are required together. Tenant is then
-// derived from credentials, so you don't need
-// [WithDefaultTenant] in this mode.
+// WithBasicAuth enables HTTP Basic auth on session and subscribe
+// routes. `user` and `password` are required together. Tenant is
+// derived from credentials server-side — no separate tenant option
+// is needed.
 func WithBasicAuth(user, password string) Option {
 	return func(c *Client) {
 		c.user = user
@@ -47,12 +46,11 @@ func WithBasicAuth(user, password string) Option {
 	}
 }
 
-// WithDefaultTenant sets the tenant used when no auth is
-// configured (dev mode, single-process tests). The server can't
-// derive tenant from credentials in that case, so this fills
-// the gap. Override per-session via [Client.Session] options.
-func WithDefaultTenant(tenant string) Option {
-	return func(c *Client) { c.tenant = tenant }
+// WithBearerToken sets a static JWT used on channel routes
+// (Broadcast / SubscribeChannel). Alias for [WithJWT]. Mutually
+// exclusive with [WithTokenProvider].
+func WithBearerToken(token string) Option {
+	return func(c *Client) { c.jwt = token }
 }
 
 // WithTimeout overrides the per-request timeout. Default 30s.
@@ -88,13 +86,20 @@ func WithTokenProvider(fn func() (string, error)) Option {
 
 // New constructs a Client.
 //
-//	client := agentdb.New("http://127.0.0.1:7878",
-//	    agentdb.WithDefaultTenant("demo"))
-//
-// or with auth:
+// Session/subscribe routes use Basic auth:
 //
 //	client := agentdb.New("https://prod.example.com",
 //	    agentdb.WithBasicAuth("alice", "hunter2"))
+//
+// Channel routes use Bearer auth:
+//
+//	client := agentdb.New("https://prod.example.com",
+//	    agentdb.WithBearerToken("eyJ..."))
+//
+// Both can be supplied simultaneously — Basic auth covers
+// session/subscribe; Bearer covers channels. Tenant is always
+// derived server-side from credentials; there is no client-side
+// tenant option.
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -121,8 +126,7 @@ func New(baseURL string, opts ...Option) *Client {
 }
 
 // Authenticated reports whether the client was constructed
-// with credentials. Handlers use this to pick the auth-bound
-// route over the legacy tenant-explicit one.
+// with Basic-auth credentials.
 func (c *Client) Authenticated() bool { return c.user != "" }
 
 // HealthReady probes /health/ready. Returns nil on 200, the
@@ -141,48 +145,23 @@ func (c *Client) HealthReady(ctx context.Context) error {
 	return errorFromResponse(resp.StatusCode, body, decodeJSONOrEmpty(body))
 }
 
-// Session returns a handle to one session. Tenant resolution:
-//   - explicit per-call via [WithSessionTenant]
-//   - else the client's [WithDefaultTenant]
-//   - else (when authed) the server derives it from credentials
-//
-// At least one of the three must be present, or Append calls
-// return an error before issuing a request.
-func (c *Client) Session(sessionID string, opts ...SessionOption) *Session {
-	s := &Session{client: c, id: sessionID, tenant: c.tenant}
-	for _, opt := range opts {
-		opt(s)
-	}
-	return s
+// Session returns a handle to one session. Tenant is always
+// derived server-side from the Basic-auth credentials supplied
+// at construction via [WithBasicAuth].
+func (c *Client) Session(sessionID string) *Session {
+	return &Session{client: c, id: sessionID}
 }
 
-// SessionOption customizes a Session at construction. Mirror
-// of the Client-level options for per-session overrides.
-type SessionOption func(*Session)
-
-// WithSessionTenant overrides the client's default tenant for
-// this session only. Use when one client talks to many tenants
-// (only possible with auth disabled — auth-mode tenant comes
-// from credentials and can't be per-session).
-func WithSessionTenant(tenant string) SessionOption {
-	return func(s *Session) { s.tenant = tenant }
-}
-
-// Session is a single AgentDB session, scoped to one tenant.
-// Construct via [Client.Session]. Every method makes one round
-// trip to the server; no client-side event caching.
+// Session is a single AgentDB session. Construct via
+// [Client.Session]. Every method makes one round trip to the
+// server; no client-side event caching.
 type Session struct {
 	client *Client
 	id     string
-	tenant string
 }
 
 // ID returns the session id this handle points at.
 func (s *Session) ID() string { return s.id }
-
-// Tenant returns the tenant the session is scoped to (may be
-// empty if relying on auth-derived tenant).
-func (s *Session) Tenant() string { return s.tenant }
 
 // Event is one record read back from AgentDB. The shape
 // mirrors the server's EventDto.
@@ -227,10 +206,7 @@ func (s *Session) Append(ctx context.Context, event any, opts ...AppendOptions) 
 	if o.ActorID != nil {
 		body["actor_id"] = *o.ActorID
 	}
-	path, err := s.appendPath()
-	if err != nil {
-		return nil, err
-	}
+	path := s.appendPath()
 	var out AppendResult
 	if err := s.client.requestJSON(ctx, http.MethodPost, path, body, &out); err != nil {
 		return nil, err
@@ -243,35 +219,15 @@ func (s *Session) Append(ctx context.Context, event any, opts ...AppendOptions) 
 // handle for the new id.
 func (s *Session) Fork(ctx context.Context, childSessionID string) (*Session, error) {
 	body := map[string]any{"new_session_id": childSessionID}
-	// No-auth mode: pass tenant via the deprecated body field
-	// so the server can resolve tenant for sessions that
-	// pre-date the locator. M26+ servers reject body-vs-auth
-	// mismatches with 400.
-	if s.tenant != "" && !s.client.Authenticated() {
-		body["tenant_id"] = s.tenant
-	}
 	path := fmt.Sprintf("/api/sessions/%s/fork", url.PathEscape(s.id))
 	if err := s.client.requestJSON(ctx, http.MethodPost, path, body, nil); err != nil {
 		return nil, err
 	}
-	return &Session{client: s.client, id: childSessionID, tenant: s.tenant}, nil
+	return &Session{client: s.client, id: childSessionID}, nil
 }
 
-func (s *Session) appendPath() (string, error) {
-	if s.client.Authenticated() && s.tenant == "" {
-		// Tenant comes from auth — use the M26 session-keyed route.
-		return fmt.Sprintf("/api/sessions/%s/append_and_fetch", url.PathEscape(s.id)), nil
-	}
-	if s.tenant == "" {
-		return "", fmt.Errorf(
-			"agentdb: tenant must be set on the client or session when no auth " +
-				"credentials are configured. Use WithDefaultTenant or WithSessionTenant",
-		)
-	}
-	return fmt.Sprintf(
-		"/api/tenants/%s/sessions/%s/append_and_fetch",
-		url.PathEscape(s.tenant), url.PathEscape(s.id),
-	), nil
+func (s *Session) appendPath() string {
+	return fmt.Sprintf("/api/sessions/%s/append_and_fetch", url.PathEscape(s.id))
 }
 
 // requestJSON issues a request and decodes the response body

@@ -54,10 +54,11 @@ func thoughtForTurn(turn, contextSize int) chatPayload {
 
 func main() {
 	url := envOr("AGENTDB_URL", "http://127.0.0.1:7878")
-	tenant := envOr("AGENTDB_TENANT", "demo")
+	user := envOr("AGENTDB_USER", "demo")
+	password := envOr("AGENTDB_PASSWORD", "demo-secret")
 	ctx := context.Background()
 
-	client := agentdb.New(url, agentdb.WithDefaultTenant(tenant))
+	client := agentdb.New(url, agentdb.WithBasicAuth(user, password))
 	if err := client.HealthReady(ctx); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"AgentDB not ready at %s. Start it with:\n"+
@@ -67,7 +68,7 @@ func main() {
 	}
 
 	sess := client.Session(sessionID)
-	fmt.Printf("# Session: id=%q tenant=%q\n\n", sess.ID(), sess.Tenant())
+	fmt.Printf("# Session: id=%q\n\n", sess.ID())
 
 	for turn := 0; turn < 3; turn++ {
 		ev := thoughtForTurn(turn, 0)

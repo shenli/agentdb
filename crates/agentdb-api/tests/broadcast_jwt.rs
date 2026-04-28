@@ -21,7 +21,7 @@ async fn channels_wildcard_allows_publish_and_subscribe() {
 
     let pub_resp = reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/t-1/channels/c-1/publish",
+            "{}/api/channels/c-1/publish",
             server.base
         ))
         .header("Authorization", format!("Bearer {token}"))
@@ -35,7 +35,7 @@ async fn channels_wildcard_allows_publish_and_subscribe() {
     // we only need to confirm the headers came back 200.
     let sub_resp = reqwest::Client::new()
         .get(format!(
-            "{}/api/tenants/t-1/channels/c-1/subscribe",
+            "{}/api/channels/c-1/subscribe",
             server.base
         ))
         .header("Authorization", format!("Bearer {token}"))
@@ -54,7 +54,7 @@ async fn channels_list_excludes_other_channels() {
     // Allowed channel: 204.
     let resp_allowed = reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/t-1/channels/c-1/publish",
+            "{}/api/channels/c-1/publish",
             server.base
         ))
         .header("Authorization", format!("Bearer {token}"))
@@ -67,7 +67,7 @@ async fn channels_list_excludes_other_channels() {
     // Disallowed channel: 403 channel_not_in_jwt.
     let resp_denied = reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/t-1/channels/c-other/publish",
+            "{}/api/channels/c-other/publish",
             server.base
         ))
         .header("Authorization", format!("Bearer {token}"))
@@ -88,7 +88,7 @@ async fn missing_channels_claim_returns_403() {
 
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/api/tenants/t-1/channels/c-1/publish",
+            "{}/api/channels/c-1/publish",
             server.base
         ))
         .header("Authorization", format!("Bearer {token}"))

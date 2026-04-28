@@ -24,6 +24,8 @@ export interface ServerHandle {
   baseUrl: string;
   proc: ChildProcess;
   shutdown: () => void;
+  /** HTTP Basic auth credentials for the pi-company user. */
+  auth: { user: string; password: string };
 }
 
 /**
@@ -69,6 +71,7 @@ export async function startAgentDBServer(): Promise<ServerHandle> {
         ...process.env,
         AGENTDB_ADDR: `127.0.0.1:${port}`,
         AGENTDB_MONGO_ADDR: `127.0.0.1:${mongoPort}`,
+        AGENTDB_REQUIRE_AUTH: "true",
       },
       stdio: "ignore",
     },
@@ -93,6 +96,24 @@ export async function startAgentDBServer(): Promise<ServerHandle> {
     throw new Error(`agentdb-server did not become ready within 90s at ${baseUrl}`);
   }
 
+  // Create the pi-company user via the admin API (no admin auth required in dev mode).
+  const piUser = process.env.PI_USER ?? "pi-company";
+  const piPassword = process.env.PI_PASSWORD ?? "pi-company-secret";
+  const createUserResp = await fetch(`${baseUrl}/api/admin/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: piUser,
+      tenant_external: piUser,
+      password: piPassword,
+    }),
+  });
+  if (createUserResp.status !== 201 && createUserResp.status !== 409) {
+    const body = await createUserResp.text();
+    if (!proc.killed) proc.kill("SIGTERM");
+    throw new Error(`Failed to create pi-company user: ${createUserResp.status} ${body}`);
+  }
+
   let shutdownCalled = false;
   const shutdown = () => {
     if (shutdownCalled) return;
@@ -103,5 +124,5 @@ export async function startAgentDBServer(): Promise<ServerHandle> {
   process.on("SIGTERM", shutdown);
   process.on("exit", shutdown);
 
-  return { baseUrl, proc, shutdown };
+  return { baseUrl, proc, shutdown, auth: { user: piUser, password: piPassword } };
 }

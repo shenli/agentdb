@@ -18,12 +18,12 @@ npm install /path/to/agentdb/clients/typescript
 
 npm publish lands once the server hits 0.1.0 stable.
 
-## Five-line hello world
+## Quick start
 
-Start the server in dev mode (zero config, ephemeral state):
+Start the server (auth mode):
 
 ```bash
-cargo run -p agentdb-server -- serve --dev
+cargo run -p agentdb-server -- serve
 ```
 
 In your TypeScript project:
@@ -31,8 +31,12 @@ In your TypeScript project:
 ```ts
 import { Client } from "agentdb";
 
-const client = new Client("http://127.0.0.1:7878");
-const session = client.session("agent-1", { tenant: "demo" });
+const client = new Client({
+  baseUrl: "http://localhost:7878",
+  auth: { user: "alice", password: "..." },
+});
+
+const session = client.session(`run-${Date.now()}`);
 const result = await session.append(
   { role: "user", text: "hello" },
   { fetchLastN: 5 }
@@ -40,25 +44,25 @@ const result = await session.append(
 console.log("seq:", result.seq, result.recent.map((e) => e.payload));
 ```
 
-## Auth mode
+Tenant is derived from the `auth` user's record server-side — no
+`tenant` param needed anywhere.
 
-When the server is started with `AGENTDB_REQUIRE_AUTH=true`, supply
-credentials at construction. Tenant comes from the credentials —
-no need to pass it explicitly.
+## Dev mode (no auth)
+
+```bash
+cargo run -p agentdb-server -- serve --dev
+```
 
 ```ts
-const client = new Client("https://prod.example.com", {
-  user: "alice",
-  password: "hunter2",
-});
-const session = client.session("agent-1");  // tenant auth-derived
-await session.append({ role: "tool", text: "did a thing" });
+const client = new Client({ baseUrl: "http://127.0.0.1:7878" });
+const session = client.session("agent-1");
+await session.append({ role: "user", text: "hello" });
 ```
 
 ## Fork
 
 ```ts
-const parent = client.session("agent-1", { tenant: "demo" });
+const parent = client.session("agent-1");
 await parent.append({ role: "user", text: "hello" });
 const child = await parent.fork("agent-1-branch-a");
 await child.append({ role: "tool", text: "branch off" });

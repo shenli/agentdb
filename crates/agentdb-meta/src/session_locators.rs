@@ -17,9 +17,17 @@
 //!
 //! See `docs/2026-04-24-next-step-design.md` §1.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use sqlx::AnyPool;
 
 use crate::error::MetaResult;
+
+/// Test-only counter incremented on every `get()` call. Used by
+/// hot-path assertion tests to verify steady-state append does not
+/// read the locator. Production reads of this counter are fine —
+/// it's a `Relaxed` atomic.
+pub static LOCATOR_GETS: AtomicU64 = AtomicU64::new(0);
 
 /// (session_id, tenant_internal_id, tablet_id, shard_id,
 /// created_at_ms, tenant_external_id). Aliased so the
@@ -94,6 +102,7 @@ pub async fn upsert(
 /// locators and the routing layer must fall back to the
 /// pre-locator path.
 pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionLocator>> {
+    LOCATOR_GETS.fetch_add(1, Ordering::Relaxed);
     let row: Option<LocatorRow> = sqlx::query_as(
         "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
             FROM session_locators WHERE session_id = ?",

@@ -1,13 +1,28 @@
 /**
  * High-level AgentDB client.
  *
- *   const client = new Client("http://127.0.0.1:7878");
- *   const session = client.session("agent-1", { tenant: "demo" });
- *   const result = await session.append(
- *     { role: "user", text: "hello" },
- *     { fetchLastN: 5 }
- *   );
+ *   import { Client } from "agentdb";
+ *
+ *   const client = new Client({
+ *     baseUrl: "http://127.0.0.1:7878",
+ *     auth: { user: "alice", password: "hunter2" },
+ *   });
+ *   const session = client.session("agent-1");
+ *   const result = await session.append({ payload: { role: "user", text: "hello" } });
  *   console.log(result.seq, result.recent.map(e => e.payload));
+ *
+ * Tenant is derived from the bearer token server-side — no `tenant`
+ * param on the client or per-method calls.
+ *
+ * Auth model:
+ *   - Session/subscribe routes: `Authorization: Basic <base64(user:pass)>`
+ *     Supply `auth: { user, password }`.
+ *   - Channel routes: `Authorization: Bearer <jwt>`
+ *     Supply `token` (static JWT) or `getToken` (rotating provider).
+ *   - If both `auth` and `token`/`getToken` are supplied the SDK uses
+ *     Basic auth for session/subscribe routes and Bearer for channel routes.
+ *   - If neither is supplied requests are sent unauthenticated (server
+ *     returns 401 when auth is required — intentional, mirrors prod model).
  *
  * Uses Node's built-in `fetch` (Node 20+). Zero runtime deps.
  */
@@ -17,31 +32,28 @@ import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
 import { parseSse } from "./sse.js";
 
 export interface ClientOptions {
-  /** HTTP Basic Auth username. Required together with `password`. */
-  user?: string;
-  password?: string;
+  /** Base URL of the AgentDB server, e.g. `"http://127.0.0.1:7878"`. */
+  baseUrl: string;
   /**
-   * Default tenant for sessions. Required when auth is disabled
-   * (the server can't derive tenant from credentials in that
-   * case). Override per-session via `client.session(id, { tenant: "..." })`.
+   * HTTP Basic Auth credentials for session/subscribe routes.
+   * Tenant is derived from the user record server-side.
    */
-  tenant?: string;
+  auth?: { user: string; password: string };
+  /**
+   * Static JWT used for channel routes (`broadcast` / `subscribeChannel`).
+   * Mutually exclusive with `getToken`. Use `getToken` for tokens that rotate.
+   */
+  token?: string;
+  /**
+   * Token provider for channel bearer auth. Called fresh on every reconnect,
+   * so a server-side `jwt_expired` close is recovered transparently.
+   * May return a string or a Promise. Mutually exclusive with `token`.
+   */
+  getToken?: () => string | Promise<string>;
   /** Per-request timeout in milliseconds. Default 30s. */
   timeoutMs?: number;
   /** Inject a custom fetch (test mocks, instrumented clients). */
   fetch?: typeof globalThis.fetch;
-  /**
-   * Static JWT used for `subscribe()` bearer auth. Mutually
-   * exclusive with `getToken`. Use `getToken` for tokens that
-   * rotate.
-   */
-  jwt?: string;
-  /**
-   * Token provider for `subscribe()` bearer auth. Called fresh on
-   * every reconnect, so a server-side `jwt_expired` close is
-   * recovered transparently. May return a string or a Promise.
-   */
-  getToken?: () => string | Promise<string>;
 }
 
 export interface Event {
@@ -49,7 +61,7 @@ export interface Event {
   tsMs: number;
   payload: unknown;
   actorId?: number;
-  /** Set on events that came from `subscribe()`. */
+  /** Set on events that came from `subscribe()`. Server-populated; read-only. */
   tenant?: string;
   /** Set on events that came from `subscribe()`. */
   session?: string;
@@ -68,8 +80,6 @@ export interface SubscribeOptions {
 }
 
 export interface ClientSubscribeOptions extends SubscribeOptions {
-  /** Override the client's default tenant. */
-  tenant?: string;
   /** Filter to one or more session ids. */
   session?: string[];
   /**
@@ -96,15 +106,8 @@ export interface AppendOptions {
   actorId?: number;
 }
 
-export interface SessionOptions {
-  /**
-   * Override the client's default tenant for this session. Use
-   * when one client talks to many tenants — though that's only
-   * possible with auth disabled, since auth-mode tenant comes
-   * from credentials.
-   */
-  tenant?: string;
-}
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface SessionOptions {}
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -113,29 +116,19 @@ export class Client {
   readonly baseUrl: string;
   readonly timeoutMs: number;
   private readonly _auth?: { user: string; password: string };
-  private readonly _tenant?: string;
   private readonly _fetch: typeof globalThis.fetch;
-  private readonly _jwt?: string;
+  private readonly _token?: string;
   private readonly _getToken?: () => string | Promise<string>;
 
-  constructor(baseUrl: string, opts: ClientOptions = {}) {
-    if (opts.user !== undefined && opts.password === undefined) {
-      throw new Error("`password` is required when `user` is set");
+  constructor(opts: ClientOptions) {
+    if (opts.token !== undefined && opts.getToken !== undefined) {
+      throw new Error("pass `token` or `getToken`, not both");
     }
-    if (opts.password !== undefined && opts.user === undefined) {
-      throw new Error("`user` is required when `password` is set");
-    }
-    if (opts.jwt !== undefined && opts.getToken !== undefined) {
-      throw new Error("pass `jwt` or `getToken`, not both");
-    }
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (opts.user !== undefined) {
-      this._auth = { user: opts.user, password: opts.password! };
-    }
-    this._tenant = opts.tenant;
+    this._auth = opts.auth;
     this._fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
-    this._jwt = opts.jwt;
+    this._token = opts.token;
     this._getToken = opts.getToken;
   }
 
@@ -143,9 +136,9 @@ export class Client {
     return this._auth !== undefined;
   }
 
-  /** Open a handle to one session. Tenant defaults to client default. */
-  session(sessionId: string, opts: SessionOptions = {}): Session {
-    return new Session(this, sessionId, opts.tenant ?? this._tenant);
+  /** Open a handle to one session. Tenant is derived from auth server-side. */
+  session(sessionId: string, _opts: SessionOptions = {}): Session {
+    return new Session(this, sessionId);
   }
 
   /**
@@ -165,29 +158,20 @@ export class Client {
   /**
    * Tenant-wide event subscription.
    *
-   * Yields envelopes from `/api/tenants/{t}/subscribe` — every
-   * appended event in the tenant, optionally filtered by session id
-   * and/or kind. AsyncIterable: consume with `for await`.
+   * Yields envelopes from `/api/subscribe` — every appended event in the
+   * tenant (derived from the Basic-auth user's record), optionally filtered
+   * by session id and/or kind. AsyncIterable: consume with `for await`.
    *
-   * On a `jwt_expired` close frame the client transparently
-   * refreshes the token (via `getToken`, if provided) and reconnects
-   * with `fromSeq = lastSeen + 1` so the consumer never sees a gap.
-   * Other terminal frames raise [`SubscriptionClosed`] for the
-   * caller to handle.
+   * On a `jwt_expired` close frame the client transparently refreshes the
+   * token (via `getToken`, if provided) and reconnects with
+   * `fromSeq = lastSeen + 1` so the consumer never sees a gap.
+   * Other terminal frames raise [`SubscriptionClosed`] for the caller to handle.
    *
    * Use this for fan-out reactors that watch many sessions; for
    * single-session tailing, `session.subscribe()` is cheaper.
    */
   async *subscribe(opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
-    const tenant = opts.tenant ?? this._tenant;
-    if (tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on Client(...) or passed to " +
-          "subscribe({ tenant: '...' }) — there is no auth-derived " +
-          "default for the tenant-wide subscribe endpoint."
-      );
-    }
-    const path = `/api/tenants/${encodePathSegment(tenant)}/subscribe`;
+    const path = `/api/subscribe`;
     yield* this._subscribeImpl({
       path,
       session: opts.session,
@@ -200,39 +184,26 @@ export class Client {
   /**
    * Publish an ephemeral broadcast message to a channel.
    *
-   * Broadcast is **ephemeral** — no durability, no
-   * replay, no per-subscriber acks. Use it for transient signals
-   * like typing indicators, cursor positions, or agent-status pings.
-   * If you need durability, use `Session.append` + `Session.subscribe`
-   * on a session instead.
+   * Broadcast is **ephemeral** — no durability, no replay, no per-subscriber
+   * acks. Use it for transient signals like typing indicators, cursor
+   * positions, or agent-status pings. If you need durability, use
+   * `Session.append` + `Session.subscribe` on a session instead.
    *
-   * `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server
-   * rejects malformed names with `channel_name_invalid`. `payload`
-   * is any JSON-serializable value.
+   * `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server rejects
+   * malformed names with `channel_name_invalid`. `payload` is any
+   * JSON-serializable value.
    *
-   * Tenant resolution mirrors the rest of the SDK: pass `tenant` to
-   * override, otherwise the client default is used. Resolves on 204.
+   * Tenant resolution is server-side via the JWT claim. Resolves on 204.
    */
   async broadcast(opts: {
     channel: string;
     payload: unknown;
-    tenant?: string;
   }): Promise<void> {
-    const tenant = opts.tenant ?? this._tenant;
-    if (tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on Client(...) or passed to " +
-          "broadcast({ tenant: '...' }) — the channels endpoint is " +
-          "tenant-explicit."
-      );
-    }
-    const path =
-      `/api/tenants/${encodePathSegment(tenant)}` +
-      `/channels/${encodePathSegment(opts.channel)}/publish`;
+    const path = `/api/channels/${encodePathSegment(opts.channel)}/publish`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
-    await this._applyAuthHeaders(headers);
+    await this._applyChannelAuthHeaders(headers);
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), this.timeoutMs);
     let resp: Response;
@@ -262,42 +233,36 @@ export class Client {
   /**
    * Subscribe to a channel; yield [`BroadcastMessage`] envelopes.
    *
-   * Counterpart to [`broadcast`]. AsyncIterable: consume with
-   * `for await`. The generator runs until the caller breaks out of
-   * the loop or the server closes the connection.
+   * Counterpart to [`broadcast`]. AsyncIterable: consume with `for await`.
+   * The generator runs until the caller breaks out of the loop or the server
+   * closes the connection.
    *
-   * Unlike per-session [`subscribe`], there is **no JWT
-   * auto-reconnect on expiry** — broadcast is ephemeral by design
-   * (spec § 5.5), so loss on disconnect is acceptable. Callers that
-   * need durability use `Session.subscribe()` instead.
+   * Unlike per-session [`subscribe`], there is **no JWT auto-reconnect on
+   * expiry** — broadcast is ephemeral by design, so loss on disconnect is
+   * acceptable. Callers that need durability use `Session.subscribe()` instead.
    *
-   * `noEcho: true` asks the server to drop envelopes whose `sender`
-   * matches this subscriber's JWT `sub` claim. Only effective with
-   * JWT auth — Basic-auth publishers emit no `sender` and never
-   * match.
+   * `noEcho: true` asks the server to drop envelopes whose `sender` matches
+   * this subscriber's JWT `sub` claim. Only effective with JWT auth —
+   * Basic-auth publishers emit no `sender` and never match.
    */
   async *subscribeChannel(opts: {
     channel: string;
-    tenant?: string;
     noEcho?: boolean;
   }): AsyncIterable<BroadcastMessage> {
-    const tenant = opts.tenant ?? this._tenant;
-    if (tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on Client(...) or passed to " +
-          "subscribeChannel({ tenant: '...' }) — the channels " +
-          "endpoint is tenant-explicit."
-      );
-    }
     const url = new URL(
-      `${this.baseUrl}/api/tenants/${encodePathSegment(tenant)}` +
-        `/channels/${encodePathSegment(opts.channel)}/subscribe`
+      `${this.baseUrl}/api/channels/${encodePathSegment(opts.channel)}/subscribe`
     );
     if (opts.noEcho) {
       url.searchParams.set("no_echo", "true");
     }
+    // For SSE channel subscribe: prefer access_token query param for JWT
+    // (avoids EventSource limitation with custom headers); fall back to
+    // Bearer header if no token is available.
+    const token = await this._channelBearerToken();
+    if (token !== undefined) {
+      url.searchParams.set("access_token", token);
+    }
     const headers: Record<string, string> = { Accept: "text/event-stream" };
-    await this._applyAuthHeaders(headers);
     // SSE is long-lived; no AbortController timeout — the consumer
     // controls cancellation by breaking out of the `for await`.
     const resp = await this._fetch(url, { headers });
@@ -340,33 +305,26 @@ export class Client {
   }
 
   /**
-   * Apply Bearer (preferred) or Basic auth onto a header map. Used
-   * by `broadcast` / `subscribeChannel` which both need the same
-   * "JWT first, fall back to Basic" plumbing as `subscribe`.
+   * Apply Bearer token auth onto a header map for channel routes.
+   * Channel routes use JWT; if no token is configured the header is left unset
+   * (server returns 401 if auth is required).
    * @internal
    */
-  private async _applyAuthHeaders(
+  private async _applyChannelAuthHeaders(
     headers: Record<string, string>
   ): Promise<void> {
-    const token = await this._bearerToken();
+    const token = await this._channelBearerToken();
     if (token !== undefined) {
       headers["Authorization"] = `Bearer ${token}`;
-      return;
-    }
-    if (this._auth) {
-      const t = Buffer.from(
-        `${this._auth.user}:${this._auth.password}`
-      ).toString("base64");
-      headers["Authorization"] = `Basic ${t}`;
     }
   }
 
   /** @internal */
-  async _bearerToken(): Promise<string | undefined> {
+  async _channelBearerToken(): Promise<string | undefined> {
     if (this._getToken !== undefined) {
       return await this._getToken();
     }
-    return this._jwt;
+    return this._token;
   }
 
   /** @internal */
@@ -401,7 +359,7 @@ export class Client {
         if (
           e instanceof SubscriptionClosed &&
           e.errorCode === "jwt_expired" &&
-          (this._getToken !== undefined || this._jwt !== undefined)
+          (this._getToken !== undefined || this._token !== undefined)
         ) {
           const fallback = e.lastSeq ?? lastSeen;
           if (fallback !== undefined) {
@@ -438,10 +396,8 @@ export class Client {
       url.searchParams.append("kind", k);
     }
     const headers: Record<string, string> = { Accept: "text/event-stream" };
-    const token = await this._bearerToken();
-    if (token !== undefined) {
-      headers["Authorization"] = `Bearer ${token}`;
-    } else if (this._auth) {
+    // Session/subscribe routes use Basic auth (tenant derived from user record).
+    if (this._auth) {
       const t = Buffer.from(
         `${this._auth.user}:${this._auth.password}`
       ).toString("base64");
@@ -545,6 +501,7 @@ export class Client {
     json?: unknown
   ): Promise<Response> {
     const headers: Record<string, string> = {};
+    // Session routes use Basic auth (tenant derived from user record server-side).
     if (this._auth) {
       const token = Buffer.from(
         `${this._auth.user}:${this._auth.password}`
@@ -570,19 +527,17 @@ export class Client {
 }
 
 /**
- * A single AgentDB session, scoped to one tenant. Construct via
- * `Client.session(...)`. The session is a thin handle — every
- * method makes one round trip; no client-side event caching.
+ * A single AgentDB session. Construct via `Client.session(...)`.
+ * The session is a thin handle — every method makes one round trip;
+ * no client-side event caching. Tenant is derived from auth server-side.
  */
 export class Session {
   readonly sessionId: string;
-  readonly tenant?: string;
   private readonly _client: Client;
 
-  constructor(client: Client, sessionId: string, tenant?: string) {
+  constructor(client: Client, sessionId: string) {
     this._client = client;
     this.sessionId = sessionId;
-    this.tenant = tenant;
   }
 
   /**
@@ -598,7 +553,7 @@ export class Session {
     if (opts.actorId !== undefined) {
       body.actor_id = opts.actorId;
     }
-    const path = this._appendPath();
+    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/append_and_fetch`;
     const d = await this._client._request("POST", path, body);
     const recent = Array.isArray(d.recent)
       ? d.recent.map(eventFromDict)
@@ -609,26 +564,16 @@ export class Session {
   /**
    * Stream events for this session via SSE.
    *
-   * AsyncIterable: consume with `for await`. Use `fromSeq` to
-   * replay from a known cursor; the server transitions from
-   * catch-up to live tail without dropping events. Use `kind` to
-   * filter on the server side.
+   * AsyncIterable: consume with `for await`. Use `fromSeq` to replay from a
+   * known cursor; the server transitions from catch-up to live tail without
+   * dropping events. Use `kind` to filter on the server side.
    *
    * Reconnect / error semantics mirror [`Client.subscribe`]:
    * `jwt_expired` is auto-recovered when a token provider is set;
    * other terminal close frames raise [`SubscriptionClosed`].
    */
   async *subscribe(opts: SubscribeOptions = {}): AsyncIterable<Event> {
-    if (this.tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on the Client or Session when subscribing — " +
-          "auth-derived tenants on the subscribe path aren't supported yet. " +
-          "Pass tenant: 'demo' (or your tenant id) to Client(...) or Client.session()."
-      );
-    }
-    const path =
-      `/api/tenants/${encodePathSegment(this.tenant)}` +
-      `/sessions/${encodePathSegment(this.sessionId)}/subscribe`;
+    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/subscribe`;
     yield* this._client._subscribeImpl({
       path,
       kind: opts.kind,
@@ -639,7 +584,7 @@ export class Session {
   /**
    * Read the last N events on this session WITHOUT writing anything.
    *
-   * Maps to the server's `POST /api/tenants/{t}/sessions/{s}/fetch_recent`.
+   * Maps to the server's `POST /api/sessions/{s}/fetch_recent`.
    * Returns `{ recent: Event[] }` — the same shape as `append({fetchLastN: N})`'s
    * response, minus the new-event `seq`.
    *
@@ -648,7 +593,7 @@ export class Session {
    * sentinel events.
    */
   async fetchRecent(n: number): Promise<{ recent: Event[] }> {
-    const path = this._fetchRecentPath();
+    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`;
     const d = await this._client._request("POST", path, { n });
     const recent = Array.isArray(d.recent)
       ? d.recent.map(eventFromDict)
@@ -657,68 +602,23 @@ export class Session {
   }
 
   /**
-   * Fork this session into a child that inherits the parent's
-   * events at fork time, MVCC-backed. Returns a `Session` handle
-   * for the new id.
+   * Fork this session into a child that inherits the parent's events at fork
+   * time, MVCC-backed. Returns a `Session` handle for the new id.
    */
   async fork(childSessionId: string): Promise<Session> {
     const body: Record<string, unknown> = {
       new_session_id: childSessionId,
     };
-    // No-auth mode: pass tenant through the deprecated body
-    // field so the server can resolve tenant for sessions that
-    // pre-date the locator (or for single-process tests). M26+
-    // servers reject body-vs-auth mismatches with 400.
-    if (this.tenant !== undefined && !this._client.authenticated) {
-      body.tenant_id = this.tenant;
-    }
     await this._client._request(
       "POST",
       `/api/sessions/${encodePathSegment(this.sessionId)}/fork`,
       body
     );
-    return new Session(this._client, childSessionId, this.tenant);
+    return new Session(this._client, childSessionId);
   }
 
   toString(): string {
-    const t = this.tenant ? `, tenant=${JSON.stringify(this.tenant)}` : "";
-    return `Session(id=${JSON.stringify(this.sessionId)}${t})`;
-  }
-
-  private _appendPath(): string {
-    if (this._client.authenticated && this.tenant === undefined) {
-      // Tenant comes from auth — use the M26 session-keyed route.
-      return `/api/sessions/${encodePathSegment(this.sessionId)}/append_and_fetch`;
-    }
-    if (this.tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on the Client or Session when no auth " +
-          "credentials are configured. Pass tenant: 'demo' (or your " +
-          "actual tenant id) to Client(...) or Client.session(...)."
-      );
-    }
-    return (
-      `/api/tenants/${encodePathSegment(this.tenant)}` +
-      `/sessions/${encodePathSegment(this.sessionId)}/append_and_fetch`
-    );
-  }
-
-  private _fetchRecentPath(): string {
-    if (this._client.authenticated && this.tenant === undefined) {
-      // Tenant comes from auth — use the M26 session-keyed route.
-      return `/api/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`;
-    }
-    if (this.tenant === undefined) {
-      throw new Error(
-        "`tenant` must be set on the Client or Session when no auth " +
-          "credentials are configured. Pass tenant: 'demo' (or your " +
-          "actual tenant id) to Client(...) or Client.session(...)."
-      );
-    }
-    return (
-      `/api/tenants/${encodePathSegment(this.tenant)}` +
-      `/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`
-    );
+    return `Session(id=${JSON.stringify(this.sessionId)})`;
   }
 }
 

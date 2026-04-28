@@ -10,43 +10,30 @@ import (
 
 // Validation tests (no server) ------------------------------------
 
-func TestSubscribeRequiresTenant(t *testing.T) {
-	client := New("http://127.0.0.1:7878")
-	events, errs := client.Subscribe(context.Background(), SubscribeOptions{})
-	// First receive on errs gives the validation error; events
-	// channel is closed in the same goroutine.
-	select {
-	case err := <-errs:
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if !contains(err.Error(), "tenant") {
-			t.Errorf("error should mention tenant, got: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("validation didn't fire within 2s")
-	}
-	// events should drain to closed.
+func TestSubscribeBuildsV2URL(t *testing.T) {
+	// v2: Subscribe no longer requires a tenant — it derives tenant
+	// server-side from auth. Just verify the call compiles and can be
+	// constructed without error.
+	client := New("http://127.0.0.1:7878", WithBasicAuth("u", "p"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so no real connection is attempted
+	events, errs := client.Subscribe(ctx, SubscribeOptions{})
 	for range events {
+	}
+	for range errs {
 	}
 }
 
-func TestSessionSubscribeRequiresTenant(t *testing.T) {
-	client := New("http://127.0.0.1:7878")
+func TestSessionSubscribeBuildsV2URL(t *testing.T) {
+	// v2: Session.Subscribe no longer requires a tenant.
+	client := New("http://127.0.0.1:7878", WithBasicAuth("u", "p"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so no real connection is attempted
 	sess := client.Session("agent-1")
-	events, errs := sess.Subscribe(context.Background(), SessionSubscribeOptions{})
-	select {
-	case err := <-errs:
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
-		if !contains(err.Error(), "tenant") {
-			t.Errorf("error should mention tenant, got: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("validation didn't fire within 2s")
-	}
+	events, errs := sess.Subscribe(ctx, SessionSubscribeOptions{})
 	for range events {
+	}
+	for range errs {
 	}
 }
 
@@ -84,7 +71,7 @@ func TestSubscriptionClosedErrorMessageMentionsCode(t *testing.T) {
 func TestSubscribeYieldsAppendedEvents(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
-	client := New(base, WithDefaultTenant("t-1"))
+	client := New(base, WithBasicAuth(smokeUser, smokePassword))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -130,7 +117,7 @@ func TestSubscribeYieldsAppendedEvents(t *testing.T) {
 func TestSubscribeReplaysFromSeq(t *testing.T) {
 	base, stop := startServer(t)
 	defer stop()
-	client := New(base, WithDefaultTenant("t-1"))
+	client := New(base, WithBasicAuth(smokeUser, smokePassword))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

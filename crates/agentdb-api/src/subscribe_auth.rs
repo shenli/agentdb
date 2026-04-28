@@ -8,7 +8,7 @@
 use axum::http::{HeaderMap, StatusCode};
 
 use crate::error::{ApiError, ErrorCode};
-use crate::jwt::{verify_for_tenant, AgentDbClaims, JwtError};
+use crate::jwt::{verify_for_tenant, verify_jwt, AgentDbClaims, JwtError};
 use crate::AppState;
 
 /// Extract and verify a JWT for the given tenant.
@@ -56,6 +56,44 @@ pub async fn extract_subscribe_jwt(
         .await
         .map_err(map_jwt_err)?;
     Ok(Some(claims))
+}
+
+/// v2 JWT extraction — discovers tenant from the JWT claim.
+///
+/// Returns `Ok(claims)` with the verified claim (which carries the
+/// tenant). Mirrors `extract_subscribe_jwt`'s header-or-query
+/// selection and dual-supply detection. Missing JWT is 401.
+pub async fn extract_subscribe_jwt_no_tenant(
+    state: &AppState,
+    headers: &HeaderMap,
+    access_token: Option<&str>,
+) -> Result<AgentDbClaims, ApiError> {
+    let header_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let token = match (header_token, access_token) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::Coded(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::BadRequestDualAuth,
+                "supply jwt via Authorization header OR ?access_token=, not both".into(),
+            ));
+        }
+        (Some(t), None) => t,
+        (None, Some(t)) => t.to_string(),
+        (None, None) => {
+            return Err(ApiError::Coded(
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::JwtInvalid,
+                "missing jwt".into(),
+            ));
+        }
+    };
+    verify_jwt(&state.jwt_config, &token)
+        .await
+        .map_err(map_jwt_err)
 }
 
 fn map_jwt_err(e: JwtError) -> ApiError {

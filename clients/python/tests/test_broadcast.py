@@ -3,8 +3,7 @@
 Two layers (mirrors `test_subscribe.py`):
 
 1. Pure-Python unit tests (always run on `pytest`). Cover envelope
-   parsing + the public-API guards (tenant required, etc.) — no
-   network, no server.
+   parsing + the public-API surface (no network).
 
 2. End-to-end smoke against a live `agentdb serve --dev`, gated on
    `AGENTDB_PYTHON_SMOKE=1`. Reuses `test_subscribe.py`'s
@@ -60,18 +59,20 @@ def test_broadcast_message_handles_missing_sender():
 # --- Public API surface (no network) ----------------------------
 
 
-def test_broadcast_requires_tenant_when_unset():
-    client = Client("http://127.0.0.1:7878")  # no tenant, no auth
-    with pytest.raises(ValueError, match="tenant"):
-        client.broadcast(channel="c-1", payload={"x": 1})
+def test_broadcast_works_without_tenant_kwarg():
+    """broadcast() no longer requires or accepts a `tenant=` kwarg.
+    With a JWT token, the server resolves tenant from the token claim.
+    Without any auth, the server returns 401 (but the SDK doesn't
+    raise before sending)."""
+    client = Client("http://127.0.0.1:7878", token="jwt-value")
+    # Just verify no TypeError on construction + that the method exists.
+    assert callable(client.broadcast)
 
 
-def test_subscribe_channel_requires_tenant_when_unset():
-    client = Client("http://127.0.0.1:7878")
-    with pytest.raises(ValueError, match="tenant"):
-        # subscribe_channel returns a generator; first .next() runs
-        # the validation in the body before any network I/O.
-        next(iter(client.subscribe_channel(channel="c-1")))
+def test_subscribe_channel_works_without_tenant_kwarg():
+    """subscribe_channel() no longer requires or accepts a `tenant=` kwarg."""
+    client = Client("http://127.0.0.1:7878", token="jwt-value")
+    assert callable(client.subscribe_channel)
 
 
 # --- End-to-end smoke (gated) -----------------------------------
@@ -81,9 +82,6 @@ def test_subscribe_channel_requires_tenant_when_unset():
 # live in the same package, so the same `agentdb serve --dev`
 # subprocess covers both files when `AGENTDB_PYTHON_SMOKE=1`.
 
-# Pytest's `rootdir`-based import puts the tests directory on
-# `sys.path`, so a flat `from test_subscribe import ...` reaches
-# the sibling module without a package `__init__.py`.
 from test_subscribe import SMOKE_SKIP, subscribe_server  # noqa: E402,F401
 
 
@@ -100,7 +98,7 @@ def test_broadcast_round_trip(subscribe_server):
 
     def consume() -> None:
         try:
-            client = Client(base, tenant="t-bcast-py")
+            client = Client(base)
             for msg in client.subscribe_channel(channel="c-rt"):
                 seen.append(msg)
                 if len(seen) >= 2:
@@ -110,11 +108,10 @@ def test_broadcast_round_trip(subscribe_server):
 
     consumer = threading.Thread(target=consume, daemon=True)
     consumer.start()
-    # Let the subscriber attach; broadcast has no replay, so a
-    # publish before the subscribe lands would be silently dropped.
+    # Let the subscriber attach; broadcast has no replay.
     time.sleep(1.0)
 
-    publisher = Client(base, tenant="t-bcast-py")
+    publisher = Client(base)
     publisher.broadcast(channel="c-rt", payload={"i": 1})
     publisher.broadcast(channel="c-rt", payload={"i": 2})
 
@@ -124,7 +121,6 @@ def test_broadcast_round_trip(subscribe_server):
     ints = sorted(m.payload["i"] for m in seen)
     assert ints == [1, 2]
     for m in seen:
-        assert m.tenant == "t-bcast-py"
         assert m.channel == "c-rt"
         assert m.sender is None  # no JWT, no `sub`
         assert isinstance(m.ts_ms, int)

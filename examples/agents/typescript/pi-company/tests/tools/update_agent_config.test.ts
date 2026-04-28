@@ -24,7 +24,7 @@ test("update_agent_config appends an agent_override event to _config:agents", as
     memory: null as any,
     channels: null as any,
     client: fc as any,
-    run: { tenant: "pi-company", runId: "r-1" },
+    run: { runId: "r-1" },
     role: "ceo" as const,
   };
 
@@ -56,7 +56,7 @@ test("update_agent_config supports multiple field patches", async () => {
     memory: null as any,
     channels: null as any,
     client: fc as any,
-    run: { tenant: "pi-company", runId: "r-1" },
+    run: { runId: "r-1" },
     role: "ceo" as const,
   };
 

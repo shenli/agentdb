@@ -1922,7 +1922,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/api/tenants/{tenant_id}/sessions/{session_id}/fetch_recent": {
@@ -2005,7 +2006,8 @@
               }
             }
           }
-        }
+        },
+        "deprecated": true
       }
     }
   },

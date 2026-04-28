@@ -43,13 +43,13 @@ class FakeClient {
 
 test("hire_contractor forks the parent session and records contractor_hired", async () => {
   const fc = new FakeClient();
-  const memory = new Memory(fc as any, { tenant: "pi-company", runId: "r-1" }, "engineer");
-  const channels = new Channels(fc as any, { tenant: "pi-company", runId: "r-1" });
+  const memory = new Memory(fc as any, { runId: "r-1" }, "engineer");
+  const channels = new Channels(fc as any, { runId: "r-1" });
   const ctx = {
     memory,
     channels,
     client: fc as any,
-    run: { tenant: "pi-company", runId: "r-1" },
+    run: { runId: "r-1" },
     role: "engineer" as const,
   };
 
@@ -91,15 +91,15 @@ test("hire_contractor child session ID has run-scoped naming", async () => {
   const fc = new FakeClient();
   const memory = new Memory(
     fc as any,
-    { tenant: "pi-company", runId: "r-1" },
+    { runId: "r-1" },
     "marketing",
   );
-  const channels = new Channels(fc as any, { tenant: "pi-company", runId: "r-1" });
+  const channels = new Channels(fc as any, { runId: "r-1" });
   const ctx = {
     memory,
     channels,
     client: fc as any,
-    run: { tenant: "pi-company", runId: "r-1" },
+    run: { runId: "r-1" },
     role: "marketing" as const,
   };
   await hireContractor.handler({ task_brief: "punchy taglines" }, ctx);

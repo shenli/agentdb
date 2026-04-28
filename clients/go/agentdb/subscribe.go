@@ -45,9 +45,6 @@ func (e *SubscriptionClosed) Error() string {
 
 // SubscribeOptions tunes a tenant-wide [Client.Subscribe] call.
 type SubscribeOptions struct {
-	// Tenant overrides the client's default. Required when the
-	// client wasn't constructed with [WithDefaultTenant].
-	Tenant string
 	// Session filters to one or more session ids.
 	Session []string
 	// Kind filters to one or more event kinds.
@@ -80,23 +77,12 @@ type SessionSubscribeOptions struct {
 // The `ctx` argument controls cancellation: cancel it to tear the
 // stream down deterministically.
 func (c *Client) Subscribe(ctx context.Context, opts SubscribeOptions) (<-chan EventEnvelope, <-chan error) {
-	tenant := opts.Tenant
-	if tenant == "" {
-		tenant = c.tenant
-	}
 	events := make(chan EventEnvelope)
 	errs := make(chan error, 1)
 	go func() {
 		defer close(events)
 		defer close(errs)
-		if tenant == "" {
-			errs <- errors.New(
-				"agentdb: tenant must be set on the client or in SubscribeOptions",
-			)
-			return
-		}
-		path := fmt.Sprintf("/api/tenants/%s/subscribe", url.PathEscape(tenant))
-		c.subscribeLoop(ctx, path, opts.Session, opts.Kind, opts.FromSeq, opts.FromSeqPerSession, events, errs)
+		c.subscribeLoop(ctx, "/api/subscribe", opts.Session, opts.Kind, opts.FromSeq, opts.FromSeqPerSession, events, errs)
 	}()
 	return events, errs
 }
@@ -109,16 +95,7 @@ func (s *Session) Subscribe(ctx context.Context, opts SessionSubscribeOptions) (
 	go func() {
 		defer close(events)
 		defer close(errs)
-		if s.tenant == "" {
-			errs <- errors.New(
-				"agentdb: tenant must be set on the client or session for subscribe (auth-derived tenants on subscribe aren't supported yet)",
-			)
-			return
-		}
-		path := fmt.Sprintf(
-			"/api/tenants/%s/sessions/%s/subscribe",
-			url.PathEscape(s.tenant), url.PathEscape(s.id),
-		)
+		path := fmt.Sprintf("/api/sessions/%s/subscribe", url.PathEscape(s.id))
 		s.client.subscribeLoop(ctx, path, nil, opts.Kind, opts.FromSeq, nil, events, errs)
 	}()
 	return events, errs

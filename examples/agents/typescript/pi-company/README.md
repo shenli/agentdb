@@ -62,6 +62,14 @@ export AGENTDB_DEMO_API_KEY=sk-...        # your provider's API key
 export AGENTDB_DEMO_MODEL=claude-haiku-4-5    # optional override
 ```
 
+The demo auto-starts an AgentDB server with auth enabled and creates a
+`pi-company` user on startup. Override credentials with environment variables:
+
+```bash
+export PI_USER=pi-company       # default
+export PI_PASSWORD=pi-company-secret   # default
+```
+
 ### Interactive mode (default)
 
 ```bash

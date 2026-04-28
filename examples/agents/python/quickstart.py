@@ -35,7 +35,8 @@ from agentdb import Client
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-TENANT = os.environ.get("AGENTDB_TENANT", "demo")
+USER = os.environ.get("AGENTDB_USER", "demo")
+PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
 SESSION_ID = "quickstart-agent"
 
 
@@ -59,7 +60,7 @@ def thought_for_turn(turn: int, recent_text: list[str]) -> dict:
 
 
 def main() -> None:
-    client = Client(SERVER_URL, tenant=TENANT)
+    client = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
     if not client.health_ready():
         raise SystemExit(
             f"AgentDB not ready at {SERVER_URL}. Start it with:\n"
@@ -67,8 +68,7 @@ def main() -> None:
         )
 
     sess = client.session(SESSION_ID)
-    print(f"# Session: {sess}")
-    print(f"# Tenant:  {TENANT}\n")
+    print(f"# Session: {sess}\n")
 
     for turn in range(3):
         # Pull the recent five events as context. Even though we

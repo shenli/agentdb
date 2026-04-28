@@ -190,6 +190,34 @@ pub async fn verify_for_tenant(
     }
 }
 
+/// Decode-then-find-tenant verification (M27 v2). Used by v2
+/// channel routes that don't carry tenant in the URL.
+///
+/// Step 1: decode the JWT once with signature validation disabled
+///         to read the `tenant` claim.
+/// Step 2: look up the per-tenant config keyed by that claim.
+/// Step 3: re-verify the signature with the resolved key (delegates
+///         to `verify_for_tenant`).
+///
+/// Returns `Err(TenantNotConfigured)` if the claim's tenant has no
+/// config; `Err(Invalid)` for malformed claims, missing `tenant`,
+/// or signature mismatches.
+pub async fn verify_jwt(config: &JwtConfig, token: &str) -> Result<AgentDbClaims, JwtError> {
+    let mut peek = Validation::default();
+    peek.insecure_disable_signature_validation();
+    peek.validate_exp = false;
+    peek.validate_aud = false;
+    let peek_claims: AgentDbClaims = decode(
+        token,
+        &DecodingKey::from_secret(b"unused-for-decode-only"),
+        &peek,
+    )
+    .map_err(|e| JwtError::Invalid(e.to_string()))?
+    .claims;
+
+    verify_for_tenant(config, &peek_claims.tenant, token).await
+}
+
 /// Process-global JWKS cache. Keyed by URL so multi-tenant
 /// deployments with different IdPs share the cache safely.
 /// 10-minute TTL matches the spec default.

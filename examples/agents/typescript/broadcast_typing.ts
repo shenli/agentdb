@@ -39,7 +39,11 @@
 import { Client } from "../../../clients/typescript/dist/src/index.js";
 
 const SERVER_URL = process.env.AGENTDB_URL ?? "http://127.0.0.1:7878";
-const TENANT = process.env.AGENTDB_TENANT ?? "demo";
+const JWT_TOKEN = process.env.AGENTDB_JWT_TOKEN;
+if (!JWT_TOKEN) {
+  console.error("AGENTDB_JWT_TOKEN is required for broadcast/channel operations");
+  process.exit(1);
+}
 const CHANNEL = "room:42";
 
 interface TypingPayload {
@@ -49,7 +53,7 @@ interface TypingPayload {
 }
 
 async function typingPublisher(): Promise<void> {
-  const client = new Client(SERVER_URL, { tenant: TENANT });
+  const client = new Client({ baseUrl: SERVER_URL, token: JWT_TOKEN });
   for (let i = 0; i < 5; i++) {
     await client.broadcast({
       channel: CHANNEL,
@@ -66,7 +70,7 @@ async function typingPublisher(): Promise<void> {
 }
 
 async function typingReactor(): Promise<void> {
-  const client = new Client(SERVER_URL, { tenant: TENANT });
+  const client = new Client({ baseUrl: SERVER_URL, token: JWT_TOKEN });
   console.log(`reactor: subscribing to ${CHANNEL}`);
   for await (const msg of client.subscribeChannel({ channel: CHANNEL })) {
     const p = msg.payload as TypingPayload;
@@ -76,7 +80,7 @@ async function typingReactor(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const ready = await new Client(SERVER_URL).healthReady();
+  const ready = await new Client({ baseUrl: SERVER_URL }).healthReady();
   if (!ready) {
     console.error(
       `AgentDB not ready at ${SERVER_URL}. Start it with:\n` +

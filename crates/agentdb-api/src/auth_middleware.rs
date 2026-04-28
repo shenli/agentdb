@@ -85,6 +85,34 @@ pub async fn basic_auth_middleware(
     let path = req.uri().path().to_string();
     let tenant_from_path = extract_tenant_id(&path);
 
+    // Subscribe and channel subscribe paths handle their own JWT auth
+    // inside the handler via `extract_subscribe_jwt`. If the client
+    // sends `Authorization: Bearer …` on those paths, let it through
+    // without demanding Basic auth — the handler will validate the JWT
+    // and deny if invalid. Non-subscribe paths still require Basic auth.
+    let is_subscribe_path = path.ends_with("/subscribe")
+        || path.contains("/subscribe?")
+        || path == "/api/subscribe"
+        || path.starts_with("/api/subscribe?");
+    if is_subscribe_path {
+        // Subscribe paths support both Basic auth and JWT Bearer.
+        // If the client sends `Authorization: Bearer …`, pass through
+        // to the handler which validates the JWT. If no Authorization
+        // header at all, also pass through so handlers can check JWT
+        // config (e.g., `?access_token=` query param) or return an
+        // appropriate 401 with the right error code. Non-Bearer auth
+        // headers fall through to the standard Basic auth path below.
+        if let Some(h) = req.headers().get(header::AUTHORIZATION) {
+            if h.to_str().unwrap_or("").starts_with("Bearer ") {
+                return next.run(req).await;
+            }
+        } else {
+            // No Authorization header on subscribe path — pass through.
+            // Handlers enforce Basic auth or JWT as appropriate.
+            return next.run(req).await;
+        }
+    }
+
     let header = match req.headers().get(header::AUTHORIZATION) {
         Some(h) => h.clone(),
         None => return ApiError::Unauthorized("missing Authorization header".into()).into_response(),
@@ -161,6 +189,76 @@ fn extract_tenant_id(path: &str) -> Option<&str> {
     match rest.split_once('/') {
         Some((tid, _)) => Some(tid),
         None => Some(rest),
+    }
+}
+
+/// Resolves the tenant for a session-keyed v2 route by combining the
+/// auth-derived tenant (when present) and the session locator's
+/// recorded tenant. Used by `append_and_fetch_session_keyed`,
+/// `fetch_recent_session_keyed`, `subscribe_session_keyed`, and
+/// (M27 Task 4) the v2 channel handlers.
+///
+/// `route_hint` is woven into the 400 error message's recovery hint
+/// (e.g., `"append_and_fetch"`, `"fetch_recent"`, `"subscribe"`) so a
+/// developer hitting a pre-M26 session sees a path forward.
+///
+/// Returns `Ok(tenant_external_id)` on success, or `Err(Response)`
+/// on the 400 / 403 / 500 error paths.
+pub async fn resolve_session_tenant(
+    state: &AppState,
+    session: &str,
+    authed: Option<&AuthedTenant>,
+    route_hint: &'static str,
+) -> Result<String, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let authed_tenant = authed.map(|a| a.external_id.as_str());
+    let authed_user = authed.map(|a| a.user_id.as_str());
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), session).await {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return Err(ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response());
+            }
+        },
+        None => None,
+    };
+    match (authed_tenant, locator_tenant.as_deref()) {
+        (Some(a), Some(l)) if a != l => {
+            Err(ApiError::Forbidden(format!(
+                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
+                authed_user.unwrap_or("?")
+            ))
+            .into_response())
+        }
+        (Some(a), _) => Ok(a.to_string()),
+        (None, Some(l)) => Ok(l.to_string()),
+        (None, None) => {
+            // When auth is configured, the missing-auth case looks like
+            // an unauthenticated request rather than a bad request —
+            // return 401 so clients know to supply credentials.
+            if state.auth.is_some() {
+                Err(ApiError::Unauthorized(
+                    "missing Authorization header".into(),
+                )
+                .into_response())
+            } else {
+                Err(ApiError::Core(agentdb_core::Error::Invalid {
+                    field: Some("tenant".into()),
+                    message: format!(
+                        "cannot resolve tenant for session {session}: no Authorization header, \
+                         no session locator. Use /api/tenants/<tid>/sessions/<sid>/{route_hint} \
+                         for pre-M26 sessions, or enable auth"
+                    ),
+                })
+                .into_response())
+            }
+        }
     }
 }
 

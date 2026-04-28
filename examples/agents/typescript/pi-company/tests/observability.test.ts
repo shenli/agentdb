@@ -31,7 +31,7 @@ const fakeTool: CompanyTool<ReturnType<typeof Type.Object<{ x: any }>>> = {
 function makeCtx(client: FakeClient, role: any = "engineer"): ToolContext {
   return {
     client: client as any,
-    run: { tenant: "t", runId: "r1" },
+    run: { runId: "r1" },
     role,
     memory: { recordEvent: async () => {}, sessionName: "r1:engineer" } as any,
     channels: null as any,
@@ -40,14 +40,14 @@ function makeCtx(client: FakeClient, role: any = "engineer"): ToolContext {
 
 test("wrapToolForObservation passes through the result unchanged", async () => {
   const client = new FakeClient();
-  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { tenant: "t", runId: "r1" });
+  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { runId: "r1" });
   const result = await wrapped.handler({ x: "hello" }, makeCtx(client));
   assert.equal(result.text, "got hello");
 });
 
 test("wrapped tool appends an observation to _plan with truncated payload", async () => {
   const client = new FakeClient();
-  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { tenant: "t", runId: "r1" });
+  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { runId: "r1" });
   await wrapped.handler({ x: "hello" }, makeCtx(client));
   const planSess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`);
   assert.ok(planSess, "should have created the _plan session");
@@ -64,7 +64,7 @@ test("wrapped tool propagates handler errors and still writes an error observati
     handler: async () => { throw new Error("boom"); },
   };
   const client = new FakeClient();
-  const wrapped = wrapToolForObservation(throwingTool, "engineer", client as any, { tenant: "t", runId: "r1" });
+  const wrapped = wrapToolForObservation(throwingTool, "engineer", client as any, { runId: "r1" });
   await assert.rejects(() => wrapped.handler({ x: "hi" }, makeCtx(client)), /boom/);
   const planSess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
   const ev = planSess.appended[0];
@@ -73,7 +73,7 @@ test("wrapped tool propagates handler errors and still writes an error observati
 
 test("relates_to_step is forwarded when params include step_id", async () => {
   const client = new FakeClient();
-  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { tenant: "t", runId: "r1" });
+  const wrapped = wrapToolForObservation(fakeTool, "engineer", client as any, { runId: "r1" });
   await wrapped.handler({ x: "hi", step_id: "s7" }, makeCtx(client));
   const planSess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
   assert.equal(planSess.appended[0].relates_to_step, "s7");

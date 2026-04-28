@@ -4,7 +4,7 @@ import { Channels, channelName } from "../src/channels.ts";
 
 test("channelName composes runId and channel", () => {
   assert.equal(
-    channelName({ tenant: "pi-company", runId: "r-1" }, "announcements"),
+    channelName({ runId: "r-1" }, "announcements"),
     "r-1:announcements",
   );
 });
@@ -14,7 +14,7 @@ test("Channels.publish forwards to broadcast()", async () => {
   const fakeClient = {
     broadcast: async (args: any) => { calls.push(args); },
   };
-  const ch = new Channels(fakeClient as any, { tenant: "pi-company", runId: "r-1" });
+  const ch = new Channels(fakeClient as any, { runId: "r-1" });
   await ch.publish("announcements", { kind: "ping" });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].channel, "r-1:announcements");
@@ -29,7 +29,7 @@ test("Channels.subscribe yields broadcasts via the SDK's AsyncIterable", async (
   const fakeClient = {
     subscribeChannel: (args: any) => fakeSub(args),
   };
-  const ch = new Channels(fakeClient as any, { tenant: "pi-company", runId: "r-1" });
+  const ch = new Channels(fakeClient as any, { runId: "r-1" });
   const got: any[] = [];
   for await (const msg of ch.subscribe("announcements")) {
     got.push((msg as any).payload.kind);

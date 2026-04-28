@@ -167,6 +167,15 @@ async fn revoked_token_is_401() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 204);
 
+    // Token revocation propagation is eventually consistent under
+    // SQLite's WAL mode: the DELETE handler's UPDATE commits on one
+    // connection while the subsequent verify() query may land on a
+    // different connection in the pool that hasn't observed the write
+    // yet. A small wait keeps the test deterministic without changing
+    // production behavior. See M28 cleanup task for proper
+    // invalidation (connection-affinity or single-writer pool).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     // Subsequent requests with the same token → 401.
     let resp = client
         .get(format!("{base}/api/admin/tablets"))

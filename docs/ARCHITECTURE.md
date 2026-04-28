@@ -152,36 +152,46 @@ Most requests are a single round trip terminating in one
 `Box_`. A few cross multiple tablets (unpinned reads,
 broadcast subscriptions); the routing layer decides.
 
-### Single-session write (REST `POST /api/sessions/:sid/append_and_fetch`)
+### REST write request flow
 
-```
-client
-   │  1. POST with payload
-   ▼
-agentdb-api
-   │  2. auth → AuthedTenant ext (auth_middleware.rs)
-   │  3. resolve session_locator (meta) → tenant + tablet
-   │  4. is the tablet local?
-   ▼
-   ├── yes ────────────────────► agentdb-core::Box_
-   │                                 │  per-session lock
-   │                                 │  HLC.now() + seq
-   │                                 │  RocksDB / SlateDB write
-   │                                 │  in-memory index update
-   │                                 │  fetch last N
-   │                                 ▼
-   │                              broadcast event to subscribers
-   │                                 │  (BroadcastBus → SSE consumers)
-   │                                 ▼
-   │                              return AppendResult
-   │
-   └── no  ────────────────────► forwarding::forward_append_and_fetch
-                                     │  HTTP POST to peer node's REST
-                                     ▼  (Authorization, X-AgentDB-HLC,
-                                         X-AgentDB-Forwarded passed through)
-                                  peer terminates locally as above,
-                                  reply relayed verbatim
-```
+1. TLS terminate / parse request.
+2. CORS middleware (subscribe + channel routes).
+3. Basic auth → `AuthedTenant { external_id, tenant_id }` injected
+   into request extensions (session/subscribe routes); JWT decode +
+   verify with tenant claim (channel routes).
+4. Handler reads tenant from extension or claim; resolves session
+   locator only if needed (cross-tenant authorization check on
+   session-keyed routes).
+5. `route_session_for_write(tenant, session)` (M27 cache-first):
+   - **Cache hit (steady-state).** `LocationProxy` returns the
+     tablet for `hash(session_id) % S`. No meta read.
+   - **Cache miss.** Fall back to tenant-hash routing
+     (`route_session_for_io`'s default path).
+6. Local-tablet path: append to RocksDB / SlateDB → index update
+   → optional `fetch_recent` snapshot → ACK.
+7. Remote-tablet path: forward via `agentdb-core::forwarding` to
+   the owning node.
+
+The `session_locators` row is the canonical record of where a
+session lives, but it is no longer on the steady-state hot path.
+Handoff updates push through `change_notifier` (Postgres
+LISTEN/NOTIFY) so `LocationProxy` converges in tens of ms.
+
+### `session_locators` consultation points (post-M27)
+
+| Path | When read | Why |
+|---|---|---|
+| Steady-state append | Never | Cache-first (LocationProxy + tenant-hash) |
+| First-write to a new session | Never (read); UPSERT once after data-plane ACK | `populate_session_locator` stamps the row off the critical path |
+| Auth-derived tenant cross-check (session-keyed v2 routes) | Once per request | Prevents a user from acting on another tenant's session |
+| Fork parent lookup | Always | Parent's tablet is canonical metadata |
+| Admin enumeration (`list_by_tenant_external`) | Always | Operator surface; cost acceptable |
+| Mongo `find` with no `session_id` | Always | Tenant-wide fanout enumeration |
+| Tenant-wide subscribe open (`/api/subscribe`) | Once per stream open | Resolves the session set |
+
+The locator is consulted in metadata-shaped paths and the auth
+cross-check; the per-append routing decision is cache-resident
+and never touches the meta store.
 
 ### Single-session read (REST recent / Mongo `find` with `session_id`)
 
@@ -209,7 +219,7 @@ recall loss. See [Hybrid retrieval](#hybrid-retrieval).
 
 ### Real-time subscribe (SSE)
 
-`GET /api/tenants/:t/subscribe` (or `…/sessions/:s/subscribe`):
+`GET /api/subscribe` (or `GET /api/sessions/:s/subscribe`):
 the handler in `agentdb-api::stream` opens the bus
 subscription, optionally replays from `from_seq` by reading
 KV/segments, then transitions to live tail. JWT auth on the
@@ -218,7 +228,7 @@ reconnect.
 
 ### Ephemeral broadcast
 
-`POST /api/tenants/:t/channels/:c/publish` writes to the
+`POST /api/channels/:c/publish` writes to the
 node-local `BroadcastBus` (`agentdb-api::broadcast`). The
 matching `subscribe` stream sends the messages to attached
 SSE consumers. No durability, no replay, no cross-node
@@ -728,8 +738,8 @@ one per use case.
 
 ### Durable session-event subscribe (`agentdb-api::stream`)
 
-`GET /api/tenants/:t/subscribe` and
-`GET /api/tenants/:t/sessions/:s/subscribe` open a
+`GET /api/subscribe` and
+`GET /api/sessions/:s/subscribe` open a
 long-lived SSE stream. Each frame carries one event envelope:
 `{tenant, session, seq, ts_ms, payload, kind?, actor_id?}`.
 
@@ -761,8 +771,8 @@ owning node when the request targets a peer-owned session.
 
 ### Ephemeral broadcast channels (`agentdb-api::broadcast`)
 
-`POST /api/tenants/:t/channels/:c/publish` and
-`GET /api/tenants/:t/channels/:c/subscribe`. Channels are
+`POST /api/channels/:c/publish` and
+`GET /api/channels/:c/subscribe`. Channels are
 ephemeral: no durability, no replay, no `from_seq`.
 
 **`BroadcastBus`.** In-process tokio broadcast channels with

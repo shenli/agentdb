@@ -30,7 +30,7 @@ class FakeChannels {
   run: any;
   constructor(client: FakeClient, run: any) { this.client = client; this.run = run; }
   async publish(name: string, payload: unknown) {
-    await this.client.broadcast({ channel: `${this.run.runId}:${name}`, payload, tenant: this.run.tenant });
+    await this.client.broadcast({ channel: `${this.run.runId}:${name}`, payload });
   }
   subscribe(_name: string) {
     return { async *[Symbol.asyncIterator]() { /* no events */ } };
@@ -60,7 +60,7 @@ function makeBudgets(over: Partial<Budgets> = {}): Budgets {
 
 test("boot() calls update_plan + dispatch_step from the scripted LLM", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   const channels = new FakeChannels(client, run);
   const llm = new ScriptedLLM([
     [
@@ -98,13 +98,13 @@ class ManualFakeChannels {
   private resolver: ((v: IteratorResult<any>) => void) | null = null;
   constructor(client: FakeClient, run: any) { this.client = client; this.run = run; }
   async publish(name: string, payload: unknown) {
-    await this.client.broadcast({ channel: `${this.run.runId}:${name}`, payload, tenant: this.run.tenant });
+    await this.client.broadcast({ channel: `${this.run.runId}:${name}`, payload });
   }
   pushToMailbox(payload: any) {
     if (this.resolver) {
       const r = this.resolver;
       this.resolver = null;
-      r({ value: { tenant: this.run.tenant, channel: `${this.run.runId}:directs:ceo`, payload, ts_ms: Date.now(), sender: "engineer" }, done: false });
+      r({ value: { channel: `${this.run.runId}:directs:ceo`, payload, ts_ms: Date.now(), sender: "engineer" }, done: false });
     } else {
       this.mailboxQueue.push(payload);
     }
@@ -127,7 +127,7 @@ class ManualFakeChannels {
             if (queue.length > 0) {
               const payload = queue.shift();
               return Promise.resolve({
-                value: { tenant: self.run.tenant, channel: `${self.run.runId}:directs:ceo`, payload, ts_ms: Date.now(), sender: "engineer" },
+                value: { channel: `${self.run.runId}:directs:ceo`, payload, ts_ms: Date.now(), sender: "engineer" },
                 done: false,
               });
             }
@@ -141,7 +141,7 @@ class ManualFakeChannels {
 
 test("start() runs boot then wakes once on a step_completed payload, terminates on wrap_up", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   const channels = new ManualFakeChannels(client, run);
   const llm = new ScriptedLLM([
     [
@@ -180,7 +180,7 @@ test("start() runs boot then wakes once on a step_completed payload, terminates 
 
 test("budget cap (maxLlmCalls) terminates the loop", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   const channels = new ManualFakeChannels(client, run);
   const llm = new ScriptedLLM(
     Array.from({ length: 20 }, () => [{ tool: "update_plan", args: {
@@ -217,7 +217,7 @@ test("budget cap (maxLlmCalls) terminates the loop", async () => {
 
 test("step timeout fires when no step_completed arrives in time", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   const channels = new ManualFakeChannels(client, run);
 
   const llm = new ScriptedLLM([

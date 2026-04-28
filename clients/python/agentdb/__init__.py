@@ -1,24 +1,21 @@
 """Python client for AgentDB.
 
-Typical usage in dev mode (no auth):
+Typical usage in auth mode:
 
     from agentdb import Client
 
-    client = Client("http://127.0.0.1:7878")
-    session = client.session("agent-1", tenant="demo")
+    client = Client(
+        base_url="http://127.0.0.1:7878",
+        auth=("alice", "hunter2"),
+    )
+    session = client.session("agent-1")
     result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
     print(result.seq, [e.payload for e in result.recent])
 
 The `append + fetch_last_n` pattern is the canonical hot path —
 write one event and read the last N back in the same round trip.
-For pure reads, point a MongoDB driver at the wire port (default
-:7879).
-
-In auth mode the tenant is implicit (derived from credentials):
-
-    client = Client("https://prod.example.com", user="alice", password="hunter2")
-    session = client.session("agent-1")  # tenant comes from auth
-    session.append({"role": "tool", "text": "did a thing"})
+Tenant is derived from the auth credentials server-side; no
+`tenant` arg is needed anywhere.
 
 For async code (LangChain, LlamaIndex, the Anthropic / OpenAI
 SDKs, etc.) install the optional `[async]` extra and use
@@ -30,10 +27,14 @@ SDKs, etc.) install the optional `[async]` extra and use
     from agentdb import AsyncClient
 
     async def main():
-        async with AsyncClient("http://127.0.0.1:7878") as client:
-            session = client.session("agent-1", tenant="demo")
-            result = await session.append({"role": "user", "text": "hi"},
-                                          fetch_last_n=5)
+        async with AsyncClient(
+            base_url="http://127.0.0.1:7878",
+            auth=("alice", "hunter2"),
+        ) as client:
+            session = client.session("agent-1")
+            result = await session.append(
+                {"role": "user", "text": "hi"}, fetch_last_n=5
+            )
             print(result.seq)
 
     asyncio.run(main())
@@ -95,4 +96,4 @@ def __getattr__(name: str):
         return getattr(_async_client, name)
     raise AttributeError(f"module 'agentdb' has no attribute {name!r}")
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

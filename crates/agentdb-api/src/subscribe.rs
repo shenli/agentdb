@@ -67,6 +67,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 
+use axum::Extension;
+
+use crate::auth_middleware::AuthedTenant;
 use crate::event_bus::EventEnvelope;
 use crate::AppState;
 
@@ -112,11 +115,33 @@ fn normalize_kind_filter(raw: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/subscribe \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn subscribe_session(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
     Query(q): Query<SubscribeQuery>,
     headers: HeaderMap,
+) -> axum::response::Response {
+    // v1 path: auth is either disabled (auth: None) or not in scope here;
+    // pass `true` to skip the Basic-auth check inside the inner handler.
+    subscribe_session_inner(state, tenant, session, q, headers, true).await
+}
+
+/// `basic_authed`: whether the caller was authenticated via Basic auth.
+/// When `false` and the server has auth configured, the inner handler
+/// returns 401 if the tenant has no JWT config (which would otherwise
+/// let the request through silently without any auth enforcement).
+async fn subscribe_session_inner(
+    state: AppState,
+    tenant: String,
+    session: String,
+    q: SubscribeQuery,
+    headers: HeaderMap,
+    basic_authed: bool,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -128,6 +153,12 @@ pub async fn subscribe_session(
     if let agentdb_core::RouteDecision::Remote { target, .. } =
         state.registry.route_session_for_io(&tenant, &session)
     {
+        // TODO(M27 Task 5): once /api/tenants/{t}/.../subscribe is deleted,
+        // this redirect should target the v2 URL `/api/sessions/{s}/subscribe`.
+        // Both v1 and v2 callers funnel through this inner helper, so we'd
+        // also need to thread the caller's route shape into the inner if we
+        // want path fidelity per call. For now the redirect uses the v1 URL
+        // because v1 still exists for both shapes during the transition.
         let path = format!(
             "/api/tenants/{}/sessions/{}/subscribe",
             tenant, session
@@ -136,10 +167,9 @@ pub async fn subscribe_session(
     }
 
     // JWT enforcement (spec §6.13). Returns Ok(None) if the tenant
-    // has no JWT config — falls through to whatever auth the route's
-    // middleware applies (typically Basic). Otherwise Some(claims) on
-    // verify success, or an ApiError on dual-auth / missing / invalid /
-    // expired token.
+    // has no JWT config — falls through to Basic-auth enforcement
+    // below. Otherwise Some(claims) on verify success, or an
+    // ApiError on dual-auth / missing / invalid / expired token.
     let jwt_claims = match crate::subscribe_auth::extract_subscribe_jwt(
         &state,
         &headers,
@@ -151,6 +181,15 @@ pub async fn subscribe_session(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+    // If JWT is not configured for this tenant, require Basic auth.
+    // When `basic_authed` is false (v2 path, no Authorization header)
+    // and the server has auth enabled, the request is unauthenticated.
+    if jwt_claims.is_none() && !basic_authed && state.auth.is_some() {
+        return crate::error::ApiError::Unauthorized(
+            "missing Authorization header".into(),
+        )
+        .into_response();
+    }
     if let Some(claims) = &jwt_claims {
         if !claims.sessions.allows(&session) {
             return crate::error::ApiError::Coded(
@@ -545,10 +584,24 @@ fn build_subscribed_payload(
     payload
 }
 
+#[deprecated(
+    since = "0.27.0",
+    note = "v1 tenant-in-URL surface; use /api/subscribe \
+            (auth-derived tenant) instead. Scheduled for removal in M28."
+)]
 pub async fn subscribe_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
     Query(q): Query<TenantSubscribeQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    subscribe_tenant_inner(state, tenant, q, headers).await
+}
+
+async fn subscribe_tenant_inner(
+    state: AppState,
+    tenant: String,
+    q: TenantSubscribeQuery,
     headers: HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -843,6 +896,72 @@ pub async fn subscribe_tenant(
     Sse::new(combined)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
         .into_response()
+}
+
+/// v2: `/api/sessions/{session_id}/subscribe` — auth-derived tenant.
+///
+/// Mirrors `append_and_fetch_session_keyed`'s shape: takes
+/// `Option<Extension<AuthedTenant>>` rather than the non-optional
+/// form so the `(None, Some(locator))` branch in
+/// `resolve_session_tenant` can fall back to the locator's tenant
+/// when the request has no auth header. The tenant-wide v2
+/// counterpart `subscribe_tenant_keyed` uses the non-optional form
+/// because there's no per-session locator to fall back to.
+#[tracing::instrument(
+    name = "rest.subscribe_session_keyed",
+    skip(state, headers, authed),
+    fields(session = %session),
+)]
+pub async fn subscribe_session_keyed(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    Query(q): Query<SubscribeQuery>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+) -> axum::response::Response {
+    let basic_authed = authed.is_some();
+    let tenant = match crate::auth_middleware::resolve_session_tenant(
+        &state,
+        &session,
+        authed.as_deref(),
+        "subscribe",
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    subscribe_session_inner(state, tenant, session, q, headers, basic_authed).await
+}
+
+/// v2: `/api/subscribe` — auth-derived tenant, no path params.
+/// Tenant is the auth-derived tenant from Basic auth. No locator
+/// cross-check needed because the URL doesn't address any specific
+/// session. Auth is always required (no JWT fallback for tenant-wide
+/// subscribe since there's no session context to look up JWT config).
+#[tracing::instrument(
+    name = "rest.subscribe_tenant_keyed",
+    skip(state, headers, authed),
+    fields(tenant = tracing::field::Empty),
+)]
+pub async fn subscribe_tenant_keyed(
+    State(state): State<AppState>,
+    Query(q): Query<TenantSubscribeQuery>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let authed = match authed {
+        Some(a) => a.0,
+        None => {
+            return crate::error::ApiError::Unauthorized(
+                "missing Authorization header".into(),
+            )
+            .into_response();
+        }
+    };
+    tracing::Span::current().record("tenant", &authed.external_id.as_str());
+    subscribe_tenant_inner(state, authed.external_id, q, headers).await
 }
 
 #[cfg(test)]
