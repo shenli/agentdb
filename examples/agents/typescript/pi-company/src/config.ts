@@ -78,18 +78,18 @@ export function reduceConfigEvents(events: AgentEvent[], role: AgentRole): Confi
 }
 
 /**
- * Read the `_config:agents` session for this tenant, reduce-over-events
- * to produce the override patch for the given role, merge with the code
- * defaults. Called at agent-instantiation time and on each agent-loop
- * iteration so hot config updates take effect.
+ * Read the `_config:agents` session, reduce-over-events to produce the
+ * override patch for the given role, merge with the code defaults. Called
+ * at agent-instantiation time and on each agent-loop iteration so hot
+ * config updates take effect. Tenant is implicit — derived from the
+ * auth-bound user on the server side.
  */
 export async function loadAgentConfig(
   client: Client,
-  tenant: string,
   role: EmployeeRole,
 ): Promise<AgentConfig> {
   const defaults = CODE_DEFAULTS[role];
-  const session = client.session(CONFIG_SESSION, { tenant });
+  const session = client.session(CONFIG_SESSION);
   const resp = await session.fetchRecent(1024);
   const recent = (resp.recent ?? []) as AgentEvent[];
   const patch = reduceConfigEvents(recent, role);
@@ -98,14 +98,14 @@ export async function loadAgentConfig(
 
 /**
  * Append an `agent_override` event to the config session. Used by the
- * CEO's `update_agent_config` tool (Task 9).
+ * CEO's `update_agent_config` tool. Tenant is implicit — derived from the
+ * auth-bound user on the server side.
  */
 export async function appendConfigOverride(
   client: Client,
-  tenant: string,
   role: AgentRole,
   patch: ConfigPatch,
 ): Promise<void> {
-  const session = client.session(CONFIG_SESSION, { tenant });
+  const session = client.session(CONFIG_SESSION);
   await session.append({ kind: "agent_override", role, patch } as any, { fetchLastN: 0 });
 }

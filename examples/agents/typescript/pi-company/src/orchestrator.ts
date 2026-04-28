@@ -127,7 +127,7 @@ export class Orchestrator {
 
   private async recordMeta(event: Record<string, unknown>): Promise<void> {
     const sessionName = `${this.run.runId}:${META_SESSION_NAME}`;
-    const session = this.client.session(sessionName, { tenant: this.run.tenant });
+    const session = this.client.session(sessionName);
     await session.append(event as any, { fetchLastN: 0 });
   }
 

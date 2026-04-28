@@ -80,7 +80,6 @@ export async function runScenario(
   steps: ScenarioStep[],
   channels: Channels,
   client: Client,
-  tenant: string,
 ): Promise<void> {
   for (const step of steps) {
     await new Promise<void>((resolve) => setTimeout(resolve, step.delayMs));
@@ -92,7 +91,7 @@ export async function runScenario(
       });
       console.log(`> CEO: ${step.action.text}`);
     } else if (step.action.type === "config_update") {
-      await appendConfigOverride(client, tenant, step.action.role, step.action.patch);
+      await appendConfigOverride(client, step.action.role, step.action.patch);
       console.log(
         `> CEO: (config update) ${step.action.role} <- ${JSON.stringify(step.action.patch).slice(0, 120)}`,
       );

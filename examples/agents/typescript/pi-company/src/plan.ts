@@ -119,7 +119,7 @@ export async function appendPlanRevised(
   steps: Step[],
   reason: string,
 ): Promise<void> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   await sess.append(
     { kind: "plan_revised", reason, steps } as any,
     { fetchLastN: 0 },
@@ -138,7 +138,7 @@ export async function appendStepDispatched(
   assigned: Role,
   text: string,
 ): Promise<void> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   await sess.append(
     { kind: "step_dispatched", step_id, assigned, text } as any,
     { fetchLastN: 0 },
@@ -158,7 +158,7 @@ export async function appendStepCompleted(
   summary: string,
   from: AgentRole,
 ): Promise<void> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   await sess.append(
     { kind: "step_completed", step_id, status, summary, from } as any,
     { fetchLastN: 0 },
@@ -178,7 +178,7 @@ export async function appendObservation(
   payload: unknown,
   relates_to_step?: string,
 ): Promise<void> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   await sess.append(
     { kind: "observation", from, toolName, payload, relates_to_step } as any,
     { fetchLastN: 0 },
@@ -195,7 +195,7 @@ export async function appendStepTimeout(
   run: RunIdentity,
   step_id: string,
 ): Promise<void> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   await sess.append(
     { kind: "step_timeout", step_id } as any,
     { fetchLastN: 0 },
@@ -213,7 +213,7 @@ export async function loadCurrentPlan(
   run: RunIdentity,
   observationWindow: number = 20,
 ): Promise<PlanState> {
-  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const sess = client.session(planSessionName(run));
   const resp = await sess.fetchRecent(1024);
   const recent = (resp.recent ?? []) as AgentEvent[];
   const state = reducePlanEvents(recent);

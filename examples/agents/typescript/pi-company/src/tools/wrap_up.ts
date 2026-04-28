@@ -26,7 +26,7 @@ export const wrapUp: CompanyTool<typeof params> = {
   parameters: params,
   handler: async (args: Static<typeof params>, ctx) => {
     const metaName = `${ctx.run.runId}:_meta`;
-    const sess = ctx.client.session(metaName, { tenant: ctx.run.tenant });
+    const sess = ctx.client.session(metaName);
     await sess.append(
       {
         kind: "run_ended",

@@ -164,7 +164,7 @@ class FakeClient {
 
 test("appendPlanRevised writes a plan_revised event to {runId}:_plan", async () => {
   const client = new FakeClient();
-  await appendPlanRevised(client as any, { tenant: "t", runId: "r1" }, [
+  await appendPlanRevised(client as any, { runId: "r1" }, [
     { id: "s1", text: "do it", assigned: "engineer", status: "pending" },
   ], "initial");
   const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`);
@@ -177,7 +177,7 @@ test("appendPlanRevised writes a plan_revised event to {runId}:_plan", async () 
 
 test("appendStepDispatched + appendStepCompleted both target {runId}:_plan", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   await appendStepDispatched(client as any, run, "s1", "engineer", "do it");
   await appendStepCompleted(client as any, run, "s1", "ok", "did it", "engineer");
   const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
@@ -189,7 +189,7 @@ test("appendStepDispatched + appendStepCompleted both target {runId}:_plan", asy
 
 test("appendObservation includes relates_to_step when provided", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
+  const run = { runId: "r1" };
   await appendObservation(client as any, run, "engineer", "write_doc", { title: "x" }, "s1");
   const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
   assert.equal(sess.appended[0].event.kind, "observation");
@@ -198,7 +198,7 @@ test("appendObservation includes relates_to_step when provided", async () => {
 
 test("appendStepTimeout writes a step_timeout event to {runId}:_plan", async () => {
   const client = new FakeClient();
-  await appendStepTimeout(client as any, { tenant: "t", runId: "r1" }, "s1");
+  await appendStepTimeout(client as any, { runId: "r1" }, "s1");
   const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
   assert.equal(sess.appended.length, 1);
   assert.equal(sess.appended[0].event.kind, "step_timeout");
@@ -207,8 +207,8 @@ test("appendStepTimeout writes a step_timeout event to {runId}:_plan", async () 
 
 test("loadCurrentPlan reduces session events and truncates observations", async () => {
   const client = new FakeClient();
-  const run = { tenant: "t", runId: "r1" };
-  const sess = client.session(`r1:${PLAN_SESSION_SUFFIX}`, { tenant: "t" }) as any as FakeSession;
+  const run = { runId: "r1" };
+  const sess = client.session(`r1:${PLAN_SESSION_SUFFIX}`) as any as FakeSession;
   sess.recent = [
     { payload: { kind: "plan_revised", reason: "v1", steps: [
       { id: "s1", text: "t", assigned: "engineer", status: "pending" },

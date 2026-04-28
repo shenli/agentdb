@@ -7,8 +7,6 @@ import { launchScenario, runScenario } from "./scenarios/launch.ts";
 import { assertApiKeyAvailable } from "./llm.ts";
 import { DEFAULT_BUDGETS, type Budgets } from "./ceo.ts";
 
-const TENANT = "pi-company";
-
 interface ParsedArgs {
   scenario?: string;
   resumeRunId?: string;
@@ -67,12 +65,15 @@ async function main(): Promise<void> {
 
   const args = parseArgs(process.argv.slice(2));
   const runId = args.resumeRunId ?? `r-${Date.now()}`;
-  const run = { tenant: TENANT, runId };
+  const run = { runId };
 
   console.log(`pi-company starting (run-id: ${runId})...`);
   const server = await startAgentDBServer();
   console.log(`AgentDB ready at ${server.baseUrl}`);
-  const client = new Client(server.baseUrl, { tenant: TENANT });
+  const client = new Client({
+    baseUrl: server.baseUrl,
+    auth: server.auth,
+  });
   const orchestrator = new Orchestrator(client, run);
 
   if (args.goal) {
@@ -93,7 +94,7 @@ async function main(): Promise<void> {
   if (args.scenario === "launch") {
     console.log(`Running scripted scenario 'launch' (run-id: ${runId})...`);
     try {
-      await runScenario(launchScenario, channels, client, TENANT);
+      await runScenario(launchScenario, channels, client);
       console.log("Scenario complete. Draining for 20s...");
       await new Promise((r) => setTimeout(r, 20_000));
     } finally {

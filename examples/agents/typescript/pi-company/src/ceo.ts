@@ -275,7 +275,7 @@ export class AutonomousCEO {
   }
 
   protected async countPlanRevisedEvents(): Promise<number> {
-    const sess = this.deps.client.session(`${this.deps.run.runId}:_plan`, { tenant: this.deps.run.tenant });
+    const sess = this.deps.client.session(`${this.deps.run.runId}:_plan`);
     const resp = await sess.fetchRecent(1024);
     return (resp.recent ?? []).filter((e: any) => (e.payload?.kind ?? e.kind) === "plan_revised").length;
   }
@@ -286,7 +286,7 @@ export class AutonomousCEO {
    */
   private async recordRunEnded(): Promise<void> {
     if (this.terminationCause === "wrap_up") return;
-    const sess = this.deps.client.session(`${this.deps.run.runId}:_meta`, { tenant: this.deps.run.tenant });
+    const sess = this.deps.client.session(`${this.deps.run.runId}:_meta`);
     await sess.append(
       { kind: "run_ended", cause: this.terminationCause || "unknown", ended_at: Date.now() } as any,
       { fetchLastN: 0 },

@@ -12,8 +12,6 @@ const skipReason = !SMOKE
   ? "set AGENTDB_PI_COMPANY_SMOKE=1 to run the autonomous-mode smoke test"
   : undefined;
 
-const TENANT = "pi-company-smoke-autonomous";
-
 test(
   "autonomous mode boots, dispatches, and terminates within budget",
   { skip: skipReason, timeout: 240_000 },
@@ -21,8 +19,11 @@ test(
     const server = await startAgentDBServer();
     try {
       const runId = `r-${Date.now()}`;
-      const run = { tenant: TENANT, runId };
-      const client = new Client(server.baseUrl, { tenant: TENANT });
+      const run = { runId };
+      const client = new Client({
+        baseUrl: server.baseUrl,
+        auth: server.auth,
+      });
       const orch = new Orchestrator(client, run);
 
       await orch.startAutonomous(
@@ -41,7 +42,7 @@ test(
       assert.ok(plan.steps.length > 0, "expected at least one step in the plan");
 
       // Verify _meta contains a run_ended event with a known cause
-      const metaSess = client.session(`${runId}:_meta`, { tenant: TENANT });
+      const metaSess = client.session(`${runId}:_meta`);
       const resp = await metaSess.fetchRecent(1024);
       const ended = (resp.recent ?? []).find(
         (e: any) => (e.payload?.kind ?? e.kind) === "run_ended",

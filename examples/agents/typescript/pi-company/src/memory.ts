@@ -35,7 +35,7 @@ export class Memory {
     this.run = run;
     this.role = role;
     this._sessionName = sessionNameOverride ?? `${run.runId}:${role}`;
-    this._session = client.session(this._sessionName, { tenant: run.tenant });
+    this._session = client.session(this._sessionName);
   }
 
   get sessionName(): string {

@@ -29,7 +29,6 @@ export class Channels {
     await this._client.broadcast({
       channel: channelName(this.run, name),
       payload,
-      tenant: this.run.tenant,
     });
   }
 
@@ -40,7 +39,6 @@ export class Channels {
   subscribe(name: string): AsyncIterable<BroadcastMessage> {
     return this._client.subscribeChannel({
       channel: channelName(this.run, name),
-      tenant: this.run.tenant,
     });
   }
 }

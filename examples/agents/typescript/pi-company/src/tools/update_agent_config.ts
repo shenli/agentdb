@@ -39,7 +39,6 @@ export const updateAgentConfig: CompanyTool<typeof params> = {
   handler: async (args: Static<typeof params>, ctx: ToolContext) => {
     await appendConfigOverride(
       ctx.client,
-      ctx.run.tenant,
       args.role as AgentRole,
       args.patch as ConfigPatch,
     );

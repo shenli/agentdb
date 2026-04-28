@@ -11,8 +11,6 @@ export type AgentRole =
 export interface AgentEvent extends AgentDBEvent {}
 
 export interface RunIdentity {
-  /** Always "pi-company" for the demo. */
-  tenant: string;
   /** e.g. "r-1714063200" */
   runId: string;
 }
