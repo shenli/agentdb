@@ -39,8 +39,8 @@ export interface AutonomousCEODeps {
  * Lifecycle:
  *   1. `boot()` runs the initial-plan turn (LLM is asked to call
  *      update_plan + dispatch_step on the goal).
- *   2. `wakeLoop()` (Task 12) subscribes to `directs:ceo` and
- *      re-deliberates whenever a `step_completed` event arrives.
+ *   2. `wakeLoop()` subscribes to `directs:ceo` and re-deliberates
+ *      whenever a `step_completed` event arrives.
  *   3. The loop terminates on `wrap_up` (terminate=true returned from
  *      runTurn) or any budget cap.
  */
@@ -66,6 +66,30 @@ export class AutonomousCEO {
     const tools = this.toolsByName();
     await this.driveTurn("(boot)", tools, ctx);
     this.revisions = await this.countPlanRevisedEvents();
+  }
+
+  async start(): Promise<void> {
+    await this.boot();
+    if (this.budgetCheckTerminate()) {
+      await this.recordRunEnded();
+      return;
+    }
+    if (!this.terminated) await this.wakeLoop();
+    await this.recordRunEnded();
+  }
+
+  /**
+   * Subscribe to `directs:ceo` and re-deliberate on every payload arriving
+   * on it (typically `step_completed` from a `report_to_ceo` call). Each
+   * iteration runs one CEO LLM turn with a wake prompt.
+   */
+  protected async wakeLoop(): Promise<void> {
+    for await (const _msg of this.deps.channels.subscribe("directs:ceo")) {
+      if (this.terminated) break;
+      if (this.budgetCheckTerminate()) break;
+      await this.driveWakeTurn();
+      if (this.terminated) break;
+    }
   }
 
   // ---- internals ----
@@ -116,6 +140,78 @@ export class AutonomousCEO {
     }
   }
 
+  private async driveWakeTurn(): Promise<void> {
+    const ctx = this.makeCtx();
+    (ctx as any)._ceoPrompt = this.wakePrompt(await this.snapshotPlan());
+    const tools = this.toolsByName();
+    await this.driveTurn("(wake)", tools, ctx);
+    this.revisions = await this.countPlanRevisedEvents();
+    this.budgetCheckTerminate();
+  }
+
+  /**
+   * Build the wake prompt. Public for inspection / production wiring.
+   */
+  protected wakePrompt(plan: PlanState): string {
+    const planText = plan.steps.length
+      ? plan.steps.map((s) => `  ${s.id} [${s.status}] (${s.assigned}) ${s.text}`).join("\n")
+      : "  (empty plan)";
+    const obsText = plan.observations.length
+      ? plan.observations.map((o) => `  - ${o.from} ${o.kind}: ${JSON.stringify(o.payload).slice(0, 120)}${o.relates_to_step ? ` (re ${o.relates_to_step})` : ""}`).join("\n")
+      : "  (none)";
+    const remaining = this.budgetsRemaining();
+    return [
+      `Goal: ${this.deps.goal}`,
+      ``,
+      `Current plan:`,
+      planText,
+      ``,
+      `Recent observations:`,
+      obsText,
+      ``,
+      `Budget remaining:`,
+      `  - revisions: ${remaining.revisions}/${this.deps.budgets.maxRevisions}`,
+      `  - time: ${remaining.minutes.toFixed(1)}/${this.deps.budgets.maxMinutes} min`,
+      `  - LLM calls: ${remaining.llmCalls}/${this.deps.budgets.maxLlmCalls}`,
+      ``,
+      `Decide what to do next: dispatch_step / update_plan / mark_step / announce / direct_message / update_agent_config / wrap_up.`,
+      `Pick the smallest next action. You will be re-prompted on the next step_completed.`,
+    ].join("\n");
+  }
+
+  private budgetsRemaining(): { revisions: number; minutes: number; llmCalls: number } {
+    const elapsedSec = (Date.now() - this.startedAt) / 1000;
+    return {
+      revisions: Math.max(0, this.deps.budgets.maxRevisions - this.revisions),
+      minutes: Math.max(0, this.deps.budgets.maxMinutes - elapsedSec / 60),
+      llmCalls: Math.max(0, this.deps.budgets.maxLlmCalls - this.llmCalls),
+    };
+  }
+
+  /**
+   * Returns true if we should stop. Sets `terminationCause` when so.
+   */
+  protected budgetCheckTerminate(): boolean {
+    if (this.terminated) return true;
+    const elapsedMs = Date.now() - this.startedAt;
+    if (this.revisions >= this.deps.budgets.maxRevisions) {
+      this.terminated = true;
+      this.terminationCause = "revision_budget_exhausted";
+      return true;
+    }
+    if (elapsedMs >= this.deps.budgets.maxMinutes * 60_000) {
+      this.terminated = true;
+      this.terminationCause = "time_budget_exhausted";
+      return true;
+    }
+    if (this.llmCalls >= this.deps.budgets.maxLlmCalls) {
+      this.terminated = true;
+      this.terminationCause = "call_budget_exhausted";
+      return true;
+    }
+    return false;
+  }
+
   protected toolsByName(): Record<string, CompanyTool> {
     const out: Record<string, CompanyTool> = {};
     for (const name of CEO_AUTONOMOUS_TOOLS) {
@@ -151,5 +247,18 @@ export class AutonomousCEO {
     const sess = this.deps.client.session(`${this.deps.run.runId}:_plan`, { tenant: this.deps.run.tenant });
     const resp = await sess.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
     return (resp.recent ?? []).filter((e: any) => (e.payload?.kind ?? e.kind) === "plan_revised").length;
+  }
+
+  /**
+   * Append `run_ended` to `_meta`. Skip when wrap_up tool already wrote it
+   * (terminationCause === "wrap_up").
+   */
+  private async recordRunEnded(): Promise<void> {
+    if (this.terminationCause === "wrap_up") return;
+    const sess = this.deps.client.session(`${this.deps.run.runId}:_meta`, { tenant: this.deps.run.tenant });
+    await sess.append(
+      { kind: "run_ended", cause: this.terminationCause || "unknown", ended_at: Date.now() } as any,
+      { fetchLastN: 0 },
+    );
   }
 }
