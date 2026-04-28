@@ -36,14 +36,15 @@ decision notes that produced this design, see:
 
 ## 1. Identity model
 
-### 1.1 Tenant — logical, implicit, auth-bound
+### 1.1 Tenant — logical boundary, dual identity mechanisms
 
-A tenant is a logical boundary for quota, isolation, and billing. It is **not** present in request payloads. Tenant identity is resolved at connection accept time:
+A tenant is a logical boundary for quota, isolation, and billing. Tenant identity is established at request time by one of two mechanisms:
 
+- **Auth-derived (M26 v2 contract, recommended):** the bearer token's claim is the canonical tenant. Endpoints like `POST /api/sessions/{s}/append_and_fetch` carry no tenant in the path; the server resolves it from auth (cross-checked against the session locator). Tenant identity is not present in request payloads.
+- **Path-carried (legacy / pre-M26 sessions):** `POST /api/tenants/{t}/sessions/{s}/append_and_fetch` accepts an explicit tenant in the URL. The auth middleware verifies the path tenant matches the bearer token (mismatch → 403).
 - **Mongo wire:** SCRAM-authenticated user maps 1:1 to a tenant. The Mongo `$db` field is a sub-namespace *inside* the tenant, not the tenant selector itself.
-- **Native REST:** bearer token in `Authorization` maps to a tenant. No tenant parameter in request bodies.
 
-Internal code paths still thread `tenant_id` for quota attribution, isolation checks, and billing accounting — but it never appears on the client-visible surface.
+Tenant identity is **not** present in request payloads — only in the URL (legacy) or derived from auth (v2). Internal code paths thread `tenant_id` for quota attribution, isolation checks, and billing accounting.
 
 ### 1.2 Session — the core data unit
 
@@ -799,8 +800,8 @@ The discipline: **one binary, three modes, all differences are config-driven.** 
 
 | Mode | Use | External deps | HA | Launch |
 |---|---|---|---|---|
-| **Embedded / dev** | laptop, CI, demo, teaching, tiny self-host | none | n/a | `agentdb start --dev` |
-| **Single-node prod** | small production, edge, initial deployment | Postgres, object storage | data-plane via object storage only | `agentdb start --config prod.toml` |
+| **Embedded / dev** | laptop, CI, demo, teaching, tiny self-host | none | n/a | `agentdb serve --dev` |
+| **Single-node prod** | small production, edge, initial deployment | Postgres, object storage | data-plane via object storage only | `agentdb serve --config prod.toml` |
 | **Clustered prod** | real production | HA Postgres, object storage, optional Redis | full (failover, cross-AZ scheduling) | Helm / docker-compose / systemd |
 
 ### 12.1 Embedded / dev mode
@@ -813,10 +814,10 @@ The discipline: **one binary, three modes, all differences are config-driven.** 
 Developer flow:
 
 ```bash
-agentdb start --dev
-# Ready in ~200ms. Mongo wire :27017, REST :8080, dashboard :9000.
+agentdb serve --dev
+# Ready in ~200ms. REST + dashboard :7878, Mongo wire :7879.
 
-mongosh mongodb://localhost:27017
+mongosh mongodb://localhost:7879
 # Insert your first event in < 10 seconds from cold.
 ```
 

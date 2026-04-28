@@ -16,9 +16,10 @@ session, inheriting full context for free, running in parallel.
 |---|---|
 | **Sessions** | One per agent (`{runId}:{role}`). Persistent across runs (`--resume=<run-id>`). The session log IS the agent's memory. |
 | **Fork (the headline)** | Every employee has a `hire_contractor` tool. Forking the agent's session is O(1); the contractor inherits the parent's full context. Three narratives — hard-task handoff, speculative parallel exploration, specialist delegation — all map to this single primitive. |
-| **Real-time event subscriptions** | The TUI subscribes to all 3 channels with durable SSE. |
-| **Ephemeral broadcast channels** | Three channels: `announcements` (CEO ↔ all), `engineering` (CTO ↔ Engineer), `gtm` (Marketing ↔ Sales). In-memory fan-out; not durable. |
+| **Ephemeral broadcast channels** | Three channels: `announcements` (CEO ↔ all), `engineering` (CTO ↔ Engineer), `gtm` (Marketing ↔ Sales). In-memory fan-out; not durable. The TUI subscribes to all 3 channels (ephemeral broadcast — no `from_seq` replay). |
 | **Config-as-events** | Agent definitions live in code (`src/agents/*.ts`). Runtime overrides go in a `_config:agents` session. The CEO's `update_agent_config` tool appends overrides; agents reload config every loop iteration. Hot-tunable, event-sourced, free history. See [`docs/agent-db.md` § Recommended pattern: config-as-events](../../../../docs/agent-db.md#recommended-pattern-config-as-events). |
+
+What this demo doesn't exercise: hybrid retrieval (BM25+vector), tenant isolation at scale, three-tier lifecycle, archive tier. It proves event-sourced multi-agent orchestration on AgentDB primitives — not full operational maturity.
 
 ## Communication
 
