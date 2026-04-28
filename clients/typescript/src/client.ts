@@ -637,6 +637,26 @@ export class Session {
   }
 
   /**
+   * Read the last N events on this session WITHOUT writing anything.
+   *
+   * Maps to the server's `POST /api/tenants/{t}/sessions/{s}/fetch_recent`.
+   * Returns `{ recent: Event[] }` — the same shape as `append({fetchLastN: N})`'s
+   * response, minus the new-event `seq`.
+   *
+   * Use this when you want to load history for context-building (e.g., reducing
+   * an event log to current state). It does NOT pollute the session with `_noop`
+   * sentinel events.
+   */
+  async fetchRecent(n: number): Promise<{ recent: Event[] }> {
+    const path = this._fetchRecentPath();
+    const d = await this._client._request("POST", path, { n });
+    const recent = Array.isArray(d.recent)
+      ? d.recent.map(eventFromDict)
+      : [];
+    return { recent };
+  }
+
+  /**
    * Fork this session into a child that inherits the parent's
    * events at fork time, MVCC-backed. Returns a `Session` handle
    * for the new id.
@@ -680,6 +700,24 @@ export class Session {
     return (
       `/api/tenants/${encodePathSegment(this.tenant)}` +
       `/sessions/${encodePathSegment(this.sessionId)}/append_and_fetch`
+    );
+  }
+
+  private _fetchRecentPath(): string {
+    if (this._client.authenticated && this.tenant === undefined) {
+      // Tenant comes from auth — use the M26 session-keyed route.
+      return `/api/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`;
+    }
+    if (this.tenant === undefined) {
+      throw new Error(
+        "`tenant` must be set on the Client or Session when no auth " +
+          "credentials are configured. Pass tenant: 'demo' (or your " +
+          "actual tenant id) to Client(...) or Client.session(...)."
+      );
+    }
+    return (
+      `/api/tenants/${encodePathSegment(this.tenant)}` +
+      `/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`
     );
   }
 }
