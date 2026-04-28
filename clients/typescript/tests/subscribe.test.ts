@@ -2,9 +2,9 @@
  * End-to-end smoke for the TypeScript SDK's `subscribe()`.
  *
  * Same fixture pattern as smoke.test.ts: spawn `agentdb serve --dev`
- * on an ephemeral port, exercise the SDK against it. Skipped when
- * the server binary hasn't been built (so a fresh checkout's
- * `npm test` doesn't fail on missing cargo output).
+ * with `AGENTDB_REQUIRE_AUTH=true` on an ephemeral port, create a test
+ * user, exercise the SDK against it. Skipped when the server binary
+ * hasn't been built.
  *
  * Also covers the synchronous validation paths (no server needed) so
  * those run on every `npm test` regardless of binary availability.
@@ -42,7 +42,11 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
+async function spawnServer(): Promise<{
+  baseUrl: string;
+  proc: ChildProcess;
+  auth: { user: string; password: string };
+}> {
   const restPort = await freePort();
   const mongoPort = await freePort();
   const proc = spawn(
@@ -57,15 +61,19 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
     ],
     {
       stdio: ["ignore", "ignore", "ignore"],
-      env: { ...process.env, RUST_LOG: "warn" },
+      env: {
+        ...process.env,
+        RUST_LOG: "warn",
+        AGENTDB_REQUIRE_AUTH: "true",
+      },
     }
   );
   const baseUrl = `http://127.0.0.1:${restPort}`;
-  const client = new Client(baseUrl);
+  const healthClient = new Client({ baseUrl });
   const deadline = Date.now() + 15_000;
   let ready = false;
   while (Date.now() < deadline) {
-    if (await client.healthReady()) {
+    if (await healthClient.healthReady()) {
       ready = true;
       break;
     }
@@ -78,7 +86,26 @@ async function spawnServer(): Promise<{ baseUrl: string; proc: ChildProcess }> {
     proc.kill();
     throw new Error("server didn't become ready within 15s");
   }
-  return { baseUrl, proc };
+
+  // Create a test user via the admin API (no admin auth required in dev mode).
+  const testUser = "sub-test-user";
+  const testPassword = "sub-password-123";
+  const testTenant = "sub-tenant";
+  const resp = await fetch(`${baseUrl}/api/admin/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: testUser,
+      tenant_external: testTenant,
+      password: testPassword,
+    }),
+  });
+  if (resp.status !== 201 && resp.status !== 409) {
+    const body = await resp.text();
+    throw new Error(`Failed to create test user: ${resp.status} ${body}`);
+  }
+
+  return { baseUrl, proc, auth: { user: testUser, password: testPassword } };
 }
 
 const skipReason = !existsSync(SERVER_BIN)
@@ -87,35 +114,16 @@ const skipReason = !existsSync(SERVER_BIN)
 
 // --- Validation tests (no server) ----------------------------------
 
-test("Client constructor rejects jwt + getToken combined", () => {
+test("Client constructor rejects token + getToken combined", () => {
   assert.throws(
     () =>
-      new Client("http://127.0.0.1:7878", {
-        jwt: "x",
+      new Client({
+        baseUrl: "http://127.0.0.1:7878",
+        token: "x",
         getToken: () => "y",
       }),
-    /jwt.*getToken/
+    /token.*getToken/
   );
-});
-
-test("client.subscribe() throws when tenant unset", async () => {
-  const client = new Client("http://127.0.0.1:7878");
-  await assert.rejects(async () => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    for await (const _ of client.subscribe()) {
-      break;
-    }
-  }, /tenant/);
-});
-
-test("session.subscribe() throws when tenant unset", async () => {
-  const client = new Client("http://127.0.0.1:7878");
-  const sess = client.session("agent-1");
-  await assert.rejects(async () => {
-    for await (const _ of sess.subscribe()) {
-      break;
-    }
-  }, /tenant/);
 });
 
 test("SubscriptionClosed carries error code + last_seq", () => {
@@ -129,13 +137,13 @@ test("SubscriptionClosed carries error code + last_seq", () => {
 // --- Live smoke (gated by server binary) ---------------------------
 
 test("subscribe() end-to-end", { skip: skipReason }, async (t) => {
-  const { baseUrl, proc } = await spawnServer();
+  const { baseUrl, proc, auth } = await spawnServer();
   t.after(() => {
     proc.kill();
   });
 
   await t.test("session.subscribe yields events appended after open", async () => {
-    const client = new Client(baseUrl, { tenant: "t-1" });
+    const client = new Client({ baseUrl, auth });
     const sess = client.session("s-sub-1");
 
     const seen: number[] = [];
@@ -166,7 +174,7 @@ test("subscribe() end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("session.subscribe replays from from_seq, then tails live", async () => {
-    const client = new Client(baseUrl, { tenant: "t-1" });
+    const client = new Client({ baseUrl, auth });
     const writer = client.session("s-sub-replay");
     for (let i = 0; i < 3; i++) {
       await writer.append({ kind: "x", i });
@@ -181,7 +189,7 @@ test("subscribe() end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("client.subscribe (tenant-wide) sees events from any session", async () => {
-    const client = new Client(baseUrl, { tenant: "t-fanout" });
+    const client = new Client({ baseUrl, auth });
     const seen: { sid: string; seq: number }[] = [];
     const iter = client.subscribe();
     const consumer = (async () => {
