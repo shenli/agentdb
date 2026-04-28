@@ -1,7 +1,7 @@
 //! M19: REST Basic Auth end-to-end.
 //!
 //! Spawns an AppState with auth enabled, creates a user via the
-//! admin endpoint, then exercises the `/api/tenants/*` routes
+//! admin endpoint, then exercises the v2 session-keyed routes
 //! with various Authorization headers. Each test asserts either
 //! the 2xx happy path or a specific 4xx.
 
@@ -133,23 +133,6 @@ async fn correct_auth_matching_tenant_is_200() {
     assert_eq!(status, 200, "expected 200, got {status}: {body}");
 }
 
-#[tokio::test]
-async fn cross_tenant_access_is_403() {
-    let (_d, _o, _m, base) = spawn_with_auth().await;
-    create_user(&base, "alice", "t-alice", "pencil").await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!(
-            "{base}/api/tenants/t-bob/sessions/s/append_and_fetch"
-        ))
-        .header("Authorization", basic("alice", "pencil"))
-        .json(&json!({"event": {"text": "hi"}, "fetch_last_n": 0}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 403);
-}
 
 #[tokio::test]
 async fn admin_endpoints_stay_open() {

@@ -143,16 +143,12 @@ pub async fn forward_request(
 pub async fn forward_append_and_fetch(
     http: &Client,
     target: &NodeTarget,
-    tenant_id: &str,
+    _tenant_id: &str,
     session_id: &str,
     body: Bytes,
     passthrough: PassthroughHeaders,
 ) -> Result<Response, ForwardError> {
-    let path = format!(
-        "/api/tenants/{}/sessions/{}/append_and_fetch",
-        urlencode(tenant_id),
-        urlencode(session_id),
-    );
+    let path = format!("/api/sessions/{}/append_and_fetch", urlencode(session_id));
     forward_request(
         http,
         target,
@@ -164,21 +160,17 @@ pub async fn forward_append_and_fetch(
     .await
 }
 
-/// Forward a POST `/api/tenants/:tid/sessions/:sid/fetch_recent`
+/// Forward a POST `/api/sessions/:sid/fetch_recent`
 /// to `target` and return the remote response verbatim.
 pub async fn forward_fetch_recent(
     http: &Client,
     target: &NodeTarget,
-    tenant_id: &str,
+    _tenant_id: &str,
     session_id: &str,
     body: Bytes,
     passthrough: PassthroughHeaders,
 ) -> Result<Response, ForwardError> {
-    let path = format!(
-        "/api/tenants/{}/sessions/{}/fetch_recent",
-        urlencode(tenant_id),
-        urlencode(session_id),
-    );
+    let path = format!("/api/sessions/{}/fetch_recent", urlencode(session_id));
     forward_request(
         http,
         target,

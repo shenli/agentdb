@@ -115,22 +115,6 @@ fn normalize_kind_filter(raw: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/subscribe \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn subscribe_session(
-    State(state): State<AppState>,
-    Path((tenant, session)): Path<(String, String)>,
-    Query(q): Query<SubscribeQuery>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    // v1 path: auth is either disabled (auth: None) or not in scope here;
-    // pass `true` to skip the Basic-auth check inside the inner handler.
-    subscribe_session_inner(state, tenant, session, q, headers, true).await
-}
-
 /// `basic_authed`: whether the caller was authenticated via Basic auth.
 /// When `false` and the server has auth configured, the inner handler
 /// returns 401 if the tenant has no JWT config (which would otherwise
@@ -573,20 +557,6 @@ fn build_subscribed_payload(
         payload["catchup_failed_sessions"] = serde_json::json!(catchup_failed_sessions);
     }
     payload
-}
-
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/subscribe \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn subscribe_tenant(
-    State(state): State<AppState>,
-    Path(tenant): Path<String>,
-    Query(q): Query<TenantSubscribeQuery>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    subscribe_tenant_inner(state, tenant, q, headers).await
 }
 
 async fn subscribe_tenant_inner(

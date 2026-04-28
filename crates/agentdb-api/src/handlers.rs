@@ -140,62 +140,6 @@ pub async fn scan_events_from_seq(
         .map_err(|e| ApiError::Internal(format!("scan_events_from_seq: fetch: {e}")))
 }
 
-#[utoipa::path(
-    post,
-    path = "/api/tenants/{tenant_id}/sessions/{session_id}/append_and_fetch",
-    tag = "primitives",
-    params(
-        ("tenant_id" = String, Path, description = "External tenant id"),
-        ("session_id" = String, Path, description = "External session id"),
-    ),
-    request_body = AppendAndFetchRequest,
-    responses(
-        (status = 200, description = "Event appended; last N events returned", body = AppendAndFetchResponse),
-        (status = 400, description = "Malformed request", body = ErrorResponse),
-        (status = 403, description = "Authenticated tenant disagrees with path tenant", body = ErrorResponse),
-        (status = 421, description = "Routing drift on a forwarded request"),
-        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
-        (status = 503, description = "Fault injected, forwarding failed, or node draining", body = ErrorResponse),
-    ),
-)]
-#[tracing::instrument(
-    name = "rest.append_and_fetch",
-    skip(state, headers, body, authed),
-    fields(
-        tenant = %tenant,
-        session = %session,
-        forwarded = headers.contains_key(FORWARDED_HEADER),
-    ),
-)]
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/append_and_fetch \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn append_and_fetch(
-    State(state): State<AppState>,
-    Path((tenant, session)): Path<(String, String)>,
-    headers: HeaderMap,
-    authed: Option<Extension<AuthedTenant>>,
-    body: Bytes,
-) -> Response {
-    // Auth-vs-path cross-check (M26 closeout). The middleware
-    // already verified path tenant matches credentials, but
-    // belt-and-braces: if for any reason an unauthed request
-    // reached us with a path tenant we can't trust, the
-    // handlers' own auth-derived view stays the source of
-    // truth. Match → fall through; mismatch → 403.
-    if let Some(Extension(authed)) = &authed {
-        if authed.external_id != tenant {
-            return ApiError::Forbidden(format!(
-                "user {} is bound to tenant {} but path targets {tenant}",
-                authed.user_id, authed.external_id
-            ))
-            .into_response();
-        }
-    }
-    do_append_and_fetch(state, tenant, session, headers, body).await
-}
 
 #[utoipa::path(
     post,
@@ -252,56 +196,6 @@ pub async fn append_and_fetch_session_keyed(
 // ---------------------------------------------------------------------------
 // fetch_recent — read-only session tail (no write, no _noop pollution)
 // ---------------------------------------------------------------------------
-
-#[utoipa::path(
-    post,
-    path = "/api/tenants/{tenant_id}/sessions/{session_id}/fetch_recent",
-    tag = "primitives",
-    params(
-        ("tenant_id" = String, Path, description = "External tenant id"),
-        ("session_id" = String, Path, description = "External session id"),
-    ),
-    request_body = FetchRecentRequest,
-    responses(
-        (status = 200, description = "Last N events returned (read-only)", body = FetchRecentResponse),
-        (status = 400, description = "Malformed request", body = ErrorResponse),
-        (status = 403, description = "Authenticated tenant disagrees with path tenant", body = ErrorResponse),
-        (status = 421, description = "Routing drift on a forwarded request"),
-        (status = 503, description = "Forwarding failed", body = ErrorResponse),
-    ),
-)]
-#[tracing::instrument(
-    name = "rest.fetch_recent",
-    skip(state, headers, body, authed),
-    fields(
-        tenant = %tenant,
-        session = %session,
-        forwarded = headers.contains_key(FORWARDED_HEADER),
-    ),
-)]
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/fetch_recent \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn fetch_recent(
-    State(state): State<AppState>,
-    Path((tenant, session)): Path<(String, String)>,
-    headers: HeaderMap,
-    authed: Option<Extension<AuthedTenant>>,
-    body: Bytes,
-) -> Response {
-    if let Some(Extension(authed)) = &authed {
-        if authed.external_id != tenant {
-            return ApiError::Forbidden(format!(
-                "user {} is bound to tenant {} but path targets {tenant}",
-                authed.user_id, authed.external_id
-            ))
-            .into_response();
-        }
-    }
-    do_fetch_recent(state, tenant, session, headers, body).await
-}
 
 #[utoipa::path(
     post,

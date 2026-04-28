@@ -141,9 +141,7 @@ impl AppState {
         version = "0.1.0",
     ),
     paths(
-        handlers::append_and_fetch,
         handlers::append_and_fetch_session_keyed,
-        handlers::fetch_recent,
         handlers::fetch_recent_session_keyed,
         fork::fork_handler,
         admin::force_tier,
@@ -277,40 +275,17 @@ pub fn router(state: AppState) -> Router {
     // ---------------------------------------------------------------
     // User-facing route registrations.
     //
-    // M27 introduced v2 auth-derived routes (/api/sessions/{s}/...,
-    // /api/subscribe, /api/channels/{c}/...). The v1 routes
-    // (/api/tenants/{t}/...) are still registered for compatibility
-    // with infrastructure tests that use auth: None setups; the v1
-    // handlers are #[deprecated] in their respective modules. v1
-    // removal + remaining test migrations are tracked as M28.
+    // v2 auth-derived routes only. v1 (/api/tenants/{t}/...) paths
+    // were removed in M28; they now return 404.
     // ---------------------------------------------------------------
 
     // Routes that require Basic auth when AppState::auth is Some.
-    // Split into a separate Router so the auth middleware only
-    // sees mutation paths — admin-plane routes are a separate
-    // subtree below with no auth layer. Both shapes are routed
-    // under the same middleware:
-    //
-    //   - `/api/tenants/{tid}/sessions/{sid}/...` — legacy,
-    //     tenant explicit in path (auth verifies path tenant
-    //     matches credentials).
-    //   - `/api/sessions/{sid}/...` — M26 v2 shape, tenant
-    //     auth-derived. Handlers read `AuthedTenant` from
-    //     request extensions and verify against the session
-    //     locator.
-    #[allow(deprecated)]
+    // Tenant is always auth-derived (from Basic credentials or the
+    // session locator in MetaStore); no tenant in the URL.
     let tenant_routes: Router<AppState> = Router::new()
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/append_and_fetch",
-            axum::routing::post(handlers::append_and_fetch),
-        )
         .route(
             "/api/sessions/:session_id/append_and_fetch",
             axum::routing::post(handlers::append_and_fetch_session_keyed),
-        )
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/fetch_recent",
-            axum::routing::post(handlers::fetch_recent),
         )
         .route(
             "/api/sessions/:session_id/fetch_recent",
@@ -331,16 +306,7 @@ pub fn router(state: AppState) -> Router {
     // include `Authorization` on preflight). Basic auth still
     // protects the actual GET when the JWT subscribe-auth path
     // isn't engaged for this tenant.
-    #[allow(deprecated)]
     let subscribe_routes: Router<AppState> = Router::new()
-        .route(
-            "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
-            axum::routing::get(subscribe::subscribe_session),
-        )
-        .route(
-            "/api/tenants/:tenant_id/subscribe",
-            axum::routing::get(subscribe::subscribe_tenant),
-        )
         .route(
             "/api/sessions/:session_id/subscribe",
             axum::routing::get(subscribe::subscribe_session_keyed),
@@ -364,16 +330,7 @@ pub fn router(state: AppState) -> Router {
     // `extract_subscribe_jwt` rather than a Basic-auth middleware.
     // Kept distinct from `subscribe_routes` for grep-ability —
     // durable session subs vs ephemeral channel broadcast.
-    #[allow(deprecated)]
     let channel_routes: Router<AppState> = Router::new()
-        .route(
-            "/api/tenants/:tenant_id/channels/:channel/publish",
-            axum::routing::post(broadcast::publish),
-        )
-        .route(
-            "/api/tenants/:tenant_id/channels/:channel/subscribe",
-            axum::routing::get(broadcast::subscribe_channel),
-        )
         .route(
             "/api/channels/:channel/publish",
             axum::routing::post(broadcast::publish_keyed),

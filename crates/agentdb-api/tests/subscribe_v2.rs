@@ -93,14 +93,14 @@ async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
     );
 }
 
-/// Append one event under the legacy tenant-explicit route to
+/// Append one event via the v2 session-keyed route to
 /// populate a session and its locator. Returns once the row
 /// exists in `session_locators` so subsequent subscribe can
 /// resolve it.
-async fn seed_session(base: &str, user: &str, pass: &str, tenant: &str, session: &str) {
+async fn seed_session(base: &str, user: &str, pass: &str, _tenant: &str, session: &str) {
     reqwest::Client::new()
         .post(format!(
-            "{base}/api/tenants/{tenant}/sessions/{session}/append_and_fetch"
+            "{base}/api/sessions/{session}/append_and_fetch"
         ))
         .header("Authorization", basic(user, pass))
         .json(&json!({"event": {"seed": true}, "fetch_last_n": 0}))
