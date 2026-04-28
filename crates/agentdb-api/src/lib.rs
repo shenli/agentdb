@@ -328,6 +328,14 @@ pub fn router(state: AppState) -> Router {
             "/api/tenants/:tenant_id/subscribe",
             axum::routing::get(subscribe::subscribe_tenant),
         )
+        .route(
+            "/api/sessions/:session_id/subscribe",
+            axum::routing::get(subscribe::subscribe_session_keyed),
+        )
+        .route(
+            "/api/subscribe",
+            axum::routing::get(subscribe::subscribe_tenant_keyed),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::basic_auth_middleware,

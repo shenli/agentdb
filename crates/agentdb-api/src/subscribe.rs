@@ -67,6 +67,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
 
+use axum::Extension;
+
+use crate::auth_middleware::AuthedTenant;
 use crate::event_bus::EventEnvelope;
 use crate::AppState;
 
@@ -116,6 +119,16 @@ pub async fn subscribe_session(
     State(state): State<AppState>,
     Path((tenant, session)): Path<(String, String)>,
     Query(q): Query<SubscribeQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    subscribe_session_inner(state, tenant, session, q, headers).await
+}
+
+async fn subscribe_session_inner(
+    state: AppState,
+    tenant: String,
+    session: String,
+    q: SubscribeQuery,
     headers: HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -551,6 +564,15 @@ pub async fn subscribe_tenant(
     Query(q): Query<TenantSubscribeQuery>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    subscribe_tenant_inner(state, tenant, q, headers).await
+}
+
+async fn subscribe_tenant_inner(
+    state: AppState,
+    tenant: String,
+    q: TenantSubscribeQuery,
+    headers: HeaderMap,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let kind_filter = normalize_kind_filter(q.kind);
@@ -843,6 +865,72 @@ pub async fn subscribe_tenant(
     Sse::new(combined)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(keepalive_secs)))
         .into_response()
+}
+
+/// v2: `/api/sessions/{session_id}/subscribe` — auth-derived tenant.
+/// Mirrors `append_and_fetch_session_keyed` (in `handlers.rs`):
+/// resolves tenant from `AuthedTenant` extension, cross-checks
+/// against the session locator, and forwards to the inner helper.
+pub async fn subscribe_session_keyed(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    Query(q): Query<SubscribeQuery>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Resolve tenant from auth, with locator cross-check.
+    // Mirrors handlers::append_and_fetch_session_keyed (lines ~221–272 of handlers.rs).
+    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
+    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return crate::error::ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
+        (Some(a), Some(l)) if a != l => {
+            return crate::error::ApiError::Forbidden(format!(
+                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
+                authed_user.unwrap_or("?")
+            ))
+            .into_response();
+        }
+        (Some(a), _) => a.to_string(),
+        (None, Some(l)) => l.to_string(),
+        (None, None) => {
+            return crate::error::ApiError::Core(agentdb_core::Error::Invalid {
+                field: Some("tenant".into()),
+                message: format!(
+                    "cannot resolve tenant for session {session}: no Authorization header, no session locator"
+                ),
+            })
+            .into_response();
+        }
+    };
+    subscribe_session_inner(state, tenant, session, q, headers).await
+}
+
+/// v2: `/api/subscribe` — auth-derived tenant, no path params.
+/// Tenant is the bearer token's claim; no locator cross-check
+/// needed because the URL doesn't address any specific session.
+pub async fn subscribe_tenant_keyed(
+    State(state): State<AppState>,
+    Query(q): Query<TenantSubscribeQuery>,
+    headers: HeaderMap,
+    Extension(authed): Extension<AuthedTenant>,
+) -> axum::response::Response {
+    subscribe_tenant_inner(state, authed.external_id, q, headers).await
 }
 
 #[cfg(test)]
