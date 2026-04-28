@@ -1163,9 +1163,8 @@ impl BoxRegistry {
     /// assignment, falling through to tenant-hash routing when no
     /// explicit override exists. The `session_locators` table
     /// stays canonical (per-session ownership record) but is no
-    /// longer on the hot path; it's read by fork-parent lookups,
-    /// admin enumeration, fanout reads, and (future) cross-tablet
-    /// recovery on lease-fence-rejected writes.
+    /// longer on the hot path; it's read by fork lookups, admin
+    /// enumeration, and fanout reads.
     ///
     /// Why this is safe: per-session migration via
     /// `session_locators::update_tablet` has zero production
@@ -1624,9 +1623,11 @@ mod tests {
         (dir, obj_dir, meta_file, reg)
     }
 
-    /// M26 final phase: build a meta-backed registry, then
-    /// expose the meta store too so tests can write locator
-    /// rows directly. Reuses meta_registry's wiring.
+    /// Build a meta-backed registry plus a handle to the meta store
+    /// itself, so tests can inspect or pre-populate locator rows.
+    /// Post-M27 the locator is no longer on the write hot path —
+    /// inline tests use this helper to demonstrate that a pre-populated
+    /// locator does not affect routing decisions.
     async fn meta_registry_with_meta(
         num_boxes: u16,
     ) -> (
@@ -1690,43 +1691,6 @@ mod tests {
         match reg.route_session_for_write("t-1", "s-1").await {
             RouteDecision::Local(b) => assert_eq!(b.id, fallback),
             RouteDecision::Remote { .. } => panic!("no shard override must stay local"),
-        }
-    }
-
-    #[tokio::test]
-    async fn route_for_write_falls_back_when_no_locator_row() {
-        // No locator row → the helper degenerates to
-        // route_session_for_io's existing logic. With no
-        // shard override either, that's tenant-hash.
-        let (_d, _o, _m, reg, _meta) = meta_registry_with_meta(4).await;
-        let fallback = reg.route_tenant("t-1").id;
-        match reg.route_session_for_write("t-1", "s-no-loc").await {
-            RouteDecision::Local(b) => assert_eq!(b.id, fallback),
-            RouteDecision::Remote { .. } => panic!("no locator + no override must stay local"),
-        }
-    }
-
-    #[tokio::test]
-    async fn route_for_write_locator_with_null_tablet_falls_back() {
-        // A session with a locator row but `tablet_id IS NULL`
-        // (created-before-placed; rare). Behave as if the row
-        // weren't there at all.
-        let (_d, _o, _m, reg, meta) = meta_registry_with_meta(4).await;
-        agentdb_meta::session_locators::upsert(
-            meta.pool(),
-            "s-pending",
-            1,
-            "t-1",
-            None,
-            crate::shard::shard_id("s-pending") as i32,
-            0,
-        )
-        .await
-        .unwrap();
-        let fallback = reg.route_tenant("t-1").id;
-        match reg.route_session_for_write("t-1", "s-pending").await {
-            RouteDecision::Local(b) => assert_eq!(b.id, fallback),
-            RouteDecision::Remote { .. } => panic!("null tablet_id must fall back, not forward"),
         }
     }
 
