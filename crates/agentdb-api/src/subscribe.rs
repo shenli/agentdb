@@ -153,16 +153,7 @@ async fn subscribe_session_inner(
     if let agentdb_core::RouteDecision::Remote { target, .. } =
         state.registry.route_session_for_io(&tenant, &session)
     {
-        // TODO(M27 Task 5): once /api/tenants/{t}/.../subscribe is deleted,
-        // this redirect should target the v2 URL `/api/sessions/{s}/subscribe`.
-        // Both v1 and v2 callers funnel through this inner helper, so we'd
-        // also need to thread the caller's route shape into the inner if we
-        // want path fidelity per call. For now the redirect uses the v1 URL
-        // because v1 still exists for both shapes during the transition.
-        let path = format!(
-            "/api/tenants/{}/sessions/{}/subscribe",
-            tenant, session
-        );
+        let path = format!("/api/sessions/{}/subscribe", session);
         return crate::forwarding::subscribe_not_owner_reply(&target, &path);
     }
 
