@@ -212,3 +212,35 @@ test("budget cap (maxLlmCalls) terminates the loop", async () => {
   assert.ok(ended);
   assert.equal(ended.cause, "call_budget_exhausted");
 });
+
+test("step timeout fires when no step_completed arrives in time", async () => {
+  const client = new FakeClient();
+  const run = { tenant: "t", runId: "r1" };
+  const channels = new ManualFakeChannels(client, run);
+
+  const llm = new ScriptedLLM([
+    [
+      { tool: "update_plan", args: {
+        reason: "x",
+        steps: [{ id: "s1", text: "x", assigned: "engineer", status: "pending" }],
+      }},
+      { tool: "dispatch_step", args: { step_id: "s1" } },
+    ],
+    [{ tool: "wrap_up", args: { reason: "stuck", summary: "engineer never replied" } }],
+  ]);
+
+  const ceo = new AutonomousCEO({
+    client: client as any,
+    channels: channels as any,
+    run,
+    goal: "ship",
+    budgets: makeBudgets({ stepTimeoutSec: 0.05 }), // 50ms
+    runTurn: (tools, ctx) => llm.runTurn(tools, ctx),
+  });
+
+  await ceo.start();
+  assert.equal(ceo.cause, "wrap_up");
+
+  const planSess = client.sessions.get("r1:_plan")!;
+  assert.ok(planSess.appended.some((e: any) => e.kind === "step_timeout" && e.step_id === "s1"));
+});

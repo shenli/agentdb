@@ -3,7 +3,7 @@ import type { Channels } from "./channels.ts";
 import type { RunIdentity } from "./types.ts";
 import type { CompanyTool, ToolContext } from "./agent.ts";
 import { ALL_TOOLS, CEO_AUTONOMOUS_TOOLS } from "./tools/index.ts";
-import { loadCurrentPlan, type PlanState } from "./plan.ts";
+import { loadCurrentPlan, appendStepTimeout, type PlanState } from "./plan.ts";
 
 export interface Budgets {
   maxRevisions: number;
@@ -82,14 +82,45 @@ export class AutonomousCEO {
    * Subscribe to `directs:ceo` and re-deliberate on every payload arriving
    * on it (typically `step_completed` from a `report_to_ceo` call). Each
    * iteration runs one CEO LLM turn with a wake prompt.
+   *
+   * Uses Promise.race between the next channel message and a step-timeout
+   * timer so the CEO is woken if an employee goes silent past `stepTimeoutSec`.
    */
   protected async wakeLoop(): Promise<void> {
-    for await (const _msg of this.deps.channels.subscribe("directs:ceo")) {
-      if (this.terminated) break;
-      if (this.budgetCheckTerminate()) break;
-      await this.driveWakeTurn();
-      if (this.terminated) break;
+    const iter = this.deps.channels.subscribe("directs:ceo")[Symbol.asyncIterator]();
+    while (!this.terminated && !this.budgetCheckTerminate()) {
+      const next = iter.next();
+      const timeoutMs = this.deps.budgets.stepTimeoutSec * 1000;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const timeoutPromise = new Promise<{ timedOut: true }>((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      });
+      const winner = await Promise.race([
+        next.then((r) => ({ kind: "msg" as const, result: r })),
+        timeoutPromise.then((t) => ({ kind: "timeout" as const, t })),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (winner.kind === "msg") {
+        if (winner.result.done) break;
+        await this.driveWakeTurn();
+      } else {
+        await this.synthesizeStepTimeout();
+        await this.driveWakeTurn();
+      }
     }
+  }
+
+  /**
+   * Find the most-recently dispatched step whose status is still
+   * in_progress (per `_plan` reduction) and append a `step_timeout`
+   * event for it. If no such step exists, no-op.
+   */
+  private async synthesizeStepTimeout(): Promise<void> {
+    const plan = await this.snapshotPlan();
+    const inProgress = plan.steps.filter((s) => s.status === "in_progress");
+    if (inProgress.length === 0) return;
+    const step = inProgress[inProgress.length - 1];
+    await appendStepTimeout(this.deps.client, this.deps.run, step.id);
   }
 
   // ---- internals ----
