@@ -1,8 +1,8 @@
 """End-to-end smoke test for the agentdb Python SDK.
 
 Spawns `agentdb serve --dev` as a subprocess on an ephemeral
-port, waits for `/health/ready`, and exercises the SDK against
-it. The whole test runs in <5s on a warm cargo cache.
+port with `AGENTDB_REQUIRE_AUTH=true`, creates a test user via
+the admin API, then exercises the SDK against it.
 
 Skipped automatically if the server binary hasn't been built —
 running this in CI without `cargo build -p agentdb-server` first
@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
 from agentdb import (
     BadRequest,
@@ -30,11 +31,13 @@ from agentdb import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_BIN = REPO_ROOT / "target" / "debug" / "agentdb"
 
+TEST_USER = "smoke-test-user"
+TEST_PASSWORD = "smoke-password-123"
+TEST_TENANT = "smoke-tenant"
+
 
 def _free_port() -> int:
-    """Bind a transient socket, get its port, drop the socket.
-    The port is racy but good enough for a smoke test — the
-    server is the next process to bind, almost certainly first."""
+    """Bind a transient socket, get its port, drop the socket."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
@@ -49,7 +52,11 @@ def server():
         )
     rest_port = _free_port()
     mongo_port = _free_port()
-    env = {**os.environ, "RUST_LOG": "warn"}
+    env = {
+        **os.environ,
+        "RUST_LOG": "warn",
+        "AGENTDB_REQUIRE_AUTH": "true",
+    }
     proc = subprocess.Popen(
         [
             str(SERVER_BIN),
@@ -65,22 +72,35 @@ def server():
         stderr=subprocess.DEVNULL,
     )
     base_url = f"http://127.0.0.1:{rest_port}"
-    client = Client(base_url, tenant="demo")
-    # Poll readiness for up to 15 seconds; the dev-mode bootstrap
-    # is normally <2s but a cold cargo build can be slow.
+    # Wait for server ready (no auth needed for /health/ready).
+    health_client = Client(base_url)
     deadline = time.time() + 15
     while time.time() < deadline:
-        if client.health_ready():
+        if health_client.health_ready():
             break
         if proc.poll() is not None:
-            pytest.fail(
-                f"server exited before ready (rc={proc.returncode})"
-            )
+            pytest.fail(f"server exited before ready (rc={proc.returncode})")
         time.sleep(0.1)
     else:
         proc.terminate()
         proc.wait(timeout=5)
         pytest.fail("server didn't become ready within 15s")
+
+    # Create a test user via the admin API (no admin auth in dev mode).
+    resp = requests.post(
+        f"{base_url}/api/admin/users",
+        json={
+            "user_id": TEST_USER,
+            "tenant_external": TEST_TENANT,
+            "password": TEST_PASSWORD,
+        },
+        timeout=5,
+    )
+    if resp.status_code not in (201, 409):
+        proc.terminate()
+        proc.wait(timeout=5)
+        pytest.fail(f"failed to create test user: {resp.status_code} {resp.text}")
+
     try:
         yield base_url
     finally:
@@ -93,7 +113,7 @@ def server():
 
 
 def test_append_round_trips(server):
-    client = Client(server, tenant="demo")
+    client = Client(server, auth=(TEST_USER, TEST_PASSWORD))
     sess = client.session("agent-smoke-1")
     result = sess.append(
         {"role": "user", "text": "hello"}, fetch_last_n=5
@@ -105,7 +125,7 @@ def test_append_round_trips(server):
 
 
 def test_append_then_append_returns_growing_recent(server):
-    client = Client(server, tenant="demo")
+    client = Client(server, auth=(TEST_USER, TEST_PASSWORD))
     sess = client.session("agent-smoke-2")
     sess.append({"i": 1}, fetch_last_n=0)
     sess.append({"i": 2}, fetch_last_n=0)
@@ -115,38 +135,16 @@ def test_append_then_append_returns_growing_recent(server):
 
 
 def test_fork_creates_a_child_session(server):
-    client = Client(server, tenant="demo")
+    client = Client(server, auth=(TEST_USER, TEST_PASSWORD))
     parent = client.session("agent-smoke-fork-parent")
     parent.append({"i": 1}, fetch_last_n=0)
     parent.append({"i": 2}, fetch_last_n=0)
     child = parent.fork("agent-smoke-fork-child")
     assert isinstance(child, Session)
     assert child.session_id == "agent-smoke-fork-child"
-    # The child can be written to and behaves like its own session.
     res = child.append({"i": 99}, fetch_last_n=10)
     payloads = [e.payload.get("i") for e in res.recent]
-    # Child sees the parent's events plus its own; order matters.
     assert payloads[-1] == 99
-
-
-def test_session_with_no_tenant_and_no_auth_raises_on_append(server):
-    # The client default tenant is None; no auth configured.
-    # The SDK should refuse to construct a path rather than
-    # send a request the server will reject.
-    client = Client(server)  # no tenant, no auth
-    sess = client.session("agent-smoke-3")
-    with pytest.raises(ValueError, match="tenant"):
-        sess.append({"x": 1})
-
-
-def test_unknown_tenant_returns_typed_error(server):
-    client = Client(server, tenant="t-nope-doesnt-exist")
-    sess = client.session("agent-smoke-4")
-    # Dev mode without auth lets through any path tenant; the
-    # tenant gets minted on first write. Not an error case in
-    # this server config — assert the contract that it succeeds.
-    result = sess.append({"k": "v"}, fetch_last_n=0)
-    assert result.seq >= 1
 
 
 def test_health_ready_probe(server):
@@ -155,16 +153,10 @@ def test_health_ready_probe(server):
 
 
 def test_bad_credentials_pair_raises_value_error():
-    # Client construction with `user` but no `password` (or vice
-    # versa) is a programmer error — surface it at construct
-    # time rather than letting the request 401.
-    with pytest.raises(ValueError, match="password"):
-        Client("http://127.0.0.1:7878", user="alice")
-    with pytest.raises(ValueError, match="user"):
-        Client("http://127.0.0.1:7878", password="pencil")
+    # `token` and `get_token` together is a programmer error.
+    with pytest.raises(ValueError, match="get_token"):
+        Client("http://127.0.0.1:7878", token="t", get_token=lambda: "t")
 
 
 # Placate the unused-import linter on `BadRequest` / `NotFound`
-# imports — they exist so the smoke tests can grow into the
-# typed-error space later without re-importing.
 _ = (BadRequest, NotFound)

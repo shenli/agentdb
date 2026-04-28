@@ -3,14 +3,23 @@
 Wraps the REST surface in a small object graph that keeps the
 common agent flow short:
 
-    client = Client("http://127.0.0.1:7878")
-    session = client.session("agent-1", tenant="demo")
+    client = Client(base_url="http://127.0.0.1:7878", auth=("alice", "hunter2"))
+    session = client.session("agent-1")
     session.append({"role": "user", "text": "..."}, fetch_last_n=5)
     session.fork("agent-1-branch-a")
 
-The client is **synchronous** and uses `requests`. An async
-variant is a natural follow-up; agent code that's already async
-can call this from a thread executor in the meantime.
+Tenant is derived from the Basic-auth credentials server-side.
+No `tenant` arg on the client or per-method calls.
+
+Auth model:
+  - Session/subscribe routes: HTTP Basic auth via `auth=("user", "password")`.
+  - Channel routes: JWT Bearer auth via `token="..."` or `get_token=lambda: "..."`.
+  - If both are supplied, Basic auth is used for session/subscribe and JWT
+    for channel routes.
+  - If neither is supplied, requests are unauthenticated (server returns 401).
+
+The client is **synchronous** and uses `requests`. For async agent code
+install the `[async]` extra and use `AsyncClient` instead.
 """
 
 from __future__ import annotations
@@ -85,68 +94,56 @@ class Client:
     """An AgentDB connection.
 
     `base_url` is the REST endpoint, e.g. `http://127.0.0.1:7878`.
-    `user` / `password` enable HTTP Basic auth; when both are
-    provided, every request carries an `Authorization` header and
-    the tenant is auth-derived. `tenant` is required only when
-    auth is disabled (dev mode) — it's the legacy path-supplied
-    tenant identity.
+
+    Auth model:
+      - `auth=("user", "password")` — HTTP Basic auth for session/subscribe
+        routes. Tenant is derived from the user record server-side.
+      - `token="..."` or `get_token=lambda: "..."` — JWT Bearer auth for
+        channel routes (broadcast / subscribe_channel). `get_token` is the
+        refreshable form: called on every reconnect so a server-side
+        `jwt_expired` close recovers transparently.
+      - Both can be supplied simultaneously: Basic auth covers
+        session/subscribe, JWT covers channel routes.
+      - If neither is supplied, requests go unauthenticated (server returns
+        401 when auth is required).
 
     `timeout` defaults to a per-request 30s; tune it down for
-    interactive agent work where you'd rather fail fast and
-    retry.
+    interactive agent work where you'd rather fail fast and retry.
     """
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str = "",
         *,
-        user: Optional[str] = None,
-        password: Optional[str] = None,
-        tenant: Optional[str] = None,
+        auth: Optional[tuple] = None,           # (user, password) for Basic
+        token: Optional[str] = None,             # JWT for channel routes
+        get_token: Optional[Callable[[], str]] = None,  # rotating JWT provider
         timeout: float = 30.0,
-        session: Optional[requests.Session] = None,
-        jwt: Optional[str] = None,
-        get_token: Optional[Callable[[], str]] = None,
+        _http: Optional[requests.Session] = None,
     ) -> None:
-        if user is not None and password is None:
-            raise ValueError("`password` is required when `user` is set")
-        if password is not None and user is None:
-            raise ValueError("`user` is required when `password` is set")
-        if jwt is not None and get_token is not None:
-            raise ValueError("pass `jwt` or `get_token`, not both")
+        if token is not None and get_token is not None:
+            raise ValueError("pass `token` or `get_token`, not both")
         self.base_url = base_url.rstrip("/")
-        self._auth = (user, password) if user is not None else None
-        self._tenant = tenant
-        self.timeout = timeout
-        self._http = session or requests.Session()
-        # `subscribe()` uses bearer-token auth (JWT) rather than HTTP
-        # Basic — that's the spec's stance for the SSE endpoint and
-        # what the browser-direct demo needs. `get_token` is the
-        # refreshable form: invoked on every reconnect so a server-
-        # side `jwt_expired` close can recover transparently.
-        self._jwt = jwt
+        self._auth = auth  # tuple (user, password) or None
+        self._token = token
         self._get_token = get_token
+        self.timeout = timeout
+        self._http = _http or requests.Session()
 
     @property
     def authenticated(self) -> bool:
+        """True when Basic-auth credentials are configured."""
         return self._auth is not None
 
-    def session(self, session_id: str, *, tenant: Optional[str] = None) -> "Session":
+    def session(self, session_id: str) -> "Session":
         """Open a handle to one session.
 
-        Tenant resolution:
-
-        - If `tenant` is given, it overrides the client default
-          and uses the legacy `/api/tenants/{tid}/...` route.
-        - Otherwise, if the client was created with auth, the
-          server derives the tenant from credentials and the
-          new `/api/sessions/{sid}/...` route is used.
-        - Otherwise, the client default `tenant` (if set) is
-          used; if neither is set, requests will fail with
-          `BadRequest("cannot resolve tenant…")` from the
-          server. Set one of them to silence that.
+        Tenant is derived from auth credentials server-side — no `tenant`
+        arg needed. The v2 routes (`/api/sessions/{id}/...`) carry no
+        tenant in the URL; the server resolves it from the `Authorization`
+        header.
         """
-        return Session(self, session_id, tenant=tenant or self._tenant)
+        return Session(self, session_id)
 
     def health_ready(self) -> bool:
         """Probe `/health/ready`. Returns True on 200, False
@@ -163,7 +160,6 @@ class Client:
     def subscribe(
         self,
         *,
-        tenant: Optional[str] = None,
         session: Optional[Sequence[str]] = None,
         kind: Optional[Sequence[str]] = None,
         from_seq: Optional[int] = None,
@@ -171,12 +167,10 @@ class Client:
     ) -> Iterator["Event"]:
         """Tenant-wide event subscription.
 
-        Yields envelopes from `/api/tenants/{t}/subscribe` — every
-        appended event in the tenant, optionally filtered by
-        session id (`session=[...]`) and/or kind (`kind=[...]`).
+        Yields envelopes from `/api/subscribe` — every appended event in
+        the tenant (derived from the Basic-auth user's record), optionally
+        filtered by session id (`session=[...]`) and/or kind (`kind=[...]`).
 
-        Tenant resolution mirrors `client.session(...)`: pass
-        `tenant=` explicitly, otherwise the client default is used.
         On JWT expiry the connection is transparently refreshed via
         `get_token` (when configured) and resumed gap-free.
 
@@ -186,14 +180,7 @@ class Client:
 
             session.subscribe()
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on Client(...) or passed to "
-                "subscribe(tenant=...) — no auth-derived default for "
-                "the tenant-wide subscribe endpoint."
-            )
-        path = f"/api/tenants/{_quote(tid)}/subscribe"
+        path = "/api/subscribe"
         return self._subscribe_impl(
             path=path,
             session=list(session) if session else None,
@@ -207,7 +194,6 @@ class Client:
         *,
         channel: str,
         payload: Any,
-        tenant: Optional[str] = None,
     ) -> None:
         """Publish an ephemeral broadcast message to a channel.
 
@@ -215,28 +201,16 @@ class Client:
         no replay, no per-subscriber acks. Use it for transient
         signals like typing indicators, cursor positions, or
         agent-status pings. If you need durability, use
-        `Session.append` + `Session.subscribe()` on a session
-        instead.
+        `Session.append` + `Session.subscribe()` on a session instead.
 
         `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server
         rejects malformed names with `channel_name_invalid`.
         `payload` is any JSON-serializable value.
 
-        Tenant resolution mirrors the rest of the SDK: pass
-        `tenant=` to override, otherwise the client default is used.
+        Tenant resolution is server-side via the JWT claim (Bearer token).
         Returns `None` on success (HTTP 204).
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on Client(...) or passed to "
-                "broadcast(tenant=...) — the channels endpoint is "
-                "tenant-explicit."
-            )
-        path = (
-            f"/api/tenants/{_quote(tid)}"
-            f"/channels/{_quote(channel)}/publish"
-        )
+        path = f"/api/channels/{_quote(channel)}/publish"
         kwargs: dict = {"timeout": self.timeout, "json": payload}
         headers: dict = {}
         token = self._bearer_token()
@@ -251,15 +225,13 @@ class Client:
         )
         if resp.status_code == 204:
             return
-        # Non-204 → decode + raise typed error. `_decode` expects a
-        # JSON dict body; channel-publish errors return one.
+        # Non-204 → decode + raise typed error.
         _ = _decode(resp)
 
     def subscribe_channel(
         self,
         *,
         channel: str,
-        tenant: Optional[str] = None,
         no_echo: bool = False,
     ) -> Iterator["BroadcastMessage"]:
         """Subscribe to a channel; yield [`BroadcastMessage`] objects.
@@ -279,17 +251,7 @@ class Client:
         effective with JWT auth — Basic-auth publishers emit
         `sender: None` and never match.
         """
-        tid = tenant or self._tenant
-        if tid is None:
-            raise ValueError(
-                "`tenant` must be set on Client(...) or passed to "
-                "subscribe_channel(tenant=...) — the channels "
-                "endpoint is tenant-explicit."
-            )
-        path = (
-            f"/api/tenants/{_quote(tid)}"
-            f"/channels/{_quote(channel)}/subscribe"
-        )
+        path = f"/api/channels/{_quote(channel)}/subscribe"
         params: List[tuple] = []
         if no_echo:
             params.append(("no_echo", "true"))
@@ -312,11 +274,6 @@ class Client:
             if resp.status_code != 200:
                 _ = _decode(resp)
             for frame in parse_lines(resp.iter_lines(decode_unicode=True)):
-                # Phase 2's stream uses no named event for envelopes,
-                # only `:keepalive` comments (which the parser drops)
-                # and the data frames themselves. Tolerate a
-                # `subscribed` ack the same way as per-session
-                # subscribe in case the server adds one later.
                 if frame.event == "subscribed":
                     continue
                 if not frame.data:
@@ -345,13 +302,12 @@ class Client:
     def _bearer_token(self) -> Optional[str]:
         """Return the current JWT, calling `get_token` if configured.
 
-        Each `subscribe()` reconnect calls this fresh so a token
-        rotation between attempts comes through without restarting
-        the iterator.
+        Each channel reconnect calls this fresh so a token rotation
+        between attempts comes through without restarting the iterator.
         """
         if self._get_token is not None:
             return self._get_token()
-        return self._jwt
+        return self._token
 
     def _subscribe_impl(
         self,
@@ -386,22 +342,18 @@ class Client:
                     from_seq_per_session=per_session_cursor,
                 ):
                     last_seen = evt.seq
-                    # For tenant-wide subscriptions, advance per-
-                    # session cursors so reconnect-after-expiry
-                    # doesn't replay events we already yielded.
                     if per_session_cursor is not None and evt.session:
                         per_session_cursor[evt.session] = evt.seq
                     yield evt
                 return  # server closed cleanly
             except SubscriptionClosed as e:
                 if e.error_code == "jwt_expired" and (
-                    self._get_token is not None or self._jwt is not None
+                    self._get_token is not None or self._token is not None
                 ):
                     if e.last_seq is not None:
                         cursor = e.last_seq + 1
                     elif last_seen is not None:
                         cursor = last_seen + 1
-                    # else: keep prior cursor (nothing seen yet).
                     continue
                 raise
 
@@ -430,18 +382,10 @@ class Client:
         token = self._bearer_token()
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
-        # `requests` doesn't have a true streaming-iterator API for
-        # SSE on Basic auth, but `stream=True` plus `iter_lines`
-        # gives us the same shape — and the SSE endpoint is the
-        # only place the SDK uses streaming, so the cost stays
-        # localised.
         kwargs: dict = {
             "params": params,
             "headers": headers,
             "stream": True,
-            # No timeout on the read side: SSE connections are
-            # long-lived; the caller controls cancellation by
-            # closing the iterator.
             "timeout": (self.timeout, None),
         }
         if self._auth is not None and "Authorization" not in headers:
@@ -451,16 +395,9 @@ class Client:
         )
         try:
             if resp.status_code != 200:
-                # Decode + raise a typed error (BadRequest,
-                # Unauthorized, …) so the subscribe path matches the
-                # rest of the SDK's error contract.
                 _ = _decode(resp)
             for frame in parse_lines(resp.iter_lines(decode_unicode=True)):
                 if frame.event == "subscribed":
-                    # Connection acknowledgement; ignore. (The
-                    # `live_seq` in the data is informational —
-                    # callers can race-test by inspecting it
-                    # themselves once we expose the raw frames.)
                     continue
                 if frame.event == "error":
                     body = json.loads(frame.data) if frame.data else {}
@@ -493,50 +430,63 @@ def _decode(resp: requests.Response) -> dict:
 
 
 class Session:
-    """A single AgentDB session, scoped to one tenant.
+    """A single AgentDB session.
 
-    Construct via `Client.session(...)`. The session is a thin
+    Construct via `Client.session(session_id)`. The session is a thin
     handle — every method makes one round trip to the server.
     No client-side caching of events.
+
+    Tenant is derived from auth credentials server-side; no `tenant`
+    field or constructor arg is present in v2.
     """
 
     def __init__(
         self,
         client: Client,
         session_id: str,
-        *,
-        tenant: Optional[str],
     ) -> None:
         self._client = client
         self.session_id = session_id
-        self.tenant = tenant
 
     def __repr__(self) -> str:
-        t = f", tenant={self.tenant!r}" if self.tenant else ""
-        return f"Session(id={self.session_id!r}{t})"
+        return f"Session(id={self.session_id!r})"
 
     def append(
         self,
-        event: Any,
+        payload: Any = None,
         *,
+        event: Any = None,
         fetch_last_n: int = 0,
         actor_id: Optional[int] = None,
     ) -> AppendResult:
         """Append one event and (optionally) read back the last N.
 
-        `event` is any JSON-serializable value — the server
-        stores it in the event's `payload` field unchanged.
+        `payload` (or `event` for backward compatibility) is any
+        JSON-serializable value — the server stores it in the event's
+        `payload` field unchanged.
         `fetch_last_n=0` skips the read-back and the response's
         `recent` list comes back empty (cheaper for hot writes).
         `actor_id` is an optional small integer for multi-actor
         sessions (e.g. user vs tool); leave `None` if unused.
         """
-        body: dict = {"event": event, "fetch_last_n": fetch_last_n}
+        # Accept both `payload=` (new) and `event=` (old positional) to ease migration.
+        data = payload if payload is not None else event
+        body: dict = {"event": data, "fetch_last_n": fetch_last_n}
         if actor_id is not None:
             body["actor_id"] = actor_id
-        path = self._append_path()
+        path = f"/api/sessions/{_quote(self.session_id)}/append_and_fetch"
         d = self._client._request("POST", path, json=body)
         return AppendResult.from_dict(d)
+
+    def fetch_recent(self, *, last_n: int = 10) -> List[Event]:
+        """Read the last N events without writing. Pure read.
+
+        Uses `POST /api/sessions/{s}/fetch_recent`. Returns an empty
+        list when the session is empty or doesn't exist yet.
+        """
+        path = f"/api/sessions/{_quote(self.session_id)}/fetch_recent"
+        d = self._client._request("POST", path, json={"last_n": last_n})
+        return [Event.from_dict(e) for e in d.get("events") or []]
 
     def subscribe(
         self,
@@ -555,44 +505,14 @@ class Session:
         Behaviour:
 
         - The iterator runs until the caller breaks out of the loop
-          or the server closes cleanly. Use a thread (or `asyncio`
-          via the async client) for fire-and-forget tailing.
+          or the server closes cleanly.
         - On a JWT expiry close frame the client transparently
           refreshes the token (via `get_token` on the parent
-          [`Client`]) and reconnects with `from_seq = last_seen +
-          1`, so consumers never see a gap.
+          [`Client`]) and reconnects with `from_seq = last_seen + 1`.
         - Other terminal close frames raise [`SubscriptionClosed`]
-          with the server-reported `error_code` and (when the
-          server provided one) `last_seq` so the caller can choose
-          to reconnect from a fresher point.
-
-        `tenant` resolution mirrors `append`: if the session was
-        opened on an authenticated client without an override,
-        the tenant comes from credentials; otherwise the explicit
-        `tenant` is used.
+          with the server-reported `error_code`.
         """
-        if self.tenant is None and not self._client.authenticated:
-            raise ValueError(
-                "`tenant` must be set on the Client or Session when no auth "
-                "credentials are configured. Pass tenant='demo' (or your "
-                "actual tenant id) to Client(...) or Client.session(...)."
-            )
-        if self.tenant is None:
-            # Auth-bound: server derives tenant. There's no
-            # session-keyed subscribe route on main; the spec
-            # routes pub/sub via the tenant-explicit form. Fall
-            # back to the legacy path with the auth-derived
-            # tenant unfilled — the server will pull tenant from
-            # credentials. (Mirrors how tests exercise the path.)
-            raise ValueError(
-                "Auth-derived tenants on subscribe() aren't supported "
-                "yet — pass an explicit tenant to Client.session() until "
-                "the auth-bound subscribe route lands."
-            )
-        path = (
-            f"/api/tenants/{_quote(self.tenant)}"
-            f"/sessions/{_quote(self.session_id)}/subscribe"
-        )
+        path = self._subscribe_path()
         return self._client._subscribe_impl(
             path=path,
             kind=list(kind) if kind else None,
@@ -609,45 +529,16 @@ class Session:
         route correctly without a follow-up touch.
         """
         body = {"new_session_id": child_session_id}
-        if self.tenant is not None and not self._client.authenticated:
-            # No auth → the server can't derive tenant from
-            # credentials. Pass it through the deprecated body
-            # field so pre-M26 servers and dev-mode tests still
-            # work. M26+ servers reject body-vs-auth mismatch
-            # with a 400, which is the right contract.
-            body["tenant_id"] = self.tenant
         self._client._request(
-            "POST", f"/api/sessions/{_quote(self.session_id)}/fork", json=body
+            "POST",
+            f"/api/sessions/{_quote(self.session_id)}/fork",
+            json=body,
         )
-        return Session(self._client, child_session_id, tenant=self.tenant)
+        return Session(self._client, child_session_id)
 
-    # --- routing helper ---
-
-    def _append_path(self) -> str:
-        """Pick between the legacy tenant-explicit path and the
-        new session-keyed path based on what the caller has
-        configured. The trade-off:
-
-        - Authenticated clients with no `tenant` override → new
-          path `/api/sessions/{sid}/append_and_fetch`. Tenant is
-          auth-derived.
-        - Anything with an explicit tenant → legacy path
-          `/api/tenants/{tid}/sessions/{sid}/append_and_fetch`,
-          which works in dev mode (no auth) and is what every
-          server version since M19 has supported.
-        """
-        if self._client.authenticated and self.tenant is None:
-            return f"/api/sessions/{_quote(self.session_id)}/append_and_fetch"
-        if self.tenant is None:
-            raise ValueError(
-                "`tenant` must be set on the Client or Session when no auth "
-                "credentials are configured. Pass tenant='demo' (or your "
-                "actual tenant id) to Client(...) or Client.session(...)."
-            )
-        return (
-            f"/api/tenants/{_quote(self.tenant)}"
-            f"/sessions/{_quote(self.session_id)}/append_and_fetch"
-        )
+    def _subscribe_path(self) -> str:
+        """Return the SSE subscribe URL for this session."""
+        return f"/api/sessions/{_quote(self.session_id)}/subscribe"
 
 
 def _quote(s: str) -> str:
@@ -663,10 +554,9 @@ def append_one(
     base_url: str,
     *,
     session_id: str,
-    event: Any,
-    tenant: Optional[str] = None,
-    user: Optional[str] = None,
-    password: Optional[str] = None,
+    event: Any = None,
+    payload: Any = None,
+    auth: Optional[tuple] = None,
     fetch_last_n: int = 0,
 ) -> AppendResult:
     """One-line helper for the most common operation: append a
@@ -675,5 +565,6 @@ def append_one(
     directly when you want to keep a connection pooled across
     many events.
     """
-    client = Client(base_url, user=user, password=password, tenant=tenant)
-    return client.session(session_id).append(event, fetch_last_n=fetch_last_n)
+    data = payload if payload is not None else event
+    client = Client(base_url, auth=auth)
+    return client.session(session_id).append(data, fetch_last_n=fetch_last_n)

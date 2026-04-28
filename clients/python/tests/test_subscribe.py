@@ -73,8 +73,7 @@ def test_parse_lines_strips_trailing_cr_for_crlf_servers():
 
 
 def test_async_parse_lines_handles_multi_line_data():
-    """Async variant should match sync semantics. Drives it with a
-    trivial async generator and `asyncio.run`."""
+    """Async variant should match sync semantics."""
     from agentdb._sse import SseFrame, parse_lines_async
 
     async def src():
@@ -95,34 +94,35 @@ def test_async_parse_lines_handles_multi_line_data():
 # --- Public API surface (no network) ----------------------------
 
 
-def test_client_rejects_jwt_and_get_token_together():
+def test_client_rejects_token_and_get_token_together():
     from agentdb import Client
 
-    with pytest.raises(ValueError, match="jwt.*get_token"):
-        Client("http://127.0.0.1:7878", jwt="t", get_token=lambda: "t")
+    with pytest.raises(ValueError, match="get_token"):
+        Client("http://127.0.0.1:7878", token="t", get_token=lambda: "t")
 
 
-def test_client_subscribe_requires_tenant_when_unset():
+def test_client_subscribe_does_not_require_tenant():
+    """subscribe() no longer requires tenant= — path is /api/subscribe."""
     from agentdb import Client
 
-    client = Client("http://127.0.0.1:7878")
-    with pytest.raises(ValueError, match="tenant"):
-        # Wrap in iter()/next() to force the generator to run
-        # validation. The check is in the eager path of
-        # Client.subscribe so even calling subscribe() should
-        # raise; verify both paths trip the same error.
-        next(iter(client.subscribe()))
+    client = Client("http://127.0.0.1:7878", auth=("u", "p"))
+    # subscribe() returns a generator; it should not raise ValueError for missing tenant
+    # It will fail only when it tries to connect (no server running).
+    gen = client.subscribe()
+    # Just verify it's a generator; don't iterate (no server).
+    import types
+    assert isinstance(gen, types.GeneratorType)
 
 
-def test_session_subscribe_without_tenant_raises():
+def test_session_subscribe_path_uses_v2():
+    """Session.subscribe path must be /api/sessions/{id}/subscribe."""
     from agentdb import Client
 
-    client = Client("http://127.0.0.1:7878")  # no tenant, no auth
+    client = Client("http://127.0.0.1:7878", auth=("u", "p"))
     sess = client.session("agent-1")
-    # subscribe() returns a generator; first .next() runs the
-    # validation in the body before any network I/O.
-    with pytest.raises(ValueError, match="tenant"):
-        next(iter(sess.subscribe()))
+    path = sess._subscribe_path()
+    assert "/api/sessions/agent-1/subscribe" in path
+    assert "/api/tenants/" not in path
 
 
 # --- End-to-end smoke (gated) -----------------------------------
@@ -173,7 +173,7 @@ def subscribe_server():
 
     from agentdb import Client
 
-    client = Client(base_url, tenant="demo")
+    client = Client(base_url)
     deadline = time.time() + 15
     while time.time() < deadline:
         if client.health_ready():
@@ -208,7 +208,7 @@ def test_subscribe_yields_appended_events(subscribe_server):
 
     def consume():
         try:
-            client = Client(base, tenant="t-1")
+            client = Client(base)
             sess = client.session("s-sub-py")
             for evt in sess.subscribe():
                 seen.append(evt)
@@ -219,10 +219,9 @@ def test_subscribe_yields_appended_events(subscribe_server):
 
     consumer = threading.Thread(target=consume, daemon=True)
     consumer.start()
-    # Give the subscribe a beat to attach before we start writing.
     time.sleep(1.0)
 
-    writer = Client(base, tenant="t-1")
+    writer = Client(base)
     sess = writer.session("s-sub-py")
     for i in range(3):
         sess.append({"kind": "msg", "n": i})
@@ -240,12 +239,12 @@ def test_subscribe_replays_from_seq(subscribe_server):
     from agentdb import Client
 
     base = subscribe_server
-    writer = Client(base, tenant="t-1")
+    writer = Client(base)
     sess = writer.session("s-sub-py-replay")
     for _ in range(3):
         sess.append({"kind": "x"})
 
-    client = Client(base, tenant="t-1")
+    client = Client(base)
     reader = client.session("s-sub-py-replay")
     seqs: list = []
     for evt in reader.subscribe(from_seq=1):
@@ -267,7 +266,7 @@ def test_tenant_subscribe_fans_out_across_sessions(subscribe_server):
 
     def consume():
         try:
-            client = Client(base, tenant="t-fanout-py")
+            client = Client(base)
             for evt in client.subscribe():
                 seen.append(evt)
                 if len(seen) >= 4:
@@ -279,7 +278,7 @@ def test_tenant_subscribe_fans_out_across_sessions(subscribe_server):
     consumer.start()
     time.sleep(1.0)
 
-    writer = Client(base, tenant="t-fanout-py")
+    writer = Client(base)
     writer.session("s-a").append({"kind": "p", "t": 1})
     writer.session("s-b").append({"kind": "p", "t": 2})
     writer.session("s-a").append({"kind": "p", "t": 3})

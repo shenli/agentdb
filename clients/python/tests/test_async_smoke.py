@@ -1,9 +1,9 @@
 """End-to-end smoke test for the AsyncClient.
 
 Same fixture pattern as test_smoke.py: spawns `agentdb serve --dev`
-once per module, then exercises the async API. Each test wraps
-its own coroutine with `asyncio.run` so we don't pull in
-pytest-asyncio as a dep.
+with `AGENTDB_REQUIRE_AUTH=true`, creates a test user via the admin
+API, then exercises the async API. Each test wraps its own coroutine
+with `asyncio.run` so we don't pull in pytest-asyncio as a dep.
 
 Skipped automatically when:
   - the server binary hasn't been built (same as the sync smoke);
@@ -20,12 +20,17 @@ import time
 from pathlib import Path
 
 import pytest
+import requests
 
 httpx = pytest.importorskip("httpx")  # gates the whole module
 from agentdb import AsyncClient, AsyncSession  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_BIN = REPO_ROOT / "target" / "debug" / "agentdb"
+
+TEST_USER = "async-smoke-user"
+TEST_PASSWORD = "async-smoke-pass-123"
+TEST_TENANT = "async-smoke-tenant"
 
 
 def _free_port() -> int:
@@ -43,7 +48,11 @@ def server():
         )
     rest_port = _free_port()
     mongo_port = _free_port()
-    env = {**os.environ, "RUST_LOG": "warn"}
+    env = {
+        **os.environ,
+        "RUST_LOG": "warn",
+        "AGENTDB_REQUIRE_AUTH": "true",
+    }
     proc = subprocess.Popen(
         [
             str(SERVER_BIN),
@@ -77,6 +86,22 @@ def server():
         proc.terminate()
         proc.wait(timeout=5)
         pytest.fail("server didn't become ready within 15s")
+
+    # Create test user via admin API.
+    resp = requests.post(
+        f"{base_url}/api/admin/users",
+        json={
+            "user_id": TEST_USER,
+            "tenant_external": TEST_TENANT,
+            "password": TEST_PASSWORD,
+        },
+        timeout=5,
+    )
+    if resp.status_code not in (201, 409):
+        proc.terminate()
+        proc.wait(timeout=5)
+        pytest.fail(f"failed to create test user: {resp.status_code} {resp.text}")
+
     try:
         yield base_url
     finally:
@@ -90,7 +115,7 @@ def server():
 
 def test_async_append_round_trips(server):
     async def run():
-        async with AsyncClient(server, tenant="demo") as client:
+        async with AsyncClient(server, auth=(TEST_USER, TEST_PASSWORD)) as client:
             sess = client.session("async-smoke-1")
             result = await sess.append(
                 {"role": "user", "text": "hello async"},
@@ -105,7 +130,7 @@ def test_async_append_round_trips(server):
 
 def test_async_multi_append_in_order(server):
     async def run():
-        async with AsyncClient(server, tenant="demo") as client:
+        async with AsyncClient(server, auth=(TEST_USER, TEST_PASSWORD)) as client:
             sess = client.session("async-smoke-2")
             await sess.append({"i": 1})
             await sess.append({"i": 2})
@@ -118,7 +143,7 @@ def test_async_multi_append_in_order(server):
 
 def test_async_fork_returns_async_session(server):
     async def run():
-        async with AsyncClient(server, tenant="demo") as client:
+        async with AsyncClient(server, auth=(TEST_USER, TEST_PASSWORD)) as client:
             parent = client.session("async-smoke-fork-parent")
             await parent.append({"i": 1})
             child = await parent.fork("async-smoke-fork-child")
@@ -131,13 +156,10 @@ def test_async_fork_returns_async_session(server):
 
 
 def test_async_gather_writes_to_distinct_sessions_in_parallel(server):
-    """Async-only payoff: the sync client serialises N session
-    writes; AsyncClient + asyncio.gather lets them fly in
-    parallel, which is the actual reason an agent framework
-    wants the async surface."""
+    """Async payoff: write to many sessions at once via asyncio.gather."""
 
     async def run():
-        async with AsyncClient(server, tenant="demo") as client:
+        async with AsyncClient(server, auth=(TEST_USER, TEST_PASSWORD)) as client:
             sessions = [client.session(f"async-fan-{i}") for i in range(5)]
             results = await asyncio.gather(
                 *(s.append({"i": i}, fetch_last_n=1) for i, s in enumerate(sessions))
@@ -145,16 +167,6 @@ def test_async_gather_writes_to_distinct_sessions_in_parallel(server):
             for i, r in enumerate(results):
                 assert r.seq == 1, f"session {i} should be at seq 1 after one write"
                 assert r.recent[0].payload["i"] == i
-
-    asyncio.run(run())
-
-
-def test_async_session_without_tenant_or_auth_raises(server):
-    async def run():
-        async with AsyncClient(server) as client:
-            sess = client.session("async-smoke-3")
-            with pytest.raises(ValueError, match="tenant"):
-                await sess.append({"x": 1})
 
     asyncio.run(run())
 
@@ -168,20 +180,17 @@ def test_async_health_ready(server):
 
 
 def test_async_unpaired_credentials_raise():
-    with pytest.raises(ValueError, match="password"):
-        AsyncClient("http://127.0.0.1:7878", user="alice")
-    with pytest.raises(ValueError, match="user"):
-        AsyncClient("http://127.0.0.1:7878", password="pencil")
+    # token + get_token together is a programmer error
+    with pytest.raises(ValueError, match="get_token"):
+        AsyncClient("http://127.0.0.1:7878", token="t", get_token=lambda: "t")
 
 
 def test_async_session_subscribe_replay(server):
     """Async per-session subscribe replays seeded events via
-    `from_seq=1`, then exits the loop after the third event. Mirrors
-    the sync `test_subscribe_replays_from_seq` but exercises the
-    httpx-backed async path."""
+    `from_seq=1`, then exits the loop after the third event."""
 
     async def run():
-        async with AsyncClient(server, tenant="t-async-sub") as client:
+        async with AsyncClient(server, auth=(TEST_USER, TEST_PASSWORD)) as client:
             sess = client.session("s-replay-async")
             for _ in range(3):
                 await sess.append({"kind": "x"})
