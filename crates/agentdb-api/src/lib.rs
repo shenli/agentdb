@@ -360,6 +360,14 @@ pub fn router(state: AppState) -> Router {
             "/api/tenants/:tenant_id/channels/:channel/subscribe",
             axum::routing::get(broadcast::subscribe_channel),
         )
+        .route(
+            "/api/channels/:channel/publish",
+            axum::routing::post(broadcast::publish_keyed),
+        )
+        .route(
+            "/api/channels/:channel/subscribe",
+            axum::routing::get(broadcast::subscribe_channel_keyed),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             cors::cors_middleware,
