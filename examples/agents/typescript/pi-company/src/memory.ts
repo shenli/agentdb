@@ -48,20 +48,13 @@ export class Memory {
   }
 
   /**
-   * Fetch the last N events for this agent's session. Implemented
-   * via append+fetch with a `_noop` placeholder, then filtered out
-   * — the SDK's only read path is `append({fetchLastN})`. Pure-read
-   * MongoDB-port access is out of scope for the demo wrapper.
+   * Fetch the last N events for this agent's session via the
+   * server's pure-read `fetch_recent` endpoint. Does not write
+   * any sentinel event to the session.
    */
   async loadHistory(n: number): Promise<AgentEvent[]> {
-    const resp = await this._session.append(
-      { kind: "_noop" },
-      { fetchLastN: n + 1 },
-    );
-    return resp.recent.filter((e) => {
-      const payload = e.payload as { kind?: string } | undefined;
-      return payload?.kind !== "_noop";
-    }) as AgentEvent[];
+    const resp = await this._session.fetchRecent(n);
+    return (resp.recent ?? []) as AgentEvent[];
   }
 
   /**

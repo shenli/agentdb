@@ -147,10 +147,10 @@ class FakeSession {
   recent: any[] = [];
   async append(event: any, opts: any) {
     this.appended.push({ event, opts });
-    if (event.kind === "_noop") {
-      return { seq: this.appended.length, recent: this.recent };
-    }
     return { seq: this.appended.length, recent: [] };
+  }
+  async fetchRecent(n: number) {
+    return { recent: this.recent.slice(-n) };
   }
 }
 

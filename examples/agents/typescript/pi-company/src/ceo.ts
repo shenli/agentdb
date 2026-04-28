@@ -276,7 +276,7 @@ export class AutonomousCEO {
 
   protected async countPlanRevisedEvents(): Promise<number> {
     const sess = this.deps.client.session(`${this.deps.run.runId}:_plan`, { tenant: this.deps.run.tenant });
-    const resp = await sess.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
+    const resp = await sess.fetchRecent(1024);
     return (resp.recent ?? []).filter((e: any) => (e.payload?.kind ?? e.kind) === "plan_revised").length;
   }
 
