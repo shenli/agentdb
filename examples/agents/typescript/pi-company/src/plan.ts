@@ -1,4 +1,5 @@
-import type { AgentEvent, AgentRole } from "./types.ts";
+import type { Client } from "agentdb";
+import type { AgentEvent, RunIdentity, AgentRole } from "./types.ts";
 
 export type Role = Exclude<AgentRole, "ceo" | "contractor">;
 
@@ -99,4 +100,103 @@ export function reducePlanEvents(events: AgentEvent[]): PlanState {
   }
 
   return { steps, observations };
+}
+
+export const PLAN_SESSION_SUFFIX = "_plan";
+
+function planSessionName(run: RunIdentity): string {
+  return `${run.runId}:${PLAN_SESSION_SUFFIX}`;
+}
+
+export async function appendPlanRevised(
+  client: Client,
+  run: RunIdentity,
+  steps: Step[],
+  reason: string,
+): Promise<void> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  await sess.append(
+    { kind: "plan_revised", reason, steps } as any,
+    { fetchLastN: 0 },
+  );
+}
+
+export async function appendStepDispatched(
+  client: Client,
+  run: RunIdentity,
+  step_id: string,
+  assigned: Role,
+  text: string,
+): Promise<void> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  await sess.append(
+    { kind: "step_dispatched", step_id, assigned, text } as any,
+    { fetchLastN: 0 },
+  );
+}
+
+export async function appendStepCompleted(
+  client: Client,
+  run: RunIdentity,
+  step_id: string,
+  status: "ok" | "failed" | "blocked" | "cancelled",
+  summary: string,
+  from: AgentRole,
+): Promise<void> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  await sess.append(
+    { kind: "step_completed", step_id, status, summary, from } as any,
+    { fetchLastN: 0 },
+  );
+}
+
+export async function appendObservation(
+  client: Client,
+  run: RunIdentity,
+  from: string,
+  toolName: string,
+  payload: unknown,
+  relates_to_step?: string,
+): Promise<void> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  await sess.append(
+    { kind: "observation", from, toolName, payload, relates_to_step } as any,
+    { fetchLastN: 0 },
+  );
+}
+
+export async function appendStepTimeout(
+  client: Client,
+  run: RunIdentity,
+  step_id: string,
+): Promise<void> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  await sess.append(
+    { kind: "step_timeout", step_id } as any,
+    { fetchLastN: 0 },
+  );
+}
+
+/**
+ * Read all events on `{runId}:_plan` (via the same _noop append+fetch trick
+ * Memory uses), reduce, and truncate the observations to the last N.
+ *
+ * `observation_window` defaults to 20.
+ */
+export async function loadCurrentPlan(
+  client: Client,
+  run: RunIdentity,
+  observation_window: number = 20,
+): Promise<PlanState> {
+  const sess = client.session(planSessionName(run), { tenant: run.tenant });
+  const resp = await sess.append({ kind: "_noop" } as any, { fetchLastN: 1024 });
+  const recent = (resp.recent ?? []).filter((e: any) => {
+    const p = e.payload ?? e;
+    return p?.kind && p.kind !== "_noop";
+  }) as AgentEvent[];
+  const state = reducePlanEvents(recent);
+  if (state.observations.length > observation_window) {
+    state.observations = state.observations.slice(-observation_window);
+  }
+  return state;
 }

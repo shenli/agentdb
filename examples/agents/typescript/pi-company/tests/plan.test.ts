@@ -131,3 +131,83 @@ test("non-plan events are ignored", () => {
   assert.deepEqual(out.steps, []);
   assert.deepEqual(out.observations, []);
 });
+
+import {
+  appendPlanRevised,
+  appendStepDispatched,
+  appendStepCompleted,
+  appendObservation,
+  loadCurrentPlan,
+  PLAN_SESSION_SUFFIX,
+} from "../src/plan.ts";
+
+class FakeSession {
+  appended: any[] = [];
+  recent: any[] = [];
+  async append(event: any, opts: any) {
+    this.appended.push({ event, opts });
+    if (event.kind === "_noop") {
+      return { seq: this.appended.length, recent: this.recent };
+    }
+    return { seq: this.appended.length, recent: [] };
+  }
+}
+
+class FakeClient {
+  sessions = new Map<string, FakeSession>();
+  session(id: string, _opts?: any) {
+    if (!this.sessions.has(id)) this.sessions.set(id, new FakeSession());
+    return this.sessions.get(id)!;
+  }
+}
+
+test("appendPlanRevised writes a plan_revised event to {runId}:_plan", async () => {
+  const client = new FakeClient();
+  await appendPlanRevised(client as any, { tenant: "t", runId: "r1" }, [
+    { id: "s1", text: "do it", assigned: "engineer", status: "pending" },
+  ], "initial");
+  const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`);
+  assert.ok(sess);
+  assert.equal(sess.appended.length, 1);
+  assert.equal(sess.appended[0].event.kind, "plan_revised");
+  assert.equal(sess.appended[0].event.reason, "initial");
+  assert.equal(sess.appended[0].event.steps.length, 1);
+});
+
+test("appendStepDispatched + appendStepCompleted both target {runId}:_plan", async () => {
+  const client = new FakeClient();
+  const run = { tenant: "t", runId: "r1" };
+  await appendStepDispatched(client as any, run, "s1", "engineer", "do it");
+  await appendStepCompleted(client as any, run, "s1", "ok", "did it", "engineer");
+  const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
+  assert.equal(sess.appended.length, 2);
+  assert.equal(sess.appended[0].event.kind, "step_dispatched");
+  assert.equal(sess.appended[1].event.kind, "step_completed");
+  assert.equal(sess.appended[1].event.from, "engineer");
+});
+
+test("appendObservation includes relates_to_step when provided", async () => {
+  const client = new FakeClient();
+  const run = { tenant: "t", runId: "r1" };
+  await appendObservation(client as any, run, "engineer", "write_doc", { title: "x" }, "s1");
+  const sess = client.sessions.get(`r1:${PLAN_SESSION_SUFFIX}`)!;
+  assert.equal(sess.appended[0].event.kind, "observation");
+  assert.equal(sess.appended[0].event.relates_to_step, "s1");
+});
+
+test("loadCurrentPlan reduces session events and truncates observations", async () => {
+  const client = new FakeClient();
+  const run = { tenant: "t", runId: "r1" };
+  const sess = client.session(`r1:${PLAN_SESSION_SUFFIX}`, { tenant: "t" }) as any as FakeSession;
+  sess.recent = [
+    { payload: { kind: "plan_revised", reason: "v1", steps: [
+      { id: "s1", text: "t", assigned: "engineer", status: "pending" },
+    ]}},
+    ...Array.from({ length: 25 }, (_, i) => ({
+      payload: { kind: "observation", from: "engineer", toolName: "write_doc", payload: { i } },
+    })),
+  ];
+  const out = await loadCurrentPlan(client as any, run, 10);
+  assert.equal(out.steps.length, 1);
+  assert.equal(out.observations.length, 10);
+});
