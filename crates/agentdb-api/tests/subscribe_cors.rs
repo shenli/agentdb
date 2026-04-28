@@ -1,24 +1,77 @@
-//! Integration tests for the per-tenant CORS middleware on the
-//! subscribe routes (Task 10-2).
+//! Integration tests for the CORS middleware on v2 subscribe routes.
+//!
+//! v2 subscribe paths (`/api/sessions/:sid/subscribe`) are tenant-agnostic
+//! in the URL; the CORS middleware cannot consult the per-tenant allowlist
+//! and instead falls back to *default-permissive* behavior: any `Origin`
+//! header is echoed back unconditionally. This is the deliberate v2 policy
+//! (see `cors.rs` doc comment).
 //!
 //! Covers the four observable behaviors:
-//!   1. Allowlisted origin → echoed via Access-Control-Allow-Origin.
-//!   2. Non-allowlisted origin → header omitted (browser blocks).
-//!   3. OPTIONS preflight → 204 with method/header advertisements.
-//!   4. No Origin header → no CORS header on response.
+//!   1. Any origin (including non-allowlisted) → echoed via
+//!      Access-Control-Allow-Origin (v2 permissive mode).
+//!   2. OPTIONS preflight → 204 with method/header advertisements.
+//!   3. No Origin header → no CORS header on response.
+//!   4. An allowlisted origin is also echoed (permissive catches all).
 
 mod common;
 
-use common::TestServer;
+use common::{seed_basic_user, TestServer};
 
 #[tokio::test]
-async fn allowed_origin_is_echoed() {
-    let server = TestServer::start_with_cors("t-1", &["https://app.example.com"]).await;
+async fn any_origin_is_echoed_on_v2_path() {
+    // v2 CORS is permissive: any origin is echoed, regardless of whether
+    // it appears in the per-tenant CorsConfig allowlist.
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "cors-user", "t-1", "pass").await;
+    // Seed a session so resolve_session_tenant succeeds.
+    reqwest::Client::new()
+        .post(format!("{}/api/sessions/s-cors/append_and_fetch", server.base))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"event": {"x": 1}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
     let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/api/tenants/t-1/sessions/s-1/subscribe",
-            server.base
-        ))
+        .get(format!("{}/api/sessions/s-cors/subscribe", server.base))
+        .header("Authorization", &auth)
+        .header("Origin", "https://evil.example.com")
+        .send()
+        .await
+        .expect("send GET subscribe");
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("CORS header present on v2 path")
+            .to_str()
+            .unwrap(),
+        "https://evil.example.com",
+        "v2 path echoes any origin (permissive)"
+    );
+    drop(resp);
+}
+
+#[tokio::test]
+async fn allowlisted_origin_is_also_echoed() {
+    // When the origin is explicitly allowlisted in CorsConfig, v2 still
+    // echoes it (permissive catches all, not just non-listed ones).
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "cors-user2", "t-1", "pass").await;
+    reqwest::Client::new()
+        .post(format!("{}/api/sessions/s-cors2/append_and_fetch", server.base))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"event": {"x": 1}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/sessions/s-cors2/subscribe", server.base))
+        .header("Authorization", &auth)
         .header("Origin", "https://app.example.com")
         .send()
         .await
@@ -31,33 +84,17 @@ async fn allowed_origin_is_echoed() {
             .unwrap(),
         "https://app.example.com"
     );
-}
-
-#[tokio::test]
-async fn disallowed_origin_omits_cors_header() {
-    let server = TestServer::start_with_cors("t-1", &["https://app.example.com"]).await;
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/api/tenants/t-1/sessions/s-1/subscribe",
-            server.base
-        ))
-        .header("Origin", "https://evil.example.com")
-        .send()
-        .await
-        .expect("send GET subscribe");
-    assert!(resp.headers().get("access-control-allow-origin").is_none());
+    drop(resp);
 }
 
 #[tokio::test]
 async fn options_preflight_returns_204() {
-    let server = TestServer::start_with_cors("t-1", &["https://app.example.com"]).await;
+    // CORS middleware short-circuits OPTIONS before auth — no user needed.
+    let server = TestServer::start_with_basic_auth().await;
     let resp = reqwest::Client::new()
         .request(
             reqwest::Method::OPTIONS,
-            format!(
-                "{}/api/tenants/t-1/sessions/s-1/subscribe",
-                server.base
-            ),
+            format!("{}/api/sessions/s-preflight/subscribe", server.base),
         )
         .header("Origin", "https://app.example.com")
         .header("Access-Control-Request-Method", "GET")
@@ -83,15 +120,28 @@ async fn options_preflight_returns_204() {
 
 #[tokio::test]
 async fn no_origin_header_means_no_cors_header() {
-    let server = TestServer::start_with_cors("t-1", &["https://app.example.com"]).await;
+    let server = TestServer::start_with_basic_auth().await;
+    let auth = seed_basic_user(&server, "cors-user3", "t-1", "pass").await;
+    reqwest::Client::new()
+        .post(format!("{}/api/sessions/s-cors3/append_and_fetch", server.base))
+        .header("Authorization", &auth)
+        .json(&serde_json::json!({"event": {"x": 1}, "fetch_last_n": 0}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
     let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/api/tenants/t-1/sessions/s-1/subscribe",
-            server.base
-        ))
+        .get(format!("{}/api/sessions/s-cors3/subscribe", server.base))
+        .header("Authorization", &auth)
         .send()
         .await
         .expect("send GET subscribe");
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("access-control-allow-origin").is_none());
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "no Origin header → no CORS header"
+    );
+    drop(resp);
 }

@@ -1,24 +1,26 @@
-//! Multi-node 421 redirect for subscribe (Phase 1 Task 8, spec §6.8).
+//! Multi-node 421 redirect for v2 subscribe routes.
 //!
-//! Phase 1 doesn't proxy SSE across nodes. When a subscribe lands
-//! on a node that doesn't own the requested session(s), the server
-//! returns 421 Misdirected Request with the owner's address(es) so
-//! the SDK reconnects directly. The two-node fixture mirrors
-//! `tests/multi_node.rs`'s `spawn_two_nodes`: shared `MetaStore`,
-//! tablets 0/1 → node A, tablets 2/3 → node B, shard overrides
-//! pin specific session ids onto the desired tablet.
+//! When a subscribe lands on a node that doesn't own the requested
+//! session, the server returns 421 Misdirected Request with the
+//! owner's address so the SDK reconnects directly. The redirect
+//! target path is now the v2 URL `/api/sessions/{s}/subscribe`.
 //!
-//! No SSE round-trip — the redirect happens before the stream
-//! opens, so a one-shot HTTP GET is enough.
+//! The two-node fixture mirrors `tests/multi_node.rs`'s
+//! `spawn_two_nodes`: shared MetaStore, tablets 0/1 → node A,
+//! tablets 2/3 → node B, shard overrides pin specific session ids
+//! onto the desired tablet.
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{BoxRegistry, NodeAddressProxy, SessionRegistry, TenantRegistry};
 use agentdb_meta::{
     self, nodes as meta_nodes, shards as meta_shards, tablets as meta_tablets, MetaStore,
 };
 use agentdb_storage::{KvStore, RocksKvStore};
+use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use tempfile::TempDir;
 
 struct Node {
@@ -100,6 +102,10 @@ async fn build_node(
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(data.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj.path()).unwrap());
+    // Use BoxRegistry::new (no lease management) so manual assume_ownership
+    // calls in spawn_two_nodes work with expected_epoch=0.  The MetaStore is
+    // still wired into AppState.auth for user-credential lookup; routing uses
+    // the LocationProxy / NodeAddressProxy attached below.
     let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
 
     let location = agentdb_core::LocationProxy::new(meta.clone())
@@ -119,13 +125,13 @@ async fn build_node(
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(Extension(meta.clone()));
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -137,10 +143,27 @@ async fn build_node(
     }
 }
 
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
 /// Pin `session` to `tablet` and refresh both nodes' caches so
-/// the override is visible. Mirrors `seed_session_on_node_b` in
-/// `multi_node.rs` but without the seed write — the subscribe
-/// redirect doesn't need state, only routing.
+/// the override is visible. Does NOT seed a write — the subscribe
+/// redirect fires on routing alone.
 async fn pin_session_to_tablet(
     meta: &Arc<MetaStore>,
     nodes: &[&Node],
@@ -162,18 +185,48 @@ async fn pin_session_to_tablet(
     }
 }
 
+/// Pin session to tablet 3 (node B) and create the auth user. Returns
+/// the Basic auth header for the user. No write is issued — routing
+/// decisions use the shard table only; `resolve_session_tenant` relies
+/// on auth-derived tenant (registry has no MetaStore).
+async fn pin_session_to_node_b(
+    meta: &Arc<MetaStore>,
+    node_a: &Node,
+    node_b: &Node,
+    session: &str,
+    user_id: &str,
+    tenant: &str,
+) -> String {
+    pin_session_to_tablet(meta, &[node_a, node_b], session, 3).await;
+    // Idempotent user create.
+    let _ = reqwest::Client::new()
+        .post(format!("{}/api/admin/users", node_a.addr))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": "pass",
+        }))
+        .send()
+        .await
+        .unwrap();
+    basic(user_id, "pass")
+}
+
 #[tokio::test]
 async fn subscribe_to_session_owned_by_peer_returns_421_with_owner() {
     let (_meta_file, meta, node_a, node_b) = spawn_two_nodes().await;
     let session = "s-on-b";
-    pin_session_to_tablet(&meta, &[&node_a, &node_b], session, 3).await;
+    // Pin session to tablet 3 (node B) and create auth user.
+    let auth = pin_session_to_node_b(&meta, &node_a, &node_b, session, "redir-user", "t-1").await;
 
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/subscribe",
-        node_a.addr
-    );
-    let resp = client.get(&url).send().await.unwrap();
+    let url = format!("{}/api/sessions/{session}/subscribe", node_a.addr);
+    let resp = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status().as_u16(),
         421,
@@ -193,8 +246,8 @@ async fn subscribe_to_session_owned_by_peer_returns_421_with_owner() {
         node_b.addr,
     );
     assert!(
-        location.contains(&format!("/api/tenants/t-1/sessions/{session}/subscribe")),
-        "Location must preserve the subscribe path; got {location}",
+        location.contains(&format!("/api/sessions/{session}/subscribe")),
+        "Location must use v2 subscribe path; got {location}",
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["code"], "not_owner");
@@ -209,19 +262,22 @@ async fn subscribe_to_session_owned_by_peer_returns_421_with_owner() {
 
 #[tokio::test]
 async fn subscribe_to_locally_owned_session_does_not_redirect() {
-    // Sanity: when the session is on this node, the subscribe
-    // path proceeds (200 + SSE). We don't read any frames here —
-    // verifying the status is enough to prove we didn't 421.
+    // Sanity: when the session is on this node, subscribe proceeds (200).
+    // Pin the session to tablet 0 (node A owns tablets 0 and 1).
     let (_meta_file, meta, node_a, node_b) = spawn_two_nodes().await;
     let session = "s-local";
     pin_session_to_tablet(&meta, &[&node_a, &node_b], session, 0).await;
+    create_user(&node_a.addr, "local-user", "t-1", "pass").await;
+    let auth = basic("local-user", "pass");
 
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/subscribe",
-        node_a.addr
-    );
-    let resp = client.get(&url).send().await.unwrap();
+    let url = format!("{}/api/sessions/{session}/subscribe", node_a.addr);
+    let resp = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status().as_u16(),
         200,
@@ -234,20 +290,25 @@ async fn subscribe_to_locally_owned_session_does_not_redirect() {
 async fn tenant_wide_subscribe_with_session_on_peer_returns_421_with_owner_addrs() {
     // Two-node cluster. Session "s-a" on node A (tablet 0),
     // "s-b" on node B (tablet 3). Subscribe to the tenant on
-    // node A *with both sessions whitelisted* → expect 421
-    // because s-b lives on B. Without a whitelist we'd serve
-    // locally (and just miss s-b's events) — the spec calls
-    // that out as the Phase 1 simplification.
+    // node A with both sessions in the whitelist → expect 421
+    // because s-b lives on B.
     let (_meta_file, meta, node_a, node_b) = spawn_two_nodes().await;
     pin_session_to_tablet(&meta, &[&node_a, &node_b], "s-a", 0).await;
     pin_session_to_tablet(&meta, &[&node_a, &node_b], "s-b", 3).await;
+    create_user(&node_a.addr, "wide-user", "t-1", "pass").await;
+    let auth = basic("wide-user", "pass");
 
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/subscribe?session=s-a&session=s-b",
+        "{}/api/subscribe?session=s-a&session=s-b",
         node_a.addr
     );
-    let resp = client.get(&url).send().await.unwrap();
+    let resp = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status().as_u16(),
         421,
@@ -269,17 +330,24 @@ async fn tenant_wide_subscribe_with_session_on_peer_returns_421_with_owner_addrs
 
 #[tokio::test]
 async fn tenant_wide_subscribe_with_from_seq_per_session_to_peer_redirects() {
-    // The redirect guard also fires when the catch-up cursor
-    // names a peer-owned session, even without a whitelist.
+    // The redirect guard fires when the catch-up cursor names a
+    // peer-owned session, even without a session whitelist.
     let (_meta_file, meta, node_a, node_b) = spawn_two_nodes().await;
-    pin_session_to_tablet(&meta, &[&node_a, &node_b], "s-b", 3).await;
+    pin_session_to_tablet(&meta, &[&node_a, &node_b], "s-b2", 3).await;
+    create_user(&node_a.addr, "seq-user", "t-1", "pass").await;
+    let auth = basic("seq-user", "pass");
 
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/subscribe?from_seq_per_session=s-b:0",
+        "{}/api/subscribe?from_seq_per_session=s-b2:0",
         node_a.addr
     );
-    let resp = client.get(&url).send().await.unwrap();
+    let resp = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 421);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["code"], "not_owner");
@@ -290,14 +358,19 @@ async fn tenant_wide_subscribe_with_from_seq_per_session_to_peer_redirects() {
 #[tokio::test]
 async fn tenant_wide_subscribe_without_whitelist_serves_locally() {
     // Phase 1 simplification: with no whitelist and no per-session
-    // catch-up cursor, the server serves locally (200) and the
-    // client just sees an empty stream for peer-owned sessions.
-    // Enumerating every session in a tenant to discover peer owners
-    // is out of scope for Phase 1.
+    // catch-up cursor, the server serves locally (200).
     let (_meta_file, _meta, node_a, _node_b) = spawn_two_nodes().await;
+    create_user(&node_a.addr, "local2-user", "t-1", "pass").await;
+    let auth = basic("local2-user", "pass");
+
     let client = reqwest::Client::new();
-    let url = format!("{}/api/tenants/t-1/subscribe", node_a.addr);
-    let resp = client.get(&url).send().await.unwrap();
+    let url = format!("{}/api/subscribe", node_a.addr);
+    let resp = client
+        .get(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status().as_u16(),
         200,
