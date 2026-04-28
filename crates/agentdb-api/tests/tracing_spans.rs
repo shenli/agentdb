@@ -9,9 +9,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use agentdb_api::{router, AppState, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
+use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, TenantRegistry};
+use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
+use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -64,48 +68,83 @@ fn capture() -> Arc<Mutex<Vec<SpanRecord>>> {
     spans
 }
 
-async fn spawn_server() -> (TempDir, TempDir, String) {
+async fn spawn_server() -> (TempDir, TempDir, tempfile::NamedTempFile, String) {
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use std::sync::Arc;
     let dir = TempDir::new().unwrap();
     let obj_dir = TempDir::new().unwrap();
+    let meta_file = tempfile::NamedTempFile::new().unwrap();
+    let meta_path = meta_file.path().to_string_lossy().to_string();
+    let meta = Arc::new(MetaStore::open_sqlite(&meta_path).await.unwrap());
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            4,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "tracing-test-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let state = AppState {
-        registry: Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap()),
+        registry,
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
         sessions: Arc::new(SessionRegistry::new(kv)),
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (dir, obj_dir, format!("http://{addr}"))
+    (dir, obj_dir, meta_file, format!("http://{addr}"))
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
 }
 
 #[tokio::test]
 #[serial]
 async fn append_and_fetch_emits_expected_span_tree() {
     let spans = capture();
-    let (_d, _od, base) = spawn_server().await;
+    let (_d, _od, _m, base) = spawn_server().await;
     let client = reqwest::Client::new();
 
+    create_user(&base, "trace-user", "t-trace", "pass").await;
+    let auth = basic("trace-user", "pass");
+
     client
-        .post(format!(
-            "{base}/api/tenants/t-trace/sessions/s-trace/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/s-trace/append_and_fetch"))
+        .header("Authorization", auth)
         .json(&json!({
             "event": {"text": "hello"},
             "actor_id": "agent-planner",
@@ -124,7 +163,7 @@ async fn append_and_fetch_emits_expected_span_tree() {
     let names: Vec<&'static str> = captured.iter().map(|s| s.name).collect();
 
     assert!(
-        names.contains(&"rest.append_and_fetch"),
+        names.contains(&"rest.append_and_fetch_session_keyed"),
         "missing REST handler span. Captured: {:?}",
         names
     );

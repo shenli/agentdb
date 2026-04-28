@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentdb_api::{router, AppState, StreamBus};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{
     BoxRegistry, HotTabletConfig, HotTabletDetector, LeaderElection, LeaderElectionConfig,
     LocationProxy, SessionRegistry, TenantRegistry,
@@ -17,6 +17,8 @@ use agentdb_core::{
 use agentdb_meta::{shards as meta_shards, MetaStore};
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -100,7 +102,7 @@ async fn spawn_saturable_node() -> (
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -127,6 +129,24 @@ async fn spawn_saturable_node() -> (
     )
 }
 
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
 #[tokio::test]
 async fn detector_flags_tablet_after_burst_and_shed_moves_shards() {
     let (_d, _o, _m, base, registry, detector, location) = spawn_saturable_node().await;
@@ -149,11 +169,15 @@ async fn detector_flags_tablet_after_burst_and_shed_moves_shards() {
     assert!(resp.status().is_success(), "set_shard failed");
     location.refresh().await.unwrap();
 
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+
     // Make one write via HTTP so the path is exercised end-
     // to-end (validates routing + handler + metrics wiring).
-    let url = format!("{base}/api/tenants/t-1/sessions/{session}/append_and_fetch");
+    let url = format!("{base}/api/sessions/{session}/append_and_fetch");
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"warmup": true}, "fetch_last_n": 0}))
         .send()
         .await
@@ -239,6 +263,7 @@ async fn detector_flags_tablet_after_burst_and_shed_moves_shards() {
     let appends_before_3 = registry.box_by_id(3).unwrap().metrics.snapshot().appends;
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"after": "shed"}, "fetch_last_n": 0}))
         .send()
         .await
@@ -259,10 +284,15 @@ async fn shed_with_migrate_data_moves_events_atomically() {
     // Write 8 events on the default tenant-hash box.
     let client = reqwest::Client::new();
     let session = "s-shed-migrate";
-    let url = format!("{base}/api/tenants/t-1/sessions/{session}/append_and_fetch");
+
+    create_user(&base, "t1-user2", "t-1", "pass2").await;
+    let auth = basic("t1-user2", "pass2");
+
+    let url = format!("{base}/api/sessions/{session}/append_and_fetch");
     for i in 1..=8 {
         let r = client
             .post(&url)
+            .header("Authorization", &auth)
             .json(&json!({"event": {"i": i}, "fetch_last_n": 0}))
             .send()
             .await
@@ -316,6 +346,7 @@ async fn shed_with_migrate_data_moves_events_atomically() {
     // history is visible.
     let r = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"i": 9}, "fetch_last_n": 30}))
         .send()
         .await

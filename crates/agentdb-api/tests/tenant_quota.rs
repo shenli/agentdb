@@ -11,13 +11,33 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry, TenantQuotaRegistry};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
+use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, TenantRegistry, TenantQuotaRegistry};
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+async fn create_user_helper(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
 
 async fn spawn() -> (
     TempDir,
@@ -37,7 +57,18 @@ async fn spawn() -> (
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 2).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            2,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "quota-test-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let quotas = Arc::new(TenantQuotaRegistry::new());
     registry
         .attach_tenant_quotas(quotas.clone())
@@ -51,7 +82,7 @@ async fn spawn() -> (
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -66,11 +97,10 @@ async fn spawn() -> (
     (dir, obj_dir, meta_file, meta, format!("http://{addr}"))
 }
 
-async fn append(client: &reqwest::Client, base: &str, tenant: &str) -> reqwest::Response {
+async fn append(client: &reqwest::Client, base: &str, tenant: &str, auth: &str) -> reqwest::Response {
     client
-        .post(format!(
-            "{base}/api/tenants/{tenant}/sessions/s-1/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/s-1/append_and_fetch"))
+        .header("Authorization", auth)
         .json(&json!({"event": {"msg": "hello"}, "fetch_last_n": 0}))
         .send()
         .await
@@ -81,8 +111,10 @@ async fn append(client: &reqwest::Client, base: &str, tenant: &str) -> reqwest::
 async fn unconfigured_tenant_is_never_throttled() {
     let (_d, _o, _m, _meta, base) = spawn().await;
     let client = reqwest::Client::new();
+    create_user_helper(&base, "free-tier-user", "free-tier", "pass").await;
+    let auth = basic("free-tier-user", "pass");
     for _ in 0..10 {
-        let r = append(&client, &base, "free-tier").await;
+        let r = append(&client, &base, "free-tier", &auth).await;
         assert_eq!(r.status().as_u16(), 200);
     }
 }
@@ -91,9 +123,11 @@ async fn unconfigured_tenant_is_never_throttled() {
 async fn configured_tenant_denies_after_burst_with_429() {
     let (_d, _o, _m, _meta, base) = spawn().await;
     let client = reqwest::Client::new();
+    create_user_helper(&base, "noisy-user", "noisy", "pass").await;
+    let auth = basic("noisy-user", "pass");
 
     // Mint the tenant with a permissive initial write.
-    assert_eq!(append(&client, &base, "noisy").await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "noisy", &auth).await.status().as_u16(), 200);
 
     // Configure a tight quota.
     let r = client
@@ -105,9 +139,9 @@ async fn configured_tenant_denies_after_burst_with_429() {
     assert_eq!(r.status().as_u16(), 200);
 
     // First post-quota write spends the burst token.
-    assert_eq!(append(&client, &base, "noisy").await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "noisy", &auth).await.status().as_u16(), 200);
     // Second should 429.
-    let r = append(&client, &base, "noisy").await;
+    let r = append(&client, &base, "noisy", &auth).await;
     assert_eq!(r.status().as_u16(), 429, "expected tenant_global deny");
     let body: Value = r.json().await.unwrap();
     assert_eq!(
@@ -121,24 +155,26 @@ async fn configured_tenant_denies_after_burst_with_429() {
 async fn bucket_refills_over_time() {
     let (_d, _o, _m, _meta, base) = spawn().await;
     let client = reqwest::Client::new();
+    create_user_helper(&base, "refill-user", "refill", "pass").await;
+    let auth = basic("refill-user", "pass");
 
-    assert_eq!(append(&client, &base, "refill").await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "refill", &auth).await.status().as_u16(), 200);
     let r = client
         .put(format!("{base}/api/admin/tenant-quotas/refill"))
-        .json(&json!({"max_qps": 100, "burst": 1}))
+        .json(&json!({"max_qps": 20, "burst": 1}))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
 
     // Drain the bucket.
-    assert_eq!(append(&client, &base, "refill").await.status().as_u16(), 200);
-    assert_eq!(append(&client, &base, "refill").await.status().as_u16(), 429);
+    assert_eq!(append(&client, &base, "refill", &auth).await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "refill", &auth).await.status().as_u16(), 429);
 
-    // 100 qps = 10ms per token. Wait 30ms to be safe.
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // 20 qps = 50ms per token. Wait 150ms to be safe.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
-        append(&client, &base, "refill").await.status().as_u16(),
+        append(&client, &base, "refill", &auth).await.status().as_u16(),
         200,
         "token should have refilled"
     );
@@ -148,8 +184,10 @@ async fn bucket_refills_over_time() {
 async fn delete_removes_enforcement() {
     let (_d, _o, _m, _meta, base) = spawn().await;
     let client = reqwest::Client::new();
+    create_user_helper(&base, "clear-me-user", "clear-me", "pass").await;
+    let auth = basic("clear-me-user", "pass");
 
-    assert_eq!(append(&client, &base, "clear-me").await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "clear-me", &auth).await.status().as_u16(), 200);
     client
         .put(format!("{base}/api/admin/tenant-quotas/clear-me"))
         .json(&json!({"max_qps": 1, "burst": 1}))
@@ -158,8 +196,8 @@ async fn delete_removes_enforcement() {
         .unwrap()
         .error_for_status()
         .unwrap();
-    assert_eq!(append(&client, &base, "clear-me").await.status().as_u16(), 200);
-    assert_eq!(append(&client, &base, "clear-me").await.status().as_u16(), 429);
+    assert_eq!(append(&client, &base, "clear-me", &auth).await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "clear-me", &auth).await.status().as_u16(), 429);
 
     let r = client
         .delete(format!("{base}/api/admin/tenant-quotas/clear-me"))
@@ -169,7 +207,7 @@ async fn delete_removes_enforcement() {
     assert_eq!(r.status().as_u16(), 204);
     for _ in 0..5 {
         assert_eq!(
-            append(&client, &base, "clear-me").await.status().as_u16(),
+            append(&client, &base, "clear-me", &auth).await.status().as_u16(),
             200,
             "quota cleared; should never deny"
         );
@@ -180,8 +218,10 @@ async fn delete_removes_enforcement() {
 async fn deny_counter_surfaces_on_get_and_metrics() {
     let (_d, _o, _m, _meta, base) = spawn().await;
     let client = reqwest::Client::new();
+    create_user_helper(&base, "counted-user", "counted", "pass").await;
+    let auth = basic("counted-user", "pass");
 
-    assert_eq!(append(&client, &base, "counted").await.status().as_u16(), 200);
+    assert_eq!(append(&client, &base, "counted", &auth).await.status().as_u16(), 200);
     client
         .put(format!("{base}/api/admin/tenant-quotas/counted"))
         .json(&json!({"max_qps": 1, "burst": 1}))
@@ -191,9 +231,9 @@ async fn deny_counter_surfaces_on_get_and_metrics() {
         .error_for_status()
         .unwrap();
     // Drain + deny three times.
-    let _ = append(&client, &base, "counted").await;
+    let _ = append(&client, &base, "counted", &auth).await;
     for _ in 0..3 {
-        assert_eq!(append(&client, &base, "counted").await.status().as_u16(), 429);
+        assert_eq!(append(&client, &base, "counted", &auth).await.status().as_u16(), 429);
     }
 
     // GET shows the counter.

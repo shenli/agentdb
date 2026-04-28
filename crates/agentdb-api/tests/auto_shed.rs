@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentdb_api::{auto_shed::AutoShedConfig, router, AppState, StreamBus};
+use agentdb_api::{auto_shed::AutoShedConfig, router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{
     BoxRegistry, HotTabletConfig, HotTabletDetector, LeaderElection, LeaderElectionConfig,
     LocationProxy, SessionRegistry, TenantRegistry,
@@ -13,6 +13,8 @@ use agentdb_core::{
 use agentdb_meta::{shards as meta_shards, MetaStore};
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -41,13 +43,16 @@ async fn spawn_with_autoshed() -> (
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj.path()).unwrap());
     let registry = Arc::new(
-        BoxRegistry::new_with_capacity(
+        BoxRegistry::new_with_meta_and_capacity(
             kv.clone(),
             store,
             4,
             Arc::new(agentdb_core::HlcClock::default()),
+            meta.clone(),
+            "autoshed-test-node".into(),
             1, // admission capacity = 1 so bursts produce waits
         )
+        .await
         .unwrap(),
     );
     let location = LocationProxy::new(meta.clone()).await.unwrap();
@@ -82,7 +87,7 @@ async fn spawn_with_autoshed() -> (
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -123,11 +128,33 @@ async fn spawn_with_autoshed() -> (
     )
 }
 
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
 #[tokio::test]
 async fn auto_shed_fires_when_tablet_is_flagged_hot() {
     let (_d, _o, _m, base, registry, _detector, location, job) =
         spawn_with_autoshed().await;
     let client = reqwest::Client::new();
+
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+
     let session = "s-auto";
 
     // Pin the session's shard to tablet 2. Writes for this
@@ -143,9 +170,10 @@ async fn auto_shed_fires_when_tablet_is_flagged_hot() {
     location.refresh().await.unwrap();
 
     // One warmup write so the session exists on box 2.
-    let url = format!("{base}/api/tenants/t-1/sessions/{session}/append_and_fetch");
+    let url = format!("{base}/api/sessions/{session}/append_and_fetch");
     client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"i": 0}, "fetch_last_n": 0}))
         .send()
         .await

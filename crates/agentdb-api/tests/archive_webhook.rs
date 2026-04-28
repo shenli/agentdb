@@ -3,12 +3,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
+use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, TenantRegistry};
+use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::{json, Value};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -36,15 +40,29 @@ async fn mock_webhook_server() -> (String, Rx) {
     (format!("http://{addr}/"), rx)
 }
 
-async fn spawn_db() -> (TempDir, TempDir, String, Arc<BoxRegistry>) {
+async fn spawn_db() -> (TempDir, TempDir, tempfile::NamedTempFile, String, Arc<BoxRegistry>) {
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     let dir = TempDir::new().unwrap();
     let obj_dir = TempDir::new().unwrap();
+    let meta_file = tempfile::NamedTempFile::new().unwrap();
+    let meta_path = meta_file.path().to_string_lossy().to_string();
+    let meta = Arc::new(MetaStore::open_sqlite(&meta_path).await.unwrap());
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 4).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            4,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "webhook-test-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let state = AppState {
         registry: registry.clone(),
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
@@ -52,19 +70,37 @@ async fn spawn_db() -> (TempDir, TempDir, String, Arc<BoxRegistry>) {
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (dir, obj_dir, format!("http://{addr}"), registry)
+    (dir, obj_dir, meta_file, format!("http://{addr}"), registry)
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
 }
 
 async fn recv_with_timeout(rx: &mut Rx) -> Option<Value> {
@@ -78,9 +114,12 @@ async fn recv_with_timeout(rx: &mut Rx) -> Option<Value> {
 #[serial]
 async fn archive_roundtrip_fires_webhooks_for_every_step() {
     let (mock_url, mut rx) = mock_webhook_server().await;
-    let (_dir, _obj_dir, base, registry) = spawn_db().await;
+    let (_dir, _obj_dir, _meta_file, base, registry) = spawn_db().await;
     let client = reqwest::Client::new();
     let box_id = registry.route_tenant("t-a").id;
+
+    create_user(&base, "ta-user", "t-a", "pass").await;
+    let auth = basic("ta-user", "pass");
 
     client
         .post(format!("{base}/api/admin/boxes/{box_id}/webhook"))
@@ -92,9 +131,8 @@ async fn archive_roundtrip_fires_webhooks_for_every_step() {
         .unwrap();
 
     client
-        .post(format!(
-            "{base}/api/tenants/t-a/sessions/s-1/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/s-1/append_and_fetch"))
+        .header("Authorization", &auth)
         .json(&json!({"event":{"text":"hi"},"fetch_last_n":0}))
         .send()
         .await
@@ -174,13 +212,15 @@ async fn archive_roundtrip_fires_webhooks_for_every_step() {
 #[tokio::test]
 #[serial]
 async fn no_webhook_when_url_unset() {
-    let (_dir, _obj_dir, base, _registry) = spawn_db().await;
+    let (_dir, _obj_dir, _meta_file, base, _registry) = spawn_db().await;
     let client = reqwest::Client::new();
 
+    create_user(&base, "tb-user", "t-b", "pass").await;
+    let auth = basic("tb-user", "pass");
+
     client
-        .post(format!(
-            "{base}/api/tenants/t-b/sessions/s/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/s/append_and_fetch"))
+        .header("Authorization", &auth)
         .json(&json!({"event":{"text":"hi"},"fetch_last_n":0}))
         .send()
         .await
@@ -203,7 +243,7 @@ async fn no_webhook_when_url_unset() {
 #[tokio::test]
 #[serial]
 async fn set_webhook_rejects_non_http_url() {
-    let (_dir, _obj_dir, base, registry) = spawn_db().await;
+    let (_dir, _obj_dir, _meta_file, base, registry) = spawn_db().await;
     let client = reqwest::Client::new();
     let box_id = registry.route_tenant("anything").id;
     let r = client
