@@ -106,6 +106,17 @@ export class Orchestrator {
   }
 
   /**
+   * Stop all employee agents without writing a `run_ended` event to `_meta`.
+   * Used by autonomous mode where `AutonomousCEO.start()` already records
+   * the run-ended event with the meaningful cause.
+   */
+  stopAgents(): void {
+    for (const agent of this.agents) {
+      agent.stop();
+    }
+  }
+
+  /**
    * Block until all employee agents' subscription loops settle. Used by
    * the entry script (Task 13) to keep the process alive while the run
    * is active.

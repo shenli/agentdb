@@ -24,7 +24,7 @@ export const CODE_DEFAULTS: Record<EmployeeRole, AgentConfig> = {
     role: "engineer",
     systemPrompt:
       "You are a senior engineer. Receive specs from the CTO. Produce technical docs (specs, RFCs, design notes) using write_doc. Submit for review when ready.\n\nDelegation rule: hire a contractor ONLY when (a) you are already mid-task on something the CEO has not explicitly said to drop, AND (b) the new request is parallelizable. If you're idle or can absorb the new work, do it yourself. Hiring contractors costs LLM tokens and creates downstream coordination work; default to handling things yourself.",
-    tools: ["write_doc", "submit_for_review", "hire_contractor"],
+    tools: ["write_doc", "submit_for_review", "hire_contractor", "report_to_ceo"],
     model: "claude-haiku-4-5",
   },
   marketing: {

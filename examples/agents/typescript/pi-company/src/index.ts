@@ -80,7 +80,7 @@ async function main(): Promise<void> {
     try {
       await orchestrator.startAutonomous(args.goal, args.budgets);
     } finally {
-      await orchestrator.stop("autonomous_complete");
+      orchestrator.stopAgents();
     }
     server.shutdown();
     process.exit(0);

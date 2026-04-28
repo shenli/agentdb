@@ -50,7 +50,7 @@ export const ALL_TOOLS: Record<string, CompanyTool> = {
 export const ROLE_TOOLS: Record<string, string[]> = {
   ceo: ["announce", "direct_message", "update_agent_config"],
   cto: ["delegate_to_engineer", "report_to_ceo", "hire_contractor"],
-  engineer: ["write_doc", "submit_for_review", "hire_contractor"],
+  engineer: ["write_doc", "submit_for_review", "hire_contractor", "report_to_ceo"],
   marketing: ["draft_campaign", "report_to_ceo", "hire_contractor"],
   sales: ["add_prospect", "draft_outreach", "report_to_ceo"],
   contractor: ["write_doc", "report_to_ceo"],
