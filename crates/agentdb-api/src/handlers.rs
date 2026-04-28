@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::auth_middleware::AuthedTenant;
-use crate::dto::{AppendAndFetchRequest, AppendAndFetchResponse, EventDto};
+use crate::dto::{AppendAndFetchRequest, AppendAndFetchResponse, EventDto, FetchRecentRequest, FetchRecentResponse};
 use crate::error::{ApiError, ErrorResponse};
 use crate::forwarding::{self, PassthroughHeaders, FORWARDED_HEADER};
 use crate::AppState;
@@ -270,6 +270,219 @@ pub async fn append_and_fetch_session_keyed(
     };
     do_append_and_fetch(state, tenant, session, headers, body).await
 }
+
+// ---------------------------------------------------------------------------
+// fetch_recent — read-only session tail (no write, no _noop pollution)
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/api/tenants/{tenant_id}/sessions/{session_id}/fetch_recent",
+    tag = "primitives",
+    params(
+        ("tenant_id" = String, Path, description = "External tenant id"),
+        ("session_id" = String, Path, description = "External session id"),
+    ),
+    request_body = FetchRecentRequest,
+    responses(
+        (status = 200, description = "Last N events returned (read-only)", body = FetchRecentResponse),
+        (status = 400, description = "Malformed request", body = ErrorResponse),
+        (status = 403, description = "Authenticated tenant disagrees with path tenant", body = ErrorResponse),
+        (status = 421, description = "Routing drift on a forwarded request"),
+        (status = 503, description = "Forwarding failed", body = ErrorResponse),
+    ),
+)]
+#[tracing::instrument(
+    name = "rest.fetch_recent",
+    skip(state, headers, body, authed),
+    fields(
+        tenant = %tenant,
+        session = %session,
+        forwarded = headers.contains_key(FORWARDED_HEADER),
+    ),
+)]
+pub async fn fetch_recent(
+    State(state): State<AppState>,
+    Path((tenant, session)): Path<(String, String)>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+    body: Bytes,
+) -> Response {
+    if let Some(Extension(authed)) = &authed {
+        if authed.external_id != tenant {
+            return ApiError::Forbidden(format!(
+                "user {} is bound to tenant {} but path targets {tenant}",
+                authed.user_id, authed.external_id
+            ))
+            .into_response();
+        }
+    }
+    do_fetch_recent(state, tenant, session, headers, body).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/sessions/{session_id}/fetch_recent",
+    tag = "primitives",
+    params(
+        ("session_id" = String, Path, description = "External session id"),
+    ),
+    request_body = FetchRecentRequest,
+    responses(
+        (status = 200, description = "Last N events returned (read-only)", body = FetchRecentResponse),
+        (status = 400, description = "Malformed request, or tenant cannot be resolved (no auth, no locator)", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid Authorization header (when auth is enabled)", body = ErrorResponse),
+        (status = 403, description = "Authenticated tenant doesn't own this session", body = ErrorResponse),
+        (status = 421, description = "Routing drift on a forwarded request"),
+        (status = 503, description = "Forwarding failed", body = ErrorResponse),
+    ),
+)]
+#[tracing::instrument(
+    name = "rest.fetch_recent_session_keyed",
+    skip(state, headers, body, authed),
+    fields(
+        session = %session,
+        forwarded = headers.contains_key(FORWARDED_HEADER),
+    ),
+)]
+pub async fn fetch_recent_session_keyed(
+    State(state): State<AppState>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+    authed: Option<Extension<AuthedTenant>>,
+    body: Bytes,
+) -> Response {
+    let authed_tenant = authed.as_deref().map(|a| a.external_id.as_str());
+    let authed_user = authed.as_deref().map(|a| a.user_id.as_str());
+    let locator_tenant = match state.registry.meta_store() {
+        Some(meta) => match agentdb_meta::session_locators::get(meta.pool(), &session).await {
+            Ok(Some(loc)) => loc.tenant_external_id,
+            Ok(None) => None,
+            Err(e) => {
+                return ApiError::Core(agentdb_core::Error::Invalid {
+                    field: None,
+                    message: format!("session locator lookup failed: {e}"),
+                })
+                .into_response()
+            }
+        },
+        None => None,
+    };
+    let tenant = match (authed_tenant, locator_tenant.as_deref()) {
+        (Some(a), Some(l)) if a != l => {
+            return ApiError::Forbidden(format!(
+                "user {} is bound to tenant {a} but session {session} belongs to tenant {l}",
+                authed_user.unwrap_or("?")
+            ))
+            .into_response();
+        }
+        (Some(a), _) => a.to_string(),
+        (None, Some(l)) => l.to_string(),
+        (None, None) => {
+            return ApiError::Core(agentdb_core::Error::Invalid {
+                field: Some("tenant".into()),
+                message: format!(
+                    "cannot resolve tenant for session {session}: no Authorization header, \
+                     no session locator. Use /api/tenants/<tid>/sessions/<sid>/fetch_recent \
+                     for pre-M26 sessions, or enable auth"
+                ),
+            })
+            .into_response()
+        }
+    };
+    do_fetch_recent(state, tenant, session, headers, body).await
+}
+
+async fn do_fetch_recent(
+    state: AppState,
+    tenant: String,
+    session: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Route same-as-write for v1 simplicity. Follower-read
+    // optimization is future work.
+    let decision = state
+        .registry
+        .route_session_for_write(&tenant, &session)
+        .await;
+    let already_forwarded = headers.contains_key(FORWARDED_HEADER);
+
+    if let agentdb_core::RouteDecision::Remote { target, tablet_id } = &decision {
+        if already_forwarded {
+            let local_node = state.registry.node_id().unwrap_or("unknown").to_string();
+            return forwarding::misdirected_reply(&local_node, *tablet_id);
+        }
+        let passthrough = PassthroughHeaders::from_headers(&headers);
+        match forwarding::forward_fetch_recent(
+            &state.http,
+            target,
+            &tenant,
+            &session,
+            body,
+            passthrough,
+        )
+        .await
+        {
+            Ok(resp) => return resp,
+            Err(err) => {
+                let body = err.to_body();
+                let status = StatusCode::SERVICE_UNAVAILABLE;
+                return (status, axum::Json(body)).into_response();
+            }
+        }
+    }
+
+    // Local path: deserialize and read.
+    let parsed: FetchRecentRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::Core(agentdb_core::Error::Invalid {
+                field: None,
+                message: format!("invalid JSON body: {e}"),
+            })
+            .into_response()
+        }
+    };
+
+    // Resolve tenant → session via the same lookup chain as scan_events_from_seq.
+    let box_ = state.registry.route_session(&tenant, &session);
+    let tenant_rec = match state.tenants.lookup(box_.id, &tenant) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            // Session/tenant not minted yet — return empty list.
+            return axum::Json(FetchRecentResponse { recent: vec![] }).into_response();
+        }
+        Err(e) => return ApiError::Internal(format!("tenant lookup: {e}")).into_response(),
+    };
+    let session_rec = match state.sessions.lookup(box_.id, tenant_rec.internal_id, &session) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return axum::Json(FetchRecentResponse { recent: vec![] }).into_response();
+        }
+        Err(e) => return ApiError::Internal(format!("session lookup: {e}")).into_response(),
+    };
+    let ctx = match agentdb_core::ReadCtx::open(&box_, state.registry.kv()) {
+        Ok(c) => c,
+        Err(e) => return ApiError::Internal(format!("open ReadCtx: {e}")).into_response(),
+    };
+    let events = match agentdb_core::fetch_last_n_merged(
+        &ctx,
+        state.registry.object_store(),
+        &state.sessions,
+        &session_rec,
+        parsed.n,
+    )
+    .await
+    {
+        Ok(evs) => evs,
+        Err(e) => return ApiError::Core(e).into_response(),
+    };
+    let recent = events.into_iter().map(EventDto::from).collect();
+    axum::Json(FetchRecentResponse { recent }).into_response()
+}
+
+// ---------------------------------------------------------------------------
 
 async fn do_append_and_fetch(
     state: AppState,

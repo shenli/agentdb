@@ -164,6 +164,32 @@ pub async fn forward_append_and_fetch(
     .await
 }
 
+/// Forward a POST `/api/tenants/:tid/sessions/:sid/fetch_recent`
+/// to `target` and return the remote response verbatim.
+pub async fn forward_fetch_recent(
+    http: &Client,
+    target: &NodeTarget,
+    tenant_id: &str,
+    session_id: &str,
+    body: Bytes,
+    passthrough: PassthroughHeaders,
+) -> Result<Response, ForwardError> {
+    let path = format!(
+        "/api/tenants/{}/sessions/{}/fetch_recent",
+        urlencode(tenant_id),
+        urlencode(session_id),
+    );
+    forward_request(
+        http,
+        target,
+        reqwest::Method::POST,
+        &path,
+        Some(body),
+        passthrough,
+    )
+    .await
+}
+
 /// Forward `GET /api/admin/sessions/:sid?tenant_id=...` to
 /// the tablet's owner node. Unlike append_and_fetch, the
 /// tenant lives in the query string, not the path.

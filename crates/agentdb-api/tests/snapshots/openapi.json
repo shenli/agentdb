@@ -1661,6 +1661,90 @@
         }
       }
     },
+    "/api/sessions/{session_id}/fetch_recent": {
+      "post": {
+        "tags": [
+          "primitives"
+        ],
+        "operationId": "fetch_recent_session_keyed",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "External session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchRecentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Last N events returned (read-only)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchRecentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request, or tenant cannot be resolved (no auth, no locator)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Authorization header (when auth is enabled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated tenant doesn't own this session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "Routing drift on a forwarded request"
+          },
+          "503": {
+            "description": "Forwarding failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/fork": {
       "post": {
         "tags": [
@@ -1830,6 +1914,89 @@
           },
           "503": {
             "description": "Fault injected, forwarding failed, or node draining",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tenants/{tenant_id}/sessions/{session_id}/fetch_recent": {
+      "post": {
+        "tags": [
+          "primitives"
+        ],
+        "operationId": "fetch_recent",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "description": "External tenant id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "External session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchRecentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Last N events returned (read-only)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FetchRecentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated tenant disagrees with path tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "421": {
+            "description": "Routing drift on a forwarded request"
+          },
+          "503": {
+            "description": "Forwarding failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2479,6 +2646,32 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "FetchRecentRequest": {
+        "type": "object",
+        "required": [
+          "n"
+        ],
+        "properties": {
+          "n": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "FetchRecentResponse": {
+        "type": "object",
+        "required": [
+          "recent"
+        ],
+        "properties": {
+          "recent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventDto"
+            }
           }
         }
       },
