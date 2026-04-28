@@ -25,7 +25,8 @@ from agentdb import AsyncClient
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-TENANT = os.environ.get("AGENTDB_TENANT", "demo")
+USER = os.environ.get("AGENTDB_USER", "demo")
+PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
 SESSION_ID = "async-quickstart-agent"
 
 
@@ -50,7 +51,7 @@ def render(label: str, recent) -> None:
 
 
 async def main() -> None:
-    async with AsyncClient(SERVER_URL, tenant=TENANT) as client:
+    async with AsyncClient(base_url=SERVER_URL, auth=(USER, PASSWORD)) as client:
         if not await client.health_ready():
             raise SystemExit(
                 f"AgentDB not ready at {SERVER_URL}. Start it with:\n"
@@ -58,8 +59,7 @@ async def main() -> None:
             )
 
         sess = client.session(SESSION_ID)
-        print(f"# Session: {sess}")
-        print(f"# Tenant:  {TENANT}\n")
+        print(f"# Session: {sess}\n")
 
         # Sequential 3-turn loop — same flow as the sync example,
         # so the payload shape lines up if you compare side-by-
