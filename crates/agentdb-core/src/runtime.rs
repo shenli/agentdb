@@ -34,6 +34,13 @@ use crate::tenant::{NewTenant, Tenant};
 /// TODO(V2.4): drive this from the tenant policy instead.
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// V2.1 hardcoded ceiling on the serialized JSON size of an inline event
+/// payload. Anything bigger should be stored as an artifact and referenced via
+/// `artifact_refs`; the suggestion attached to `EventTooLarge` points callers
+/// at that path.
+/// TODO(V2.4): drive this from the tenant policy instead.
+const MAX_INLINE_EVENT_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
     pub tenant_id: Id,
@@ -551,6 +558,26 @@ impl Runtime {
             }
         }
 
+        // Inline payload size guard. Done after the idempotency short-circuit
+        // (a retry that already committed should replay, not re-validate) but
+        // before we lock state, so a misbehaving caller can't churn the mutex
+        // by hammering oversized payloads. The MAX_INLINE_EVENT_BYTES limit is
+        // hardcoded for V2.1; V2.4 will pull it from the tenant policy.
+        let payload_len = serde_json::to_vec(&req.payload)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if payload_len > MAX_INLINE_EVENT_BYTES {
+            return Err(Error::new(
+                ErrorCode::EventTooLarge,
+                format!(
+                    "inline event payload {payload_len} bytes exceeds {MAX_INLINE_EVENT_BYTES} byte limit"
+                ),
+            )
+            .with_suggestion(
+                "store the payload as an artifact and reference it via artifact_refs",
+            ));
+        }
+
         let mut s = self.state.lock().await;
 
         // Re-check under the state lock to close the concurrent-append race:
@@ -563,8 +590,12 @@ impl Runtime {
             }
         }
 
-        let (seq, policy_version, session_snapshot) = {
-            let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
+        // Validate session + agent membership without mutating yet, so the
+        // artifact_refs check below can run in the right error-code order
+        // (session/agent mismatches surface as their dedicated NotFound
+        // before we ever look at artifacts).
+        {
+            let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
                 Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
             // Tenant isolation: a session id from tenant B is "not found" from
@@ -587,6 +618,39 @@ impl Runtime {
                     format!("{}", req.agent_id),
                 ));
             }
+        }
+
+        // Validate every artifact_ref points to a live artifact owned by the
+        // same tenant before we mutate session state. We collapse "wrong
+        // kind", "unknown id", "soft-deleted", and "owned by another tenant"
+        // into a single `ArtifactNotFound` (mirroring `get_artifact`) so a
+        // caller in tenant A can't probe tenant B's artifact ids by
+        // error-code differential.
+        for art_ref in &req.artifact_refs {
+            let known = (art_ref.artifact_id.kind() == crate::id::IdKind::Artifact)
+                && s.artifacts
+                    .get(art_ref.artifact_id.as_str())
+                    .is_some_and(|a| {
+                        a.deleted_at_ms.is_none()
+                            && a.tenant_id.as_str() == req.tenant_id.as_str()
+                    });
+            if !known {
+                return Err(Error::new(
+                    ErrorCode::ArtifactNotFound,
+                    format!("{}", art_ref.artifact_id),
+                ));
+            }
+        }
+
+        let (seq, policy_version, session_snapshot) = {
+            // Re-acquire mutable access to the session row to mint the seq
+            // and bump `last_active_at_ms`. The validation above already
+            // confirmed the session is the right tenant + agent; no
+            // additional checks needed here.
+            let session = s
+                .sessions
+                .get_mut(req.session_id.as_str())
+                .expect("session presence checked above");
             let seq = session.next_seq;
             let pv = session.policy_version;
             session.next_seq += 1;
