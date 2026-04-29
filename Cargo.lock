@@ -19,6 +19,7 @@ dependencies = [
 name = "agentdb-core"
 version = "0.1.0"
 dependencies = [
+ "agentdb-index",
  "agentdb-storage",
  "anyhow",
  "serde",
@@ -27,6 +28,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -395,6 +395,12 @@ impl Persist {
     /// Look up a record by primary key (tenant + record_id). Returns
     /// `None` if the row is absent. Callers are responsible for
     /// soft-delete and expiration filtering.
+    ///
+    /// Currently unused by the V2.2a runtime (which serves
+    /// `get_record` from the in-memory cache hydrated at startup);
+    /// kept for the V2.2b HTTP layer that will need on-demand reads
+    /// against the KV store.
+    #[allow(dead_code)]
     pub fn get_record(
         &self,
         tenant_id: &str,
