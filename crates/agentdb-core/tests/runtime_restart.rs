@@ -7,14 +7,23 @@
 use std::sync::Arc;
 
 use agentdb_core::agent::NewAgent;
+use agentdb_core::artifact::NewArtifact;
 use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime};
 use agentdb_core::session::NewSession;
 use agentdb_core::tenant::NewTenant;
-use agentdb_storage::{KvStore, RocksKvStore};
+use agentdb_storage::{
+    ContentBackend, InMemoryContentBackend, KvStore, LocalFsContentBackend, RocksKvStore,
+};
 use tempfile::TempDir;
 
 fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
     Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
+}
+
+/// Convenience for restart tests that don't exercise artifacts: pair every
+/// `with_kv` with a fresh in-memory content backend.
+fn in_memory_content() -> Arc<dyn ContentBackend> {
+    Arc::new(InMemoryContentBackend::default())
 }
 
 #[tokio::test]
@@ -22,7 +31,7 @@ async fn events_and_next_seq_survive_restart() {
     let dir = TempDir::new().unwrap();
 
     let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let t = rt
         .create_tenant(NewTenant {
             external_key: "acme".into(),
@@ -59,7 +68,7 @@ async fn events_and_next_seq_survive_restart() {
     // dropped first (single-writer lock), which happened above when `rt` (and
     // its captured Arc<KvStore>) went out of scope.
     let kv2 = open_kv(dir.path());
-    let rt2 = Runtime::with_kv(kv2);
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
 
     let events = rt2
         .fetch_from_seq(FetchRequest {
@@ -88,7 +97,7 @@ async fn idempotency_records_survive_restart() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
 
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     let mut req = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"v": 1}));
     req.idempotency_key = Some("k1".into());
@@ -96,7 +105,7 @@ async fn idempotency_records_survive_restart() {
     drop(rt);
 
     let kv2 = open_kv(dir.path());
-    let rt2 = Runtime::with_kv(kv2);
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
     let r2 = rt2.append(req).await.unwrap();
     assert_eq!(r1.event_id, r2.event_id);
     assert_eq!(r1.seq, r2.seq);
@@ -119,12 +128,12 @@ async fn idempotency_records_survive_restart() {
 async fn tenants_agents_and_sessions_hydrate_on_open() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     drop(rt);
 
     let kv2 = open_kv(dir.path());
-    let rt2 = Runtime::with_kv(kv2);
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
 
     // Append should work — proves tenant + agent + session were rehydrated.
     let r = rt2
@@ -138,7 +147,7 @@ async fn tenants_agents_and_sessions_hydrate_on_open() {
 async fn append_and_fetch_uses_kv_recent() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     for i in 0..3_u64 {
         rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": i})))
@@ -164,7 +173,7 @@ async fn append_and_fetch_uses_kv_recent() {
 async fn event_by_id_index_is_written_and_survives_restart() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     let r = rt
         .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
@@ -174,7 +183,7 @@ async fn event_by_id_index_is_written_and_survives_restart() {
 
     // Reopen — the event_by_id row must still resolve to (session_id, seq).
     let kv2 = open_kv(dir.path());
-    let rt2 = Runtime::with_kv(kv2);
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
     let lookup = rt2
         .lookup_event_by_id(&t.tenant_id, &r.event_id)
         .await
@@ -186,13 +195,73 @@ async fn event_by_id_index_is_written_and_survives_restart() {
 }
 
 #[tokio::test]
+async fn artifacts_survive_restart() {
+    // End-to-end persistence test for V2.1 artifacts: metadata to RocksDB,
+    // bytes to a LocalFsContentBackend rooted next to the kv directory.
+    // After dropping the runtime and reopening both, the artifact metadata
+    // must hydrate and the blob must still be readable.
+    let dir = TempDir::new().unwrap();
+    let kv_path = dir.path().join("kv");
+    let content_root = dir.path().join("content");
+
+    let (t, art) = {
+        let kv = open_kv(&kv_path);
+        let content: Arc<dyn ContentBackend> =
+            Arc::new(LocalFsContentBackend::new(&content_root));
+        let rt = Runtime::with_kv(kv, content);
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "art-acme".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let art = rt
+            .create_artifact(
+                NewArtifact {
+                    tenant_id: t.tenant_id.clone(),
+                    content_type: Some("application/octet-stream".into()),
+                    expected_sha256: None,
+                },
+                b"hello".to_vec(),
+            )
+            .await
+            .unwrap();
+        (t, art)
+        // rt + its captured kv arc go out of scope here, releasing the
+        // single-writer rocks lock before we reopen below.
+    };
+
+    // RocksDB requires the prior handle to be dropped before reopening
+    // (single-writer lock); scoping the first runtime above released it.
+    let kv2 = open_kv(&kv_path);
+    let content2: Arc<dyn ContentBackend> =
+        Arc::new(LocalFsContentBackend::new(&content_root));
+    let rt2 = Runtime::with_kv(kv2, content2);
+
+    let got = rt2
+        .get_artifact(&t.tenant_id, &art.artifact_id)
+        .await
+        .unwrap();
+    assert_eq!(got.bytes, 5);
+    assert_eq!(got.sha256, art.sha256);
+    assert_eq!(got.content_type.as_deref(), Some("application/octet-stream"));
+
+    let blob = rt2
+        .get_artifact_blob(&t.tenant_id, &art.artifact_id)
+        .await
+        .unwrap();
+    assert_eq!(blob, b"hello");
+}
+
+#[tokio::test]
 async fn fetch_with_wrong_tenant_id_fails() {
     use agentdb_core::errors::ErrorCode;
     use agentdb_core::id::{Id, IdKind};
 
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv);
+    let rt = Runtime::with_kv(kv, in_memory_content());
     let (_t, _a, s) = rt.bootstrap_test_session().await;
     let bogus_tenant = Id::new(IdKind::Tenant);
     let err = rt

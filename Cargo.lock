@@ -97,8 +97,10 @@ name = "agentdb-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "object_store",
  "rocksdb",
+ "sha2",
  "slatedb",
  "tempfile",
  "thiserror 1.0.69",

@@ -10,8 +10,10 @@ thiserror = { workspace = true }
 rocksdb = { workspace = true }
 slatedb = { workspace = true }
 object_store = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 tracing = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
