@@ -1,0 +1,30 @@
+# AgentDB V2 Design
+
+Status: draft
+
+Date: 2026-04-28
+
+This directory contains the V2 design direction for AgentDB. It does not replace
+the current implementation docs yet. It captures the architectural consensus
+reached after reviewing the V1 prototype, product positioning, large payload
+requirements, and AI Agents Platform use cases.
+
+Core thesis:
+
+> AgentDB is the runtime database for AI Agents Platforms.
+
+Framework integrations are both an adoption path and a validation workload. A
+good AgentDB adapter for LangGraph, OpenAI Agents SDK, Vercel AI SDK, or similar
+frameworks should be mostly mapping code because AgentDB already provides ordered
+history, checkpoints, artifacts, scoped search, idempotency, subscriptions, and
+lifecycle primitives.
+
+SDK priority is Python first, then TypeScript. Go/Golang SDK or client support is
+not part of the V2 prototype scope.
+
+Start with:
+
+- [`agent-runtime-database.md`](agent-runtime-database.md) — V2 positioning,
+  data model, runtime/storage split, ID allocation, and design principles.
+- [`minimal-single-machine-implementation.md`](minimal-single-machine-implementation.md)
+  — implementation handoff for AI coding agents building the local V2 prototype.
