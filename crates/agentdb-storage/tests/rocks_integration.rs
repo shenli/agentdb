@@ -1,6 +1,6 @@
 mod kv_contract;
 
-use agentdb_storage::{encode_key, BoxId, KvStore, Namespace, RocksKvStore, TenantId};
+use agentdb_storage::{KvStore, RocksKvStore};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -23,13 +23,12 @@ fn rocks_satisfies_kv_contract() {
 fn rocks_reopens_and_reads_previously_written_data() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
+    let key = b"event/1/2/3/0/00000000000000000001".to_vec();
     {
         let store = RocksKvStore::open(&path).expect("open 1");
-        let key = encode_key(Namespace::Events, 1 as BoxId, 2 as TenantId, 3, 0, 1);
         store.put(&key, b"hello").unwrap();
     }
     let store = RocksKvStore::open(&path).expect("reopen");
-    let key = encode_key(Namespace::Events, 1, 2, 3, 0, 1);
     let got = store.get(&key).unwrap();
     assert_eq!(got.as_deref(), Some(b"hello".as_ref()));
 }
