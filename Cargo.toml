@@ -55,6 +55,7 @@ pbkdf2 = "0.12"
 rand = "0.8"
 base64 = "0.22"
 subtle = "2"
+async-trait = "0.1"
 # REST TLS termination.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
