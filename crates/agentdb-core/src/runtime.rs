@@ -217,11 +217,23 @@ impl Runtime {
     pub async fn create_session(&self, req: NewSession) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
-            if !s.agents.contains_key(req.agent_id.as_str()) {
-                return Err(Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
+            // Verify the agent exists AND belongs to the requesting tenant. We
+            // collapse "agent unknown" and "agent belongs to another tenant"
+            // into the same `AgentNotFound` response so a caller in tenant A
+            // can't probe tenant B's agent ids by error-code differential.
+            let agent = s
+                .agents
+                .get(req.agent_id.as_str())
+                .filter(|a| a.deleted_at_ms.is_none())
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id))
+                })?;
+            if agent.tenant_id.as_str() != req.tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::AgentNotFound,
+                    format!("{}", req.agent_id),
+                ));
             }
-            // Tenant existence is implicit via agent ownership for V2.0; cross-check
-            // is added in V2.4 when policy attachment validates the relationship.
             let sess = Session::create(req);
             s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
             sess
@@ -282,6 +294,26 @@ impl Runtime {
             let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
                 Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
+            // Tenant isolation: a session id from tenant B is "not found" from
+            // tenant A's perspective, otherwise an attacker who learns a
+            // cross-tenant session id could append events into another
+            // tenant's session (and worse: those events would persist under
+            // the attacker's tenant key prefix, splitting the session).
+            if session.tenant_id.as_str() != req.tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", req.session_id),
+                ));
+            }
+            // Agent must match the session's recorded agent. We surface this
+            // as `AgentNotFound` (more precise than reusing SessionNotFound)
+            // so callers get an actionable error.
+            if session.agent_id.as_str() != req.agent_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::AgentNotFound,
+                    format!("{}", req.agent_id),
+                ));
+            }
             let seq = session.next_seq;
             let pv = session.policy_version;
             session.next_seq += 1;
