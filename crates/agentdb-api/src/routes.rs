@@ -9,15 +9,18 @@
 //! in `crate::errors`.
 
 use axum::{
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 
 use agentdb_core::{
     runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest},
-    Agent, EventEnvelope, IdKind, NewAgent, NewSession, NewTenant, Session, Tenant,
+    Agent, Artifact, EventEnvelope, IdKind, NewAgent, NewArtifact, NewSession, NewTenant, Session,
+    Tenant,
 };
 
 use crate::dto::{
@@ -28,6 +31,14 @@ use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
 
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
+const SHA256_HEADER: &str = "X-Sha256";
+
+/// Per-request body cap for the artifact POST route. The runtime enforces a
+/// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
+/// layer so a borderline-oversized body still reaches the handler and
+/// surfaces a structured `ARTIFACT_TOO_LARGE` 422 instead of axum's default
+/// "payload too large" / connection reset.
+const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -53,6 +64,23 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/append-and-fetch",
             post(append_and_fetch),
+        )
+        .route(
+            "/api/tenants/:tenant_id/artifacts",
+            post(create_artifact)
+                // Raise the per-route body limit so the runtime's 16 MB
+                // ARTIFACT_TOO_LARGE check actually fires; axum's default
+                // (2 MB) would reject these as PAYLOAD_TOO_LARGE before
+                // the handler ever runs.
+                .layer(DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/tenants/:tenant_id/artifacts/:artifact_id",
+            get(get_artifact),
+        )
+        .route(
+            "/api/tenants/:tenant_id/artifacts/:artifact_id/blob",
+            get(get_artifact_blob),
         )
 }
 
@@ -222,6 +250,120 @@ async fn fetch_events(
         })
         .await?;
     Ok(Json(events))
+}
+
+/// `POST /api/tenants/:tenant_id/artifacts`
+///
+/// Body: raw bytes (the artifact content). NO multipart, NO base64 — content
+/// type is taken straight off the request `Content-Type` header.
+///
+/// Headers:
+/// - `Content-Type` — recorded on the artifact metadata. Absent → None.
+/// - `X-Sha256` (optional, hex) — caller-asserted digest. Mismatch with the
+///   server's computed digest yields 422 HASH_MISMATCH.
+/// - `Idempotency-Key` (optional) — accepted but currently a no-op. Artifact
+///   idempotency is V2.1+ work; we don't fail just because the header was
+///   sent so existing clients keep working.
+///
+/// Errors map per `crate::errors::status_for`:
+/// - body > 16 MB → 422 ARTIFACT_TOO_LARGE
+/// - X-Sha256 mismatch → 422 HASH_MISMATCH
+/// - tenant not found → 404 TENANT_NOT_FOUND
+async fn create_artifact(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Artifact>), ApiError> {
+    // Bad path-id collapses to a structured 404. There's no INVALID_INPUT
+    // ErrorCode in V2 — a syntactically broken id is indistinguishable from
+    // a non-existent one to the caller, so TenantNotFound is the right
+    // outcome (matches the rest of the V2.0 routes).
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let expected_sha256 = headers
+        .get(SHA256_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Idempotency-Key on artifact POST is intentionally a no-op for V2.1.
+    // Read it just to avoid surprising clients that send it; a future
+    // milestone will route it through an idempotency store like the
+    // append path does.
+    let _ = idempotency_key(&headers);
+
+    let art = s
+        .runtime
+        .create_artifact(
+            NewArtifact {
+                tenant_id: tid,
+                content_type,
+                expected_sha256,
+            },
+            body.to_vec(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(art)))
+}
+
+/// `GET /api/tenants/:tenant_id/artifacts/:artifact_id`
+///
+/// Returns the artifact metadata as JSON. ArtifactNotFound (which collapses
+/// "unknown id", "soft-deleted", "wrong tenant") → 404.
+async fn get_artifact(
+    State(s): State<AppState>,
+    Path((tenant_id, artifact_id)): Path<(String, String)>,
+) -> Result<Json<Artifact>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let aid = parse_id_or(
+        &artifact_id,
+        IdKind::Artifact,
+        agentdb_core::ErrorCode::ArtifactNotFound,
+    )?;
+    let art = s.runtime.get_artifact(&tid, &aid).await?;
+    Ok(Json(art))
+}
+
+/// `GET /api/tenants/:tenant_id/artifacts/:artifact_id/blob`
+///
+/// Returns the raw bytes with `Content-Type` set from the artifact metadata
+/// (or `application/octet-stream` if absent) and `Content-Length` from the
+/// stored byte count. V2.1 reads the whole blob into memory; streaming is
+/// V2.4 work.
+async fn get_artifact_blob(
+    State(s): State<AppState>,
+    Path((tenant_id, artifact_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let aid = parse_id_or(
+        &artifact_id,
+        IdKind::Artifact,
+        agentdb_core::ErrorCode::ArtifactNotFound,
+    )?;
+
+    // Fetch metadata first so we can set Content-Type and Content-Length on
+    // the response. If the artifact doesn't exist this errors out before we
+    // ever ask the content backend for bytes.
+    let art = s.runtime.get_artifact(&tid, &aid).await?;
+    let bytes = s.runtime.get_artifact_blob(&tid, &aid).await?;
+
+    let content_type = art
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    let h = resp.headers_mut();
+    if let Ok(v) = content_type.parse() {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    if let Ok(v) = art.bytes.to_string().parse() {
+        h.insert(header::CONTENT_LENGTH, v);
+    }
+    Ok(resp)
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Option<String> {
