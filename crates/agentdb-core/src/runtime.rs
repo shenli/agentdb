@@ -710,6 +710,39 @@ impl Runtime {
             }
         }
 
+        // V2.2: validate every `source_refs[i].record_id` points to a live
+        // record in the same tenant. Records are V2.2's domain so they're
+        // strictly checked here (mirroring the artifact_refs check above).
+        //
+        // Other `SourceRef` variants are intentionally NOT validated:
+        // - `artifact_id`: the canonical artifact link is the
+        //   caller-explicit `artifact_refs: Vec<ArtifactRef>` field, which
+        //   is already validated above. `source_refs.artifact_id` is a
+        //   provenance hint, not a hard reference, so we don't double-walk.
+        // - `session_id` + `seq`: validating would require a per-session
+        //   `max_seq` lookup; events are append-only and a future V2.5
+        //   fork-protection pass will revisit cross-session refs.
+        // - `event_id`: `lookup_event_by_id` exists but V2.2 keeps the
+        //   validation surface narrow to records only.
+        // - `skill_id`: skills land in V2.3.
+        for sr in &req.source_refs {
+            if let Some(rec_id) = &sr.record_id {
+                let exists = (rec_id.kind() == crate::id::IdKind::Record)
+                    && s.records
+                        .get(rec_id.as_str())
+                        .is_some_and(|r| {
+                            r.deleted_at_ms.is_none()
+                                && r.tenant_id.as_str() == req.tenant_id.as_str()
+                        });
+                if !exists {
+                    return Err(Error::new(
+                        ErrorCode::RecordNotFound,
+                        format!("{}", rec_id),
+                    ));
+                }
+            }
+        }
+
         let (seq, policy_version, session_snapshot) = {
             // Re-acquire mutable access to the session row to mint the seq
             // and bump `last_active_at_ms`. The validation above already
