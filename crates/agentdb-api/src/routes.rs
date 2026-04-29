@@ -10,7 +10,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,14 +18,17 @@ use axum::{
 };
 
 use agentdb_core::{
-    runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest},
-    Agent, Artifact, EventEnvelope, IdKind, NewAgent, NewArtifact, NewSession, NewTenant, Session,
-    Tenant,
+    record::{NewRecord, SearchableRecord},
+    runtime::{
+        AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest,
+    },
+    Agent, Artifact, ErrorCode, EventEnvelope, Id, IdKind, NewAgent, NewArtifact, NewSession,
+    NewTenant, Session, SourceRef, Tenant,
 };
 
 use crate::dto::{
-    AppendAndFetchBody, AppendBody, CreateAgentBody, CreateSessionBody, CreateTenantBody,
-    FetchQuery,
+    AppendAndFetchBody, AppendBody, CreateAgentBody, CreateRecordBody, CreateSessionBody,
+    CreateTenantBody, FetchQuery, SearchRecordsResponse,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -81,6 +84,24 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/artifacts/:artifact_id/blob",
             get(get_artifact_blob),
+        )
+        // V2.2 records: register `/records/search` BEFORE
+        // `/records/:record_id` so the literal `search` segment beats the
+        // dynamic `:record_id` matcher. axum 0.7's matchit-based router
+        // does prefer static over dynamic segments at the same depth, but
+        // we encode the order here so a future router refactor can't
+        // silently swap precedence.
+        .route(
+            "/api/tenants/:tenant_id/records/search",
+            get(search_records),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records",
+            post(create_record),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records/:record_id",
+            get(get_record).delete(delete_record),
         )
 }
 
@@ -372,3 +393,241 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
 }
+
+/// `POST /api/tenants/:tenant_id/records`
+///
+/// Body shape mirrors `agentdb_core::NewRecord` minus `tenant_id` (which the
+/// path supplies). Optional fields default sensibly via serde; if `policy` is
+/// omitted the runtime applies `IndexingPolicy::default()`.
+async fn create_record(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<CreateRecordBody>,
+) -> Result<(StatusCode, Json<SearchableRecord>), ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rec = s
+        .runtime
+        .write_record(NewRecord {
+            tenant_id: tid,
+            namespace: body.namespace,
+            scope: body.scope,
+            text: body.text,
+            metadata: body.metadata,
+            tags: body.tags,
+            source: body.source,
+            embedding: body.embedding,
+            policy: body.policy.unwrap_or_default(),
+            expires_at_ms: body.expires_at_ms,
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(rec)))
+}
+
+/// `GET /api/tenants/:tenant_id/records/:record_id`
+///
+/// Returns the record. RecordNotFound (collapsing "unknown id",
+/// "soft-deleted", "expired", "wrong tenant") → 404.
+async fn get_record(
+    State(s): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+) -> Result<Json<SearchableRecord>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
+    let rec = s.runtime.get_record(&tid, &rid).await?;
+    Ok(Json(rec))
+}
+
+/// `GET /api/tenants/:tenant_id/records/search`
+///
+/// Query params (see [`crate::dto::SearchRecordsQuery`] for the full list):
+/// - `text` (optional)
+/// - `namespace` (repeatable; empty list = tenant root)
+/// - `tag` (repeatable; AND-semantics)
+/// - `source_session` + `source_seq`, `source_artifact`, `source_record`,
+///   `source_skill`, `source_event` (post-filter on `SourceRef`)
+/// - `limit` (default 20, capped at 100)
+///
+/// `embedding` is intentionally NOT exposed via GET — vector search lives
+/// behind a future `POST /search` endpoint.
+async fn search_records(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<SearchRecordsResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+
+    // Parse the query string by hand because the default `Query` extractor
+    // sits on top of serde_urlencoded, which collapses repeated keys (we
+    // need `namespace=a&namespace=b` to round-trip into a Vec).
+    let parsed = parse_search_query(raw.as_deref().unwrap_or(""));
+
+    let limit = parsed.limit.clamp(1, 100);
+
+    // Build the source filter from the populated `source_*` query params.
+    // We only construct one if at least one of these is set; an absent
+    // filter means "no source-based post-filter".
+    let source_filter = build_source_filter(&parsed)?;
+
+    let req = SearchRequest {
+        tenant_id: tid,
+        namespace: parsed.namespace,
+        text: parsed.text,
+        // Vector search via GET is intentionally unsupported in V2.2b.
+        // See route doc comment.
+        embedding: None,
+        tags: parsed.tags,
+        source_filter,
+        limit,
+    };
+    let records = s.runtime.search_records(req).await?;
+    Ok(Json(SearchRecordsResponse { records }))
+}
+
+/// `DELETE /api/tenants/:tenant_id/records/:record_id`
+///
+/// Soft-delete. RecordNotFound (already deleted, unknown, wrong tenant) → 404.
+/// Successful delete returns 204 with an empty body.
+async fn delete_record(
+    State(s): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
+    s.runtime.delete_record(&tid, &rid).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Hand-rolled query-string parser for the search route. Handles the
+/// repeated-key cases (`namespace`, `tag`) that serde_urlencoded can't
+/// express; everything else is a single-occurrence `key=value` pair.
+struct ParsedSearchQuery {
+    text: Option<String>,
+    namespace: Vec<String>,
+    tags: Vec<String>,
+    source_session: Option<String>,
+    source_seq: Option<u64>,
+    source_artifact: Option<String>,
+    source_record: Option<String>,
+    source_skill: Option<String>,
+    source_event: Option<String>,
+    limit: usize,
+}
+
+fn parse_search_query(raw: &str) -> ParsedSearchQuery {
+    let mut out = ParsedSearchQuery {
+        text: None,
+        namespace: vec![],
+        tags: vec![],
+        source_session: None,
+        source_seq: None,
+        source_artifact: None,
+        source_record: None,
+        source_skill: None,
+        source_event: None,
+        limit: 20,
+    };
+    if raw.is_empty() {
+        return out;
+    }
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        let key = url_decode(k);
+        let val = url_decode(v);
+        match key.as_str() {
+            "text" => out.text = Some(val),
+            "namespace" => out.namespace.push(val),
+            "tag" => out.tags.push(val),
+            "source_session" => out.source_session = Some(val),
+            "source_seq" => out.source_seq = val.parse().ok(),
+            "source_artifact" => out.source_artifact = Some(val),
+            "source_record" => out.source_record = Some(val),
+            "source_skill" => out.source_skill = Some(val),
+            "source_event" => out.source_event = Some(val),
+            "limit" => {
+                if let Ok(n) = val.parse() {
+                    out.limit = n;
+                }
+            }
+            _ => {} // unknown keys are silently ignored
+        }
+    }
+    out
+}
+
+/// Lightweight URL-decoder for query string values: handles `+` → space and
+/// `%XX` percent-encoding. Falls back to the raw input on malformed escapes
+/// (matches what serde_urlencoded does — we don't want to 400 a search just
+/// because a stray `%` slipped through).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if b == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            } else {
+                out.push(b);
+                i += 1;
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        // Lossily recover so invalid UTF-8 doesn't 500 the request.
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    })
+}
+
+fn build_source_filter(q: &ParsedSearchQuery) -> Result<Option<SourceRef>, ApiError> {
+    // Skip building entirely when nothing is set.
+    let any_set = q.source_session.is_some()
+        || q.source_seq.is_some()
+        || q.source_artifact.is_some()
+        || q.source_record.is_some()
+        || q.source_skill.is_some()
+        || q.source_event.is_some();
+    if !any_set {
+        return Ok(None);
+    }
+    let session_id = parse_opt_id(q.source_session.as_deref(), IdKind::Session)?;
+    let artifact_id = parse_opt_id(q.source_artifact.as_deref(), IdKind::Artifact)?;
+    let record_id = parse_opt_id(q.source_record.as_deref(), IdKind::Record)?;
+    let skill_id = parse_opt_id(q.source_skill.as_deref(), IdKind::Skill)?;
+    let event_id = parse_opt_id(q.source_event.as_deref(), IdKind::Event)?;
+    Ok(Some(SourceRef {
+        session_id,
+        seq: q.source_seq,
+        event_id,
+        artifact_id,
+        record_id,
+        skill_id,
+    }))
+}
+
+/// Parse an optional id string into an Id of the given kind. Bad parses
+/// collapse to `None` rather than erroring — a malformed source filter id
+/// matches no record by definition, which is the desired behavior. (We
+/// don't want a typo'd source_record to 400 a search.)
+fn parse_opt_id(s: Option<&str>, kind: IdKind) -> Result<Option<Id>, ApiError> {
+    match s {
+        None => Ok(None),
+        Some(raw) => Ok(Id::parse_kind(raw, kind).ok()),
+    }
+}
+
