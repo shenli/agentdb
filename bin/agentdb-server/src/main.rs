@@ -34,6 +34,12 @@ struct ServeOpts {
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
 
+    /// Filesystem path that holds artifact content (raw blobs). Created if
+    /// it doesn't exist. Defaults to `<data_dir>/content`. Ignored when
+    /// `--in-memory` is set.
+    #[arg(long)]
+    content_dir: Option<PathBuf>,
+
     /// Use an ephemeral in-memory backend instead of RocksDB. Convenient for
     /// smoke testing; everything is lost on shutdown.
     #[arg(long)]
@@ -59,13 +65,20 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         let kv = Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
             as Arc<dyn agentdb_storage::KvStore + Send + Sync>;
         tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
-        // V2.1a wires a content backend into Runtime::with_kv so artifact
-        // bytes have a place to land. V2.1b will surface a --content-dir
-        // flag and route artifact bytes to local FS rooted there; for now
-        // we use the in-memory content backend so the binary still boots
-        // and the metadata path is exercised end-to-end.
-        let content: Arc<dyn agentdb_storage::ContentBackend> =
-            Arc::new(agentdb_storage::InMemoryContentBackend::default());
+
+        // Artifact content lives in a separate filesystem tree so the
+        // RocksDB metadata directory stays small and operators can mount the
+        // content tree on a different disk if they need to. Default is
+        // `<data_dir>/content`; `--content-dir` overrides it.
+        let content_dir = opts
+            .content_dir
+            .clone()
+            .unwrap_or_else(|| opts.data_dir.join("content"));
+        std::fs::create_dir_all(&content_dir)?;
+        tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
+        let content: Arc<dyn agentdb_storage::ContentBackend> = Arc::new(
+            agentdb_storage::LocalFsContentBackend::new(&content_dir),
+        );
         agentdb_core::Runtime::with_kv(kv, content)
     };
 
