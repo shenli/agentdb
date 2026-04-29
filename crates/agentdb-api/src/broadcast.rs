@@ -59,61 +59,6 @@ fn check_channel_claim(
     Ok(())
 }
 
-/// `POST /api/tenants/:tenant_id/channels/:channel/publish` (v1).
-///
-/// Spec § 5.1, § 5.3, § 5.5, § 5.7. Validation order is fail-cheapest-
-/// first: channel-name check, body-size cap, JWT verification, JSON
-/// parse, then enqueue + 204.
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/channels/{c}/publish \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn publish(
-    State(state): State<AppState>,
-    Path((tenant, channel)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    if !validate_channel_name(&channel) {
-        return ApiError::Coded(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::ChannelNameInvalid,
-            "channel name fails validation".into(),
-        )
-        .into_response();
-    }
-
-    if body.len() > MAX_BODY_BYTES {
-        // TODO(Task 14): mint a dedicated `BodyTooLarge` ErrorCode +
-        // runbook. `InvalidRequest` is the closest existing variant
-        // while we're still in Phase 2 plumbing.
-        return ApiError::Coded(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            ErrorCode::InvalidRequest,
-            format!("body exceeds {MAX_BODY_BYTES} bytes"),
-        )
-        .into_response();
-    }
-
-    // JWT enforcement (only when tenant has JWT config).
-    // `?access_token=` query support is reserved for the SSE GET in
-    // Task 5; publish is header-only because senders aren't browsers
-    // hitting EventSource.
-    let claims = match crate::subscribe_auth::extract_subscribe_jwt(
-        &state, &headers, None, &tenant,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(resp) = check_channel_claim(claims.as_ref(), &channel) {
-        return resp;
-    }
-
-    publish_inner(state, tenant, channel, headers, body, claims).await
-}
 
 /// Shared publish body: JSON parse, enqueue + 204.
 /// `claims` is `Some` when auth was enforced (JWT path); `None` when
@@ -180,54 +125,6 @@ pub struct SubscribeChannelQuery {
     pub no_echo: Option<bool>,
 }
 
-/// `GET /api/tenants/:tenant_id/channels/:channel/subscribe` (v1).
-///
-/// Spec § 5.1, § 5.2, § 5.5, § 5.8. Validation order matches
-/// [`publish`]: channel-name → JWT verify → JWT channel allow-list →
-/// open subscription → stream envelopes.
-///
-/// Lag policy (spec § 5.5) is the inverse of Phase 1's
-/// `subscribe_session`: broadcast is ephemeral with no replay, so
-/// `RecvError::Overflowed(_)` is silently skipped (the subscriber
-/// missed the older messages — there's nothing to recover, only
-/// fresher ones to keep delivering). No `lag_too_far` close frame.
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/channels/{c}/subscribe \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn subscribe_channel(
-    State(state): State<AppState>,
-    Path((tenant, channel)): Path<(String, String)>,
-    axum_extra::extract::Query(q): axum_extra::extract::Query<SubscribeChannelQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if !validate_channel_name(&channel) {
-        return ApiError::Coded(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::ChannelNameInvalid,
-            "channel name fails validation".into(),
-        )
-        .into_response();
-    }
-
-    let claims = match crate::subscribe_auth::extract_subscribe_jwt(
-        &state,
-        &headers,
-        q.access_token.as_deref(),
-        &tenant,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(resp) = check_channel_claim(claims.as_ref(), &channel) {
-        return resp;
-    }
-
-    subscribe_channel_inner(state, tenant, channel, q, headers, claims).await
-}
 
 /// Shared subscribe body: echo-filter setup, bus subscription, SSE stream.
 /// `claims` is `Some` when auth was enforced (JWT path); `None` when the

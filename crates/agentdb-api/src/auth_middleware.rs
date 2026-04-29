@@ -79,11 +79,7 @@ pub async fn basic_auth_middleware(
         None => return ApiError::Internal("auth configured without meta store".into()).into_response(),
     };
 
-    // Path form: /api/tenants/{tenant_id}/... — only this
-    // shape carries a path tenant; /api/sessions/... shapes
-    // do not, and handlers verify tenant from the locator.
     let path = req.uri().path().to_string();
-    let tenant_from_path = extract_tenant_id(&path);
 
     // Subscribe and channel subscribe paths handle their own JWT auth
     // inside the handler via `extract_subscribe_jwt`. If the client
@@ -133,19 +129,9 @@ pub async fn basic_auth_middleware(
     if !verify_password(&password, &user.credentials) {
         return ApiError::Unauthorized("auth failed".into()).into_response();
     }
-    if let Some(tid) = tenant_from_path {
-        if tid != user.tenant_external {
-            return ApiError::Forbidden(format!(
-                "user {user_id} is bound to tenant {} but request targets {tid}",
-                user.tenant_external
-            ))
-            .into_response();
-        }
-    }
     // Auth succeeded. Hand the tenant identity to downstream
-    // handlers via an extension so they don't have to re-derive
-    // it from the path. Path-tenant verification (above) is
-    // belt-and-braces with the handlers' own checks.
+    // handlers via an extension; v2 handlers cross-check it
+    // against the session locator where applicable.
     req.extensions_mut().insert(AuthedTenant {
         external_id: user.tenant_external.clone(),
         user_id,
@@ -180,35 +166,17 @@ fn parse_basic(header: &str) -> Result<(String, String), &'static str> {
     Ok((u.to_string(), p.to_string()))
 }
 
-/// Extract `{tenant_id}` from a `/api/tenants/{tid}/...` path.
-/// Returns `None` if the path doesn't match that prefix (which
-/// means auth isn't applicable — the middleware should only be
-/// registered on tenant routes, but defend in depth).
-fn extract_tenant_id(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/api/tenants/")?;
-    match rest.split_once('/') {
-        Some((tid, _)) => Some(tid),
-        None => Some(rest),
-    }
-}
-
 /// Resolves the tenant for a session-keyed v2 route by combining the
 /// auth-derived tenant (when present) and the session locator's
 /// recorded tenant. Used by `append_and_fetch_session_keyed`,
-/// `fetch_recent_session_keyed`, `subscribe_session_keyed`, and
-/// (M27 Task 4) the v2 channel handlers.
-///
-/// `route_hint` is woven into the 400 error message's recovery hint
-/// (e.g., `"append_and_fetch"`, `"fetch_recent"`, `"subscribe"`) so a
-/// developer hitting a pre-M26 session sees a path forward.
+/// `fetch_recent_session_keyed`, and `subscribe_session_keyed`.
 ///
 /// Returns `Ok(tenant_external_id)` on success, or `Err(Response)`
-/// on the 400 / 403 / 500 error paths.
+/// on the 401 / 403 / 500 error paths.
 pub async fn resolve_session_tenant(
     state: &AppState,
     session: &str,
     authed: Option<&AuthedTenant>,
-    route_hint: &'static str,
 ) -> Result<String, axum::response::Response> {
     use axum::response::IntoResponse;
 
@@ -251,9 +219,8 @@ pub async fn resolve_session_tenant(
                 Err(ApiError::Core(agentdb_core::Error::Invalid {
                     field: Some("tenant".into()),
                     message: format!(
-                        "cannot resolve tenant for session {session}: no Authorization header, \
-                         no session locator. Use /api/tenants/<tid>/sessions/<sid>/{route_hint} \
-                         for pre-M26 sessions, or enable auth"
+                        "cannot resolve tenant for session {session}: no Authorization \
+                         header and no session locator. Enable auth and supply credentials."
                     ),
                 })
                 .into_response())
@@ -292,14 +259,6 @@ mod tests {
     fn parse_basic_rejects_missing_colon() {
         let hdr = format!("Basic {}", B64.encode(b"alicepencil"));
         assert!(parse_basic(&hdr).is_err());
-    }
-
-    #[test]
-    fn extract_tenant_id_handles_various_path_shapes() {
-        assert_eq!(extract_tenant_id("/api/tenants/t-1/sessions/s"), Some("t-1"));
-        assert_eq!(extract_tenant_id("/api/tenants/t-42"), Some("t-42"));
-        assert_eq!(extract_tenant_id("/api/admin/users"), None);
-        assert_eq!(extract_tenant_id("/"), None);
     }
 
     #[test]

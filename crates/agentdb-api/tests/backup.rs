@@ -7,11 +7,13 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
-use agentdb_core::{BackupManifest, BoxRegistry, SessionRegistry, TenantRegistry};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
+use agentdb_core::{BackupManifest, BoxRegistry, HlcClock, SessionRegistry, TenantRegistry};
 use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
 use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -34,7 +36,18 @@ async fn spawn() -> Node {
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 2).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            2,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "backup-test-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
 
     let state = AppState {
         registry,
@@ -43,7 +56,7 @@ async fn spawn() -> Node {
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -63,16 +76,33 @@ async fn spawn() -> Node {
     }
 }
 
-async fn append(client: &reqwest::Client, base: &str, tenant: &str, session: &str, body: Value) {
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
+async fn append(client: &reqwest::Client, base: &str, tenant: &str, session: &str, body: Value, auth: &str) {
     let r = client
-        .post(format!(
-            "{base}/api/tenants/{tenant}/sessions/{session}/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/{session}/append_and_fetch"))
+        .header("Authorization", auth)
         .json(&json!({"event": body, "fetch_last_n": 0}))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 200, "append failed: {}", r.text().await.unwrap());
+    assert_eq!(r.status().as_u16(), 200, "append failed for {tenant}/{session}: {}", r.text().await.unwrap());
 }
 
 #[tokio::test]
@@ -82,7 +112,9 @@ async fn backup_writes_kv_and_meta_sqlite_and_manifest() {
 
     // Seed a tenant + one write so the KV has content and the
     // meta store has a tenants row.
-    append(&client, &node.base, "t-acme", "s-1", json!({"msg": "hello"})).await;
+    create_user(&node.base, "acme-user", "t-acme", "pass").await;
+    let auth = basic("acme-user", "pass");
+    append(&client, &node.base, "t-acme", "s-1", json!({"msg": "hello"}), &auth).await;
 
     let out = TempDir::new().unwrap();
     let dest = out.path().join("snap");
@@ -117,7 +149,9 @@ async fn backup_refuses_when_out_dir_exists() {
     let client = reqwest::Client::new();
 
     // Seed writes so the backup has content.
-    append(&client, &node.base, "t-1", "s-1", json!({"msg": "x"})).await;
+    create_user(&node.base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+    append(&client, &node.base, "t-1", "s-1", json!({"msg": "x"}), &auth).await;
 
     let out = TempDir::new().unwrap();
     let dest = out.path().join("existing");

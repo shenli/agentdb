@@ -112,14 +112,14 @@ async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
     );
 }
 
-/// Append one event under the legacy tenant-explicit route to
+/// Append one event via the v2 session-keyed route to
 /// populate a session and its locator. Returns once the row
 /// exists in `session_locators` so subsequent fork/find can
 /// resolve it.
-async fn seed_session(base: &str, user: &str, pass: &str, tenant: &str, session: &str) {
+async fn seed_session(base: &str, user: &str, pass: &str, _tenant: &str, session: &str) {
     reqwest::Client::new()
         .post(format!(
-            "{base}/api/tenants/{tenant}/sessions/{session}/append_and_fetch"
+            "{base}/api/sessions/{session}/append_and_fetch"
         ))
         .header("Authorization", basic(user, pass))
         .json(&json!({"event": {"seed": true}, "fetch_last_n": 0}))
@@ -272,23 +272,3 @@ async fn session_keyed_append_for_other_tenants_session_is_403() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
-#[tokio::test]
-async fn legacy_route_with_path_tenant_mismatching_auth_is_403() {
-    let env = spawn().await;
-    create_user(&env.base, "alice", "t-alice", "pencil").await;
-
-    // alice's credentials, but path says t-bob. Middleware
-    // catches this before the handler — same contract as
-    // before this PR.
-    let resp = reqwest::Client::new()
-        .post(format!(
-            "{}/api/tenants/t-bob/sessions/s/append_and_fetch",
-            env.base
-        ))
-        .header("Authorization", basic("alice", "pencil"))
-        .json(&json!({"event": {"text": "x"}, "fetch_last_n": 0}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 403);
-}

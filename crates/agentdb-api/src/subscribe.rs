@@ -115,22 +115,6 @@ fn normalize_kind_filter(raw: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/sessions/{s}/subscribe \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn subscribe_session(
-    State(state): State<AppState>,
-    Path((tenant, session)): Path<(String, String)>,
-    Query(q): Query<SubscribeQuery>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    // v1 path: auth is either disabled (auth: None) or not in scope here;
-    // pass `true` to skip the Basic-auth check inside the inner handler.
-    subscribe_session_inner(state, tenant, session, q, headers, true).await
-}
-
 /// `basic_authed`: whether the caller was authenticated via Basic auth.
 /// When `false` and the server has auth configured, the inner handler
 /// returns 401 if the tenant has no JWT config (which would otherwise
@@ -153,16 +137,7 @@ async fn subscribe_session_inner(
     if let agentdb_core::RouteDecision::Remote { target, .. } =
         state.registry.route_session_for_io(&tenant, &session)
     {
-        // TODO(M27 Task 5): once /api/tenants/{t}/.../subscribe is deleted,
-        // this redirect should target the v2 URL `/api/sessions/{s}/subscribe`.
-        // Both v1 and v2 callers funnel through this inner helper, so we'd
-        // also need to thread the caller's route shape into the inner if we
-        // want path fidelity per call. For now the redirect uses the v1 URL
-        // because v1 still exists for both shapes during the transition.
-        let path = format!(
-            "/api/tenants/{}/sessions/{}/subscribe",
-            tenant, session
-        );
+        let path = format!("/api/sessions/{}/subscribe", session);
         return crate::forwarding::subscribe_not_owner_reply(&target, &path);
     }
 
@@ -480,8 +455,8 @@ fn kind_matches(env: &EventEnvelope, kind_filter: &[String]) -> bool {
         .is_some_and(|k| kind_filter.iter().any(|f| f == k))
 }
 
-/// Query string for `GET /api/tenants/{tenant_id}/subscribe`. All
-/// fields are optional (spec §6.5).
+/// Query string for `GET /api/subscribe` (tenant-wide). All fields
+/// are optional (spec §6.5).
 ///
 /// `session` and `kind` are repeated-key vectors decoded via
 /// `serde_html_form` (matching [`SubscribeQuery`]). `session` is a
@@ -582,20 +557,6 @@ fn build_subscribed_payload(
         payload["catchup_failed_sessions"] = serde_json::json!(catchup_failed_sessions);
     }
     payload
-}
-
-#[deprecated(
-    since = "0.27.0",
-    note = "v1 tenant-in-URL surface; use /api/subscribe \
-            (auth-derived tenant) instead. Scheduled for removal in M28."
-)]
-pub async fn subscribe_tenant(
-    State(state): State<AppState>,
-    Path(tenant): Path<String>,
-    Query(q): Query<TenantSubscribeQuery>,
-    headers: HeaderMap,
-) -> axum::response::Response {
-    subscribe_tenant_inner(state, tenant, q, headers).await
 }
 
 async fn subscribe_tenant_inner(
@@ -924,7 +885,6 @@ pub async fn subscribe_session_keyed(
         &state,
         &session,
         authed.as_deref(),
-        "subscribe",
     )
     .await
     {

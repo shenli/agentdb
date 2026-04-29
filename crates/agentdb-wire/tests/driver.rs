@@ -36,7 +36,28 @@ async fn spawn_with_http() -> (TempDir, TempDir, u16, u16) {
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(kv_dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store.clone(), 4).unwrap());
+    // Meta-backed registry so v2 routes can resolve tenant via the
+    // session locator when auth is disabled (this test boots with
+    // auth: None; the fork handler populates the locator on child
+    // mint, and resolve_session_tenant uses the (None, Some(l))
+    // branch to derive tenant from the locator).
+    let meta = Arc::new(
+        agentdb_meta::MetaStore::open_sqlite(":memory:")
+            .await
+            .unwrap(),
+    );
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store.clone(),
+            4,
+            Arc::new(agentdb_core::HlcClock::default()),
+            meta.clone(),
+            "self".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let tenants = Arc::new(TenantRegistry::new(kv.clone()));
     let sessions = Arc::new(SessionRegistry::new(kv));
 
@@ -303,7 +324,7 @@ async fn fork_child_merges_parent_tail_via_http_append_and_fetch() {
     // doesn't invoke append_and_fetch; we use the REST endpoint directly).
     let resp: serde_json::Value = rest
         .post(format!(
-            "http://127.0.0.1:{http_port}/api/tenants/t-fork/sessions/child/append_and_fetch"
+            "http://127.0.0.1:{http_port}/api/sessions/child/append_and_fetch"
         ))
         .json(&serde_json::json!({"event": {"c": 1}, "fetch_last_n": 5}))
         .send()

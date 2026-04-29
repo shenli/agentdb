@@ -17,9 +17,11 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{BoxRegistry, LocationProxy, SessionRegistry, TenantRegistry};
 use agentdb_storage::{KvStore, RocksKvStore};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -65,7 +67,7 @@ async fn spawn() -> (
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
@@ -89,24 +91,45 @@ async fn spawn() -> (
     )
 }
 
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
 #[tokio::test]
 async fn shard_override_actually_reroutes_future_writes() {
     let (_dir, _obj_dir, _meta_file, base, registry, _proxy) = spawn().await;
     let client = reqwest::Client::new();
 
-    let tenant = "t-route";
+    create_user(&base, "route-user", "t-route", "pass").await;
+    let auth = basic("route-user", "pass");
+
     let session = "s-route-me";
-    let url = format!("{base}/api/tenants/{tenant}/sessions/{session}/append_and_fetch");
+    let url = format!("{base}/api/sessions/{session}/append_and_fetch");
     let body = json!({"event": {"text": "hi"}, "fetch_last_n": 0});
 
     // Baseline: with no override, writes land on the tenant-hash box.
-    let default_box = registry.route_tenant(tenant).id;
+    let default_box = registry.route_tenant("t-route").id;
     let appends_before: Vec<u64> = (0..4)
         .map(|i| registry.box_by_id(i).unwrap().metrics.snapshot().appends)
         .collect();
 
     client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&body)
         .send()
         .await
@@ -141,6 +164,7 @@ async fn shard_override_actually_reroutes_future_writes() {
     // Second write — must land on target_box.
     client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&body)
         .send()
         .await
@@ -173,6 +197,7 @@ async fn shard_override_actually_reroutes_future_writes() {
     // Third write — back to the default box.
     client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&body)
         .send()
         .await

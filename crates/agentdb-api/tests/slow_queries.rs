@@ -7,21 +7,39 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
-use agentdb_core::{BoxRegistry, SessionRegistry, SlowQueryBuffer, TenantRegistry};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
+use agentdb_core::{BoxRegistry, HlcClock, SessionRegistry, SlowQueryBuffer, TenantRegistry};
+use agentdb_meta::MetaStore;
 use agentdb_storage::{KvStore, RocksKvStore};
+use axum::Extension;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-async fn spawn(threshold_ms: u64, capacity: usize) -> (TempDir, TempDir, String, Arc<SlowQueryBuffer>) {
+async fn spawn(threshold_ms: u64, capacity: usize) -> (TempDir, TempDir, tempfile::NamedTempFile, String, Arc<SlowQueryBuffer>) {
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     let dir = TempDir::new().unwrap();
     let obj_dir = TempDir::new().unwrap();
+    let meta_file = tempfile::NamedTempFile::new().unwrap();
+    let meta_path = meta_file.path().to_string_lossy().to_string();
+    let meta = Arc::new(MetaStore::open_sqlite(&meta_path).await.unwrap());
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 2).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            2,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "slow-query-test-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let buf = Arc::new(SlowQueryBuffer::new(threshold_ms, capacity));
     registry
         .attach_slow_queries(buf.clone())
@@ -35,40 +53,59 @@ async fn spawn(threshold_ms: u64, capacity: usize) -> (TempDir, TempDir, String,
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (dir, obj_dir, format!("http://{addr}"), buf)
+    (dir, obj_dir, meta_file, format!("http://{addr}"), buf)
 }
 
-async fn append(client: &reqwest::Client, base: &str, tenant: &str, session: &str) {
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
+}
+
+async fn append(client: &reqwest::Client, base: &str, tenant: &str, session: &str, auth: &str) {
     let r = client
-        .post(format!(
-            "{base}/api/tenants/{tenant}/sessions/{session}/append_and_fetch"
-        ))
+        .post(format!("{base}/api/sessions/{session}/append_and_fetch"))
+        .header("Authorization", auth)
         .json(&json!({"event": {"msg": "hi"}, "fetch_last_n": 0}))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 200, "append failed: {}", r.text().await.unwrap());
+    assert_eq!(r.status().as_u16(), 200, "append failed for {tenant}/{session}: {}", r.text().await.unwrap());
 }
 
 #[tokio::test]
 async fn append_gets_recorded_when_above_threshold() {
     // Threshold 0 records every request, regardless of how
     // fast — keeps the test deterministic across machines.
-    let (_d, _o, base, _buf) = spawn(0, 64).await;
+    let (_d, _o, _m, base, _buf) = spawn(0, 64).await;
     let client = reqwest::Client::new();
-    append(&client, &base, "t-1", "s-1").await;
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+    append(&client, &base, "t-1", "s-1", &auth).await;
 
     let v: Value = client
         .get(format!("{base}/api/admin/slow-queries"))
@@ -103,10 +140,12 @@ async fn append_gets_recorded_when_above_threshold() {
 #[tokio::test]
 async fn fast_requests_are_not_recorded_when_below_threshold() {
     // threshold 60s — nothing in a hot-path test will be slow.
-    let (_d, _o, base, buf) = spawn(60_000, 64).await;
+    let (_d, _o, _m, base, buf) = spawn(60_000, 64).await;
     let client = reqwest::Client::new();
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
     for _ in 0..5 {
-        append(&client, &base, "t-1", "s-1").await;
+        append(&client, &base, "t-1", "s-1", &auth).await;
     }
     assert_eq!(buf.len(), 0, "no appends should clear a 60s threshold");
 }
@@ -121,10 +160,24 @@ async fn endpoint_returns_empty_array_when_no_buffer_attached() {
     use object_store::ObjectStore;
     let dir = TempDir::new().unwrap();
     let obj_dir = TempDir::new().unwrap();
+    let meta_file = tempfile::NamedTempFile::new().unwrap();
+    let meta_path = meta_file.path().to_string_lossy().to_string();
+    let meta = Arc::new(MetaStore::open_sqlite(&meta_path).await.unwrap());
     let kv: Arc<dyn KvStore> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(obj_dir.path()).unwrap());
-    let registry = Arc::new(BoxRegistry::new(kv.clone(), store, 2).unwrap());
+    let registry = Arc::new(
+        BoxRegistry::new_with_meta(
+            kv.clone(),
+            store,
+            2,
+            Arc::new(HlcClock::default()),
+            meta.clone(),
+            "slow-query-nobuf-node".into(),
+        )
+        .await
+        .unwrap(),
+    );
     let state = AppState {
         registry,
         tenants: Arc::new(TenantRegistry::new(kv.clone())),
@@ -132,13 +185,13 @@ async fn endpoint_returns_empty_array_when_no_buffer_attached() {
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(Extension(meta.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -147,7 +200,9 @@ async fn endpoint_returns_empty_array_when_no_buffer_attached() {
     let base = format!("http://{addr}");
 
     let client = reqwest::Client::new();
-    append(&client, &base, "t-1", "s-1").await;
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+    append(&client, &base, "t-1", "s-1", &auth).await;
 
     let v: Value = client
         .get(format!("{base}/api/admin/slow-queries"))
@@ -162,10 +217,14 @@ async fn endpoint_returns_empty_array_when_no_buffer_attached() {
 
 #[tokio::test]
 async fn filter_by_tenant_is_honored() {
-    let (_d, _o, base, _buf) = spawn(0, 64).await;
+    let (_d, _o, _m, base, _buf) = spawn(0, 64).await;
     let client = reqwest::Client::new();
-    append(&client, &base, "alpha", "s").await;
-    append(&client, &base, "beta", "s").await;
+    create_user(&base, "alpha-user", "alpha", "pass").await;
+    create_user(&base, "beta-user", "beta", "pass2").await;
+    let auth_alpha = basic("alpha-user", "pass");
+    let auth_beta = basic("beta-user", "pass2");
+    append(&client, &base, "alpha", "s-alpha", &auth_alpha).await;
+    append(&client, &base, "beta", "s-beta", &auth_beta).await;
 
     let v: Value = client
         .get(format!("{base}/api/admin/slow-queries?tenant=alpha"))
@@ -185,10 +244,12 @@ async fn filter_by_tenant_is_honored() {
 
 #[tokio::test]
 async fn metrics_surface_records_per_kind_counter() {
-    let (_d, _o, base, _buf) = spawn(0, 64).await;
+    let (_d, _o, _m, base, _buf) = spawn(0, 64).await;
     let client = reqwest::Client::new();
-    append(&client, &base, "t-1", "s-1").await;
-    append(&client, &base, "t-1", "s-2").await;
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+    append(&client, &base, "t-1", "s-1", &auth).await;
+    append(&client, &base, "t-1", "s-2", &auth).await;
 
     let body = client
         .get(format!("{base}/metrics"))
@@ -211,10 +272,12 @@ async fn metrics_surface_records_per_kind_counter() {
 
 #[tokio::test]
 async fn ring_evicts_oldest_when_over_capacity() {
-    let (_d, _o, base, buf) = spawn(0, 3).await;
+    let (_d, _o, _m, base, buf) = spawn(0, 3).await;
     let client = reqwest::Client::new();
+    create_user(&base, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
     for i in 0..6 {
-        append(&client, &base, "t-1", &format!("s-{i}")).await;
+        append(&client, &base, "t-1", &format!("s-{i}"), &auth).await;
     }
     assert_eq!(buf.len(), 3, "ring size must clamp to capacity");
     let v: Value = client

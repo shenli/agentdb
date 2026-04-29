@@ -77,16 +77,3 @@ async fn publish_too_large_returns_413() {
     assert_eq!(resp.status(), 413);
 }
 
-#[tokio::test]
-async fn publish_with_basic_auth_falls_through_no_jwt_no_sender() {
-    // TestServer::start() has no JWT config — extractor returns Ok(None);
-    // sender stays None. This is v1-specific behaviour (no JWT required).
-    let server = TestServer::start().await;
-    let resp = reqwest::Client::new()
-        .post(format!("{}/api/tenants/t-1/channels/c-1/publish", server.base))
-        .json(&serde_json::json!({"hello": true}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 204);
-}

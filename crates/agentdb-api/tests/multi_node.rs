@@ -17,10 +17,12 @@
 
 use std::sync::Arc;
 
-use agentdb_api::{router, AppState, StreamBus};
+use agentdb_api::{router, AppState, AuthConfig, StreamBus};
 use agentdb_core::{BoxRegistry, NodeAddressProxy, SessionRegistry, TenantRegistry};
 use agentdb_meta::{self, nodes as meta_nodes, shards as meta_shards, tablets as meta_tablets, MetaStore};
 use agentdb_storage::{KvStore, RocksKvStore};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -118,13 +120,13 @@ async fn build_node(
         stream: StreamBus::default(),
         event_bus: agentdb_api::EventBus::default(),
         http: agentdb_api::webhook::new_client(),
-        auth: None,
+        auth: Some(AuthConfig { meta: Some(meta.clone()) }),
         admin_auth: None,
         jwt_config: agentdb_api::jwt::JwtConfig::default(),
         cors_config: agentdb_api::cors::CorsConfig::default(),
         broadcast_bus: agentdb_api::BroadcastBus::default(),
     };
-    let app = router(state);
+    let app = router(state).layer(axum::Extension(meta.clone()));
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -134,6 +136,24 @@ async fn build_node(
         _data: data,
         _obj: obj,
     }
+}
+
+async fn create_user(base: &str, user_id: &str, tenant: &str, password: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/admin/users"))
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "tenant_external": tenant,
+            "password": password,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "create_user failed: {}", resp.text().await.unwrap());
+}
+
+fn basic(user: &str, pass: &str) -> String {
+    format!("Basic {}", B64.encode(format!("{user}:{pass}").as_bytes()))
 }
 
 fn sum_appends(reg: &BoxRegistry) -> u64 {
@@ -164,13 +184,18 @@ async fn write_to_node_a_for_tablet_owned_by_b_lands_on_b() {
     let na_b = node_b.registry.node_address_proxy().unwrap();
     na_b.refresh().await.unwrap();
 
+    // Create user on node A (admin API is shared-MetaStore backed).
+    create_user(&node_a.addr, "t1-user", "t-1", "pass").await;
+    let auth = basic("t1-user", "pass");
+
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/append_and_fetch",
+        "{}/api/sessions/{session}/append_and_fetch",
         node_a.addr
     );
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"text": "hello-multi-node"}, "fetch_last_n": 0}))
         .send()
         .await
@@ -229,13 +254,17 @@ async fn loop_guard_rejects_already_forwarded_requests() {
         .await
         .unwrap();
 
+    create_user(&node_a.addr, "t1-user-b", "t-1", "passb").await;
+    let auth = basic("t1-user-b", "passb");
+
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/append_and_fetch",
+        "{}/api/sessions/{session}/append_and_fetch",
         node_a.addr
     );
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .header("X-AgentDB-Forwarded", "1")
         .json(&json!({"event": {"text": "ping"}, "fetch_last_n": 0}))
         .send()
@@ -262,13 +291,17 @@ async fn locally_owned_tablet_does_not_forward() {
         .unwrap();
     node_a.registry.location().unwrap().refresh().await.unwrap();
 
+    create_user(&node_a.addr, "t1-user-c", "t-1", "passc").await;
+    let auth = basic("t1-user-c", "passc");
+
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/append_and_fetch",
+        "{}/api/sessions/{session}/append_and_fetch",
         node_a.addr
     );
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"text": "local"}, "fetch_last_n": 0}))
         .send()
         .await
@@ -301,7 +334,7 @@ async fn locally_owned_tablet_does_not_forward() {
 /// Helper: run the full override-and-refresh choreography for a
 /// session owned by node B, then land a write on node A that
 /// forwards to B (so subsequent reads on that session have
-/// something to find).
+/// something to find). Creates a t-1 user on node A if not already done.
 async fn seed_session_on_node_b(
     meta: &Arc<MetaStore>,
     node_a: &Node,
@@ -321,13 +354,26 @@ async fn seed_session_on_node_b(
             .await
             .unwrap();
     }
+    // Ensure a t-1 user exists (idempotent: create_user succeeds or conflicts).
+    let _ = reqwest::Client::new()
+        .post(format!("{}/api/admin/users", node_a.addr))
+        .json(&serde_json::json!({
+            "user_id": "seed-user",
+            "tenant_external": "t-1",
+            "password": "seedpass",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let auth = basic("seed-user", "seedpass");
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/tenants/t-1/sessions/{session}/append_and_fetch",
+        "{}/api/sessions/{session}/append_and_fetch",
         node_a.addr
     );
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({"event": {"text": "seed"}, "fetch_last_n": 0}))
         .send()
         .await
@@ -379,10 +425,12 @@ async fn fork_forwards_to_owner() {
     let parent = "s-fork-parent";
     seed_session_on_node_b(&meta, &node_a, &node_b, parent).await;
 
+    let auth = basic("seed-user", "seedpass");
     let client = reqwest::Client::new();
     let url = format!("{}/api/sessions/{parent}/fork", node_a.addr);
     let resp = client
         .post(&url)
+        .header("Authorization", &auth)
         .json(&json!({
             "tenant_id": "t-1",
             "new_session_id": "s-fork-child",

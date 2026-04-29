@@ -138,21 +138,19 @@ pub async fn forward_request(
     Ok(resp)
 }
 
-/// Forward a POST `/api/tenants/:tid/sessions/:sid/append_and_fetch`
-/// to `target` and return the remote response verbatim.
+/// Forward a POST `/api/sessions/:sid/append_and_fetch` to `target`
+/// and return the remote response verbatim. The `tenant_id` arg is
+/// retained for parity with prior call sites; the forwarded URL no
+/// longer carries it.
 pub async fn forward_append_and_fetch(
     http: &Client,
     target: &NodeTarget,
-    tenant_id: &str,
+    _tenant_id: &str,
     session_id: &str,
     body: Bytes,
     passthrough: PassthroughHeaders,
 ) -> Result<Response, ForwardError> {
-    let path = format!(
-        "/api/tenants/{}/sessions/{}/append_and_fetch",
-        urlencode(tenant_id),
-        urlencode(session_id),
-    );
+    let path = format!("/api/sessions/{}/append_and_fetch", urlencode(session_id));
     forward_request(
         http,
         target,
@@ -164,21 +162,17 @@ pub async fn forward_append_and_fetch(
     .await
 }
 
-/// Forward a POST `/api/tenants/:tid/sessions/:sid/fetch_recent`
+/// Forward a POST `/api/sessions/:sid/fetch_recent`
 /// to `target` and return the remote response verbatim.
 pub async fn forward_fetch_recent(
     http: &Client,
     target: &NodeTarget,
-    tenant_id: &str,
+    _tenant_id: &str,
     session_id: &str,
     body: Bytes,
     passthrough: PassthroughHeaders,
 ) -> Result<Response, ForwardError> {
-    let path = format!(
-        "/api/tenants/{}/sessions/{}/fetch_recent",
-        urlencode(tenant_id),
-        urlencode(session_id),
-    );
+    let path = format!("/api/sessions/{}/fetch_recent", urlencode(session_id));
     forward_request(
         http,
         target,
@@ -454,10 +448,10 @@ mod tests {
             address: "127.0.0.1:9999".into(),
             mongo_address: None,
         };
-        let r = subscribe_not_owner_reply(&target, "/api/tenants/t-1/sessions/s-1/subscribe");
+        let r = subscribe_not_owner_reply(&target, "/api/sessions/s-1/subscribe");
         assert_eq!(r.status().as_u16(), 421);
         let loc = r.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-        assert_eq!(loc, "http://127.0.0.1:9999/api/tenants/t-1/sessions/s-1/subscribe");
+        assert_eq!(loc, "http://127.0.0.1:9999/api/sessions/s-1/subscribe");
     }
 
     #[test]
