@@ -91,3 +91,23 @@ impl Id {
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.inner) }
 }
+
+impl serde::Serialize for Id {
+    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ser.serialize_str(&self.inner)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Id {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(de)?;
+        Id::parse(&s).map_err(D::Error::custom)
+    }
+}
