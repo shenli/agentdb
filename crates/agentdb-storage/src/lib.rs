@@ -9,6 +9,7 @@ pub mod key;
 pub mod kv;
 pub mod rocks;
 pub mod slate;
+pub mod v2_keys;
 
 pub use error::{Error, Result};
 pub use key::{
