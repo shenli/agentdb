@@ -27,12 +27,7 @@ pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionO
     }))
 }
 
-pub async fn set(
-    pool: &AnyPool,
-    session_id: &str,
-    tablet_id: i64,
-    now_ms: i64,
-) -> MetaResult<()> {
+pub async fn set(pool: &AnyPool, session_id: &str, tablet_id: i64, now_ms: i64) -> MetaResult<()> {
     sqlx::query(
         "INSERT INTO session_overrides (session_id, tablet_id, created_at_ms) VALUES (?, ?, ?)
          ON CONFLICT (session_id) DO UPDATE SET tablet_id = excluded.tablet_id",

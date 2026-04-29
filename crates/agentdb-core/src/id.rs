@@ -73,23 +73,35 @@ impl Id {
         let kind = IdKind::from_prefix(prefix)
             .ok_or_else(|| IdError::UnknownPrefix(prefix.to_string()))?;
         Uuid::from_str(body)?;
-        Ok(Self { kind, inner: s.to_string() })
+        Ok(Self {
+            kind,
+            inner: s.to_string(),
+        })
     }
 
     pub fn parse_kind(s: &str, expected: IdKind) -> Result<Self, IdError> {
         let id = Self::parse(s)?;
         if id.kind != expected {
-            return Err(IdError::KindMismatch { expected, got: id.kind });
+            return Err(IdError::KindMismatch {
+                expected,
+                got: id.kind,
+            });
         }
         Ok(id)
     }
 
-    pub fn kind(&self) -> IdKind { self.kind }
-    pub fn as_str(&self) -> &str { &self.inner }
+    pub fn kind(&self) -> IdKind {
+        self.kind
+    }
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
 }
 
 impl fmt::Display for Id {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.inner) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.inner)
+    }
 }
 
 impl serde::Serialize for Id {

@@ -107,5 +107,8 @@ fn idempotency_key_is_omitted_from_json_when_none() {
         policy_version: 1,
     });
     let v = serde_json::to_value(&e).unwrap();
-    assert!(v.get("idempotency_key").is_none(), "idempotency_key should be omitted when None; got {v}");
+    assert!(
+        v.get("idempotency_key").is_none(),
+        "idempotency_key should be omitted when None; got {v}"
+    );
 }

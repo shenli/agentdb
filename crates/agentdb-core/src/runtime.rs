@@ -11,9 +11,9 @@
 //! together. With KV this is implemented via `KvStore::write_batch`; with
 //! in-memory it's the state mutex.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use agentdb_index::doc_id::DocId;
@@ -60,7 +60,13 @@ pub struct AppendRequest {
 impl AppendRequest {
     /// Convenience for tests and simple call sites that already have references
     /// to the live tenant/agent/session.
-    pub fn simple(t: &Tenant, a: &Agent, s: &Session, kind: &str, payload: serde_json::Value) -> Self {
+    pub fn simple(
+        t: &Tenant,
+        a: &Agent,
+        s: &Session,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             tenant_id: t.tenant_id.clone(),
             agent_id: a.agent_id.clone(),
@@ -282,9 +288,7 @@ impl Runtime {
             state
                 .record_to_doc
                 .insert(r.record_id.as_str().to_string(), doc_id);
-            state
-                .records
-                .insert(r.record_id.as_str().to_string(), r);
+            state.records.insert(r.record_id.as_str().to_string(), r);
         }
 
         Arc::new(Self {
@@ -298,7 +302,7 @@ impl Runtime {
     }
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
-     /// match a live (non-soft-deleted) tenant.
+    /// match a live (non-soft-deleted) tenant.
     pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
         let s = self.state.lock().await;
         s.tenants
@@ -338,16 +342,15 @@ impl Runtime {
             // External keys are tenant-name slots; a duplicate is an
             // unrecoverable client error (not a retry), so we surface it as
             // AliasConflict rather than IdempotencyConflict.
-            if !req.external_key.is_empty()
-                && s.tenant_aliases.contains_key(&req.external_key)
-            {
+            if !req.external_key.is_empty() && s.tenant_aliases.contains_key(&req.external_key) {
                 return Err(Error::new(
                     ErrorCode::AliasConflict,
                     format!("tenant external_key already in use: {}", req.external_key),
                 ));
             }
             let t = Tenant::create(req);
-            s.tenants.insert(t.tenant_id.as_str().to_string(), t.clone());
+            s.tenants
+                .insert(t.tenant_id.as_str().to_string(), t.clone());
             if !t.external_key.is_empty() {
                 s.tenant_aliases
                     .insert(t.external_key.clone(), t.tenant_id.as_str().to_string());
@@ -364,7 +367,10 @@ impl Runtime {
         let a = {
             let mut s = self.state.lock().await;
             if !s.tenants.contains_key(req.tenant_id.as_str()) {
-                return Err(Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
             }
             // Agent alias is unique within (tenant, alias). Two tenants can
             // both have an agent named "rep-1".
@@ -408,9 +414,7 @@ impl Runtime {
                 .agents
                 .get(req.agent_id.as_str())
                 .filter(|a| a.deleted_at_ms.is_none())
-                .ok_or_else(|| {
-                    Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id))
-                })?;
+                .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)))?;
             if agent.tenant_id.as_str() != req.tenant_id.as_str() {
                 return Err(Error::new(
                     ErrorCode::AgentNotFound,
@@ -430,7 +434,8 @@ impl Runtime {
                 }
             }
             let sess = Session::create(req);
-            s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
+            s.sessions
+                .insert(sess.session_id.as_str().to_string(), sess.clone());
             if let Some(alias) = sess.alias.as_deref() {
                 if !alias.is_empty() {
                     s.session_aliases.insert(
@@ -458,11 +463,7 @@ impl Runtime {
     /// content write succeeds we have an orphan blob; V2.4 GC will reap it
     /// (TODO: link the reaper plan once it lands). This task accepts the
     /// orphan window in exchange for a simpler V2.1 surface.
-    pub async fn create_artifact(
-        &self,
-        req: NewArtifact,
-        bytes: Vec<u8>,
-    ) -> Result<Artifact> {
+    pub async fn create_artifact(&self, req: NewArtifact, bytes: Vec<u8>) -> Result<Artifact> {
         // Reject oversized blobs before touching the content backend so a
         // misbehaving caller can't fill disk by streaming a huge body.
         let len = bytes.len() as u64;
@@ -496,9 +497,7 @@ impl Runtime {
             .content
             .put(req.tenant_id.as_str(), artifact_id.as_str(), &bytes)
             .await
-            .map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("content put failed: {e}"))
-            })?;
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content put failed: {e}")))?;
 
         // Verify caller-provided sha256 against the digest the backend
         // computed while writing. On mismatch we best-effort delete the
@@ -551,17 +550,11 @@ impl Runtime {
     /// different tenant — we collapse those cases (mirroring the
     /// agent/session lookups) so the caller in tenant A cannot probe
     /// tenant B's artifact ids by error-code differential.
-    pub async fn get_artifact(
-        &self,
-        tenant_id: &Id,
-        artifact_id: &Id,
-    ) -> Result<Artifact> {
+    pub async fn get_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<Artifact> {
         let s = self.state.lock().await;
         s.artifacts
             .get(artifact_id.as_str())
-            .filter(|a| {
-                a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
-            })
+            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::ArtifactNotFound, format!("{}", artifact_id)))
     }
@@ -570,11 +563,7 @@ impl Runtime {
     /// Once raw is purged (V2.4 derivative-only lifecycle) the bytes are
     /// gone but the metadata stays — a `get_artifact_blob` against a
     /// purged artifact returns `ArtifactNotFound`.
-    pub async fn get_artifact_blob(
-        &self,
-        tenant_id: &Id,
-        artifact_id: &Id,
-    ) -> Result<Vec<u8>> {
+    pub async fn get_artifact_blob(&self, tenant_id: &Id, artifact_id: &Id) -> Result<Vec<u8>> {
         let art = self.get_artifact(tenant_id, artifact_id).await?;
         if art.raw_purged_at_ms.is_some() {
             return Err(Error::new(
@@ -587,36 +576,44 @@ impl Runtime {
         self.content
             .get(tenant_id.as_str(), artifact_id.as_str())
             .await
-            .map_err(|e| {
-                Error::new(ErrorCode::Internal, format!("content get failed: {e}"))
-            })
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))
     }
 
     /// Test-only convenience that creates a tenant + agent + session in one shot.
     pub async fn bootstrap_test_session(&self) -> (Tenant, Agent, Session) {
-        let t = self.create_tenant(NewTenant {
-            external_key: "test".into(),
-            policy: serde_json::json!({}),
-        }).await.unwrap();
-        let a = self.create_agent(NewAgent {
-            tenant_id: t.tenant_id.clone(),
-            alias: None,
-            config: serde_json::json!({}),
-        }).await.unwrap();
-        let s = self.create_session(NewSession {
-            tenant_id: t.tenant_id.clone(),
-            agent_id: a.agent_id.clone(),
-            alias: None,
-        }).await.unwrap();
+        let t = self
+            .create_tenant(NewTenant {
+                external_key: "test".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let a = self
+            .create_agent(NewAgent {
+                tenant_id: t.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let s = self
+            .create_session(NewSession {
+                tenant_id: t.tenant_id.clone(),
+                agent_id: a.agent_id.clone(),
+                alias: None,
+            })
+            .await
+            .unwrap();
         (t, a, s)
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
-        let idem_full_key = req.idempotency_key.as_ref().map(|k| {
-            format!("{}::{}::{}::{}", req.tenant_id, "append", req.session_id, k)
-        });
+        let idem_full_key = req
+            .idempotency_key
+            .as_ref()
+            .map(|k| format!("{}::{}::{}::{}", req.tenant_id, "append", req.session_id, k));
 
         // Optimistic check before locking — fast path for retries that find a
         // committed result without contending on the state mutex.
@@ -699,8 +696,7 @@ impl Runtime {
                 && s.artifacts
                     .get(art_ref.artifact_id.as_str())
                     .is_some_and(|a| {
-                        a.deleted_at_ms.is_none()
-                            && a.tenant_id.as_str() == req.tenant_id.as_str()
+                        a.deleted_at_ms.is_none() && a.tenant_id.as_str() == req.tenant_id.as_str()
                     });
             if !known {
                 return Err(Error::new(
@@ -728,17 +724,11 @@ impl Runtime {
         for sr in &req.source_refs {
             if let Some(rec_id) = &sr.record_id {
                 let exists = (rec_id.kind() == crate::id::IdKind::Record)
-                    && s.records
-                        .get(rec_id.as_str())
-                        .is_some_and(|r| {
-                            r.deleted_at_ms.is_none()
-                                && r.tenant_id.as_str() == req.tenant_id.as_str()
-                        });
+                    && s.records.get(rec_id.as_str()).is_some_and(|r| {
+                        r.deleted_at_ms.is_none() && r.tenant_id.as_str() == req.tenant_id.as_str()
+                    });
                 if !exists {
-                    return Err(Error::new(
-                        ErrorCode::RecordNotFound,
-                        format!("{}", rec_id),
-                    ));
+                    return Err(Error::new(ErrorCode::RecordNotFound, format!("{}", rec_id)));
                 }
             }
         }
@@ -922,9 +912,11 @@ impl Runtime {
             let raw = p
                 .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
                 .map_err(internal)?;
-            let Some((sid, seq)) = raw else { return Ok(None) };
-            let session_id = Id::parse(&sid)
-                .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+            let Some((sid, seq)) = raw else {
+                return Ok(None);
+            };
+            let session_id =
+                Id::parse(&sid).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
             return Ok(Some((session_id, seq)));
         }
 
@@ -951,9 +943,10 @@ impl Runtime {
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         let s = self.state.lock().await;
-        let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
-            Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
-        })?;
+        let session = s
+            .sessions
+            .get(req.session_id.as_str())
+            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)))?;
         // tenant_id on FetchRequest finally becomes load-bearing for the KV
         // backend's tenant-scoped key encoding. Refuse mismatches outright so
         // callers can't sidestep tenancy by passing the wrong tenant.
@@ -978,7 +971,11 @@ impl Runtime {
         }
         let lo = (req.session_id.as_str().to_string(), req.from_seq);
         let hi = (req.session_id.as_str().to_string(), u64::MAX);
-        Ok(s.events.range(lo..=hi).take(req.limit).map(|(_, v)| v.clone()).collect())
+        Ok(s.events
+            .range(lo..=hi)
+            .take(req.limit)
+            .map(|(_, v)| v.clone())
+            .collect())
     }
 }
 
@@ -1004,7 +1001,12 @@ pub struct SearchRequest {
 
 impl SearchRequest {
     /// Convenience: text-only search with no filters.
-    pub fn text_only(tenant_id: Id, namespace: Vec<String>, query: impl Into<String>, limit: usize) -> Self {
+    pub fn text_only(
+        tenant_id: Id,
+        namespace: Vec<String>,
+        query: impl Into<String>,
+        limit: usize,
+    ) -> Self {
         Self {
             tenant_id,
             namespace,
@@ -1088,11 +1090,7 @@ impl Runtime {
     /// different tenant. The four cases collapse into a single error
     /// code (mirroring `get_artifact`) so a caller in tenant A cannot
     /// probe tenant B's record_ids by error-code differential.
-    pub async fn get_record(
-        &self,
-        tenant_id: &Id,
-        record_id: &Id,
-    ) -> Result<SearchableRecord> {
+    pub async fn get_record(&self, tenant_id: &Id, record_id: &Id) -> Result<SearchableRecord> {
         let s = self.state.lock().await;
         s.records
             .get(record_id.as_str())
@@ -1131,11 +1129,7 @@ impl Runtime {
             }
         }
 
-        let path = format!(
-            "{}::{}",
-            req.tenant_id.as_str(),
-            req.namespace.join("/")
-        );
+        let path = format!("{}::{}", req.tenant_id.as_str(), req.namespace.join("/"));
 
         // Allow some slack so post-filtering by tags/source can still
         // produce `limit` matches even when a few top hits get filtered
@@ -1171,11 +1165,11 @@ impl Runtime {
         // descending-score order and resolve each DocId to a record.
         // Brute-force path: walk every record in the namespace. We
         // distinguish the two by whether `text` or `embedding` was set.
-        let candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some() || req.embedding.is_some() {
+        let candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some()
+            || req.embedding.is_some()
+        {
             let mut ranked: Vec<(DocId, f32)> = hits.into_iter().collect();
-            ranked.sort_by(|(_, a), (_, b)| {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            ranked.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             ranked
                 .into_iter()
                 .filter_map(|(doc, score)| {
@@ -1188,8 +1182,7 @@ impl Runtime {
             s.records
                 .values()
                 .filter(|r| {
-                    r.tenant_id.as_str() == req.tenant_id.as_str()
-                        && r.namespace == req.namespace
+                    r.tenant_id.as_str() == req.tenant_id.as_str() && r.namespace == req.namespace
                 })
                 .map(|r| (r.clone(), 0.0))
                 .collect()
@@ -1216,7 +1209,9 @@ impl Runtime {
                 continue;
             }
             if let Some(filter) = &req.source_filter {
-                let Some(rs) = r.source.as_ref() else { continue };
+                let Some(rs) = r.source.as_ref() else {
+                    continue;
+                };
                 if !source_ref_matches(rs, filter) {
                     continue;
                 }
@@ -1242,12 +1237,9 @@ impl Runtime {
     /// tombstoning pass.
     pub async fn delete_record(&self, tenant_id: &Id, record_id: &Id) -> Result<()> {
         let mut s = self.state.lock().await;
-        let live = s
-            .records
-            .get(record_id.as_str())
-            .is_some_and(|r| {
-                r.deleted_at_ms.is_none() && r.tenant_id.as_str() == tenant_id.as_str()
-            });
+        let live = s.records.get(record_id.as_str()).is_some_and(|r| {
+            r.deleted_at_ms.is_none() && r.tenant_id.as_str() == tenant_id.as_str()
+        });
         if !live {
             return Err(Error::new(
                 ErrorCode::RecordNotFound,
@@ -1430,10 +1422,7 @@ fn extract_selected_fields(
 /// Verify a stored idempotency record matches the incoming request and replay
 /// the original response, or surface a conflict if any field that affects
 /// the commit differs.
-fn verify_idem_replay(
-    rec: &IdempotencyRecord,
-    req: &AppendRequest,
-) -> Result<AppendResponse> {
+fn verify_idem_replay(rec: &IdempotencyRecord, req: &AppendRequest) -> Result<AppendResponse> {
     let h = hash_request(
         &req.tenant_id,
         &req.agent_id,

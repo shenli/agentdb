@@ -1,5 +1,5 @@
-use agentdb_core::session::{Session, NewSession, Lifecycle, Status};
 use agentdb_core::id::{Id, IdKind};
+use agentdb_core::session::{Lifecycle, NewSession, Session, Status};
 
 #[test]
 fn session_starts_active_warm_with_seq_zero() {

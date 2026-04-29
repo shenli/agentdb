@@ -69,11 +69,7 @@ pub fn derive_credentials(password: &str, iterations: u32) -> Credentials {
 /// Deterministic variant used by tests to pin salt for RFC
 /// vector reproduction. Production code always takes the
 /// random-salt path above.
-pub fn derive_credentials_with_salt(
-    password: &str,
-    salt: &[u8],
-    iterations: u32,
-) -> Credentials {
+pub fn derive_credentials_with_salt(password: &str, salt: &[u8], iterations: u32) -> Credentials {
     let salted = salted_password(password, salt, iterations);
     let client_key = hmac_sha256(&salted, b"Client Key");
     let server_key = hmac_sha256(&salted, b"Server Key");

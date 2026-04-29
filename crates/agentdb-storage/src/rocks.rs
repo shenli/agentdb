@@ -233,8 +233,14 @@ mod owned_snapshot_tests {
 
         // Open the checkpoint as an independent store and read back.
         let restored = RocksKvStore::open(&dest).unwrap();
-        assert_eq!(restored.get(b"alpha").unwrap().as_deref(), Some(b"a-val".as_ref()));
-        assert_eq!(restored.get(b"beta").unwrap().as_deref(), Some(b"b-val".as_ref()));
+        assert_eq!(
+            restored.get(b"alpha").unwrap().as_deref(),
+            Some(b"a-val".as_ref())
+        );
+        assert_eq!(
+            restored.get(b"beta").unwrap().as_deref(),
+            Some(b"b-val".as_ref())
+        );
     }
 
     #[test]

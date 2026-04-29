@@ -114,10 +114,9 @@ pub struct CreateRecordBody {
 
 /// Query params for `GET /api/tenants/:tenant_id/records/search`.
 ///
-/// `namespace` and `tag` are repeatable. `embedding` is intentionally NOT
-/// exposed via GET — vector search lives behind a future `POST /search`
-/// endpoint (V2.2.5+). For now, drop into `Runtime::search_records` directly
-/// from in-process callers if you need ANN.
+/// `namespace` and `tag` are repeatable. GET is for text/list searches; vector
+/// search uses the JSON `POST /records/search` shape below so embeddings do not
+/// have to be encoded into a URL.
 #[derive(Debug, Deserialize)]
 pub struct SearchRecordsQuery {
     #[serde(default)]
@@ -150,7 +149,28 @@ fn default_search_limit() -> usize {
     20
 }
 
-/// Response body for `GET /api/tenants/:tenant_id/records/search`.
+/// Request body for `POST /api/tenants/:tenant_id/records/search`.
+///
+/// Supports the full V2.2 search surface, including caller-supplied vector
+/// embeddings. `source` is a partial [`SourceRef`]: every populated field must
+/// match the candidate record's source.
+#[derive(Debug, Deserialize)]
+pub struct SearchRecordsBody {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub namespace: Vec<String>,
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source: Option<SourceRef>,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+/// Response body for `GET` or `POST /api/tenants/:tenant_id/records/search`.
 ///
 /// Wrapped in an object for forward-compat — pagination cursors land here in
 /// a later milestone without breaking the wire shape.

@@ -46,10 +46,7 @@ async fn record_round_trip() {
     // GET /api/tenants/{tid}/records/{rid}
     let got: serde_json::Value = app
         .client
-        .get(format!(
-            "{}/api/tenants/{tid}/records/{rid}",
-            app.base
-        ))
+        .get(format!("{}/api/tenants/{tid}/records/{rid}", app.base))
         .send()
         .await
         .unwrap()
@@ -129,7 +126,11 @@ async fn search_records_by_namespace_and_text() {
         .await
         .unwrap();
     let recs = resp["records"].as_array().unwrap();
-    assert_eq!(recs.len(), 2, "expected 2 matches in namespace=test, got {recs:?}");
+    assert_eq!(
+        recs.len(),
+        2,
+        "expected 2 matches in namespace=test, got {recs:?}"
+    );
     for r in recs {
         assert_eq!(r["namespace"], json!(["test"]));
     }
@@ -176,6 +177,99 @@ async fn search_records_with_no_text_returns_namespace_listing() {
 }
 
 #[tokio::test]
+async fn post_search_records_supports_vector_embedding() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    for (text, embedding) in [
+        ("east", vec![1.0, 0.0, 0.0]),
+        ("north", vec![0.0, 1.0, 0.0]),
+        ("up", vec![0.0, 0.0, 1.0]),
+    ] {
+        app.client
+            .post(format!("{}/api/tenants/{tid}/records", app.base))
+            .json(&json!({
+                "namespace": ["vectors"],
+                "text": text,
+                "embedding": embedding,
+                "policy": {
+                    "mode": "metadata_only",
+                    "fields": [],
+                    "vector_allowed": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let resp: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/search", app.base))
+        .json(&json!({
+            "namespace": ["vectors"],
+            "embedding": [0.0, 1.0, 0.0],
+            "limit": 3
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let recs = resp["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 3);
+    assert_eq!(recs[0]["text"], "north");
+}
+
+#[tokio::test]
+async fn post_vector_search_skips_records_when_policy_denies_vector() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "namespace": ["vectors"],
+            "text": "denied",
+            "embedding": [1.0, 0.0, 0.0],
+            "policy": {
+                "mode": "metadata_only",
+                "fields": [],
+                "vector_allowed": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let resp: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/search", app.base))
+        .json(&json!({
+            "namespace": ["vectors"],
+            "embedding": [1.0, 0.0, 0.0],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["records"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn search_route_beats_dynamic_record_id_route() {
     // Route-ordering regression: `/records/search` must be matched as the
     // static path even though `/records/:record_id` would otherwise eat
@@ -186,10 +280,7 @@ async fn search_route_beats_dynamic_record_id_route() {
     let (tid, _, _) = bootstrap_session(&app).await;
     let resp = app
         .client
-        .get(format!(
-            "{}/api/tenants/{tid}/records/search",
-            app.base
-        ))
+        .get(format!("{}/api/tenants/{tid}/records/search", app.base))
         .send()
         .await
         .unwrap();
@@ -218,10 +309,7 @@ async fn record_not_found_under_wrong_tenant() {
     let (tid2, _, _) = bootstrap_session_with_key(&app, "second").await;
     let resp = app
         .client
-        .get(format!(
-            "{}/api/tenants/{tid2}/records/{rid}",
-            app.base
-        ))
+        .get(format!("{}/api/tenants/{tid2}/records/{rid}", app.base))
         .send()
         .await
         .unwrap();
@@ -272,10 +360,7 @@ async fn delete_record_removes_from_search() {
     // DELETE.
     let resp = app
         .client
-        .delete(format!(
-            "{}/api/tenants/{tid}/records/{rid}",
-            app.base
-        ))
+        .delete(format!("{}/api/tenants/{tid}/records/{rid}", app.base))
         .send()
         .await
         .unwrap();
@@ -301,10 +386,7 @@ async fn delete_record_removes_from_search() {
     // GET on the deleted id is now a 404.
     let resp = app
         .client
-        .get(format!(
-            "{}/api/tenants/{tid}/records/{rid}",
-            app.base
-        ))
+        .get(format!("{}/api/tenants/{tid}/records/{rid}", app.base))
         .send()
         .await
         .unwrap();
@@ -318,10 +400,7 @@ async fn delete_unknown_record_returns_404() {
     let bogus = "rec_018f0000-0000-7000-8000-000000000000";
     let resp = app
         .client
-        .delete(format!(
-            "{}/api/tenants/{tid}/records/{bogus}",
-            app.base
-        ))
+        .delete(format!("{}/api/tenants/{tid}/records/{bogus}", app.base))
         .send()
         .await
         .unwrap();
@@ -417,10 +496,7 @@ async fn bootstrap_session(app: &TestApp) -> (String, String, String) {
     bootstrap_session_with_key(app, "test").await
 }
 
-async fn bootstrap_session_with_key(
-    app: &TestApp,
-    external_key: &str,
-) -> (String, String, String) {
+async fn bootstrap_session_with_key(app: &TestApp, external_key: &str) -> (String, String, String) {
     let t: serde_json::Value = app
         .client
         .post(format!("{}/api/tenants", app.base))

@@ -7,25 +7,52 @@ use agentdb_core::tenant::NewTenant;
 #[tokio::test]
 async fn append_assigns_contiguous_seqs() {
     let rt = Runtime::in_memory();
-    let t = rt.create_tenant(NewTenant {
-        external_key: "acme".into(),
-        policy: serde_json::json!({}),
-    }).await.unwrap();
-    let a = rt.create_agent(NewAgent {
-        tenant_id: t.tenant_id.clone(),
-        alias: None,
-        config: serde_json::json!({}),
-    }).await.unwrap();
-    let s = rt.create_session(NewSession {
-        tenant_id: t.tenant_id.clone(),
-        agent_id: a.agent_id.clone(),
-        alias: None,
-    }).await.unwrap();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "acme".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
 
-    let r1 = rt.append(AppendRequest::simple(&t, &a, &s, "ping", serde_json::json!({"i": 1}))).await.unwrap();
+    let r1 = rt
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "ping",
+            serde_json::json!({"i": 1}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(r1.seq, 0);
 
-    let r2 = rt.append(AppendRequest::simple(&t, &a, &s, "ping", serde_json::json!({"i": 2}))).await.unwrap();
+    let r2 = rt
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "ping",
+            serde_json::json!({"i": 2}),
+        ))
+        .await
+        .unwrap();
     assert_eq!(r2.seq, 1);
 
     assert_ne!(r1.event_id, r2.event_id);
@@ -36,14 +63,33 @@ async fn append_and_fetch_returns_recent() {
     let rt = Runtime::in_memory();
     let (t, a, s) = rt.bootstrap_test_session().await;
 
-    rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({}))).await.unwrap();
-    rt.append(AppendRequest::simple(&t, &a, &s, "y", serde_json::json!({}))).await.unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "y",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
 
-    let r3 = rt.append_and_fetch(
-        AppendRequest::simple(&t, &a, &s, "z", serde_json::json!({})),
-        /* last */ 5,
-        /* max_bytes */ 1_000_000,
-    ).await.unwrap();
+    let r3 = rt
+        .append_and_fetch(
+            AppendRequest::simple(&t, &a, &s, "z", serde_json::json!({})),
+            /* last */ 5,
+            /* max_bytes */ 1_000_000,
+        )
+        .await
+        .unwrap();
     assert_eq!(r3.seq, 2);
     assert_eq!(r3.recent.len(), 3);
     assert_eq!(r3.recent[0].seq, 0);
@@ -65,11 +111,20 @@ async fn idempotent_append_returns_original_result() {
     assert_eq!(r1.event_id, r2.event_id);
 
     // Only ONE event was actually persisted.
-    let recent = rt.append_and_fetch(
-        AppendRequest::simple(&t, &a, &s, "y", serde_json::json!({})),
-        /* last */ 10, 1_000_000,
-    ).await.unwrap().recent;
-    assert_eq!(recent.len(), 2, "expected 1 idempotent event + 1 fresh, got: {recent:?}");
+    let recent = rt
+        .append_and_fetch(
+            AppendRequest::simple(&t, &a, &s, "y", serde_json::json!({})),
+            /* last */ 10,
+            1_000_000,
+        )
+        .await
+        .unwrap()
+        .recent;
+    assert_eq!(
+        recent.len(),
+        2,
+        "expected 1 idempotent event + 1 fresh, got: {recent:?}"
+    );
 }
 
 #[tokio::test]
@@ -91,11 +146,14 @@ async fn idempotent_conflict_on_payload_change() {
 async fn create_agent_rejects_unknown_tenant() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();
-    let err = rt.create_agent(NewAgent {
-        tenant_id: Id::new(IdKind::Tenant),
-        alias: None,
-        config: serde_json::json!({}),
-    }).await.unwrap_err();
+    let err = rt
+        .create_agent(NewAgent {
+            tenant_id: Id::new(IdKind::Tenant),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::TenantNotFound);
 }
 
@@ -103,15 +161,21 @@ async fn create_agent_rejects_unknown_tenant() {
 async fn create_session_rejects_unknown_agent() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();
-    let t = rt.create_tenant(NewTenant {
-        external_key: "x".into(),
-        policy: serde_json::json!({}),
-    }).await.unwrap();
-    let err = rt.create_session(NewSession {
-        tenant_id: t.tenant_id,
-        agent_id: Id::new(IdKind::Agent),
-        alias: None,
-    }).await.unwrap_err();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "x".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let err = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id,
+            agent_id: Id::new(IdKind::Agent),
+            alias: None,
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::AgentNotFound);
 }
 
@@ -141,22 +205,34 @@ async fn concurrent_idempotent_appends_resolve_consistently() {
     }
     let first = &results[0];
     for r in &results {
-        assert_eq!(r.event_id, first.event_id, "all idempotent appends must return the same event_id");
-        assert_eq!(r.seq, first.seq, "all idempotent appends must return the same seq");
+        assert_eq!(
+            r.event_id, first.event_id,
+            "all idempotent appends must return the same event_id"
+        );
+        assert_eq!(
+            r.seq, first.seq,
+            "all idempotent appends must return the same seq"
+        );
     }
 
     // Only one event was persisted in the session.
-    let resp = rt.append_and_fetch(
-        AppendRequest::simple(&t, &a, &s, "tail", serde_json::json!({})),
-        /* last */ 100,
-        /* max_bytes */ 1_000_000,
-    ).await.unwrap();
+    let resp = rt
+        .append_and_fetch(
+            AppendRequest::simple(&t, &a, &s, "tail", serde_json::json!({})),
+            /* last */ 100,
+            /* max_bytes */ 1_000_000,
+        )
+        .await
+        .unwrap();
     // 1 idempotent + 1 fresh "tail" = 2 events
     assert_eq!(
         resp.recent.len(),
         2,
         "expected exactly 1 idempotent commit + 1 tail append; got {:?}",
-        resp.recent.iter().map(|e| (e.seq, &e.kind)).collect::<Vec<_>>()
+        resp.recent
+            .iter()
+            .map(|e| (e.seq, &e.kind))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -226,7 +302,13 @@ async fn lookup_event_by_id_works_in_memory() {
     let rt = Runtime::in_memory();
     let (t, a, s) = rt.bootstrap_test_session().await;
     let r = rt
-        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 1}),
+        ))
         .await
         .unwrap();
 
@@ -251,7 +333,13 @@ async fn lookup_event_by_id_rejects_cross_tenant_in_memory() {
     let rt = Runtime::in_memory();
     let (t1, a, s) = rt.bootstrap_test_session().await;
     let r = rt
-        .append(AppendRequest::simple(&t1, &a, &s, "x", serde_json::json!({})))
+        .append(AppendRequest::simple(
+            &t1,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     let t2 = rt

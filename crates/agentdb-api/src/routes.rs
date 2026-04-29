@@ -19,16 +19,14 @@ use axum::{
 
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
-    runtime::{
-        AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest,
-    },
+    runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest},
     Agent, Artifact, ErrorCode, EventEnvelope, Id, IdKind, NewAgent, NewArtifact, NewSession,
     NewTenant, Session, SourceRef, Tenant,
 };
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, CreateAgentBody, CreateRecordBody, CreateSessionBody,
-    CreateTenantBody, FetchQuery, SearchRecordsResponse,
+    CreateTenantBody, FetchQuery, SearchRecordsBody, SearchRecordsResponse,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -48,10 +46,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/tenants", post(create_tenant))
         .route("/api/tenants/:tenant_id", get(get_tenant))
         .route("/api/tenants/:tenant_id/agents", post(create_agent))
-        .route(
-            "/api/tenants/:tenant_id/agents/:agent_id",
-            get(get_agent),
-        )
+        .route("/api/tenants/:tenant_id/agents/:agent_id", get(get_agent))
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id/sessions",
             post(create_session),
@@ -93,12 +88,9 @@ pub fn routes() -> Router<AppState> {
         // silently swap precedence.
         .route(
             "/api/tenants/:tenant_id/records/search",
-            get(search_records),
+            get(search_records).post(search_records_json),
         )
-        .route(
-            "/api/tenants/:tenant_id/records",
-            post(create_record),
-        )
+        .route("/api/tenants/:tenant_id/records", post(create_record))
         .route(
             "/api/tenants/:tenant_id/records/:record_id",
             get(get_record).delete(delete_record),
@@ -123,7 +115,11 @@ async fn get_tenant(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     Ok(Json(s.runtime.get_tenant(&tid).await?))
 }
 
@@ -132,7 +128,11 @@ async fn create_agent(
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateAgentBody>,
 ) -> Result<Json<Agent>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let a = s
         .runtime
         .create_agent(NewAgent {
@@ -148,8 +148,16 @@ async fn get_agent(
     State(s): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<Agent>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
-    let aid = parse_id_or(&agent_id, IdKind::Agent, agentdb_core::ErrorCode::AgentNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let aid = parse_id_or(
+        &agent_id,
+        IdKind::Agent,
+        agentdb_core::ErrorCode::AgentNotFound,
+    )?;
     Ok(Json(s.runtime.get_agent(&tid, &aid).await?))
 }
 
@@ -158,8 +166,16 @@ async fn create_session(
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Json<Session>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
-    let aid = parse_id_or(&agent_id, IdKind::Agent, agentdb_core::ErrorCode::AgentNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let aid = parse_id_or(
+        &agent_id,
+        IdKind::Agent,
+        agentdb_core::ErrorCode::AgentNotFound,
+    )?;
     let sess = s
         .runtime
         .create_session(NewSession {
@@ -175,7 +191,11 @@ async fn get_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<Session>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let sid = parse_id_or(
         &session_id,
         IdKind::Session,
@@ -190,13 +210,21 @@ async fn append_event(
     headers: HeaderMap,
     Json(body): Json<AppendBody>,
 ) -> Result<Json<AppendResponse>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let sid = parse_id_or(
         &session_id,
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let aid = parse_id_or(&body.agent_id, IdKind::Agent, agentdb_core::ErrorCode::AgentNotFound)?;
+    let aid = parse_id_or(
+        &body.agent_id,
+        IdKind::Agent,
+        agentdb_core::ErrorCode::AgentNotFound,
+    )?;
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -221,13 +249,21 @@ async fn append_and_fetch(
     headers: HeaderMap,
     Json(body): Json<AppendAndFetchBody>,
 ) -> Result<Json<AppendAndFetchResponse>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let sid = parse_id_or(
         &session_id,
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let aid = parse_id_or(&body.agent_id, IdKind::Agent, agentdb_core::ErrorCode::AgentNotFound)?;
+    let aid = parse_id_or(
+        &body.agent_id,
+        IdKind::Agent,
+        agentdb_core::ErrorCode::AgentNotFound,
+    )?;
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -255,7 +291,11 @@ async fn fetch_events(
     Path((tenant_id, session_id)): Path<(String, String)>,
     Query(q): Query<FetchQuery>,
 ) -> Result<Json<Vec<EventEnvelope>>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let sid = parse_id_or(
         &session_id,
         IdKind::Session,
@@ -300,7 +340,11 @@ async fn create_artifact(
     // ErrorCode in V2 — a syntactically broken id is indistinguishable from
     // a non-existent one to the caller, so TenantNotFound is the right
     // outcome (matches the rest of the V2.0 routes).
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -338,7 +382,11 @@ async fn get_artifact(
     State(s): State<AppState>,
     Path((tenant_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Json<Artifact>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let aid = parse_id_or(
         &artifact_id,
         IdKind::Artifact,
@@ -358,7 +406,11 @@ async fn get_artifact_blob(
     State(s): State<AppState>,
     Path((tenant_id, artifact_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, agentdb_core::ErrorCode::TenantNotFound)?;
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
     let aid = parse_id_or(
         &artifact_id,
         IdKind::Artifact,
@@ -447,8 +499,8 @@ async fn get_record(
 ///   `source_skill`, `source_event` (post-filter on `SourceRef`)
 /// - `limit` (default 20, capped at 100)
 ///
-/// `embedding` is intentionally NOT exposed via GET — vector search lives
-/// behind a future `POST /search` endpoint.
+/// `embedding` is intentionally NOT exposed via GET — vector search uses
+/// `POST /records/search` with a JSON body.
 async fn search_records(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -478,6 +530,30 @@ async fn search_records(
         tags: parsed.tags,
         source_filter,
         limit,
+    };
+    let records = s.runtime.search_records(req).await?;
+    Ok(Json(SearchRecordsResponse { records }))
+}
+
+/// `POST /api/tenants/:tenant_id/records/search`
+///
+/// JSON search form for the full V2.2 record-search surface. This is the route
+/// callers use for vector search because embeddings are request-body data, not
+/// URL query data.
+async fn search_records_json(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SearchRecordsBody>,
+) -> Result<Json<SearchRecordsResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let req = SearchRequest {
+        tenant_id: tid,
+        namespace: body.namespace,
+        text: body.text,
+        embedding: body.embedding,
+        tags: body.tags,
+        source_filter: body.source,
+        limit: body.limit.clamp(1, 100),
     };
     let records = s.runtime.search_records(req).await?;
     Ok(Json(SearchRecordsResponse { records }))
@@ -630,4 +706,3 @@ fn parse_opt_id(s: Option<&str>, kind: IdKind) -> Result<Option<Id>, ApiError> {
         Some(raw) => Ok(Id::parse_kind(raw, kind).ok()),
     }
 }
-

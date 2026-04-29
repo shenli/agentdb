@@ -45,7 +45,10 @@ mod tests {
     async fn set_get_roundtrip() {
         let p = pool().await;
         set(&p, "shard_count", "16384", 100).await.unwrap();
-        assert_eq!(get(&p, "shard_count").await.unwrap().as_deref(), Some("16384"));
+        assert_eq!(
+            get(&p, "shard_count").await.unwrap().as_deref(),
+            Some("16384")
+        );
     }
 
     #[tokio::test]

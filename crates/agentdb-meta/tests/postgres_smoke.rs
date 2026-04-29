@@ -123,14 +123,9 @@ async fn pg_admin_token_roundtrip() {
     };
     cleanup_schema(&url).await;
     let store = MetaStore::open_postgres(&url).await.unwrap();
-    let minted = admin_tokens::mint(
-        store.pool(),
-        "alice",
-        admin_tokens::AdminScope::Admin,
-        1000,
-    )
-    .await
-    .unwrap();
+    let minted = admin_tokens::mint(store.pool(), "alice", admin_tokens::AdminScope::Admin, 1000)
+        .await
+        .unwrap();
     let v = admin_tokens::verify(store.pool(), &minted.plaintext)
         .await
         .unwrap()

@@ -70,10 +70,6 @@ pub fn record_key(tenant_id: &str, record_id: &str) -> String {
 /// Secondary index over `(tenant_id, namespace_path)` for prefix-scanning
 /// every record under a namespace. `namespace_path` is the slash-joined
 /// namespace components (matching `SearchableRecord::namespace_path()`).
-pub fn record_by_namespace_key(
-    tenant_id: &str,
-    namespace_path: &str,
-    record_id: &str,
-) -> String {
+pub fn record_by_namespace_key(tenant_id: &str, namespace_path: &str, record_id: &str) -> String {
     format!("record/searchable_by_namespace/{tenant_id}/{namespace_path}/{record_id}")
 }

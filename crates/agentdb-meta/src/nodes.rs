@@ -88,12 +88,7 @@ pub async fn heartbeat(pool: &AnyPool, node_id: &str, now_ms: i64) -> MetaResult
 /// Unlike [`upsert`], this preserves the existing `address` —
 /// `POST /api/admin/drain` uses it to flip state to `"draining"`
 /// without accidentally wiping the advertised address.
-pub async fn set_state(
-    pool: &AnyPool,
-    node_id: &str,
-    state: &str,
-    now_ms: i64,
-) -> MetaResult<()> {
+pub async fn set_state(pool: &AnyPool, node_id: &str, state: &str, now_ms: i64) -> MetaResult<()> {
     let rows = sqlx::query("UPDATE nodes SET state = ?, last_heartbeat_ms = ? WHERE node_id = ?")
         .bind(state)
         .bind(now_ms)
@@ -155,10 +150,7 @@ fn into_node(row: NodeRow) -> Node {
 /// surface membership changes. `last_heartbeat_ms` is NOT
 /// touched — we want the original timestamp preserved so GC and
 /// observability can see how long the node has been gone.
-pub async fn mark_dead_if_stale(
-    pool: &AnyPool,
-    deadline_ms: i64,
-) -> MetaResult<Vec<String>> {
+pub async fn mark_dead_if_stale(pool: &AnyPool, deadline_ms: i64) -> MetaResult<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "UPDATE nodes SET state = 'dead' \
            WHERE state = 'alive' AND last_heartbeat_ms < ? \
@@ -242,9 +234,17 @@ mod tests {
         upsert(&p, "node-a", "old-addr", None, "alive", 100, None)
             .await
             .unwrap();
-        upsert(&p, "node-a", "new-addr", Some("new-mongo"), "draining", 200, None)
-            .await
-            .unwrap();
+        upsert(
+            &p,
+            "node-a",
+            "new-addr",
+            Some("new-mongo"),
+            "draining",
+            200,
+            None,
+        )
+        .await
+        .unwrap();
         let n = get(&p, "node-a").await.unwrap().unwrap();
         assert_eq!(n.address, "new-addr");
         assert_eq!(n.mongo_address.as_deref(), Some("new-mongo"));
@@ -257,7 +257,9 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_advances_timestamp() {
         let p = pool().await;
-        upsert(&p, "node-a", "addr", None, "alive", 100, None).await.unwrap();
+        upsert(&p, "node-a", "addr", None, "alive", 100, None)
+            .await
+            .unwrap();
         heartbeat(&p, "node-a", 500).await.unwrap();
         let n = get(&p, "node-a").await.unwrap().unwrap();
         assert_eq!(n.last_heartbeat_ms, 500);
@@ -293,9 +295,15 @@ mod tests {
     #[tokio::test]
     async fn list_all_returns_every_node_in_id_order() {
         let p = pool().await;
-        upsert(&p, "node-b", "bb", None, "alive", 100, None).await.unwrap();
-        upsert(&p, "node-a", "aa", Some("amongo"), "alive", 100, None).await.unwrap();
-        upsert(&p, "node-c", "cc", None, "draining", 200, None).await.unwrap();
+        upsert(&p, "node-b", "bb", None, "alive", 100, None)
+            .await
+            .unwrap();
+        upsert(&p, "node-a", "aa", Some("amongo"), "alive", 100, None)
+            .await
+            .unwrap();
+        upsert(&p, "node-c", "cc", None, "draining", 200, None)
+            .await
+            .unwrap();
         let all = list_all(&p).await.unwrap();
         let ids: Vec<_> = all.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(ids, ["node-a", "node-b", "node-c"]);
@@ -304,8 +312,12 @@ mod tests {
     #[tokio::test]
     async fn stale_detects_nodes_below_threshold() {
         let p = pool().await;
-        upsert(&p, "healthy", "a", None, "alive", 1000, None).await.unwrap();
-        upsert(&p, "dead", "b", None, "alive", 50, None).await.unwrap();
+        upsert(&p, "healthy", "a", None, "alive", 1000, None)
+            .await
+            .unwrap();
+        upsert(&p, "dead", "b", None, "alive", 50, None)
+            .await
+            .unwrap();
         let s = stale(&p, 500).await.unwrap();
         let ids: Vec<_> = s.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(ids, ["dead"]);
@@ -314,9 +326,15 @@ mod tests {
     #[tokio::test]
     async fn mark_dead_if_stale_transitions_and_reports() {
         let p = pool().await;
-        upsert(&p, "fresh", "a", None, "alive", 1000, None).await.unwrap();
-        upsert(&p, "gone-1", "b", None, "alive", 100, None).await.unwrap();
-        upsert(&p, "gone-2", "c", None, "alive", 120, None).await.unwrap();
+        upsert(&p, "fresh", "a", None, "alive", 1000, None)
+            .await
+            .unwrap();
+        upsert(&p, "gone-1", "b", None, "alive", 100, None)
+            .await
+            .unwrap();
+        upsert(&p, "gone-2", "c", None, "alive", 120, None)
+            .await
+            .unwrap();
         // deadline 500 → both gone-1/gone-2 flip; fresh stays alive.
         let mut changed = mark_dead_if_stale(&p, 500).await.unwrap();
         changed.sort();
@@ -326,7 +344,10 @@ mod tests {
         assert_eq!(get(&p, "gone-1").await.unwrap().unwrap().state, "dead");
         // Heartbeat timestamp is preserved so GC + operators can
         // tell how long the node has been gone.
-        assert_eq!(get(&p, "gone-1").await.unwrap().unwrap().last_heartbeat_ms, 100);
+        assert_eq!(
+            get(&p, "gone-1").await.unwrap().unwrap().last_heartbeat_ms,
+            100
+        );
 
         // Idempotent: a second call returns an empty list because
         // the stale rows are now state='dead' and the predicate
@@ -338,8 +359,12 @@ mod tests {
     #[tokio::test]
     async fn mark_dead_if_stale_ignores_non_alive_states() {
         let p = pool().await;
-        upsert(&p, "leaving", "a", None, "leaving", 100, None).await.unwrap();
-        upsert(&p, "draining", "b", None, "draining", 100, None).await.unwrap();
+        upsert(&p, "leaving", "a", None, "leaving", 100, None)
+            .await
+            .unwrap();
+        upsert(&p, "draining", "b", None, "draining", 100, None)
+            .await
+            .unwrap();
         let changed = mark_dead_if_stale(&p, 500).await.unwrap();
         assert!(
             changed.is_empty(),
@@ -351,9 +376,15 @@ mod tests {
     async fn gc_dead_removes_long_gone_rows_only() {
         let p = pool().await;
         // Three dead rows with different ages, plus one alive.
-        upsert(&p, "just-died", "a", None, "alive", 500, None).await.unwrap();
-        upsert(&p, "ancient", "b", None, "alive", 10, None).await.unwrap();
-        upsert(&p, "alive", "c", None, "alive", 1000, None).await.unwrap();
+        upsert(&p, "just-died", "a", None, "alive", 500, None)
+            .await
+            .unwrap();
+        upsert(&p, "ancient", "b", None, "alive", 10, None)
+            .await
+            .unwrap();
+        upsert(&p, "alive", "c", None, "alive", 1000, None)
+            .await
+            .unwrap();
         mark_dead_if_stale(&p, 900).await.unwrap();
 
         // GC with a 100 deadline: "ancient" (hb=10) and
@@ -371,8 +402,12 @@ mod tests {
         // that would cover every timestamp in the table, rows
         // whose state != 'dead' must be left alone.
         let p = pool().await;
-        upsert(&p, "alive", "a", None, "alive", 10, None).await.unwrap();
-        upsert(&p, "leaving", "b", None, "leaving", 10, None).await.unwrap();
+        upsert(&p, "alive", "a", None, "alive", 10, None)
+            .await
+            .unwrap();
+        upsert(&p, "leaving", "b", None, "leaving", 10, None)
+            .await
+            .unwrap();
         let removed = gc_dead(&p, i64::MAX).await.unwrap();
         assert!(removed.is_empty());
         assert!(get(&p, "alive").await.unwrap().is_some());
@@ -382,7 +417,9 @@ mod tests {
     #[tokio::test]
     async fn remove_reports_whether_row_existed() {
         let p = pool().await;
-        upsert(&p, "node-a", "a", None, "alive", 100, None).await.unwrap();
+        upsert(&p, "node-a", "a", None, "alive", 100, None)
+            .await
+            .unwrap();
         assert!(remove(&p, "node-a").await.unwrap());
         assert!(get(&p, "node-a").await.unwrap().is_none());
         // Second remove returns false — already gone.

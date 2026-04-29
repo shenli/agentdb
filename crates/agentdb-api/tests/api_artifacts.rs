@@ -66,7 +66,11 @@ async fn artifact_round_trip() {
         .error_for_status()
         .unwrap();
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "text/plain"
     );
     assert_eq!(
@@ -114,7 +118,11 @@ async fn artifact_without_content_type_defaults_to_octet_stream() {
         .error_for_status()
         .unwrap();
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/octet-stream"
     );
 }
@@ -341,10 +349,7 @@ async fn bootstrap_session(app: &TestApp) -> (String, String, String) {
 
 /// Caller-supplied tenant external_key so multi-tenant tests can spin up
 /// fresh tenants without colliding on the unique-alias constraint.
-async fn bootstrap_session_with_key(
-    app: &TestApp,
-    external_key: &str,
-) -> (String, String, String) {
+async fn bootstrap_session_with_key(app: &TestApp, external_key: &str) -> (String, String, String) {
     let t: serde_json::Value = app
         .client
         .post(format!("{}/api/tenants", app.base))

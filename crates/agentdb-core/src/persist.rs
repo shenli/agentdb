@@ -94,8 +94,7 @@ impl Persist {
     pub fn put_artifact(&self, a: &Artifact) -> KvResult<()> {
         let ops: Vec<WriteOp> = vec![
             WriteOp::Put {
-                key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str())
-                    .into_bytes(),
+                key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
                 value: serde_json::to_vec(a).expect("artifact serializes"),
             },
             WriteOp::Put {
@@ -134,7 +133,11 @@ impl Persist {
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(4);
-        let ek = event_key(event.tenant_id.as_str(), event.session_id.as_str(), event.seq);
+        let ek = event_key(
+            event.tenant_id.as_str(),
+            event.session_id.as_str(),
+            event.seq,
+        );
         ops.push(WriteOp::Put {
             key: ek.into_bytes(),
             value: serde_json::to_vec(event).expect("event serializes"),
@@ -176,7 +179,9 @@ impl Persist {
         tenant_id: &str,
         event_id: &str,
     ) -> KvResult<Option<(String, u64)>> {
-        let raw = self.kv.get(event_by_id_key(tenant_id, event_id).as_bytes())?;
+        let raw = self
+            .kv
+            .get(event_by_id_key(tenant_id, event_id).as_bytes())?;
         let Some(bytes) = raw else { return Ok(None) };
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).expect("event_by_id pointer decodes");
@@ -207,8 +212,7 @@ impl Persist {
         let mut out = Vec::new();
         for res in iter {
             let (_k, v) = res?;
-            let env: EventEnvelope =
-                serde_json::from_slice(&v).expect("event envelope decodes");
+            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
             if env.seq < from_seq {
                 continue;
             }
@@ -229,8 +233,7 @@ impl Persist {
         let mut max_seq: Option<u64> = None;
         for res in iter {
             let (_k, v) = res?;
-            let env: EventEnvelope =
-                serde_json::from_slice(&v).expect("event envelope decodes");
+            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
             max_seq = Some(match max_seq {
                 Some(m) if m >= env.seq => m,
                 _ => env.seq,
@@ -316,8 +319,8 @@ impl Persist {
         let mut out = Vec::new();
         for res in iter {
             let (k, v) = res?;
-            let suffix = std::str::from_utf8(&k[prefix.len()..])
-                .expect("agent_alias key suffix is utf8");
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("agent_alias key suffix is utf8");
             // suffix shape: "{tenant_id}/{alias}"
             let mut split = suffix.splitn(2, '/');
             let tenant = split.next().expect("tenant_id segment").to_string();
@@ -337,8 +340,8 @@ impl Persist {
         let mut out = Vec::new();
         for res in iter {
             let (k, v) = res?;
-            let suffix = std::str::from_utf8(&k[prefix.len()..])
-                .expect("session_alias key suffix is utf8");
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("session_alias key suffix is utf8");
             let mut split = suffix.splitn(2, '/');
             let tenant = split.next().expect("tenant_id segment").to_string();
             let alias = split.next().expect("alias segment").to_string();
@@ -408,8 +411,7 @@ impl Persist {
     ) -> KvResult<Option<SearchableRecord>> {
         let raw = self.kv.get(record_key(tenant_id, record_id).as_bytes())?;
         let Some(bytes) = raw else { return Ok(None) };
-        let r: SearchableRecord =
-            serde_json::from_slice(&bytes).expect("record decodes");
+        let r: SearchableRecord = serde_json::from_slice(&bytes).expect("record decodes");
         Ok(Some(r))
     }
 

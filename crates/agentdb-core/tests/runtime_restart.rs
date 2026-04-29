@@ -57,12 +57,24 @@ async fn events_and_next_seq_survive_restart() {
         .await
         .unwrap();
 
-    rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
-        .await
-        .unwrap();
-    rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 2})))
-        .await
-        .unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({"i": 1}),
+    ))
+    .await
+    .unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({"i": 2}),
+    ))
+    .await
+    .unwrap();
     drop(rt);
 
     // Reopen the same on-disk KV path. RocksDB requires the prior handle to be
@@ -87,7 +99,13 @@ async fn events_and_next_seq_survive_restart() {
     // next_seq should be 2 after restart — confirmed by the seq assigned to a
     // fresh append being exactly 2.
     let r3 = rt2
-        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 3})))
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 3}),
+        ))
         .await
         .unwrap();
     assert_eq!(r3.seq, 2);
@@ -121,7 +139,11 @@ async fn idempotency_records_survive_restart() {
         })
         .await
         .unwrap();
-    assert_eq!(events.len(), 1, "idempotent retry must not create a second event");
+    assert_eq!(
+        events.len(),
+        1,
+        "idempotent retry must not create a second event"
+    );
     assert_eq!(events[0].seq, 0);
 }
 
@@ -138,7 +160,13 @@ async fn tenants_agents_and_sessions_hydrate_on_open() {
 
     // Append should work — proves tenant + agent + session were rehydrated.
     let r = rt2
-        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({})))
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(r.seq, 0);
@@ -151,9 +179,15 @@ async fn append_and_fetch_uses_kv_recent() {
     let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     for i in 0..3_u64 {
-        rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": i})))
-            .await
-            .unwrap();
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": i}),
+        ))
+        .await
+        .unwrap();
     }
     let r = rt
         .append_and_fetch(
@@ -177,7 +211,13 @@ async fn event_by_id_index_is_written_and_survives_restart() {
     let rt = Runtime::with_kv(kv, in_memory_content());
     let (t, a, s) = rt.bootstrap_test_session().await;
     let r = rt
-        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 1}),
+        ))
         .await
         .unwrap();
     drop(rt);
@@ -207,8 +247,7 @@ async fn artifacts_survive_restart() {
 
     let (t, art) = {
         let kv = open_kv(&kv_path);
-        let content: Arc<dyn ContentBackend> =
-            Arc::new(LocalFsContentBackend::new(&content_root));
+        let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
         let rt = Runtime::with_kv(kv, content);
         let t = rt
             .create_tenant(NewTenant {
@@ -236,8 +275,7 @@ async fn artifacts_survive_restart() {
     // RocksDB requires the prior handle to be dropped before reopening
     // (single-writer lock); scoping the first runtime above released it.
     let kv2 = open_kv(&kv_path);
-    let content2: Arc<dyn ContentBackend> =
-        Arc::new(LocalFsContentBackend::new(&content_root));
+    let content2: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
     let rt2 = Runtime::with_kv(kv2, content2);
 
     let got = rt2
@@ -246,7 +284,10 @@ async fn artifacts_survive_restart() {
         .unwrap();
     assert_eq!(got.bytes, 5);
     assert_eq!(got.sha256, art.sha256);
-    assert_eq!(got.content_type.as_deref(), Some("application/octet-stream"));
+    assert_eq!(
+        got.content_type.as_deref(),
+        Some("application/octet-stream")
+    );
 
     let blob = rt2
         .get_artifact_blob(&t.tenant_id, &art.artifact_id)
