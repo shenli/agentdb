@@ -14,6 +14,11 @@ pub enum ErrorCode {
     ArtifactTooLarge,
     HashMismatch,
     IdempotencyConflict,
+    /// A tenant external_key, agent alias, or session alias collided with an
+    /// existing live record in the same scope. Distinct from
+    /// `IdempotencyConflict` (which is about retry semantics) — this is a
+    /// hard constraint failure on a fresh create.
+    AliasConflict,
     PolicyDenied,
     InvalidCursor,
     RateLimited,

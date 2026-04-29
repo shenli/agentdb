@@ -40,7 +40,7 @@ fn status_for(code: ErrorCode) -> StatusCode {
         EventTooLarge | ArtifactTooLarge | HashMismatch | PolicyDenied | InvalidCursor => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        IdempotencyConflict => StatusCode::CONFLICT,
+        IdempotencyConflict | AliasConflict => StatusCode::CONFLICT,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }

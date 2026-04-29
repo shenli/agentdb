@@ -86,6 +86,20 @@ struct State {
     /// in-memory backend; the KV backend reads events back from storage on
     /// demand instead of carrying a duplicate copy in memory.
     events: BTreeMap<(String, u64), EventEnvelope>,
+    /// Alias / external_key uniqueness maps. Each entry is the canonical
+    /// "is this alias claimed?" lookup; on `create_*` we check the map under
+    /// the state lock and reject collisions with `AliasConflict`.
+    ///
+    /// Tenant alias scope is global (external_key is a global identifier).
+    /// Agent and session alias scopes are tenant-local — encoded as
+    /// "{tenant_id}::{alias}" so we can use a flat BTreeMap.
+    tenant_aliases: BTreeMap<String, String>,
+    agent_aliases: BTreeMap<String, String>,
+    session_aliases: BTreeMap<String, String>,
+}
+
+fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
+    format!("{tenant_id}::{alias}")
 }
 
 pub struct Runtime {
@@ -135,6 +149,32 @@ impl Runtime {
                 }
             }
             state.sessions.insert(s.session_id.as_str().to_string(), s);
+        }
+        // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
+        // runtime keeps enforcing the same constraints. We scan the alias
+        // prefixes directly rather than walking the records; alias rows are
+        // the source of truth for "this name is taken".
+        for (external_key, tenant_id) in persist
+            .scan_all_tenant_aliases()
+            .expect("hydrate tenant aliases")
+        {
+            state.tenant_aliases.insert(external_key, tenant_id);
+        }
+        for ((tenant, alias), agent_id) in persist
+            .scan_all_agent_aliases()
+            .expect("hydrate agent aliases")
+        {
+            state
+                .agent_aliases
+                .insert(scoped_alias_key(&tenant, &alias), agent_id);
+        }
+        for ((tenant, alias), session_id) in persist
+            .scan_all_session_aliases()
+            .expect("hydrate session aliases")
+        {
+            state
+                .session_aliases
+                .insert(scoped_alias_key(&tenant, &alias), session_id);
         }
 
         let idem = IdempotencyStore::default();
@@ -187,11 +227,27 @@ impl Runtime {
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
-        let t = Tenant::create(req);
-        {
+        let t = {
             let mut s = self.state.lock().await;
+            // External keys are tenant-name slots; a duplicate is an
+            // unrecoverable client error (not a retry), so we surface it as
+            // AliasConflict rather than IdempotencyConflict.
+            if !req.external_key.is_empty()
+                && s.tenant_aliases.contains_key(&req.external_key)
+            {
+                return Err(Error::new(
+                    ErrorCode::AliasConflict,
+                    format!("tenant external_key already in use: {}", req.external_key),
+                ));
+            }
+            let t = Tenant::create(req);
             s.tenants.insert(t.tenant_id.as_str().to_string(), t.clone());
-        }
+            if !t.external_key.is_empty() {
+                s.tenant_aliases
+                    .insert(t.external_key.clone(), t.tenant_id.as_str().to_string());
+            }
+            t
+        };
         if let Some(p) = &self.persist {
             p.put_tenant(&t).map_err(internal)?;
         }
@@ -204,8 +260,29 @@ impl Runtime {
             if !s.tenants.contains_key(req.tenant_id.as_str()) {
                 return Err(Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
             }
+            // Agent alias is unique within (tenant, alias). Two tenants can
+            // both have an agent named "rep-1".
+            if let Some(alias) = req.alias.as_deref() {
+                if !alias.is_empty() {
+                    let key = scoped_alias_key(req.tenant_id.as_str(), alias);
+                    if s.agent_aliases.contains_key(&key) {
+                        return Err(Error::new(
+                            ErrorCode::AliasConflict,
+                            format!("agent alias already in use in tenant: {alias}"),
+                        ));
+                    }
+                }
+            }
             let a = Agent::create(req);
             s.agents.insert(a.agent_id.as_str().to_string(), a.clone());
+            if let Some(alias) = a.alias.as_deref() {
+                if !alias.is_empty() {
+                    s.agent_aliases.insert(
+                        scoped_alias_key(a.tenant_id.as_str(), alias),
+                        a.agent_id.as_str().to_string(),
+                    );
+                }
+            }
             a
         };
         if let Some(p) = &self.persist {
@@ -234,8 +311,28 @@ impl Runtime {
                     format!("{}", req.agent_id),
                 ));
             }
+            // Session alias is unique within (tenant, alias).
+            if let Some(alias) = req.alias.as_deref() {
+                if !alias.is_empty() {
+                    let key = scoped_alias_key(req.tenant_id.as_str(), alias);
+                    if s.session_aliases.contains_key(&key) {
+                        return Err(Error::new(
+                            ErrorCode::AliasConflict,
+                            format!("session alias already in use in tenant: {alias}"),
+                        ));
+                    }
+                }
+            }
             let sess = Session::create(req);
             s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
+            if let Some(alias) = sess.alias.as_deref() {
+                if !alias.is_empty() {
+                    s.session_aliases.insert(
+                        scoped_alias_key(sess.tenant_id.as_str(), alias),
+                        sess.session_id.as_str().to_string(),
+                    );
+                }
+            }
             sess
         };
         if let Some(p) = &self.persist {

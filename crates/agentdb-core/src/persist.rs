@@ -25,7 +25,8 @@
 use std::sync::Arc;
 
 use agentdb_storage::keys::{
-    agent_record_key, event_key, session_record_key, tenant_record_key,
+    agent_alias_key, agent_record_key, event_key, session_alias_key, session_record_key,
+    tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
 
@@ -45,23 +46,59 @@ impl Persist {
     }
 
     // ----- single-record writes -----
+    //
+    // Each `put_*` writes the primary record AND, if an alias / external_key
+    // is set, an alias index row in the same atomic batch. Hydration scans
+    // both prefixes (`record/{kind}/`, `record/{kind}_alias/`) at startup so
+    // the in-memory uniqueness map reflects on-disk state.
 
     pub fn put_tenant(&self, t: &Tenant) -> KvResult<()> {
-        let key = tenant_record_key(t.tenant_id.as_str());
-        let value = serde_json::to_vec(t).expect("tenant serializes");
-        self.kv.put(key.as_bytes(), &value)
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Put {
+            key: tenant_record_key(t.tenant_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(t).expect("tenant serializes"),
+        });
+        if !t.external_key.is_empty() {
+            ops.push(WriteOp::Put {
+                key: tenant_alias_key(&t.external_key).into_bytes(),
+                value: t.tenant_id.as_str().as_bytes().to_vec(),
+            });
+        }
+        self.kv.write_batch(ops)
     }
 
     pub fn put_agent(&self, a: &Agent) -> KvResult<()> {
-        let key = agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str());
-        let value = serde_json::to_vec(a).expect("agent serializes");
-        self.kv.put(key.as_bytes(), &value)
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Put {
+            key: agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(a).expect("agent serializes"),
+        });
+        if let Some(alias) = a.alias.as_deref() {
+            if !alias.is_empty() {
+                ops.push(WriteOp::Put {
+                    key: agent_alias_key(a.tenant_id.as_str(), alias).into_bytes(),
+                    value: a.agent_id.as_str().as_bytes().to_vec(),
+                });
+            }
+        }
+        self.kv.write_batch(ops)
     }
 
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
-        let key = session_record_key(s.tenant_id.as_str(), s.session_id.as_str());
-        let value = serde_json::to_vec(s).expect("session serializes");
-        self.kv.put(key.as_bytes(), &value)
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Put {
+            key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(s).expect("session serializes"),
+        });
+        if let Some(alias) = s.alias.as_deref() {
+            if !alias.is_empty() {
+                ops.push(WriteOp::Put {
+                    key: session_alias_key(s.tenant_id.as_str(), alias).into_bytes(),
+                    value: s.session_id.as_str().as_bytes().to_vec(),
+                });
+            }
+        }
+        self.kv.write_batch(ops)
     }
 
     /// Atomic multi-write for the append commit path. Bundles the event row,
@@ -181,6 +218,66 @@ impl Persist {
             let (_k, v) = res?;
             let s: Session = serde_json::from_slice(&v).expect("session decodes");
             out.push(s);
+        }
+        Ok(out)
+    }
+
+    /// Scan tenant alias rows, yielding `(external_key, tenant_id)` pairs.
+    /// Used at hydration to rebuild the in-memory uniqueness map.
+    pub fn scan_all_tenant_aliases(&self) -> KvResult<Vec<(String, String)>> {
+        let prefix = b"record/tenant_alias/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let external_key = std::str::from_utf8(&k[prefix.len()..])
+                .expect("tenant_alias key suffix is utf8")
+                .to_string();
+            let tenant_id = std::str::from_utf8(&v)
+                .expect("tenant_alias value is utf8")
+                .to_string();
+            out.push((external_key, tenant_id));
+        }
+        Ok(out)
+    }
+
+    /// Scan agent alias rows, yielding `((tenant_id, alias), agent_id)`.
+    pub fn scan_all_agent_aliases(&self) -> KvResult<Vec<((String, String), String)>> {
+        let prefix = b"record/agent_alias/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix = std::str::from_utf8(&k[prefix.len()..])
+                .expect("agent_alias key suffix is utf8");
+            // suffix shape: "{tenant_id}/{alias}"
+            let mut split = suffix.splitn(2, '/');
+            let tenant = split.next().expect("tenant_id segment").to_string();
+            let alias = split.next().expect("alias segment").to_string();
+            let agent_id = std::str::from_utf8(&v)
+                .expect("agent_alias value is utf8")
+                .to_string();
+            out.push(((tenant, alias), agent_id));
+        }
+        Ok(out)
+    }
+
+    /// Scan session alias rows, yielding `((tenant_id, alias), session_id)`.
+    pub fn scan_all_session_aliases(&self) -> KvResult<Vec<((String, String), String)>> {
+        let prefix = b"record/session_alias/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix = std::str::from_utf8(&k[prefix.len()..])
+                .expect("session_alias key suffix is utf8");
+            let mut split = suffix.splitn(2, '/');
+            let tenant = split.next().expect("tenant_id segment").to_string();
+            let alias = split.next().expect("alias segment").to_string();
+            let session_id = std::str::from_utf8(&v)
+                .expect("session_alias value is utf8")
+                .to_string();
+            out.push(((tenant, alias), session_id));
         }
         Ok(out)
     }
