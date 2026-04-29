@@ -14,6 +14,11 @@ pub enum ErrorCode {
     ArtifactTooLarge,
     HashMismatch,
     IdempotencyConflict,
+    /// A tenant external_key, agent alias, or session alias collided with an
+    /// existing live record in the same scope. Distinct from
+    /// `IdempotencyConflict` (which is about retry semantics) — this is a
+    /// hard constraint failure on a fresh create.
+    AliasConflict,
     PolicyDenied,
     InvalidCursor,
     RateLimited,
@@ -27,7 +32,7 @@ impl ErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct V2Error {
+pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
@@ -35,7 +40,9 @@ pub struct V2Error {
     pub suggestion: Option<String>,
 }
 
-impl V2Error {
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,

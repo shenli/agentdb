@@ -9,6 +9,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::event::{ArtifactRef, SourceRef};
+use crate::id::Id;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub payload_hash: u64,
@@ -40,12 +43,36 @@ impl IdempotencyStore {
     }
 }
 
-/// Hash a JSON payload for idempotency-conflict detection. Two requests with
-/// the same idempotency key but different payloads must produce different
-/// hashes; same payload must produce same hash.
-pub fn hash_payload(payload: &serde_json::Value) -> u64 {
+/// Hash the full append-request shape for idempotency-conflict detection.
+///
+/// We must include every field the caller can vary — not just `payload` —
+/// because a retry that changes `kind`, `artifact_refs`, `source_refs`, or
+/// the (tenant, agent, session) routing tuple is a *different* request that
+/// must surface as a conflict, not silently replay the original commit.
+///
+/// The implementation builds a canonical JSON object and hashes its string
+/// form. JSON object key order is fixed by the literal here, so identical
+/// inputs produce identical hashes.
+pub fn hash_request(
+    tenant_id: &Id,
+    agent_id: &Id,
+    session_id: &Id,
+    kind: &str,
+    payload: &serde_json::Value,
+    artifact_refs: &[ArtifactRef],
+    source_refs: &[SourceRef],
+) -> u64 {
     use std::hash::{Hash, Hasher};
+    let canon = serde_json::json!({
+        "tenant_id": tenant_id.as_str(),
+        "agent_id": agent_id.as_str(),
+        "session_id": session_id.as_str(),
+        "kind": kind,
+        "payload": payload,
+        "artifact_refs": artifact_refs,
+        "source_refs": source_refs,
+    });
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(payload).unwrap().hash(&mut h);
+    serde_json::to_string(&canon).unwrap().hash(&mut h);
     h.finish()
 }

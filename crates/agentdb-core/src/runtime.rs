@@ -19,15 +19,13 @@ use tokio::sync::Mutex;
 use agentdb_storage::KvStore;
 
 use crate::agent::{Agent, NewAgent};
-use crate::errors::{ErrorCode, V2Error};
+use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
-use crate::idempotency::{hash_payload, IdempotencyRecord, IdempotencyStore};
-use crate::persist::V2Persist;
+use crate::idempotency::{hash_request, IdempotencyRecord, IdempotencyStore};
+use crate::persist::Persist;
 use crate::session::{NewSession, Session};
 use crate::tenant::{NewTenant, Tenant};
-
-pub type V2Result<T> = Result<T, V2Error>;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -88,12 +86,26 @@ struct State {
     /// in-memory backend; the KV backend reads events back from storage on
     /// demand instead of carrying a duplicate copy in memory.
     events: BTreeMap<(String, u64), EventEnvelope>,
+    /// Alias / external_key uniqueness maps. Each entry is the canonical
+    /// "is this alias claimed?" lookup; on `create_*` we check the map under
+    /// the state lock and reject collisions with `AliasConflict`.
+    ///
+    /// Tenant alias scope is global (external_key is a global identifier).
+    /// Agent and session alias scopes are tenant-local — encoded as
+    /// "{tenant_id}::{alias}" so we can use a flat BTreeMap.
+    tenant_aliases: BTreeMap<String, String>,
+    agent_aliases: BTreeMap<String, String>,
+    session_aliases: BTreeMap<String, String>,
+}
+
+fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
+    format!("{tenant_id}::{alias}")
 }
 
 pub struct Runtime {
     state: Mutex<State>,
     idem: IdempotencyStore,
-    persist: Option<V2Persist>,
+    persist: Option<Persist>,
 }
 
 impl Runtime {
@@ -117,7 +129,7 @@ impl Runtime {
     /// post-restart correctness independent of backend-specific batch
     /// guarantees.
     pub fn with_kv(kv: Arc<dyn KvStore + Send + Sync>) -> Arc<Self> {
-        let persist = V2Persist::new(kv);
+        let persist = Persist::new(kv);
 
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {
@@ -138,6 +150,32 @@ impl Runtime {
             }
             state.sessions.insert(s.session_id.as_str().to_string(), s);
         }
+        // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
+        // runtime keeps enforcing the same constraints. We scan the alias
+        // prefixes directly rather than walking the records; alias rows are
+        // the source of truth for "this name is taken".
+        for (external_key, tenant_id) in persist
+            .scan_all_tenant_aliases()
+            .expect("hydrate tenant aliases")
+        {
+            state.tenant_aliases.insert(external_key, tenant_id);
+        }
+        for ((tenant, alias), agent_id) in persist
+            .scan_all_agent_aliases()
+            .expect("hydrate agent aliases")
+        {
+            state
+                .agent_aliases
+                .insert(scoped_alias_key(&tenant, &alias), agent_id);
+        }
+        for ((tenant, alias), session_id) in persist
+            .scan_all_session_aliases()
+            .expect("hydrate session aliases")
+        {
+            state
+                .session_aliases
+                .insert(scoped_alias_key(&tenant, &alias), session_id);
+        }
 
         let idem = IdempotencyStore::default();
         idem.extend(
@@ -155,29 +193,29 @@ impl Runtime {
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
      /// match a live (non-soft-deleted) tenant.
-    pub async fn get_tenant(&self, tenant_id: &Id) -> V2Result<Tenant> {
+    pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
         let s = self.state.lock().await;
         s.tenants
             .get(tenant_id.as_str())
             .filter(|t| t.deleted_at_ms.is_none())
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
+            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
     }
 
     /// Look up an agent by id, scoped to the given tenant. Returns
     /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
-    pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> V2Result<Agent> {
+    pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<Agent> {
         let s = self.state.lock().await;
         s.agents
             .get(agent_id.as_str())
             .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+            .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
     }
 
     /// Look up a session by id, scoped to the given tenant. Returns
     /// `SessionNotFound` if the id is unknown or belongs to a different tenant.
-    pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> V2Result<Session> {
+    pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> Result<Session> {
         let s = self.state.lock().await;
         s.sessions
             .get(session_id.as_str())
@@ -185,29 +223,66 @@ impl Runtime {
                 sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
             })
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
     }
 
-    pub async fn create_tenant(&self, req: NewTenant) -> V2Result<Tenant> {
-        let t = Tenant::create(req);
-        {
+    pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
+        let t = {
             let mut s = self.state.lock().await;
+            // External keys are tenant-name slots; a duplicate is an
+            // unrecoverable client error (not a retry), so we surface it as
+            // AliasConflict rather than IdempotencyConflict.
+            if !req.external_key.is_empty()
+                && s.tenant_aliases.contains_key(&req.external_key)
+            {
+                return Err(Error::new(
+                    ErrorCode::AliasConflict,
+                    format!("tenant external_key already in use: {}", req.external_key),
+                ));
+            }
+            let t = Tenant::create(req);
             s.tenants.insert(t.tenant_id.as_str().to_string(), t.clone());
-        }
+            if !t.external_key.is_empty() {
+                s.tenant_aliases
+                    .insert(t.external_key.clone(), t.tenant_id.as_str().to_string());
+            }
+            t
+        };
         if let Some(p) = &self.persist {
             p.put_tenant(&t).map_err(internal)?;
         }
         Ok(t)
     }
 
-    pub async fn create_agent(&self, req: NewAgent) -> V2Result<Agent> {
+    pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
         let a = {
             let mut s = self.state.lock().await;
             if !s.tenants.contains_key(req.tenant_id.as_str()) {
-                return Err(V2Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+                return Err(Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+            }
+            // Agent alias is unique within (tenant, alias). Two tenants can
+            // both have an agent named "rep-1".
+            if let Some(alias) = req.alias.as_deref() {
+                if !alias.is_empty() {
+                    let key = scoped_alias_key(req.tenant_id.as_str(), alias);
+                    if s.agent_aliases.contains_key(&key) {
+                        return Err(Error::new(
+                            ErrorCode::AliasConflict,
+                            format!("agent alias already in use in tenant: {alias}"),
+                        ));
+                    }
+                }
             }
             let a = Agent::create(req);
             s.agents.insert(a.agent_id.as_str().to_string(), a.clone());
+            if let Some(alias) = a.alias.as_deref() {
+                if !alias.is_empty() {
+                    s.agent_aliases.insert(
+                        scoped_alias_key(a.tenant_id.as_str(), alias),
+                        a.agent_id.as_str().to_string(),
+                    );
+                }
+            }
             a
         };
         if let Some(p) = &self.persist {
@@ -216,16 +291,48 @@ impl Runtime {
         Ok(a)
     }
 
-    pub async fn create_session(&self, req: NewSession) -> V2Result<Session> {
+    pub async fn create_session(&self, req: NewSession) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
-            if !s.agents.contains_key(req.agent_id.as_str()) {
-                return Err(V2Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
+            // Verify the agent exists AND belongs to the requesting tenant. We
+            // collapse "agent unknown" and "agent belongs to another tenant"
+            // into the same `AgentNotFound` response so a caller in tenant A
+            // can't probe tenant B's agent ids by error-code differential.
+            let agent = s
+                .agents
+                .get(req.agent_id.as_str())
+                .filter(|a| a.deleted_at_ms.is_none())
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id))
+                })?;
+            if agent.tenant_id.as_str() != req.tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::AgentNotFound,
+                    format!("{}", req.agent_id),
+                ));
             }
-            // Tenant existence is implicit via agent ownership for V2.0; cross-check
-            // is added in V2.4 when policy attachment validates the relationship.
+            // Session alias is unique within (tenant, alias).
+            if let Some(alias) = req.alias.as_deref() {
+                if !alias.is_empty() {
+                    let key = scoped_alias_key(req.tenant_id.as_str(), alias);
+                    if s.session_aliases.contains_key(&key) {
+                        return Err(Error::new(
+                            ErrorCode::AliasConflict,
+                            format!("session alias already in use in tenant: {alias}"),
+                        ));
+                    }
+                }
+            }
             let sess = Session::create(req);
             s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
+            if let Some(alias) = sess.alias.as_deref() {
+                if !alias.is_empty() {
+                    s.session_aliases.insert(
+                        scoped_alias_key(sess.tenant_id.as_str(), alias),
+                        sess.session_id.as_str().to_string(),
+                    );
+                }
+            }
             sess
         };
         if let Some(p) = &self.persist {
@@ -253,7 +360,7 @@ impl Runtime {
         (t, a, s)
     }
 
-    pub async fn append(&self, req: AppendRequest) -> V2Result<AppendResponse> {
+    pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
         let idem_full_key = req.idempotency_key.as_ref().map(|k| {
@@ -264,7 +371,7 @@ impl Runtime {
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
-                return verify_idem_replay(&rec, &req.payload);
+                return verify_idem_replay(&rec, &req);
             }
         }
 
@@ -276,14 +383,34 @@ impl Runtime {
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
                 drop(s);
-                return verify_idem_replay(&rec, &req.payload);
+                return verify_idem_replay(&rec, &req);
             }
         }
 
         let (seq, policy_version, session_snapshot) = {
             let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
-                V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+                Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
+            // Tenant isolation: a session id from tenant B is "not found" from
+            // tenant A's perspective, otherwise an attacker who learns a
+            // cross-tenant session id could append events into another
+            // tenant's session (and worse: those events would persist under
+            // the attacker's tenant key prefix, splitting the session).
+            if session.tenant_id.as_str() != req.tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", req.session_id),
+                ));
+            }
+            // Agent must match the session's recorded agent. We surface this
+            // as `AgentNotFound` (more precise than reusing SessionNotFound)
+            // so callers get an actionable error.
+            if session.agent_id.as_str() != req.agent_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::AgentNotFound,
+                    format!("{}", req.agent_id),
+                ));
+            }
             let seq = session.next_seq;
             let pv = session.policy_version;
             session.next_seq += 1;
@@ -308,9 +435,20 @@ impl Runtime {
         let resp = AppendResponse { event_id, seq };
 
         // Build the idempotency record up-front so both the in-memory and KV
-        // commit paths can use it.
+        // commit paths can use it. The hash covers the entire request shape
+        // (not just payload) so that a retry under the same idempotency key
+        // with a different `kind`, agent, session, or refs is detected as a
+        // conflict rather than silently replaying the original result.
         let idem_record = idem_full_key.as_ref().map(|_| IdempotencyRecord {
-            payload_hash: hash_payload(&req.payload),
+            payload_hash: hash_request(
+                &req.tenant_id,
+                &req.agent_id,
+                &req.session_id,
+                &req.kind,
+                &req.payload,
+                &req.artifact_refs,
+                &req.source_refs,
+            ),
             result_json: serde_json::to_string(&resp).unwrap(),
         });
 
@@ -369,7 +507,7 @@ impl Runtime {
         req: AppendRequest,
         last: usize,
         _max_bytes: usize,
-    ) -> V2Result<AppendAndFetchResponse> {
+    ) -> Result<AppendAndFetchResponse> {
         // TODO(V2.4): enforce max_bytes
         let tenant_id = req.tenant_id.clone();
         let session_id = req.session_id.clone();
@@ -413,20 +551,43 @@ impl Runtime {
         })
     }
 
+    /// Resolve an `event_id` to its `(session_id, seq)` location via the
+    /// persisted `event_by_id` secondary index.
+    ///
+    /// In-memory runtime returns `Ok(None)` because the index isn't tracked
+    /// in memory; callers that need event-by-id resolution must use a
+    /// KV-backed Runtime. This is acceptable for V2.0; revisit if/when the
+    /// in-memory mode grows beyond test scaffolding.
+    pub async fn lookup_event_by_id(
+        &self,
+        tenant_id: &Id,
+        event_id: &Id,
+    ) -> Result<Option<(Id, u64)>> {
+        let Some(p) = &self.persist else {
+            return Ok(None);
+        };
+        let raw = p
+            .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
+            .map_err(internal)?;
+        let Some((sid, seq)) = raw else { return Ok(None) };
+        let session_id = Id::parse(&sid).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        Ok(Some((session_id, seq)))
+    }
+
     /// Return events from `from_seq` (inclusive) up to `limit` count, in
     /// ascending seq order. Returns `SessionNotFound` if the session does not
     /// exist. Returns an empty vec if `from_seq` is past the session's last
     /// committed seq.
-    pub async fn fetch_from_seq(&self, req: FetchRequest) -> V2Result<Vec<EventEnvelope>> {
+    pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         let s = self.state.lock().await;
         let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
-            V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+            Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
         })?;
         // tenant_id on FetchRequest finally becomes load-bearing for the KV
         // backend's tenant-scoped key encoding. Refuse mismatches outright so
         // callers can't sidestep tenancy by passing the wrong tenant.
         if session.tenant_id.as_str() != req.tenant_id.as_str() {
-            return Err(V2Error::new(
+            return Err(Error::new(
                 ErrorCode::SessionNotFound,
                 format!("{}", req.session_id),
             ));
@@ -450,17 +611,26 @@ impl Runtime {
     }
 }
 
-/// Verify a stored idempotency record matches the incoming payload and replay
-/// the original response, or surface a conflict if the payload differs.
+/// Verify a stored idempotency record matches the incoming request and replay
+/// the original response, or surface a conflict if any field that affects
+/// the commit differs.
 fn verify_idem_replay(
     rec: &IdempotencyRecord,
-    payload: &serde_json::Value,
-) -> V2Result<AppendResponse> {
-    let h = hash_payload(payload);
+    req: &AppendRequest,
+) -> Result<AppendResponse> {
+    let h = hash_request(
+        &req.tenant_id,
+        &req.agent_id,
+        &req.session_id,
+        &req.kind,
+        &req.payload,
+        &req.artifact_refs,
+        &req.source_refs,
+    );
     if rec.payload_hash != h {
-        return Err(V2Error::new(
+        return Err(Error::new(
             ErrorCode::IdempotencyConflict,
-            "payload differs for the same idempotency key",
+            "request differs for the same idempotency key",
         ));
     }
     let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
@@ -469,7 +639,7 @@ fn verify_idem_replay(
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the
-/// V2Error code surface stable.
-fn internal(e: agentdb_storage::Error) -> V2Error {
-    V2Error::new(ErrorCode::Internal, e.to_string())
+/// Error code surface stable.
+fn internal(e: agentdb_storage::Error) -> Error {
+    Error::new(ErrorCode::Internal, e.to_string())
 }

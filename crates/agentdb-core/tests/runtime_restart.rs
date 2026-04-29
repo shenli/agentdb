@@ -161,6 +161,31 @@ async fn append_and_fetch_uses_kv_recent() {
 }
 
 #[tokio::test]
+async fn event_by_id_index_is_written_and_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv);
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let r = rt
+        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
+        .await
+        .unwrap();
+    drop(rt);
+
+    // Reopen — the event_by_id row must still resolve to (session_id, seq).
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2);
+    let lookup = rt2
+        .lookup_event_by_id(&t.tenant_id, &r.event_id)
+        .await
+        .unwrap();
+    assert!(lookup.is_some(), "event_by_id row missing after restart");
+    let (sid, seq) = lookup.unwrap();
+    assert_eq!(sid.as_str(), s.session_id.as_str());
+    assert_eq!(seq, 0);
+}
+
+#[tokio::test]
 async fn fetch_with_wrong_tenant_id_fails() {
     use agentdb_core::errors::ErrorCode;
     use agentdb_core::id::{Id, IdKind};

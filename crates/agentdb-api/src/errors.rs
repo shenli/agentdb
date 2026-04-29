@@ -1,8 +1,8 @@
-//! HTTP error mapping for the runtime's `V2Error`.
+//! HTTP error mapping for the runtime's `Error`.
 //!
-//! Routes return `Result<T, ApiError>`; `ApiError` wraps a `V2Error` and
-//! implements `IntoResponse` so the framework can serialize the wire body and
-//! pick the right status code without each handler repeating the mapping.
+//! Routes return `Result<T, ApiError>`; `ApiError` wraps an `agentdb_core::Error`
+//! and implements `IntoResponse` so the framework can serialize the wire body
+//! and pick the right status code without each handler repeating the mapping.
 
 use axum::{
     http::StatusCode,
@@ -10,17 +10,17 @@ use axum::{
     Json,
 };
 
-use agentdb_core::{ErrorCode, V2Error};
+use agentdb_core::{Error, ErrorCode};
 
-/// Wrapper that lets axum convert a `V2Error` into an HTTP response.
+/// Wrapper that lets axum convert an `agentdb_core::Error` into an HTTP response.
 ///
-/// The body is the V2Error JSON serialization (already includes `code`,
+/// The body is the Error JSON serialization (already includes `code`,
 /// `message`, `retryable`, optional `suggestion`). The status code is chosen
 /// from the `code` per the V2.0 contract.
-pub struct ApiError(pub V2Error);
+pub struct ApiError(pub Error);
 
-impl From<V2Error> for ApiError {
-    fn from(e: V2Error) -> Self {
+impl From<Error> for ApiError {
+    fn from(e: Error) -> Self {
         ApiError(e)
     }
 }
@@ -40,7 +40,7 @@ fn status_for(code: ErrorCode) -> StatusCode {
         EventTooLarge | ArtifactTooLarge | HashMismatch | PolicyDenied | InvalidCursor => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        IdempotencyConflict => StatusCode::CONFLICT,
+        IdempotencyConflict | AliasConflict => StatusCode::CONFLICT,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -56,5 +56,5 @@ pub fn parse_id_or(
     not_found_code: ErrorCode,
 ) -> Result<agentdb_core::Id, ApiError> {
     agentdb_core::Id::parse_kind(s, kind)
-        .map_err(|e| ApiError(V2Error::new(not_found_code, e.to_string())))
+        .map_err(|e| ApiError(Error::new(not_found_code, e.to_string())))
 }

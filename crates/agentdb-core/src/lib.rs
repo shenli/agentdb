@@ -11,7 +11,7 @@
 //!   layer.
 //! - [`Id`] — typed-prefix UUIDv7 identifier shared across all
 //!   resources.
-//! - [`V2Error`] / [`ErrorCode`] — structured runtime errors.
+//! - [`Error`] / [`ErrorCode`] — structured runtime errors.
 
 /// Schema/API version, ISO date — opaque, do not parse.
 pub const VERSION: &str = "2026-04-28";
@@ -27,7 +27,7 @@ pub mod session;
 pub mod tenant;
 
 pub use agent::{Agent, NewAgent};
-pub use errors::{ErrorCode, V2Error};
+pub use errors::{Error, ErrorCode};
 pub use event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 pub use id::{Id, IdKind};
 pub use idempotency::{IdempotencyRecord, IdempotencyStore};
