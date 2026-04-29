@@ -29,8 +29,7 @@ fn id_deserialization_validates_prefix() {
     // that's acceptable for V2.0. This test asserts the looser contract:
     // malformed IDs (missing prefix separator / unknown prefix / bad uuid body)
     // ARE rejected by Id::parse.
-    let _ok = serde_json::from_str::<Tenant>(bad_json).expect("any valid Id kind deserializes");
-    let _ = _ok; // unused; the assertion below is the real check
+    serde_json::from_str::<Tenant>(bad_json).expect("any valid Id kind deserializes");
     let malformed_json = r#"{"tenant_id":"not-an-id","external_key":"z","policy":{},"created_at_ms":0,"deleted_at_ms":null}"#;
     let err = serde_json::from_str::<Tenant>(malformed_json).unwrap_err();
     let msg = format!("{err}");
