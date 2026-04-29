@@ -39,6 +39,7 @@ pub mod slow_query;
 pub mod tenant_quota;
 pub mod tiering;
 pub mod types;
+pub mod v2;
 
 pub use admission::{AdmissionDenied, Scope, TokenBucket};
 pub use backup::{
