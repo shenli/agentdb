@@ -216,3 +216,58 @@ async fn append_rejects_unknown_session() {
     let err = rt.append(req).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::SessionNotFound);
 }
+
+#[tokio::test]
+async fn lookup_event_by_id_works_in_memory() {
+    // Symmetry with the KV-backed path: in-memory `event_by_id` must
+    // resolve to (session_id, seq) after an append. Previously this
+    // returned `Ok(None)` because the in-memory backend didn't track
+    // the secondary index.
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let r = rt
+        .append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 1})))
+        .await
+        .unwrap();
+
+    let lookup = rt
+        .lookup_event_by_id(&t.tenant_id, &r.event_id)
+        .await
+        .unwrap();
+    assert!(
+        lookup.is_some(),
+        "in-memory event_by_id lookup should resolve after append"
+    );
+    let (sid, seq) = lookup.unwrap();
+    assert_eq!(sid.as_str(), s.session_id.as_str());
+    assert_eq!(seq, 0);
+}
+
+#[tokio::test]
+async fn lookup_event_by_id_rejects_cross_tenant_in_memory() {
+    // Tenant scope: an event_id owned by tenant t1 must NOT resolve
+    // when looked up under tenant t2. Returning `Some` would leak the
+    // existence of cross-tenant events to a probing caller.
+    let rt = Runtime::in_memory();
+    let (t1, a, s) = rt.bootstrap_test_session().await;
+    let r = rt
+        .append(AppendRequest::simple(&t1, &a, &s, "x", serde_json::json!({})))
+        .await
+        .unwrap();
+    let t2 = rt
+        .create_tenant(NewTenant {
+            external_key: "t2".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    let lookup = rt
+        .lookup_event_by_id(&t2.tenant_id, &r.event_id)
+        .await
+        .unwrap();
+    assert!(
+        lookup.is_none(),
+        "cross-tenant lookup must be None to avoid existence leak"
+    );
+}

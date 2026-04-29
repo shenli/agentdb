@@ -86,6 +86,12 @@ struct State {
     /// in-memory backend; the KV backend reads events back from storage on
     /// demand instead of carrying a duplicate copy in memory.
     events: BTreeMap<(String, u64), EventEnvelope>,
+    /// Maps `event_id -> (session_id_str, seq)` for in-memory `event_by_id`
+    /// lookup. Only populated in the in-memory backend (the KV backend
+    /// resolves through the `event_by_id` secondary index in storage).
+    /// Reset on every restart, which is fine — the in-memory backend
+    /// doesn't persist anyway.
+    event_by_id: BTreeMap<String, (String, u64)>,
     /// Alias / external_key uniqueness maps. Each entry is the canonical
     /// "is this alias claimed?" lookup; on `create_*` we check the map under
     /// the state lock and reject collisions with `AliasConflict`.
@@ -475,8 +481,16 @@ impl Runtime {
                 return Err(internal(e));
             }
         } else {
-            // In-memory backend: keep the events map populated.
+            // In-memory backend: keep the events map populated, and
+            // mirror the `event_by_id` secondary-index entry that the
+            // KV backend writes via `append_batch`. Without this the
+            // in-memory `lookup_event_by_id` would always return None,
+            // which is asymmetric with the KV path.
             let key = (req.session_id.as_str().to_string(), seq);
+            s.event_by_id.insert(
+                envelope.event_id.as_str().to_string(),
+                (envelope.session_id.as_str().to_string(), envelope.seq),
+            );
             s.events.insert(key, envelope);
         }
 
@@ -551,27 +565,49 @@ impl Runtime {
         })
     }
 
-    /// Resolve an `event_id` to its `(session_id, seq)` location via the
-    /// persisted `event_by_id` secondary index.
+    /// Resolve an `event_id` to its `(session_id, seq)` location.
     ///
-    /// In-memory runtime returns `Ok(None)` because the index isn't tracked
-    /// in memory; callers that need event-by-id resolution must use a
-    /// KV-backed Runtime. This is acceptable for V2.0; revisit if/when the
-    /// in-memory mode grows beyond test scaffolding.
+    /// KV-backed runtime resolves through the persisted `event_by_id`
+    /// secondary index. In-memory runtime resolves through an in-process
+    /// map populated on `append`; the map is reset on every restart, which
+    /// is fine — the in-memory backend doesn't persist anyway.
+    ///
+    /// In both branches the lookup is tenant-scoped: an event_id created
+    /// under tenant A is `None` to a caller passing tenant B, so a probe
+    /// for cross-tenant event ids cannot leak existence.
     pub async fn lookup_event_by_id(
         &self,
         tenant_id: &Id,
         event_id: &Id,
     ) -> Result<Option<(Id, u64)>> {
-        let Some(p) = &self.persist else {
+        if let Some(p) = &self.persist {
+            // KV-backed: persist is the single source of truth. The
+            // KV `event_by_id` key is itself tenant-scoped, so a
+            // mismatched tenant simply won't find the row.
+            let raw = p
+                .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
+                .map_err(internal)?;
+            let Some((sid, seq)) = raw else { return Ok(None) };
+            let session_id = Id::parse(&sid)
+                .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+            return Ok(Some((session_id, seq)));
+        }
+
+        // In-memory backend: walk the event into its session, confirm
+        // the session belongs to the requesting tenant.
+        let s = self.state.lock().await;
+        let Some((sid_str, seq)) = s.event_by_id.get(event_id.as_str()) else {
             return Ok(None);
         };
-        let raw = p
-            .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
-            .map_err(internal)?;
-        let Some((sid, seq)) = raw else { return Ok(None) };
-        let session_id = Id::parse(&sid).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
-        Ok(Some((session_id, seq)))
+        let Some(sess) = s.sessions.get(sid_str.as_str()) else {
+            // Session was deleted out from under the event_by_id
+            // entry; treat as not-found rather than leak the orphan.
+            return Ok(None);
+        };
+        if sess.tenant_id.as_str() != tenant_id.as_str() {
+            return Ok(None);
+        }
+        Ok(Some((sess.session_id.clone(), *seq)))
     }
 
     /// Return events from `from_seq` (inclusive) up to `limit` count, in
