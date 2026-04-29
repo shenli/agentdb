@@ -22,7 +22,7 @@ use crate::agent::{Agent, NewAgent};
 use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
-use crate::idempotency::{hash_payload, IdempotencyRecord, IdempotencyStore};
+use crate::idempotency::{hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
 use crate::session::{NewSession, Session};
 use crate::tenant::{NewTenant, Tenant};
@@ -274,7 +274,7 @@ impl Runtime {
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
-                return verify_idem_replay(&rec, &req.payload);
+                return verify_idem_replay(&rec, &req);
             }
         }
 
@@ -286,7 +286,7 @@ impl Runtime {
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
                 drop(s);
-                return verify_idem_replay(&rec, &req.payload);
+                return verify_idem_replay(&rec, &req);
             }
         }
 
@@ -338,9 +338,20 @@ impl Runtime {
         let resp = AppendResponse { event_id, seq };
 
         // Build the idempotency record up-front so both the in-memory and KV
-        // commit paths can use it.
+        // commit paths can use it. The hash covers the entire request shape
+        // (not just payload) so that a retry under the same idempotency key
+        // with a different `kind`, agent, session, or refs is detected as a
+        // conflict rather than silently replaying the original result.
         let idem_record = idem_full_key.as_ref().map(|_| IdempotencyRecord {
-            payload_hash: hash_payload(&req.payload),
+            payload_hash: hash_request(
+                &req.tenant_id,
+                &req.agent_id,
+                &req.session_id,
+                &req.kind,
+                &req.payload,
+                &req.artifact_refs,
+                &req.source_refs,
+            ),
             result_json: serde_json::to_string(&resp).unwrap(),
         });
 
@@ -480,17 +491,26 @@ impl Runtime {
     }
 }
 
-/// Verify a stored idempotency record matches the incoming payload and replay
-/// the original response, or surface a conflict if the payload differs.
+/// Verify a stored idempotency record matches the incoming request and replay
+/// the original response, or surface a conflict if any field that affects
+/// the commit differs.
 fn verify_idem_replay(
     rec: &IdempotencyRecord,
-    payload: &serde_json::Value,
+    req: &AppendRequest,
 ) -> Result<AppendResponse> {
-    let h = hash_payload(payload);
+    let h = hash_request(
+        &req.tenant_id,
+        &req.agent_id,
+        &req.session_id,
+        &req.kind,
+        &req.payload,
+        &req.artifact_refs,
+        &req.source_refs,
+    );
     if rec.payload_hash != h {
         return Err(Error::new(
             ErrorCode::IdempotencyConflict,
-            "payload differs for the same idempotency key",
+            "request differs for the same idempotency key",
         ));
     }
     let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();

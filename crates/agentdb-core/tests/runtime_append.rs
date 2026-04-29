@@ -161,6 +161,43 @@ async fn concurrent_idempotent_appends_resolve_consistently() {
 }
 
 #[tokio::test]
+async fn idempotent_conflict_on_kind_change() {
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let mut r1 = AppendRequest::simple(&t, &a, &s, "kind_a", serde_json::json!({}));
+    r1.idempotency_key = Some("k1".into());
+    rt.append(r1).await.unwrap();
+
+    let mut r2 = AppendRequest::simple(&t, &a, &s, "kind_b", serde_json::json!({}));
+    r2.idempotency_key = Some("k1".into());
+    let err = rt.append(r2).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
+async fn idempotent_conflict_on_artifact_refs_change() {
+    use agentdb_core::event::ArtifactRef;
+    use agentdb_core::id::{Id, IdKind};
+
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let mut r1 = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({}));
+    r1.idempotency_key = Some("k1".into());
+    rt.append(r1).await.unwrap();
+
+    let mut r2 = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({}));
+    r2.artifact_refs = vec![ArtifactRef {
+        artifact_id: Id::new(IdKind::Artifact),
+        content_type: None,
+        bytes: None,
+        sha256: None,
+    }];
+    r2.idempotency_key = Some("k1".into());
+    let err = rt.append(r2).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();
