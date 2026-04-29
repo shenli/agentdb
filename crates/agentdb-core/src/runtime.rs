@@ -16,9 +16,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use agentdb_storage::content::{ContentBackend, InMemoryContentBackend};
 use agentdb_storage::KvStore;
 
 use crate::agent::{Agent, NewAgent};
+use crate::artifact::{Artifact, NewArtifact};
 use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
@@ -26,6 +28,11 @@ use crate::idempotency::{hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
 use crate::session::{NewSession, Session};
 use crate::tenant::{NewTenant, Tenant};
+
+/// V2.1 hardcoded artifact size cap. Picked to fit comfortably in memory
+/// since the content backend reads/writes the whole blob in one shot.
+/// TODO(V2.4): drive this from the tenant policy instead.
+const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -82,6 +89,9 @@ struct State {
     tenants: BTreeMap<String, Tenant>,
     agents: BTreeMap<String, Agent>,
     sessions: BTreeMap<String, Session>,
+    /// Keyed by artifact_id_str. Hydrated at startup from
+    /// `Persist::scan_all_artifacts`; updated on every `create_artifact`.
+    artifacts: BTreeMap<String, Artifact>,
     /// Keyed by (session_id, seq) for ordered scan. Only populated in the
     /// in-memory backend; the KV backend reads events back from storage on
     /// demand instead of carrying a duplicate copy in memory.
@@ -112,6 +122,7 @@ pub struct Runtime {
     state: Mutex<State>,
     idem: IdempotencyStore,
     persist: Option<Persist>,
+    content: Arc<dyn ContentBackend>,
 }
 
 impl Runtime {
@@ -120,12 +131,14 @@ impl Runtime {
             state: Mutex::new(State::default()),
             idem: IdempotencyStore::default(),
             persist: None,
+            content: Arc::new(InMemoryContentBackend::default()),
         })
     }
 
-    /// Build a Runtime backed by `kv`. Hydrates tenants, agents, sessions, and
-    /// idempotency records from storage at startup; events are NOT preloaded
-    /// and are read on demand via `fetch_from_seq`.
+    /// Build a Runtime backed by `kv` for metadata and `content` for artifact
+    /// bytes. Hydrates tenants, agents, sessions, artifacts, and idempotency
+    /// records from storage at startup; events are NOT preloaded and are read
+    /// on demand via `fetch_from_seq`.
     ///
     /// Reconciliation: for every hydrated session, the highest persisted event
     /// seq is checked and `next_seq` is bumped past it if needed. This is a
@@ -134,7 +147,13 @@ impl Runtime {
     /// the RocksDB backend honors atomically) but is cheap to do and makes
     /// post-restart correctness independent of backend-specific batch
     /// guarantees.
-    pub fn with_kv(kv: Arc<dyn KvStore + Send + Sync>) -> Arc<Self> {
+    ///
+    /// Artifact metadata is hydrated; the bytes themselves stay in `content`
+    /// and are read on demand via `get_artifact_blob`.
+    pub fn with_kv(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+    ) -> Arc<Self> {
         let persist = Persist::new(kv);
 
         let mut state = State::default();
@@ -155,6 +174,11 @@ impl Runtime {
                 }
             }
             state.sessions.insert(s.session_id.as_str().to_string(), s);
+        }
+        for art in persist.scan_all_artifacts().expect("hydrate artifacts") {
+            state
+                .artifacts
+                .insert(art.artifact_id.as_str().to_string(), art);
         }
         // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
         // runtime keeps enforcing the same constraints. We scan the alias
@@ -194,6 +218,7 @@ impl Runtime {
             state: Mutex::new(state),
             idem,
             persist: Some(persist),
+            content,
         })
     }
 
@@ -345,6 +370,151 @@ impl Runtime {
             p.put_session(&sess).map_err(internal)?;
         }
         Ok(sess)
+    }
+
+    /// Create an artifact: write the bytes to the content backend, persist
+    /// the metadata, return the metadata record. Tenant must exist.
+    ///
+    /// On success the bytes are durable (or in-memory equivalent) and the
+    /// metadata is committed atomically with the secondary `by_sha256` index.
+    ///
+    /// Atomicity caveat: the content write and the metadata write are
+    /// **separate** persistence steps. If the metadata write fails after the
+    /// content write succeeds we have an orphan blob; V2.4 GC will reap it
+    /// (TODO: link the reaper plan once it lands). This task accepts the
+    /// orphan window in exchange for a simpler V2.1 surface.
+    pub async fn create_artifact(
+        &self,
+        req: NewArtifact,
+        bytes: Vec<u8>,
+    ) -> Result<Artifact> {
+        // Reject oversized blobs before touching the content backend so a
+        // misbehaving caller can't fill disk by streaming a huge body.
+        let len = bytes.len() as u64;
+        if len > MAX_ARTIFACT_BYTES {
+            return Err(Error::new(
+                ErrorCode::ArtifactTooLarge,
+                format!("artifact body {len} bytes exceeds cap {MAX_ARTIFACT_BYTES}"),
+            ));
+        }
+
+        // Validate tenant exists. We hold the lock only long enough to look
+        // up the tenant; the content I/O happens after we drop it.
+        {
+            let s = self.state.lock().await;
+            if !s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none())
+            {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+        }
+
+        // Mint the id BEFORE the put so the content backend path is stable
+        // regardless of how long the put takes.
+        let artifact_id = Id::new(crate::id::IdKind::Artifact);
+        let put = self
+            .content
+            .put(req.tenant_id.as_str(), artifact_id.as_str(), &bytes)
+            .await
+            .map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("content put failed: {e}"))
+            })?;
+
+        // Verify caller-provided sha256 against the digest the backend
+        // computed while writing. On mismatch we best-effort delete the
+        // freshly-written blob to avoid orphaning it; ignore the delete
+        // error since the caller is already getting an error and the GC
+        // reaper will clean up later.
+        if let Some(expected) = req.expected_sha256.as_deref() {
+            if !expected.eq_ignore_ascii_case(&put.sha256_hex) {
+                let _ = self
+                    .content
+                    .delete(req.tenant_id.as_str(), artifact_id.as_str())
+                    .await;
+                return Err(Error::new(
+                    ErrorCode::HashMismatch,
+                    format!(
+                        "expected sha256 {expected} but content hashed to {}",
+                        put.sha256_hex
+                    ),
+                ));
+            }
+        }
+
+        // Build the record with the freshly-minted id rather than relying on
+        // Artifact::from_put to mint one (it would mint a different id from
+        // the one we already used to write the blob).
+        let artifact = Artifact {
+            artifact_id: artifact_id.clone(),
+            tenant_id: req.tenant_id,
+            content_type: req.content_type,
+            bytes: put.bytes,
+            sha256: put.sha256_hex,
+            created_at_ms: crate::now_ms(),
+            deleted_at_ms: None,
+            raw_purged_at_ms: None,
+        };
+
+        // Persist metadata, then update the in-memory cache. If persist
+        // fails the bytes are an orphan (see atomicity caveat above).
+        if let Some(p) = &self.persist {
+            p.put_artifact(&artifact).map_err(internal)?;
+        }
+        let mut s = self.state.lock().await;
+        s.artifacts
+            .insert(artifact.artifact_id.as_str().to_string(), artifact.clone());
+        Ok(artifact)
+    }
+
+    /// Look up artifact metadata, scoped to `tenant_id`. Returns
+    /// `ArtifactNotFound` if the id is unknown, soft-deleted, or owned by a
+    /// different tenant — we collapse those cases (mirroring the
+    /// agent/session lookups) so the caller in tenant A cannot probe
+    /// tenant B's artifact ids by error-code differential.
+    pub async fn get_artifact(
+        &self,
+        tenant_id: &Id,
+        artifact_id: &Id,
+    ) -> Result<Artifact> {
+        let s = self.state.lock().await;
+        s.artifacts
+            .get(artifact_id.as_str())
+            .filter(|a| {
+                a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::ArtifactNotFound, format!("{}", artifact_id)))
+    }
+
+    /// Read the bytes for an artifact. Same scoping rules as `get_artifact`.
+    /// Once raw is purged (V2.4 derivative-only lifecycle) the bytes are
+    /// gone but the metadata stays — a `get_artifact_blob` against a
+    /// purged artifact returns `ArtifactNotFound`.
+    pub async fn get_artifact_blob(
+        &self,
+        tenant_id: &Id,
+        artifact_id: &Id,
+    ) -> Result<Vec<u8>> {
+        let art = self.get_artifact(tenant_id, artifact_id).await?;
+        if art.raw_purged_at_ms.is_some() {
+            return Err(Error::new(
+                ErrorCode::ArtifactNotFound,
+                format!("{}", artifact_id),
+            ));
+        }
+        // TODO(V2.4): re-verify the returned bytes against art.sha256. Skipped
+        // in V2.1 to avoid hashing on every read.
+        self.content
+            .get(tenant_id.as_str(), artifact_id.as_str())
+            .await
+            .map_err(|e| {
+                Error::new(ErrorCode::Internal, format!("content get failed: {e}"))
+            })
     }
 
     /// Test-only convenience that creates a tenant + agent + session in one shot.

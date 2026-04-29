@@ -91,15 +91,17 @@ impl Persist {
     /// has no V2.1 lookup API; it's populated so a future dedup pass lands
     /// without rewriting this code path.
     pub fn put_artifact(&self, a: &Artifact) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
-        ops.push(WriteOp::Put {
-            key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
-            value: serde_json::to_vec(a).expect("artifact serializes"),
-        });
-        ops.push(WriteOp::Put {
-            key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
-            value: a.artifact_id.as_str().as_bytes().to_vec(),
-        });
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Put {
+                key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str())
+                    .into_bytes(),
+                value: serde_json::to_vec(a).expect("artifact serializes"),
+            },
+            WriteOp::Put {
+                key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
+                value: a.artifact_id.as_str().as_bytes().to_vec(),
+            },
+        ];
         self.kv.write_batch(ops)
     }
 

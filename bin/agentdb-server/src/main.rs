@@ -59,7 +59,14 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         let kv = Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
             as Arc<dyn agentdb_storage::KvStore + Send + Sync>;
         tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
-        agentdb_core::Runtime::with_kv(kv)
+        // V2.1a wires a content backend into Runtime::with_kv so artifact
+        // bytes have a place to land. V2.1b will surface a --content-dir
+        // flag and route artifact bytes to local FS rooted there; for now
+        // we use the in-memory content backend so the binary still boots
+        // and the metadata path is exercised end-to-end.
+        let content: Arc<dyn agentdb_storage::ContentBackend> =
+            Arc::new(agentdb_storage::InMemoryContentBackend::default());
+        agentdb_core::Runtime::with_kv(kv, content)
     };
 
     let state = agentdb_api::AppState { runtime };
