@@ -48,6 +48,14 @@ impl AppendRequest {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub from_seq: u64,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendResponse {
     pub event_id: Id,
@@ -241,6 +249,20 @@ impl Runtime {
             seq: appended.seq,
             recent,
         })
+    }
+
+    /// Return events from `from_seq` (inclusive) up to `limit` count, in
+    /// ascending seq order. Returns `SessionNotFound` if the session does not
+    /// exist. Returns an empty vec if `from_seq` is past the session's last
+    /// committed seq.
+    pub async fn fetch_from_seq(&self, req: FetchRequest) -> V2Result<Vec<EventEnvelope>> {
+        let s = self.state.lock().await;
+        if !s.sessions.contains_key(req.session_id.as_str()) {
+            return Err(V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)));
+        }
+        let lo = (req.session_id.as_str().to_string(), req.from_seq);
+        let hi = (req.session_id.as_str().to_string(), u64::MAX);
+        Ok(s.events.range(lo..=hi).take(req.limit).map(|(_, v)| v.clone()).collect())
     }
 }
 
