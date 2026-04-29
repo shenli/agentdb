@@ -115,6 +115,51 @@ async fn create_session_rejects_unknown_agent() {
     assert_eq!(err.code, ErrorCode::AgentNotFound);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_idempotent_appends_resolve_consistently() {
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+
+    // 16 concurrent appends, all with idempotency key "k1" and identical payload
+    // — every result should agree (same event_id+seq) and only one event should
+    // actually be persisted in the session.
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let rt = rt.clone();
+        let t = t.clone();
+        let a = a.clone();
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut req = AppendRequest::simple(&t, &a, &s, "k", serde_json::json!({"v": 1}));
+            req.idempotency_key = Some("k1".into());
+            rt.append(req).await
+        }));
+    }
+    let mut results = Vec::new();
+    for h in tasks {
+        results.push(h.await.unwrap().unwrap());
+    }
+    let first = &results[0];
+    for r in &results {
+        assert_eq!(r.event_id, first.event_id, "all idempotent appends must return the same event_id");
+        assert_eq!(r.seq, first.seq, "all idempotent appends must return the same seq");
+    }
+
+    // Only one event was persisted in the session.
+    let resp = rt.append_and_fetch(
+        AppendRequest::simple(&t, &a, &s, "tail", serde_json::json!({})),
+        /* last */ 100,
+        /* max_bytes */ 1_000_000,
+    ).await.unwrap();
+    // 1 idempotent + 1 fresh "tail" = 2 events
+    assert_eq!(
+        resp.recent.len(),
+        2,
+        "expected exactly 1 idempotent commit + 1 tail append; got {:?}",
+        resp.recent.iter().map(|e| (e.seq, &e.kind)).collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::v2::id::{Id, IdKind};

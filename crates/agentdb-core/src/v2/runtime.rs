@@ -137,21 +137,26 @@ impl Runtime {
             format!("{}::{}::{}::{}", req.tenant_id, "append", req.session_id, k)
         });
 
+        // Optimistic check before locking — fast path for retries that find a
+        // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
-                let h = hash_payload(&req.payload);
-                if rec.payload_hash != h {
-                    return Err(V2Error::new(
-                        ErrorCode::IdempotencyConflict,
-                        "payload differs for the same idempotency key",
-                    ));
-                }
-                let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
-                return Ok(resp);
+                return verify_idem_replay(&rec, &req.payload);
             }
         }
 
         let mut s = self.state.lock().await;
+
+        // Re-check under the state lock to close the concurrent-append race:
+        // another task could have committed our key between the optimistic check
+        // and the lock acquisition above.
+        if let Some(ref full) = idem_full_key {
+            if let Some(rec) = self.idem.lookup(full) {
+                drop(s);
+                return verify_idem_replay(&rec, &req.payload);
+            }
+        }
+
         let (seq, policy_version) = {
             let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
                 V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
@@ -181,10 +186,12 @@ impl Runtime {
 
         let resp = AppendResponse { event_id, seq };
 
-        // Drop the state lock before recording idempotency to avoid holding two
-        // locks. The idempotency store has its own lock.
-        drop(s);
-
+        // Record the idempotency result while still holding the state lock so
+        // concurrent appends with the same key serialize cleanly: any racing
+        // caller will observe this record on its under-lock re-check and replay
+        // instead of committing a second event. Lock order is (state -> idem)
+        // and the idempotency store never reaches back into state, so there is
+        // no deadlock risk despite holding both briefly.
         if let Some(full) = idem_full_key {
             self.idem.put(
                 full,
@@ -194,10 +201,19 @@ impl Runtime {
                 },
             );
         }
+        drop(s);
 
         Ok(resp)
     }
 
+    /// Append an event and return it together with up to `last` recent events
+    /// from the session in ascending seq order.
+    ///
+    /// # Parameters
+    /// - `last`: maximum number of recent events to return.
+    /// - `max_bytes`: **reserved**; not enforced until V2.4 introduces budgeted
+    ///   context. Callers should pass a sensible cap anyway since it will become
+    ///   load-bearing without an API change.
     pub async fn append_and_fetch(
         &self,
         req: AppendRequest,
@@ -226,4 +242,21 @@ impl Runtime {
             recent,
         })
     }
+}
+
+/// Verify a stored idempotency record matches the incoming payload and replay
+/// the original response, or surface a conflict if the payload differs.
+fn verify_idem_replay(
+    rec: &IdempotencyRecord,
+    payload: &serde_json::Value,
+) -> V2Result<AppendResponse> {
+    let h = hash_payload(payload);
+    if rec.payload_hash != h {
+        return Err(V2Error::new(
+            ErrorCode::IdempotencyConflict,
+            "payload differs for the same idempotency key",
+        ));
+    }
+    let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
+    Ok(resp)
 }
