@@ -57,3 +57,23 @@ pub fn artifact_record_key(tenant_id: &str, artifact_id: &str) -> String {
 pub fn artifact_by_sha256_key(tenant_id: &str, sha256_hex: &str) -> String {
     format!("record/artifact_by_sha256/{tenant_id}/{sha256_hex}")
 }
+
+/// Primary key for a V2.2 searchable record. Disjoint from
+/// `record/{tenant,agent,session,artifact}/...` because the segment after
+/// `record/` is `searchable`, and disjoint from
+/// `record/searchable_by_namespace/...` because the prefix `record/searchable/`
+/// ends in `/` while the index prefix continues with `_`.
+pub fn record_key(tenant_id: &str, record_id: &str) -> String {
+    format!("record/searchable/{tenant_id}/{record_id}")
+}
+
+/// Secondary index over `(tenant_id, namespace_path)` for prefix-scanning
+/// every record under a namespace. `namespace_path` is the slash-joined
+/// namespace components (matching `SearchableRecord::namespace_path()`).
+pub fn record_by_namespace_key(
+    tenant_id: &str,
+    namespace_path: &str,
+    record_id: &str,
+) -> String {
+    format!("record/searchable_by_namespace/{tenant_id}/{namespace_path}/{record_id}")
+}
