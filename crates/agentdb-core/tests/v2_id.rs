@@ -18,7 +18,7 @@ fn ids_round_trip_through_str() {
 
 #[test]
 fn parse_rejects_wrong_prefix() {
-    let err = Id::parse("xyz_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap_err();
+    let err = Id::parse("xyz_018f4a7e-4b8a-7000-8000-000000000000").unwrap_err();
     assert!(format!("{err}").contains("unknown prefix"));
 }
 

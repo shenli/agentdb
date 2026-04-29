@@ -56,7 +56,7 @@ pub enum IdError {
     #[error("unknown prefix '{0}'")]
     UnknownPrefix(String),
     #[error("invalid uuid body: {0}")]
-    BadBody(String),
+    BadBody(#[from] uuid::Error),
     #[error("expected {expected:?} but got {got:?}")]
     KindMismatch { expected: IdKind, got: IdKind },
 }
@@ -72,7 +72,7 @@ impl Id {
         let (prefix, body) = s.split_once('_').ok_or(IdError::MissingSeparator)?;
         let kind = IdKind::from_prefix(prefix)
             .ok_or_else(|| IdError::UnknownPrefix(prefix.to_string()))?;
-        Uuid::from_str(body).map_err(|e| IdError::BadBody(e.to_string()))?;
+        Uuid::from_str(body)?;
         Ok(Self { kind, inner: s.to_string() })
     }
 
