@@ -25,8 +25,8 @@
 use std::sync::Arc;
 
 use agentdb_storage::keys::{
-    agent_alias_key, agent_record_key, event_key, session_alias_key, session_record_key,
-    tenant_alias_key, tenant_record_key,
+    agent_alias_key, agent_record_key, event_by_id_key, event_key, session_alias_key,
+    session_record_key, tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
 
@@ -102,15 +102,16 @@ impl Persist {
     }
 
     /// Atomic multi-write for the append commit path. Bundles the event row,
-    /// the updated session row, and (optionally) the idempotency record so
-    /// that on crash recovery either all three are visible or none are.
+    /// the updated session row, the `event_by_id` secondary index row, and
+    /// (optionally) the idempotency record so that on crash recovery either
+    /// all of them are visible or none are.
     pub fn append_batch(
         &self,
         event: &EventEnvelope,
         session: &Session,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(4);
         let ek = event_key(event.tenant_id.as_str(), event.session_id.as_str(), event.seq);
         ops.push(WriteOp::Put {
             key: ek.into_bytes(),
@@ -120,6 +121,17 @@ impl Persist {
         ops.push(WriteOp::Put {
             key: sk.into_bytes(),
             value: serde_json::to_vec(session).expect("session serializes"),
+        });
+        // Secondary index: event_by_id -> {session_id, seq}. Lets a caller
+        // look up an event by its event_id without scanning the session.
+        let by_id = event_by_id_key(event.tenant_id.as_str(), event.event_id.as_str());
+        ops.push(WriteOp::Put {
+            key: by_id.into_bytes(),
+            value: serde_json::to_vec(&serde_json::json!({
+                "session_id": event.session_id.as_str(),
+                "seq": event.seq,
+            }))
+            .expect("event_by_id pointer serializes"),
         });
         if let Some((full_key, rec)) = idem {
             // Persist under a stable "record/idempotency/<full_key>" namespace so
@@ -133,6 +145,25 @@ impl Persist {
             });
         }
         self.kv.write_batch(ops)
+    }
+
+    /// Resolve an `event_id` to its `(session_id, seq)` location via the
+    /// `event_by_id` secondary index. Returns `None` if no row exists.
+    pub fn lookup_event_by_id(
+        &self,
+        tenant_id: &str,
+        event_id: &str,
+    ) -> KvResult<Option<(String, u64)>> {
+        let raw = self.kv.get(event_by_id_key(tenant_id, event_id).as_bytes())?;
+        let Some(bytes) = raw else { return Ok(None) };
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("event_by_id pointer decodes");
+        let session_id = v["session_id"]
+            .as_str()
+            .expect("event_by_id pointer has session_id")
+            .to_string();
+        let seq = v["seq"].as_u64().expect("event_by_id pointer has seq");
+        Ok(Some((session_id, seq)))
     }
 
     // ----- reads -----

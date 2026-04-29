@@ -551,6 +551,29 @@ impl Runtime {
         })
     }
 
+    /// Resolve an `event_id` to its `(session_id, seq)` location via the
+    /// persisted `event_by_id` secondary index.
+    ///
+    /// In-memory runtime returns `Ok(None)` because the index isn't tracked
+    /// in memory; callers that need event-by-id resolution must use a
+    /// KV-backed Runtime. This is acceptable for V2.0; revisit if/when the
+    /// in-memory mode grows beyond test scaffolding.
+    pub async fn lookup_event_by_id(
+        &self,
+        tenant_id: &Id,
+        event_id: &Id,
+    ) -> Result<Option<(Id, u64)>> {
+        let Some(p) = &self.persist else {
+            return Ok(None);
+        };
+        let raw = p
+            .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
+            .map_err(internal)?;
+        let Some((sid, seq)) = raw else { return Ok(None) };
+        let session_id = Id::parse(&sid).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        Ok(Some((session_id, seq)))
+    }
+
     /// Return events from `from_seq` (inclusive) up to `limit` count, in
     /// ascending seq order. Returns `SessionNotFound` if the session does not
     /// exist. Returns an empty vec if `from_seq` is past the session's last
