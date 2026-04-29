@@ -13,7 +13,7 @@ primitives without implementing distributed scale or a managed service.
 Build a minimal AgentDB V2 runtime database that can run with:
 
 ```bash
-agentdb serve --dev --v2
+agentdb serve --dev
 ```
 
 The prototype should prove these runtime primitives:
@@ -278,14 +278,15 @@ idempotency/{tenant_id}/{operation}/{target}/{key} -> result_hash + result
 
 ## 8. Runtime API Contract
 
-Use `/v2` endpoints for the prototype. Request/response DTOs may live in
-`agentdb-api` or `agentdb-wire`, but must stay aligned with runtime types.
+Use `/api` endpoints for the prototype. V2 is a clean break, so the public API
+path does not need a version prefix. Request/response DTOs should live in
+`agentdb-api` and must stay aligned with runtime types.
 
 ### 8.1 Tenants
 
 ```text
-POST /v2/tenants
-GET  /v2/tenants/{tenant_id}
+POST /api/tenants
+GET  /api/tenants/{tenant_id}
 ```
 
 Create request:
@@ -297,20 +298,20 @@ Create request:
 ### 8.2 Agents
 
 ```text
-POST /v2/tenants/{tenant_id}/agents
-GET  /v2/tenants/{tenant_id}/agents/{agent_id}
+POST /api/tenants/{tenant_id}/agents
+GET  /api/tenants/{tenant_id}/agents/{agent_id}
 ```
 
 ### 8.3 Sessions And Events
 
 ```text
-POST /v2/tenants/{tenant_id}/agents/{agent_id}/sessions
-GET  /v2/tenants/{tenant_id}/sessions/{session_id}
-POST /v2/tenants/{tenant_id}/sessions/{session_id}/events
-POST /v2/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
-GET  /v2/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=&limit=
-GET  /v2/tenants/{tenant_id}/sessions/{session_id}/replay
-POST /v2/tenants/{tenant_id}/sessions/{session_id}/fork
+POST /api/tenants/{tenant_id}/agents/{agent_id}/sessions
+GET  /api/tenants/{tenant_id}/sessions/{session_id}
+POST /api/tenants/{tenant_id}/sessions/{session_id}/events
+POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
+GET  /api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=&limit=
+GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
+POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 ```
 
 Append response:
@@ -332,9 +333,9 @@ Append-and-fetch response:
 ### 8.4 Artifacts
 
 ```text
-POST /v2/tenants/{tenant_id}/artifacts
-GET  /v2/tenants/{tenant_id}/artifacts/{artifact_id}
-GET  /v2/tenants/{tenant_id}/artifacts/{artifact_id}/blob
+POST /api/tenants/{tenant_id}/artifacts
+GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}
+GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
 ```
 
 The first cut may use buffered upload. Streaming upload can come later.
@@ -346,9 +347,9 @@ the local artifact content layout; both must read back through the same API.
 ### 8.5 Searchable Records
 
 ```text
-POST   /v2/tenants/{tenant_id}/records
-GET    /v2/tenants/{tenant_id}/records/search
-DELETE /v2/tenants/{tenant_id}/records/{record_id}
+POST   /api/tenants/{tenant_id}/records
+GET    /api/tenants/{tenant_id}/records/search
+DELETE /api/tenants/{tenant_id}/records/{record_id}
 ```
 
 Search must support namespace, scope, tags, text query, source refs, and limit.
@@ -356,15 +357,15 @@ Search must support namespace, scope, tags, text query, source refs, and limit.
 ### 8.6 Skills
 
 ```text
-POST /v2/tenants/{tenant_id}/skills
-POST /v2/tenants/{tenant_id}/agents/{agent_id}/skills/bind
-GET  /v2/tenants/{tenant_id}/agents/{agent_id}/skills
+POST /api/tenants/{tenant_id}/skills
+POST /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
+GET  /api/tenants/{tenant_id}/agents/{agent_id}/skills
 ```
 
 ### 8.7 Subscribe
 
 ```text
-GET /v2/tenants/{tenant_id}/sessions/{session_id}/subscribe?from_seq=N
+GET /api/tenants/{tenant_id}/sessions/{session_id}/subscribe?from_seq=N
 ```
 
 Use Server-Sent Events for the first cut.
@@ -452,7 +453,7 @@ P0 enforcement:
 Expose a simple context endpoint after append/fetch works:
 
 ```text
-POST /v2/tenants/{tenant_id}/sessions/{session_id}/context
+POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 ```
 
 Request:

@@ -14,10 +14,10 @@ for cold segments, segment-based lifecycle tiering) and adds an **artifact
 content backend** abstraction: artifact metadata lives in the runtime
 metadata/event store next to events/agents/sessions; artifact content lives in
 a separate content backend (local filesystem for the single-machine prototype,
-S3-compatible object store for distributed deployments). The runtime API
-exposes only put/get/head — the storage engine decides whether small content
-is inlined or spilled to the content backend. Wire surface is new: typed
-prefixed IDs over `/v2/...` HTTP routes. The Mongo wire facade
+  S3-compatible object store for distributed deployments). The runtime API
+  exposes only put/get/head — the storage engine decides whether small content
+  is inlined or spilled to the content backend. Wire surface is a clean-break
+  native `/api/...` HTTP API with typed prefixed IDs. The Mongo wire facade
 (`agentdb-wire`) and the Go SDK (`clients/go`) are deleted.
 
 **Tech Stack:** Rust (existing crates), Axum (HTTP), Tokio (async), RocksDB +
@@ -54,7 +54,7 @@ These are decided up front so they don't get re-litigated in every milestone.
 
 | Decision | Choice |
 |---|---|
-| Cutover model | Parallel: V1 `/api/...` and V2 `/v2/...` coexist behind a `--v2` flag during V2.0–V2.7. Single switch (delete V1) at V2.8 (Cutover & Deletion). |
+| Cutover model | Clean break. The native runtime API uses `/api/...`; no `/v2` path and no compatibility shim are required. Delete or ignore the old V1 surface instead of running parallel routes. |
 | `agentdb-wire` Mongo facade | Deleted at V2.8. |
 | `clients/go` | Deleted at V2.8. |
 | Storage backends | Unchanged: RocksDB + SlateDB for KV, object_store for blobs/cold, Postgres for control-plane meta. |
@@ -94,29 +94,29 @@ Scope:
 - Atomic per-session append; `next_seq` updated under per-session lock
 - Append-and-fetch in one runtime call
 - Idempotency record store + result cache (P0 scope: append + append-and-fetch)
-- `/v2/tenants`, `/v2/tenants/{ten}/agents`, `/v2/tenants/{ten}/agents/{agt}/sessions`, `/v2/tenants/{ten}/sessions/{ses}/events`, `/v2/tenants/{ten}/sessions/{ses}/append-and-fetch`, `/v2/tenants/{ten}/sessions/{ses}/events?from_seq=`
+- `/api/tenants`, `/api/tenants/{ten}/agents`, `/api/tenants/{ten}/agents/{agt}/sessions`, `/api/tenants/{ten}/sessions/{ses}/events`, `/api/tenants/{ten}/sessions/{ses}/append-and-fetch`, `/api/tenants/{ten}/sessions/{ses}/events?from_seq=`
 - Structured error response shape with `code`, `message`, `retryable`, `suggestion`
-- `--v2` flag on `agentdb serve` to mount V2 routes alongside V1
+- `agentdb serve` mounts the native runtime API directly; no `--v2` flag
 
 Files:
 
 - Create: `crates/agentdb-core/src/v2/{mod,id,tenant,agent,session,event,runtime,idempotency,errors}.rs`
 - Create: `crates/agentdb-storage/src/v2_keys.rs`
-- Create: `crates/agentdb-api/src/v2/{mod,routes,dto,errors,middleware}.rs`
-- Modify: `crates/agentdb-api/src/lib.rs` (mount V2 router under `--v2`)
-- Modify: `bin/agentdb-server/src/serve.rs` (add `--v2` flag)
+- Create or replace: `crates/agentdb-api/src/{routes,dto,errors,middleware}.rs`
+- Modify: `crates/agentdb-api/src/lib.rs` (mount native runtime router)
+- Modify: `bin/agentdb-server/src/serve.rs` (serve native runtime API)
 - Create: `crates/agentdb-meta/migrations/0030_v2_agents_idempotency.sql`
 - Test: `crates/agentdb-core/tests/v2_runtime_basics.rs`, `crates/agentdb-api/tests/v2_routes.rs`
 
 Exit criteria:
 
-- A new V2 tenant can be created, an agent registered, a session opened, an
-  event appended, and the same event fetched back via `/v2/...`.
+- A new tenant can be created, an agent registered, a session opened, an event
+  appended, and the same event fetched back via `/api/...`.
 - `seq` is monotonic and contiguous within a session across restarts.
 - Idempotency-Key on append returns identical result on retry; conflict on
   payload mismatch.
-- V1 `/api/...` routes still pass their existing tests; `--v2` flag toggles V2
-  routes.
+- Native `/api/...` routes pass their tests. There is no V1 compatibility route
+  requirement.
 - Restart preserves tenant, agent, session, and event records.
 
 Dependencies: none (foundation milestone).
@@ -134,8 +134,8 @@ Scope:
   atomic install
 - Storage engine decides physical placement for artifact content; the API does
   not expose whether small content was inlined or spilled to the content backend
-- `POST /v2/.../artifacts` (buffered upload, P0), `GET /v2/.../artifacts/{id}`,
-  `GET /v2/.../artifacts/{id}/blob`
+- `POST /api/.../artifacts` (buffered upload, P0), `GET /api/.../artifacts/{id}`,
+  `GET /api/.../artifacts/{id}/blob`
 - Event `artifact_refs` validation: every ref must point to a real artifact in
   the same tenant
 - Idempotency-Key on artifact put
@@ -171,7 +171,7 @@ Scope:
 
 - Searchable record type (impl guide §6.4) with `namespace`, `scope`,
   `metadata`, `tags`, `source` refs
-- `POST /v2/.../records`, `GET /v2/.../records/search`, `DELETE /v2/.../records/{id}`
+- `POST /api/.../records`, `GET /api/.../records/search`, `DELETE /api/.../records/{id}`
 - Search must support: namespace, scope, tags, text query, source refs, limit
 - Indexing policy enforced at write time: `no_indexing` / `metadata_only` /
   `selected_fields` / `summary_only`
@@ -204,8 +204,8 @@ Dependencies: V2.0 (for tenant/agent scope).
 Scope:
 
 - Skill type (impl guide §6.5) with `manifest`, `version`, `artifact_refs`
-- Registry: `POST /v2/.../skills`, `POST /v2/.../agents/{agt}/skills/bind`,
-  `GET /v2/.../agents/{agt}/skills`
+- Registry: `POST /api/.../skills`, `POST /api/.../agents/{agt}/skills/bind`,
+  `GET /api/.../agents/{agt}/skills`
 - `(tenant_id, skill_name, version)` uniqueness
 - `skill_used` event kind that records `skill_id` + exact `version` for replay
 - Skill packages may be stored as artifacts (cross-link to V2.1)
@@ -349,21 +349,20 @@ Exit criteria:
 
 Dependencies: V2.0, V2.1, V2.2.
 
-### V2.5 — Fork + subscribe + context builder at /v2 (~2000 LoC)
+### V2.5 — Fork + subscribe + context builder (~2000 LoC)
 
 **Maps to impl guide §15 steps 11–12, 14.**
 
 Scope:
 
-- `POST /v2/.../sessions/{ses}/fork` with `at_seq`; child gets fresh
+- `POST /api/.../sessions/{ses}/fork` with `at_seq`; child gets fresh
   `session_id` and child-local `seq` starting at 0
 - Replay merging: parent events through `at_seq`, then child events
-- `GET /v2/.../sessions/{ses}/subscribe` — SSE replay-from-seq + live tail;
-  reuses V1's broadcast infra under V2 routes
-- `GET /v2/.../sessions/{ses}/replay` for explicit replay endpoint (impl guide
+- `GET /api/.../sessions/{ses}/subscribe` — SSE replay-from-seq + live tail
+- `GET /api/.../sessions/{ses}/replay` for explicit replay endpoint (impl guide
   §8.3)
 - Generalized changefeed: `watch(stream_id | tenant_id | agent_id, from_cursor)`
-- `POST /v2/.../sessions/{ses}/context` (impl guide §12) with `max_events`,
+- `POST /api/.../sessions/{ses}/context` (impl guide §12) with `max_events`,
   `max_bytes`, `include[]`, `record_query`
 
 Files:
@@ -392,8 +391,8 @@ Dependencies: V2.0.
 
 Scope:
 
-- Python SDK rewrite: `clients/python/` mapped to `/v2/...` surface
-- TypeScript SDK rewrite: `clients/typescript/` mapped to `/v2/...` surface
+- Python SDK rewrite: `clients/python/` mapped to `/api/...` surface
+- TypeScript SDK rewrite: `clients/typescript/` mapped to `/api/...` surface
 - Both SDKs expose: tenant, agent, session, event append, append-and-fetch,
   fetch, replay, fork, subscribe, artifact put/get, record write/search, skill
   register/bind, context build
@@ -410,12 +409,12 @@ Exit criteria:
 
 - Both SDKs run the impl guide §16 sample (sales agent: register skill, open
   session, append-and-fetch with artifact, write record, fork, subscribe).
-- E2E test against a `serve --v2` instance passes for both SDKs.
+- E2E test against an `agentdb serve` instance passes for both SDKs.
 - SDK versions bumped to `2.0.0`.
 
 Dependencies: V2.0–V2.5 (full V2 surface).
 
-### V2.7 — V1 deletion + cutover (~−5000 LoC net)
+### V2.7 — Legacy deletion and cleanup (~−5000 LoC net)
 
 **Maps to spec §22 non-goals + change-list §11.2.**
 
@@ -424,11 +423,11 @@ Scope:
 - Delete `crates/agentdb-wire/` entirely
 - Delete `clients/go/` entirely
 - Delete `crates/agentdb-api/src/{handlers,subscribe,broadcast,fork}.rs` V1 handlers
-- Delete V1 `/api/...` routes from the router
-- Remove `--v2` flag (V2 is now the only surface)
+- Delete obsolete V1 handlers and compatibility code from the router
+- Ensure no `--v2` flag exists; the native runtime API is the only surface
 - Update `docs/agent-db.md`, `DESIGN.md`, `ARCHITECTURE.md` to V2 facts
-- Migrate V1 integration tests still applicable (sub-path: `/api` → `/v2`,
-  payload shape changes, typed IDs)
+- Migrate V1 integration tests still applicable to the new `/api` payload shapes
+  and typed IDs
 - Bump server major version to `2.0.0`
 
 Files:
@@ -438,7 +437,7 @@ Files:
   related v1 modules
 - Modify: `Cargo.toml` workspace (remove `agentdb-wire` member)
 - Modify: `crates/agentdb-api/src/lib.rs` (router cleanup)
-- Modify: `bin/agentdb-server/src/serve.rs` (drop `--v2`)
+- Modify: `bin/agentdb-server/src/serve.rs` (remove obsolete compatibility flags)
 - Modify: `docs/agent-db.md`, `docs/DESIGN.md`, `docs/ARCHITECTURE.md`,
   top-level `README.md`, `AGENTS.md`
 - Migrate: `crates/agentdb-api/tests/*` retain only V2-applicable cases
@@ -446,7 +445,7 @@ Files:
 Exit criteria:
 
 - `cargo build --workspace` clean with no `agentdb-wire` references.
-- No `/api/...` routes mounted; only `/v2/...` and admin paths.
+- Only the native `/api/...` runtime routes and admin paths are mounted.
 - Full test suite green.
 - `cargo clippy --all-targets -- -D warnings` clean.
 - README + DESIGN + ARCHITECTURE describe only V2.
@@ -2086,21 +2085,21 @@ async fn create_tenant_agent_session_append_fetch_round_trip() {
     let app = v2_test_app().await;
     let client = app.client();
 
-    let t: serde_json::Value = client.post("/v2/tenants").json(&json!({"external_key":"acme"})).send().await.unwrap().json().await.unwrap();
+    let t: serde_json::Value = client.post("/api/tenants").json(&json!({"external_key":"acme"})).send().await.unwrap().json().await.unwrap();
     let tid = t["tenant_id"].as_str().unwrap();
 
-    let a: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/agents")).json(&json!({"alias":"sales-rep"})).send().await.unwrap().json().await.unwrap();
+    let a: serde_json::Value = client.post(&format!("/api/tenants/{tid}/agents")).json(&json!({"alias":"sales-rep"})).send().await.unwrap().json().await.unwrap();
     let aid = a["agent_id"].as_str().unwrap();
 
-    let s: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/agents/{aid}/sessions")).json(&json!({})).send().await.unwrap().json().await.unwrap();
+    let s: serde_json::Value = client.post(&format!("/api/tenants/{tid}/agents/{aid}/sessions")).json(&json!({})).send().await.unwrap().json().await.unwrap();
     let sid = s["session_id"].as_str().unwrap();
 
-    let r: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/sessions/{sid}/events"))
+    let r: serde_json::Value = client.post(&format!("/api/tenants/{tid}/sessions/{sid}/events"))
         .json(&json!({"kind":"x","payload":{"i":1}}))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(r["seq"].as_u64().unwrap(), 0);
 
-    let resp: serde_json::Value = client.get(&format!("/v2/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=10"))
+    let resp: serde_json::Value = client.get(&format!("/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=10"))
         .send().await.unwrap().json().await.unwrap();
     let events = resp["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
@@ -2113,7 +2112,7 @@ async fn append_and_fetch_returns_recent() {
     let client = app.client();
     let (tid, _aid, sid) = app.bootstrap_session().await;
 
-    let r: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/sessions/{sid}/append-and-fetch"))
+    let r: serde_json::Value = client.post(&format!("/api/tenants/{tid}/sessions/{sid}/append-and-fetch"))
         .json(&json!({"kind":"x","payload":{},"last":5,"max_bytes":1000000}))
         .send().await.unwrap().json().await.unwrap();
     assert_eq!(r["seq"].as_u64().unwrap(), 0);
@@ -2126,11 +2125,11 @@ async fn idempotency_key_replays_result() {
     let client = app.client();
     let (tid, _aid, sid) = app.bootstrap_session().await;
 
-    let r1: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/sessions/{sid}/events"))
+    let r1: serde_json::Value = client.post(&format!("/api/tenants/{tid}/sessions/{sid}/events"))
         .header("Idempotency-Key", "k1")
         .json(&json!({"kind":"x","payload":{"v":1}}))
         .send().await.unwrap().json().await.unwrap();
-    let r2: serde_json::Value = client.post(&format!("/v2/tenants/{tid}/sessions/{sid}/events"))
+    let r2: serde_json::Value = client.post(&format!("/api/tenants/{tid}/sessions/{sid}/events"))
         .header("Idempotency-Key", "k1")
         .json(&json!({"kind":"x","payload":{"v":1}}))
         .send().await.unwrap().json().await.unwrap();
@@ -2147,7 +2146,7 @@ cargo test -p agentdb-api --test v2_http_smoke
 
 Expected: FAIL — `v2_test_app` and `bootstrap_session` helpers + V2 routes do not exist.
 
-- [ ] **Step 3: Implement `--v2` flag, V2 router, DTOs, error mapping, test harness**
+- [ ] **Step 3: Implement native `/api` router, DTOs, error mapping, test harness**
 
 Build out `crates/agentdb-api/src/v2/`:
 
@@ -2182,8 +2181,7 @@ pub fn build_router(state: AppState, mount_v2: bool) -> axum::Router {
 Modify `bin/agentdb-server/src/serve.rs`:
 
 ```rust
-// add a --v2 flag (clap or env-driven, matching existing pattern).
-// when --v2 is set, build_router with mount_v2 = true.
+// serve the native runtime API directly; do not add a --v2 flag.
 ```
 
 Create `crates/agentdb-api/tests/common/mod.rs` (or extend the existing one)
@@ -2191,7 +2189,7 @@ with:
 
 ```rust
 pub async fn v2_test_app() -> TestApp {
-    // start a Runtime::with_kv on a temp dir, wrap in AppState, build_router(state, true),
+    // start a Runtime::with_kv on a temp dir, wrap in AppState, build_router(state),
     // launch on a random port, return a TestApp with `client()` and `bootstrap_session()`.
 }
 ```
@@ -2210,8 +2208,8 @@ Expected: PASS (3 tests).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/agentdb-api/src/{lib.rs,v2/} crates/agentdb-api/tests/{common,v2_http_smoke.rs} bin/agentdb-server/src/serve.rs
-git commit -m "feat(api): /v2 routes for tenant/agent/session/event with --v2 flag (V2.0)"
+git add crates/agentdb-api/src/{lib.rs,routes.rs,dto.rs,errors.rs} crates/agentdb-api/tests/{common,v2_http_smoke.rs} bin/agentdb-server/src/serve.rs
+git commit -m "feat(api): native runtime routes for tenant/agent/session/event"
 ```
 
 ### Task 13: V1 regression check + V2.0 PR
@@ -2226,7 +2224,7 @@ git commit -m "feat(api): /v2 routes for tenant/agent/session/event with --v2 fl
 cargo test --workspace
 ```
 
-Expected: PASS — all V1 `/api/*` tests still pass alongside new V2 tests.
+Expected: PASS — native `/api/*` runtime tests pass.
 
 - [ ] **Step 2: Run clippy**
 
@@ -2236,18 +2234,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 3: Run integration test against `serve --v2`**
+- [ ] **Step 3: Run integration test against `agentdb serve`**
 
 Start the server in one terminal:
 
 ```bash
-cargo run -p agentdb-server -- serve --dev --v2
+cargo run -p agentdb-server -- serve --dev
 ```
 
-In another terminal, exercise the V2 routes manually:
+In another terminal, exercise the native runtime routes manually:
 
 ```bash
-curl -sX POST localhost:8080/v2/tenants -H 'content-type: application/json' -d '{"external_key":"acme"}'
+curl -sX POST localhost:8080/api/tenants -H 'content-type: application/json' -d '{"external_key":"acme"}'
 # capture tenant_id, then chain through agent → session → events
 ```
 
