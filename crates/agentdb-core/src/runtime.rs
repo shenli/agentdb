@@ -12,10 +12,13 @@
 //! in-memory it's the state mutex.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use agentdb_index::doc_id::DocId;
+use agentdb_index::text::{InMemoryInverted, TextIndex};
+use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{ContentBackend, InMemoryContentBackend};
 use agentdb_storage::KvStore;
 
@@ -26,6 +29,7 @@ use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
 use crate::idempotency::{hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
+use crate::record::{IndexingMode, NewRecord, SearchableRecord};
 use crate::session::{NewSession, Session};
 use crate::tenant::{NewTenant, Tenant};
 
@@ -119,6 +123,25 @@ struct State {
     tenant_aliases: BTreeMap<String, String>,
     agent_aliases: BTreeMap<String, String>,
     session_aliases: BTreeMap<String, String>,
+    /// V2.2 searchable records, keyed by `record_id` string. Hydrated at
+    /// startup from `Persist::scan_all_records`; updated on every
+    /// `write_record` / `delete_record`.
+    records: BTreeMap<String, SearchableRecord>,
+    /// Reverse mapping `DocId -> record_id_str`. Search hits come back
+    /// from the text + vector indexes as `DocId`s; we walk this map to
+    /// recover the record_id and post-filter from `records`. The
+    /// `DocId` itself is minted by [`mint_doc_id`] from a per-runtime
+    /// counter, so it is unique and stable for the runtime's lifetime
+    /// (rebuilt on hydration).
+    doc_to_record: BTreeMap<DocId, String>,
+    /// Forward mapping `record_id_str -> DocId`. Used on
+    /// `delete_record` to remove the index entry and the reverse
+    /// mapping in one shot.
+    record_to_doc: BTreeMap<String, DocId>,
+    /// Counter behind [`mint_doc_id`]. Lives in `State` so the same
+    /// state mutex serializes counter increments alongside record
+    /// inserts.
+    next_doc_seq: u64,
 }
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
@@ -130,6 +153,21 @@ pub struct Runtime {
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
+    /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
+    /// records. Wrapped in a `std::sync::Mutex` because
+    /// `TextIndex::insert` takes `&mut self`. All operations are short
+    /// (CPU-bound; no I/O) so a blocking mutex is fine.
+    ///
+    /// The `path` parameter we pass into the index is
+    /// `"{tenant_id}::{namespace_path}"`, giving each tenant +
+    /// namespace its own segment — the `path`-isolated semantics in
+    /// [`InMemoryInverted`] are what enforce search isolation.
+    text_index: StdMutex<InMemoryInverted>,
+    /// Per-(tenant, namespace) HNSW vector index. Same locking story
+    /// as `text_index`. The HNSW backend already keeps an internal
+    /// `parking_lot::Mutex` per path; the outer `StdMutex` here only
+    /// guards the `&mut self` requirement of the trait surface.
+    vector_index: StdMutex<HnswVectorIndex>,
 }
 
 impl Runtime {
@@ -139,6 +177,8 @@ impl Runtime {
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
+            text_index: StdMutex::new(InMemoryInverted::new()),
+            vector_index: StdMutex::new(HnswVectorIndex::new()),
         })
     }
 
@@ -221,11 +261,39 @@ impl Runtime {
                 .expect("hydrate idempotency records"),
         );
 
+        // Build the V2.2 text + vector indexes from scratch and replay
+        // every live record into them. DocIds are minted fresh per run
+        // (see `mint_doc_id`); the reverse map (`doc_to_record`) is
+        // rebuilt alongside, so a restart trades a brief warm-up cost
+        // for not having to persist the doc-id assignment.
+        let mut text_idx = InMemoryInverted::new();
+        let mut vector_idx = HnswVectorIndex::new();
+        for r in persist.scan_all_records().expect("hydrate records") {
+            if r.deleted_at_ms.is_some() || r.is_expired() {
+                // GC will reap these; skip them at hydration time so
+                // they don't leak into the indexes.
+                continue;
+            }
+            let doc_id = mint_doc_id(&mut state.next_doc_seq);
+            index_record_into(&mut text_idx, &mut vector_idx, &r, doc_id);
+            state
+                .doc_to_record
+                .insert(doc_id, r.record_id.as_str().to_string());
+            state
+                .record_to_doc
+                .insert(r.record_id.as_str().to_string(), doc_id);
+            state
+                .records
+                .insert(r.record_id.as_str().to_string(), r);
+        }
+
         Arc::new(Self {
             state: Mutex::new(state),
             idem,
             persist: Some(persist),
             content,
+            text_index: StdMutex::new(text_idx),
+            vector_index: StdMutex::new(vector_idx),
         })
     }
 
@@ -642,6 +710,39 @@ impl Runtime {
             }
         }
 
+        // V2.2: validate every `source_refs[i].record_id` points to a live
+        // record in the same tenant. Records are V2.2's domain so they're
+        // strictly checked here (mirroring the artifact_refs check above).
+        //
+        // Other `SourceRef` variants are intentionally NOT validated:
+        // - `artifact_id`: the canonical artifact link is the
+        //   caller-explicit `artifact_refs: Vec<ArtifactRef>` field, which
+        //   is already validated above. `source_refs.artifact_id` is a
+        //   provenance hint, not a hard reference, so we don't double-walk.
+        // - `session_id` + `seq`: validating would require a per-session
+        //   `max_seq` lookup; events are append-only and a future V2.5
+        //   fork-protection pass will revisit cross-session refs.
+        // - `event_id`: `lookup_event_by_id` exists but V2.2 keeps the
+        //   validation surface narrow to records only.
+        // - `skill_id`: skills land in V2.3.
+        for sr in &req.source_refs {
+            if let Some(rec_id) = &sr.record_id {
+                let exists = (rec_id.kind() == crate::id::IdKind::Record)
+                    && s.records
+                        .get(rec_id.as_str())
+                        .is_some_and(|r| {
+                            r.deleted_at_ms.is_none()
+                                && r.tenant_id.as_str() == req.tenant_id.as_str()
+                        });
+                if !exists {
+                    return Err(Error::new(
+                        ErrorCode::RecordNotFound,
+                        format!("{}", rec_id),
+                    ));
+                }
+            }
+        }
+
         let (seq, policy_version, session_snapshot) = {
             // Re-acquire mutable access to the session row to mint the seq
             // and bump `last_active_at_ms`. The validation above already
@@ -879,6 +980,451 @@ impl Runtime {
         let hi = (req.session_id.as_str().to_string(), u64::MAX);
         Ok(s.events.range(lo..=hi).take(req.limit).map(|(_, v)| v.clone()).collect())
     }
+}
+
+/// V2.2 search request for `Runtime::search_records`. Either `text`,
+/// `embedding`, or both may be set; if both are absent, the runtime
+/// returns every live record under the `(tenant_id, namespace)` scope
+/// up to `limit`.
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub tenant_id: Id,
+    pub namespace: Vec<String>,
+    pub text: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    /// Post-index tag filter. A record matches when **every** tag in
+    /// this list is present in `SearchableRecord::tags`.
+    pub tags: Vec<String>,
+    /// Post-index source filter. A record matches when its `source`
+    /// is `Some(s)` and `s` matches every populated field of the
+    /// filter (unset fields don't constrain).
+    pub source_filter: Option<SourceRef>,
+    pub limit: usize,
+}
+
+impl SearchRequest {
+    /// Convenience: text-only search with no filters.
+    pub fn text_only(tenant_id: Id, namespace: Vec<String>, query: impl Into<String>, limit: usize) -> Self {
+        Self {
+            tenant_id,
+            namespace,
+            text: Some(query.into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit,
+        }
+    }
+}
+
+impl Runtime {
+    /// Create and persist a V2.2 [`SearchableRecord`]. The record is
+    /// indexed into the per-(tenant, namespace) text and vector indexes
+    /// according to its `policy` *before* it is persisted, so a search
+    /// against the in-memory cache cannot see a record that hasn't yet
+    /// hit the indexes. The persist step is last; on persist failure we
+    /// roll the indexes back to keep the runtime consistent with disk.
+    pub async fn write_record(&self, req: NewRecord) -> Result<SearchableRecord> {
+        let record = SearchableRecord::create(req);
+
+        // Validate tenant exists. We hold the state lock only for the
+        // tenant existence check; the index operations and persist
+        // happen after we drop it.
+        {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(record.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", record.tenant_id),
+                ));
+            }
+        }
+
+        // Mint the DocId and index the record. We do this before
+        // persisting so a successful indexes-then-persist failure path
+        // gives us a single thing to roll back (the index inserts) —
+        // we can't selectively delete a single doc from the BM25
+        // postings list cheaply, so on persist failure we tolerate the
+        // residual index entry: the corresponding record_id never gets
+        // committed to `state.records`, so search will look it up,
+        // find nothing, and skip it (the post-filter step rejects
+        // unknown record_ids).
+        let mut s = self.state.lock().await;
+        let doc_id = mint_doc_id(&mut s.next_doc_seq);
+        {
+            let mut text = self.text_index.lock().expect("text index lock");
+            let mut vec = self.vector_index.lock().expect("vector index lock");
+            index_record_into(&mut text, &mut vec, &record, doc_id);
+        }
+
+        // Persist with the state lock still held — concurrent
+        // `write_record`s for the same tenant + namespace mint distinct
+        // DocIds (counter is under the lock) and the persist order
+        // matches the index-insert order.
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_record(&record) {
+                // Persist failed: drop the cache + DocId mapping we
+                // were about to install. The index inserts above are
+                // not rolled back — see the long comment above.
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+        s.records
+            .insert(record.record_id.as_str().to_string(), record.clone());
+        s.doc_to_record
+            .insert(doc_id, record.record_id.as_str().to_string());
+        s.record_to_doc
+            .insert(record.record_id.as_str().to_string(), doc_id);
+        Ok(record)
+    }
+
+    /// Look up a record by primary key. Returns `RecordNotFound` if
+    /// the record is unknown, soft-deleted, expired, or owned by a
+    /// different tenant. The four cases collapse into a single error
+    /// code (mirroring `get_artifact`) so a caller in tenant A cannot
+    /// probe tenant B's record_ids by error-code differential.
+    pub async fn get_record(
+        &self,
+        tenant_id: &Id,
+        record_id: &Id,
+    ) -> Result<SearchableRecord> {
+        let s = self.state.lock().await;
+        s.records
+            .get(record_id.as_str())
+            .filter(|r| {
+                r.deleted_at_ms.is_none()
+                    && r.tenant_id.as_str() == tenant_id.as_str()
+                    && !r.is_expired()
+            })
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", record_id)))
+    }
+
+    /// Search the (tenant, namespace) scope. If `text` is set, run a
+    /// BM25 text search; if `embedding` is set, run a cosine
+    /// nearest-neighbor search; if both, run both and union by record
+    /// (keeping the higher score per record_id). If neither is set,
+    /// return every live record in the namespace, capped at `limit`.
+    ///
+    /// Tag and source post-filters are applied after the index step.
+    /// Soft-deleted and expired records are filtered out.
+    pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+        // Validate tenant exists. Tenant scope leaks would defeat the
+        // (tenant, namespace) isolation the index `path` already
+        // provides, so reject upfront.
+        {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+        }
+
+        let path = format!(
+            "{}::{}",
+            req.tenant_id.as_str(),
+            req.namespace.join("/")
+        );
+
+        // Allow some slack so post-filtering by tags/source can still
+        // produce `limit` matches even when a few top hits get filtered
+        // out. Capped to avoid a denial-of-service vector via huge
+        // search limits.
+        let slack = req.limit.saturating_mul(2).clamp(req.limit, 1024);
+
+        // Collect index hits as (doc_id, score). When neither text
+        // nor embedding is supplied we skip the indexes and return
+        // every live record in the namespace (subject to filters and
+        // limit) by walking the in-memory record cache directly.
+        let mut hits: BTreeMap<DocId, f32> = BTreeMap::new();
+        if let Some(query) = req.text.as_deref() {
+            let text = self.text_index.lock().expect("text index lock");
+            for (doc, score) in text.search(&path, query, slack) {
+                hits.entry(doc)
+                    .and_modify(|s| *s = s.max(score))
+                    .or_insert(score);
+            }
+        }
+        if let Some(emb) = req.embedding.as_deref() {
+            let vec = self.vector_index.lock().expect("vector index lock");
+            for (doc, score) in vec.knn(&path, emb, slack) {
+                hits.entry(doc)
+                    .and_modify(|s| *s = s.max(score))
+                    .or_insert(score);
+            }
+        }
+
+        let s = self.state.lock().await;
+
+        // Build the candidate list. Index-driven path: walk hits in
+        // descending-score order and resolve each DocId to a record.
+        // Brute-force path: walk every record in the namespace. We
+        // distinguish the two by whether `text` or `embedding` was set.
+        let candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some() || req.embedding.is_some() {
+            let mut ranked: Vec<(DocId, f32)> = hits.into_iter().collect();
+            ranked.sort_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked
+                .into_iter()
+                .filter_map(|(doc, score)| {
+                    let rid = s.doc_to_record.get(&doc)?;
+                    let r = s.records.get(rid)?;
+                    Some((r.clone(), score))
+                })
+                .collect()
+        } else {
+            s.records
+                .values()
+                .filter(|r| {
+                    r.tenant_id.as_str() == req.tenant_id.as_str()
+                        && r.namespace == req.namespace
+                })
+                .map(|r| (r.clone(), 0.0))
+                .collect()
+        };
+        drop(s);
+
+        // Post-filtering: tenant + namespace (defense in depth — the
+        // index `path` already isolates these, but a stale DocId from
+        // a deleted record could in principle still resolve to a
+        // record under a different namespace if the indexes ever drift),
+        // plus tags, source, soft-delete, and expiration.
+        let mut out: Vec<SearchableRecord> = Vec::new();
+        for (r, _score) in candidates {
+            if r.tenant_id.as_str() != req.tenant_id.as_str() {
+                continue;
+            }
+            if r.namespace != req.namespace {
+                continue;
+            }
+            if r.deleted_at_ms.is_some() || r.is_expired() {
+                continue;
+            }
+            if !req.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)) {
+                continue;
+            }
+            if let Some(filter) = &req.source_filter {
+                let Some(rs) = r.source.as_ref() else { continue };
+                if !source_ref_matches(rs, filter) {
+                    continue;
+                }
+            }
+            out.push(r);
+            if out.len() >= req.limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Soft-delete a record: set `deleted_at_ms = now`, persist the
+    /// updated row, and remove the entry from the text + vector
+    /// indexes (and the DocId mappings). Returns `RecordNotFound` if
+    /// the record is unknown or owned by a different tenant.
+    ///
+    /// Note that V2.2 does NOT support text-index removal cheaply
+    /// (the BM25 backend's `insert` is one-way). We "remove" by
+    /// dropping the DocId mapping; future searches still touch the
+    /// stale postings entry but the unresolvable DocId gets filtered
+    /// out at the resolve step. V2.4 will replace this with a proper
+    /// tombstoning pass.
+    pub async fn delete_record(&self, tenant_id: &Id, record_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s
+            .records
+            .get(record_id.as_str())
+            .is_some_and(|r| {
+                r.deleted_at_ms.is_none() && r.tenant_id.as_str() == tenant_id.as_str()
+            });
+        if !live {
+            return Err(Error::new(
+                ErrorCode::RecordNotFound,
+                format!("{}", record_id),
+            ));
+        }
+
+        // Mutate the record in place so the persisted shape matches
+        // the in-memory shape after the persist step.
+        let updated = {
+            let r = s
+                .records
+                .get_mut(record_id.as_str())
+                .expect("presence checked above");
+            r.deleted_at_ms = Some(crate::now_ms());
+            r.clone()
+        };
+
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_record(&updated) {
+                // Roll back the soft-delete in the cache so the
+                // in-memory state stays consistent with disk.
+                if let Some(r) = s.records.get_mut(record_id.as_str()) {
+                    r.deleted_at_ms = None;
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+
+        if let Some(doc) = s.record_to_doc.remove(record_id.as_str()) {
+            s.doc_to_record.remove(&doc);
+        }
+        Ok(())
+    }
+}
+
+/// Compare a record's `source` against a search filter. The filter
+/// only constrains the fields it sets — every populated filter field
+/// must match the record's corresponding field.
+fn source_ref_matches(rec: &SourceRef, filter: &SourceRef) -> bool {
+    fn match_id(r: &Option<Id>, f: &Option<Id>) -> bool {
+        match (r, f) {
+            (_, None) => true,
+            (Some(rid), Some(fid)) => rid.as_str() == fid.as_str(),
+            (None, Some(_)) => false,
+        }
+    }
+    fn match_u64(r: &Option<u64>, f: &Option<u64>) -> bool {
+        match (r, f) {
+            (_, None) => true,
+            (Some(rv), Some(fv)) => rv == fv,
+            (None, Some(_)) => false,
+        }
+    }
+    match_id(&rec.session_id, &filter.session_id)
+        && match_u64(&rec.seq, &filter.seq)
+        && match_id(&rec.event_id, &filter.event_id)
+        && match_id(&rec.artifact_id, &filter.artifact_id)
+        && match_id(&rec.record_id, &filter.record_id)
+        && match_id(&rec.skill_id, &filter.skill_id)
+}
+
+/// Mint a fresh `DocId` from the per-runtime counter. The pair
+/// `(0, seq)` plays the role `agentdb-index` reserves for
+/// `(session_internal_id, seq)` in event-driven uses. We don't have
+/// session_internal_ids for records, so we keep the first half pinned
+/// to `0` and let the second half be the unique counter — combined
+/// with the per-(tenant, namespace) `path` isolation already enforced
+/// by the indexes themselves, that's sufficient.
+fn mint_doc_id(next: &mut u64) -> DocId {
+    let seq = *next;
+    *next = next.checked_add(1).expect("doc_id counter overflow");
+    DocId::new(0, seq)
+}
+
+/// Index a record's text + (optional) embedding into the per-path
+/// indexes. Shared between `Runtime::write_record` and the hydration
+/// loop so a record that survives a restart is indexed exactly the
+/// same way it was on first write.
+fn index_record_into(
+    text: &mut InMemoryInverted,
+    vector: &mut HnswVectorIndex,
+    r: &SearchableRecord,
+    doc_id: DocId,
+) {
+    let path = format!("{}::{}", r.tenant_id.as_str(), r.namespace_path());
+    let indexable_text: Option<String> = match r.policy.mode {
+        IndexingMode::NoIndexing => None,
+        IndexingMode::MetadataOnly => Some(extract_metadata_strings(&r.metadata, &r.tags)),
+        IndexingMode::SelectedFields => Some(extract_selected_fields(
+            &r.metadata,
+            &r.policy.fields,
+            &r.tags,
+        )),
+        IndexingMode::SummaryOnly => r
+            .text
+            .as_ref()
+            .map(|s| s.chars().take(256).collect::<String>()),
+    };
+    if let Some(t) = indexable_text {
+        if !t.is_empty() {
+            text.insert(&path, doc_id, &t);
+        }
+    }
+    if r.policy.vector_allowed {
+        if let Some(emb) = r.embedding.as_ref() {
+            // Vector index only fails on dim-mismatch within a path;
+            // tracking the error per record would require widening
+            // the runtime API. For V2.2 we log and drop on mismatch
+            // so a single bad record can't poison the whole index.
+            if let Err(e) = vector.insert(&path, doc_id, emb) {
+                tracing::warn!(
+                    record_id = r.record_id.as_str(),
+                    path = path.as_str(),
+                    error = %e,
+                    "vector index insert failed; record will be text-searchable only"
+                );
+            }
+        }
+    }
+}
+
+/// Concatenate every string value reachable from `metadata` plus
+/// every tag, separated by spaces. Used by `IndexingMode::MetadataOnly`.
+fn extract_metadata_strings(metadata: &serde_json::Value, tags: &[String]) -> String {
+    let mut out = String::new();
+    for tag in tags {
+        out.push_str(tag);
+        out.push(' ');
+    }
+    walk_strings(metadata, &mut out);
+    out
+}
+
+fn walk_strings(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+            out.push(' ');
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                walk_strings(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                walk_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Concatenate the values of the named top-level fields in `metadata`
+/// (string-typed only) plus the tags. Used by
+/// `IndexingMode::SelectedFields`.
+fn extract_selected_fields(
+    metadata: &serde_json::Value,
+    fields: &[String],
+    tags: &[String],
+) -> String {
+    let mut out = String::new();
+    for tag in tags {
+        out.push_str(tag);
+        out.push(' ');
+    }
+    if let serde_json::Value::Object(map) = metadata {
+        for f in fields {
+            if let Some(serde_json::Value::String(s)) = map.get(f) {
+                out.push_str(s);
+                out.push(' ');
+            }
+        }
+    }
+    out
 }
 
 /// Verify a stored idempotency record matches the incoming request and replay

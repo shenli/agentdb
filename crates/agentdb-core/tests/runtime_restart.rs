@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use agentdb_core::agent::NewAgent;
 use agentdb_core::artifact::NewArtifact;
-use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime};
+use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord};
+use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime, SearchRequest};
 use agentdb_core::session::NewSession;
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
@@ -252,6 +253,85 @@ async fn artifacts_survive_restart() {
         .await
         .unwrap();
     assert_eq!(blob, b"hello");
+}
+
+#[tokio::test]
+async fn records_and_indexes_survive_restart() {
+    // V2.2: SearchableRecord persistence plus index hydration. Three
+    // records with different metadata should still come back from
+    // search_records after the runtime is dropped and reopened against
+    // the same KV directory — proving both the records hydrated AND
+    // the indexes were rebuilt against them.
+    let dir = TempDir::new().unwrap();
+
+    let (tenant_id, recorded_titles) = {
+        let kv = open_kv(dir.path());
+        let rt = Runtime::with_kv(kv, in_memory_content());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "rec-acme".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let titles = ["alpha quartet", "beta rhythm", "carrots are orange"];
+        for title in &titles {
+            rt.write_record(NewRecord {
+                tenant_id: t.tenant_id.clone(),
+                namespace: vec!["kb".into()],
+                scope: serde_json::json!({}),
+                text: None,
+                metadata: serde_json::json!({"title": title}),
+                tags: vec![],
+                source: None,
+                embedding: None,
+                policy: IndexingPolicy {
+                    mode: IndexingMode::MetadataOnly,
+                    fields: vec![],
+                    vector_allowed: false,
+                },
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        }
+        (t.tenant_id.clone(), titles)
+        // rt + its captured kv arc go out of scope here, releasing the
+        // single-writer rocks lock before we reopen below.
+    };
+
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
+
+    // Confirm a text query against the rebuilt indexes finds the right
+    // record — proves both the record hydrated and the index was
+    // re-populated for that record.
+    let hits = rt2
+        .search_records(SearchRequest::text_only(
+            tenant_id.clone(),
+            vec!["kb".into()],
+            "quartet",
+            10,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].metadata["title"], recorded_titles[0]);
+
+    // And a "search everything in namespace" query returns all three.
+    let all = rt2
+        .search_records(SearchRequest {
+            tenant_id,
+            namespace: vec!["kb".into()],
+            text: None,
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]

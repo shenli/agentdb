@@ -1,6 +1,6 @@
 use agentdb_storage::keys::{
     agent_record_key, artifact_by_sha256_key, artifact_record_key, event_by_id_key, event_key,
-    idempotency_key, session_record_key, tenant_record_key,
+    idempotency_key, record_by_namespace_key, record_key, session_record_key, tenant_record_key,
 };
 
 #[test]
@@ -61,4 +61,44 @@ fn artifact_record_and_by_sha256_have_disjoint_prefixes() {
     assert!(rec.starts_with("record/artifact/"));
     assert!(idx.starts_with("record/artifact_by_sha256/"));
     assert!(!idx.starts_with("record/artifact/"));
+}
+
+#[test]
+fn record_key_is_tenant_first() {
+    let k = record_key("ten_abc", "rec_xyz");
+    assert_eq!(k, "record/searchable/ten_abc/rec_xyz");
+}
+
+#[test]
+fn record_by_namespace_key_includes_namespace_path() {
+    let k = record_by_namespace_key("ten_abc", "agent/support", "rec_xyz");
+    assert_eq!(
+        k,
+        "record/searchable_by_namespace/ten_abc/agent/support/rec_xyz"
+    );
+}
+
+#[test]
+fn record_and_by_namespace_have_disjoint_prefixes() {
+    // `scan_all_records` scans `record/searchable/` as a prefix; it must NOT
+    // match the `record/searchable_by_namespace/...` secondary-index entries
+    // because the byte after `record/searchable` is `_` for the index but
+    // `/` for the record prefix.
+    let rec = record_key("t", "r");
+    let idx = record_by_namespace_key("t", "ns", "r");
+    assert!(rec.starts_with("record/searchable/"));
+    assert!(idx.starts_with("record/searchable_by_namespace/"));
+    assert!(!idx.starts_with("record/searchable/"));
+}
+
+#[test]
+fn record_key_disjoint_from_other_record_namespaces() {
+    // The `record/searchable/...` prefix must not be a parent of (or be
+    // shadowed by) any of the existing `record/{tenant,agent,session,artifact}/`
+    // namespaces — we lean on this for clean prefix scans during hydration.
+    let r = record_key("t", "r");
+    assert!(!r.starts_with("record/tenant/"));
+    assert!(!r.starts_with("record/agent/"));
+    assert!(!r.starts_with("record/session/"));
+    assert!(!r.starts_with("record/artifact/"));
 }

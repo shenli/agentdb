@@ -20,13 +20,14 @@ per-session `seq`, append-and-fetch, copy-free fork, durable SSE subscribe,
 warm/cold/archive lifecycle, tenant-first storage keys. The V2 runtime model is
 broader: it requires first-class Agent, Artifact, Searchable Record, Skill, and
 Policy objects; typed global IDs; explicit indexing policy; idempotency on the
-runtime path; and a clean `/v2` API surface.
+runtime path; and a clean-break `/api` API surface.
 
 V2 is a clean break. Under V2:
 
 - the Mongo wire facade (`agentdb-wire`, 2279 LoC) is deleted,
 - the Go SDK is deleted,
-- `/api/...` routes are replaced by `/v2/...` routes,
+- old `/api/...` route shapes are replaced by the new native `/api/...` route
+  shapes,
 - typed prefixed IDs (`ten_`, `agt_`, `ses_`, `evt_`, `art_`, `rec_`, `skl_`,
   `pol_`) become the wire format.
 
@@ -39,9 +40,10 @@ Recent commits (M27/M28) refer to "v2 routes." Those routes are V1-shape routes
 with auth-derived tenant, not the V2-spec runtime. To avoid confusion in the
 plan and PRs:
 
-- "auth-derived V1" or just "V1 routes" — current `/api/...` paths
+- "auth-derived V1" or just "V1 routes" — old `/api/...` paths
 - "V2 runtime" or "V2 spec" — the design in `docs/v2_design/`
-- "V2 routes" — `/v2/tenants/{tenant_id}/...` paths from §8 of the impl guide
+- "native runtime routes" — `/api/tenants/{tenant_id}/...` paths from §8 of the
+  impl guide
 
 ## 3. Keep-list (§11.1) — V2 says these V1 ideas remain right
 
@@ -49,7 +51,7 @@ plan and PRs:
 |---|---|---|
 | Session as core execution boundary | `agentdb-core/src/types.rs:65-85` | Keep, add agent ownership |
 | Per-session ordered `seq` | `Event.seq: u64` | Keep |
-| Append-and-fetch | `/api/sessions/:id/append_and_fetch` | Keep semantics, move to `/v2/...` |
+| Append-and-fetch | `/api/sessions/:id/append_and_fetch` | Keep semantics, move to the new `/api/...` shape |
 | Copy-free fork | `Session.forked_from: Option<ForkRef>` | Keep, expose at V2 path |
 | Durable + ephemeral subscribe | SSE in `agentdb-api/src/subscribe.rs`, broadcast channels | Keep, expose at V2 path |
 | Warm/cold/archive lifecycle | `agentdb-core/src/tiering.rs` + segment cold storage | Keep, surface as policy-driven |
@@ -63,10 +65,10 @@ plan and PRs:
 | Agent as only metadata | True — `Event::actor_id` free string only | Build first-class Agent: `agt_*` ID, registration, policies, skill bindings, session ownership |
 | Events as only main data model | True — no Artifact / Record / Skill / Policy primitives | Add Artifact, Searchable Record, Skill, Policy as runtime peers connected by source refs |
 | Large payloads inline | True — `Event.payload: serde_json::Value` always inline | Enforce inline vs artifact thresholds; add `artifact_refs: []` |
-| Last-N context only | True — only `fetch_recent` | Add `/v2/.../context` with byte/token budgets and inclusion filters |
+| Last-N context only | True — only `fetch_recent` | Add `/api/.../context` with byte/token budgets and inclusion filters |
 | Recursive indexing | True — `InMemoryInverted` indexes per-path across full payload | Add explicit indexing policy: `no_indexing`/`metadata_only`/`summary_only`/`selected_fields[]`; vector and artifact-derived allowed/denied |
 | Operator-first dashboard | True — `agentdb-dashboard` is an 11-line placeholder | Session-first UI: timeline, fork tree, artifacts, records, skills, replay |
-| Document-store adapters as primary API | True — `agentdb-wire` (2279 LoC) is the Mongo wire facade | Delete `agentdb-wire`. V2 native `/v2` is the only surface |
+| Document-store adapters as primary API | True — `agentdb-wire` (2279 LoC) is the Mongo wire facade | Delete `agentdb-wire`. The native runtime `/api` surface is the only surface |
 
 ## 5. First-class object coverage (§5)
 
@@ -238,42 +240,42 @@ search, lifecycle, or index policy — AgentDB is missing a primitive.
 
 | SDK | V1 | V2 disposition |
 |---|---|---|
-| Python | `clients/python/`, migrated to v2 routes (M27) | Rewrite for V2 spec `/v2` surface; remains P0 |
-| TypeScript | `clients/typescript/`, migrated to v2 routes (M27) | Rewrite for V2 spec `/v2` surface; P1 |
+| Python | `clients/python/`, migrated to v2 routes (M27) | Rewrite for clean-break `/api` surface; remains P0 |
+| TypeScript | `clients/typescript/`, migrated to v2 routes (M27) | Rewrite for clean-break `/api` surface; P1 |
 | Go | `clients/go/`, present | **Delete** — V2 §22 non-goal |
 
 Go callers may use the HTTP API directly; no maintained Go client.
 
 ## 15. Wire surface
 
-V1 routes (`/api/...`) are auth-derived but not V2-shape. V2 routes from impl
-guide §8:
+Old V1 routes (`/api/...`) are auth-derived but not V2-shape. Native runtime
+routes from impl guide §8:
 
 ```text
-/v2/tenants/{tenant_id}
-/v2/tenants/{tenant_id}/agents
-/v2/tenants/{tenant_id}/agents/{agent_id}
-/v2/tenants/{tenant_id}/agents/{agent_id}/sessions
-/v2/tenants/{tenant_id}/sessions/{session_id}
-/v2/tenants/{tenant_id}/sessions/{session_id}/events
-/v2/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
-/v2/tenants/{tenant_id}/sessions/{session_id}/replay
-/v2/tenants/{tenant_id}/sessions/{session_id}/fork
-/v2/tenants/{tenant_id}/sessions/{session_id}/subscribe       (SSE)
-/v2/tenants/{tenant_id}/sessions/{session_id}/context
-/v2/tenants/{tenant_id}/artifacts
-/v2/tenants/{tenant_id}/artifacts/{artifact_id}
-/v2/tenants/{tenant_id}/artifacts/{artifact_id}/blob
-/v2/tenants/{tenant_id}/records
-/v2/tenants/{tenant_id}/records/search
-/v2/tenants/{tenant_id}/records/{record_id}
-/v2/tenants/{tenant_id}/skills
-/v2/tenants/{tenant_id}/agents/{agent_id}/skills/bind
-/v2/tenants/{tenant_id}/agents/{agent_id}/skills
+/api/tenants/{tenant_id}
+/api/tenants/{tenant_id}/agents
+/api/tenants/{tenant_id}/agents/{agent_id}
+/api/tenants/{tenant_id}/agents/{agent_id}/sessions
+/api/tenants/{tenant_id}/sessions/{session_id}
+/api/tenants/{tenant_id}/sessions/{session_id}/events
+/api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
+/api/tenants/{tenant_id}/sessions/{session_id}/replay
+/api/tenants/{tenant_id}/sessions/{session_id}/fork
+/api/tenants/{tenant_id}/sessions/{session_id}/subscribe       (SSE)
+/api/tenants/{tenant_id}/sessions/{session_id}/context
+/api/tenants/{tenant_id}/artifacts
+/api/tenants/{tenant_id}/artifacts/{artifact_id}
+/api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
+/api/tenants/{tenant_id}/records
+/api/tenants/{tenant_id}/records/search
+/api/tenants/{tenant_id}/records/{record_id}
+/api/tenants/{tenant_id}/skills
+/api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
+/api/tenants/{tenant_id}/agents/{agent_id}/skills
 ```
 
-Decision: build `/v2/...` new; delete `/api/...` once the Python and TypeScript
-SDKs cut over.
+Decision: build the new native `/api/...` shape directly. No `/v2` path is
+needed because V2 is a clean break.
 
 ## 16. Crate-by-crate disposition
 
@@ -282,22 +284,19 @@ SDKs cut over.
 | `agentdb-core` | Extend. Add `agent`, `artifact`, `record`, `skill`, `policy`, `id_prefix` modules. Extend Event envelope. |
 | `agentdb-storage` | Keep. KV trait stable. Add artifact content backend trait with filesystem and object-store impls (storage engine decides inline vs spill), CAS API, generalized changefeed. |
 | `agentdb-index` | Extend. Add indexing-policy parameter. Vector accepts caller-supplied embedding. Add invalidation hook for source deletion. |
-| `agentdb-api` | Replace. Build `/v2/*` routes + DTOs new. Delete `/api/*` after SDK cutover. |
+| `agentdb-api` | Replace old handlers with the new native `/api/*` routes + DTOs. |
 | `agentdb-wire` | **Delete.** V2 explicitly drops the MongoDB facade. |
 | `agentdb-meta` | Extend. Add tables for Agent registration, Skill registry, Policy attachments, Idempotency results, Artifact metadata. |
 | `agentdb-dashboard` | Build. Session-first UI per V2 spec. |
-| `bin/agentdb-server` | No `--v2` flag needed if V1 is deleted in the same milestone. Otherwise gate behind `--v2` until cutover. |
+| `bin/agentdb-server` | No `--v2` flag. Serve the native runtime API directly. |
 | `clients/go` | **Delete.** |
-| `clients/python` | Rewrite for `/v2`. |
-| `clients/typescript` | Rewrite for `/v2`. |
+| `clients/python` | Rewrite for `/api`. |
+| `clients/typescript` | Rewrite for `/api`. |
 
 ## 17. Decisions to confirm before planning
 
-1. **Cutover model.** Single switch (delete V1 routes the same milestone V2
-   routes ship) vs parallel (`--v2` flag, V1 stays on `/api/...` until V2 is
-   stable). Recommendation: parallel for the duration of native V2 build, single
-   switch on the framework-adapter milestone. This avoids a long mixed-state
-   period without forcing the whole V2 effort behind one giant PR.
+1. **Cutover model.** Confirmed clean break. Build the new native `/api/...`
+   shape directly; do not add `/v2` routes or a `--v2` flag.
 2. **`agentdb-wire` deletion.** V2 spec confirms this. Confirm no external
    user is depending on the Mongo facade. Recommendation: delete in the V2
    cutover milestone.
@@ -328,5 +327,5 @@ SDKs cut over.
 
 V1's storage and durability primitives are V2-ready. The runtime model is not.
 V2 is a runtime-layer rewrite on top of mostly-unchanged storage, plus a wire
-break (typed IDs, `/v2/...` routes), plus deletion of two non-V2-aligned
+break (typed IDs and the new native `/api/...` shape), plus deletion of two non-V2-aligned
 subsystems (`agentdb-wire`, `clients/go`).

@@ -5,8 +5,9 @@
 //! avoid repeating them. Responses serialize the runtime types directly (no
 //! shape change needed there) — only the request shapes need adapting.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use agentdb_core::record::{IndexingPolicy, SearchableRecord};
 use agentdb_core::{ArtifactRef, SourceRef};
 
 #[derive(Debug, Deserialize)]
@@ -80,4 +81,80 @@ fn default_max_bytes() -> usize {
 
 fn default_fetch_limit() -> usize {
     100
+}
+
+/// Request body for `POST /api/tenants/:tenant_id/records`.
+///
+/// `tenant_id` comes from the path; the body has every other field that
+/// `agentdb_core::NewRecord` carries. All optional fields default sensibly via
+/// serde so a minimally-shaped body — `{"namespace": ["..."]}` — works.
+#[derive(Debug, Deserialize)]
+pub struct CreateRecordBody {
+    #[serde(default)]
+    pub namespace: Vec<String>,
+    #[serde(default = "default_policy")]
+    pub scope: serde_json::Value,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default = "default_policy")]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source: Option<SourceRef>,
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+    /// Caller-supplied indexing policy. If omitted, falls back to
+    /// `IndexingPolicy::default()` (metadata-only, no vector).
+    #[serde(default)]
+    pub policy: Option<IndexingPolicy>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Query params for `GET /api/tenants/:tenant_id/records/search`.
+///
+/// `namespace` and `tag` are repeatable. `embedding` is intentionally NOT
+/// exposed via GET — vector search lives behind a future `POST /search`
+/// endpoint (V2.2.5+). For now, drop into `Runtime::search_records` directly
+/// from in-process callers if you need ANN.
+#[derive(Debug, Deserialize)]
+pub struct SearchRecordsQuery {
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Repeatable: `?namespace=agent&namespace=support` →
+    /// `["agent", "support"]`. Empty list means "search at tenant root".
+    #[serde(default, rename = "namespace")]
+    pub namespace: Vec<String>,
+    /// Repeatable: `?tag=foo&tag=bar` → `["foo", "bar"]`. A record must
+    /// carry every requested tag to match.
+    #[serde(default, rename = "tag")]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source_session: Option<String>,
+    #[serde(default)]
+    pub source_seq: Option<u64>,
+    #[serde(default)]
+    pub source_artifact: Option<String>,
+    #[serde(default)]
+    pub source_record: Option<String>,
+    #[serde(default)]
+    pub source_skill: Option<String>,
+    #[serde(default)]
+    pub source_event: Option<String>,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+/// Response body for `GET /api/tenants/:tenant_id/records/search`.
+///
+/// Wrapped in an object for forward-compat — pagination cursors land here in
+/// a later milestone without breaking the wire shape.
+#[derive(Debug, Serialize)]
+pub struct SearchRecordsResponse {
+    pub records: Vec<SearchableRecord>,
 }
