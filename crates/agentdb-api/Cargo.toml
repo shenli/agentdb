@@ -9,3 +9,10 @@ license.workspace = true
 agentdb-core = { path = "../agentdb-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+agentdb-storage = { path = "../agentdb-storage" }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

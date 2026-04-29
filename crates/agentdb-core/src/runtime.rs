@@ -153,6 +153,41 @@ impl Runtime {
         })
     }
 
+    /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
+     /// match a live (non-soft-deleted) tenant.
+    pub async fn get_tenant(&self, tenant_id: &Id) -> V2Result<Tenant> {
+        let s = self.state.lock().await;
+        s.tenants
+            .get(tenant_id.as_str())
+            .filter(|t| t.deleted_at_ms.is_none())
+            .cloned()
+            .ok_or_else(|| V2Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
+    }
+
+    /// Look up an agent by id, scoped to the given tenant. Returns
+    /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
+    pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> V2Result<Agent> {
+        let s = self.state.lock().await;
+        s.agents
+            .get(agent_id.as_str())
+            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
+            .cloned()
+            .ok_or_else(|| V2Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+    }
+
+    /// Look up a session by id, scoped to the given tenant. Returns
+    /// `SessionNotFound` if the id is unknown or belongs to a different tenant.
+    pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> V2Result<Session> {
+        let s = self.state.lock().await;
+        s.sessions
+            .get(session_id.as_str())
+            .filter(|sess| {
+                sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .ok_or_else(|| V2Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+    }
+
     pub async fn create_tenant(&self, req: NewTenant) -> V2Result<Tenant> {
         let t = Tenant::create(req);
         {

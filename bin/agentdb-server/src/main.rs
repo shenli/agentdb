@@ -1,12 +1,12 @@
-//! `agentdb` binary — minimal scaffold.
+//! `agentdb` binary — V2.0 server entrypoint.
 //!
-//! The V1 server (Mongo wire, V1 REST, admin CLI subcommands) was deleted in
-//! the v2.0 restructure. The next milestone wires the new flat-namespace
-//! runtime + HTTP routes through this binary; for now it accepts a `--bind`
-//! address and starts an empty router so the build (and `cargo run --bin
-//! agentdb -- serve`) still produces something runnable.
+//! Mounts the v2 HTTP routes from `agentdb-api` against a `Runtime`. By default
+//! the runtime is RocksDB-backed at `--data-dir/runtime`; pass `--in-memory` to
+//! get the ephemeral backend (useful for smoke tests and local dev).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 
@@ -19,7 +19,7 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
-    /// Start the HTTP server with the empty v2 router.
+    /// Start the HTTP server with the V2.0 router.
     Serve(ServeOpts),
 }
 
@@ -28,6 +28,16 @@ struct ServeOpts {
     /// `host:port` to bind. Defaults to `127.0.0.1:8080`.
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
+
+    /// Filesystem path that holds the RocksDB-backed runtime state. Created if
+    /// it doesn't exist. Ignored when `--in-memory` is set.
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+
+    /// Use an ephemeral in-memory backend instead of RocksDB. Convenient for
+    /// smoke testing; everything is lost on shutdown.
+    #[arg(long)]
+    in_memory: bool,
 }
 
 #[tokio::main]
@@ -40,7 +50,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
-    let runtime = agentdb_core::Runtime::in_memory();
+    let runtime = if opts.in_memory {
+        tracing::info!("using in-memory runtime (state lost on shutdown)");
+        agentdb_core::Runtime::in_memory()
+    } else {
+        let kv_path = opts.data_dir.join("runtime");
+        std::fs::create_dir_all(&kv_path)?;
+        let kv = Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
+            as Arc<dyn agentdb_storage::KvStore + Send + Sync>;
+        tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
+        agentdb_core::Runtime::with_kv(kv)
+    };
+
     let state = agentdb_api::AppState { runtime };
     let app = agentdb_api::router(state);
     let listener = tokio::net::TcpListener::bind(opts.bind).await?;

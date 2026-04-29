@@ -1,21 +1,26 @@
 //! AgentDB HTTP API.
 //!
-//! V1 routes were deleted in the v2.0 restructure. This crate is currently a
-//! skeleton: [`AppState`] holds the runtime handle and [`router`] returns an
-//! empty `axum::Router`. The next milestone restores HTTP endpoints targeting
-//! the flat `agentdb_core::*` runtime.
+//! V2.0 routes wrap `agentdb_core::Runtime` (tenant / agent / session / event
+//! lifecycle). Auth, SSE subscribe, and the artifact / record / skill / policy
+//! surfaces are deliberately deferred to later milestones.
 
-use std::sync::Arc;
+pub mod dto;
+pub mod errors;
+pub mod routes;
+pub mod state;
+
+pub use errors::ApiError;
+pub use state::AppState;
 
 use axum::Router;
 
-use agentdb_core::Runtime;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub runtime: Arc<Runtime>,
+/// Build the V2.0 router with all runtime routes mounted under `/api/...`.
+pub fn build_router(state: AppState) -> Router {
+    routes::routes().with_state(state)
 }
 
+/// Backwards-compatible alias for callers that grew up calling `router(state)`.
+/// New code should prefer `build_router`.
 pub fn router(state: AppState) -> Router {
-    Router::new().with_state(state)
+    build_router(state)
 }
