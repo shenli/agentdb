@@ -5,8 +5,8 @@
 //! 2. Calls the runtime.
 //! 3. Returns either a serde-serialized runtime type or an `ApiError`.
 //!
-//! Wire DTOs live in `crate::dto`. Status codes for `V2Error` live in
-//! `crate::errors`.
+//! Wire DTOs live in `crate::dto`. Status codes for `agentdb_core::Error` live
+//! in `crate::errors`.
 
 use axum::{
     extract::{Path, Query, State},

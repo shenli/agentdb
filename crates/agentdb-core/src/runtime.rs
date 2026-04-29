@@ -19,15 +19,13 @@ use tokio::sync::Mutex;
 use agentdb_storage::KvStore;
 
 use crate::agent::{Agent, NewAgent};
-use crate::errors::{ErrorCode, V2Error};
+use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
 use crate::idempotency::{hash_payload, IdempotencyRecord, IdempotencyStore};
-use crate::persist::V2Persist;
+use crate::persist::Persist;
 use crate::session::{NewSession, Session};
 use crate::tenant::{NewTenant, Tenant};
-
-pub type V2Result<T> = Result<T, V2Error>;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -93,7 +91,7 @@ struct State {
 pub struct Runtime {
     state: Mutex<State>,
     idem: IdempotencyStore,
-    persist: Option<V2Persist>,
+    persist: Option<Persist>,
 }
 
 impl Runtime {
@@ -117,7 +115,7 @@ impl Runtime {
     /// post-restart correctness independent of backend-specific batch
     /// guarantees.
     pub fn with_kv(kv: Arc<dyn KvStore + Send + Sync>) -> Arc<Self> {
-        let persist = V2Persist::new(kv);
+        let persist = Persist::new(kv);
 
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {
@@ -155,29 +153,29 @@ impl Runtime {
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
      /// match a live (non-soft-deleted) tenant.
-    pub async fn get_tenant(&self, tenant_id: &Id) -> V2Result<Tenant> {
+    pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
         let s = self.state.lock().await;
         s.tenants
             .get(tenant_id.as_str())
             .filter(|t| t.deleted_at_ms.is_none())
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
+            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
     }
 
     /// Look up an agent by id, scoped to the given tenant. Returns
     /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
-    pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> V2Result<Agent> {
+    pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<Agent> {
         let s = self.state.lock().await;
         s.agents
             .get(agent_id.as_str())
             .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+            .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
     }
 
     /// Look up a session by id, scoped to the given tenant. Returns
     /// `SessionNotFound` if the id is unknown or belongs to a different tenant.
-    pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> V2Result<Session> {
+    pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> Result<Session> {
         let s = self.state.lock().await;
         s.sessions
             .get(session_id.as_str())
@@ -185,10 +183,10 @@ impl Runtime {
                 sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
             })
             .cloned()
-            .ok_or_else(|| V2Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
     }
 
-    pub async fn create_tenant(&self, req: NewTenant) -> V2Result<Tenant> {
+    pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
         let t = Tenant::create(req);
         {
             let mut s = self.state.lock().await;
@@ -200,11 +198,11 @@ impl Runtime {
         Ok(t)
     }
 
-    pub async fn create_agent(&self, req: NewAgent) -> V2Result<Agent> {
+    pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
         let a = {
             let mut s = self.state.lock().await;
             if !s.tenants.contains_key(req.tenant_id.as_str()) {
-                return Err(V2Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+                return Err(Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
             }
             let a = Agent::create(req);
             s.agents.insert(a.agent_id.as_str().to_string(), a.clone());
@@ -216,11 +214,11 @@ impl Runtime {
         Ok(a)
     }
 
-    pub async fn create_session(&self, req: NewSession) -> V2Result<Session> {
+    pub async fn create_session(&self, req: NewSession) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
             if !s.agents.contains_key(req.agent_id.as_str()) {
-                return Err(V2Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
+                return Err(Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
             }
             // Tenant existence is implicit via agent ownership for V2.0; cross-check
             // is added in V2.4 when policy attachment validates the relationship.
@@ -253,7 +251,7 @@ impl Runtime {
         (t, a, s)
     }
 
-    pub async fn append(&self, req: AppendRequest) -> V2Result<AppendResponse> {
+    pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
         let idem_full_key = req.idempotency_key.as_ref().map(|k| {
@@ -282,7 +280,7 @@ impl Runtime {
 
         let (seq, policy_version, session_snapshot) = {
             let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
-                V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+                Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
             let seq = session.next_seq;
             let pv = session.policy_version;
@@ -369,7 +367,7 @@ impl Runtime {
         req: AppendRequest,
         last: usize,
         _max_bytes: usize,
-    ) -> V2Result<AppendAndFetchResponse> {
+    ) -> Result<AppendAndFetchResponse> {
         // TODO(V2.4): enforce max_bytes
         let tenant_id = req.tenant_id.clone();
         let session_id = req.session_id.clone();
@@ -417,16 +415,16 @@ impl Runtime {
     /// ascending seq order. Returns `SessionNotFound` if the session does not
     /// exist. Returns an empty vec if `from_seq` is past the session's last
     /// committed seq.
-    pub async fn fetch_from_seq(&self, req: FetchRequest) -> V2Result<Vec<EventEnvelope>> {
+    pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         let s = self.state.lock().await;
         let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
-            V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+            Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
         })?;
         // tenant_id on FetchRequest finally becomes load-bearing for the KV
         // backend's tenant-scoped key encoding. Refuse mismatches outright so
         // callers can't sidestep tenancy by passing the wrong tenant.
         if session.tenant_id.as_str() != req.tenant_id.as_str() {
-            return Err(V2Error::new(
+            return Err(Error::new(
                 ErrorCode::SessionNotFound,
                 format!("{}", req.session_id),
             ));
@@ -455,10 +453,10 @@ impl Runtime {
 fn verify_idem_replay(
     rec: &IdempotencyRecord,
     payload: &serde_json::Value,
-) -> V2Result<AppendResponse> {
+) -> Result<AppendResponse> {
     let h = hash_payload(payload);
     if rec.payload_hash != h {
-        return Err(V2Error::new(
+        return Err(Error::new(
             ErrorCode::IdempotencyConflict,
             "payload differs for the same idempotency key",
         ));
@@ -469,7 +467,7 @@ fn verify_idem_replay(
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the
-/// V2Error code surface stable.
-fn internal(e: agentdb_storage::Error) -> V2Error {
-    V2Error::new(ErrorCode::Internal, e.to_string())
+/// Error code surface stable.
+fn internal(e: agentdb_storage::Error) -> Error {
+    Error::new(ErrorCode::Internal, e.to_string())
 }

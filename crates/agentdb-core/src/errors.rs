@@ -27,7 +27,7 @@ impl ErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct V2Error {
+pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
@@ -35,7 +35,9 @@ pub struct V2Error {
     pub suggestion: Option<String>,
 }
 
-impl V2Error {
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,

@@ -35,11 +35,11 @@ use crate::idempotency::IdempotencyRecord;
 use crate::session::Session;
 use crate::tenant::Tenant;
 
-pub(crate) struct V2Persist {
+pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
 }
 
-impl V2Persist {
+impl Persist {
     pub fn new(kv: Arc<dyn KvStore + Send + Sync>) -> Self {
         Self { kv }
     }
