@@ -7,29 +7,14 @@ license.workspace = true
 
 [dependencies]
 agentdb-storage = { path = "../agentdb-storage" }
-agentdb-index = { path = "../agentdb-index" }
-agentdb-meta = { path = "../agentdb-meta" }
-parking_lot = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
-object_store = { workspace = true }
-bson = { workspace = true }
-futures-util = "0.3"
-utoipa = { workspace = true }
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "time"] }
-async-trait = "0.1"
-bytes = "1"
-futures = "0.3"
 serial_test = "3"
-criterion = "0.5"
-
-[[bench]]
-name = "mvcc_bench"
-harness = false

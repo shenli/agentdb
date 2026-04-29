@@ -1,3 +1,0 @@
-# Compiled binaries from `go build .` in subdirs
-*.test
-*.out

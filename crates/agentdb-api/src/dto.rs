@@ -1,50 +1,83 @@
-use serde::{Deserialize, Serialize};
+//! Wire DTOs for the V2.0 HTTP routes.
+//!
+//! These are deliberately separate from the runtime types: HTTP path params
+//! already carry `tenant_id`, `agent_id`, `session_id`, so the request bodies
+//! avoid repeating them. Responses serialize the runtime types directly (no
+//! shape change needed there) — only the request shapes need adapting.
 
-#[derive(Deserialize, utoipa::ToSchema)]
-pub struct AppendAndFetchRequest {
-    pub event: serde_json::Value,
+use serde::Deserialize;
+
+use agentdb_core::{ArtifactRef, SourceRef};
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTenantBody {
+    pub external_key: String,
+    #[serde(default = "default_policy")]
+    pub policy: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAgentBody {
     #[serde(default)]
-    pub fetch_last_n: usize,
-    /// Optional agent identifier to attribute this event to. See
-    /// `docs/agent-db-v2.md` §2.3 for the agent-as-metadata stance —
-    /// free-form string, no pre-registration, no separate resource.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_id: Option<String>,
+    pub alias: Option<String>,
+    #[serde(default = "default_policy")]
+    pub config: serde_json::Value,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct AppendAndFetchResponse {
-    pub seq: u64,
-    pub recent: Vec<EventDto>,
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionBody {
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct EventDto {
-    pub seq: u64,
-    pub ts: u64,
-    /// Agent attribution, if any. Mirrors `Event::actor_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_id: Option<String>,
+#[derive(Debug, Deserialize)]
+pub struct AppendBody {
+    pub agent_id: String,
+    pub kind: String,
+    #[serde(default = "default_policy")]
     pub payload: serde_json::Value,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub source_refs: Vec<SourceRef>,
 }
 
-impl From<agentdb_core::Event> for EventDto {
-    fn from(e: agentdb_core::Event) -> Self {
-        Self {
-            seq: e.seq,
-            ts: e.ts,
-            actor_id: e.actor_id,
-            payload: e.payload,
-        }
-    }
+#[derive(Debug, Deserialize)]
+pub struct AppendAndFetchBody {
+    pub agent_id: String,
+    pub kind: String,
+    #[serde(default = "default_policy")]
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub source_refs: Vec<SourceRef>,
+    #[serde(default = "default_last")]
+    pub last: usize,
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
 }
 
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct FetchRecentRequest {
-    pub n: usize,
+#[derive(Debug, Deserialize)]
+pub struct FetchQuery {
+    #[serde(default)]
+    pub from_seq: u64,
+    #[serde(default = "default_fetch_limit")]
+    pub limit: usize,
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct FetchRecentResponse {
-    pub recent: Vec<EventDto>,
+fn default_policy() -> serde_json::Value {
+    serde_json::Value::Object(Default::default())
+}
+
+fn default_last() -> usize {
+    20
+}
+
+fn default_max_bytes() -> usize {
+    1_000_000
+}
+
+fn default_fetch_limit() -> usize {
+    100
 }
