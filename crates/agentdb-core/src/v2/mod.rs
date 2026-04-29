@@ -6,6 +6,7 @@ pub const VERSION: &str = "2026-04-28";
 
 pub mod agent;
 pub mod errors;
+pub mod event;
 pub mod id;
 pub mod session;
 pub mod tenant;
