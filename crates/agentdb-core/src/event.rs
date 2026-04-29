@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::{Id, IdKind};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRef {
     pub artifact_id: Id,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13,7 +13,7 @@ pub struct ArtifactRef {
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<Id>,

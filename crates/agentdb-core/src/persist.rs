@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, artifact_by_sha256_key, artifact_record_key,
-    event_by_id_key, event_key, session_alias_key, session_record_key, tenant_alias_key,
-    tenant_record_key,
+    event_by_id_key, event_key, record_by_namespace_key, record_key, session_alias_key,
+    session_record_key, tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
 
@@ -35,6 +35,7 @@ use crate::agent::Agent;
 use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
+use crate::record::SearchableRecord;
 use crate::session::Session;
 use crate::tenant::Tenant;
 
@@ -363,6 +364,61 @@ impl Persist {
             let rec: IdempotencyRecord =
                 serde_json::from_slice(&v).expect("idempotency record decodes");
             out.push((full_key, rec));
+        }
+        Ok(out)
+    }
+
+    /// Atomic write of a V2.2 searchable record's primary row plus the
+    /// `record_by_namespace` secondary index entry. Both rows are written
+    /// in one batch so a crash either reveals the new record + index
+    /// pair or neither — no half-state where a record is reachable by id
+    /// but missing from a namespace prefix scan (or vice versa).
+    pub fn put_record(&self, r: &SearchableRecord) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Put {
+                key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
+                value: serde_json::to_vec(r).expect("record serializes"),
+            },
+            WriteOp::Put {
+                key: record_by_namespace_key(
+                    r.tenant_id.as_str(),
+                    &r.namespace_path(),
+                    r.record_id.as_str(),
+                )
+                .into_bytes(),
+                value: r.record_id.as_str().as_bytes().to_vec(),
+            },
+        ];
+        self.kv.write_batch(ops)
+    }
+
+    /// Look up a record by primary key (tenant + record_id). Returns
+    /// `None` if the row is absent. Callers are responsible for
+    /// soft-delete and expiration filtering.
+    pub fn get_record(
+        &self,
+        tenant_id: &str,
+        record_id: &str,
+    ) -> KvResult<Option<SearchableRecord>> {
+        let raw = self.kv.get(record_key(tenant_id, record_id).as_bytes())?;
+        let Some(bytes) = raw else { return Ok(None) };
+        let r: SearchableRecord =
+            serde_json::from_slice(&bytes).expect("record decodes");
+        Ok(Some(r))
+    }
+
+    /// Hydrate every searchable record from the KV store. The
+    /// `record/searchable/` prefix is byte-disjoint from the secondary
+    /// index prefix `record/searchable_by_namespace/` (the byte after
+    /// `record/searchable` is `_` for the index but `/` for the record
+    /// prefix), so this scan does NOT pick up index entries.
+    pub fn scan_all_records(&self) -> KvResult<Vec<SearchableRecord>> {
+        let iter = self.kv.scan_prefix(b"record/searchable/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let r: SearchableRecord = serde_json::from_slice(&v).expect("record decodes");
+            out.push(r);
         }
         Ok(out)
     }
