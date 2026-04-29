@@ -158,7 +158,7 @@ function dashboard() {
     },
 
     async demoFork() {
-      await fetch('/api/tenants/t-demo/sessions/agent/append_and_fetch', {
+      await fetch('/api/sessions/agent/append_and_fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ event: { text: 'hello' }, fetch_last_n: 0 }),

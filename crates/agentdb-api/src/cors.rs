@@ -29,26 +29,26 @@ impl CorsConfig {
     }
 }
 
-/// Per-tenant CORS middleware for subscribe and channel routes.
+/// CORS middleware for v2 subscribe and channel routes.
 ///
-/// **v1 paths** (`/api/tenants/:tenant_id/...`): reads the tenant from
-/// the URL and checks it against the per-tenant CORS allowlist in
-/// `CorsConfig`. Only allowlisted origins receive the
-/// `Access-Control-Allow-Origin` header.
+/// v2 paths (`/api/sessions/:sid/subscribe`, `/api/subscribe`,
+/// `/api/channels/:c/publish`, `/api/channels/:c/subscribe`) carry
+/// no tenant in the URL — tenant is derived from auth/JWT, which
+/// runs *after* this middleware. With no path-tenant to look up
+/// against `CorsConfig::per_tenant`, the middleware applies
+/// default-permissive CORS: echoes back whatever `Origin` header
+/// the browser sent.
 ///
-/// **v2 paths** (anything else under `/api/`, e.g.
-/// `/api/sessions/:sid/subscribe`, `/api/channels/:c/publish`): the
-/// tenant cannot be extracted from the URL (it comes from auth/JWT,
-/// which runs *after* this middleware). For v2 paths the middleware
-/// applies default-permissive CORS: it echoes back whatever `Origin`
-/// header the browser sent, without consulting per-tenant config.
-/// This is intentionally broad for v2 until a v2-specific tenant
-/// lookup strategy is designed (tracked in Task 5b follow-up).
+/// `OPTIONS` preflight requests short-circuit with 204 carrying
+/// the CORS headers. Requests with no `Origin` header pass through
+/// untouched.
 ///
-/// `OPTIONS` preflight requests are short-circuited with 204 in both
-/// cases. Requests with no `Origin` header pass through untouched.
+/// Per-tenant CORS allowlist enforcement on v2 paths is a known
+/// limitation; reintroducing it requires either decoding the auth
+/// header inside this middleware (heavy) or moving CORS to a
+/// post-auth handler (breaks OPTIONS preflights). Tracked as M29.
 pub async fn cors_middleware(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -58,20 +58,9 @@ pub async fn cors_middleware(
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
 
-    let path = req.uri().path().to_string();
-    let tenant = extract_tenant_from_path(&path);
-
-    // For v1 paths: check per-tenant allowlist.
-    // For v2 paths (no tenant in URL): echo origin unconditionally
-    // when an Origin header is present (default-permissive).
-    let allowed = match (origin.as_deref(), tenant.as_deref()) {
-        (Some(o), Some(t)) => state.cors_config.allowed_origin(t, o),
-        (Some(o), None) => {
-            // v2 path — no tenant in URL; echo origin unconditionally.
-            Some(o.to_string())
-        }
-        _ => None,
-    };
+    // v2 default-permissive: echo the request's Origin back. No
+    // path-tenant to consult, no per-tenant allowlist applied.
+    let allowed = origin;
 
     if req.method() == Method::OPTIONS {
         let mut resp = Response::builder()
@@ -105,40 +94,6 @@ pub async fn cors_middleware(
         h.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
     resp
-}
-
-/// Pull the tenant id out of paths shaped like
-/// `/api/tenants/<id>/...`. Returns `None` for non-tenant paths
-/// (health, metrics, admin, …) — those skip CORS entirely because
-/// the middleware is only layered on the subscribe routes.
-fn extract_tenant_from_path(path: &str) -> Option<String> {
-    let mut parts = path.split('/').filter(|s| !s.is_empty());
-    if parts.next()? != "api" {
-        return None;
-    }
-    if parts.next()? != "tenants" {
-        return None;
-    }
-    Some(parts.next()?.to_string())
-}
-
-#[cfg(test)]
-mod path_tests {
-    use super::extract_tenant_from_path;
-
-    #[test]
-    fn extracts_tenant_from_subscribe_paths() {
-        assert_eq!(
-            extract_tenant_from_path("/api/tenants/t-1/subscribe"),
-            Some("t-1".into())
-        );
-        assert_eq!(
-            extract_tenant_from_path("/api/tenants/t-1/sessions/s-1/subscribe"),
-            Some("t-1".into())
-        );
-        assert_eq!(extract_tenant_from_path("/health/ready"), None);
-        assert_eq!(extract_tenant_from_path("/api/admin/nodes"), None);
-    }
 }
 
 #[cfg(test)]

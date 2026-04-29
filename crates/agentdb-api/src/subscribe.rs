@@ -455,8 +455,8 @@ fn kind_matches(env: &EventEnvelope, kind_filter: &[String]) -> bool {
         .is_some_and(|k| kind_filter.iter().any(|f| f == k))
 }
 
-/// Query string for `GET /api/tenants/{tenant_id}/subscribe`. All
-/// fields are optional (spec §6.5).
+/// Query string for `GET /api/subscribe` (tenant-wide). All fields
+/// are optional (spec §6.5).
 ///
 /// `session` and `kind` are repeated-key vectors decoded via
 /// `serde_html_form` (matching [`SubscribeQuery`]). `session` is a
@@ -885,7 +885,6 @@ pub async fn subscribe_session_keyed(
         &state,
         &session,
         authed.as_deref(),
-        "subscribe",
     )
     .await
     {

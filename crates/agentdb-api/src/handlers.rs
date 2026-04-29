@@ -183,7 +183,6 @@ pub async fn append_and_fetch_session_keyed(
         &state,
         &session,
         authed.as_deref(),
-        "append_and_fetch",
     )
     .await
     {
@@ -233,7 +232,6 @@ pub async fn fetch_recent_session_keyed(
         &state,
         &session,
         authed.as_deref(),
-        "fetch_recent",
     )
     .await
     {

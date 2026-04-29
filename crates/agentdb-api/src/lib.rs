@@ -60,10 +60,11 @@ pub struct AppState {
     /// `docs/superpowers/specs/2026-04-25-pubsub-design.md` §6.7.
     pub event_bus: EventBus,
     pub http: reqwest::Client,
-    /// M19 auth config. `None` → no auth required; the Basic
-    /// Auth middleware is a no-op. `Some` → `/api/tenants/*`
-    /// endpoints require `Authorization: Basic <...>` that
-    /// verifies against a user in the meta store.
+    /// Auth config. `None` → no auth required; the Basic Auth
+    /// middleware is a no-op (used by some `auth: None` infrastructure
+    /// tests). `Some` → session/subscribe endpoints require
+    /// `Authorization: Basic <...>` that verifies against a user
+    /// in the meta store.
     pub auth: Option<AuthConfig>,
     /// Admin-plane auth config (post-M25). `None` → admin
     /// endpoints stay open (dev mode, backward compat).

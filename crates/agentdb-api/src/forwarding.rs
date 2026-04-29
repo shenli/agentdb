@@ -138,8 +138,10 @@ pub async fn forward_request(
     Ok(resp)
 }
 
-/// Forward a POST `/api/tenants/:tid/sessions/:sid/append_and_fetch`
-/// to `target` and return the remote response verbatim.
+/// Forward a POST `/api/sessions/:sid/append_and_fetch` to `target`
+/// and return the remote response verbatim. The `tenant_id` arg is
+/// retained for parity with prior call sites; the forwarded URL no
+/// longer carries it.
 pub async fn forward_append_and_fetch(
     http: &Client,
     target: &NodeTarget,
@@ -446,10 +448,10 @@ mod tests {
             address: "127.0.0.1:9999".into(),
             mongo_address: None,
         };
-        let r = subscribe_not_owner_reply(&target, "/api/tenants/t-1/sessions/s-1/subscribe");
+        let r = subscribe_not_owner_reply(&target, "/api/sessions/s-1/subscribe");
         assert_eq!(r.status().as_u16(), 421);
         let loc = r.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-        assert_eq!(loc, "http://127.0.0.1:9999/api/tenants/t-1/sessions/s-1/subscribe");
+        assert_eq!(loc, "http://127.0.0.1:9999/api/sessions/s-1/subscribe");
     }
 
     #[test]
