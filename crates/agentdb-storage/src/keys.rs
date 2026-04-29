@@ -46,3 +46,14 @@ pub fn event_by_id_key(tenant_id: &str, event_id: &str) -> String {
 pub fn idempotency_key(tenant_id: &str, operation: &str, target: &str, key: &str) -> String {
     format!("idempotency/{tenant_id}/{operation}/{target}/{key}")
 }
+
+pub fn artifact_record_key(tenant_id: &str, artifact_id: &str) -> String {
+    format!("record/artifact/{tenant_id}/{artifact_id}")
+}
+
+/// Secondary index keyed by sha256 hex digest. Populated on every artifact
+/// write so a future dedup pass (V2.1+) can land without rewriting the
+/// batched-write path; V2.1 itself does not expose a lookup-by-sha256 API.
+pub fn artifact_by_sha256_key(tenant_id: &str, sha256_hex: &str) -> String {
+    format!("record/artifact_by_sha256/{tenant_id}/{sha256_hex}")
+}
