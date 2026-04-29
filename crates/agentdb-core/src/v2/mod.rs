@@ -9,6 +9,7 @@ pub mod errors;
 pub mod event;
 pub mod id;
 pub mod idempotency;
+pub(crate) mod persist;
 pub mod runtime;
 pub mod session;
 pub mod tenant;

@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     pub payload_hash: u64,
     pub result_json: String,
@@ -24,6 +26,17 @@ impl IdempotencyStore {
     }
     pub fn put(&self, key: String, record: IdempotencyRecord) {
         self.inner.lock().unwrap().insert(key, record);
+    }
+    /// Bulk-load records (used by `Runtime::with_kv` to hydrate the in-memory
+    /// idempotency table from persisted state at startup).
+    pub fn extend<I>(&self, records: I)
+    where
+        I: IntoIterator<Item = (String, IdempotencyRecord)>,
+    {
+        let mut g = self.inner.lock().unwrap();
+        for (k, v) in records {
+            g.insert(k, v);
+        }
     }
 }
 

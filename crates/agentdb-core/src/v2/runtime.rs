@@ -1,21 +1,31 @@
-//! V2 runtime — atomic append, idempotency, basic in-memory state.
+//! V2 runtime — atomic append, idempotency, in-memory state with optional
+//! KV-backed persistence (Task 11).
 //!
-//! Task 11 will replace the in-memory state with KV-backed persistence; the
-//! public API surface (Runtime, AppendRequest, etc.) is meant to stay stable
-//! across that transition.
+//! `Runtime::in_memory()` keeps the original ephemeral behavior (used by every
+//! pre-Task-11 unit/integration test). `Runtime::with_kv(kv)` mirrors every
+//! mutation into the supplied `KvStore` and hydrates from it on startup, so
+//! sessions, events, and idempotency records survive restarts.
+//!
+//! Atomicity contract for `append` (per Task 9 fix): the event row, the
+//! updated session row, and the idempotency record (if present) commit
+//! together. With KV this is implemented via `KvStore::write_batch`; with
+//! in-memory it's the state mutex.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
-use crate::v2::id::Id;
-use crate::v2::tenant::{Tenant, NewTenant};
+use agentdb_storage::KvStore;
+
 use crate::v2::agent::{Agent, NewAgent};
-use crate::v2::session::{Session, NewSession};
-use crate::v2::event::{EventEnvelope, NewEvent, ArtifactRef, SourceRef};
-use crate::v2::errors::{V2Error, ErrorCode};
-use crate::v2::idempotency::{IdempotencyStore, IdempotencyRecord, hash_payload};
+use crate::v2::errors::{ErrorCode, V2Error};
+use crate::v2::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+use crate::v2::id::Id;
+use crate::v2::idempotency::{hash_payload, IdempotencyRecord, IdempotencyStore};
+use crate::v2::persist::V2Persist;
+use crate::v2::session::{NewSession, Session};
+use crate::v2::tenant::{NewTenant, Tenant};
 
 pub type V2Result<T> = Result<T, V2Error>;
 
@@ -74,13 +84,16 @@ struct State {
     tenants: BTreeMap<String, Tenant>,
     agents: BTreeMap<String, Agent>,
     sessions: BTreeMap<String, Session>,
-    /// Keyed by (session_id, seq) for ordered scan.
+    /// Keyed by (session_id, seq) for ordered scan. Only populated in the
+    /// in-memory backend; the KV backend reads events back from storage on
+    /// demand instead of carrying a duplicate copy in memory.
     events: BTreeMap<(String, u64), EventEnvelope>,
 }
 
 pub struct Runtime {
     state: Mutex<State>,
     idem: IdempotencyStore,
+    persist: Option<V2Persist>,
 }
 
 impl Runtime {
@@ -88,34 +101,101 @@ impl Runtime {
         Arc::new(Self {
             state: Mutex::new(State::default()),
             idem: IdempotencyStore::default(),
+            persist: None,
+        })
+    }
+
+    /// Build a Runtime backed by `kv`. Hydrates tenants, agents, sessions, and
+    /// idempotency records from storage at startup; events are NOT preloaded
+    /// and are read on demand via `fetch_from_seq`.
+    ///
+    /// Reconciliation: for every hydrated session, the highest persisted event
+    /// seq is checked and `next_seq` is bumped past it if needed. This is a
+    /// belt-and-suspenders defense against partial-batch states that
+    /// theoretically shouldn't exist (the append path uses `write_batch` which
+    /// the RocksDB backend honors atomically) but is cheap to do and makes
+    /// post-restart correctness independent of backend-specific batch
+    /// guarantees.
+    pub fn with_kv(kv: Arc<dyn KvStore + Send + Sync>) -> Arc<Self> {
+        let persist = V2Persist::new(kv);
+
+        let mut state = State::default();
+        for t in persist.scan_all_tenants().expect("hydrate tenants") {
+            state.tenants.insert(t.tenant_id.as_str().to_string(), t);
+        }
+        for a in persist.scan_all_agents().expect("hydrate agents") {
+            state.agents.insert(a.agent_id.as_str().to_string(), a);
+        }
+        for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
+            // Reconcile next_seq against persisted events.
+            let max_seq = persist
+                .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
+                .expect("hydrate session events");
+            if let Some(m) = max_seq {
+                if s.next_seq <= m {
+                    s.next_seq = m + 1;
+                }
+            }
+            state.sessions.insert(s.session_id.as_str().to_string(), s);
+        }
+
+        let idem = IdempotencyStore::default();
+        idem.extend(
+            persist
+                .scan_all_idempotency()
+                .expect("hydrate idempotency records"),
+        );
+
+        Arc::new(Self {
+            state: Mutex::new(state),
+            idem,
+            persist: Some(persist),
         })
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> V2Result<Tenant> {
         let t = Tenant::create(req);
-        self.state.lock().await.tenants.insert(t.tenant_id.as_str().to_string(), t.clone());
+        {
+            let mut s = self.state.lock().await;
+            s.tenants.insert(t.tenant_id.as_str().to_string(), t.clone());
+        }
+        if let Some(p) = &self.persist {
+            p.put_tenant(&t).map_err(internal)?;
+        }
         Ok(t)
     }
 
     pub async fn create_agent(&self, req: NewAgent) -> V2Result<Agent> {
-        let mut s = self.state.lock().await;
-        if !s.tenants.contains_key(req.tenant_id.as_str()) {
-            return Err(V2Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+        let a = {
+            let mut s = self.state.lock().await;
+            if !s.tenants.contains_key(req.tenant_id.as_str()) {
+                return Err(V2Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id)));
+            }
+            let a = Agent::create(req);
+            s.agents.insert(a.agent_id.as_str().to_string(), a.clone());
+            a
+        };
+        if let Some(p) = &self.persist {
+            p.put_agent(&a).map_err(internal)?;
         }
-        let a = Agent::create(req);
-        s.agents.insert(a.agent_id.as_str().to_string(), a.clone());
         Ok(a)
     }
 
     pub async fn create_session(&self, req: NewSession) -> V2Result<Session> {
-        let mut s = self.state.lock().await;
-        if !s.agents.contains_key(req.agent_id.as_str()) {
-            return Err(V2Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
+        let sess = {
+            let mut s = self.state.lock().await;
+            if !s.agents.contains_key(req.agent_id.as_str()) {
+                return Err(V2Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)));
+            }
+            // Tenant existence is implicit via agent ownership for V2.0; cross-check
+            // is added in V2.4 when policy attachment validates the relationship.
+            let sess = Session::create(req);
+            s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
+            sess
+        };
+        if let Some(p) = &self.persist {
+            p.put_session(&sess).map_err(internal)?;
         }
-        // Tenant existence is implicit via agent ownership for V2.0; cross-check
-        // is added in V2.4 when policy attachment validates the relationship.
-        let sess = Session::create(req);
-        s.sessions.insert(sess.session_id.as_str().to_string(), sess.clone());
         Ok(sess)
     }
 
@@ -165,7 +245,7 @@ impl Runtime {
             }
         }
 
-        let (seq, policy_version) = {
+        let (seq, policy_version, session_snapshot) = {
             let session = s.sessions.get_mut(req.session_id.as_str()).ok_or_else(|| {
                 V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
@@ -173,7 +253,7 @@ impl Runtime {
             let pv = session.policy_version;
             session.next_seq += 1;
             session.last_active_at_ms = super::now_ms();
-            (seq, pv)
+            (seq, pv, session.clone())
         };
 
         let envelope = EventEnvelope::create(NewEvent {
@@ -189,10 +269,43 @@ impl Runtime {
             policy_version,
         });
         let event_id = envelope.event_id.clone();
-        let key = (req.session_id.as_str().to_string(), seq);
-        s.events.insert(key, envelope);
 
         let resp = AppendResponse { event_id, seq };
+
+        // Build the idempotency record up-front so both the in-memory and KV
+        // commit paths can use it.
+        let idem_record = idem_full_key.as_ref().map(|_| IdempotencyRecord {
+            payload_hash: hash_payload(&req.payload),
+            result_json: serde_json::to_string(&resp).unwrap(),
+        });
+
+        // Atomic commit. With persist=Some, we use KvStore::write_batch to bind
+        // event + session + idempotency record into a single durable write so
+        // the Task 9 invariant (idempotency record commit is in the same atomic
+        // boundary as the event+session commit) survives crashes.
+        if let Some(p) = &self.persist {
+            let pair = idem_full_key
+                .as_ref()
+                .zip(idem_record.as_ref())
+                .map(|(k, r)| (k.as_str(), r));
+            // If the batch fails we must NOT have mutated visible state. We've
+            // already touched session.next_seq above, so on failure we roll it
+            // back before returning an error.
+            if let Err(e) = p.append_batch(&envelope, &session_snapshot, pair) {
+                if let Some(sess) = s.sessions.get_mut(req.session_id.as_str()) {
+                    sess.next_seq = seq;
+                    // last_active_at_ms is monotonic-ish; leaving it advanced
+                    // is harmless and reverting would require capturing the
+                    // pre-image. Skip for simplicity.
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        } else {
+            // In-memory backend: keep the events map populated.
+            let key = (req.session_id.as_str().to_string(), seq);
+            s.events.insert(key, envelope);
+        }
 
         // Record the idempotency result while still holding the state lock so
         // concurrent appends with the same key serialize cleanly: any racing
@@ -200,14 +313,8 @@ impl Runtime {
         // instead of committing a second event. Lock order is (state -> idem)
         // and the idempotency store never reaches back into state, so there is
         // no deadlock risk despite holding both briefly.
-        if let Some(full) = idem_full_key {
-            self.idem.put(
-                full,
-                IdempotencyRecord {
-                    payload_hash: hash_payload(&req.payload),
-                    result_json: serde_json::to_string(&resp).unwrap(),
-                },
-            );
+        if let (Some(full), Some(rec)) = (idem_full_key, idem_record) {
+            self.idem.put(full, rec);
         }
         drop(s);
 
@@ -229,8 +336,28 @@ impl Runtime {
         _max_bytes: usize,
     ) -> V2Result<AppendAndFetchResponse> {
         // TODO(V2.4): enforce max_bytes
+        let tenant_id = req.tenant_id.clone();
         let session_id = req.session_id.clone();
         let appended = self.append(req).await?;
+
+        // KV-backed: scan the session's events from storage so we don't need to
+        // also keep an in-memory copy. We bound the scan with `last` by reading
+        // from seq 0 with a high enough limit; for V2.0 sessions are small.
+        if let Some(p) = &self.persist {
+            let mut all = p
+                .scan_events(tenant_id.as_str(), session_id.as_str(), 0, usize::MAX)
+                .map_err(internal)?;
+            // Tail of length `last`, in ascending seq order.
+            if all.len() > last {
+                let drop_n = all.len() - last;
+                all.drain(0..drop_n);
+            }
+            return Ok(AppendAndFetchResponse {
+                event_id: appended.event_id,
+                seq: appended.seq,
+                recent: all,
+            });
+        }
 
         let s = self.state.lock().await;
         let lo = (session_id.as_str().to_string(), 0);
@@ -257,8 +384,30 @@ impl Runtime {
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> V2Result<Vec<EventEnvelope>> {
         let s = self.state.lock().await;
-        if !s.sessions.contains_key(req.session_id.as_str()) {
-            return Err(V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)));
+        let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
+            V2Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+        })?;
+        // tenant_id on FetchRequest finally becomes load-bearing for the KV
+        // backend's tenant-scoped key encoding. Refuse mismatches outright so
+        // callers can't sidestep tenancy by passing the wrong tenant.
+        if session.tenant_id.as_str() != req.tenant_id.as_str() {
+            return Err(V2Error::new(
+                ErrorCode::SessionNotFound,
+                format!("{}", req.session_id),
+            ));
+        }
+
+        if let Some(p) = &self.persist {
+            // Drop the lock before the KV scan to avoid blocking other appends.
+            drop(s);
+            return p
+                .scan_events(
+                    req.tenant_id.as_str(),
+                    req.session_id.as_str(),
+                    req.from_seq,
+                    req.limit,
+                )
+                .map_err(internal);
         }
         let lo = (req.session_id.as_str().to_string(), req.from_seq);
         let hi = (req.session_id.as_str().to_string(), u64::MAX);
@@ -281,4 +430,11 @@ fn verify_idem_replay(
     }
     let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
     Ok(resp)
+}
+
+/// Map a storage-layer error into a V2 `Internal` error. The persist layer
+/// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the
+/// V2Error code surface stable.
+fn internal(e: agentdb_storage::Error) -> V2Error {
+    V2Error::new(ErrorCode::Internal, e.to_string())
 }
