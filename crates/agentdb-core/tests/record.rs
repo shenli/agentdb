@@ -32,7 +32,10 @@ fn create_assigns_typed_id_and_default_shape() {
     assert!(r.deleted_at_ms.is_none());
     assert!(r.expires_at_ms.is_none());
     assert!(r.created_at_ms > 0);
-    assert_eq!(r.namespace, vec!["agent".to_string(), "support".to_string()]);
+    assert_eq!(
+        r.namespace,
+        vec!["agent".to_string(), "support".to_string()]
+    );
     assert_eq!(r.text.as_deref(), Some("hello world"));
 }
 

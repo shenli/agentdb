@@ -149,10 +149,7 @@ pub async fn mint(
 /// real deployment would index on a prefix to cut the scan
 /// down, but per-request cost is already a single atomic
 /// per entry.
-pub async fn verify(
-    pool: &AnyPool,
-    presented: &str,
-) -> MetaResult<Option<(String, AdminScope)>> {
+pub async fn verify(pool: &AnyPool, presented: &str) -> MetaResult<Option<(String, AdminScope)>> {
     let candidate = B64.encode(sha256(presented.as_bytes()));
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT token_id, token_hash_b64, scope FROM admin_tokens WHERE revoked_at_ms IS NULL",
@@ -163,12 +160,7 @@ pub async fn verify(
     // independent of token position.
     let mut matched: Option<(String, AdminScope)> = None;
     for (id, hash, scope) in rows {
-        if candidate
-            .as_bytes()
-            .ct_eq(hash.as_bytes())
-            .unwrap_u8()
-            == 1
-        {
+        if candidate.as_bytes().ct_eq(hash.as_bytes()).unwrap_u8() == 1 {
             // First match wins — the hash index is UNIQUE, so
             // there can't be two.
             if matched.is_none() {
@@ -264,13 +256,12 @@ mod tests {
         let minted = mint(&p, "bootstrap", AdminScope::Admin, 100).await.unwrap();
         assert!(minted.plaintext.starts_with(TOKEN_PREFIX));
         // Plaintext never hits the DB.
-        let (rows,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM admin_tokens WHERE token_hash_b64 = ?",
-        )
-        .bind(B64.encode(sha256(minted.plaintext.as_bytes())))
-        .fetch_one(&p)
-        .await
-        .unwrap();
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM admin_tokens WHERE token_hash_b64 = ?")
+                .bind(B64.encode(sha256(minted.plaintext.as_bytes())))
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(rows, 1);
     }
 
@@ -336,7 +327,9 @@ mod tests {
     #[tokio::test]
     async fn readonly_scope_roundtrips_through_list() {
         let p = pool().await;
-        let _ = mint(&p, "grafana", AdminScope::Readonly, 100).await.unwrap();
+        let _ = mint(&p, "grafana", AdminScope::Readonly, 100)
+            .await
+            .unwrap();
         let _ = mint(&p, "cron", AdminScope::Admin, 200).await.unwrap();
         let active = list_active(&p).await.unwrap();
         let scopes: std::collections::HashMap<&str, AdminScope> = active

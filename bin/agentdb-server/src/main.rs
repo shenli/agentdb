@@ -76,9 +76,8 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             .unwrap_or_else(|| opts.data_dir.join("content"));
         std::fs::create_dir_all(&content_dir)?;
         tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
-        let content: Arc<dyn agentdb_storage::ContentBackend> = Arc::new(
-            agentdb_storage::LocalFsContentBackend::new(&content_dir),
-        );
+        let content: Arc<dyn agentdb_storage::ContentBackend> =
+            Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
         agentdb_core::Runtime::with_kv(kv, content)
     };
 

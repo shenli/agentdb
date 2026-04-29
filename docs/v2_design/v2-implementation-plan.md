@@ -55,14 +55,14 @@ These are decided up front so they don't get re-litigated in every milestone.
 | Decision | Choice |
 |---|---|
 | Cutover model | Clean break. The native runtime API uses `/api/...`; no `/v2` path and no compatibility shim are required. Delete or ignore the old V1 surface instead of running parallel routes. |
-| `agentdb-wire` Mongo facade | Deleted at V2.8. |
-| `clients/go` | Deleted at V2.8. |
+| `agentdb-wire` Mongo facade | Deleted at V2.7. |
+| `clients/go` | Deleted at V2.7. |
 | Storage backends | Unchanged: RocksDB + SlateDB for KV, object_store for blobs/cold, Postgres for control-plane meta. |
 | ID format | UUIDv7 with type prefixes (`ten_`, `agt_`, `ses_`, `evt_`, `art_`, `rec_`, `skl_`, `pol_`). Internal `u64` IDs persist inside the existing 31-byte key encoding for backward storage compatibility. |
 | Policy persistence | Long-lived policy + attachment records in `agentdb-meta` (Postgres). Hot-path policy decisions cached locally in the runtime core; refreshed asynchronously (V2 §12.2). |
-| SDK priority | Python rewrite at V2.7 (P0). TypeScript rewrite at V2.7 (P0). Go: deleted. |
-| Framework adapter | LangGraph at V2.9. Validation rule: adapter must be mostly mapping code. |
-| Dashboard | Built at V2.9 alongside the adapter, so it can demonstrate real adapter traffic. |
+| SDK priority | Python rewrite at V2.6 (P0). TypeScript rewrite at V2.6 (P0). Go: deleted. |
+| Framework adapter | LangGraph at V2.8. Validation rule: adapter must be mostly mapping code. |
+| Dashboard | Built at V2.8 alongside the adapter, so it can demonstrate real adapter traffic. |
 | Schema versioning | Every event payload, every searchable record, every skill manifest, every policy carries `schema_version: "YYYY-MM-DD"`. V2 baseline: `2026-04-28`. |
 | Idempotency | P0 on event append + append-and-fetch (V2.0). Extended to artifact/record/skill/policy mutations at their respective milestones. |
 | Deletion model | Soft-delete + GC. Every runtime object record carries `deleted_at_ms: Option<u64>`. Synchronous deletes write a marker, never destroy. A separate GC worker (V2.4) removes content backend bytes, index entries, and the metadata record itself once the retention window from policy elapses. Artifacts additionally carry `raw_purged_at_ms` for derivative-only mode (raw bytes purged while metadata + derivatives + provenance remain). GC is tenant-scoped, idempotent, resumable, respects legal hold, and runs in a worker pool isolated from hot-path append. Reads filter `deleted_at_ms IS NULL` by default; admin/audit may pass `include_deleted=true`. Delete and purge events flow through the changefeed so subscribers see them. |
@@ -165,13 +165,17 @@ Dependencies: V2.0.
 
 ### V2.2 — Searchable records + indexing policy (~2500 LoC)
 
+Status: implemented in `feature/v2.2-records-followup`.
+
 **Maps to impl guide §15 step 9 + V2 §9.4.**
 
 Scope:
 
 - Searchable record type (impl guide §6.4) with `namespace`, `scope`,
   `metadata`, `tags`, `source` refs
-- `POST /api/.../records`, `GET /api/.../records/search`, `DELETE /api/.../records/{id}`
+- `POST /api/.../records`, `GET /api/.../records/search`,
+  `POST /api/.../records/search` for vector/body search,
+  `DELETE /api/.../records/{id}`
 - Search must support: namespace, scope, tags, text query, source refs, limit
 - Indexing policy enforced at write time: `no_indexing` / `metadata_only` /
   `selected_fields` / `summary_only`
@@ -194,6 +198,13 @@ Exit criteria:
 - Search across namespace + scope + text returns expected matches.
 - Vector search returns nearest-neighbor by caller-supplied embedding.
 - Deleting a record invalidates its index entries.
+
+Validation:
+
+- `cargo test -p agentdb-api --test api_records`
+- `cargo test -p agentdb-core --test record --test record_runtime --test runtime_source_refs --test runtime_restart`
+- `cargo test -p agentdb-core -p agentdb-api`
+- `cargo test -p agentdb-index`
 
 Dependencies: V2.0 (for tenant/agent scope).
 
@@ -2069,7 +2080,8 @@ git commit -m "feat(core): KV-backed v2 Runtime; events and sessions survive res
 
 - Create: `crates/agentdb-api/src/v2/{mod,routes,dto,errors}.rs`
 - Modify: `crates/agentdb-api/src/lib.rs` (mount V2 router)
-- Modify: `bin/agentdb-server/src/serve.rs` (add `--v2` flag)
+- Modify: `bin/agentdb-server/src/serve.rs` (serve native runtime API directly;
+  no `--v2` flag)
 - Test: `crates/agentdb-api/tests/v2_http_smoke.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -2167,14 +2179,10 @@ Modify `crates/agentdb-api/src/lib.rs`:
 ```rust
 pub mod v2;
 
-pub fn build_router(state: AppState, mount_v2: bool) -> axum::Router {
-    let mut router = axum::Router::new()
-        // ... existing /api/* mounting unchanged ...
-        ;
-    if mount_v2 {
-        router = router.merge(v2::routes::router(state.clone()));
-    }
-    router
+pub fn build_router(state: AppState) -> axum::Router {
+    axum::Router::new()
+        // ... admin/health mounting unchanged ...
+        .merge(v2::routes::router(state.clone()))
 }
 ```
 
@@ -2262,7 +2270,7 @@ For each exit criterion in §2 V2.0 above, confirm:
 - [x] `seq` monotonic + contiguous across restart (Task 11 test)
 - [x] Idempotency-Key replay (Task 9 + Task 12 tests)
 - [x] V1 tests still green
-- [x] `--v2` toggles V2 routes
+- [x] Native `/api/...` routes are mounted directly by `agentdb serve --dev`
 
 - [ ] **Step 5: Open the V2.0 PR**
 
@@ -2271,15 +2279,15 @@ gh pr create --title "feat: V2 scaffolding — tenant/agent/session/event + idem
 ## Summary
 - V2 runtime scaffolding from docs/v2_design (V2 §11.2 change-list)
 - Typed-prefix UUIDv7 IDs, V2 event envelope with artifact_refs/source_refs/schema_version
-- Tenant/Agent/Session as first-class objects under /v2/...
+- Tenant/Agent/Session as first-class objects under native /api/...
 - Atomic append + append-and-fetch + Idempotency-Key replay
 - KV-backed: events and sessions survive restart
-- Mounted behind `--v2` flag; V1 /api/* routes untouched
+- Native runtime API mounted directly; no `--v2` compatibility flag
 
 ## Test plan
 - [x] cargo test --workspace
 - [x] cargo clippy --workspace --all-targets -- -D warnings
-- [x] Manual smoke against `serve --dev --v2`
+- [x] Manual smoke against `serve --dev`
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF

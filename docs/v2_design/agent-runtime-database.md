@@ -1567,23 +1567,21 @@ P0:
 7. Session-first dashboard: timeline, artifacts, searchable records, skills,
    fork tree.
 8. Single-machine `serve --dev` mode suitable for framework adapters.
-9. At least one high-quality framework adapter that proves AgentDB can sit under
+9. Python SDK/client and TypeScript SDK/client for the native `/api` surface.
+10. At least one high-quality framework adapter that proves AgentDB can sit under
    an existing agent runtime without forcing a rewrite.
-10. Structured errors with `suggestion`, `retryable`, and `docs`.
+11. Structured errors with `suggestion`, `retryable`, and `docs`.
 
 P1:
 
-1. Python SDK/client.
-2. LangGraph adapter.
-3. OpenAI Agents SDK session adapter.
-4. TypeScript SDK/client.
-5. MCP server exposing AgentDB tools/resources/prompts.
-6. Vercel AI SDK template.
-7. Adapters for popular open-source agents/frameworks once their persistence
+1. OpenAI Agents SDK session adapter.
+2. MCP server exposing AgentDB tools/resources/prompts.
+3. Vercel AI SDK template.
+4. Adapters for popular open-source agents/frameworks once their persistence
    boundaries are stable.
-8. Multi-node scale-out path.
-9. Advanced tenant quotas and runaway-agent detection.
-10. Artifact dedup and derivative-only retention mode.
+5. Multi-node scale-out path.
+6. Advanced tenant quotas and runaway-agent detection.
+7. Artifact dedup and derivative-only retention mode.
 
 ## 22. Non-Goals For V2 Prototype
 

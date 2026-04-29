@@ -59,12 +59,14 @@ fn recall_at_k(approx: &[usize], exact: &[usize]) -> f32 {
 
 #[test]
 fn incremental_insert_then_query_beats_baseline_recall() {
-    let vecs: Vec<Vec<f32>> = random_vecs(N, DIM, 42).into_iter().map(|v| normalise(&v)).collect();
+    let vecs: Vec<Vec<f32>> = random_vecs(N, DIM, 42)
+        .into_iter()
+        .map(|v| normalise(&v))
+        .collect();
 
     // Build HNSW incrementally. hnsw_rs signature:
     //   Hnsw::new(max_nb_connections, max_elements, max_layers, ef_construction, distance)
-    let hnsw: Hnsw<'_, f32, DistCosine> =
-        Hnsw::new(16, N + 1000, 16, 200, DistCosine {});
+    let hnsw: Hnsw<'_, f32, DistCosine> = Hnsw::new(16, N + 1000, 16, 200, DistCosine {});
 
     // Insert one-at-a-time to verify the library supports online insert.
     for (i, v) in vecs.iter().enumerate() {
@@ -126,8 +128,7 @@ fn serialize_dump_and_reload_preserves_query_results() {
 
     // Reload.
     let mut io = HnswIo::new(&dir, prefix);
-    let loaded: Hnsw<'_, f32, DistCosine> =
-        io.load_hnsw().expect("load_hnsw must succeed");
+    let loaded: Hnsw<'_, f32, DistCosine> = io.load_hnsw().expect("load_hnsw must succeed");
     let neighbours_b = loaded.search(&vecs[11], K, 50);
     let query_id_b: Vec<usize> = neighbours_b.iter().map(|n| n.d_id).collect();
 

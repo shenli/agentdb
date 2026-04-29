@@ -2,7 +2,10 @@ use agentdb_core::tenant::{NewTenant, Tenant};
 
 #[test]
 fn create_tenant_assigns_typed_id() {
-    let req = NewTenant { external_key: "acme".into(), policy: serde_json::json!({}) };
+    let req = NewTenant {
+        external_key: "acme".into(),
+        policy: serde_json::json!({}),
+    };
     let t = Tenant::create(req);
     assert!(t.tenant_id.as_str().starts_with("ten_"));
     assert_eq!(t.external_key, "acme");
@@ -12,7 +15,10 @@ fn create_tenant_assigns_typed_id() {
 
 #[test]
 fn tenant_round_trips_through_serde() {
-    let t = Tenant::create(NewTenant { external_key: "z".into(), policy: serde_json::json!({}) });
+    let t = Tenant::create(NewTenant {
+        external_key: "z".into(),
+        policy: serde_json::json!({}),
+    });
     let s = serde_json::to_string(&t).unwrap();
     let parsed: Tenant = serde_json::from_str(&s).unwrap();
     assert_eq!(parsed.tenant_id, t.tenant_id);

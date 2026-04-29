@@ -116,12 +116,11 @@ pub async fn list_overrides(pool: &AnyPool) -> MetaResult<Vec<ShardRow>> {
 /// dead tablet's ownership, it needs the list of shards pointing
 /// at that tablet so it can reassign them to a live tablet.
 pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<i64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        "SELECT shard_id FROM shards WHERE tablet_id = ? ORDER BY shard_id",
-    )
-    .bind(tablet_id)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(i64,)> =
+        sqlx::query_as("SELECT shard_id FROM shards WHERE tablet_id = ? ORDER BY shard_id")
+            .bind(tablet_id)
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 

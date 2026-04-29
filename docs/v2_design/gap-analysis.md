@@ -268,6 +268,7 @@ routes from impl guide §8:
 /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
 /api/tenants/{tenant_id}/records
 /api/tenants/{tenant_id}/records/search
+/api/tenants/{tenant_id}/records/search                       (POST for vector)
 /api/tenants/{tenant_id}/records/{record_id}
 /api/tenants/{tenant_id}/skills
 /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind

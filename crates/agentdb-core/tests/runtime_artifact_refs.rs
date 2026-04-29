@@ -119,13 +119,7 @@ async fn append_rejects_oversized_inline_payload() {
     // 64 KB is the V2.1 cap; 70 KB clears it with margin and stays small
     // enough not to inflate test memory.
     let big = "x".repeat(70_000);
-    let req = AppendRequest::simple(
-        &t,
-        &a,
-        &s,
-        "x",
-        serde_json::json!({ "big": big }),
-    );
+    let req = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({ "big": big }));
     let err = rt.append(req).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::EventTooLarge);
     assert!(

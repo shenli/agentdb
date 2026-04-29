@@ -4,6 +4,12 @@ Status: draft
 
 Date: 2026-04-28
 
+Implementation checkpoint:
+
+- V2.0 tenant/agent/session/event core, V2.1 artifacts, and V2.2 searchable
+  records/indexing policy are implemented in the Rust runtime/API prototype.
+- Current next milestone: V2.3 skills.
+
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
 reached after reviewing the V1 prototype, product positioning, large payload
@@ -28,3 +34,7 @@ Start with:
   data model, runtime/storage split, ID allocation, and design principles.
 - [`minimal-single-machine-implementation.md`](minimal-single-machine-implementation.md)
   — implementation handoff for AI coding agents building the local V2 prototype.
+- [`gap-analysis.md`](gap-analysis.md) — V1-to-V2 delta, including what stays,
+  what changes, and which crates are deleted or rewritten.
+- [`v2-implementation-plan.md`](v2-implementation-plan.md) — milestone roadmap
+  and detailed V2.0 task-level plan.

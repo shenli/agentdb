@@ -54,12 +54,13 @@ pub async fn create(pool: &AnyPool, external_id: &str, now_ms: i64) -> MetaResul
     // `RETURNING` works on SQLite (>=3.35) and Postgres —
     // dialect-agnostic and avoids SQLite's
     // `last_insert_rowid` (unsupported on AnyQueryResult).
-    let result: Result<(i64,), _> =
-        sqlx::query_as("INSERT INTO tenants (external_id, created_at_ms) VALUES (?, ?) RETURNING internal_id")
-            .bind(external_id)
-            .bind(now_ms)
-            .fetch_one(pool)
-            .await;
+    let result: Result<(i64,), _> = sqlx::query_as(
+        "INSERT INTO tenants (external_id, created_at_ms) VALUES (?, ?) RETURNING internal_id",
+    )
+    .bind(external_id)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await;
     match result {
         Ok((id,)) => Ok(Tenant {
             internal_id: id,
@@ -74,11 +75,7 @@ pub async fn create(pool: &AnyPool, external_id: &str, now_ms: i64) -> MetaResul
 }
 
 /// Idempotent: return the existing tenant or create a new one.
-pub async fn get_or_create(
-    pool: &AnyPool,
-    external_id: &str,
-    now_ms: i64,
-) -> MetaResult<Tenant> {
+pub async fn get_or_create(pool: &AnyPool, external_id: &str, now_ms: i64) -> MetaResult<Tenant> {
     if let Some(t) = get_by_external(pool, external_id).await? {
         return Ok(t);
     }

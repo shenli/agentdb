@@ -126,14 +126,12 @@ pub async fn update_tablet(
     session_id: &str,
     new_tablet_id: i64,
 ) -> MetaResult<bool> {
-    let rows = sqlx::query(
-        "UPDATE session_locators SET tablet_id = ? WHERE session_id = ?",
-    )
-    .bind(new_tablet_id)
-    .bind(session_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let rows = sqlx::query("UPDATE session_locators SET tablet_id = ? WHERE session_id = ?")
+        .bind(new_tablet_id)
+        .bind(session_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
     Ok(rows > 0)
 }
 
@@ -236,14 +234,8 @@ pub async fn list_by_tenant(
 }
 
 fn into_locator(row: LocatorRow) -> SessionLocator {
-    let (
-        session_id,
-        tenant_internal_id,
-        tablet_id,
-        shard_id,
-        created_at_ms,
-        tenant_external_id,
-    ) = row;
+    let (session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id) =
+        row;
     SessionLocator {
         session_id,
         tenant_internal_id,
@@ -265,7 +257,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_get_round_trips() {
         let p = pool().await;
-        assert!(upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap());
+        assert!(upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000)
+            .await
+            .unwrap());
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.session_id, "s-1");
         assert_eq!(l.tenant_internal_id, 7);
@@ -278,15 +272,22 @@ mod tests {
     #[tokio::test]
     async fn upsert_is_idempotent_and_does_not_overwrite_tablet_id() {
         let p = pool().await;
-        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000)
+            .await
+            .unwrap();
         // Simulate a handoff completion having moved this
         // session: tablet 3 → tablet 9 via update_tablet.
         update_tablet(&p, "s-1", 9).await.unwrap();
         // A subsequent populate-on-write must NOT clobber the
         // updated tablet_id. The old code's "first call wins"
         // semantics is what keeps the locator authoritative.
-        let inserted = upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 2_000).await.unwrap();
-        assert!(!inserted, "second upsert returns false — row already present");
+        let inserted = upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 2_000)
+            .await
+            .unwrap();
+        assert!(
+            !inserted,
+            "second upsert returns false — row already present"
+        );
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.tablet_id, Some(9), "update_tablet wins over re-upsert");
         assert_eq!(l.created_at_ms, 1_000, "original timestamp preserved");
@@ -298,7 +299,9 @@ mod tests {
         // hosting tablet isn't yet known. Must round-trip
         // None and not violate any constraint.
         let p = pool().await;
-        upsert(&p, "s-pending", 1, "tenant-1", None, 0, 100).await.unwrap();
+        upsert(&p, "s-pending", 1, "tenant-1", None, 0, 100)
+            .await
+            .unwrap();
         let l = get(&p, "s-pending").await.unwrap().unwrap();
         assert!(l.tablet_id.is_none());
     }
@@ -309,7 +312,9 @@ mod tests {
         // Unknown session id → false.
         assert!(!update_tablet(&p, "s-ghost", 9).await.unwrap());
         // Known session → true.
-        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000)
+            .await
+            .unwrap();
         assert!(update_tablet(&p, "s-1", 9).await.unwrap());
         let l = get(&p, "s-1").await.unwrap().unwrap();
         assert_eq!(l.tablet_id, Some(9));
@@ -319,7 +324,9 @@ mod tests {
     async fn delete_reports_whether_row_existed() {
         let p = pool().await;
         assert!(!delete(&p, "s-ghost").await.unwrap());
-        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000).await.unwrap();
+        upsert(&p, "s-1", 7, "tenant-7", Some(3), 42, 1_000)
+            .await
+            .unwrap();
         assert!(delete(&p, "s-1").await.unwrap());
         assert!(get(&p, "s-1").await.unwrap().is_none());
         // Idempotent second delete.
@@ -333,7 +340,9 @@ mod tests {
         upsert(&p, "s-a", 1, "t-1", Some(0), 0, 0).await.unwrap();
         upsert(&p, "s-b", 1, "t-1", Some(0), 0, 0).await.unwrap();
         // Different tenant — must NOT show up.
-        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0)
+            .await
+            .unwrap();
 
         let mine = list_by_tenant(&p, 1, None, 100).await.unwrap();
         let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
@@ -346,7 +355,9 @@ mod tests {
         upsert(&p, "s-c", 1, "t-1", Some(0), 0, 0).await.unwrap();
         upsert(&p, "s-a", 1, "t-1", Some(0), 0, 0).await.unwrap();
         upsert(&p, "s-b", 1, "t-1", Some(0), 0, 0).await.unwrap();
-        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0)
+            .await
+            .unwrap();
         let mine = list_by_tenant_external(&p, "t-1", None, 100).await.unwrap();
         let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
         assert_eq!(ids, ["s-a", "s-b", "s-c"]);

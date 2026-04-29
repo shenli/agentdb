@@ -172,8 +172,8 @@ impl MetaStore {
             .to_lowercase();
         match backend.as_str() {
             "sqlite" => {
-                let path = std::env::var("AGENTDB_META_PATH")
-                    .unwrap_or_else(|_| "meta.sqlite".into());
+                let path =
+                    std::env::var("AGENTDB_META_PATH").unwrap_or_else(|_| "meta.sqlite".into());
                 Self::open_sqlite(&path).await
             }
             "postgres" | "pg" => {
@@ -235,9 +235,10 @@ impl MetaStore {
     }
 
     async fn backup_sqlite(&self, dest_path: &std::path::Path) -> MetaResult<()> {
-        let sqlite = self.sqlite.as_ref().ok_or_else(|| {
-            MetaError::Migration("sqlite backend missing native pool".into())
-        })?;
+        let sqlite = self
+            .sqlite
+            .as_ref()
+            .ok_or_else(|| MetaError::Migration("sqlite backend missing native pool".into()))?;
         let dest_str = dest_path.to_string_lossy().to_string();
         let escaped = dest_str.replace('\'', "''");
         let sql = format!("VACUUM INTO '{escaped}'");

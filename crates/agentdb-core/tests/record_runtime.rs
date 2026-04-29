@@ -94,7 +94,10 @@ async fn write_and_get_record_round_trip() {
 
     let got = rt.get_record(&t.tenant_id, &r.record_id).await.unwrap();
     assert_eq!(got.record_id.as_str(), r.record_id.as_str());
-    assert_eq!(got.namespace, vec!["agent".to_string(), "memory".to_string()]);
+    assert_eq!(
+        got.namespace,
+        vec!["agent".to_string(), "memory".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -136,7 +139,10 @@ async fn get_record_returns_not_found_for_missing_or_wrong_tenant() {
     assert_eq!(err.code, ErrorCode::RecordNotFound);
 
     // Real record_id but wrong tenant — collapsed into RecordNotFound.
-    let err = rt.get_record(&t2.tenant_id, &r.record_id).await.unwrap_err();
+    let err = rt
+        .get_record(&t2.tenant_id, &r.record_id)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::RecordNotFound);
 }
 
@@ -199,7 +205,10 @@ async fn metadata_only_policy_does_not_index_text_field() {
         ))
         .await
         .unwrap();
-    assert!(hits.is_empty(), "metadata_only must NOT index the text field");
+    assert!(
+        hits.is_empty(),
+        "metadata_only must NOT index the text field"
+    );
 }
 
 #[tokio::test]
@@ -247,7 +256,10 @@ async fn selected_fields_policy_indexes_only_named_fields() {
         ))
         .await
         .unwrap();
-    assert!(hit_text.is_empty(), "text field is not indexed under SelectedFields");
+    assert!(
+        hit_text.is_empty(),
+        "text field is not indexed under SelectedFields"
+    );
 }
 
 #[tokio::test]
@@ -284,7 +296,10 @@ async fn summary_only_policy_indexes_text_field() {
         ))
         .await
         .unwrap();
-    assert!(no_hits.is_empty(), "metadata is not indexed under SummaryOnly");
+    assert!(
+        no_hits.is_empty(),
+        "metadata is not indexed under SummaryOnly"
+    );
 }
 
 #[tokio::test]
@@ -486,7 +501,10 @@ async fn vector_denied_policy_skips_vector_index() {
         })
         .await
         .unwrap();
-    assert!(hits.is_empty(), "vector_allowed=false must keep the record out of the vector index");
+    assert!(
+        hits.is_empty(),
+        "vector_allowed=false must keep the record out of the vector index"
+    );
 }
 
 #[tokio::test]
@@ -584,7 +602,14 @@ async fn search_filters_by_source_event_id() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(
-        hits[0].source.as_ref().unwrap().event_id.as_ref().unwrap().as_str(),
+        hits[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .event_id
+            .as_ref()
+            .unwrap()
+            .as_str(),
         evt_id.as_str()
     );
 }
@@ -606,10 +631,7 @@ async fn delete_record_removes_from_search_and_get() {
 
     rt.delete_record(&t.tenant_id, &r.record_id).await.unwrap();
 
-    let err = rt
-        .get_record(&t.tenant_id, &r.record_id)
-        .await
-        .unwrap_err();
+    let err = rt.get_record(&t.tenant_id, &r.record_id).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::RecordNotFound);
 
     let hits = rt
@@ -665,7 +687,10 @@ async fn expired_record_is_excluded_from_get_and_search() {
     r.expires_at_ms = Some(0); // already expired
     let rec = rt.write_record(r).await.unwrap();
 
-    let err = rt.get_record(&t.tenant_id, &rec.record_id).await.unwrap_err();
+    let err = rt
+        .get_record(&t.tenant_id, &rec.record_id)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::RecordNotFound);
 
     let hits = rt

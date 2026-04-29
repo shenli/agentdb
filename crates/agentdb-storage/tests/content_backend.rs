@@ -12,8 +12,7 @@ use tempfile::TempDir;
 
 // Precomputed sha256("hello world") — used to pin that the put result
 // returns the correct hex digest, not just any digest.
-const HELLO_WORLD_SHA256: &str =
-    "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+const HELLO_WORLD_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
 fn local(dir: &TempDir) -> Arc<dyn ContentBackend> {
     Arc::new(LocalFsContentBackend::new(dir.path()))

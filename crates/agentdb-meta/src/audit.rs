@@ -97,10 +97,7 @@ pub async fn insert(
 /// [`DEFAULT_LIMIT`]). Clients paginate by passing the oldest
 /// returned `ts_ms` as the next `until_ms`.
 pub async fn list(pool: &AnyPool, filter: &AuditFilter) -> MetaResult<Vec<AuditRecord>> {
-    let limit = filter
-        .limit
-        .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, MAX_LIMIT);
+    let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     // Build the SQL with bound parameters. Keeping the WHERE
     // clause dynamic avoids materializing a CTE for absent
@@ -257,12 +254,26 @@ mod tests {
     async fn insert_allocates_monotonic_ids() {
         let p = pool().await;
         let a = insert(
-            &p, 10, None, "GET".into(), "/api/admin/x".into(), None, 200, None,
+            &p,
+            10,
+            None,
+            "GET".into(),
+            "/api/admin/x".into(),
+            None,
+            200,
+            None,
         )
         .await
         .unwrap();
         let b = insert(
-            &p, 20, None, "GET".into(), "/api/admin/y".into(), None, 200, None,
+            &p,
+            20,
+            None,
+            "GET".into(),
+            "/api/admin/y".into(),
+            None,
+            200,
+            None,
         )
         .await
         .unwrap();
@@ -421,7 +432,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            rows.iter().any(|r| r.actor_token_id.is_none() && r.status == 401),
+            rows.iter()
+                .any(|r| r.actor_token_id.is_none() && r.status == 401),
             "401s should be visible in an unfiltered listing"
         );
     }

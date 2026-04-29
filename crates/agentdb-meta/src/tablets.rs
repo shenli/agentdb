@@ -59,14 +59,16 @@ pub async fn get(pool: &AnyPool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
     .bind(tablet_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, owner, epoch, lease, created, handoff)| Tablet {
-        tablet_id: id,
-        owner_node_id: owner,
-        epoch,
-        lease_expires_at_ms: lease,
-        created_at_ms: created,
-        handoff_target_node_id: handoff,
-    }))
+    Ok(
+        row.map(|(id, owner, epoch, lease, created, handoff)| Tablet {
+            tablet_id: id,
+            owner_node_id: owner,
+            epoch,
+            lease_expires_at_ms: lease,
+            created_at_ms: created,
+            handoff_target_node_id: handoff,
+        }),
+    )
 }
 
 /// Atomically claim or renew ownership. Bumps `epoch` and sets
@@ -481,7 +483,10 @@ mod tests {
         assert_eq!(t.owner_node_id.as_deref(), Some("node-b"));
         assert!(t.handoff_target_node_id.is_none());
         assert_eq!(t.lease_expires_at_ms, 0, "lease must be reset");
-        assert_eq!(t.epoch, 2, "epoch must advance so the source's lease is fenced");
+        assert_eq!(
+            t.epoch, 2,
+            "epoch must advance so the source's lease is fenced"
+        );
     }
 
     #[tokio::test]
@@ -538,9 +543,7 @@ mod tests {
         let p = pool().await;
         get_or_create(&p, 7, 100).await.unwrap();
         // Owner+lease in place at epoch 1.
-        let claimed = assume_ownership(&p, 7, 0, "node-a", 5_000)
-            .await
-            .unwrap();
+        let claimed = assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
         assert_eq!(claimed.epoch, 1);
         assert_eq!(claimed.owner_node_id.as_deref(), Some("node-a"));
 

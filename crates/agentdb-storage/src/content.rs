@@ -55,12 +55,7 @@ pub trait ContentBackend: Send + Sync {
     /// writing. Implementations MUST guarantee that on a successful return
     /// the bytes are durable (or the in-memory equivalent) and a concurrent
     /// reader sees either the new content or no content at that path.
-    async fn put(
-        &self,
-        tenant_id: &str,
-        artifact_id: &str,
-        bytes: &[u8],
-    ) -> io::Result<PutResult>;
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult>;
 
     /// Read the entire blob into memory. V2.1 does not stream; large blobs
     /// are memory-bound. TODO(V2.4): expose a streaming reader.
@@ -119,12 +114,7 @@ impl LocalFsContentBackend {
 
 #[async_trait]
 impl ContentBackend for LocalFsContentBackend {
-    async fn put(
-        &self,
-        tenant_id: &str,
-        artifact_id: &str,
-        bytes: &[u8],
-    ) -> io::Result<PutResult> {
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
         let dir = self.dir_for(tenant_id, artifact_id);
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -193,12 +183,7 @@ pub struct InMemoryContentBackend {
 
 #[async_trait]
 impl ContentBackend for InMemoryContentBackend {
-    async fn put(
-        &self,
-        tenant_id: &str,
-        artifact_id: &str,
-        bytes: &[u8],
-    ) -> io::Result<PutResult> {
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let sha256_hex = hex_encode(&hasher.finalize());

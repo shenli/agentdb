@@ -1,4 +1,4 @@
-use agentdb_core::errors::{ErrorCode, Error};
+use agentdb_core::errors::{Error, ErrorCode};
 
 #[test]
 fn error_serializes_with_required_fields() {

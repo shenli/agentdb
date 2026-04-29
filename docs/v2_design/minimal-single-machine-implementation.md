@@ -74,10 +74,10 @@ Use the existing crate layout.
 | `crates/agentdb-storage` | V2 storage traits, key encoding, local repository helpers |
 | `crates/agentdb-index` | text search hooks; vector hooks only if caller supplies embeddings |
 | `crates/agentdb-api` | HTTP DTOs, routes, SSE subscription endpoint, structured errors |
-| `crates/agentdb-wire` | wire DTOs shared by API/SDK if appropriate |
+| `crates/agentdb-wire` | legacy Mongo facade; do not add new V2 behavior here, and delete during V2 cleanup |
 | `crates/agentdb-dashboard` | session-first UI after core APIs stabilize |
 | `crates/agentdb-meta` | metadata persistence if reused by the local server |
-| `bin/agentdb-server` | `serve --dev --v2` wiring and local data directory configuration |
+| `bin/agentdb-server` | `serve --dev` wiring and local data directory configuration |
 
 Do not let framework adapters or dashboard needs define the core model. They must
 map onto runtime primitives.
@@ -349,10 +349,13 @@ the local artifact content layout; both must read back through the same API.
 ```text
 POST   /api/tenants/{tenant_id}/records
 GET    /api/tenants/{tenant_id}/records/search
+POST   /api/tenants/{tenant_id}/records/search
 DELETE /api/tenants/{tenant_id}/records/{record_id}
 ```
 
-Search must support namespace, scope, tags, text query, source refs, and limit.
+Search must support namespace, scope, tags, text query, caller-supplied
+embedding, source refs, and limit. GET is for text/list searches; POST carries
+the JSON body form used for vector search.
 
 ### 8.6 Skills
 
@@ -562,7 +565,9 @@ Minimum error codes:
 6. Add idempotency records for append.
 7. Implement local artifact put/get/head with SHA-256 verification.
 8. Add artifact ref validation during event append.
-9. Implement searchable record write/search with simple text matching.
+9. Implement searchable record write/search with simple text and caller-supplied
+   vector search. Implemented in V2.2 with namespace/scope/tag/source filters
+   and write-time indexing policy enforcement.
 10. Implement skill register/bind/list.
 11. Implement session fork metadata and replay merge.
 12. Implement SSE subscribe from sequence with in-process fanout.
