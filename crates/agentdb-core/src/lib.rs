@@ -17,6 +17,7 @@
 pub const VERSION: &str = "2026-04-28";
 
 pub mod agent;
+pub mod artifact;
 pub mod errors;
 pub mod event;
 pub mod id;
@@ -27,6 +28,7 @@ pub mod session;
 pub mod tenant;
 
 pub use agent::{Agent, NewAgent};
+pub use artifact::{Artifact, NewArtifact};
 pub use errors::{Error, ErrorCode};
 pub use event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 pub use id::{Id, IdKind};

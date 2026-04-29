@@ -25,12 +25,14 @@
 use std::sync::Arc;
 
 use agentdb_storage::keys::{
-    agent_alias_key, agent_record_key, event_by_id_key, event_key, session_alias_key,
-    session_record_key, tenant_alias_key, tenant_record_key,
+    agent_alias_key, agent_record_key, artifact_by_sha256_key, artifact_record_key,
+    event_by_id_key, event_key, session_alias_key, session_record_key, tenant_alias_key,
+    tenant_record_key,
 };
 use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
 
 use crate::agent::Agent;
+use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::session::Session;
@@ -81,6 +83,23 @@ impl Persist {
                 });
             }
         }
+        self.kv.write_batch(ops)
+    }
+
+    /// Atomically write an artifact's primary record AND the
+    /// `artifact_by_sha256` secondary index in one batch. The sha256 index
+    /// has no V2.1 lookup API; it's populated so a future dedup pass lands
+    /// without rewriting this code path.
+    pub fn put_artifact(&self, a: &Artifact) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Put {
+            key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(a).expect("artifact serializes"),
+        });
+        ops.push(WriteOp::Put {
+            key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
+            value: a.artifact_id.as_str().as_bytes().to_vec(),
+        });
         self.kv.write_batch(ops)
     }
 
@@ -249,6 +268,21 @@ impl Persist {
             let (_k, v) = res?;
             let s: Session = serde_json::from_slice(&v).expect("session decodes");
             out.push(s);
+        }
+        Ok(out)
+    }
+
+    /// Hydrate all live artifact metadata records. The `record/artifact/`
+    /// prefix is disjoint from the `record/artifact_by_sha256/` index prefix
+    /// (the byte after `record/artifact` is `_` for the index, `/` for the
+    /// record), so this scan does NOT pick up index entries.
+    pub fn scan_all_artifacts(&self) -> KvResult<Vec<Artifact>> {
+        let iter = self.kv.scan_prefix(b"record/artifact/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let a: Artifact = serde_json::from_slice(&v).expect("artifact decodes");
+            out.push(a);
         }
         Ok(out)
     }
