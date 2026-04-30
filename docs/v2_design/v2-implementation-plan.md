@@ -769,6 +769,29 @@ Follow-up:
 - Teach forwarded requests to validate tablet epoch before mutating state.
 - Add proxy timeout and response-size policy knobs for production deployment.
 
+### V2.17 — Forwarded write epoch fencing (~350 LoC)
+
+Status: forwarded write fencing complete. V2.17 validates the tablet epoch
+carried by forwarded requests against the owner node's current route snapshot
+before session mutations run.
+
+Scope:
+
+- `RouteRuntime::validate_forwarded_epoch(...)` checks forwarded routing headers
+  only when a request has passed through an AgentDB forwarder.
+- Owner nodes reject malformed forwarded requests, stale tablet epochs, missing
+  tablet metadata, or owner changes before append/delete/fork mutations run.
+- Stale forwarded writes return retryable `ROUTE_STALE_TABLET_EPOCH` with the
+  current tablet epoch advertised in response headers.
+- Integration coverage verifies a stale remote-owner append is rejected by the
+  owner and does not write an event.
+
+Follow-up:
+
+- Refresh route snapshots after placement, lease, node, or locator changes
+  instead of loading only at boot.
+- Add proxy timeout and response-size policy knobs for production deployment.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

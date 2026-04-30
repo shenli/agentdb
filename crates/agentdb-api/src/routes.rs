@@ -342,6 +342,9 @@ async fn delete_session(
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
     s.runtime.delete_session(&tid, &sid).await?;
     Ok(with_headers(
         StatusCode::NO_CONTENT.into_response(),
@@ -386,6 +389,9 @@ async fn append_event(
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -446,6 +452,9 @@ async fn append_and_fetch(
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -533,6 +542,9 @@ async fn fork_session(
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
     let child = s
         .runtime
         .fork_session(ForkSessionRequest {
@@ -918,6 +930,13 @@ fn route_forward_failed_response(forward: &ForwardRequest, err: &reqwest::Error)
         HeaderValue::from_static("ROUTE_FORWARD_FAILED"),
     );
     response
+}
+
+fn validate_forwarded_mutation(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    state
+        .routing
+        .validate_forwarded_epoch(headers)
+        .map_err(|rejection| route_rejection_response(&rejection))
 }
 
 fn with_headers(mut response: Response, headers: HeaderMap) -> Response {

@@ -216,6 +216,49 @@ async fn session_handlers_proxy_remote_owner_append() {
 }
 
 #[tokio::test]
+async fn forwarded_mutation_with_stale_epoch_is_rejected_by_owner() {
+    let (app, _owner) = spawn_stale_epoch_proxy_pair().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    let r = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {"i": 1},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 409);
+    assert_eq!(
+        r.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
+        "ROUTE_STALE_TABLET_EPOCH"
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "ROUTE_STALE_TABLET_EPOCH");
+
+    let events = app
+        .runtime
+        .fetch_from_seq(FetchRequest {
+            tenant_id: Id::parse_kind(&tid, IdKind::Tenant).unwrap(),
+            session_id: Id::parse_kind(&sid, IdKind::Session).unwrap(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
 async fn session_handlers_return_route_rejection_for_unassigned_tablet() {
     let app = spawn_unassigned_routed_app().await;
     let (tid, _aid, sid) = bootstrap_session(&app).await;
@@ -451,7 +494,14 @@ async fn spawn_routed_app(owner_node_id: &str) -> TestApp {
 
 async fn spawn_proxy_pair() -> (TestApp, TestApp) {
     let runtime = Runtime::in_memory();
-    let owner = spawn_app_with_state(AppState::new(runtime.clone())).await;
+    let owner_snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-b"))])
+        .with_nodes(vec![node("node-b", "http://127.0.0.1:18081")]);
+    let owner = spawn_app_with_state(
+        AppState::new(runtime.clone())
+            .with_routing(RouteRuntime::snapshot("node-b", owner_snapshot)),
+    )
+    .await;
     let snapshot = RouteSnapshot::new(1)
         .with_tablets(vec![tablet(0, Some("node-b"))])
         .with_nodes(vec![
@@ -460,6 +510,29 @@ async fn spawn_proxy_pair() -> (TestApp, TestApp) {
         ]);
     let local = spawn_app_with_state(
         AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot)),
+    )
+    .await;
+    (local, owner)
+}
+
+async fn spawn_stale_epoch_proxy_pair() -> (TestApp, TestApp) {
+    let runtime = Runtime::in_memory();
+    let owner_snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet_with_epoch(0, Some("node-b"), 2)])
+        .with_nodes(vec![node("node-b", "http://127.0.0.1:18081")]);
+    let owner = spawn_app_with_state(
+        AppState::new(runtime.clone())
+            .with_routing(RouteRuntime::snapshot("node-b", owner_snapshot)),
+    )
+    .await;
+    let local_snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet_with_epoch(0, Some("node-b"), 1)])
+        .with_nodes(vec![
+            node("node-a", "http://127.0.0.1:18080"),
+            node("node-b", &owner.base),
+        ]);
+    let local = spawn_app_with_state(
+        AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", local_snapshot)),
     )
     .await;
     (local, owner)
@@ -487,10 +560,14 @@ fn node(id: &str, address: &str) -> Node {
 }
 
 fn tablet(id: i64, owner: Option<&str>) -> Tablet {
+    tablet_with_epoch(id, owner, 1)
+}
+
+fn tablet_with_epoch(id: i64, owner: Option<&str>, epoch: i64) -> Tablet {
     Tablet {
         tablet_id: id,
         owner_node_id: owner.map(str::to_string),
-        epoch: 1,
+        epoch,
         lease_expires_at_ms: i64::MAX,
         created_at_ms: 0,
         handoff_target_node_id: None,

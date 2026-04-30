@@ -213,6 +213,49 @@ impl RouteRuntime {
             incoming_headers,
         )
     }
+
+    pub fn validate_forwarded_epoch(
+        &self,
+        incoming_headers: &HeaderMap,
+    ) -> Result<(), RouteRejection> {
+        if !incoming_headers.contains_key(HDR_FORWARDED_BY) {
+            return Ok(());
+        }
+        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+            return Ok(());
+        };
+        let tablet_id = parse_i64_header(incoming_headers, HDR_TABLET_ID)?;
+        let forwarded_epoch = parse_i64_header(incoming_headers, HDR_TABLET_EPOCH)?;
+        let Some(tablet) = snapshot
+            .tablets
+            .iter()
+            .find(|tablet| tablet.tablet_id == tablet_id)
+        else {
+            return Err(forward_epoch_rejection(
+                tablet_id,
+                None,
+                "ROUTE_FORWARD_TABLET_MISSING",
+                "forwarded tablet metadata is missing on the owner node",
+            ));
+        };
+        if tablet.epoch != forwarded_epoch {
+            return Err(forward_epoch_rejection(
+                tablet_id,
+                Some(tablet.epoch),
+                "ROUTE_STALE_TABLET_EPOCH",
+                "forwarded request carried a stale tablet epoch",
+            ));
+        }
+        if tablet.owner_node_id.as_deref() != Some(&self.local_node_id) {
+            return Err(forward_epoch_rejection(
+                tablet_id,
+                Some(tablet.epoch),
+                "ROUTE_OWNER_CHANGED",
+                "forwarded tablet is no longer owned by this node",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RouteSnapshot {
@@ -467,6 +510,49 @@ fn forward_loop_rejection(target: &RouteTarget) -> RouteRejection {
         code: "ROUTE_FORWARD_LOOP",
         message: "request has already been forwarded once".into(),
         retryable: false,
+        headers,
+    }
+}
+
+fn parse_i64_header(headers: &HeaderMap, name: &'static str) -> Result<i64, RouteRejection> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| invalid_forward_rejection(name))
+}
+
+fn invalid_forward_rejection(name: &'static str) -> RouteRejection {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, HDR_ROUTE_ACTION, "reject");
+    insert_header(&mut headers, HDR_ROUTE_REASON, "ROUTE_INVALID_FORWARD");
+    RouteRejection {
+        status: StatusCode::BAD_REQUEST,
+        code: "ROUTE_INVALID_FORWARD",
+        message: format!("forwarded request is missing a valid {name} header"),
+        retryable: false,
+        headers,
+    }
+}
+
+fn forward_epoch_rejection(
+    tablet_id: i64,
+    current_epoch: Option<i64>,
+    code: &'static str,
+    message: &'static str,
+) -> RouteRejection {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, HDR_ROUTE_ACTION, "reject");
+    insert_header(&mut headers, HDR_ROUTE_REASON, code);
+    insert_header(&mut headers, HDR_TABLET_ID, &tablet_id.to_string());
+    if let Some(epoch) = current_epoch {
+        insert_header(&mut headers, HDR_TABLET_EPOCH, &epoch.to_string());
+    }
+    RouteRejection {
+        status: StatusCode::CONFLICT,
+        code,
+        message: message.into(),
+        retryable: true,
         headers,
     }
 }
@@ -895,5 +981,37 @@ mod tests {
         };
         assert_eq!(rejection.code, "ROUTE_UNASSIGNED");
         assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn validate_forwarded_epoch_accepts_current_local_owner() {
+        let snapshot = RouteSnapshot::new(1)
+            .with_tablets(vec![tablet(7, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![node("node-a", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, HDR_FORWARDED_BY, "node-b");
+        insert_header(&mut headers, HDR_TABLET_ID, "7");
+        insert_header(&mut headers, HDR_TABLET_EPOCH, "3");
+
+        runtime.validate_forwarded_epoch(&headers).unwrap();
+    }
+
+    #[test]
+    fn validate_forwarded_epoch_rejects_stale_epoch() {
+        let snapshot = RouteSnapshot::new(1)
+            .with_tablets(vec![tablet(7, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![node("node-a", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, HDR_FORWARDED_BY, "node-b");
+        insert_header(&mut headers, HDR_TABLET_ID, "7");
+        insert_header(&mut headers, HDR_TABLET_EPOCH, "2");
+
+        let err = runtime.validate_forwarded_epoch(&headers).unwrap_err();
+
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.code, "ROUTE_STALE_TABLET_EPOCH");
+        assert_eq!(err.headers[HDR_TABLET_EPOCH].to_str().unwrap(), "3");
     }
 }
