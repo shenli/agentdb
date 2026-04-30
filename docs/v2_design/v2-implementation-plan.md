@@ -582,19 +582,23 @@ Dependencies: V2.0–V2.7.
 Status: adapter backlog complete for the single-machine V2 prototype. V2.9 adds
 the OpenAI Agents SDK custom session adapter, an MCP stdio server exposing
 AgentDB tools/resources/prompts, and a Vercel AI SDK chat persistence template.
-The remaining P1 work is the multi-node request-forwarding path plus
-managed-service hardening such as KMS hooks and durable region metadata.
+The remaining managed-service hardening is now mostly KMS/key-state integration
+at storage boundaries. Multi-node routing, request forwarding, durable region
+metadata, route snapshot refresh, and route diagnostics are covered by V2.10
+through V2.22.
 
 These are noted but not scheduled into this plan. They're tracked as follow-up:
 
 - OpenAI Agents SDK session adapter (implemented)
 - MCP server exposing AgentDB tools/resources/prompts (implemented)
 - Vercel AI SDK template (implemented)
-- Multi-node scale-out path
+- Multi-node scale-out path (routing/forwarding path implemented through V2.22;
+  scheduler and operator hardening continue separately)
 - Advanced runaway-agent detection
 - Artifact deduplication
 - Encryption + KMS hooks at storage boundaries (V2 §12.6)
-- Region routing / residency enforcement (V2 §12.5)
+- Region routing / residency enforcement (implemented through V2.10 and
+  V2.20; future work may add richer tenant policy sources)
 
 Each will get its own plan when prioritized.
 
@@ -865,8 +869,8 @@ Scope:
 
 Follow-up:
 
-- Clean stale V2 gap-summary references for completed request forwarding and
-  durable region metadata work.
+- Add KMS/key availability signals at storage boundaries and route rejection
+  diagnostics.
 
 ### V2.21 — Operator-facing route metadata visibility (~250 LoC)
 
@@ -888,8 +892,8 @@ Scope:
 
 Follow-up:
 
-- Clean stale V2 gap-summary references for completed request forwarding and
-  durable region metadata work.
+- Add KMS/key availability signals at storage boundaries and route rejection
+  diagnostics.
 
 ### V2.22 — Route decision dry-run diagnostics (~250 LoC)
 
@@ -911,8 +915,29 @@ Scope:
 
 Follow-up:
 
-- Clean stale V2 gap-summary references for completed request forwarding and
-  durable region metadata work.
+- Add KMS/key availability signals at storage boundaries and route rejection
+  diagnostics.
+
+### V2.23 — V2 summary cleanup (~100 LoC)
+
+Status: V2 summary cleanup complete. V2.23 removes stale references that still
+described request forwarding and durable region metadata as future work after
+V2.16–V2.22 completed those surfaces.
+
+Scope:
+
+- README checkpoints now identify V2.10+ as the multi-node scale-out series.
+- V2.9 backlog text distinguishes completed routing/forwarding work from the
+  still-open KMS/key-state hardening.
+- Spec coverage maps V2 §12 to V2.10–V2.22 for routing, forwarding, region
+  metadata, refresh, and diagnostics.
+- Self-review now lists KMS hooks as the remaining V2 §12.6 follow-up instead
+  of completed routing work.
+
+Follow-up:
+
+- Add KMS/key availability signals at storage boundaries and route rejection
+  diagnostics.
 
 ---
 
@@ -2710,7 +2735,7 @@ milestone.
 | V2 §9 Runtime core responsibilities | All milestones |
 | V2 §10 Storage engine capabilities | V2.0 (ordered streams, metadata records), V2.1 (artifact store), V2.2 (indexing hooks), V2.4 (lifecycle), V2.5 (changefeed) |
 | V2 §11 Lessons from V1 prototype | This entire plan honors §11.1 keep-list and §11.2 change-list |
-| V2 §12 Managed-service data plane | Partial (V2.4 covers tenant isolation + admission; V2.10 adds routing/residency planning; request forwarding + KMS remain follow-up) |
+| V2 §12 Managed-service data plane | Partial (V2.4 covers tenant isolation + admission; V2.10–V2.22 cover routing/residency planning, forwarding, durable region metadata, refresh, visibility, and dry-run diagnostics; KMS remains follow-up) |
 | V2 §13–14 ID allocation + summary | V2.0 |
 | V2 §15 Storage layout sketch | V2.0 (key encoders) + V2.1 (artifact metadata and content backend refs) |
 | V2 §16 API sketch + adapter requirements | V2.0–V2.5 (native API), V2.6 (SDKs), V2.8 (LangGraph adapter as proof) |
@@ -2719,7 +2744,7 @@ milestone.
 | V2 §19 Subscription semantics | V2.5 |
 | V2 §20 What belongs in AgentDB vs application | This plan honors the boundary |
 | V2 §21 Prototype priorities | Roadmap matches §21 P0 list |
-| V2 §22 Non-goals | V2.7 (delete `agentdb-wire`, `clients/go`); KMS and durable region routing metadata remain follow-up |
+| V2 §22 Non-goals | V2.7 (delete `agentdb-wire`, `clients/go`); KMS remains follow-up |
 | Impl §1–§4 Goal/non-goals/SDK/repo | V2.0 sets foundation |
 | Impl §5 Local storage | V2.0 (uses existing RocksDB+SlateDB+local FS) |
 | Impl §6 Core data types | V2.0 |
@@ -2742,8 +2767,9 @@ Per the writing-plans skill self-review checklist:
 
 **1. Spec coverage:** §4 above maps every spec section to a milestone. OpenAI
 and Vercel adapters are covered by V2.9. Region routing planning starts in
-V2.10; runtime forwarding, durable region metadata, and KMS hooks (V2 §12.6)
-remain follow-up work and are noted as such.
+V2.10, request forwarding lands in V2.16, durable region metadata lands in
+V2.20, and route visibility/diagnostics land in V2.21–V2.22. KMS hooks
+(V2 §12.6) remain follow-up work and are noted as such.
 
 **2. Placeholder scan:** Skill says no `TBD`, no "implement later", no "similar
 to Task N". Re-checked V2.0 task plan: every step has actual code or commands.
