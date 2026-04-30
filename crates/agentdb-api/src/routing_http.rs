@@ -356,6 +356,7 @@ impl RouteRuntime {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn validate_forwarded_epoch(
         &self,
         incoming_headers: &HeaderMap,
@@ -555,7 +556,7 @@ impl RouteSnapshot {
                 && locator
                     .tenant_external_id
                     .as_deref()
-                    .is_none_or(|locator_tenant| locator_tenant == tenant_id)
+                    .map_or(true, |locator_tenant| locator_tenant == tenant_id)
         })
     }
 
@@ -671,6 +672,7 @@ pub fn route_rejection_response(rejection: &RouteRejection) -> Response {
     response
 }
 
+#[allow(clippy::result_large_err)]
 pub fn prepare_forward_request(
     target: &RouteTarget,
     original_path_and_query: &str,
@@ -812,6 +814,7 @@ fn forward_loop_rejection(target: &RouteTarget) -> RouteRejection {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_i64_header(headers: &HeaderMap, name: &'static str) -> Result<i64, RouteRejection> {
     headers
         .get(name)

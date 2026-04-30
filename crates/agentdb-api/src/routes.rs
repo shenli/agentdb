@@ -990,6 +990,7 @@ fn route_forward_response_too_large(forward: &ForwardRequest, max_response_bytes
     response
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_forwarded_mutation(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     state
         .routing
