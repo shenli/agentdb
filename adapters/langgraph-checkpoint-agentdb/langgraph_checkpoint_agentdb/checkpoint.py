@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 
+from agentdb import SessionEventKind, agent_status, validate_adapter_events
+
 
 SCHEMA_VERSION = "2026-04-28"
 
@@ -22,6 +24,18 @@ class CheckpointTuple:
     metadata: Dict[str, Any]
     parent_config: Optional[Dict[str, Any]] = None
     pending_writes: tuple = ()
+
+
+@dataclass(frozen=True)
+class AdapterReadinessReport:
+    warnings: tuple[str, ...]
+    event_count: int
+    checkpoint_count: int
+    last_seq: Optional[int]
+
+    @property
+    def ready(self) -> bool:
+        return not self.warnings
 
 
 class AgentDBSaver:
@@ -156,6 +170,73 @@ class AgentDBSaver:
                 metadata=dict(payload.get("metadata") or {}),
             )
 
+    def validate_readiness(self, config: Mapping[str, Any], *, limit: int = 1000) -> AdapterReadinessReport:
+        """Check the LangGraph checkpoint timeline against adapter-readiness rules.
+
+        This is intentionally advisory. It verifies the LangGraph-specific
+        mapping and then runs the shared AgentDB convention validator over a
+        recovered-status proof event so adapter tests exercise the same resume
+        cursor contract as harnesses.
+        """
+
+        configurable = _configurable(config)
+        session_id = _required(configurable, "agentdb_session_id")
+        thread_id = _required(configurable, "thread_id")
+        session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
+        events = list(session.replay(limit=limit))
+        warnings: list[str] = []
+        checkpoint_count = 0
+        last_seq: Optional[int] = None
+
+        for event in events:
+            seq = _event_field(event, "seq")
+            if seq is None:
+                warnings.append("langgraph_event_missing_seq")
+            elif last_seq is not None and int(seq) <= last_seq:
+                warnings.append("langgraph_non_monotonic_seq")
+            if seq is not None:
+                last_seq = int(seq)
+
+            if _event_field(event, "kind") != "langgraph_checkpoint":
+                continue
+            checkpoint_count += 1
+            payload = _event_field(event, "payload") or {}
+            if _event_field(payload, "thread_id") != thread_id:
+                warnings.append("langgraph_checkpoint_thread_mismatch")
+            if not _event_field(payload, "checkpoint_id"):
+                warnings.append("langgraph_checkpoint_missing_checkpoint_id")
+
+        if not events:
+            warnings.append("langgraph_no_session_events")
+        if checkpoint_count == 0:
+            warnings.append("langgraph_no_checkpoint_events")
+
+        if last_seq is not None:
+            warnings.extend(
+                validate_adapter_events(
+                    [
+                        {
+                            "event_id": "evt_langgraph_readiness_recovered",
+                            "seq": last_seq,
+                            "kind": SessionEventKind.AGENT_STATUS.value,
+                            "payload": agent_status("recovered", last_seen_seq=last_seq),
+                        }
+                    ]
+                )
+            )
+        return AdapterReadinessReport(
+            warnings=tuple(dict.fromkeys(warnings)),
+            event_count=len(events),
+            checkpoint_count=checkpoint_count,
+            last_seq=last_seq,
+        )
+
+    def assert_ready(self, config: Mapping[str, Any], *, limit: int = 1000) -> AdapterReadinessReport:
+        report = self.validate_readiness(config, limit=limit)
+        if not report.ready:
+            raise AssertionError("\n".join(report.warnings))
+        return report
+
 
 def _configurable(config: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(config.get("configurable") or {})
@@ -172,3 +253,9 @@ def _compact(value: Any) -> str:
     import json
 
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _event_field(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
