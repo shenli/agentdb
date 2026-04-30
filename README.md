@@ -12,6 +12,8 @@ Go SDK are no longer part of the workspace. The supported surfaces are:
 - Rust runtime/API crates in `crates/agentdb-core` and `crates/agentdb-api`
 - Python SDK in `clients/python`
 - TypeScript SDK in `clients/typescript`
+- LangGraph adapter in `adapters/langgraph-checkpoint-agentdb`
+- Session dashboard mounted at `/dashboard`
 - V2 design notes in `docs/v2_design`
 
 ## Run Locally
@@ -32,6 +34,12 @@ The readiness probe is:
 
 ```bash
 curl -i http://127.0.0.1:8080/health/ready
+```
+
+The V2 session dashboard is available at:
+
+```text
+http://127.0.0.1:8080/dashboard/
 ```
 
 ## API Shape
@@ -120,7 +128,9 @@ crates/agentdb-api           native V2 HTTP routes
 crates/agentdb-storage       RocksDB/SlateDB KV and artifact content backends
 crates/agentdb-index         text/vector indexing helpers
 crates/agentdb-meta          control-plane metadata helpers
-crates/agentdb-dashboard     dashboard placeholder
+crates/agentdb-dashboard     session-first dashboard assets
+adapters/langgraph-checkpoint-agentdb
+                              LangGraph checkpoint/store adapter
 clients/python               Python SDK
 clients/typescript           TypeScript SDK
 docs/v2_design               V2 design and implementation plan
@@ -132,6 +142,7 @@ docs/v2_design               V2 design and implementation plan
 cargo build --workspace
 cargo test -p agentdb-core -p agentdb-api
 python3 -m pytest -q clients/python/tests
+PYTHONPATH=adapters/langgraph-checkpoint-agentdb python3 -m pytest -q adapters/langgraph-checkpoint-agentdb/tests
 (cd clients/typescript && npm test && npm run build)
 ```
 
