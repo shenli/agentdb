@@ -19,6 +19,14 @@ pub struct Artifact {
     pub content_type: Option<String>,
     pub bytes: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_key_version: Option<String>,
     pub created_at_ms: u64,
     /// See `Tenant::deleted_at_ms` for the soft-delete contract that applies
     /// uniformly to every V2 runtime object.
@@ -54,6 +62,10 @@ impl Artifact {
             content_type: req.content_type,
             bytes: put.bytes,
             sha256: put.sha256_hex,
+            content_key_id: None,
+            content_key_version: None,
+            metadata_key_id: None,
+            metadata_key_version: None,
             created_at_ms: crate::now_ms(),
             deleted_at_ms: None,
             raw_purged_at_ms: None,

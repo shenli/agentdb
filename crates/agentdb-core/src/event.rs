@@ -45,6 +45,10 @@ pub struct EventEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub policy_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_key_version: Option<String>,
     /// See `Tenant::deleted_at_ms` for the soft-delete contract that applies
     /// uniformly to every V2 runtime object.
     pub deleted_at_ms: Option<u64>,
@@ -62,6 +66,8 @@ pub struct NewEvent {
     pub source_refs: Vec<SourceRef>,
     pub idempotency_key: Option<String>,
     pub policy_version: u64,
+    pub metadata_key_id: Option<String>,
+    pub metadata_key_version: Option<String>,
 }
 
 impl EventEnvelope {
@@ -80,6 +86,8 @@ impl EventEnvelope {
             source_refs: req.source_refs,
             idempotency_key: req.idempotency_key,
             policy_version: req.policy_version,
+            metadata_key_id: req.metadata_key_id,
+            metadata_key_version: req.metadata_key_version,
             deleted_at_ms: None,
         }
     }

@@ -20,6 +20,7 @@ use agentdb_index::doc_id::DocId;
 use agentdb_index::text::{InMemoryInverted, TextIndex};
 use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBackend};
+use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
@@ -667,10 +668,6 @@ impl Runtime {
         self.kms
             .resolve_tenant_key(tenant_id.as_str(), operation)
             .map_err(kms_error)
-    }
-
-    fn ensure_key_available(&self, tenant_id: &Id, operation: KeyOperation) -> Result<()> {
-        self.resolve_key(tenant_id, operation).map(|_| ())
     }
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
@@ -1664,17 +1661,18 @@ impl Runtime {
         }
 
         let content_key = self.resolve_key(&req.tenant_id, KeyOperation::ContentWrite)?;
-        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
+        let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
         let crypto_context = ContentCryptoContext {
             tenant_id: req.tenant_id.as_str(),
             artifact_id: artifact_id.as_str(),
             key: &content_key,
         };
-        let stored_bytes = self
+        let encrypted_bytes = self
             .content_crypto
             .encrypt(&crypto_context, &bytes)
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content encrypt failed: {e}")))?;
+        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
         let _put = self
             .content
             .put(req.tenant_id.as_str(), artifact_id.as_str(), &stored_bytes)
@@ -1690,6 +1688,10 @@ impl Runtime {
             content_type: req.content_type,
             bytes: bytes.len() as u64,
             sha256: plaintext_sha256,
+            content_key_id: Some(content_key.key_id.clone()),
+            content_key_version: content_key.key_version.clone(),
+            metadata_key_id: Some(metadata_key.key_id.clone()),
+            metadata_key_version: metadata_key.key_version.clone(),
             created_at_ms: crate::now_ms(),
             deleted_at_ms: None,
             raw_purged_at_ms: None,
@@ -1740,12 +1742,22 @@ impl Runtime {
                 format!("{}", artifact_id),
             ));
         }
-        let content_key = self.resolve_key(tenant_id, KeyOperation::ContentRead)?;
+        let current_key = self.resolve_key(tenant_id, KeyOperation::ContentRead)?;
         let stored_bytes = self
             .content
             .get(tenant_id.as_str(), artifact_id.as_str())
             .await
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))?;
+        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content envelope failed: {e}")))?
+        {
+            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
+            None => (
+                key_from_parts(&art.content_key_id, &art.content_key_version)
+                    .unwrap_or(current_key),
+                stored_bytes,
+            ),
+        };
         let crypto_context = ContentCryptoContext {
             tenant_id: tenant_id.as_str(),
             artifact_id: artifact_id.as_str(),
@@ -1753,7 +1765,7 @@ impl Runtime {
         };
         let plaintext = self
             .content_crypto
-            .decrypt(&crypto_context, &stored_bytes)
+            .decrypt(&crypto_context, &ciphertext)
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content decrypt failed: {e}")))?;
         let actual_sha256 = sha256_hex(&plaintext);
         if actual_sha256 != art.sha256 {
@@ -2715,7 +2727,7 @@ impl Runtime {
             }
         }
 
-        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
+        let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
         let (seq, _prior_policy_version, session_snapshot) = {
             // Re-acquire mutable access to the session row to mint the seq
@@ -2745,6 +2757,8 @@ impl Runtime {
             source_refs: req.source_refs.clone(),
             idempotency_key: req.idempotency_key.clone(),
             policy_version: policy.version,
+            metadata_key_id: Some(metadata_key.key_id),
+            metadata_key_version: metadata_key.key_version,
         });
         let event_id = envelope.event_id.clone();
 
@@ -3765,6 +3779,13 @@ where
 /// Error code surface stable.
 fn internal(e: agentdb_storage::Error) -> Error {
     Error::new(ErrorCode::Internal, e.to_string())
+}
+
+fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {
+    key_id.as_ref().map(|key_id| KeyResolution {
+        key_id: key_id.clone(),
+        key_version: key_version.clone(),
+    })
 }
 
 fn kms_error(e: KmsError) -> Error {

@@ -91,8 +91,11 @@ Implementation checkpoint:
   content boundary while preserving plaintext artifact identity metadata.
 - V2.26 extends envelope encryption/decryption adapters to artifact metadata
   and event KV rows while preserving existing secondary indexes.
-- Current next milestone: record key version metadata for encrypted artifacts,
-  events, and metadata rows.
+- V2.27 records key id/version metadata for encrypted artifact content,
+  artifact metadata, and event rows so future reads and audits can identify
+  the key material used at write time.
+- Current next milestone: V2 design implementation follow-ups are complete for
+  the current prototype scope.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

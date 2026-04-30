@@ -125,14 +125,15 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
             )
             .unwrap()
             .unwrap();
-        assert!(artifact_raw.starts_with(b"meta:"));
+        assert!(artifact_raw.starts_with(b"AGDB-ENVELOPE-v1\n"));
         assert!(!artifact_raw.starts_with(b"{"));
+        assert!(artifact.metadata_key_id.as_deref().is_some());
 
         let event_raw = kv
             .get(event_key(tenant.tenant_id.as_str(), session.session_id.as_str(), 0).as_bytes())
             .unwrap()
             .unwrap();
-        assert!(event_raw.starts_with(b"meta:"));
+        assert!(event_raw.starts_with(b"AGDB-ENVELOPE-v1\n"));
         assert!(!event_raw
             .windows(b"secret event metadata".len())
             .any(|w| { w == b"secret event metadata" }));
@@ -156,6 +157,7 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
     let artifact = rt.get_artifact(&tenant_id, &artifact_id).await.unwrap();
     assert_eq!(artifact.bytes, 5);
     assert_eq!(artifact.content_type.as_deref(), Some("text/plain"));
+    assert!(artifact.metadata_key_id.as_deref().is_some());
 
     let fetched = rt
         .fetch_from_seq(FetchRequest {
@@ -169,4 +171,5 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].kind, "message");
     assert_eq!(fetched[0].payload["body"], "secret event metadata");
+    assert!(fetched[0].metadata_key_id.as_deref().is_some());
 }

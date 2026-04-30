@@ -17,6 +17,8 @@ fn envelope_carries_required_fields() {
         source_refs: vec![],
         idempotency_key: Some("client-1".into()),
         policy_version: 1,
+        metadata_key_id: None,
+        metadata_key_version: None,
     });
     assert!(e.event_id.as_str().starts_with("evt_"));
     assert_eq!(e.tenant_id, tenant);
@@ -47,6 +49,8 @@ fn envelope_round_trips_through_json() {
         source_refs: vec![],
         idempotency_key: None,
         policy_version: 1,
+        metadata_key_id: None,
+        metadata_key_version: None,
     });
     let s = serde_json::to_string(&e).unwrap();
     let back: EventEnvelope = serde_json::from_str(&s).unwrap();
@@ -84,6 +88,8 @@ fn envelope_carries_artifact_and_source_refs() {
         }],
         idempotency_key: None,
         policy_version: 1,
+        metadata_key_id: None,
+        metadata_key_version: None,
     });
     assert_eq!(e.artifact_refs.len(), 1);
     assert_eq!(e.artifact_refs[0].artifact_id, art);
@@ -105,6 +111,8 @@ fn idempotency_key_is_omitted_from_json_when_none() {
         source_refs: vec![],
         idempotency_key: None,
         policy_version: 1,
+        metadata_key_id: None,
+        metadata_key_version: None,
     });
     let v = serde_json::to_value(&e).unwrap();
     assert!(
