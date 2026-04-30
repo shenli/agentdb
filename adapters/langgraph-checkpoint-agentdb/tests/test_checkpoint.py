@@ -12,6 +12,7 @@ class Result:
 class Event:
     kind: str
     payload: dict
+    seq: int
 
 
 class FakeSession:
@@ -21,7 +22,7 @@ class FakeSession:
 
     def append(self, payload, *, kind, idempotency_key):
         self.appends.append((payload, kind, idempotency_key))
-        self.events.append(Event(kind, payload))
+        self.events.append(Event(kind, payload, len(self.events)))
         return Result(seq=len(self.events) - 1)
 
     def replay(self, *, limit):
@@ -91,3 +92,44 @@ def test_put_writes_uses_pending_writes_event():
     assert payload["writes"] == [("channel", "value")]
     assert idem == "langgraph-writes:thread-a:ckpt-1:task-1:node-a"
     assert client.records[0][1]["namespace"] == ["langgraph", "pending_writes"]
+
+
+def test_validate_readiness_accepts_checkpoint_timeline():
+    client = FakeClient()
+    saver = AgentDBSaver(client, tenant_id="ten_1", agent_id="agt_1")
+    config = {"configurable": {"thread_id": "thread-a", "agentdb_session_id": "ses_1"}}
+    next_config = saver.put(config, {"id": "ckpt-1"}, {})
+    saver.put(next_config, {"id": "ckpt-2"}, {})
+
+    report = saver.validate_readiness(config, limit=10)
+
+    assert report.ready is True
+    assert report.event_count == 2
+    assert report.checkpoint_count == 2
+    assert report.last_seq == 1
+    assert saver.assert_ready(config).ready is True
+
+
+def test_validate_readiness_reports_missing_checkpoint_timeline():
+    client = FakeClient()
+    saver = AgentDBSaver(client, tenant_id="ten_1", agent_id="agt_1")
+    config = {"configurable": {"thread_id": "thread-a", "agentdb_session_id": "ses_1"}}
+
+    report = saver.validate_readiness(config)
+
+    assert report.ready is False
+    assert "langgraph_no_session_events" in report.warnings
+    assert "langgraph_no_checkpoint_events" in report.warnings
+
+
+def test_assert_ready_raises_on_warnings():
+    client = FakeClient()
+    saver = AgentDBSaver(client, tenant_id="ten_1", agent_id="agt_1")
+    config = {"configurable": {"thread_id": "thread-a", "agentdb_session_id": "ses_1"}}
+
+    try:
+        saver.assert_ready(config)
+    except AssertionError as exc:
+        assert "langgraph_no_session_events" in str(exc)
+    else:
+        raise AssertionError("assert_ready should fail when readiness warnings exist")

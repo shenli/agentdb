@@ -33,3 +33,25 @@ config = {
 saver.put(config, {"id": "ckpt-1", "channel_values": {}}, {"source": "input"})
 store.put(("incidents",), "incident-42", {"severity": "high"}, tags=["incident"])
 ```
+
+## Adapter readiness
+
+The saver can validate that a LangGraph thread is using AgentDB's session layer
+as intended:
+
+```python
+report = saver.validate_readiness(config)
+if not report.ready:
+    raise AssertionError(report.warnings)
+```
+
+`validate_readiness` checks the LangGraph checkpoint timeline for AgentDB
+ordering, checkpoint IDs, monotonic sequence, and resume-cursor coverage. It also
+exercises the shared SDK adapter-readiness validator with a recovered-status
+proof event so the adapter stays aligned with the session-layer contract.
+
+For tests, use `assert_ready`:
+
+```python
+saver.assert_ready(config)
+```
