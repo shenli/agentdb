@@ -579,11 +579,17 @@ Dependencies: V2.0–V2.7.
 
 ### V2.9 — Stretch / P1 backlog (not part of initial cutover)
 
+Status: adapter backlog complete for the single-machine V2 prototype. V2.9 adds
+the OpenAI Agents SDK custom session adapter, an MCP stdio server exposing
+AgentDB tools/resources/prompts, and a Vercel AI SDK chat persistence template.
+The remaining P1 work is the multi-node scale-out path plus managed-service
+hardening such as KMS hooks and region routing.
+
 These are noted but not scheduled into this plan. They're tracked as follow-up:
 
-- OpenAI Agents SDK session adapter
-- MCP server exposing AgentDB tools/resources/prompts
-- Vercel AI SDK template
+- OpenAI Agents SDK session adapter (implemented)
+- MCP server exposing AgentDB tools/resources/prompts (implemented)
+- Vercel AI SDK template (implemented)
 - Multi-node scale-out path
 - Advanced runaway-agent detection
 - Artifact deduplication
