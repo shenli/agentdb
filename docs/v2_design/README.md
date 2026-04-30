@@ -58,6 +58,10 @@ Implementation checkpoint:
 - V2.13 adds the runtime routing guard to `AppState`: single-node deployments
   stay disabled by default, while tests and future handler wiring can inject
   fixed planner decisions and receive local/forward/reject guard outcomes.
+- V2.14 replaces fixed-only guard testing with metadata snapshot-backed route
+  evaluation: `RouteRuntime` can compute local/forward/reject outcomes from
+  node/tablet/shard/session-locator snapshots without async metadata reads
+  inside request handlers.
 - Current next milestone: call the routing guard from session handlers and
   attach the same-cluster HTTP client.
 

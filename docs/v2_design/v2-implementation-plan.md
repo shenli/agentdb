@@ -687,6 +687,32 @@ Follow-up:
 - Execute `ForwardRequest` through an internal HTTP client and pass through the
   owner node response.
 
+### V2.14 — Metadata-backed route snapshots (~400 LoC)
+
+Status: snapshot runtime complete. V2.14 extends `RouteRuntime` with an
+immutable metadata snapshot mode so handler code can evaluate routing through
+the V2.10 planner without performing async metadata reads on the hot path.
+
+Scope:
+
+- `RouteSnapshot` carries shard count, request location, residency policy, and
+  node/tablet/shard snapshots behind cheap cloneable references.
+- `RouteRuntime::snapshot(...)` installs metadata-backed routing while keeping
+  disabled routing as the default single-node behavior.
+- `RouteRuntime::guard_session(...)` accepts tenant/session locator context,
+  calls `plan_route(...)`, and maps the decision to the existing
+  local/forward/reject HTTP guard outcomes.
+- Focused tests cover local ownership, remote-owner forward preparation, and
+  unassigned-tablet rejection.
+
+Follow-up:
+
+- Load route snapshots from the runtime metadata store at server boot and
+  refresh them after placement changes.
+- Call `RouteRuntime::guard_session(...)` from session/event handlers.
+- Execute `ForwardRequest` through an internal HTTP client and pass through the
+  owner node response.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan
