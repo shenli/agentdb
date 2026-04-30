@@ -107,7 +107,10 @@ pub fn routes() -> Router<AppState> {
             get(get_record).delete(delete_record),
         )
         .route("/api/tenants/:tenant_id/skills", post(create_skill))
-        .route("/api/tenants/:tenant_id/skills/:skill_id", get(get_skill))
+        .route(
+            "/api/tenants/:tenant_id/skills/:skill_id",
+            get(get_skill).delete(delete_skill),
+        )
         .route(
             "/api/tenants/:tenant_id/policy/lifecycle-sweep",
             post(run_lifecycle_sweep),
@@ -688,6 +691,16 @@ async fn get_skill(
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
     Ok(Json(s.runtime.get_skill(&tid, &sid).await?))
+}
+
+async fn delete_skill(
+    State(s): State<AppState>,
+    Path((tenant_id, skill_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
+    s.runtime.delete_skill(&tid, &sid).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn bind_skill(

@@ -20,6 +20,8 @@ Implementation checkpoint:
   lifecycle/GC work by priority and exposes it through the API.
 - V2.4e adds session soft-delete plus session/event hard purge in tenant-scoped
   GC sweeps.
+- V2.4f adds skill soft-delete plus skill/binding hard purge in tenant-scoped
+  GC sweeps.
 - Current next milestone: fuller quota dimensions, remaining GC handlers, and
   changefeed delete/purge events.
 
