@@ -1012,6 +1012,35 @@ Follow-up:
 - Record key version metadata for encrypted artifacts, events, and metadata
   rows.
 
+### V2.27 — Key-version metadata for encrypted rows (~250 LoC)
+
+Status: key-version metadata complete. V2.27 records encryption key identity at
+the storage envelope boundary so future reads and audits can identify the key
+material used at write time.
+
+Scope:
+
+- Artifact metadata now records content key id/version and metadata key
+  id/version.
+- Event envelopes now record metadata key id/version.
+- Artifact content writes wrap encrypted content bytes in a small storage
+  envelope containing the resolved key id/version before calling the content
+  backend.
+- Artifact content reads prefer the key recorded in the storage envelope, then
+  fall back to artifact metadata/current resolver for legacy rows.
+- Metadata/event KV writes wrap encrypted rows in the same key-aware envelope
+  while preserving tenant-first primary keys and plaintext secondary index
+  keys.
+- Metadata/event KV reads decode the storage envelope before decrypting and
+  pass the recorded key metadata to the crypto adapter.
+- Restart coverage verifies artifact content, artifact metadata, and event rows
+  retain key metadata while preserving existing runtime read behavior.
+
+Follow-up:
+
+- No remaining V2 design implementation follow-ups are tracked for the current
+  prototype scope.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

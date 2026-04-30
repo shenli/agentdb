@@ -77,6 +77,8 @@ async fn artifact_content_crypto_wraps_storage_bytes_but_preserves_plaintext_met
 
         assert_eq!(artifact.bytes, plaintext.len() as u64);
         assert_eq!(artifact.sha256, sha256_hex(plaintext));
+        assert!(artifact.content_key_id.as_deref().is_some());
+        assert!(artifact.metadata_key_id.as_deref().is_some());
 
         let stored_path = content_root
             .join("artifact_content")
@@ -85,7 +87,8 @@ async fn artifact_content_crypto_wraps_storage_bytes_but_preserves_plaintext_met
             .join("blob");
         let stored = std::fs::read(stored_path).unwrap();
         assert_ne!(stored, plaintext);
-        assert!(stored.starts_with(b"enc:"));
+        assert!(stored.starts_with(b"AGDB-ENVELOPE-v1\n"));
+        assert!(stored.windows(b"tenant:".len()).any(|w| w == b"tenant:"));
 
         let round_trip = rt
             .get_artifact_blob(&tenant.tenant_id, &artifact.artifact_id)
@@ -112,6 +115,8 @@ async fn artifact_content_crypto_wraps_storage_bytes_but_preserves_plaintext_met
     let metadata = rt.get_artifact(&tenant_id, &artifact_id).await.unwrap();
     assert_eq!(metadata.bytes, plaintext.len() as u64);
     assert_eq!(metadata.sha256, sha256);
+    assert!(metadata.content_key_id.as_deref().is_some());
+    assert!(metadata.metadata_key_id.as_deref().is_some());
 
     let reopened_blob = rt
         .get_artifact_blob(&tenant_id, &artifact_id)

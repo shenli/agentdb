@@ -6,6 +6,8 @@
 
 use std::io;
 
+use crate::kms::KeyResolution;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataObjectKind {
     Artifact,
@@ -26,6 +28,7 @@ pub struct MetadataCryptoContext<'a> {
     pub tenant_id: &'a str,
     pub object_kind: MetadataObjectKind,
     pub object_id: &'a str,
+    pub key: Option<KeyResolution>,
 }
 
 pub trait MetadataCryptoAdapter: Send + Sync {
@@ -70,6 +73,7 @@ mod tests {
             tenant_id: "ten_a",
             object_kind: MetadataObjectKind::Event,
             object_id: "evt_a",
+            key: None,
         };
 
         let encrypted = IdentityMetadataCryptoAdapter

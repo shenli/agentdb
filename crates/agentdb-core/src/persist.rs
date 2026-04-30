@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
     artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_key,
@@ -32,8 +33,8 @@ use agentdb_storage::keys::{
 };
 use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
-    KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind, Result as KvResult,
-    WriteOp,
+    KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
+    Result as KvResult, WriteOp,
 };
 
 use crate::agent::Agent;
@@ -46,6 +47,13 @@ use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
+
+fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {
+    key_id.as_ref().map(|key_id| KeyResolution {
+        key_id: key_id.clone(),
+        key_version: key_version.clone(),
+    })
+}
 
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
@@ -68,7 +76,8 @@ impl Persist {
         context: &MetadataCryptoContext<'_>,
         plaintext: &[u8],
     ) -> KvResult<Vec<u8>> {
-        self.metadata_crypto
+        let ciphertext = self
+            .metadata_crypto
             .encrypt(context, plaintext)
             .map_err(|e| {
                 StorageError::Other(format!(
@@ -76,7 +85,11 @@ impl Persist {
                     context.object_kind.as_str(),
                     context.object_id
                 ))
-            })
+            })?;
+        Ok(match context.key.as_ref() {
+            Some(key) => encode_keyed_envelope(key, &ciphertext),
+            None => ciphertext,
+        })
     }
 
     fn decrypt_metadata(
@@ -84,8 +97,20 @@ impl Persist {
         context: &MetadataCryptoContext<'_>,
         ciphertext: &[u8],
     ) -> KvResult<Vec<u8>> {
+        let decoded = decode_keyed_envelope(ciphertext)
+            .map_err(|e| StorageError::Other(format!("metadata envelope decode failed: {e}")))?;
+        let (recorded_key, ciphertext) = match decoded {
+            Some((key, ciphertext)) => (Some(key), ciphertext),
+            None => (None, ciphertext.to_vec()),
+        };
+        let context = MetadataCryptoContext {
+            tenant_id: context.tenant_id,
+            object_kind: context.object_kind,
+            object_id: context.object_id,
+            key: recorded_key.or_else(|| context.key.clone()),
+        };
         self.metadata_crypto
-            .decrypt(context, ciphertext)
+            .decrypt(&context, &ciphertext)
             .map_err(|e| {
                 StorageError::Other(format!(
                     "metadata decrypt failed for {} {}: {e}",
@@ -96,18 +121,22 @@ impl Persist {
     }
 
     fn artifact_context<'a>(&self, a: &'a Artifact) -> MetadataCryptoContext<'a> {
+        let key = key_from_parts(&a.metadata_key_id, &a.metadata_key_version);
         MetadataCryptoContext {
             tenant_id: a.tenant_id.as_str(),
             object_kind: MetadataObjectKind::Artifact,
             object_id: a.artifact_id.as_str(),
+            key,
         }
     }
 
     fn event_context<'a>(&self, e: &'a EventEnvelope) -> MetadataCryptoContext<'a> {
+        let key = key_from_parts(&e.metadata_key_id, &e.metadata_key_version);
         MetadataCryptoContext {
             tenant_id: e.tenant_id.as_str(),
             object_kind: MetadataObjectKind::Event,
             object_id: e.session_id.as_str(),
+            key,
         }
     }
 
@@ -121,6 +150,7 @@ impl Persist {
             tenant_id,
             object_kind: MetadataObjectKind::Event,
             object_id: session_id,
+            key: None,
         }
     }
 
@@ -467,6 +497,7 @@ impl Persist {
                 tenant_id,
                 object_kind: MetadataObjectKind::Artifact,
                 object_id: artifact_id,
+                key: None,
             };
             let plaintext = self.decrypt_metadata(&context, &v)?;
             let a: Artifact = serde_json::from_slice(&plaintext).expect("artifact decodes");
