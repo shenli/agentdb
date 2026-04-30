@@ -869,8 +869,7 @@ Scope:
 
 Follow-up:
 
-- Add KMS/key availability signals at storage boundaries and route rejection
-  diagnostics.
+- Add envelope encryption/decryption adapters at the artifact content boundary.
 
 ### V2.21 — Operator-facing route metadata visibility (~250 LoC)
 
@@ -892,8 +891,7 @@ Scope:
 
 Follow-up:
 
-- Add KMS/key availability signals at storage boundaries and route rejection
-  diagnostics.
+- Add envelope encryption/decryption adapters at the artifact content boundary.
 
 ### V2.22 — Route decision dry-run diagnostics (~250 LoC)
 
@@ -915,8 +913,7 @@ Scope:
 
 Follow-up:
 
-- Add KMS/key availability signals at storage boundaries and route rejection
-  diagnostics.
+- Add envelope encryption/decryption adapters at the artifact content boundary.
 
 ### V2.23 — V2 summary cleanup (~100 LoC)
 
@@ -936,8 +933,32 @@ Scope:
 
 Follow-up:
 
-- Add KMS/key availability signals at storage boundaries and route rejection
-  diagnostics.
+- Add envelope encryption/decryption adapters at the artifact content boundary.
+
+### V2.24 — KMS/key availability signals (~350 LoC)
+
+Status: KMS/key availability signals complete. V2.24 introduces the provider
+boundary for tenant key resolution and surfaces unavailable keys as structured
+runtime/API and route diagnostics without implementing encryption yet.
+
+Scope:
+
+- `agentdb-storage` exposes a provider-neutral `KmsKeyResolver` trait,
+  key-operation enum, key-resolution shape, and test/static resolver.
+- `Runtime` accepts an injected key resolver and defaults to an allow-all
+  resolver for existing local deployments.
+- Artifact content writes/reads and event metadata writes check tenant key
+  availability before crossing their storage boundary.
+- Unavailable keys return `KEY_UNAVAILABLE`, retryable, with an operator
+  suggestion; the HTTP API maps it to 503.
+- Route diagnostics now include `ROUTE_KEY_UNAVAILABLE` and
+  `key_unavailable` reason support for policy/planner integration.
+- Core coverage verifies unavailable keys reject artifact content writes and
+  event metadata writes.
+
+Follow-up:
+
+- Add envelope encryption/decryption adapters at the artifact content boundary.
 
 ---
 

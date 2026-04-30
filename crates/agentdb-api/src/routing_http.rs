@@ -484,6 +484,7 @@ fn route_reason_code(reason: RouteReason) -> &'static str {
         RouteReason::NodeUnavailable => "node_unavailable",
         RouteReason::ResidencyDenied => "residency_denied",
         RouteReason::WrongLocation => "wrong_location",
+        RouteReason::KeyUnavailable => "key_unavailable",
     }
 }
 
@@ -649,6 +650,9 @@ pub fn route_rejection_response(rejection: &RouteRejection) -> Response {
         }
         "ROUTE_RESIDENCY_DENIED" => Some("move the session to an allowed location before retrying"),
         "ROUTE_UNASSIGNED" => Some("retry after placement or failover assigns the tablet"),
+        "ROUTE_KEY_UNAVAILABLE" => {
+            Some("restore or rotate the tenant encryption key before retrying")
+        }
         "ROUTE_FORWARD_LOOP" => {
             Some("retry against the owner node advertised in the routing headers")
         }
@@ -765,6 +769,12 @@ fn route_rejection(decision: &RouteDecision) -> RouteRejection {
             "ROUTE_NODE_UNAVAILABLE",
             true,
             "target tablet owner node is not alive",
+        ),
+        RouteReason::KeyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ROUTE_KEY_UNAVAILABLE",
+            true,
+            "tenant encryption key is unavailable for the routed request",
         ),
     };
     let mut headers = HeaderMap::new();
@@ -997,6 +1007,26 @@ mod tests {
         assert_eq!(
             rejection.headers[HDR_ROUTE_ACTION].to_str().unwrap(),
             "reject"
+        );
+    }
+
+    #[test]
+    fn key_unavailable_rejection_is_retryable_503() {
+        let outcome = route_http_outcome(&decision(
+            RouteAction::Reject,
+            Some(RouteReason::KeyUnavailable),
+        ));
+        let RouteHttpOutcome::Reject(rejection) = outcome else {
+            panic!("expected rejection");
+        };
+        assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejection.code, "ROUTE_KEY_UNAVAILABLE");
+        assert!(rejection.retryable);
+        let response = route_rejection_response(&rejection);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
+            "ROUTE_KEY_UNAVAILABLE"
         );
     }
 
