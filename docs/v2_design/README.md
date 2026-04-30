@@ -41,7 +41,11 @@ Implementation checkpoint:
 - V2.8 adds the LangGraph checkpoint/store adapter package plus a mounted
   session-first dashboard for timeline, replay, fork, artifact, record, skill,
   context, watch, and SSE inspection.
-- Current next milestone: V2.9/P1 adapter backlog and scale-out proof points.
+- V2.9 covers the P1 integration backlog with an OpenAI Agents SDK session
+  adapter, MCP stdio server, and Vercel AI SDK persistence template on top of
+  the V2 API. Multi-node scale-out remains a post-adapter follow-up.
+- Current next milestone: multi-node scale-out path and managed-service
+  hardening.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
