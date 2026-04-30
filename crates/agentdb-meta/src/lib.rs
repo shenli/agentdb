@@ -23,6 +23,7 @@ pub mod config;
 pub mod error;
 pub mod migrations;
 pub mod nodes;
+pub mod routing;
 pub mod scheduler;
 pub mod scram;
 pub mod session_locators;

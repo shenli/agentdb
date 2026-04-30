@@ -127,7 +127,7 @@ crates/agentdb-core          runtime model and tenant/session/event semantics
 crates/agentdb-api           native V2 HTTP routes
 crates/agentdb-storage       RocksDB/SlateDB KV and artifact content backends
 crates/agentdb-index         text/vector indexing helpers
-crates/agentdb-meta          control-plane metadata helpers
+crates/agentdb-meta          control-plane metadata and routing planner
 crates/agentdb-dashboard     session-first dashboard assets
 adapters/langgraph-checkpoint-agentdb
                               LangGraph checkpoint/store adapter
@@ -146,6 +146,7 @@ docs/v2_design               V2 design and implementation plan
 ```bash
 cargo build --workspace
 cargo test -p agentdb-core -p agentdb-api
+cargo test -p agentdb-meta routing
 python3 -m pytest -q clients/python/tests
 PYTHONPATH=adapters/langgraph-checkpoint-agentdb python3 -m pytest -q adapters/langgraph-checkpoint-agentdb/tests
 PYTHONPATH=clients/python:adapters/openai-agents-agentdb python3 -m pytest -q adapters/openai-agents-agentdb/tests

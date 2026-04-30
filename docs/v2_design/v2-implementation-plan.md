@@ -582,8 +582,8 @@ Dependencies: V2.0–V2.7.
 Status: adapter backlog complete for the single-machine V2 prototype. V2.9 adds
 the OpenAI Agents SDK custom session adapter, an MCP stdio server exposing
 AgentDB tools/resources/prompts, and a Vercel AI SDK chat persistence template.
-The remaining P1 work is the multi-node scale-out path plus managed-service
-hardening such as KMS hooks and region routing.
+The remaining P1 work is the multi-node request-forwarding path plus
+managed-service hardening such as KMS hooks and durable region metadata.
 
 These are noted but not scheduled into this plan. They're tracked as follow-up:
 
@@ -597,6 +597,31 @@ These are noted but not scheduled into this plan. They're tracked as follow-up:
 - Region routing / residency enforcement (V2 §12.5)
 
 Each will get its own plan when prioritized.
+
+### V2.10 — Multi-node routing planner (~800 LoC)
+
+Status: metadata contract complete. V2.10 adds a pure routing planner in
+`agentdb-meta` that consumes the existing node, tablet, shard, and session
+locator snapshots and returns one of four data-plane actions: serve locally,
+forward to another node, reject for residency/location policy, or report the
+tablet unassigned so placement/failover can run.
+
+Scope:
+
+- Deterministic tenant-to-shard fallback for sessions without locators
+- Session locator precedence over shard override/default routing
+- Tablet owner, lease, node liveness, and owner address resolution
+- Prototype residency policy over the existing node location label
+  (`availability_zone`) with cross-location rejection support
+- Focused unit tests for local, forward, expired lease, residency denied, and
+  wrong-location decisions
+
+Follow-up:
+
+- Wire the planner into the HTTP data path and return/forward according to the
+  decision.
+- Split region and availability zone into distinct metadata fields.
+- Add KMS key availability signals to the same reject/forward decision shape.
 
 ---
 
@@ -2394,7 +2419,7 @@ milestone.
 | V2 §9 Runtime core responsibilities | All milestones |
 | V2 §10 Storage engine capabilities | V2.0 (ordered streams, metadata records), V2.1 (artifact store), V2.2 (indexing hooks), V2.4 (lifecycle), V2.5 (changefeed) |
 | V2 §11 Lessons from V1 prototype | This entire plan honors §11.1 keep-list and §11.2 change-list |
-| V2 §12 Managed-service data plane | Partial (V2.4 covers tenant isolation + admission; full coverage is V2.9 P1 backlog) |
+| V2 §12 Managed-service data plane | Partial (V2.4 covers tenant isolation + admission; V2.10 adds routing/residency planning; request forwarding + KMS remain follow-up) |
 | V2 §13–14 ID allocation + summary | V2.0 |
 | V2 §15 Storage layout sketch | V2.0 (key encoders) + V2.1 (artifact metadata and content backend refs) |
 | V2 §16 API sketch + adapter requirements | V2.0–V2.5 (native API), V2.6 (SDKs), V2.8 (LangGraph adapter as proof) |
@@ -2403,7 +2428,7 @@ milestone.
 | V2 §19 Subscription semantics | V2.5 |
 | V2 §20 What belongs in AgentDB vs application | This plan honors the boundary |
 | V2 §21 Prototype priorities | Roadmap matches §21 P0 list |
-| V2 §22 Non-goals | V2.7 (delete `agentdb-wire`, `clients/go`); KMS/region routing deferred to V2.9 backlog |
+| V2 §22 Non-goals | V2.7 (delete `agentdb-wire`, `clients/go`); KMS and durable region routing metadata remain follow-up |
 | Impl §1–§4 Goal/non-goals/SDK/repo | V2.0 sets foundation |
 | Impl §5 Local storage | V2.0 (uses existing RocksDB+SlateDB+local FS) |
 | Impl §6 Core data types | V2.0 |
@@ -2424,9 +2449,10 @@ milestone.
 
 Per the writing-plans skill self-review checklist:
 
-**1. Spec coverage:** §4 above maps every spec section to a milestone. KMS hooks
-(V2 §12.6), region routing (V2 §12.5), and OpenAI/Vercel adapters are explicitly
-deferred to V2.9 P1 backlog and noted as such.
+**1. Spec coverage:** §4 above maps every spec section to a milestone. OpenAI
+and Vercel adapters are covered by V2.9. Region routing planning starts in
+V2.10; runtime forwarding, durable region metadata, and KMS hooks (V2 §12.6)
+remain follow-up work and are noted as such.
 
 **2. Placeholder scan:** Skill says no `TBD`, no "implement later", no "similar
 to Task N". Re-checked V2.0 task plan: every step has actual code or commands.
