@@ -14,8 +14,12 @@
 # ~3GB target/ directory stay in the builder.
 
 # -------- builder --------
-FROM rust:1.84-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Prime the dep cache. We copy just the manifests first so
 # `cargo fetch` and the noop-compile happen before the source
@@ -29,7 +33,6 @@ COPY crates/agentdb-dashboard/Cargo.toml crates/agentdb-dashboard/
 COPY crates/agentdb-index/Cargo.toml crates/agentdb-index/
 COPY crates/agentdb-meta/Cargo.toml crates/agentdb-meta/
 COPY crates/agentdb-storage/Cargo.toml crates/agentdb-storage/
-COPY crates/agentdb-wire/Cargo.toml crates/agentdb-wire/
 
 # Dummy source files are needed because cargo can't resolve the
 # workspace without them. `cargo fetch --locked` materializes the
@@ -38,11 +41,12 @@ COPY crates/agentdb-wire/Cargo.toml crates/agentdb-wire/
 RUN mkdir -p bin/agentdb-server/src crates/agentdb-api/src \
         crates/agentdb-core/src crates/agentdb-dashboard/src \
         crates/agentdb-index/src crates/agentdb-meta/src \
-        crates/agentdb-storage/src crates/agentdb-wire/src \
+        crates/agentdb-storage/src crates/agentdb-index/benches \
     && echo "fn main(){}" > bin/agentdb-server/src/main.rs \
-    && for c in api core dashboard index meta storage wire; do \
+    && for c in api core dashboard index meta storage; do \
            echo "" > crates/agentdb-$c/src/lib.rs; \
        done \
+    && echo "fn main(){}" > crates/agentdb-index/benches/vector_bench.rs \
     && cargo fetch --locked
 
 # Now the real build. Source copy invalidates the compile-cache
