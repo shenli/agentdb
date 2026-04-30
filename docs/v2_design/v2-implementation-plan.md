@@ -252,9 +252,12 @@ Dependencies: V2.0; V2.1 for skill-as-artifact case.
 Status: in progress. V2.4a implements the hot-path policy slice:
 tenant policy + agent override resolution, priority parsing, append/artifact/
 record quota enforcement, `policy_version` stamping on events, and
-`include_deleted=true` record reads. Lifecycle transitions, tier templates,
-backpressure headers, full multi-dimensional quotas, and GC worker scheduling
-remain for V2.4b+.
+`include_deleted=true` record reads. V2.4b implements policy-driven session
+lifecycle transitions, derivative-only artifact raw purge, synchronous GC for
+soft-deleted records/artifacts after retention, and legal-hold skips. Tier
+templates, backpressure headers, full multi-dimensional quotas, broader object
+GC handlers, changefeed events, and background worker scheduling remain for
+V2.4c+.
 
 **Maps to impl guide §15 step 13 + V2 §17, §18, §12.8.**
 

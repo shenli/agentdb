@@ -71,6 +71,26 @@ impl Default for RetentionPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecyclePolicy {
+    #[serde(default)]
+    pub cold_after_ms: Option<u64>,
+    #[serde(default)]
+    pub archive_after_ms: Option<u64>,
+    #[serde(default)]
+    pub derivative_only_after_ms: Option<u64>,
+}
+
+impl Default for LifecyclePolicy {
+    fn default() -> Self {
+        Self {
+            cold_after_ms: None,
+            archive_after_ms: None,
+            derivative_only_after_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimePolicy {
     #[serde(default = "default_policy_version")]
     pub version: u64,
@@ -82,6 +102,8 @@ pub struct RuntimePolicy {
     pub artifact_size: ArtifactSizePolicy,
     #[serde(default)]
     pub retention: RetentionPolicy,
+    #[serde(default)]
+    pub lifecycle: LifecyclePolicy,
 }
 
 fn default_policy_version() -> u64 {
@@ -96,6 +118,7 @@ impl Default for RuntimePolicy {
             quota: QuotaPolicy::default(),
             artifact_size: ArtifactSizePolicy::default(),
             retention: RetentionPolicy::default(),
+            lifecycle: LifecyclePolicy::default(),
         }
     }
 }

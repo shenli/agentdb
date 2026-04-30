@@ -107,6 +107,18 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    pub fn delete_artifact(&self, a: &Artifact) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Delete {
+                key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
+            },
+            WriteOp::Delete {
+                key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
+            },
+        ];
+        self.kv.write_batch(ops)
+    }
+
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Put {
@@ -392,6 +404,23 @@ impl Persist {
                 )
                 .into_bytes(),
                 value: r.record_id.as_str().as_bytes().to_vec(),
+            },
+        ];
+        self.kv.write_batch(ops)
+    }
+
+    pub fn delete_record(&self, r: &SearchableRecord) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Delete {
+                key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
+            },
+            WriteOp::Delete {
+                key: record_by_namespace_key(
+                    r.tenant_id.as_str(),
+                    &r.namespace_path(),
+                    r.record_id.as_str(),
+                )
+                .into_bytes(),
             },
         ];
         self.kv.write_batch(ops)
