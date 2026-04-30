@@ -11,7 +11,7 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,7 +19,7 @@ use axum::{
 
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
-    runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest},
+    runtime::{AppendRequest, FetchRequest, SearchRequest},
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ErrorCode, EventEnvelope, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Session, Skill, SourceRef, Tenant,
 };
@@ -27,13 +27,14 @@ use agentdb_core::{
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, IncludeDeletedQuery,
-    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse,
+    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse, SweepBody,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
 
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const SHA256_HEADER: &str = "X-Sha256";
+const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -106,6 +107,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/tenants/:tenant_id/skills", post(create_skill))
         .route("/api/tenants/:tenant_id/skills/:skill_id", get(get_skill))
+        .route(
+            "/api/tenants/:tenant_id/policy/lifecycle-sweep",
+            post(run_lifecycle_sweep),
+        )
+        .route(
+            "/api/tenants/:tenant_id/policy/gc-sweep",
+            post(run_gc_sweep),
+        )
 }
 
 async fn create_tenant(
@@ -176,7 +185,7 @@ async fn create_session(
     State(s): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<CreateSessionBody>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -190,12 +199,17 @@ async fn create_session(
     let sess = s
         .runtime
         .create_session(NewSession {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             agent_id: aid,
             alias: body.alias,
         })
         .await?;
-    Ok(Json(sess))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(sess),
+        backpressure,
+    ))
 }
 
 async fn get_session(
@@ -220,7 +234,7 @@ async fn append_event(
     Path((tenant_id, session_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AppendBody>,
-) -> Result<Json<AppendResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -241,9 +255,9 @@ async fn append_event(
     let resp = s
         .runtime
         .append(AppendRequest {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             agent_id: aid,
-            session_id: sid,
+            session_id: sid.clone(),
             kind: body.kind,
             payload: body.payload,
             artifact_refs: body.artifact_refs,
@@ -251,7 +265,13 @@ async fn append_event(
             idempotency_key: idem_key,
         })
         .await?;
-    Ok(Json(resp))
+    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
+    Ok(json_with_backpressure(
+        StatusCode::OK,
+        Json(resp),
+        backpressure,
+    ))
 }
 
 async fn append_and_fetch(
@@ -259,7 +279,7 @@ async fn append_and_fetch(
     Path((tenant_id, session_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AppendAndFetchBody>,
-) -> Result<Json<AppendAndFetchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -281,9 +301,9 @@ async fn append_and_fetch(
         .runtime
         .append_and_fetch(
             AppendRequest {
-                tenant_id: tid,
+                tenant_id: tid.clone(),
                 agent_id: aid,
-                session_id: sid,
+                session_id: sid.clone(),
                 kind: body.kind,
                 payload: body.payload,
                 artifact_refs: body.artifact_refs,
@@ -294,7 +314,13 @@ async fn append_and_fetch(
             body.max_bytes,
         )
         .await?;
-    Ok(Json(resp))
+    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
+    Ok(json_with_backpressure(
+        StatusCode::OK,
+        Json(resp),
+        backpressure,
+    ))
 }
 
 async fn fetch_events(
@@ -346,7 +372,7 @@ async fn create_artifact(
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Artifact>), ApiError> {
+) -> Result<Response, ApiError> {
     // Bad path-id collapses to a structured 404. There's no INVALID_INPUT
     // ErrorCode in V2 — a syntactically broken id is indistinguishable from
     // a non-existent one to the caller, so TenantNotFound is the right
@@ -375,14 +401,19 @@ async fn create_artifact(
         .runtime
         .create_artifact(
             NewArtifact {
-                tenant_id: tid,
+                tenant_id: tid.clone(),
                 content_type,
                 expected_sha256,
             },
             body.to_vec(),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(art)))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(art),
+        backpressure,
+    ))
 }
 
 /// `GET /api/tenants/:tenant_id/artifacts/:artifact_id`
@@ -457,6 +488,20 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn json_with_backpressure<T: serde::Serialize>(
+    status: StatusCode,
+    body: Json<T>,
+    backpressure: agentdb_core::BackpressureReport,
+) -> Response {
+    let mut resp = (status, body).into_response();
+    if let Some(value) = backpressure.header_value() {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(BACKPRESSURE_HEADER, value);
+        }
+    }
+    resp
+}
+
 /// `POST /api/tenants/:tenant_id/records`
 ///
 /// Body shape mirrors `agentdb_core::NewRecord` minus `tenant_id` (which the
@@ -466,12 +511,12 @@ async fn create_record(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateRecordBody>,
-) -> Result<(StatusCode, Json<SearchableRecord>), ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let rec = s
         .runtime
         .write_record(NewRecord {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             namespace: body.namespace,
             scope: body.scope,
             text: body.text,
@@ -483,7 +528,12 @@ async fn create_record(
             expires_at_ms: body.expires_at_ms,
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(rec)))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(rec),
+        backpressure,
+    ))
 }
 
 /// `GET /api/tenants/:tenant_id/records/:record_id`
@@ -649,6 +699,40 @@ async fn list_agent_skills(
     let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
     let skills = s.runtime.list_agent_skills(&tid, &aid).await?;
     Ok(Json(ListAgentSkillsResponse { skills }))
+}
+
+async fn run_lifecycle_sweep(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SweepBody>,
+) -> Result<Json<agentdb_core::LifecycleSweepReport>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let report = s
+        .runtime
+        .sweep_lifecycle_for_tenant_at(&tid, body.now_ms.unwrap_or_else(current_ms))
+        .await?;
+    Ok(Json(report))
+}
+
+async fn run_gc_sweep(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SweepBody>,
+) -> Result<Json<agentdb_core::GcSweepReport>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let report = s
+        .runtime
+        .gc_sweep_for_tenant_at(&tid, body.now_ms.unwrap_or_else(current_ms))
+        .await?;
+    Ok(Json(report))
+}
+
+fn current_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Hand-rolled query-string parser for the search route. Handles the

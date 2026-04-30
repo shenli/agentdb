@@ -12,8 +12,12 @@ Implementation checkpoint:
 - V2.4b adds policy-driven session lifecycle transitions, derivative-only
   artifact raw purge, soft-deleted record/artifact GC, and legal-hold
   retention skips in the runtime core.
-- Current next milestone: V2.4c tier templates, soft-quota backpressure, fuller
-  quota dimensions, and background worker scheduling.
+- V2.4c adds built-in tier policy templates, record/artifact storage soft
+  quota backpressure headers, active-session and session-event pressure
+  signals, hard active-session and artifact-storage quotas, and tenant-scoped
+  lifecycle/GC sweep API endpoints.
+- Current next milestone: V2.4d fuller quota dimensions, background worker
+  scheduling, broader GC handlers, and changefeed delete/purge events.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

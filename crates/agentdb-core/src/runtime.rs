@@ -91,16 +91,59 @@ pub struct AppendAndFetchResponse {
     pub recent: Vec<EventEnvelope>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct LifecycleSweepReport {
     pub sessions_transitioned: usize,
     pub artifacts_raw_purged: usize,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct GcSweepReport {
     pub records_purged: usize,
     pub artifacts_purged: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackpressureSignal {
+    pub bucket: String,
+    pub percent: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct BackpressureReport {
+    pub signals: Vec<BackpressureSignal>,
+}
+
+impl BackpressureReport {
+    pub fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    pub fn header_value(&self) -> Option<String> {
+        if self.signals.is_empty() {
+            return None;
+        }
+        Some(
+            self.signals
+                .iter()
+                .map(|s| format!("{}={}", s.bucket, s.percent))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+
+    fn push_if_over(&mut self, bucket: impl Into<String>, usage: u64, soft_limit: u64) {
+        if let Some(percent) = usage_percent(usage, soft_limit) {
+            self.signals.push(BackpressureSignal {
+                bucket: bucket.into(),
+                percent,
+            });
+        }
+    }
+
+    pub fn merge(&mut self, other: BackpressureReport) {
+        self.signals.extend(other.signals);
+    }
 }
 
 #[derive(Default, Debug)]
@@ -486,6 +529,27 @@ impl Runtime {
     pub async fn create_session(&self, req: NewSession) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
+            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
+            if let Some(max) = policy.quota.max_active_sessions {
+                let active_sessions = s
+                    .sessions
+                    .values()
+                    .filter(|sess| {
+                        sess.tenant_id.as_str() == req.tenant_id.as_str()
+                            && sess.deleted_at_ms.is_none()
+                            && sess.status == crate::session::Status::Active
+                    })
+                    .count();
+                if active_sessions >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies session create: active session quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
+            }
             // Verify the agent exists AND belongs to the requesting tenant. We
             // collapse "agent unknown" and "agent belongs to another tenant"
             // into the same `AgentNotFound` response so a caller in tenant A
@@ -758,6 +822,91 @@ impl Runtime {
         Ok(base.merge_override(override_json))
     }
 
+    pub async fn backpressure_for_tenant(&self, tenant_id: &Id) -> Result<BackpressureReport> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let policy = policy_for_tenant_in_state(&s, tenant_id);
+        let mut report = BackpressureReport::default();
+
+        if let Some(soft) = policy.quota.soft_max_active_sessions {
+            let active_sessions = s
+                .sessions
+                .values()
+                .filter(|sess| {
+                    sess.tenant_id.as_str() == tenant_id.as_str()
+                        && sess.deleted_at_ms.is_none()
+                        && sess.status == crate::session::Status::Active
+                })
+                .count();
+            report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
+        }
+
+        if let Some(soft) = policy.quota.soft_max_records {
+            let live_records = s
+                .records
+                .values()
+                .filter(|r| {
+                    r.tenant_id.as_str() == tenant_id.as_str()
+                        && r.deleted_at_ms.is_none()
+                        && !r.is_expired()
+                })
+                .count();
+            report.push_if_over("records", live_records as u64, soft as u64);
+        }
+
+        if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
+            let live_bytes: u64 = s
+                .artifacts
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .map(|a| a.bytes)
+                .sum();
+            report.push_if_over("artifact_storage", live_bytes, soft);
+        }
+
+        Ok(report)
+    }
+
+    pub async fn backpressure_for_session(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<BackpressureReport> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let session = s
+            .sessions
+            .get(session_id.as_str())
+            .filter(|sess| {
+                sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+        let policy = policy_for_tenant_in_state(&s, tenant_id);
+        let mut report = BackpressureReport::default();
+        if let Some(soft) = policy.quota.soft_max_events_per_session {
+            report.push_if_over("session_events", session.next_seq, soft);
+        }
+        Ok(report)
+    }
+
     /// Create an artifact: write the bytes to the content backend, persist
     /// the metadata, return the metadata record. Tenant must exist.
     ///
@@ -797,6 +946,25 @@ impl Runtime {
                     ErrorCode::TenantNotFound,
                     format!("{}", req.tenant_id),
                 ));
+            }
+            if let Some(max) = policy.quota.max_artifact_storage_bytes {
+                let live_bytes: u64 = s
+                    .artifacts
+                    .values()
+                    .filter(|a| {
+                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
+                    })
+                    .map(|a| a.bytes)
+                    .sum();
+                if live_bytes.saturating_add(len) > max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies artifact write: artifact storage quota {max} bytes exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
             }
         }
 
@@ -922,6 +1090,35 @@ impl Runtime {
     }
 
     pub async fn sweep_lifecycle_at(&self, now_ms: u64) -> Result<LifecycleSweepReport> {
+        self.sweep_lifecycle_inner(None, now_ms).await
+    }
+
+    pub async fn sweep_lifecycle_for_tenant_at(
+        &self,
+        tenant_id: &Id,
+        now_ms: u64,
+    ) -> Result<LifecycleSweepReport> {
+        {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", tenant_id),
+                ));
+            }
+        }
+        self.sweep_lifecycle_inner(Some(tenant_id), now_ms).await
+    }
+
+    async fn sweep_lifecycle_inner(
+        &self,
+        tenant_scope: Option<&Id>,
+        now_ms: u64,
+    ) -> Result<LifecycleSweepReport> {
         let mut report = LifecycleSweepReport::default();
         let artifact_candidates = {
             let mut s = self.state.lock().await;
@@ -931,6 +1128,11 @@ impl Runtime {
                     continue;
                 };
                 if session.deleted_at_ms.is_some() {
+                    continue;
+                }
+                if tenant_scope
+                    .is_some_and(|tenant_id| session.tenant_id.as_str() != tenant_id.as_str())
+                {
                     continue;
                 }
                 let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
@@ -952,6 +1154,9 @@ impl Runtime {
             s.artifacts
                 .values()
                 .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
+                .filter(|a| {
+                    tenant_scope.is_none_or(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                })
                 .filter(|a| {
                     let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
                     !policy.retention.legal_hold
@@ -996,6 +1201,35 @@ impl Runtime {
     }
 
     pub async fn gc_sweep_at(&self, now_ms: u64) -> Result<GcSweepReport> {
+        self.gc_sweep_inner(None, now_ms).await
+    }
+
+    pub async fn gc_sweep_for_tenant_at(
+        &self,
+        tenant_id: &Id,
+        now_ms: u64,
+    ) -> Result<GcSweepReport> {
+        {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", tenant_id),
+                ));
+            }
+        }
+        self.gc_sweep_inner(Some(tenant_id), now_ms).await
+    }
+
+    async fn gc_sweep_inner(
+        &self,
+        tenant_scope: Option<&Id>,
+        now_ms: u64,
+    ) -> Result<GcSweepReport> {
         let mut report = GcSweepReport::default();
         {
             let mut s = self.state.lock().await;
@@ -1003,6 +1237,11 @@ impl Runtime {
                 .records
                 .iter()
                 .filter_map(|(id, r)| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| r.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
                     let deleted_at = r.deleted_at_ms?;
                     let policy = policy_for_tenant_in_state(&s, &r.tenant_id);
                     if policy.retention.legal_hold
@@ -1034,6 +1273,11 @@ impl Runtime {
             s.artifacts
                 .values()
                 .filter_map(|a| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| a.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
                     let deleted_at = a.deleted_at_ms?;
                     let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
                     if policy.retention.legal_hold
@@ -1861,6 +2105,16 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
+    if soft_limit == 0 {
+        return (usage > 0).then_some(100);
+    }
+    if usage < soft_limit {
+        return None;
+    }
+    Some(usage.saturating_mul(100).saturating_div(soft_limit))
 }
 
 /// Compare a record's `source` against a search filter. The filter

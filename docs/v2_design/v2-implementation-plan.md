@@ -255,9 +255,11 @@ record quota enforcement, `policy_version` stamping on events, and
 `include_deleted=true` record reads. V2.4b implements policy-driven session
 lifecycle transitions, derivative-only artifact raw purge, synchronous GC for
 soft-deleted records/artifacts after retention, and legal-hold skips. Tier
-templates, backpressure headers, full multi-dimensional quotas, broader object
-GC handlers, changefeed events, and background worker scheduling remain for
-V2.4c+.
+templates, record/artifact storage backpressure headers, active-session and
+session-event pressure signals, hard active-session and artifact-storage
+quotas, and tenant-scoped lifecycle/GC sweep API endpoints landed in V2.4c.
+Full multi-dimensional quotas, broader object GC handlers, changefeed events,
+and background worker scheduling remain for V2.4d+.
 
 **Maps to impl guide §15 step 13 + V2 §17, §18, §12.8.**
 

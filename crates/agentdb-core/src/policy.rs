@@ -25,16 +25,34 @@ impl Default for Priority {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaPolicy {
     #[serde(default)]
+    pub soft_max_events_per_session: Option<u64>,
+    #[serde(default)]
     pub max_events_per_session: Option<u64>,
     #[serde(default)]
+    pub soft_max_active_sessions: Option<usize>,
+    #[serde(default)]
+    pub max_active_sessions: Option<usize>,
+    #[serde(default)]
+    pub soft_max_records: Option<usize>,
+    #[serde(default)]
     pub max_records: Option<usize>,
+    #[serde(default)]
+    pub soft_max_artifact_storage_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_artifact_storage_bytes: Option<u64>,
 }
 
 impl Default for QuotaPolicy {
     fn default() -> Self {
         Self {
+            soft_max_events_per_session: None,
             max_events_per_session: None,
+            soft_max_active_sessions: None,
+            max_active_sessions: None,
+            soft_max_records: None,
             max_records: None,
+            soft_max_artifact_storage_bytes: None,
+            max_artifact_storage_bytes: None,
         }
     }
 }
@@ -92,6 +110,8 @@ impl Default for LifecyclePolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimePolicy {
+    #[serde(default)]
+    pub tier: Option<String>,
     #[serde(default = "default_policy_version")]
     pub version: u64,
     #[serde(default)]
@@ -113,6 +133,7 @@ fn default_policy_version() -> u64 {
 impl Default for RuntimePolicy {
     fn default() -> Self {
         Self {
+            tier: None,
             version: 1,
             priority: Priority::Normal,
             quota: QuotaPolicy::default(),
@@ -128,7 +149,13 @@ impl RuntimePolicy {
         if v.is_null() {
             return Self::default();
         }
-        serde_json::from_value(v.clone()).unwrap_or_default()
+        let mut base = v
+            .get("tier")
+            .and_then(|tier| tier.as_str())
+            .map(tier_template)
+            .unwrap_or_default();
+        base = base.merge_override(v);
+        base
     }
 
     pub fn merge_override(mut self, override_json: &serde_json::Value) -> Self {
@@ -139,6 +166,80 @@ impl RuntimePolicy {
         merge_json(&mut base, override_json);
         self = serde_json::from_value(base).unwrap_or(self);
         self
+    }
+}
+
+fn tier_template(name: &str) -> RuntimePolicy {
+    match name {
+        "free" => RuntimePolicy {
+            tier: Some("free".into()),
+            version: 10_001,
+            priority: Priority::Low,
+            quota: QuotaPolicy {
+                soft_max_events_per_session: Some(80),
+                max_events_per_session: Some(100),
+                soft_max_active_sessions: Some(8),
+                max_active_sessions: Some(10),
+                soft_max_records: Some(80),
+                max_records: Some(100),
+                soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024),
+                max_artifact_storage_bytes: Some(10 * 1024 * 1024),
+            },
+            artifact_size: ArtifactSizePolicy {
+                max_inline_event_bytes: 32 * 1024,
+                max_artifact_bytes: 2 * 1024 * 1024,
+            },
+            retention: RetentionPolicy::default(),
+            lifecycle: LifecyclePolicy {
+                cold_after_ms: Some(24 * 60 * 60 * 1000),
+                archive_after_ms: Some(7 * 24 * 60 * 60 * 1000),
+                derivative_only_after_ms: Some(30 * 24 * 60 * 60 * 1000),
+            },
+        },
+        "pro" => RuntimePolicy {
+            tier: Some("pro".into()),
+            version: 10_002,
+            priority: Priority::Normal,
+            quota: QuotaPolicy {
+                soft_max_events_per_session: Some(8_000),
+                max_events_per_session: Some(10_000),
+                soft_max_active_sessions: Some(800),
+                max_active_sessions: Some(1_000),
+                soft_max_records: Some(8_000),
+                max_records: Some(10_000),
+                soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024 * 1024),
+                max_artifact_storage_bytes: Some(10 * 1024 * 1024 * 1024),
+            },
+            artifact_size: ArtifactSizePolicy::default(),
+            retention: RetentionPolicy::default(),
+            lifecycle: LifecyclePolicy {
+                cold_after_ms: Some(7 * 24 * 60 * 60 * 1000),
+                archive_after_ms: Some(30 * 24 * 60 * 60 * 1000),
+                derivative_only_after_ms: Some(90 * 24 * 60 * 60 * 1000),
+            },
+        },
+        "enterprise" => RuntimePolicy {
+            tier: Some("enterprise".into()),
+            version: 10_003,
+            priority: Priority::High,
+            quota: QuotaPolicy {
+                soft_max_events_per_session: None,
+                max_events_per_session: None,
+                soft_max_active_sessions: None,
+                max_active_sessions: None,
+                soft_max_records: None,
+                max_records: None,
+                soft_max_artifact_storage_bytes: None,
+                max_artifact_storage_bytes: None,
+            },
+            artifact_size: ArtifactSizePolicy {
+                max_inline_event_bytes: 256 * 1024,
+                max_artifact_bytes: 128 * 1024 * 1024,
+            },
+            retention: RetentionPolicy::default(),
+            lifecycle: LifecyclePolicy::default(),
+        },
+        _ => RuntimePolicy::default(),
     }
 }
 
