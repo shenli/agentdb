@@ -78,8 +78,11 @@ Implementation checkpoint:
 - V2.20 splits the prototype routing location label into durable
   `nodes.region` metadata with AZ fallback, adds `--route-region`, and wakes
   route snapshot refreshes immediately on Postgres `session_locators` changes.
-- Current next milestone: add operator-facing route metadata visibility for
-  region/AZ decisions.
+- V2.21 adds operator-facing routing visibility with `GET /api/admin/routing`,
+  exposing route mode, local node, region/AZ node metadata, tablet owners, and
+  snapshot counts.
+- Current next milestone: add route decision dry-run diagnostics for a tenant
+  and optional session id.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
