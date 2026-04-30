@@ -8,6 +8,8 @@
 //! Wire DTOs live in `crate::dto`. Status codes for `agentdb_core::Error` live
 //! in `crate::errors`.
 
+use std::time::Duration;
+
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, OriginalUri, Path, Query, RawQuery, State},
@@ -883,41 +885,56 @@ async fn execute_forward(
     let mut request = state
         .proxy
         .request(method, &forward.uri)
-        .headers(forward.headers.clone());
+        .headers(forward.headers.clone())
+        .timeout(Duration::from_millis(state.proxy_policy.timeout_ms.max(1)));
     if let Some(body) = body {
         request = request.body(body);
     }
     match request.send().await {
-        Ok(response) => proxy_response(response).await,
+        Ok(response) => {
+            proxy_response(response, forward, state.proxy_policy.max_response_bytes).await
+        }
         Err(err) => route_forward_failed_response(&forward, &err),
     }
 }
 
-async fn proxy_response(response: reqwest::Response) -> Response {
+async fn proxy_response(
+    response: reqwest::Response,
+    forward: ForwardRequest,
+    max_response_bytes: u64,
+) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = response.headers().clone();
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_response_bytes)
+    {
+        return route_forward_response_too_large(&forward, max_response_bytes);
+    }
     let body = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return route_forward_failed_response(
-                &ForwardRequest {
-                    uri: "<response-body>".into(),
-                    headers: HeaderMap::new(),
-                },
-                &err,
-            );
+            return route_forward_failed_response(&forward, &err);
         }
     };
+    if body.len() as u64 > max_response_bytes {
+        return route_forward_response_too_large(&forward, max_response_bytes);
+    }
     let mut out = (status, body).into_response();
     out.headers_mut().extend(headers);
     out
 }
 
 fn route_forward_failed_response(forward: &ForwardRequest, err: &reqwest::Error) -> Response {
+    let code = if err.is_timeout() {
+        "ROUTE_FORWARD_TIMEOUT"
+    } else {
+        "ROUTE_FORWARD_FAILED"
+    };
     let body = serde_json::json!({
         "error": {
-            "code": "ROUTE_FORWARD_FAILED",
+            "code": code,
             "message": format!("failed to forward request to owner node: {err}"),
             "retryable": true,
             "suggestion": "retry against the owner node advertised in the routing headers"
@@ -925,9 +942,26 @@ fn route_forward_failed_response(forward: &ForwardRequest, err: &reqwest::Error)
     });
     let mut response = (StatusCode::BAD_GATEWAY, Json(body)).into_response();
     response.headers_mut().extend(forward.headers.clone());
+    response
+        .headers_mut()
+        .insert(HDR_ROUTE_REASON, HeaderValue::from_static(code));
+    response
+}
+
+fn route_forward_response_too_large(forward: &ForwardRequest, max_response_bytes: u64) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": "ROUTE_FORWARD_RESPONSE_TOO_LARGE",
+            "message": format!("forwarded owner response exceeded proxy limit of {max_response_bytes} bytes"),
+            "retryable": false,
+            "suggestion": "increase route proxy response limits or request a smaller response"
+        }
+    });
+    let mut response = (StatusCode::BAD_GATEWAY, Json(body)).into_response();
+    response.headers_mut().extend(forward.headers.clone());
     response.headers_mut().insert(
         HDR_ROUTE_REASON,
-        HeaderValue::from_static("ROUTE_FORWARD_FAILED"),
+        HeaderValue::from_static("ROUTE_FORWARD_RESPONSE_TOO_LARGE"),
     );
     response
 }
