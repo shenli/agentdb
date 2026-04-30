@@ -530,6 +530,14 @@ Dependencies: V2.0–V2.6 (V2 must fully replace V1 first).
 
 ### V2.8 — Framework adapter (LangGraph) + session-first dashboard (~5000 LoC)
 
+Status: complete for the single-machine V2 prototype. V2.8 adds a Python
+`langgraph-checkpoint-agentdb` package with LangGraph-compatible checkpoint
+saver and namespaced store mappings over AgentDB sessions, events, records, and
+idempotency keys. The server now mounts `/dashboard`, a session-first static
+dashboard that exercises the native V2 API for timelines, replay, SSE snapshots,
+watch cursors, fork creation, artifacts, searchable records, skills, and context
+packs.
+
 **Maps to impl guide §16 + V2 §16.1, §16.2.**
 
 Scope:

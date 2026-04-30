@@ -1,363 +1,353 @@
-// AgentDB dashboard — Alpine component. One top-level
-// `dashboard()` function; each admin tab has its own
-// sub-object that owns its fetch + render state.
-//
-// Auth: when the admin surface requires a bearer token,
-// paste it into the header input. It lives in localStorage
-// (origin-scoped) and is sent as `Authorization: Bearer` on
-// every admin fetch. No token == plaintext fetch (OK when
-// `AGENTDB_REQUIRE_ADMIN_AUTH` is unset).
+const storeKey = "agentdb.v28.dashboard";
 
-const TOKEN_KEY = 'agentdb.admin.token';
-const TAB_KEY = 'agentdb.dashboard.tab';
+const state = {
+  events: [],
+  forks: [],
+};
 
-function dashboard() {
-  return {
-    tab: 'overview',
-    adminToken: '',
-    // Overview state.
-    boxes: [],
-    events: [],
-    totalAppends: 0,
-    totalForks: 0,
-    totalTenants: 0,
-    _nextId: 0,
-    // Admin tabs.
-    slow: slowPanel(),
-    audit: auditPanel(),
-    tokens: tokensPanel(),
-    quotas: quotasPanel(),
+const $ = (id) => document.getElementById(id);
 
-    async init() {
-      try { this.adminToken = localStorage.getItem(TOKEN_KEY) || ''; } catch (_) {}
-      try { this.tab = localStorage.getItem(TAB_KEY) || 'overview'; } catch (_) {}
-      await this.refreshBoxes();
-      this.connectStream();
-      setInterval(() => this.refreshBoxes(), 5000);
-      // Start a polling loop that refreshes only the visible
-      // admin tab. 5s is responsive enough for operator UX
-      // without hammering the server.
-      setInterval(() => this.pollActiveTab(), 5000);
-      this.pollActiveTab();
-    },
+document.addEventListener("DOMContentLoaded", () => {
+  restoreInputs();
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    button.addEventListener("click", () => dispatch(button.dataset.action));
+  });
+  renderTimeline();
+  renderForkTree();
+});
 
-    switchTab(name) {
-      this.tab = name;
-      try { localStorage.setItem(TAB_KEY, name); } catch (_) {}
-      this.pollActiveTab();
-    },
-
-    pollActiveTab() {
-      const h = this.tokenHeader();
-      if (this.tab === 'slow') this.slow.load(h);
-      else if (this.tab === 'audit') this.audit.load(h);
-      else if (this.tab === 'tokens') this.tokens.load(h);
-      else if (this.tab === 'quotas') this.quotas.load(h);
-    },
-
-    saveToken() {
-      try {
-        if (this.adminToken) localStorage.setItem(TOKEN_KEY, this.adminToken);
-        else localStorage.removeItem(TOKEN_KEY);
-      } catch (_) {}
-      // Immediately refresh the active tab so the operator
-      // sees whether the new token unblocked it.
-      this.pollActiveTab();
-    },
-
-    tokenHeader() {
-      return this.adminToken
-        ? { 'Authorization': 'Bearer ' + this.adminToken }
-        : {};
-    },
-
-    async refreshBoxes() {
-      try {
-        const resp = await fetch('/api/admin/boxes', { headers: this.tokenHeader() });
-        if (!resp.ok) return;
-        const data = await resp.json();
-        this.boxes = data.map(b => ({
-          id: b.id,
-          warm_sessions: (b.metrics && b.metrics.gauges && b.metrics.gauges.warm_sessions) || 0,
-          cold_sessions: (b.metrics && b.metrics.gauges && b.metrics.gauges.cold_sessions) || 0,
-          fault_active: b.fault_active,
-          num_tenants: b.num_tenants,
-          appends: (b.metrics && b.metrics.appends) || 0,
-          forks: (b.metrics && b.metrics.forks) || 0,
-          open_snapshots: (b.metrics && b.metrics.open_snapshots) || 0,
-          segments_pinned_by_snapshots: (b.metrics && b.metrics.segments_pinned_by_snapshots) || 0,
-          archive_sessions: (b.metrics && b.metrics.gauges && b.metrics.gauges.archive_sessions) || 0,
-          webhook_url: b.webhook_url || null,
-          webhook_fires: (b.metrics && b.metrics.webhook_fires) || 0,
-          webhook_failures: (b.metrics && b.metrics.webhook_failures) || 0,
-        }));
-        this.totalTenants = this.boxes.reduce((s, b) => s + b.num_tenants, 0);
-        this.totalAppends = this.boxes.reduce((s, b) => s + b.appends, 0);
-        this.totalForks = this.boxes.reduce((s, b) => s + b.forks, 0);
-      } catch (err) {
-        console.error('refreshBoxes', err);
-      }
-    },
-
-    connectStream() {
-      const src = new EventSource('/api/stream');
-      src.onmessage = (e) => {
-        try {
-          const ev = JSON.parse(e.data);
-          ev._id = this._nextId++;
-          this.events.push(ev);
-          if (this.events.length > 200) this.events.shift();
-          if (ev.event === 'MetricsTick') {
-            for (const tb of ev.boxes) {
-              const b = this.boxes.find(x => x.id === tb.id);
-              if (b) {
-                b.warm_sessions = tb.warm_sessions;
-                b.cold_sessions = tb.cold_sessions;
-                b.fault_active = tb.fault_active;
-                b.appends = tb.appends;
-                b.forks = tb.forks;
-                b.open_snapshots = tb.open_snapshots || 0;
-                b.segments_pinned_by_snapshots = tb.segments_pinned_by_snapshots || 0;
-              }
-            }
-          }
-        } catch (err) {
-          console.error('sse parse', err);
-        }
-      };
-      src.onerror = () => console.warn('sse error');
-    },
-
-    describe(ev) {
-      switch (ev.event) {
-        case 'TierChange': return `${ev.session_id} ${ev.from} → ${ev.to} (box ${ev.box_id})`;
-        case 'ForkCreated': return `${ev.parent} → ${ev.child} (box ${ev.box_id})`;
-        case 'FaultInjected': return `box ${ev.box_id} ${ev.kind} for ${ev.duration_s}s`;
-        case 'QuotaHit': return ev.tenant
-          ? `box ${ev.box_id} quota ${ev.kind} (tenant ${ev.tenant})`
-          : `box ${ev.box_id} quota ${ev.kind}`;
-        case 'MetricsTick': return `${ev.boxes.length} boxes`;
-        case 'SegmentGcRun': return `box ${ev.box_id}: reclaimed ${ev.reclaimed}, skipped ${ev.skipped_pinned} pinned`;
-        default: return JSON.stringify(ev);
-      }
-    },
-
-    snapsLine(b) {
-      const snaps = b.open_snapshots || 0;
-      const pins = b.segments_pinned_by_snapshots || 0;
-      return pins > 0 ? `snapshots: ${snaps} (${pins} seg pins)` : `snapshots: ${snaps}`;
-    },
-
-    webhookLine(b) {
-      const fires = b.webhook_fires || 0;
-      const fails = b.webhook_failures || 0;
-      if (!b.webhook_url) return `webhook: none`;
-      let host;
-      try { host = new URL(b.webhook_url).host; } catch { host = '***'; }
-      return `webhook: ${host} (${fires} ok / ${fails} fail)`;
-    },
-
+function dispatch(action) {
+  const actions = {
+    load: loadTimeline,
+    replay: replaySession,
+    subscribe: subscribeSession,
+    watch: watchScope,
+    context: buildContext,
+    fork: forkSession,
+    artifact: loadArtifact,
+    records: searchRecords,
+    skills: loadSkills,
+    clear: () => setRaw(""),
   };
+  return actions[action] && actions[action]();
 }
 
-// Shared helper: describe a fetch failure for the operator.
-async function explainFetchFailure(resp) {
-  if (resp.status === 401) return '401 Unauthorized — set an admin token above.';
-  if (resp.status === 403) return '403 Forbidden — this token lacks the required scope.';
-  if (resp.status === 503) return '503 — meta store not configured on this server.';
+function readConfig() {
+  const cfg = {
+    tenantId: $("tenantId").value.trim(),
+    sessionId: $("sessionId").value.trim(),
+    agentId: $("agentId").value.trim(),
+    fromSeq: Number($("fromSeq").value || 0),
+    limit: Number($("limit").value || 100),
+    token: $("token").value.trim(),
+  };
+  localStorage.setItem(storeKey, JSON.stringify(cfg));
+  if (!cfg.tenantId) throw new Error("tenant_id is required");
+  if (!cfg.sessionId) throw new Error("session_id is required");
+  return cfg;
+}
+
+function restoreInputs() {
   try {
-    const body = await resp.text();
-    return `${resp.status} ${resp.statusText}: ${body.slice(0, 200)}`;
-  } catch (_) {
-    return `${resp.status} ${resp.statusText}`;
+    const cfg = JSON.parse(localStorage.getItem(storeKey) || "{}");
+    for (const [key, value] of Object.entries(cfg)) {
+      if ($(key) && value !== undefined) $(key).value = value;
+    }
+  } catch (_) {}
+}
+
+async function request(path, options = {}) {
+  const cfg = readConfig();
+  const headers = new Headers(options.headers || {});
+  applyAuth(headers, cfg);
+  if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const resp = await fetch(path, { ...options, headers });
+  const contentType = resp.headers.get("content-type") || "";
+  const body = contentType.includes("application/json") ? await resp.json() : await resp.text();
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}: ${stringify(body)}`);
+  setConnection("ok");
+  setRaw(body);
+  return body;
+}
+
+async function loadTimeline() {
+  try {
+    const cfg = readConfig();
+    const params = new URLSearchParams({ from_seq: String(cfg.fromSeq), limit: String(cfg.limit) });
+    state.events = await request(`/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/events?${params}`);
+    renderTimeline();
+  } catch (err) {
+    fail(err);
   }
 }
 
-function slowPanel() {
-  return {
-    rows: [],
-    err: '',
-    kindFilter: '',
-    tenantFilter: '',
-    limit: 50,
+async function replaySession() {
+  try {
+    const cfg = readConfig();
+    const params = new URLSearchParams({ from_seq: String(cfg.fromSeq), limit: String(cfg.limit) });
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/replay?${params}`);
+    state.events = data.events || [];
+    renderTimeline();
+    if (data.lineage) {
+      state.forks = data.lineage;
+      renderForkTree();
+    }
+  } catch (err) {
+    fail(err);
+  }
+}
 
-    async load(headers) {
-      const params = new URLSearchParams();
-      params.set('limit', String(this.limit || 50));
-      if (this.kindFilter) params.set('kind', this.kindFilter);
-      if (this.tenantFilter) params.set('tenant', this.tenantFilter);
-      try {
-        const resp = await fetch('/api/admin/slow-queries?' + params, { headers });
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          this.rows = [];
-          return;
-        }
-        this.rows = await resp.json();
-        this.err = '';
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
+async function subscribeSession() {
+  try {
+    const cfg = readConfig();
+    const params = new URLSearchParams({ from_seq: String(cfg.fromSeq), limit: String(cfg.limit) });
+    const url = `/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/subscribe?${params}`;
+    const headers = new Headers({ Accept: "text/event-stream" });
+    applyAuth(headers, cfg);
+    const resp = await fetch(url, { headers });
+    const text = await resp.text();
+    if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}: ${text.slice(0, 500)}`);
+    state.events = parseSse(text);
+    setConnection("sse snapshot");
+    setRaw(state.events);
+    renderTimeline();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function watchScope() {
+  try {
+    const cfg = readConfig();
+    const params = new URLSearchParams({ scope: "session", session_id: cfg.sessionId, limit: String(cfg.limit) });
+    if (cfg.agentId) params.set("agent_id", cfg.agentId);
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/watch?${params}`);
+    state.events = data.map((item) => item.event || item);
+    renderTimeline();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function buildContext() {
+  try {
+    const cfg = readConfig();
+    await request(`/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/context`, {
+      method: "POST",
+      body: JSON.stringify({
+        max_events: 20,
+        max_bytes: 1000000,
+        include: ["recent_events", "records", "skills", "policy"],
+        record_query: recordQuery(),
+      }),
+    });
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function forkSession() {
+  try {
+    const cfg = readConfig();
+    const body = {
+      at_seq: Number($("forkSeq").value || 0),
+      alias: $("forkAlias").value.trim() || null,
+    };
+    const child = await request(`/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/fork`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    state.forks.push({ parent_session_id: cfg.sessionId, child_session_id: child.session_id, at_seq: body.at_seq });
+    renderForkTree();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function loadArtifact() {
+  try {
+    const cfg = readConfig();
+    const artifactId = $("artifactId").value.trim();
+    if (!artifactId) throw new Error("artifact_id is required");
+    const meta = await request(`/api/tenants/${enc(cfg.tenantId)}/artifacts/${enc(artifactId)}`);
+    $("artifactView").textContent = stringify(meta);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function searchRecords() {
+  try {
+    const cfg = readConfig();
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/records/search`, {
+      method: "POST",
+      body: JSON.stringify(recordQuery()),
+    });
+    renderRows("records", data.records || []);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function loadSkills() {
+  try {
+    const cfg = readConfig();
+    if (!cfg.agentId) throw new Error("agent_id is required");
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/agents/${enc(cfg.agentId)}/skills`);
+    renderRows("skills", data.skills || []);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function recordQuery() {
+  const sourceSession = $("recordSourceSession").value.trim();
+  return {
+    text: $("recordText").value.trim() || null,
+    namespace: csv($("recordNamespace").value),
+    tags: csv($("recordTags").value),
+    source: sourceSession ? { session_id: sourceSession } : null,
+    limit: Number($("limit").value || 100),
   };
 }
 
-function auditPanel() {
-  return {
-    rows: [],
-    err: '',
-    pathPrefix: '',
-    actor: '',
-    limit: 50,
-
-    async load(headers) {
-      const params = new URLSearchParams();
-      params.set('limit', String(this.limit || 50));
-      if (this.pathPrefix) params.set('path_prefix', this.pathPrefix);
-      if (this.actor) params.set('actor_id', this.actor);
-      try {
-        const resp = await fetch('/api/admin/audit?' + params, { headers });
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          this.rows = [];
-          return;
-        }
-        this.rows = await resp.json();
-        this.err = '';
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
-  };
+function renderTimeline() {
+  $("eventCount").textContent = `${state.events.length} events`;
+  const root = $("timeline");
+  root.textContent = "";
+  if (!state.events.length) {
+    root.append(empty("No events loaded"));
+    return;
+  }
+  state.events
+    .slice()
+    .sort((a, b) => (a.seq || 0) - (b.seq || 0))
+    .forEach((event) => {
+      const item = document.createElement("article");
+      item.className = "event";
+      item.innerHTML = `
+        <div class="event-meta">
+          <span class="seq">#${event.seq ?? "-"}</span>
+          <span>${escapeHtml(event.kind || "event")}</span>
+          <time>${formatTime(event.created_at_ms)}</time>
+        </div>
+        <div class="summary">${escapeHtml(summary(event.payload))}</div>
+        <div class="refs">${artifactRefs(event)}</div>
+      `;
+      item.addEventListener("click", () => setRaw(event));
+      root.append(item);
+    });
 }
 
-function tokensPanel() {
-  return {
-    rows: [],
-    err: '',
-    newDesc: '',
-    newScope: 'admin',
-    lastPlaintext: '',
-
-    async load(headers) {
-      try {
-        const resp = await fetch('/api/admin/tokens', { headers });
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          this.rows = [];
-          return;
-        }
-        this.rows = await resp.json();
-        this.err = '';
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
-
-    async mint(headers) {
-      try {
-        const resp = await fetch('/api/admin/tokens', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...headers },
-          body: JSON.stringify({ description: this.newDesc, scope: this.newScope }),
-        });
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          return;
-        }
-        const body = await resp.json();
-        this.lastPlaintext = body.token;
-        this.newDesc = '';
-        await this.load(headers);
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
-
-    async revoke(id, headers) {
-      if (!confirm(`Revoke token ${id}?`)) return;
-      try {
-        const resp = await fetch('/api/admin/tokens/' + encodeURIComponent(id), {
-          method: 'DELETE',
-          headers,
-        });
-        if (!resp.ok && resp.status !== 204) {
-          this.err = await explainFetchFailure(resp);
-          return;
-        }
-        await this.load(headers);
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
-  };
+function renderForkTree() {
+  const root = $("forkTree");
+  root.textContent = "";
+  if (!state.forks.length) {
+    root.append(empty("No forks recorded in this browser"));
+    return;
+  }
+  state.forks.forEach((edge) => {
+    const row = document.createElement("div");
+    row.className = "edge";
+    row.textContent = `${edge.parent_session_id || edge.parent || "parent"} -> ${edge.child_session_id || edge.child || "child"} @ ${edge.at_seq ?? "-"}`;
+    root.append(row);
+  });
 }
 
-function quotasPanel() {
-  return {
-    rows: [],
-    err: '',
-    tenantInput: '',
-    qpsInput: null,
-    burstInput: null,
+function renderRows(id, rows) {
+  const root = $(id);
+  root.textContent = "";
+  if (!rows.length) {
+    root.append(empty("No rows"));
+    return;
+  }
+  rows.forEach((row) => {
+    const node = document.createElement("button");
+    node.className = "row";
+    node.type = "button";
+    node.textContent = row.record_id || row.skill_id || row.id || summary(row);
+    node.addEventListener("click", () => setRaw(row));
+    root.append(node);
+  });
+}
 
-    async load(headers) {
-      try {
-        const resp = await fetch('/api/admin/tenant-quotas', { headers });
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          this.rows = [];
-          return;
-        }
-        this.rows = await resp.json();
-        this.err = '';
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
+function upsertEvent(event) {
+  const idx = state.events.findIndex((item) => item.event_id === event.event_id);
+  if (idx >= 0) state.events[idx] = event;
+  else state.events.push(event);
+}
 
-    async put(headers) {
-      if (!this.tenantInput || !this.qpsInput || !this.burstInput) {
-        this.err = 'fill tenant, max qps, and burst';
-        return;
-      }
-      try {
-        const resp = await fetch(
-          '/api/admin/tenant-quotas/' + encodeURIComponent(this.tenantInput),
-          {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json', ...headers },
-            body: JSON.stringify({ max_qps: this.qpsInput, burst: this.burstInput }),
-          },
-        );
-        if (!resp.ok) {
-          this.err = await explainFetchFailure(resp);
-          return;
-        }
-        this.tenantInput = '';
-        this.qpsInput = null;
-        this.burstInput = null;
-        await this.load(headers);
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
+function parseSse(text) {
+  const out = [];
+  let data = "";
+  text.split(/\r?\n/).forEach((line) => {
+    if (line.startsWith("data:")) data += line.slice(5).trimStart();
+    if (line === "" && data) {
+      out.push(JSON.parse(data));
+      data = "";
+    }
+  });
+  if (data) out.push(JSON.parse(data));
+  return out;
+}
 
-    async clear(tenantId, headers) {
-      if (!confirm(`Clear quota for ${tenantId}?`)) return;
-      try {
-        const resp = await fetch(
-          '/api/admin/tenant-quotas/' + encodeURIComponent(tenantId),
-          { method: 'DELETE', headers },
-        );
-        if (!resp.ok && resp.status !== 204) {
-          this.err = await explainFetchFailure(resp);
-          return;
-        }
-        await this.load(headers);
-      } catch (e) {
-        this.err = String(e);
-      }
-    },
-  };
+function applyAuth(headers, cfg) {
+  if (cfg.token) headers.set("Authorization", `Bearer ${cfg.token}`);
+}
+
+function artifactRefs(event) {
+  const refs = event.artifact_refs || [];
+  if (!refs.length) return "";
+  return refs.map((ref) => `<button class="ref" data-artifact="${escapeHtml(ref.artifact_id || ref)}">${escapeHtml(ref.artifact_id || ref)}</button>`).join("");
+}
+
+function empty(text) {
+  const node = document.createElement("p");
+  node.className = "empty";
+  node.textContent = text;
+  return node;
+}
+
+function fail(err) {
+  setConnection("error");
+  setRaw(String(err && err.message ? err.message : err));
+}
+
+function setConnection(text) {
+  $("connection").textContent = text;
+}
+
+function setRaw(value) {
+  $("raw").textContent = typeof value === "string" ? value : stringify(value);
+}
+
+function summary(value) {
+  const text = stringify(value);
+  return text.length > 220 ? `${text.slice(0, 220)}...` : text;
+}
+
+function stringify(value) {
+  return JSON.stringify(value, null, 2);
+}
+
+function csv(value) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function enc(value) {
+  return encodeURIComponent(value);
+}
+
+function formatTime(ms) {
+  return ms ? new Date(ms).toLocaleString() : "";
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
 }

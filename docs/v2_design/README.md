@@ -38,8 +38,10 @@ Implementation checkpoint:
 - V2.7 removes the remaining legacy SDK/test/doc surface around the old
   tenantless routes, Mongo wire facade, Go SDK, and broadcast channel helpers,
   leaving the native V2 HTTP API as the supported runtime surface.
-- Current next milestone: adapter proof points on top of the V2.0-V2.7 native
-  API surface.
+- V2.8 adds the LangGraph checkpoint/store adapter package plus a mounted
+  session-first dashboard for timeline, replay, fork, artifact, record, skill,
+  context, watch, and SSE inspection.
+- Current next milestone: V2.9/P1 adapter backlog and scale-out proof points.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

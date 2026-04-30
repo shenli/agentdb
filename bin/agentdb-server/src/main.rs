@@ -82,7 +82,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     };
 
     let state = agentdb_api::AppState { runtime };
-    let app = agentdb_api::router(state);
+    let app = agentdb_api::router(state).nest("/dashboard", agentdb_dashboard::router());
     let listener = tokio::net::TcpListener::bind(opts.bind).await?;
     tracing::info!(addr = %opts.bind, "agentdb listening");
     axum::serve(listener, app).await?;
