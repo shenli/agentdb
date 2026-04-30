@@ -11,7 +11,7 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,7 +19,7 @@ use axum::{
 
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
-    runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest},
+    runtime::{AppendRequest, FetchRequest, SearchRequest},
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ErrorCode, EventEnvelope, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Session, Skill, SourceRef, Tenant,
 };
@@ -34,6 +34,7 @@ use crate::state::AppState;
 
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const SHA256_HEADER: &str = "X-Sha256";
+const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -220,7 +221,7 @@ async fn append_event(
     Path((tenant_id, session_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AppendBody>,
-) -> Result<Json<AppendResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -241,7 +242,7 @@ async fn append_event(
     let resp = s
         .runtime
         .append(AppendRequest {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             agent_id: aid,
             session_id: sid,
             kind: body.kind,
@@ -251,7 +252,12 @@ async fn append_event(
             idempotency_key: idem_key,
         })
         .await?;
-    Ok(Json(resp))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::OK,
+        Json(resp),
+        backpressure,
+    ))
 }
 
 async fn append_and_fetch(
@@ -259,7 +265,7 @@ async fn append_and_fetch(
     Path((tenant_id, session_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<AppendAndFetchBody>,
-) -> Result<Json<AppendAndFetchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -281,7 +287,7 @@ async fn append_and_fetch(
         .runtime
         .append_and_fetch(
             AppendRequest {
-                tenant_id: tid,
+                tenant_id: tid.clone(),
                 agent_id: aid,
                 session_id: sid,
                 kind: body.kind,
@@ -294,7 +300,12 @@ async fn append_and_fetch(
             body.max_bytes,
         )
         .await?;
-    Ok(Json(resp))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::OK,
+        Json(resp),
+        backpressure,
+    ))
 }
 
 async fn fetch_events(
@@ -346,7 +357,7 @@ async fn create_artifact(
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, Json<Artifact>), ApiError> {
+) -> Result<Response, ApiError> {
     // Bad path-id collapses to a structured 404. There's no INVALID_INPUT
     // ErrorCode in V2 — a syntactically broken id is indistinguishable from
     // a non-existent one to the caller, so TenantNotFound is the right
@@ -375,14 +386,19 @@ async fn create_artifact(
         .runtime
         .create_artifact(
             NewArtifact {
-                tenant_id: tid,
+                tenant_id: tid.clone(),
                 content_type,
                 expected_sha256,
             },
             body.to_vec(),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(art)))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(art),
+        backpressure,
+    ))
 }
 
 /// `GET /api/tenants/:tenant_id/artifacts/:artifact_id`
@@ -457,6 +473,20 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn json_with_backpressure<T: serde::Serialize>(
+    status: StatusCode,
+    body: Json<T>,
+    backpressure: agentdb_core::BackpressureReport,
+) -> Response {
+    let mut resp = (status, body).into_response();
+    if let Some(value) = backpressure.header_value() {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(BACKPRESSURE_HEADER, value);
+        }
+    }
+    resp
+}
+
 /// `POST /api/tenants/:tenant_id/records`
 ///
 /// Body shape mirrors `agentdb_core::NewRecord` minus `tenant_id` (which the
@@ -466,12 +496,12 @@ async fn create_record(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateRecordBody>,
-) -> Result<(StatusCode, Json<SearchableRecord>), ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let rec = s
         .runtime
         .write_record(NewRecord {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             namespace: body.namespace,
             scope: body.scope,
             text: body.text,
@@ -483,7 +513,12 @@ async fn create_record(
             expires_at_ms: body.expires_at_ms,
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(rec)))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(rec),
+        backpressure,
+    ))
 }
 
 /// `GET /api/tenants/:tenant_id/records/:record_id`

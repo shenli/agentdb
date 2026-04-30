@@ -103,6 +103,36 @@ pub struct GcSweepReport {
     pub artifacts_purged: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackpressureSignal {
+    pub bucket: String,
+    pub percent: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackpressureReport {
+    pub signals: Vec<BackpressureSignal>,
+}
+
+impl BackpressureReport {
+    pub fn is_empty(&self) -> bool {
+        self.signals.is_empty()
+    }
+
+    pub fn header_value(&self) -> Option<String> {
+        if self.signals.is_empty() {
+            return None;
+        }
+        Some(
+            self.signals
+                .iter()
+                .map(|s| format!("{}={}", s.bucket, s.percent))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
 #[derive(Default, Debug)]
 struct State {
     tenants: BTreeMap<String, Tenant>,
@@ -758,6 +788,57 @@ impl Runtime {
         Ok(base.merge_override(override_json))
     }
 
+    pub async fn backpressure_for_tenant(&self, tenant_id: &Id) -> Result<BackpressureReport> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let policy = policy_for_tenant_in_state(&s, tenant_id);
+        let mut report = BackpressureReport::default();
+
+        if let Some(soft) = policy.quota.soft_max_records {
+            let live_records = s
+                .records
+                .values()
+                .filter(|r| {
+                    r.tenant_id.as_str() == tenant_id.as_str()
+                        && r.deleted_at_ms.is_none()
+                        && !r.is_expired()
+                })
+                .count();
+            if let Some(percent) = usage_percent(live_records as u64, soft as u64) {
+                report.signals.push(BackpressureSignal {
+                    bucket: "records".into(),
+                    percent,
+                });
+            }
+        }
+
+        if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
+            let live_bytes: u64 = s
+                .artifacts
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .map(|a| a.bytes)
+                .sum();
+            if let Some(percent) = usage_percent(live_bytes, soft) {
+                report.signals.push(BackpressureSignal {
+                    bucket: "artifact_storage".into(),
+                    percent,
+                });
+            }
+        }
+
+        Ok(report)
+    }
+
     /// Create an artifact: write the bytes to the content backend, persist
     /// the metadata, return the metadata record. Tenant must exist.
     ///
@@ -797,6 +878,25 @@ impl Runtime {
                     ErrorCode::TenantNotFound,
                     format!("{}", req.tenant_id),
                 ));
+            }
+            if let Some(max) = policy.quota.max_artifact_storage_bytes {
+                let live_bytes: u64 = s
+                    .artifacts
+                    .values()
+                    .filter(|a| {
+                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
+                    })
+                    .map(|a| a.bytes)
+                    .sum();
+                if live_bytes.saturating_add(len) > max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies artifact write: artifact storage quota {max} bytes exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
             }
         }
 
@@ -1861,6 +1961,16 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
+    if soft_limit == 0 {
+        return (usage > 0).then_some(100);
+    }
+    if usage < soft_limit {
+        return None;
+    }
+    Some(usage.saturating_mul(100).saturating_div(soft_limit))
 }
 
 /// Compare a record's `source` against a search filter. The filter

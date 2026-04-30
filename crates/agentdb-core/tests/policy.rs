@@ -187,3 +187,103 @@ fn policy_defaults_and_priority_parse() {
     assert_eq!(p.priority, Priority::High);
     assert_eq!(p.artifact_size.max_inline_event_bytes, 64 * 1024);
 }
+
+#[test]
+fn tier_template_resolves_and_allows_overrides() {
+    let free = RuntimePolicy::from_json(&serde_json::json!({"tier": "free"}));
+    assert_eq!(free.tier.as_deref(), Some("free"));
+    assert_eq!(free.version, 10_001);
+    assert_eq!(free.priority, Priority::Low);
+    assert_eq!(free.quota.max_records, Some(100));
+
+    let another_free = RuntimePolicy::from_json(&serde_json::json!({"tier": "free"}));
+    assert_eq!(another_free.version, free.version);
+
+    let pro_override = RuntimePolicy::from_json(&serde_json::json!({
+        "tier": "pro",
+        "version": 77,
+        "quota": {"max_records": 2}
+    }));
+    assert_eq!(pro_override.tier.as_deref(), Some("pro"));
+    assert_eq!(pro_override.version, 77);
+    assert_eq!(pro_override.priority, Priority::Normal);
+    assert_eq!(pro_override.quota.max_records, Some(2));
+    assert_eq!(pro_override.quota.soft_max_records, Some(8_000));
+}
+
+#[tokio::test]
+async fn backpressure_reports_soft_record_quota() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "bp-records".into(),
+            policy: serde_json::json!({
+                "quota": {"soft_max_records": 1, "max_records": 10}
+            }),
+        })
+        .await
+        .unwrap();
+
+    let req = NewRecord {
+        tenant_id: t.tenant_id.clone(),
+        namespace: vec!["n".into()],
+        scope: serde_json::json!({}),
+        text: Some("x".into()),
+        metadata: serde_json::json!({}),
+        tags: vec![],
+        source: None,
+        embedding: None,
+        policy: IndexingPolicy::default(),
+        expires_at_ms: None,
+    };
+    rt.write_record(req).await.unwrap();
+
+    let report = rt.backpressure_for_tenant(&t.tenant_id).await.unwrap();
+    assert_eq!(report.header_value().as_deref(), Some("records=100"));
+}
+
+#[tokio::test]
+async fn artifact_storage_quota_enforces_hard_limit_and_reports_soft_limit() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "bp-artifacts".into(),
+            policy: serde_json::json!({
+                "quota": {
+                    "soft_max_artifact_storage_bytes": 4,
+                    "max_artifact_storage_bytes": 6
+                }
+            }),
+        })
+        .await
+        .unwrap();
+
+    rt.create_artifact(
+        NewArtifact {
+            tenant_id: t.tenant_id.clone(),
+            content_type: None,
+            expected_sha256: None,
+        },
+        b"1234".to_vec(),
+    )
+    .await
+    .unwrap();
+    let report = rt.backpressure_for_tenant(&t.tenant_id).await.unwrap();
+    assert_eq!(
+        report.header_value().as_deref(),
+        Some("artifact_storage=100")
+    );
+
+    let err = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: t.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"123".to_vec(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+}
