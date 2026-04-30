@@ -67,8 +67,10 @@ Implementation checkpoint:
   remote/unassigned decisions before local state is mutated.
 - V2.16 executes same-cluster `ForwardRequest`s through an internal HTTP client
   and passes owner-node responses back through the original handler path.
-- Current next milestone: refresh route snapshots after placement changes and
-  validate forwarded tablet epochs before mutating state.
+- V2.17 validates forwarded tablet epochs on owner nodes before session
+  mutations run, rejecting stale forwarded writes when ownership changed.
+- Current next milestone: refresh route snapshots after placement, lease, node,
+  or locator changes instead of loading only at boot.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
