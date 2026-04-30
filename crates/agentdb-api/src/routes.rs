@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
@@ -57,6 +57,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(health_ready))
         .route("/api/admin/routing", get(get_routing_status))
+        .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/tenants", post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
@@ -164,6 +165,22 @@ async fn get_routing_status(
     State(s): State<AppState>,
 ) -> Json<crate::routing_http::RouteRuntimeStatus> {
     Json(s.routing.describe())
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteDecisionQuery {
+    tenant_id: String,
+    session_id: Option<String>,
+}
+
+async fn get_routing_decision(
+    State(s): State<AppState>,
+    Query(query): Query<RouteDecisionQuery>,
+) -> Json<crate::routing_http::RouteDecisionDryRun> {
+    Json(
+        s.routing
+            .dry_run_decision(&query.tenant_id, query.session_id.as_deref()),
+    )
 }
 
 async fn create_tenant(

@@ -157,6 +157,25 @@ pub struct RouteTabletStatus {
     pub lease_expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteDecisionDryRun {
+    pub mode: &'static str,
+    pub local_node_id: String,
+    pub tenant_id: String,
+    pub session_id: Option<String>,
+    pub session_locator_found: bool,
+    pub action: &'static str,
+    pub shard_id: Option<i64>,
+    pub tablet_id: Option<i64>,
+    pub owner_node_id: Option<String>,
+    pub owner_address: Option<String>,
+    pub owner_location: Option<String>,
+    pub epoch: Option<i64>,
+    pub reason: Option<&'static str>,
+    pub route_error_code: Option<&'static str>,
+    pub retryable: Option<bool>,
+}
+
 impl RouteRuntime {
     pub fn disabled() -> Self {
         Self {
@@ -206,6 +225,67 @@ impl RouteRuntime {
                 local_node_id: self.local_node_id.to_string(),
                 snapshot: Some(snapshot.describe(&self.local_node_id)),
             },
+        }
+    }
+
+    pub fn dry_run_decision(
+        &self,
+        tenant_id: &str,
+        session_id: Option<&str>,
+    ) -> RouteDecisionDryRun {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        match &*mode {
+            RouteRuntimeMode::Disabled => RouteDecisionDryRun {
+                mode: "disabled",
+                local_node_id: self.local_node_id.to_string(),
+                tenant_id: tenant_id.to_string(),
+                session_id: session_id.map(str::to_string),
+                session_locator_found: false,
+                action: "local",
+                shard_id: None,
+                tablet_id: None,
+                owner_node_id: None,
+                owner_address: None,
+                owner_location: None,
+                epoch: None,
+                reason: None,
+                route_error_code: None,
+                retryable: None,
+            },
+            RouteRuntimeMode::Fixed(decision) => dry_run_from_decision(
+                "fixed",
+                &self.local_node_id,
+                tenant_id,
+                session_id,
+                false,
+                decision,
+            ),
+            RouteRuntimeMode::Snapshot(snapshot) => {
+                let session_locator =
+                    session_id.and_then(|sid| snapshot.session_locator(tenant_id, sid));
+                let decision = plan_route(
+                    RouteRequest {
+                        tenant_id,
+                        session_locator,
+                        request_location: snapshot.request_location.as_deref(),
+                        local_node_id: Some(&self.local_node_id),
+                        shard_count: snapshot.shard_count,
+                        now_ms: now_ms(),
+                        policy: snapshot.policy.clone(),
+                    },
+                    &snapshot.shards,
+                    &snapshot.tablets,
+                    &snapshot.nodes,
+                );
+                dry_run_from_decision(
+                    "snapshot",
+                    &self.local_node_id,
+                    tenant_id,
+                    session_id,
+                    session_locator.is_some(),
+                    &decision,
+                )
+            }
         }
     }
 
@@ -357,6 +437,53 @@ impl RouteRuntime {
             }
             RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
         }
+    }
+}
+
+fn dry_run_from_decision(
+    mode: &'static str,
+    local_node_id: &str,
+    tenant_id: &str,
+    session_id: Option<&str>,
+    session_locator_found: bool,
+    decision: &RouteDecision,
+) -> RouteDecisionDryRun {
+    let (action, route_error_code, retryable) = match decision.action {
+        RouteAction::Local => ("local", None, None),
+        RouteAction::Forward => ("forward", None, None),
+        RouteAction::Reject | RouteAction::Unassigned => {
+            let rejection = route_rejection(decision);
+            ("reject", Some(rejection.code), Some(rejection.retryable))
+        }
+    };
+    RouteDecisionDryRun {
+        mode,
+        local_node_id: local_node_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        session_id: session_id.map(str::to_string),
+        session_locator_found,
+        action,
+        shard_id: Some(decision.shard_id),
+        tablet_id: Some(decision.tablet_id),
+        owner_node_id: decision.owner_node_id.clone(),
+        owner_address: decision.owner_address.clone(),
+        owner_location: decision.owner_location.clone(),
+        epoch: decision.epoch,
+        reason: decision.reason.map(route_reason_code),
+        route_error_code,
+        retryable,
+    }
+}
+
+fn route_reason_code(reason: RouteReason) -> &'static str {
+    match reason {
+        RouteReason::MissingTablet => "missing_tablet",
+        RouteReason::MissingOwner => "missing_owner",
+        RouteReason::ExpiredLease => "expired_lease",
+        RouteReason::MissingNode => "missing_node",
+        RouteReason::NodeUnavailable => "node_unavailable",
+        RouteReason::ResidencyDenied => "residency_denied",
+        RouteReason::WrongLocation => "wrong_location",
     }
 }
 

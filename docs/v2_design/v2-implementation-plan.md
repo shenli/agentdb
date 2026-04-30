@@ -865,7 +865,8 @@ Scope:
 
 Follow-up:
 
-- Add route decision dry-run diagnostics for a tenant and optional session id.
+- Clean stale V2 gap-summary references for completed request forwarding and
+  durable region metadata work.
 
 ### V2.21 — Operator-facing route metadata visibility (~250 LoC)
 
@@ -887,7 +888,31 @@ Scope:
 
 Follow-up:
 
-- Add route decision dry-run diagnostics for a tenant and optional session id.
+- Clean stale V2 gap-summary references for completed request forwarding and
+  durable region metadata work.
+
+### V2.22 — Route decision dry-run diagnostics (~250 LoC)
+
+Status: route decision dry-run diagnostics complete. V2.22 adds a read-only
+admin endpoint for asking how the current routing runtime would handle a tenant
+and optional session id without issuing a data-plane session request.
+
+Scope:
+
+- `RouteRuntime::dry_run_decision(...)` evaluates disabled, fixed, and
+  snapshot-backed routing modes without building a proxied HTTP request.
+- Snapshot dry runs consult session locators when a session id is supplied, then
+  return the computed action, shard/tablet, owner node/address/location, epoch,
+  planner reason, route error code, and retryability.
+- `GET /api/admin/routing/decision?tenant_id=...&session_id=...` exposes the
+  dry-run result through the existing `agentdb-api` router.
+- HTTP smoke coverage verifies disabled local dry runs and snapshot-backed
+  forward dry runs.
+
+Follow-up:
+
+- Clean stale V2 gap-summary references for completed request forwarding and
+  durable region metadata work.
 
 ---
 

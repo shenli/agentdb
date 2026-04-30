@@ -81,8 +81,11 @@ Implementation checkpoint:
 - V2.21 adds operator-facing routing visibility with `GET /api/admin/routing`,
   exposing route mode, local node, region/AZ node metadata, tablet owners, and
   snapshot counts.
-- Current next milestone: add route decision dry-run diagnostics for a tenant
-  and optional session id.
+- V2.22 adds `GET /api/admin/routing/decision` dry-run diagnostics for a
+  tenant and optional session id, returning the local/forward/reject decision
+  without issuing a session request.
+- Current next milestone: clean stale V2 gap-summary references for completed
+  request forwarding and durable region metadata work.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
