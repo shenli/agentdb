@@ -643,6 +643,26 @@ Follow-up:
 - Add the actual same-cluster HTTP proxy path for `Forward` outcomes.
 - Add KMS/key-state reasons to the same `Reject` response shape.
 
+### V2.12 — Handler proxy preparation (~400 LoC)
+
+Status: proxy preparation contract complete. V2.12 extends
+`agentdb-api::routing_http` so handler code can turn a `Forward` target into a
+ready-to-send same-cluster request:
+
+- owner URI construction from owner address + original path/query
+- hop-by-hop header stripping (`Host`, `Connection`, `Content-Length`, etc.)
+- preservation of application headers such as auth and content type
+- propagation of `x-agentdb-*` routing metadata to the owner
+- `x-agentdb-forwarded-by` and `x-agentdb-forwarded-for` tracking
+- 421 `ROUTE_FORWARD_LOOP` rejection for requests that already passed through
+  an AgentDB forwarder
+
+Follow-up:
+
+- Call this guard from session/event handlers.
+- Add the actual HTTP client execution path and response pass-through.
+- Teach forwarded requests to validate tablet epoch before mutating state.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan
