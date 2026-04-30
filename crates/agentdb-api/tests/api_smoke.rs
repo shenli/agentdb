@@ -237,6 +237,65 @@ async fn admin_routing_status_reports_snapshot_metadata() {
 }
 
 #[tokio::test]
+async fn admin_routing_decision_reports_disabled_local_dry_run() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/admin/routing/decision?tenant_id=ten_1&session_id=ses_1",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "disabled");
+    assert_eq!(body["tenant_id"], "ten_1");
+    assert_eq!(body["session_id"], "ses_1");
+    assert_eq!(body["action"], "local");
+    assert_eq!(body["session_locator_found"], false);
+    assert!(body["route_error_code"].is_null());
+}
+
+#[tokio::test]
+async fn admin_routing_decision_reports_snapshot_forward_dry_run() {
+    let app = spawn_routed_app("node-b").await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/admin/routing/decision?tenant_id=ten_1&session_id=ses_1",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "snapshot");
+    assert_eq!(body["local_node_id"], "node-a");
+    assert_eq!(body["action"], "forward");
+    assert_eq!(body["shard_id"], 0);
+    assert_eq!(body["tablet_id"], 0);
+    assert_eq!(body["owner_node_id"], "node-b");
+    assert_eq!(body["owner_location"], "us-west-2");
+    assert_eq!(body["epoch"], 1);
+    assert_eq!(body["session_locator_found"], false);
+    assert!(body["reason"].is_null());
+    assert!(body["route_error_code"].is_null());
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
