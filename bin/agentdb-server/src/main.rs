@@ -64,6 +64,15 @@ struct ServeOpts {
     /// LISTEN/NOTIFY can trigger faster refreshes for shard/node/tablet changes.
     #[arg(long, default_value_t = 5_000)]
     route_refresh_interval_ms: u64,
+
+    /// Timeout for same-cluster routing proxy requests.
+    #[arg(long, default_value_t = 5_000)]
+    route_proxy_timeout_ms: u64,
+
+    /// Maximum owner-node response body size that the routing proxy will pass
+    /// through to the original caller.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    route_proxy_max_response_bytes: u64,
 }
 
 #[tokio::main]
@@ -101,7 +110,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         agentdb_core::Runtime::with_kv(kv, content)
     };
 
-    let mut state = agentdb_api::AppState::new(runtime);
+    let mut state =
+        agentdb_api::AppState::new(runtime).with_proxy_policy(agentdb_api::state::ProxyPolicy {
+            timeout_ms: opts.route_proxy_timeout_ms,
+            max_response_bytes: opts.route_proxy_max_response_bytes,
+        });
     if let Some(node_id) = opts.route_node_id.as_deref() {
         let meta = agentdb_meta::MetaStore::open_from_env().await?;
         let snapshot =

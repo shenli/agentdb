@@ -11,6 +11,7 @@ use agentdb_api::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_TABLET_ID,
     },
+    state::ProxyPolicy,
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
@@ -259,6 +260,48 @@ async fn forwarded_mutation_with_stale_epoch_is_rejected_by_owner() {
 }
 
 #[tokio::test]
+async fn proxy_rejects_oversized_owner_response() {
+    let (app, owner) = spawn_proxy_pair_with_policy(128).await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+    owner
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            owner.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "large",
+            "payload": {"blob": "x".repeat(512)},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let r = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=10",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 502);
+    assert_eq!(
+        r.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
+        "ROUTE_FORWARD_RESPONSE_TOO_LARGE"
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "ROUTE_FORWARD_RESPONSE_TOO_LARGE");
+}
+
+#[tokio::test]
 async fn session_handlers_return_route_rejection_for_unassigned_tablet() {
     let app = spawn_unassigned_routed_app().await;
     let (tid, _aid, sid) = bootstrap_session(&app).await;
@@ -493,6 +536,10 @@ async fn spawn_routed_app(owner_node_id: &str) -> TestApp {
 }
 
 async fn spawn_proxy_pair() -> (TestApp, TestApp) {
+    spawn_proxy_pair_with_policy(16 * 1024 * 1024).await
+}
+
+async fn spawn_proxy_pair_with_policy(max_response_bytes: u64) -> (TestApp, TestApp) {
     let runtime = Runtime::in_memory();
     let owner_snapshot = RouteSnapshot::new(1)
         .with_tablets(vec![tablet(0, Some("node-b"))])
@@ -509,7 +556,12 @@ async fn spawn_proxy_pair() -> (TestApp, TestApp) {
             node("node-b", &owner.base),
         ]);
     let local = spawn_app_with_state(
-        AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot)),
+        AppState::new(runtime)
+            .with_routing(RouteRuntime::snapshot("node-a", snapshot))
+            .with_proxy_policy(ProxyPolicy {
+                timeout_ms: 5_000,
+                max_response_bytes,
+            }),
     )
     .await;
     (local, owner)

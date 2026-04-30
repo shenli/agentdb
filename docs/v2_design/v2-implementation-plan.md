@@ -815,7 +815,32 @@ Scope:
 
 Follow-up:
 
-- Add proxy timeout and response-size policy knobs for production deployment.
+- Split prototype location labels into durable region/AZ metadata.
+- Extend metadata notifications to `session_locators` so locator updates can
+  also wake the refresh loop immediately on Postgres.
+
+### V2.19 — Routing proxy policy knobs (~300 LoC)
+
+Status: proxy policy complete. V2.19 adds explicit production guardrails for
+same-cluster proxy execution.
+
+Scope:
+
+- `AppState` carries a `ProxyPolicy` with per-forward timeout and maximum
+  owner-response body size.
+- `agentdb serve` exposes `--route-proxy-timeout-ms` and
+  `--route-proxy-max-response-bytes`.
+- Forwarded requests apply the configured timeout through the internal
+  `reqwest::Client`.
+- Owner responses whose `Content-Length` or buffered body exceed the configured
+  limit are rejected with `ROUTE_FORWARD_RESPONSE_TOO_LARGE`.
+- Timeout transport errors are surfaced as `ROUTE_FORWARD_TIMEOUT`; other
+  transport failures remain `ROUTE_FORWARD_FAILED`.
+- Integration coverage verifies an oversized proxied owner response is rejected
+  before pass-through.
+
+Follow-up:
+
 - Split prototype location labels into durable region/AZ metadata.
 - Extend metadata notifications to `session_locators` so locator updates can
   also wake the refresh loop immediately on Postgres.
