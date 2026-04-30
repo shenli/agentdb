@@ -744,6 +744,31 @@ Follow-up:
   instead of loading only at boot.
 - Teach forwarded requests to validate tablet epoch before mutating state.
 
+### V2.16 — Same-cluster routing proxy execution (~450 LoC)
+
+Status: proxy execution complete. V2.16 replaces the temporary
+`ROUTE_FORWARD_UNAVAILABLE` response with an internal same-cluster HTTP client
+that sends prepared `ForwardRequest`s to the owner node and passes the owner
+response back to the original caller.
+
+Scope:
+
+- `AppState` owns a cloneable internal `reqwest::Client` for routing proxy
+  calls.
+- Session-scoped GET/DELETE handlers proxy without a body; session-scoped POST
+  handlers rebuild the parsed JSON body for forwarding.
+- Forward failures return a retryable `ROUTE_FORWARD_FAILED` response with the
+  routing headers preserved.
+- Integration coverage runs a local node and owner node over real HTTP and
+  verifies a remote-owner append is served through the proxy path.
+
+Follow-up:
+
+- Refresh route snapshots after placement, lease, node, or locator changes
+  instead of loading only at boot.
+- Teach forwarded requests to validate tablet epoch before mutating state.
+- Add proxy timeout and response-size policy knobs for production deployment.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

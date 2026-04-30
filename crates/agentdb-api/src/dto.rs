@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use agentdb_core::record::{IndexingPolicy, SearchableRecord};
 use agentdb_core::{AgentSkillBinding, ArtifactRef, SourceRef};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTenantBody {
     pub external_key: String,
     #[serde(default = "default_policy")]
     pub policy: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateAgentBody {
     #[serde(default)]
     pub alias: Option<String>,
@@ -25,13 +25,13 @@ pub struct CreateAgentBody {
     pub config: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSessionBody {
     #[serde(default)]
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AppendBody {
     pub agent_id: String,
     pub kind: String,
@@ -43,7 +43,7 @@ pub struct AppendBody {
     pub source_refs: Vec<SourceRef>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AppendAndFetchBody {
     pub agent_id: String,
     pub kind: String,
@@ -59,14 +59,14 @@ pub struct AppendAndFetchBody {
     pub max_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ForkSessionBody {
     pub at_seq: u64,
     #[serde(default)]
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FetchQuery {
     #[serde(default)]
     pub from_seq: u64,
@@ -74,7 +74,7 @@ pub struct FetchQuery {
     pub limit: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ReplayQuery {
     #[serde(default)]
     pub from_seq: Option<u64>,
@@ -82,7 +82,7 @@ pub struct ReplayQuery {
     pub limit: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct WatchQuery {
     #[serde(default = "default_watch_scope")]
     pub scope: String,
@@ -96,7 +96,7 @@ pub struct WatchQuery {
     pub limit: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct IncludeDeletedQuery {
     #[serde(default)]
     pub include_deleted: bool,
@@ -127,7 +127,7 @@ fn default_watch_scope() -> String {
 /// `tenant_id` comes from the path; the body has every other field that
 /// `agentdb_core::NewRecord` carries. All optional fields default sensibly via
 /// serde so a minimally-shaped body — `{"namespace": ["..."]}` — works.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateRecordBody {
     #[serde(default)]
     pub namespace: Vec<String>,
@@ -156,7 +156,7 @@ pub struct CreateRecordBody {
 /// `namespace` and `tag` are repeatable. GET is for text/list searches; vector
 /// search uses the JSON `POST /records/search` shape below so embeddings do not
 /// have to be encoded into a URL.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SearchRecordsQuery {
     #[serde(default)]
     pub text: Option<String>,
@@ -193,7 +193,7 @@ fn default_search_limit() -> usize {
 /// Supports the full V2.2 search surface, including caller-supplied vector
 /// embeddings. `source` is a partial [`SourceRef`]: every populated field must
 /// match the candidate record's source.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SearchRecordsBody {
     #[serde(default)]
     pub text: Option<String>,
@@ -209,7 +209,7 @@ pub struct SearchRecordsBody {
     pub limit: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ContextBody {
     #[serde(default = "default_context_max_events")]
     pub max_events: usize,
@@ -238,7 +238,7 @@ pub struct SearchRecordsResponse {
     pub records: Vec<SearchableRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSkillBody {
     pub name: String,
     pub version: String,
@@ -248,7 +248,7 @@ pub struct CreateSkillBody {
     pub artifact_refs: Vec<ArtifactRef>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BindSkillBody {
     pub skill_id: String,
 }
