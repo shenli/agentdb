@@ -78,6 +78,7 @@ pub enum RouteReason {
     NodeUnavailable,
     ResidencyDenied,
     WrongLocation,
+    KeyUnavailable,
 }
 
 pub fn plan_route(

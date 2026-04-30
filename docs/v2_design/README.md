@@ -84,8 +84,11 @@ Implementation checkpoint:
 - V2.22 adds `GET /api/admin/routing/decision` dry-run diagnostics for a
   tenant and optional session id, returning the local/forward/reject decision
   without issuing a session request.
-- Current next milestone: add KMS/key availability signals at storage
-  boundaries and route rejection diagnostics.
+- V2.24 adds provider-neutral KMS/key availability signals at storage
+  boundaries plus structured runtime/API and route rejection diagnostics for
+  unavailable tenant keys.
+- Current next milestone: add envelope encryption/decryption adapters at the
+  artifact content boundary.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

@@ -7,12 +7,17 @@
 pub mod content;
 pub mod error;
 pub mod keys;
+pub mod kms;
 pub mod kv;
 pub mod rocks;
 pub mod slate;
 
 pub use content::{ContentBackend, InMemoryContentBackend, LocalFsContentBackend, PutResult};
 pub use error::{Error, Result};
+pub use kms::{
+    AllowAllKmsKeyResolver, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KmsResult,
+    StaticKeyState, StaticKmsKeyResolver,
+};
 pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 pub use rocks::RocksKvStore;
 pub use slate::SlateKvStore;

@@ -20,7 +20,7 @@ use agentdb_index::doc_id::DocId;
 use agentdb_index::text::{InMemoryInverted, TextIndex};
 use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{ContentBackend, InMemoryContentBackend};
-use agentdb_storage::KvStore;
+use agentdb_storage::{AllowAllKmsKeyResolver, KeyOperation, KmsError, KmsKeyResolver, KvStore};
 
 use crate::agent::{Agent, NewAgent};
 use crate::artifact::{Artifact, NewArtifact};
@@ -414,6 +414,7 @@ pub struct Runtime {
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
+    kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
     /// `TextIndex::insert` takes `&mut self`. All operations are short
@@ -438,6 +439,19 @@ impl Runtime {
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
+            kms: Arc::new(AllowAllKmsKeyResolver),
+            text_index: StdMutex::new(InMemoryInverted::new()),
+            vector_index: StdMutex::new(HnswVectorIndex::new()),
+        })
+    }
+
+    pub fn in_memory_with_kms(kms: Arc<dyn KmsKeyResolver>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State::default()),
+            idem: IdempotencyStore::default(),
+            persist: None,
+            content: Arc::new(InMemoryContentBackend::default()),
+            kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
         })
@@ -461,6 +475,14 @@ impl Runtime {
     pub fn with_kv(
         kv: Arc<dyn KvStore + Send + Sync>,
         content: Arc<dyn ContentBackend>,
+    ) -> Arc<Self> {
+        Self::with_kv_and_kms(kv, content, Arc::new(AllowAllKmsKeyResolver))
+    }
+
+    pub fn with_kv_and_kms(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
     ) -> Arc<Self> {
         let persist = Persist::new(kv);
 
@@ -580,9 +602,17 @@ impl Runtime {
             idem,
             persist: Some(persist),
             content,
+            kms,
             text_index: StdMutex::new(text_idx),
             vector_index: StdMutex::new(vector_idx),
         })
+    }
+
+    fn ensure_key_available(&self, tenant_id: &Id, operation: KeyOperation) -> Result<()> {
+        self.kms
+            .resolve_tenant_key(tenant_id.as_str(), operation)
+            .map(|_| ())
+            .map_err(kms_error)
     }
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
@@ -1555,6 +1585,9 @@ impl Runtime {
             }
         }
 
+        self.ensure_key_available(&req.tenant_id, KeyOperation::ContentWrite)?;
+        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
+
         // Mint the id BEFORE the put so the content backend path is stable
         // regardless of how long the put takes.
         let artifact_id = Id::new(crate::id::IdKind::Artifact);
@@ -1644,6 +1677,7 @@ impl Runtime {
                 format!("{}", artifact_id),
             ));
         }
+        self.ensure_key_available(tenant_id, KeyOperation::ContentRead)?;
         // TODO(V2.4): re-verify the returned bytes against art.sha256. Skipped
         // in V2.1 to avoid hashing on every read.
         self.content
@@ -2598,6 +2632,8 @@ impl Runtime {
                 return Err(Error::new(ErrorCode::SkillNotFound, skill_id_raw));
             }
         }
+
+        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
         let (seq, _prior_policy_version, session_snapshot) = {
             // Re-acquire mutable access to the session row to mint the seq
@@ -3647,4 +3683,19 @@ where
 /// Error code surface stable.
 fn internal(e: agentdb_storage::Error) -> Error {
     Error::new(ErrorCode::Internal, e.to_string())
+}
+
+fn kms_error(e: KmsError) -> Error {
+    match e {
+        KmsError::KeyUnavailable {
+            tenant_id,
+            operation,
+            reason,
+        } => Error::new(
+            ErrorCode::KeyUnavailable,
+            format!("tenant {tenant_id} key unavailable for {operation}: {reason}"),
+        )
+        .with_suggestion("restore or rotate the tenant encryption key before retrying"),
+        KmsError::Other(message) => Error::new(ErrorCode::Internal, message),
+    }
 }
