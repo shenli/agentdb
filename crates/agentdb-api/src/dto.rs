@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, SearchableRecord};
-use agentdb_core::{ArtifactRef, SourceRef};
+use agentdb_core::{AgentSkillBinding, ArtifactRef, SourceRef};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTenantBody {
@@ -177,4 +177,24 @@ pub struct SearchRecordsBody {
 #[derive(Debug, Serialize)]
 pub struct SearchRecordsResponse {
     pub records: Vec<SearchableRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSkillBody {
+    pub name: String,
+    pub version: String,
+    #[serde(default = "default_policy")]
+    pub manifest: serde_json::Value,
+    #[serde(default)]
+    pub artifact_refs: Vec<ArtifactRef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BindSkillBody {
+    pub skill_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListAgentSkillsResponse {
+    pub skills: Vec<AgentSkillBinding>,
 }

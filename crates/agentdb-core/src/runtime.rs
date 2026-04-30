@@ -27,10 +27,11 @@ use crate::artifact::{Artifact, NewArtifact};
 use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
-use crate::idempotency::{hash_request, IdempotencyRecord, IdempotencyStore};
+use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
 use crate::session::{NewSession, Session};
+use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
 
 /// V2.1 hardcoded artifact size cap. Picked to fit comfortably in memory
@@ -129,6 +130,12 @@ struct State {
     tenant_aliases: BTreeMap<String, String>,
     agent_aliases: BTreeMap<String, String>,
     session_aliases: BTreeMap<String, String>,
+    /// V2.3 skills, keyed by skill_id string.
+    skills: BTreeMap<String, Skill>,
+    /// Uniqueness map for `(tenant_id, skill_name, version) -> skill_id`.
+    skill_uniques: BTreeMap<String, String>,
+    /// Agent skill bindings keyed by `(agent_id, skill_id)`.
+    agent_skill_bindings: BTreeMap<(String, String), AgentSkillBinding>,
     /// V2.2 searchable records, keyed by `record_id` string. Hydrated at
     /// startup from `Persist::scan_all_records`; updated on every
     /// `write_record` / `delete_record`.
@@ -152,6 +159,10 @@ struct State {
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
     format!("{tenant_id}::{alias}")
+}
+
+fn skill_unique_state_key(tenant_id: &str, name: &str, version: &str) -> String {
+    format!("{tenant_id}::{name}::{version}")
 }
 
 pub struct Runtime {
@@ -258,6 +269,35 @@ impl Runtime {
             state
                 .session_aliases
                 .insert(scoped_alias_key(&tenant, &alias), session_id);
+        }
+        for skill in persist.scan_all_skills().expect("hydrate skills") {
+            if skill.deleted_at_ms.is_none() {
+                state
+                    .skills
+                    .insert(skill.skill_id.as_str().to_string(), skill);
+            }
+        }
+        for ((tenant, name, version), skill_id) in persist
+            .scan_all_skill_uniques()
+            .expect("hydrate skill uniqueness")
+        {
+            state
+                .skill_uniques
+                .insert(skill_unique_state_key(&tenant, &name, &version), skill_id);
+        }
+        for binding in persist
+            .scan_all_agent_skill_bindings()
+            .expect("hydrate agent skill bindings")
+        {
+            if binding.deleted_at_ms.is_none() {
+                state.agent_skill_bindings.insert(
+                    (
+                        binding.agent_id.as_str().to_string(),
+                        binding.skill_id.as_str().to_string(),
+                    ),
+                    binding,
+                );
+            }
         }
 
         let idem = IdempotencyStore::default();
@@ -450,6 +490,198 @@ impl Runtime {
             p.put_session(&sess).map_err(internal)?;
         }
         Ok(sess)
+    }
+
+    /// Register a V2.3 skill. `(tenant_id, name, version)` is unique.
+    /// Artifact refs are validated against live artifacts in the same tenant.
+    pub async fn register_skill(
+        &self,
+        req: NewSkill,
+        idempotency_key: Option<String>,
+    ) -> Result<Skill> {
+        let idem_full_key = idempotency_key.as_ref().map(|k| {
+            format!(
+                "{}::{}::{}::{}",
+                req.tenant_id, "skill_register", req.name, k
+            )
+        });
+        let req_hash = hash_skill_register_request(&req);
+        if let Some(ref full) = idem_full_key {
+            if let Some(rec) = self.idem.lookup(full) {
+                return verify_json_replay(&rec, req_hash);
+            }
+        }
+
+        let skill = {
+            let mut s = self.state.lock().await;
+            if let Some(ref full) = idem_full_key {
+                if let Some(rec) = self.idem.lookup(full) {
+                    drop(s);
+                    return verify_json_replay(&rec, req_hash);
+                }
+            }
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+            let unique = skill_unique_state_key(req.tenant_id.as_str(), &req.name, &req.version);
+            if s.skill_uniques.contains_key(&unique) {
+                return Err(Error::new(
+                    ErrorCode::AliasConflict,
+                    format!(
+                        "skill version already registered: {}@{}",
+                        req.name, req.version
+                    ),
+                ));
+            }
+            for art_ref in &req.artifact_refs {
+                let exists = art_ref.artifact_id.kind() == crate::id::IdKind::Artifact
+                    && s.artifacts
+                        .get(art_ref.artifact_id.as_str())
+                        .is_some_and(|a| {
+                            a.deleted_at_ms.is_none()
+                                && a.tenant_id.as_str() == req.tenant_id.as_str()
+                        });
+                if !exists {
+                    return Err(Error::new(
+                        ErrorCode::ArtifactNotFound,
+                        format!("{}", art_ref.artifact_id),
+                    ));
+                }
+            }
+            let skill = Skill::create(req);
+            if let Some(p) = &self.persist {
+                p.put_skill(&skill).map_err(internal)?;
+            }
+            s.skill_uniques
+                .insert(unique, skill.skill_id.as_str().to_string());
+            s.skills
+                .insert(skill.skill_id.as_str().to_string(), skill.clone());
+            skill
+        };
+
+        if let Some(full) = idem_full_key {
+            let rec = IdempotencyRecord {
+                payload_hash: req_hash,
+                result_json: serde_json::to_string(&skill).unwrap(),
+            };
+            if let Some(p) = &self.persist {
+                p.put_idempotency(&full, &rec).map_err(internal)?;
+            }
+            self.idem.put(full, rec);
+        }
+        Ok(skill)
+    }
+
+    pub async fn get_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<Skill> {
+        let s = self.state.lock().await;
+        s.skills
+            .get(skill_id.as_str())
+            .filter(|skill| {
+                skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", skill_id)))
+    }
+
+    /// Bind an exact skill version to an agent. Rebinding the same skill id is
+    /// idempotent even without an Idempotency-Key.
+    pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
+        let idem_full_key = req.idempotency_key.as_ref().map(|k| {
+            format!(
+                "{}::{}::{}::{}",
+                req.tenant_id, "skill_bind", req.agent_id, k
+            )
+        });
+        let req_hash = hash_skill_bind_request(&req);
+        if let Some(ref full) = idem_full_key {
+            if let Some(rec) = self.idem.lookup(full) {
+                return verify_json_replay(&rec, req_hash);
+            }
+        }
+
+        let binding = {
+            let mut s = self.state.lock().await;
+            if let Some(ref full) = idem_full_key {
+                if let Some(rec) = self.idem.lookup(full) {
+                    drop(s);
+                    return verify_json_replay(&rec, req_hash);
+                }
+            }
+            let agent = s
+                .agents
+                .get(req.agent_id.as_str())
+                .filter(|a| {
+                    a.deleted_at_ms.is_none() && a.tenant_id.as_str() == req.tenant_id.as_str()
+                })
+                .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)))?;
+            let skill = s
+                .skills
+                .get(req.skill_id.as_str())
+                .filter(|skill| {
+                    skill.deleted_at_ms.is_none()
+                        && skill.tenant_id.as_str() == req.tenant_id.as_str()
+                })
+                .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", req.skill_id)))?;
+            let key = (
+                agent.agent_id.as_str().to_string(),
+                skill.skill_id.as_str().to_string(),
+            );
+            if let Some(existing) = s.agent_skill_bindings.get(&key) {
+                return Ok(existing.clone());
+            }
+            let binding =
+                AgentSkillBinding::create(req.tenant_id.clone(), req.agent_id.clone(), skill);
+            if let Some(p) = &self.persist {
+                p.put_agent_skill_binding(&binding).map_err(internal)?;
+            }
+            s.agent_skill_bindings.insert(key, binding.clone());
+            binding
+        };
+
+        if let Some(full) = idem_full_key {
+            let rec = IdempotencyRecord {
+                payload_hash: req_hash,
+                result_json: serde_json::to_string(&binding).unwrap(),
+            };
+            if let Some(p) = &self.persist {
+                p.put_idempotency(&full, &rec).map_err(internal)?;
+            }
+            self.idem.put(full, rec);
+        }
+        Ok(binding)
+    }
+
+    pub async fn list_agent_skills(
+        &self,
+        tenant_id: &Id,
+        agent_id: &Id,
+    ) -> Result<Vec<AgentSkillBinding>> {
+        let s = self.state.lock().await;
+        let agent_live = s.agents.get(agent_id.as_str()).is_some_and(|a| {
+            a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
+        });
+        if !agent_live {
+            return Err(Error::new(
+                ErrorCode::AgentNotFound,
+                format!("{}", agent_id),
+            ));
+        }
+        Ok(s.agent_skill_bindings
+            .values()
+            .filter(|b| {
+                b.deleted_at_ms.is_none()
+                    && b.tenant_id.as_str() == tenant_id.as_str()
+                    && b.agent_id.as_str() == agent_id.as_str()
+            })
+            .cloned()
+            .collect())
     }
 
     /// Create an artifact: write the bytes to the content backend, persist
@@ -720,7 +952,6 @@ impl Runtime {
         //   fork-protection pass will revisit cross-session refs.
         // - `event_id`: `lookup_event_by_id` exists but V2.2 keeps the
         //   validation surface narrow to records only.
-        // - `skill_id`: skills land in V2.3.
         for sr in &req.source_refs {
             if let Some(rec_id) = &sr.record_id {
                 let exists = (rec_id.kind() == crate::id::IdKind::Record)
@@ -730,6 +961,52 @@ impl Runtime {
                 if !exists {
                     return Err(Error::new(ErrorCode::RecordNotFound, format!("{}", rec_id)));
                 }
+            }
+            if let Some(skill_id) = &sr.skill_id {
+                let exists = (skill_id.kind() == crate::id::IdKind::Skill)
+                    && s.skills.get(skill_id.as_str()).is_some_and(|skill| {
+                        skill.deleted_at_ms.is_none()
+                            && skill.tenant_id.as_str() == req.tenant_id.as_str()
+                    });
+                if !exists {
+                    return Err(Error::new(
+                        ErrorCode::SkillNotFound,
+                        format!("{}", skill_id),
+                    ));
+                }
+            }
+        }
+
+        if req.kind == "skill_used" {
+            let skill_id_raw = req
+                .payload
+                .get("skill_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::SkillNotFound,
+                        "skill_used payload must include skill_id",
+                    )
+                })?;
+            let version = req
+                .payload
+                .get("version")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::SkillNotFound,
+                        "skill_used payload must include version",
+                    )
+                })?;
+            let skill_id = Id::parse_kind(skill_id_raw, crate::id::IdKind::Skill)
+                .map_err(|_| Error::new(ErrorCode::SkillNotFound, skill_id_raw))?;
+            let exact = s.skills.get(skill_id.as_str()).is_some_and(|skill| {
+                skill.deleted_at_ms.is_none()
+                    && skill.tenant_id.as_str() == req.tenant_id.as_str()
+                    && skill.version == version
+            });
+            if !exact {
+                return Err(Error::new(ErrorCode::SkillNotFound, skill_id_raw));
             }
         }
 
@@ -1440,6 +1717,37 @@ fn verify_idem_replay(rec: &IdempotencyRecord, req: &AppendRequest) -> Result<Ap
     }
     let resp: AppendResponse = serde_json::from_str(&rec.result_json).unwrap();
     Ok(resp)
+}
+
+fn hash_skill_register_request(req: &NewSkill) -> u64 {
+    hash_json(&serde_json::json!({
+        "tenant_id": req.tenant_id.as_str(),
+        "name": req.name,
+        "version": req.version,
+        "manifest": req.manifest,
+        "artifact_refs": req.artifact_refs,
+    }))
+}
+
+fn hash_skill_bind_request(req: &BindSkillRequest) -> u64 {
+    hash_json(&serde_json::json!({
+        "tenant_id": req.tenant_id.as_str(),
+        "agent_id": req.agent_id.as_str(),
+        "skill_id": req.skill_id.as_str(),
+    }))
+}
+
+fn verify_json_replay<T>(rec: &IdempotencyRecord, expected_hash: u64) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if rec.payload_hash != expected_hash {
+        return Err(Error::new(
+            ErrorCode::IdempotencyConflict,
+            "request differs for the same idempotency key",
+        ));
+    }
+    Ok(serde_json::from_str(&rec.result_json).unwrap())
 }
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer

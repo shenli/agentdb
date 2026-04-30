@@ -6,9 +6,10 @@ Date: 2026-04-28
 
 Implementation checkpoint:
 
-- V2.0 tenant/agent/session/event core, V2.1 artifacts, and V2.2 searchable
-  records/indexing policy are implemented in the Rust runtime/API prototype.
-- Current next milestone: V2.3 skills.
+- V2.0 tenant/agent/session/event core, V2.1 artifacts, V2.2 searchable
+  records/indexing policy, and V2.3 skills are implemented in the Rust
+  runtime/API prototype.
+- Current next milestone: V2.4 policy, lifecycle, and GC.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
