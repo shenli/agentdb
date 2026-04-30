@@ -22,7 +22,8 @@ use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
 use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBackend};
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
-    IdentityContentCryptoAdapter, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KvStore,
+    IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
+    KmsError, KmsKeyResolver, KvStore, MetadataCryptoAdapter,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -506,11 +507,12 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
     ) -> Arc<Self> {
-        Self::with_kv_kms_and_content_crypto(
+        Self::with_kv_kms_content_and_metadata_crypto(
             kv,
             content,
             kms,
             Arc::new(IdentityContentCryptoAdapter),
+            Arc::new(IdentityMetadataCryptoAdapter),
         )
     }
 
@@ -520,7 +522,23 @@ impl Runtime {
         kms: Arc<dyn KmsKeyResolver>,
         content_crypto: Arc<dyn ContentCryptoAdapter>,
     ) -> Arc<Self> {
-        let persist = Persist::new(kv);
+        Self::with_kv_kms_content_and_metadata_crypto(
+            kv,
+            content,
+            kms,
+            content_crypto,
+            Arc::new(IdentityMetadataCryptoAdapter),
+        )
+    }
+
+    pub fn with_kv_kms_content_and_metadata_crypto(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    ) -> Arc<Self> {
+        let persist = Persist::with_metadata_crypto(kv, metadata_crypto);
 
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {

@@ -30,7 +30,11 @@ use agentdb_storage::keys::{
     session_alias_key, session_record_key, skill_record_key, skill_unique_key, tenant_alias_key,
     tenant_record_key,
 };
-use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
+use agentdb_storage::Error as StorageError;
+use agentdb_storage::{
+    KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind, Result as KvResult,
+    WriteOp,
+};
 
 use crate::agent::Agent;
 use crate::artifact::Artifact;
@@ -45,11 +49,79 @@ type SkillUniqueRecord = ((String, String, String), String);
 
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
+    metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
 }
 
 impl Persist {
-    pub fn new(kv: Arc<dyn KvStore + Send + Sync>) -> Self {
-        Self { kv }
+    pub fn with_metadata_crypto(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    ) -> Self {
+        Self {
+            kv,
+            metadata_crypto,
+        }
+    }
+
+    fn encrypt_metadata(
+        &self,
+        context: &MetadataCryptoContext<'_>,
+        plaintext: &[u8],
+    ) -> KvResult<Vec<u8>> {
+        self.metadata_crypto
+            .encrypt(context, plaintext)
+            .map_err(|e| {
+                StorageError::Other(format!(
+                    "metadata encrypt failed for {} {}: {e}",
+                    context.object_kind.as_str(),
+                    context.object_id
+                ))
+            })
+    }
+
+    fn decrypt_metadata(
+        &self,
+        context: &MetadataCryptoContext<'_>,
+        ciphertext: &[u8],
+    ) -> KvResult<Vec<u8>> {
+        self.metadata_crypto
+            .decrypt(context, ciphertext)
+            .map_err(|e| {
+                StorageError::Other(format!(
+                    "metadata decrypt failed for {} {}: {e}",
+                    context.object_kind.as_str(),
+                    context.object_id
+                ))
+            })
+    }
+
+    fn artifact_context<'a>(&self, a: &'a Artifact) -> MetadataCryptoContext<'a> {
+        MetadataCryptoContext {
+            tenant_id: a.tenant_id.as_str(),
+            object_kind: MetadataObjectKind::Artifact,
+            object_id: a.artifact_id.as_str(),
+        }
+    }
+
+    fn event_context<'a>(&self, e: &'a EventEnvelope) -> MetadataCryptoContext<'a> {
+        MetadataCryptoContext {
+            tenant_id: e.tenant_id.as_str(),
+            object_kind: MetadataObjectKind::Event,
+            object_id: e.session_id.as_str(),
+        }
+    }
+
+    fn event_context_from_key<'a>(
+        &self,
+        tenant_id: &'a str,
+        session_id: &'a str,
+        _seq: u64,
+    ) -> MetadataCryptoContext<'a> {
+        MetadataCryptoContext {
+            tenant_id,
+            object_kind: MetadataObjectKind::Event,
+            object_id: session_id,
+        }
     }
 
     // ----- single-record writes -----
@@ -124,10 +196,15 @@ impl Persist {
     /// has no V2.1 lookup API; it's populated so a future dedup pass lands
     /// without rewriting this code path.
     pub fn put_artifact(&self, a: &Artifact) -> KvResult<()> {
+        let artifact_context = self.artifact_context(a);
+        let artifact_value = self.encrypt_metadata(
+            &artifact_context,
+            &serde_json::to_vec(a).expect("artifact serializes"),
+        )?;
         let ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
-                value: serde_json::to_vec(a).expect("artifact serializes"),
+                value: artifact_value,
             },
             WriteOp::Put {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
@@ -188,7 +265,10 @@ impl Persist {
         let mut count = 0;
         for res in iter {
             let (k, v) = res?;
-            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
+            let context = self.event_context_from_key(tenant_id, session_id, 0);
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let env: EventEnvelope =
+                serde_json::from_slice(&plaintext).expect("event envelope decodes");
             ops.push(WriteOp::Delete { key: k });
             ops.push(WriteOp::Delete {
                 key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),
@@ -217,9 +297,14 @@ impl Persist {
             event.session_id.as_str(),
             event.seq,
         );
+        let event_context = self.event_context(event);
+        let event_value = self.encrypt_metadata(
+            &event_context,
+            &serde_json::to_vec(event).expect("event serializes"),
+        )?;
         ops.push(WriteOp::Put {
             key: ek.into_bytes(),
-            value: serde_json::to_vec(event).expect("event serializes"),
+            value: event_value,
         });
         let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
         ops.push(WriteOp::Put {
@@ -291,7 +376,10 @@ impl Persist {
         let mut out = Vec::new();
         for res in iter {
             let (_k, v) = res?;
-            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
+            let context = self.event_context_from_key(tenant_id, session_id, 0);
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let env: EventEnvelope =
+                serde_json::from_slice(&plaintext).expect("event envelope decodes");
             if env.seq < from_seq {
                 continue;
             }
@@ -312,7 +400,10 @@ impl Persist {
         let mut max_seq: Option<u64> = None;
         for res in iter {
             let (_k, v) = res?;
-            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
+            let context = self.event_context_from_key(tenant_id, session_id, 0);
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let env: EventEnvelope =
+                serde_json::from_slice(&plaintext).expect("event envelope decodes");
             max_seq = Some(match max_seq {
                 Some(m) if m >= env.seq => m,
                 _ => env.seq,
@@ -362,11 +453,23 @@ impl Persist {
     /// (the byte after `record/artifact` is `_` for the index, `/` for the
     /// record), so this scan does NOT pick up index entries.
     pub fn scan_all_artifacts(&self) -> KvResult<Vec<Artifact>> {
-        let iter = self.kv.scan_prefix(b"record/artifact/")?;
+        let prefix = b"record/artifact/";
+        let iter = self.kv.scan_prefix(prefix)?;
         let mut out = Vec::new();
         for res in iter {
-            let (_k, v) = res?;
-            let a: Artifact = serde_json::from_slice(&v).expect("artifact decodes");
+            let (k, v) = res?;
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("artifact key suffix is utf8");
+            let mut split = suffix.splitn(2, '/');
+            let tenant_id = split.next().expect("tenant_id segment");
+            let artifact_id = split.next().expect("artifact_id segment");
+            let context = MetadataCryptoContext {
+                tenant_id,
+                object_kind: MetadataObjectKind::Artifact,
+                object_id: artifact_id,
+            };
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let a: Artifact = serde_json::from_slice(&plaintext).expect("artifact decodes");
             out.push(a);
         }
         Ok(out)

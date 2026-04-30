@@ -10,6 +10,7 @@ pub mod error;
 pub mod keys;
 pub mod kms;
 pub mod kv;
+pub mod metadata_crypto;
 pub mod rocks;
 pub mod slate;
 
@@ -25,5 +26,8 @@ pub use kms::{
     StaticKeyState, StaticKmsKeyResolver,
 };
 pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
+pub use metadata_crypto::{
+    IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
+};
 pub use rocks::RocksKvStore;
 pub use slate::SlateKvStore;
