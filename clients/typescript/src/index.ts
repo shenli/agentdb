@@ -26,6 +26,21 @@
  */
 
 export { Client, Session } from "./client.js";
+export {
+  SessionEventKind,
+  agentStatus,
+  approvalRequested,
+  approvalResult,
+  artifactCreated,
+  contextPackBuilt,
+  modelMessage,
+  modelThought,
+  toolCall,
+  toolError,
+  toolResult,
+  userMessage,
+} from "./conventions.js";
+export type { Payload, SessionEventKind as SessionEventKindValue } from "./conventions.js";
 export type {
   AppendOptions,
   AppendAndFetchOptions,

@@ -40,6 +40,20 @@ working agent loops.
 """
 
 from .client import Client, Session, AppendResult, Event, WatchItem
+from .conventions import (
+    SessionEventKind,
+    agent_status,
+    approval_requested,
+    approval_result,
+    artifact_created,
+    context_pack_built,
+    model_message,
+    model_thought,
+    tool_call,
+    tool_error,
+    tool_result,
+    user_message,
+)
 from .errors import (
     AgentDBError,
     BadRequest,
@@ -59,6 +73,18 @@ __all__ = [
     "AppendResult",
     "Event",
     "WatchItem",
+    "SessionEventKind",
+    "agent_status",
+    "approval_requested",
+    "approval_result",
+    "artifact_created",
+    "context_pack_built",
+    "model_message",
+    "model_thought",
+    "tool_call",
+    "tool_error",
+    "tool_result",
+    "user_message",
     "AsyncClient",
     "AsyncSession",
     "AgentDBError",
