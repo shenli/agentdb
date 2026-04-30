@@ -104,7 +104,20 @@ requirements, and AI Agents Platform use cases.
 
 Core thesis:
 
-> AgentDB is the runtime database for AI Agents Platforms.
+> AgentDB is the durable session database for AI Agents Platforms.
+
+Agent platforms should be able to decouple stateless brains from replaceable
+hands. Brains are models, harnesses, planners, and agent loops. Hands are
+sandboxes, MCP servers, tools, browsers, filesystems, and external systems.
+AgentDB owns the session layer between them: the durable, ordered, replayable
+execution state that survives harness crashes, tool failures, context resets, and
+sandbox replacement.
+
+The session is not the model context window. Context windows are transient and
+model-specific; sessions are durable execution truth. Harnesses and adapters can
+build whatever context shape a model needs from events, artifacts, searchable
+records, skills, and policy hints, while AgentDB preserves the recoverable source
+of truth underneath.
 
 Framework integrations are both an adoption path and a validation workload. A
 good AgentDB adapter for LangGraph, OpenAI Agents SDK, Vercel AI SDK, or similar

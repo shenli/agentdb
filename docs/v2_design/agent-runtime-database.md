@@ -11,7 +11,41 @@ application's OLTP database.
 
 AgentDB V2 is:
 
-> The runtime database for AI Agents Platforms.
+> The durable session database for AI Agents Platforms.
+
+An agent platform has three separable runtime concerns:
+
+```text
+Brain:
+  model, harness, planner, memory strategy, context builder
+
+Hands:
+  sandboxes, tools, MCP servers, browsers, filesystems, external systems
+
+Session:
+  durable ordered execution state, artifacts, searchable records, policy,
+  subscriptions, replay, fork lineage, audit trail
+```
+
+AgentDB owns the session layer. It is not the brain and not the hands. It should
+make very few assumptions about which model, harness, sandbox, tool proxy, or
+workflow engine a platform uses. Those components should be replaceable because
+the durable execution truth lives in AgentDB sessions.
+
+A harness that crashes should be able to start again with:
+
+```text
+wake(session_id)
+get_events(session_id, range/filter)
+append_event(session_id, event)
+subscribe(session_id, from_seq)
+fork_session(parent_session_id, at_seq)
+build_context(session_id, budget/query)
+```
+
+A sandbox or tool that fails should be replaceable because its calls, results,
+errors, artifacts, and side effects are represented in the session timeline
+rather than trapped inside one process or container.
 
 The target user is not a solo agent developer. For a single agent, files,
 SQLite, Postgres, MongoDB, Redis, or a vector store are usually good enough.
@@ -57,6 +91,18 @@ Short version:
 Your product database stores customer truth.
 AgentDB stores agent execution truth.
 ```
+
+The central product constraint follows from that split:
+
+```text
+The session is not the model context window.
+```
+
+The context window is transient, lossy, model-specific, and often transformed by
+compaction, trimming, summarization, or prompt-cache layout. The session log is
+durable, ordered, queryable, replayable, and independent of those harness
+decisions. AgentDB should preserve execution truth; harnesses and framework
+adapters decide how to convert that truth into the next model input.
 
 ## 2. Why Existing Storage Is Not Enough
 
@@ -274,12 +320,19 @@ replacement for them.
 
 ## 4. Architectural Boundary
 
-AgentDB V2 separates the agent runtime semantics from the lower-level storage
+AgentDB V2 separates brains, hands, session semantics, and lower-level storage
 engine capabilities:
 
 ```text
-User / SDK / API
-  Agent, Session, Searchable Record, Artifact, Skill, Policy
+Brain / Harness / Adapter
+  wake, read history, build context, call model, decide next action
+
+Hands / Tools / Sandboxes
+  execute tool calls, mutate external systems, produce files/logs/results
+
+AgentDB Session Runtime
+  Agent, Session, Event, Artifact, Searchable Record, Skill, Policy,
+  Subscription, Replay, Fork, Context Pack
 
 AgentDB Runtime Core
   agent-native semantics and invariants
@@ -295,6 +348,17 @@ application.
 The storage engine should not need to understand every high-level agent concept.
 It must instead provide the low-level capabilities the runtime core needs to
 enforce agent semantics correctly and efficiently.
+
+The brain/hands/session boundary gives AgentDB a narrow product job:
+
+- Keep the session durable even if the harness process is gone.
+- Keep tool and sandbox outputs recoverable even if the execution environment is
+  replaced.
+- Keep context construction reversible by preserving the source events and
+  artifacts underneath summaries or trims.
+- Keep fork/replay/audit independent of any particular model's prompt format.
+- Keep integrations thin by exposing ordered append, replay, subscribe, context,
+  artifacts, and searchable records as native primitives.
 
 ## 5. First-Class Runtime Objects
 
@@ -549,6 +613,11 @@ const context = await session.context({
 ```
 
 Context construction strategies will evolve, so this API must be extensible.
+The context API should return a context pack derived from durable session data;
+it should not become the only place where context exists. A harness may compact,
+trim, reorder, or summarize context packs for a specific model, but the original
+events, artifacts, source refs, records, skills, and policy hints remain
+available for later recovery and replay.
 
 ## 10. Storage Engine Capabilities
 

@@ -5,6 +5,20 @@ agent-native objects rather than a document-store compatibility facade.
 
 ## Product Thesis
 
+Long-running agent platforms need a stable boundary between:
+
+- **brains**: models, harnesses, planners, and agent loops
+- **hands**: sandboxes, tools, MCP servers, browsers, filesystems, and external
+  systems
+- **sessions**: durable execution state that lets brains recover, inspect,
+  resume, replay, fork, and audit work
+
+AgentDB owns the session layer. It is not the model runtime, harness, sandbox,
+or workflow engine. A harness should be able to crash and restart with
+`wake(session_id)`, fetch the durable event log, append the next event, and
+continue. A sandbox or tool should be replaceable because its outputs and errors
+are recorded as session events and artifacts rather than hidden inside a process.
+
 Agent platforms repeatedly need the same primitives:
 
 - ordered session history
@@ -18,6 +32,12 @@ Agent platforms repeatedly need the same primitives:
 
 AgentDB makes those primitives first-class so framework adapters are mostly
 mapping code.
+
+The session is not the model context window. Context windows are transient,
+lossy, model-specific, and often transformed by compaction or trimming. The
+session log is durable, ordered, queryable, and recoverable. Context builders and
+framework adapters may choose which slices, summaries, records, artifacts, and
+skills to pass to a model, but AgentDB preserves the underlying execution truth.
 
 ## Active Interfaces
 
@@ -78,6 +98,18 @@ fork-aware.
 Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant/session/agent watch returns changefeed items with cursors for higher
 level consumers.
+
+The canonical harness flow is:
+
+```text
+wake(session_id)
+get events, records, artifacts, skills, and policy hints
+build model context in the harness
+call the model
+execute requested tools or sandboxes as external hands
+append tool calls, tool results, model outputs, approvals, and artifacts
+repeat or sleep
+```
 
 ## Policy, Lifecycle, And GC
 
