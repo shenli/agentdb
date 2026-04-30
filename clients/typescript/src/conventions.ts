@@ -210,6 +210,26 @@ export function contextPackBuilt(
   });
 }
 
+export function contextSourceRefs(
+  context: Payload,
+  opts: { maxRefs?: number } = {}
+): Payload[] {
+  const refs: Payload[] = [];
+  for (const event of arrayField(context.events)) {
+    const eventId = field(event, "event_id", "eventId");
+    if (eventId !== undefined) refs.push({ event_id: eventId });
+  }
+  for (const record of arrayField(context.records)) {
+    const recordId = field(record, "record_id", "recordId");
+    if (recordId !== undefined) refs.push({ record_id: recordId });
+  }
+  for (const skill of arrayField(context.skills)) {
+    const skillId = field(skill, "skill_id", "skillId");
+    if (skillId !== undefined) refs.push({ skill_id: skillId });
+  }
+  return opts.maxRefs === undefined ? refs : refs.slice(0, opts.maxRefs);
+}
+
 export function agentStatus(
   status: string,
   opts: { summary?: string; lastSeenSeq?: number; reason?: string; metadata?: Payload } = {}
@@ -225,4 +245,16 @@ export function agentStatus(
 
 function compact(input: Payload): Payload {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+}
+
+function arrayField(value: unknown): Payload[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Payload => item !== null && typeof item === "object" && !Array.isArray(item));
+}
+
+function field(value: Payload, ...names: string[]): unknown {
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(value, name)) return value[name];
+  }
+  return undefined;
 }

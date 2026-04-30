@@ -126,6 +126,48 @@ await session.append(
 Helpers are intentionally client-side only. They do not prevent custom event
 kinds or adapter-specific payload fields.
 
+## Context Provenance
+
+Context is a derived view over the durable session log. When a harness builds
+context for a model call, record a `context_pack_built` event with source refs,
+then link the model output to that event:
+
+```ts
+import {
+  SessionEventKind,
+  contextPackBuilt,
+  contextSourceRefs,
+  modelMessage,
+} from "agentdb";
+
+const context = await session.context({
+  include: ["recent_events", "records"],
+  maxEvents: 20,
+});
+const contextEvent = await session.append(
+  contextPackBuilt("ctx_1", ["recent_events", "records"], {
+    maxEvents: 20,
+    selectedEventCount: Array.isArray(context.events) ? context.events.length : 0,
+    selectedRecordCount: Array.isArray(context.records) ? context.records.length : 0,
+  }),
+  {
+    kind: SessionEventKind.ContextPackBuilt,
+    sourceRefs: contextSourceRefs(context, { maxRefs: 50 }),
+  }
+);
+
+await session.append(
+  modelMessage("The report is ready.", { contextPackId: "ctx_1" }),
+  {
+    kind: SessionEventKind.ModelMessage,
+    sourceRefs: [{ event_id: contextEvent.eventId }],
+  }
+);
+```
+
+This keeps the prompt/context shape model-specific while preserving the
+recoverable events and records that produced it.
+
 ## Testing
 
 ```bash

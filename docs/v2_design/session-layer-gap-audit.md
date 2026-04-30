@@ -235,6 +235,8 @@ Exit criteria:
 
 ### P2: Context provenance examples
 
+Status: implemented in the SDK convention helpers and README examples.
+
 Clarify how context packs relate to durable execution truth.
 
 Deliverables:

@@ -22,10 +22,10 @@ These conventions are:
 - not a closed enum enforced by the runtime,
 - centered on durable session truth rather than model-specific prompt format.
 
-The Python and TypeScript SDKs export `SessionEventKind` plus payload builders
-for these conventions. Those helpers are client-side conveniences for adapters;
-the server still accepts custom `kind` values and adapter-specific payload
-fields.
+The Python and TypeScript SDKs export `SessionEventKind`, payload builders, and
+`context_source_refs` / `contextSourceRefs` helpers for these conventions. Those
+helpers are client-side conveniences for adapters; the server still accepts
+custom `kind` values and adapter-specific payload fields.
 
 ## 2. Envelope Rules
 
