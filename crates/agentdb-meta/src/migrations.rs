@@ -63,7 +63,7 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
     ),
     (
         8,
-        "node mongo_address for cross-node Mongo wire forwarding",
+        "legacy node peer address column",
         include_str!("../migrations/008_node_mongo_address.sql"),
         include_str!("../migrations/008_node_mongo_address.pg.sql"),
     ),

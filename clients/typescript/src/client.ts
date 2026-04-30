@@ -1,4 +1,3 @@
-import { BroadcastMessage, parseBroadcastEnvelope } from "./broadcast.js";
 import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
 import { parseSse } from "./sse.js";
 import { Buffer } from "node:buffer";
@@ -218,31 +217,6 @@ export class Client {
     throw new Error("tenant-wide streaming requires watch(tenantId, ...) in V2");
   }
 
-  async broadcast(opts: { channel: string; payload: unknown }): Promise<void> {
-    const resp = await this._rawFetch("POST", `/api/channels/${enc(opts.channel)}/publish`, opts.payload, {}, true);
-    if (resp.status === 204) return;
-    throw await errorFrom(resp);
-  }
-
-  async *subscribeChannel(opts: { channel: string; noEcho?: boolean }): AsyncIterable<BroadcastMessage> {
-    const url = new URL(`${this.baseUrl}/api/channels/${enc(opts.channel)}/subscribe`);
-    if (opts.noEcho) url.searchParams.set("no_echo", "true");
-    const token = await this._channelBearerToken();
-    if (token) url.searchParams.set("access_token", token);
-    const resp = await this._fetch(url, { headers: { Accept: "text/event-stream" } });
-    if (!resp.ok) throw await errorFrom(resp);
-    if (!resp.body) throw new AgentDBError("subscribeChannel response has no body", { statusCode: resp.status });
-    const reader = resp.body.getReader();
-    try {
-      for await (const frame of parseSse(reader)) {
-        if (frame.event && frame.event !== "message") continue;
-        if (frame.data) yield parseBroadcastEnvelope(frame.data);
-      }
-    } finally {
-      try { reader.releaseLock(); } catch {}
-    }
-  }
-
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
     const resp = await this._rawFetch(method, path, json, headers);
     if (!resp.ok) throw await errorFrom(resp);
@@ -260,7 +234,7 @@ export class Client {
   }
 
   private async _requestRawJson(method: string, path: string, init: { body?: BodyInit; headers?: Record<string, string> }): Promise<Record<string, unknown>> {
-    const resp = await this._rawFetch(method, path, undefined, init.headers ?? {}, false, init.body);
+    const resp = await this._rawFetch(method, path, undefined, init.headers ?? {}, init.body);
     if (!resp.ok) throw await errorFrom(resp);
     return JSON.parse(await resp.text()) as Record<string, unknown>;
   }
@@ -270,10 +244,9 @@ export class Client {
     path: string,
     json?: unknown,
     headers: Record<string, string> = {},
-    channelAuth = false,
     rawBody?: BodyInit
   ): Promise<Response> {
-    const hdrs = { ...headers, ...(await this._authHeaders(channelAuth)) };
+    const hdrs = { ...headers, ...(await this._authHeaders()) };
     let body: BodyInit | undefined = rawBody;
     if (json !== undefined) {
       hdrs["Content-Type"] = "application/json";
@@ -292,20 +265,12 @@ export class Client {
     return await this._fetch(input, init);
   }
 
-  private async _authHeaders(channelAuth = false): Promise<Record<string, string>> {
+  private async _authHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {};
-    if (channelAuth) {
-      const token = await this._channelBearerToken();
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-    } else if (this._auth) {
+    if (this._auth) {
       headers["Authorization"] = `Basic ${Buffer.from(`${this._auth.user}:${this._auth.password}`).toString("base64")}`;
     }
     return headers;
-  }
-
-  async _channelBearerToken(): Promise<string | undefined> {
-    if (this._getToken) return await this._getToken();
-    return this._token;
   }
 }
 

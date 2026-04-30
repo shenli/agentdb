@@ -1,4 +1,4 @@
-//! HTTP routes for the V2.0 runtime.
+//! HTTP routes for the V2 runtime.
 //!
 //! Routes are mounted under `/api/...`. Each handler:
 //! 1. Parses path params (typed Ids) — bad input becomes a structured 404.
@@ -51,6 +51,7 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/health/ready", get(health_ready))
         .route("/api/tenants", post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
@@ -148,6 +149,10 @@ pub fn routes() -> Router<AppState> {
             post(run_gc_sweep),
         )
         .route("/api/policy/worker/run", post(run_policy_worker))
+}
+
+async fn health_ready() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn create_tenant(

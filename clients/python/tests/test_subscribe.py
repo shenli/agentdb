@@ -8,7 +8,7 @@ Two layers:
    boundary, multi-line `data:` joins, and the leading-space rule
    right is the difference between "works" and "drops events".
 
-2. End-to-end smoke against a live `agentdb serve --dev` server,
+2. End-to-end smoke against a live `agentdb serve --in-memory` server,
    gated on `AGENTDB_PYTHON_SMOKE=1`. Skipped by default to keep
    `pytest` fast and not require the cargo workspace to be built.
 """
@@ -19,7 +19,6 @@ import asyncio
 import os
 import socket
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -180,17 +179,14 @@ def subscribe_server():
             "run `cargo build -p agentdb-server` first"
         )
     rest_port = _free_port()
-    mongo_port = _free_port()
     env = {**os.environ, "RUST_LOG": "warn"}
     proc = subprocess.Popen(
         [
             str(SERVER_BIN),
             "serve",
-            "--dev",
-            "--addr",
+            "--in-memory",
+            "--bind",
             f"127.0.0.1:{rest_port}",
-            "--mongo-addr",
-            f"127.0.0.1:{mongo_port}",
         ],
         env=env,
         stdout=subprocess.DEVNULL,
@@ -223,40 +219,27 @@ def subscribe_server():
             proc.wait(timeout=5)
 
 
-@SMOKE_SKIP
-def test_subscribe_yields_appended_events(subscribe_server):
-    """Live-tail: open a per-session subscription, then append three
-    events, and watch them come back in order."""
+def _session(base_url: str, label: str):
     from agentdb import Client
 
-    base = subscribe_server
-    seen: list = []
-    error_box: list = []
+    client = Client(base_url)
+    tenant = client.create_tenant(label)
+    agent = client.create_agent(tenant["tenant_id"], alias=f"{label}-agent")
+    return client, client.create_session(tenant["tenant_id"], agent["agent_id"], alias=label)
 
-    def consume():
-        try:
-            client = Client(base)
-            sess = client.session("s-sub-py")
-            for evt in sess.subscribe():
-                seen.append(evt)
-                if len(seen) >= 3:
-                    return
-        except Exception as e:  # pragma: no cover (smoke debug)
-            error_box.append(e)
 
-    consumer = threading.Thread(target=consume, daemon=True)
-    consumer.start()
-    time.sleep(1.0)
-
-    writer = Client(base)
-    sess = writer.session("s-sub-py")
+@SMOKE_SKIP
+def test_subscribe_yields_appended_events(subscribe_server):
+    """V2 subscribe replays the session event snapshot as SSE."""
+    _, sess = _session(subscribe_server, "s-sub-py")
     for i in range(3):
         sess.append({"kind": "msg", "n": i})
-    consumer.join(timeout=10)
-    assert not error_box, f"consumer crashed: {error_box[0]!r}"
-    assert len(seen) == 3
-    seqs = sorted(e.seq for e in seen)
-    assert seqs == [1, 2, 3]
+    seen = []
+    for evt in sess.subscribe(from_seq=0):
+        seen.append(evt)
+        if len(seen) >= 3:
+            break
+    assert [e.seq for e in seen] == [0, 1, 2]
 
 
 @SMOKE_SKIP
@@ -265,53 +248,27 @@ def test_subscribe_replays_from_seq(subscribe_server):
     should replay them in order."""
     from agentdb import Client
 
-    base = subscribe_server
-    writer = Client(base)
-    sess = writer.session("s-sub-py-replay")
+    _, sess = _session(subscribe_server, "s-sub-py-replay")
     for _ in range(3):
         sess.append({"kind": "x"})
 
-    client = Client(base)
-    reader = client.session("s-sub-py-replay")
     seqs: list = []
-    for evt in reader.subscribe(from_seq=1):
+    for evt in sess.subscribe(from_seq=1):
         seqs.append(evt.seq)
-        if len(seqs) >= 3:
+        if len(seqs) >= 2:
             break
-    assert seqs == [1, 2, 3]
+    assert seqs == [1, 2]
 
 
 @SMOKE_SKIP
-def test_tenant_subscribe_fans_out_across_sessions(subscribe_server):
-    """Tenant-wide subscribe sees events from any session under
-    the tenant."""
-    from agentdb import Client
-
-    base = subscribe_server
-    seen: list = []
-    error_box: list = []
-
-    def consume():
-        try:
-            client = Client(base)
-            for evt in client.subscribe():
-                seen.append(evt)
-                if len(seen) >= 4:
-                    return
-        except Exception as e:  # pragma: no cover (smoke debug)
-            error_box.append(e)
-
-    consumer = threading.Thread(target=consume, daemon=True)
-    consumer.start()
-    time.sleep(1.0)
-
-    writer = Client(base)
-    writer.session("s-a").append({"kind": "p", "t": 1})
-    writer.session("s-b").append({"kind": "p", "t": 2})
-    writer.session("s-a").append({"kind": "p", "t": 3})
-    writer.session("s-b").append({"kind": "p", "t": 4})
-    consumer.join(timeout=10)
-    assert not error_box, f"consumer crashed: {error_box[0]!r}"
-    assert len(seen) == 4
-    sids = {e.session for e in seen}
-    assert "s-a" in sids and "s-b" in sids
+def test_tenant_watch_fans_out_across_sessions(subscribe_server):
+    """Tenant-wide watch sees events from any session under the tenant."""
+    client, first = _session(subscribe_server, "s-a")
+    second = client.create_session(first.tenant_id, first.agent_id, alias="s-b")
+    first.append({"kind": "p", "t": 1})
+    second.append({"kind": "p", "t": 2})
+    first.append({"kind": "p", "t": 3})
+    second.append({"kind": "p", "t": 4})
+    seen = client.watch(first.tenant_id, scope="tenant", limit=10)
+    sids = {item.event.session_id for item in seen}
+    assert first.session_id in sids and second.session_id in sids

@@ -18,11 +18,9 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 async-broadcast = "0.7"
-bson = { version = "3", features = ["serde"] }
 bytes = "1"
 byteorder = "1"
 instant-distance = "0.6"
-mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-3", "compat-3-3-0"] }
 parking_lot = "0.12"
 thiserror = "1"
 rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
@@ -60,8 +58,6 @@ async-trait = "0.1"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
-# Mongo wire TLS termination (raw rustls handshake over TCP).
-tokio-rustls = "0.26"
 # Dev-only: generate ephemeral self-signed certs for
 # `agentdb serve --dev-tls` and integration tests.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }

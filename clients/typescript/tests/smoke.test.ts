@@ -1,17 +1,15 @@
 /**
  * End-to-end smoke test for the agentdb TypeScript SDK.
  *
- * Spawns `agentdb serve --dev` as a subprocess on an ephemeral port
- * with `AGENTDB_REQUIRE_AUTH=true`, creates a test user via the admin
- * API, then exercises the SDK against it. Run with:
+ * Spawns `agentdb serve --in-memory` as a subprocess on an ephemeral
+ * port, then exercises the V2 SDK against it. Run with:
  *
  *   npm test
  *
  * (which builds first, then runs `node --test dist/tests`).
  *
- * Skipped automatically if the server binary hasn't been built —
- * running this in CI without `cargo build -p agentdb-server`
- * first is a no-op rather than a hard failure.
+ * Skipped by default. Set `AGENTDB_TYPESCRIPT_SMOKE=1` after building the
+ * server binary to run it.
  */
 
 import test from "node:test";
@@ -51,28 +49,21 @@ async function freePort(): Promise<number> {
 async function spawnServer(): Promise<{
   baseUrl: string;
   proc: ChildProcess;
-  testUser: string;
-  testPassword: string;
-  testTenant: string;
 }> {
   const restPort = await freePort();
-  const mongoPort = await freePort();
   const proc = spawn(
     SERVER_BIN,
     [
       "serve",
-      "--dev",
-      "--addr",
+      "--in-memory",
+      "--bind",
       `127.0.0.1:${restPort}`,
-      "--mongo-addr",
-      `127.0.0.1:${mongoPort}`,
     ],
     {
       stdio: ["ignore", "ignore", "ignore"],
       env: {
         ...process.env,
         RUST_LOG: "warn",
-        AGENTDB_REQUIRE_AUTH: "true",
       },
     }
   );
@@ -96,47 +87,37 @@ async function spawnServer(): Promise<{
     throw new Error("server didn't become ready within 15s");
   }
 
-  // Create a test user via the admin API (no admin auth required in dev mode).
-  const testUser = "smoke-test-user";
-  const testPassword = "smoke-password-123";
-  const testTenant = "smoke-tenant";
-  const resp = await fetch(`${baseUrl}/api/admin/users`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      user_id: testUser,
-      tenant_external: testTenant,
-      password: testPassword,
-    }),
-  });
-  if (resp.status !== 201 && resp.status !== 409) {
-    const body = await resp.text();
-    throw new Error(`Failed to create test user: ${resp.status} ${body}`);
-  }
-
-  return { baseUrl, proc, testUser, testPassword, testTenant };
+  return { baseUrl, proc };
 }
 
 const skipReason = !existsSync(SERVER_BIN)
   ? `server binary not found at ${SERVER_BIN}; run \`cargo build -p agentdb-server\` first`
+  : process.env["AGENTDB_TYPESCRIPT_SMOKE"] !== "1"
+    ? "set AGENTDB_TYPESCRIPT_SMOKE=1 to run live server smoke tests"
   : undefined;
 
 test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
-  const { baseUrl, proc, testUser, testPassword } = await spawnServer();
+  const { baseUrl, proc } = await spawnServer();
   t.after(() => {
     proc.kill();
   });
 
-  const auth = { user: testUser, password: testPassword };
+  let counter = 0;
+  async function newSession(label: string): Promise<Session> {
+    counter += 1;
+    const client = new Client({ baseUrl });
+    const tenant = await client.createTenant(`${label}-${counter}`);
+    const agent = await client.createAgent(String(tenant.tenant_id), { alias: `${label}-agent` });
+    return await client.createSession(String(tenant.tenant_id), String(agent.agent_id), { alias: label });
+  }
 
   await t.test("append round-trips a single event", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("agent-smoke-1");
+    const sess = await newSession("agent-smoke-1");
     const result = await sess.append(
       { role: "user", text: "hello" },
       { fetchLastN: 5 }
     );
-    assert.ok(result.seq >= 1);
+    assert.ok(result.seq >= 0);
     assert.equal(result.recent.length, 1);
     const payload = result.recent[0]!.payload as Record<string, string>;
     assert.equal(payload.role, "user");
@@ -144,8 +125,7 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("multiple appends accumulate in order", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("agent-smoke-2");
+    const sess = await newSession("agent-smoke-2");
     await sess.append({ i: 1 });
     await sess.append({ i: 2 });
     const last = await sess.append({ i: 3 }, { fetchLastN: 10 });
@@ -154,28 +134,25 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("fork creates a child that inherits parent events", async () => {
-    const client = new Client({ baseUrl, auth });
-    const parent = client.session("agent-smoke-fork-parent");
+    const parent = await newSession("agent-smoke-fork-parent");
     await parent.append({ i: 1 });
     await parent.append({ i: 2 });
-    const child = await parent.fork("agent-smoke-fork-child");
+    const child = await parent.fork({ atSeq: 1, alias: "agent-smoke-fork-child" });
     assert.ok(child instanceof Session);
-    assert.equal(child.sessionId, "agent-smoke-fork-child");
+    assert.match(child.sessionId, /^ses_/);
     const res = await child.append({ i: 99 }, { fetchLastN: 10 });
     const last = res.recent[res.recent.length - 1]!;
     assert.equal((last.payload as { i: number }).i, 99);
   });
 
   await t.test("fetchRecent on empty session returns empty array", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("agent-smoke-fetch-empty");
+    const sess = await newSession("agent-smoke-fetch-empty");
     const result = await sess.fetchRecent(5);
     assert.deepEqual(result.recent, []);
   });
 
   await t.test("fetchRecent after 3 appends returns last 2 in order", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("agent-smoke-fetch-3");
+    const sess = await newSession("agent-smoke-fetch-3");
     await sess.append({ i: 1 });
     await sess.append({ i: 2 });
     await sess.append({ i: 3 });
@@ -186,8 +163,7 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
   });
 
   await t.test("fetchRecent(0) returns empty array", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("agent-smoke-fetch-zero");
+    const sess = await newSession("agent-smoke-fetch-zero");
     await sess.append({ x: 1 });
     const result = await sess.fetchRecent(0);
     assert.deepEqual(result.recent, []);

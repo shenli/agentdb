@@ -157,32 +157,6 @@ function dashboard() {
       return `webhook: ${host} (${fires} ok / ${fails} fail)`;
     },
 
-    async demoFork() {
-      await fetch('/api/sessions/agent/append_and_fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: { text: 'hello' }, fetch_last_n: 0 }),
-      });
-      await fetch('/api/sessions/agent/fork', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: 't-demo', new_session_id: 'subagent-' + Date.now() }),
-      });
-    },
-    async demoFault(boxId) {
-      await fetch(`/api/admin/boxes/${boxId}/inject_fault`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...this.tokenHeader() },
-        body: JSON.stringify({ kind: 'latency', duration_s: 10, latency_ms: 300 }),
-      });
-    },
-    async demoCold() {
-      await fetch('/api/admin/tier/force', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...this.tokenHeader() },
-        body: JSON.stringify({ tenant_id: 't-demo', session_id: 'agent', target: 'cold' }),
-      });
-    },
   };
 }
 

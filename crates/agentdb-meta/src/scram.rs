@@ -22,7 +22,7 @@
 //!
 //! This module is the pure-crypto layer — no I/O, no DB, no
 //! async. Callers glue it to the users table (see `users.rs`) and
-//! the wire / REST handshake (see agentdb-wire + agentdb-api).
+//! HTTP authentication.
 
 use hmac::{Hmac, Mac};
 use rand::RngCore;
