@@ -450,6 +450,13 @@ Dependencies: V2.0.
 
 ### V2.6 — SDK rewrites (Python + TypeScript) (~2500 LoC)
 
+Status: complete for the V2 prototype SDK surface. The Python and TypeScript
+clients now target the native tenant-scoped `/api/...` routes, expose opaque
+typed ID aliases, generate idempotency keys client-side for mutating calls, and
+cover tenant/agent/session creation, append, append-and-fetch, fetch, replay,
+fork, subscribe/watch, artifacts, records, skills, and context helpers. Package
+versions are bumped to `2.0.0` for the clean-break SDK surface.
+
 **Maps to impl guide §3.**
 
 Scope:

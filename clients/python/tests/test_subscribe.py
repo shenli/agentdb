@@ -101,28 +101,55 @@ def test_client_rejects_token_and_get_token_together():
         Client("http://127.0.0.1:7878", token="t", get_token=lambda: "t")
 
 
-def test_client_subscribe_does_not_require_tenant():
-    """subscribe() no longer requires tenant= — path is /api/subscribe."""
+def test_tenant_watch_path_uses_v2():
+    """Tenant-wide watch uses the native tenant-scoped V2 route."""
     from agentdb import Client
 
     client = Client("http://127.0.0.1:7878", auth=("u", "p"))
-    # subscribe() returns a generator; it should not raise ValueError for missing tenant
-    # It will fail only when it tries to connect (no server running).
-    gen = client.subscribe()
-    # Just verify it's a generator; don't iterate (no server).
-    import types
-    assert isinstance(gen, types.GeneratorType)
+    calls = []
+
+    def fake(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return []
+
+    client._request = fake
+    client.watch("ten_1", scope="tenant")
+    assert calls == [
+        (
+            "GET",
+            "/api/tenants/ten_1/watch",
+            {"params": {"scope": "tenant", "limit": "100"}},
+        )
+    ]
 
 
 def test_session_subscribe_path_uses_v2():
-    """Session.subscribe path must be /api/sessions/{id}/subscribe."""
+    """Session.subscribe path must be tenant scoped."""
     from agentdb import Client
 
     client = Client("http://127.0.0.1:7878", auth=("u", "p"))
-    sess = client.session("agent-1")
-    path = sess._subscribe_path()
-    assert "/api/sessions/agent-1/subscribe" in path
-    assert "/api/tenants/" not in path
+    sess = client.session("ten_1", "ses_1")
+    gen = sess.subscribe()
+
+    class FakeResponse:
+        status_code = 200
+
+        def iter_lines(self, decode_unicode=True):
+            return iter(())
+
+        def close(self):
+            pass
+
+    calls = []
+
+    def fake(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return FakeResponse()
+
+    client._raw_request = fake
+    list(gen)
+    assert calls[0][0] == "GET"
+    assert calls[0][1] == "/api/tenants/ten_1/sessions/ses_1/subscribe"
 
 
 # --- End-to-end smoke (gated) -----------------------------------

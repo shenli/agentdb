@@ -1,117 +1,83 @@
-/**
- * High-level AgentDB client.
- *
- *   import { Client } from "agentdb";
- *
- *   const client = new Client({
- *     baseUrl: "http://127.0.0.1:7878",
- *     auth: { user: "alice", password: "hunter2" },
- *   });
- *   const session = client.session("agent-1");
- *   const result = await session.append({ payload: { role: "user", text: "hello" } });
- *   console.log(result.seq, result.recent.map(e => e.payload));
- *
- * Tenant is derived from the bearer token server-side — no `tenant`
- * param on the client or per-method calls.
- *
- * Auth model:
- *   - Session/subscribe routes: `Authorization: Basic <base64(user:pass)>`
- *     Supply `auth: { user, password }`.
- *   - Channel routes: `Authorization: Bearer <jwt>`
- *     Supply `token` (static JWT) or `getToken` (rotating provider).
- *   - If both `auth` and `token`/`getToken` are supplied the SDK uses
- *     Basic auth for session/subscribe routes and Bearer for channel routes.
- *   - If neither is supplied requests are sent unauthenticated (server
- *     returns 401 when auth is required — intentional, mirrors prod model).
- *
- * Uses Node's built-in `fetch` (Node 20+). Zero runtime deps.
- */
-
 import { BroadcastMessage, parseBroadcastEnvelope } from "./broadcast.js";
 import { AgentDBError, SubscriptionClosed, fromResponse } from "./errors.js";
 import { parseSse } from "./sse.js";
+import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
+
+export type TenantId = string;
+export type AgentId = string;
+export type SessionId = string;
+export type EventId = string;
+export type ArtifactId = string;
+export type RecordId = string;
+export type SkillId = string;
 
 export interface ClientOptions {
-  /** Base URL of the AgentDB server, e.g. `"http://127.0.0.1:7878"`. */
   baseUrl: string;
-  /**
-   * HTTP Basic Auth credentials for session/subscribe routes.
-   * Tenant is derived from the user record server-side.
-   */
   auth?: { user: string; password: string };
-  /**
-   * Static JWT used for channel routes (`broadcast` / `subscribeChannel`).
-   * Mutually exclusive with `getToken`. Use `getToken` for tokens that rotate.
-   */
   token?: string;
-  /**
-   * Token provider for channel bearer auth. Called fresh on every reconnect,
-   * so a server-side `jwt_expired` close is recovered transparently.
-   * May return a string or a Promise. Mutually exclusive with `token`.
-   */
   getToken?: () => string | Promise<string>;
-  /** Per-request timeout in milliseconds. Default 30s. */
   timeoutMs?: number;
-  /** Inject a custom fetch (test mocks, instrumented clients). */
   fetch?: typeof globalThis.fetch;
 }
 
 export interface Event {
+  tenantId: TenantId;
+  agentId: AgentId;
+  sessionId: SessionId;
+  session?: SessionId;
+  eventId: EventId;
   seq: number;
-  tsMs: number;
+  kind: string;
   payload: unknown;
-  actorId?: number;
-  /** Set on events that came from `subscribe()`. Server-populated; read-only. */
-  tenant?: string;
-  /** Set on events that came from `subscribe()`. */
-  session?: string;
-  /** Set on events that came from `subscribe()` (when the server tagged a kind). */
-  kind?: string;
-}
-
-export interface SubscribeOptions {
-  /** Filter by event kind(s). */
-  kind?: string[];
-  /**
-   * Replay from this sequence number first, then transition into
-   * live tail without dropping events. Inclusive lower bound.
-   */
-  fromSeq?: number;
-}
-
-export interface ClientSubscribeOptions extends SubscribeOptions {
-  /** Filter to one or more session ids. */
-  session?: string[];
-  /**
-   * Per-session catch-up cursors for tenant-wide subscribe.
-   * The map key is the session id; the value is a `from_seq`.
-   * Sent as `from_seq_per_session=sid:seq,sid:seq,...`.
-   */
-  fromSeqPerSession?: Record<string, number>;
+  createdAtMs: number;
 }
 
 export interface AppendResult {
+  eventId: EventId;
   seq: number;
   recent: Event[];
 }
 
+export interface WatchItem {
+  cursor: string;
+  event: Event;
+}
+
 export interface AppendOptions {
-  /**
-   * Read back the last N events in the same round trip. 0 (the
-   * default) skips the read-back and `recent` comes back empty —
-   * cheaper for hot writes.
-   */
+  kind?: string;
+  agentId?: AgentId;
+  artifactRefs?: unknown[];
+  sourceRefs?: unknown[];
+  idempotencyKey?: string;
   fetchLastN?: number;
-  /** Optional small int for multi-actor sessions (user vs tool). */
   actorId?: number;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export interface SessionOptions {}
+export interface AppendAndFetchOptions extends AppendOptions {
+  last?: number;
+  maxBytes?: number;
+}
+
+export interface SessionOptions {
+  agentId?: AgentId;
+}
+
+export interface SubscribeOptions {
+  fromSeq?: number;
+  limit?: number;
+}
+
+export interface ClientSubscribeOptions {
+  scope?: "tenant" | "session" | "agent";
+  sessionId?: SessionId;
+  agentId?: AgentId;
+  fromCursor?: string;
+  limit?: number;
+}
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/** An AgentDB connection. Use `client.session(...)` to open a session handle. */
 export class Client {
   readonly baseUrl: string;
   readonly timeoutMs: number;
@@ -136,510 +102,351 @@ export class Client {
     return this._auth !== undefined;
   }
 
-  /** Open a handle to one session. Tenant is derived from auth server-side. */
-  session(sessionId: string, _opts: SessionOptions = {}): Session {
-    return new Session(this, sessionId);
-  }
-
-  /**
-   * Probe `/health/ready`. Returns true on 200, false otherwise.
-   * Useful while waiting on a server that's still bootstrapping
-   * (dev-mode test harnesses, CI smoke tests).
-   */
   async healthReady(): Promise<boolean> {
     try {
-      const resp = await this._rawFetch("GET", "/health/ready");
-      return resp.status === 200;
+      return (await this._rawFetch("GET", "/health/ready")).status === 200;
     } catch {
       return false;
     }
   }
 
-  /**
-   * Tenant-wide event subscription.
-   *
-   * Yields envelopes from `/api/subscribe` — every appended event in the
-   * tenant (derived from the Basic-auth user's record), optionally filtered
-   * by session id and/or kind. AsyncIterable: consume with `for await`.
-   *
-   * On a `jwt_expired` close frame the client transparently refreshes the
-   * token (via `getToken`, if provided) and reconnects with
-   * `fromSeq = lastSeen + 1` so the consumer never sees a gap.
-   * Other terminal frames raise [`SubscriptionClosed`] for the caller to handle.
-   *
-   * Use this for fan-out reactors that watch many sessions; for
-   * single-session tailing, `session.subscribe()` is cheaper.
-   */
-  async *subscribe(opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
-    const path = `/api/subscribe`;
-    yield* this._subscribeImpl({
-      path,
-      session: opts.session,
-      kind: opts.kind,
-      fromSeq: opts.fromSeq,
-      fromSeqPerSession: opts.fromSeqPerSession,
+  async createTenant(externalKey: string, policy: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    return await this._request("POST", "/api/tenants", { external_key: externalKey, policy });
+  }
+
+  async createAgent(
+    tenantId: TenantId,
+    opts: { alias?: string | null; config?: Record<string, unknown> } = {}
+  ): Promise<Record<string, unknown>> {
+    return await this._request("POST", `/api/tenants/${enc(tenantId)}/agents`, {
+      alias: opts.alias ?? null,
+      config: opts.config ?? {},
     });
   }
 
-  /**
-   * Publish an ephemeral broadcast message to a channel.
-   *
-   * Broadcast is **ephemeral** — no durability, no replay, no per-subscriber
-   * acks. Use it for transient signals like typing indicators, cursor
-   * positions, or agent-status pings. If you need durability, use
-   * `Session.append` + `Session.subscribe` on a session instead.
-   *
-   * `channel` must match `^[a-zA-Z0-9._:-]{1,256}$` — the server rejects
-   * malformed names with `channel_name_invalid`. `payload` is any
-   * JSON-serializable value.
-   *
-   * Tenant resolution is server-side via the JWT claim. Resolves on 204.
-   */
-  async broadcast(opts: {
-    channel: string;
-    payload: unknown;
-  }): Promise<void> {
-    const path = `/api/channels/${encodePathSegment(opts.channel)}/publish`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    await this._applyChannelAuthHeaders(headers);
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), this.timeoutMs);
-    let resp: Response;
-    try {
-      resp = await this._fetch(`${this.baseUrl}${path}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(opts.payload),
-        signal: ctl.signal,
-      });
-    } finally {
-      clearTimeout(t);
-    }
-    if (resp.status === 204) return;
-    let body: unknown = null;
-    const text = await resp.text();
-    if (text.length > 0) {
-      try {
-        body = JSON.parse(text);
-      } catch {
-        body = text;
-      }
-    }
-    throw fromResponse(resp.status, body);
-  }
-
-  /**
-   * Subscribe to a channel; yield [`BroadcastMessage`] envelopes.
-   *
-   * Counterpart to [`broadcast`]. AsyncIterable: consume with `for await`.
-   * The generator runs until the caller breaks out of the loop or the server
-   * closes the connection.
-   *
-   * Unlike per-session [`subscribe`], there is **no JWT auto-reconnect on
-   * expiry** — broadcast is ephemeral by design, so loss on disconnect is
-   * acceptable. Callers that need durability use `Session.subscribe()` instead.
-   *
-   * `noEcho: true` asks the server to drop envelopes whose `sender` matches
-   * this subscriber's JWT `sub` claim. Only effective with JWT auth —
-   * Basic-auth publishers emit no `sender` and never match.
-   */
-  async *subscribeChannel(opts: {
-    channel: string;
-    noEcho?: boolean;
-  }): AsyncIterable<BroadcastMessage> {
-    const url = new URL(
-      `${this.baseUrl}/api/channels/${encodePathSegment(opts.channel)}/subscribe`
+  async createSession(
+    tenantId: TenantId,
+    agentId: AgentId,
+    opts: { alias?: string | null } = {}
+  ): Promise<Session> {
+    const data = await this._request(
+      "POST",
+      `/api/tenants/${enc(tenantId)}/agents/${enc(agentId)}/sessions`,
+      { alias: opts.alias ?? null }
     );
-    if (opts.noEcho) {
-      url.searchParams.set("no_echo", "true");
+    return new Session(this, tenantId, String(data.session_id), { agentId: String(data.agent_id) });
+  }
+
+  session(tenantId: TenantId, sessionId?: SessionId, opts: SessionOptions = {}): Session {
+    if (sessionId === undefined) {
+      return new Session(this, tenantId, tenantId, opts);
     }
-    // For SSE channel subscribe: prefer access_token query param for JWT
-    // (avoids EventSource limitation with custom headers); fall back to
-    // Bearer header if no token is available.
+    return new Session(this, tenantId, sessionId, opts);
+  }
+
+  async putArtifact(
+    tenantId: TenantId,
+    data: BodyInit,
+    opts: { contentType?: string; sha256?: string } = {}
+  ): Promise<Record<string, unknown>> {
+    const headers: Record<string, string> = {};
+    if (opts.contentType) headers["Content-Type"] = opts.contentType;
+    if (opts.sha256) headers["X-Sha256"] = opts.sha256;
+    return await this._requestRawJson("POST", `/api/tenants/${enc(tenantId)}/artifacts`, {
+      body: data,
+      headers,
+    });
+  }
+
+  async getArtifact(tenantId: TenantId, artifactId: ArtifactId): Promise<Record<string, unknown>> {
+    return await this._request("GET", `/api/tenants/${enc(tenantId)}/artifacts/${enc(artifactId)}`);
+  }
+
+  async getArtifactBlob(tenantId: TenantId, artifactId: ArtifactId): Promise<ArrayBuffer> {
+    const resp = await this._rawFetch("GET", `/api/tenants/${enc(tenantId)}/artifacts/${enc(artifactId)}/blob`);
+    if (resp.ok) return await resp.arrayBuffer();
+    throw await errorFrom(resp);
+  }
+
+  async writeRecord(tenantId: TenantId, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return await this._request("POST", `/api/tenants/${enc(tenantId)}/records`, body);
+  }
+
+  async searchRecords(tenantId: TenantId, body: Record<string, unknown>): Promise<unknown[]> {
+    const data = await this._request("POST", `/api/tenants/${enc(tenantId)}/records/search`, body);
+    return Array.isArray(data.records) ? data.records : [];
+  }
+
+  async registerSkill(
+    tenantId: TenantId,
+    body: { name: string; version: string; manifest?: Record<string, unknown>; artifactRefs?: unknown[]; idempotencyKey?: string }
+  ): Promise<Record<string, unknown>> {
+    return await this._request("POST", `/api/tenants/${enc(tenantId)}/skills`, {
+      name: body.name,
+      version: body.version,
+      manifest: body.manifest ?? {},
+      artifact_refs: body.artifactRefs ?? [],
+    }, idem(body.idempotencyKey));
+  }
+
+  async bindSkill(
+    tenantId: TenantId,
+    agentId: AgentId,
+    skillId: SkillId,
+    opts: { idempotencyKey?: string } = {}
+  ): Promise<Record<string, unknown>> {
+    return await this._request(
+      "POST",
+      `/api/tenants/${enc(tenantId)}/agents/${enc(agentId)}/skills/bind`,
+      { skill_id: skillId },
+      idem(opts.idempotencyKey)
+    );
+  }
+
+  async watch(tenantId: TenantId, opts: ClientSubscribeOptions = {}): Promise<WatchItem[]> {
+    const url = new URL(`${this.baseUrl}/api/tenants/${enc(tenantId)}/watch`);
+    url.searchParams.set("scope", opts.scope ?? "tenant");
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    if (opts.sessionId) url.searchParams.set("session_id", opts.sessionId);
+    if (opts.agentId) url.searchParams.set("agent_id", opts.agentId);
+    if (opts.fromCursor) url.searchParams.set("from_cursor", opts.fromCursor);
+    const data = await this._requestAbsolute("GET", url);
+    return Array.isArray(data) ? data.map(watchItemFromDict) : [];
+  }
+
+  async *subscribe(_opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
+    throw new Error("tenant-wide streaming requires watch(tenantId, ...) in V2");
+  }
+
+  async broadcast(opts: { channel: string; payload: unknown }): Promise<void> {
+    const resp = await this._rawFetch("POST", `/api/channels/${enc(opts.channel)}/publish`, opts.payload, {}, true);
+    if (resp.status === 204) return;
+    throw await errorFrom(resp);
+  }
+
+  async *subscribeChannel(opts: { channel: string; noEcho?: boolean }): AsyncIterable<BroadcastMessage> {
+    const url = new URL(`${this.baseUrl}/api/channels/${enc(opts.channel)}/subscribe`);
+    if (opts.noEcho) url.searchParams.set("no_echo", "true");
     const token = await this._channelBearerToken();
-    if (token !== undefined) {
-      url.searchParams.set("access_token", token);
-    }
-    const headers: Record<string, string> = { Accept: "text/event-stream" };
-    // SSE is long-lived; no AbortController timeout — the consumer
-    // controls cancellation by breaking out of the `for await`.
-    const resp = await this._fetch(url, { headers });
-    if (!resp.ok) {
-      let body: unknown = null;
-      const text = await resp.text();
-      if (text.length > 0) {
-        try {
-          body = JSON.parse(text);
-        } catch {
-          body = text;
-        }
-      }
-      throw fromResponse(resp.status, body);
-    }
-    if (!resp.body) {
-      throw new AgentDBError("subscribeChannel response has no body", {
-        statusCode: resp.status,
-      });
-    }
+    if (token) url.searchParams.set("access_token", token);
+    const resp = await this._fetch(url, { headers: { Accept: "text/event-stream" } });
+    if (!resp.ok) throw await errorFrom(resp);
+    if (!resp.body) throw new AgentDBError("subscribeChannel response has no body", { statusCode: resp.status });
     const reader = resp.body.getReader();
     try {
       for await (const frame of parseSse(reader)) {
-        // The broadcast stream uses no named event for envelopes; only
-        // `:keepalive` comments (which the parser drops) and the
-        // data frames themselves. Tolerate a `subscribed` ack the
-        // same way as per-session subscribe in case the server adds
-        // one later.
         if (frame.event && frame.event !== "message") continue;
-        if (!frame.data) continue;
-        yield parseBroadcastEnvelope(frame.data);
+        if (frame.data) yield parseBroadcastEnvelope(frame.data);
       }
     } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        /* lock already released on stream close */
-      }
+      try { reader.releaseLock(); } catch {}
     }
   }
 
-  /**
-   * Apply Bearer token auth onto a header map for channel routes.
-   * Channel routes use JWT; if no token is configured the header is left unset
-   * (server returns 401 if auth is required).
-   * @internal
-   */
-  private async _applyChannelAuthHeaders(
-    headers: Record<string, string>
-  ): Promise<void> {
-    const token = await this._channelBearerToken();
-    if (token !== undefined) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-  }
-
-  /** @internal */
-  async _channelBearerToken(): Promise<string | undefined> {
-    if (this._getToken !== undefined) {
-      return await this._getToken();
-    }
-    return this._token;
-  }
-
-  /** @internal */
-  async *_subscribeImpl(args: {
-    path: string;
-    session?: string[];
-    kind?: string[];
-    fromSeq?: number;
-    fromSeqPerSession?: Record<string, number>;
-  }): AsyncGenerator<Event> {
-    let cursor = args.fromSeq;
-    const perSessionCursor: Record<string, number> | undefined =
-      args.fromSeqPerSession ? { ...args.fromSeqPerSession } : undefined;
-    for (;;) {
-      let lastSeen: number | undefined;
-      try {
-        for await (const evt of this._streamOnce({
-          path: args.path,
-          session: args.session,
-          kind: args.kind,
-          fromSeq: cursor,
-          fromSeqPerSession: perSessionCursor,
-        })) {
-          lastSeen = evt.seq;
-          if (perSessionCursor && evt.session) {
-            perSessionCursor[evt.session] = evt.seq;
-          }
-          yield evt;
-        }
-        return; // server closed cleanly
-      } catch (e) {
-        if (
-          e instanceof SubscriptionClosed &&
-          e.errorCode === "jwt_expired" &&
-          (this._getToken !== undefined || this._token !== undefined)
-        ) {
-          const fallback = e.lastSeq ?? lastSeen;
-          if (fallback !== undefined) {
-            cursor = fallback + 1;
-          }
-          continue;
-        }
-        throw e;
-      }
-    }
-  }
-
-  private async *_streamOnce(args: {
-    path: string;
-    session?: string[];
-    kind?: string[];
-    fromSeq?: number;
-    fromSeqPerSession?: Record<string, number>;
-  }): AsyncGenerator<Event> {
-    const url = new URL(`${this.baseUrl}${args.path}`);
-    if (args.fromSeq !== undefined) {
-      url.searchParams.set("from_seq", String(args.fromSeq));
-    }
-    if (args.fromSeqPerSession && Object.keys(args.fromSeqPerSession).length > 0) {
-      const joined = Object.entries(args.fromSeqPerSession)
-        .map(([sid, seq]) => `${sid}:${seq}`)
-        .join(",");
-      url.searchParams.set("from_seq_per_session", joined);
-    }
-    for (const s of args.session ?? []) {
-      url.searchParams.append("session", s);
-    }
-    for (const k of args.kind ?? []) {
-      url.searchParams.append("kind", k);
-    }
-    const headers: Record<string, string> = { Accept: "text/event-stream" };
-    // Session/subscribe routes use Basic auth (tenant derived from user record).
-    if (this._auth) {
-      const t = Buffer.from(
-        `${this._auth.user}:${this._auth.password}`
-      ).toString("base64");
-      headers["Authorization"] = `Basic ${t}`;
-    }
-    // SSE is long-lived; no AbortController timeout — caller
-    // controls cancellation by breaking out of the `for await`.
-    const resp = await this._fetch(url, { headers });
-    if (!resp.ok) {
-      let body: unknown = null;
-      const text = await resp.text();
-      if (text.length > 0) {
-        try {
-          body = JSON.parse(text);
-        } catch {
-          body = text;
-        }
-      }
-      throw fromResponse(resp.status, body);
-    }
-    if (!resp.body) {
-      throw new AgentDBError("subscribe response has no body", {
-        statusCode: resp.status,
-      });
-    }
-    const reader = resp.body.getReader();
-    try {
-      for await (const frame of parseSse(reader)) {
-        if (frame.event === "subscribed") {
-          // Acknowledgement — informational live_seq, no event payload.
-          continue;
-        }
-        if (frame.event === "error") {
-          let body: { error?: string; last_seq?: number } = {};
-          try {
-            body = frame.data ? JSON.parse(frame.data) : {};
-          } catch {
-            // Server should always emit valid JSON; if not, surface
-            // the raw text in the error code so debugging isn't
-            // entirely opaque.
-          }
-          throw new SubscriptionClosed(body.error ?? "unknown", {
-            lastSeq: body.last_seq,
-          });
-        }
-        if (!frame.data) continue;
-        const env = JSON.parse(frame.data) as Record<string, unknown>;
-        const evt: Event = {
-          seq: Number(env.seq),
-          tsMs: Number(env.ts_ms ?? env.ts ?? 0),
-          payload: env.payload,
-        };
-        if (env.tenant !== undefined) evt.tenant = String(env.tenant);
-        if (env.session !== undefined) evt.session = String(env.session);
-        if (env.kind !== undefined && env.kind !== null) {
-          evt.kind = String(env.kind);
-        }
-        if (env.actor_id !== undefined && env.actor_id !== null) {
-          evt.actorId = Number(env.actor_id);
-        }
-        yield evt;
-      }
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        /* lock already released on stream close */
-      }
-    }
-  }
-
-  /** @internal */
-  async _request(method: string, path: string, json?: unknown): Promise<Record<string, unknown>> {
-    const resp = await this._rawFetch(method, path, json);
-    let body: unknown;
+  async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
+    const resp = await this._rawFetch(method, path, json, headers);
+    if (!resp.ok) throw await errorFrom(resp);
     const text = await resp.text();
-    if (text.length === 0) {
-      body = null;
-    } else {
-      try {
-        body = JSON.parse(text);
-      } catch {
-        body = text;
-      }
-    }
-    if (resp.status >= 200 && resp.status < 300) {
-      if (body && typeof body === "object" && !Array.isArray(body)) {
-        return body as Record<string, unknown>;
-      }
-      throw new AgentDBError(
-        `AgentDB returned 2xx with non-JSON body: ${String(body)}`,
-        { statusCode: resp.status, body }
-      );
-    }
-    throw fromResponse(resp.status, body);
+    if (!text) return {};
+    const data = JSON.parse(text) as unknown;
+    if (data && typeof data === "object" && !Array.isArray(data)) return data as Record<string, unknown>;
+    return data as Record<string, unknown>;
   }
 
-  private async _rawFetch(
+  private async _requestAbsolute(method: string, url: URL): Promise<unknown> {
+    const resp = await this._fetch(url, { method, headers: await this._authHeaders() });
+    if (!resp.ok) throw await errorFrom(resp);
+    return JSON.parse(await resp.text());
+  }
+
+  private async _requestRawJson(method: string, path: string, init: { body?: BodyInit; headers?: Record<string, string> }): Promise<Record<string, unknown>> {
+    const resp = await this._rawFetch(method, path, undefined, init.headers ?? {}, false, init.body);
+    if (!resp.ok) throw await errorFrom(resp);
+    return JSON.parse(await resp.text()) as Record<string, unknown>;
+  }
+
+  async _rawFetch(
     method: string,
     path: string,
-    json?: unknown
+    json?: unknown,
+    headers: Record<string, string> = {},
+    channelAuth = false,
+    rawBody?: BodyInit
   ): Promise<Response> {
-    const headers: Record<string, string> = {};
-    // Session routes use Basic auth (tenant derived from user record server-side).
-    if (this._auth) {
-      const token = Buffer.from(
-        `${this._auth.user}:${this._auth.password}`
-      ).toString("base64");
-      headers["Authorization"] = `Basic ${token}`;
-    }
+    const hdrs = { ...headers, ...(await this._authHeaders(channelAuth)) };
+    let body: BodyInit | undefined = rawBody;
     if (json !== undefined) {
-      headers["Content-Type"] = "application/json";
+      hdrs["Content-Type"] = "application/json";
+      body = JSON.stringify(json);
     }
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), this.timeoutMs);
     try {
-      return await this._fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers,
-        body: json !== undefined ? JSON.stringify(json) : undefined,
-        signal: ctl.signal,
-      });
+      return await this._fetch(`${this.baseUrl}${path}`, { method, headers: hdrs, body, signal: ctl.signal });
     } finally {
       clearTimeout(t);
     }
+  }
+
+  async _fetchUrl(input: string | URL, init: RequestInit): Promise<Response> {
+    return await this._fetch(input, init);
+  }
+
+  private async _authHeaders(channelAuth = false): Promise<Record<string, string>> {
+    const headers: Record<string, string> = {};
+    if (channelAuth) {
+      const token = await this._channelBearerToken();
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+    } else if (this._auth) {
+      headers["Authorization"] = `Basic ${Buffer.from(`${this._auth.user}:${this._auth.password}`).toString("base64")}`;
+    }
+    return headers;
+  }
+
+  async _channelBearerToken(): Promise<string | undefined> {
+    if (this._getToken) return await this._getToken();
+    return this._token;
   }
 }
 
-/**
- * A single AgentDB session. Construct via `Client.session(...)`.
- * The session is a thin handle — every method makes one round trip;
- * no client-side event caching. Tenant is derived from auth server-side.
- */
 export class Session {
-  readonly sessionId: string;
+  readonly tenantId: TenantId;
+  readonly sessionId: SessionId;
+  readonly agentId?: AgentId;
   private readonly _client: Client;
 
-  constructor(client: Client, sessionId: string) {
+  constructor(client: Client, tenantId: TenantId, sessionId: SessionId, opts: SessionOptions = {}) {
     this._client = client;
+    this.tenantId = tenantId;
     this.sessionId = sessionId;
+    this.agentId = opts.agentId;
   }
 
-  /**
-   * Append one event and (optionally) read back the last N. The
-   * canonical hot-path primitive; combines the write and the
-   * read-back into one round trip.
-   */
-  async append(event: unknown, opts: AppendOptions = {}): Promise<AppendResult> {
-    const body: Record<string, unknown> = {
-      event,
-      fetch_last_n: opts.fetchLastN ?? 0,
-    };
-    if (opts.actorId !== undefined) {
-      body.actor_id = opts.actorId;
+  async append(payload: unknown, opts: AppendOptions = {}): Promise<AppendResult> {
+    if (opts.fetchLastN && opts.fetchLastN > 0) {
+      return await this.appendAndFetch(payload, { ...opts, last: opts.fetchLastN });
     }
-    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/append_and_fetch`;
-    const d = await this._client._request("POST", path, body);
-    const recent = Array.isArray(d.recent)
-      ? d.recent.map(eventFromDict)
-      : [];
-    return { seq: Number(d.seq), recent };
+    const d = await this._client._request("POST", this.eventsPath(), this.appendBody(payload, opts), idem(opts.idempotencyKey));
+    return { eventId: String(d.event_id), seq: Number(d.seq), recent: [] };
   }
 
-  /**
-   * Stream events for this session via SSE.
-   *
-   * AsyncIterable: consume with `for await`. Use `fromSeq` to replay from a
-   * known cursor; the server transitions from catch-up to live tail without
-   * dropping events. Use `kind` to filter on the server side.
-   *
-   * Reconnect / error semantics mirror [`Client.subscribe`]:
-   * `jwt_expired` is auto-recovered when a token provider is set;
-   * other terminal close frames raise [`SubscriptionClosed`].
-   */
+  async appendAndFetch(payload: unknown, opts: AppendAndFetchOptions = {}): Promise<AppendResult> {
+    const body = { ...this.appendBody(payload, opts), last: opts.last ?? 20, max_bytes: opts.maxBytes ?? 1_000_000 };
+    const d = await this._client._request(
+      "POST",
+      `/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/append-and-fetch`,
+      body,
+      idem(opts.idempotencyKey)
+    );
+    return { eventId: String(d.event_id), seq: Number(d.seq), recent: Array.isArray(d.recent) ? d.recent.map(eventFromDict) : [] };
+  }
+
+  async fetch(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    const url = new URL(`${this._client.baseUrl}${this.eventsPath()}`);
+    url.searchParams.set("from_seq", String(opts.fromSeq ?? 0));
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    const data = await (this._client as unknown as { _requestAbsolute(method: string, url: URL): Promise<unknown> })._requestAbsolute("GET", url);
+    return Array.isArray(data) ? data.map(eventFromDict) : [];
+  }
+
+  async fetchRecent(n: number): Promise<{ recent: Event[] }> {
+    const all = await this.fetch({ fromSeq: 0, limit: 1000 });
+    return { recent: n <= 0 ? [] : all.slice(-n) };
+  }
+
+  async replay(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    const url = new URL(`${this._client.baseUrl}/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/replay`);
+    if (opts.fromSeq !== undefined) url.searchParams.set("from_seq", String(opts.fromSeq));
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    const data = await (this._client as unknown as { _requestAbsolute(method: string, url: URL): Promise<Record<string, unknown>> })._requestAbsolute("GET", url);
+    return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
+  }
+
+  async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<Session> {
+    const body = typeof opts === "string"
+      ? { at_seq: 0, alias: opts }
+      : { at_seq: opts.atSeq, alias: opts.alias ?? null };
+    const d = await this._client._request("POST", `/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/fork`, {
+      ...body,
+    });
+    return new Session(this._client, this.tenantId, String(d.session_id), { agentId: String(d.agent_id) });
+  }
+
   async *subscribe(opts: SubscribeOptions = {}): AsyncIterable<Event> {
-    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/subscribe`;
-    yield* this._client._subscribeImpl({
-      path,
-      kind: opts.kind,
-      fromSeq: opts.fromSeq,
+    const url = new URL(`${this._client.baseUrl}/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/subscribe`);
+    url.searchParams.set("from_seq", String(opts.fromSeq ?? 0));
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    const resp = await this._client._fetchUrl(url, { headers: { Accept: "text/event-stream" } });
+    if (!resp.ok) throw await errorFrom(resp);
+    if (!resp.body) throw new AgentDBError("subscribe response has no body", { statusCode: resp.status });
+    const reader = resp.body.getReader();
+    try {
+      for await (const frame of parseSse(reader)) {
+        if (frame.event === "error") throw new SubscriptionClosed("error");
+        if (frame.data) yield eventFromDict(JSON.parse(frame.data));
+      }
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+  }
+
+  async context(opts: { maxEvents?: number; maxBytes?: number; include?: string[]; recordQuery?: Record<string, unknown> } = {}): Promise<Record<string, unknown>> {
+    return await this._client._request("POST", `/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/context`, {
+      max_events: opts.maxEvents ?? 20,
+      max_bytes: opts.maxBytes ?? 1_000_000,
+      include: opts.include ?? ["recent_events"],
+      record_query: opts.recordQuery,
     });
   }
 
-  /**
-   * Read the last N events on this session WITHOUT writing anything.
-   *
-   * Maps to the server's `POST /api/sessions/{s}/fetch_recent`.
-   * Returns `{ recent: Event[] }` — the same shape as `append({fetchLastN: N})`'s
-   * response, minus the new-event `seq`.
-   *
-   * Use this when you want to load history for context-building (e.g., reducing
-   * an event log to current state). It does NOT pollute the session with `_noop`
-   * sentinel events.
-   */
-  async fetchRecent(n: number): Promise<{ recent: Event[] }> {
-    const path = `/api/sessions/${encodePathSegment(this.sessionId)}/fetch_recent`;
-    const d = await this._client._request("POST", path, { n });
-    const recent = Array.isArray(d.recent)
-      ? d.recent.map(eventFromDict)
-      : [];
-    return { recent };
+  private eventsPath(): string {
+    return `/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/events`;
   }
 
-  /**
-   * Fork this session into a child that inherits the parent's events at fork
-   * time, MVCC-backed. Returns a `Session` handle for the new id.
-   */
-  async fork(childSessionId: string): Promise<Session> {
-    const body: Record<string, unknown> = {
-      new_session_id: childSessionId,
+  private appendBody(payload: unknown, opts: AppendOptions): Record<string, unknown> {
+    const agentId = opts.agentId ?? this.agentId;
+    if (!agentId) throw new Error("agentId is required for append");
+    return {
+      agent_id: agentId,
+      kind: opts.kind ?? "message",
+      payload,
+      artifact_refs: opts.artifactRefs ?? [],
+      source_refs: opts.sourceRefs ?? [],
     };
-    await this._client._request(
-      "POST",
-      `/api/sessions/${encodePathSegment(this.sessionId)}/fork`,
-      body
-    );
-    return new Session(this._client, childSessionId);
-  }
-
-  toString(): string {
-    return `Session(id=${JSON.stringify(this.sessionId)})`;
   }
 }
 
 function eventFromDict(d: unknown): Event {
-  if (!d || typeof d !== "object") {
-    throw new Error(`Expected event object, got ${typeof d}`);
-  }
   const rec = d as Record<string, unknown>;
-  const seq = Number(rec.seq);
-  const tsMs = Number(rec.ts_ms ?? rec.ts ?? 0);
-  const ev: Event = { seq, tsMs, payload: rec.payload };
-  if (rec.actor_id !== undefined && rec.actor_id !== null) {
-    ev.actorId = Number(rec.actor_id);
-  }
-  return ev;
+  return {
+    tenantId: String(rec.tenant_id),
+    agentId: String(rec.agent_id),
+    sessionId: String(rec.session_id),
+    session: String(rec.session_id),
+    eventId: String(rec.event_id),
+    seq: Number(rec.seq),
+    kind: String(rec.kind),
+    payload: rec.payload,
+    createdAtMs: Number(rec.created_at_ms ?? 0),
+  };
 }
 
-function encodePathSegment(s: string): string {
-  // Match the Python SDK's safe set: keep ASCII letters/digits and
-  // `-_.~` raw, percent-escape everything else.
-  return encodeURIComponent(s).replace(/['()*]/g, (c) => {
-    return "%" + c.charCodeAt(0).toString(16).toUpperCase();
-  });
+function watchItemFromDict(d: unknown): WatchItem {
+  const rec = d as Record<string, unknown>;
+  return { cursor: String(rec.cursor), event: eventFromDict(rec.event) };
+}
+
+function enc(s: string): string {
+  return encodeURIComponent(s).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function idem(key?: string): Record<string, string> {
+  return { "Idempotency-Key": key ?? randomUUID() };
+}
+
+async function errorFrom(resp: Response): Promise<AgentDBError> {
+  const text = await resp.text();
+  let body: unknown = text;
+  try { body = text ? JSON.parse(text) : null; } catch {}
+  return fromResponse(resp.status, body);
 }

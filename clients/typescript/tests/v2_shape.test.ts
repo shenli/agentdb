@@ -1,154 +1,70 @@
-/**
- * Compile-time and runtime assertions for the v2 Client shape.
- *
- * Verifies:
- * - `tenant` is no longer a valid constructor arg (compile-time, via @ts-expect-error)
- * - URLs use v2 shapes (/api/sessions/{s}/..., /api/subscribe, /api/channels/{c}/...)
- * - No /api/tenants/ prefix appears in any URL
- *
- * Uses the same node:test runner as the rest of the SDK test suite.
- * The `fetch` injection in ClientOptions lets us assert URL shapes
- * without spinning up a server.
- */
-
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { Client } from "../src/index.js";
 
-test("constructor takes baseUrl + auth, no tenant field", () => {
-  // @ts-expect-error — `tenant` must not be a valid constructor option
-  const _bad = new Client({ baseUrl: "http://localhost", tenant: "x" });
-  // Suppress unused-variable warning at runtime
-  void _bad;
-});
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
-test("constructor accepts auth: { user, password }", () => {
-  const c = new Client({ baseUrl: "http://localhost", auth: { user: "u", password: "p" } });
-  assert.ok(c);
-  assert.equal(c.authenticated, true);
-});
-
-test("constructor accepts token (JWT) for channel routes", () => {
-  const c = new Client({ baseUrl: "http://localhost", token: "jwt.tok.en" });
-  assert.ok(c);
-  assert.equal(c.authenticated, false); // Basic auth absent
-});
-
-test("append posts to /api/sessions/{s}/append_and_fetch", async () => {
+test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   const calls: string[] = [];
   const mockFetch = async (url: string | URL) => {
-    calls.push(String(url));
-    return new Response(JSON.stringify({ seq: 1, recent: [] }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    const raw = String(url);
+    calls.push(raw);
+    if (raw.endsWith("/api/tenants")) return json({ tenant_id: "ten_1" });
+    if (raw.endsWith("/agents")) return json({ agent_id: "agt_1" });
+    if (raw.endsWith("/sessions")) return json({ session_id: "ses_1", agent_id: "agt_1" });
+    if (raw.endsWith("/events")) return json({ event_id: "evt_1", seq: 0 });
+    if (raw.endsWith("/append-and-fetch")) return json({ event_id: "evt_2", seq: 1, recent: [] });
+    if (raw.endsWith("/fork")) return json({ session_id: "ses_child", agent_id: "agt_1" });
+    if (raw.includes("/replay")) return json({ events: [] });
+    if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
+    if (raw.includes("/watch")) return json([]);
+    if (raw.endsWith("/artifacts")) return json({ artifact_id: "art_1" });
+    if (raw.endsWith("/records/search")) return json({ records: [] });
+    if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
+    if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
+    if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
+    return json({});
   };
-  const c = new Client({
-    baseUrl: "http://x",
-    auth: { user: "u", password: "p" },
-    fetch: mockFetch as typeof globalThis.fetch,
-  });
-  await c.session("s1").append({ payload: { hello: "world" } });
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0]!.includes("/api/sessions/s1/append_and_fetch"), `unexpected URL: ${calls[0]}`);
-  assert.ok(!calls[0]!.includes("/api/tenants/"), `URL must not contain /api/tenants/: ${calls[0]}`);
+
+  const c = new Client({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const tenant = await c.createTenant("acme");
+  const agent = await c.createAgent(String(tenant.tenant_id));
+  const session = await c.createSession(String(tenant.tenant_id), String(agent.agent_id));
+  await session.append({ hello: "world" });
+  await session.appendAndFetch({ hello: "again" });
+  await session.fork({ atSeq: 0, alias: "branch" });
+  await session.replay();
+  await session.context({ include: ["recent_events", "records"] });
+  await c.watch(String(tenant.tenant_id));
+  await c.putArtifact(String(tenant.tenant_id), new Blob(["blob"]));
+  await c.writeRecord(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
+  await c.searchRecords(String(tenant.tenant_id), { namespace: ["mem"], text: "x" });
+  const skill = await c.registerSkill(String(tenant.tenant_id), { name: "tool", version: "1" });
+  await c.bindSkill(String(tenant.tenant_id), String(agent.agent_id), String(skill.skill_id));
+
+  assert.ok(calls.some((url) => url.includes("/api/tenants/ten_1/agents")));
+  assert.ok(calls.some((url) => url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
+  assert.ok(calls.some((url) => url.includes("/append-and-fetch")));
+  assert.ok(calls.some((url) => url.includes("/fork")));
+  assert.ok(calls.some((url) => url.includes("/replay")));
+  assert.ok(calls.some((url) => url.includes("/context")));
+  assert.ok(calls.some((url) => url.includes("/watch")));
 });
 
-test("fetchRecent posts to /api/sessions/{s}/fetch_recent", async () => {
-  const calls: string[] = [];
-  const mockFetch = async (url: string | URL) => {
-    calls.push(String(url));
-    return new Response(JSON.stringify({ recent: [] }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  };
-  const c = new Client({
-    baseUrl: "http://x",
-    auth: { user: "u", password: "p" },
-    fetch: mockFetch as typeof globalThis.fetch,
-  });
-  await c.session("sess-abc").fetchRecent(5);
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0]!.includes("/api/sessions/sess-abc/fetch_recent"), `unexpected URL: ${calls[0]}`);
-  assert.ok(!calls[0]!.includes("/api/tenants/"), `URL must not contain /api/tenants/: ${calls[0]}`);
+test("append requires an agent id", async () => {
+  const c = new Client({ baseUrl: "http://x", fetch: (async () => json({})) as typeof globalThis.fetch });
+  await assert.rejects(() => c.session("ten_1", "ses_1").append({ x: 1 }), /agentId/);
 });
 
-test("session.subscribe targets /api/sessions/{s}/subscribe", async () => {
-  // We verify the URL by consuming one iteration of the subscribe generator
-  // against a mock fetch that returns an immediately-closing SSE stream.
-  const calls: string[] = [];
-  const mockFetch = async (url: string | URL) => {
-    calls.push(String(url));
-    // Return a minimal SSE stream that closes immediately (no frames).
-    const body = new ReadableStream({
-      start(controller) {
-        controller.close();
-      },
-    });
-    return new Response(body, {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    });
-  };
-  const c = new Client({
-    baseUrl: "http://x",
-    auth: { user: "u", password: "p" },
-    fetch: mockFetch as typeof globalThis.fetch,
-  });
-  // Consume the subscribe iterable — the mock stream closes immediately so
-  // the for-await loop exits after one fetch round trip.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  for await (const _evt of c.session("my-session").subscribe()) {
-    // no events since the stream closes immediately
-  }
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0]!.includes("/api/sessions/my-session/subscribe"), `unexpected URL: ${calls[0]}`);
-  assert.ok(!calls[0]!.includes("/api/tenants/"), `URL must not contain /api/tenants/: ${calls[0]}`);
-});
-
-test("client.subscribe targets /api/subscribe (tenant-wide)", async () => {
-  const calls: string[] = [];
-  const mockFetch = async (url: string | URL) => {
-    calls.push(String(url));
-    const body = new ReadableStream({
-      start(controller) {
-        controller.close();
-      },
-    });
-    return new Response(body, {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    });
-  };
-  const c = new Client({
-    baseUrl: "http://x",
-    auth: { user: "u", password: "p" },
-    fetch: mockFetch as typeof globalThis.fetch,
-  });
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  for await (const _evt of c.subscribe()) {
-    // no events since the stream closes immediately
-  }
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0]!.includes("/api/subscribe"), `unexpected URL: ${calls[0]}`);
-  assert.ok(!calls[0]!.includes("/api/tenants/"), `URL must not contain /api/tenants/: ${calls[0]}`);
-});
-
-test("broadcast posts to /api/channels/{c}/publish", async () => {
-  const calls: string[] = [];
-  const mockFetch = async (url: string | URL) => {
-    calls.push(String(url));
-    return new Response(null, { status: 204 });
-  };
-  const c = new Client({
-    baseUrl: "http://x",
-    token: "jwt",
-    fetch: mockFetch as typeof globalThis.fetch,
-  });
-  await c.broadcast({ channel: "my-chan", payload: { x: 1 } });
-  assert.equal(calls.length, 1);
-  assert.ok(calls[0]!.includes("/api/channels/my-chan/publish"), `unexpected URL: ${calls[0]}`);
-  assert.ok(!calls[0]!.includes("/api/tenants/"), `URL must not contain /api/tenants/: ${calls[0]}`);
+test("constructor rejects token + getToken combined", () => {
+  assert.throws(
+    () => new Client({ baseUrl: "http://x", token: "x", getToken: () => "y" }),
+    /token.*getToken/
+  );
 });
