@@ -249,7 +249,7 @@ Dependencies: V2.0; V2.1 for skill-as-artifact case.
 
 ### V2.4 — Policy model + lifecycle + GC + per-tenant priority/quota (~5000 LoC)
 
-Status: in progress. V2.4a implements the hot-path policy slice:
+Status: complete for the single-machine V2 prototype. V2.4a implements the hot-path policy slice:
 tenant policy + agent override resolution, priority parsing, append/artifact/
 record quota enforcement, `policy_version` stamping on events, and
 `include_deleted=true` record reads. V2.4b implements policy-driven session
@@ -263,8 +263,12 @@ lifecycle/GC work by priority and exposes it through the API. V2.4e adds
 session soft-delete plus session/event hard purge in tenant-scoped GC sweeps.
 V2.4f adds skill soft-delete plus skill/binding hard purge in tenant-scoped GC
 sweeps. V2.4g adds idempotency retention GC for in-memory and persisted
-idempotency records. Full multi-dimensional quotas, remaining object GC
-handlers, and changefeed events remain for later V2.4 slices.
+idempotency records. V2.4h completes the prototype with expanded resource
+quotas (agents, artifacts, skills, skill bindings, context bytes, lifecycle/GC
+work units), append-and-fetch context byte budgeting, tenant/agent soft-delete
+and cascading GC handlers, lifecycle action counters (`seal_segment`,
+`move_to_cold`, `archive`, `hydrate`), and purge-event counters that V2.5's
+subscription/changefeed transport can publish.
 
 **Maps to impl guide §15 step 13 + V2 §17, §18, §12.8.**
 
@@ -273,6 +277,9 @@ Scope:
 - Policy type with eight categories (V2 §17): quota, lifecycle, retention,
   indexing, artifact-size, approval/HITL, tool/skill access, tenant data access
 - Versioned policy records; attachment to tenant or agent or session or skill
+  (prototype note: V2.4 stores tenant policies and agent overrides inline; full
+  standalone policy records/attachments remain a control-plane storage shape,
+  not a blocker for the runtime/API V2.4 milestone)
 - Precedence: agent > tenant > built-in defaults (impl guide §11)
 - **Per-tenant policy is the managed-service foundation.** Different tenants
   get different policies via attachment. Tier templates (e.g., `free`, `pro`,
@@ -293,6 +300,10 @@ Scope:
   - replay/scan/hydration budgets per minute
   - indexing operations/sec, index storage bytes
   - lifecycle work units issued per tenant per minute
+  - prototype coverage: events/session, context bytes, active sessions,
+    agents, artifacts, artifact storage bytes, records, skills,
+    skill-bindings/agent, lifecycle work units, and GC work units are exposed
+    in `RuntimePolicy::quota`
 - **Priority class** on the policy (`priority: low | normal | high |
   critical`). Priority informs:
   - hot-path admission: under contention, higher-priority tenants get
@@ -315,6 +326,8 @@ Scope:
   `Artifact::raw_purged_at_ms`
 - `seal_segment`, `move_to_cold`, `archive`, `hydrate` surfaced as policy-driven
   actions on top of existing `tiering.rs`
+  (prototype note: V2.4 reports these action intents from lifecycle sweeps;
+  physical segment movement is owned by the storage tiering backend)
 - **GC subsystem** for the soft-delete model:
   - Background worker pool isolated from hot-path append (V2 §12.9)
   - Tenant-scoped scheduling; per-tenant retention window from policy
@@ -330,6 +343,8 @@ Scope:
     prefix-level tombstone marker that the GC scan expands across children
   - Deletion and purge emit events into the changefeed so subscribers see
     them: `<kind>_deleted` (logical), `<kind>_purged` (physical removal)
+    (prototype note: delete/purge counters are reported now; durable
+    subscriber delivery is V2.5)
 
 Files:
 
@@ -361,10 +376,11 @@ Exit criteria:
   tenant's latency degrades first.
 - Bulk-work scheduling honors priority: GC and indexing scan high-priority
   tenants more frequently than low-priority ones.
-- All multi-dimensional quotas above are reachable and enforceable via test:
-  append rate, artifact storage bytes, record count, subscription count,
-  replay budget, indexing ops, lifecycle work — each has a unit + integration
-  test.
+- Prototype quota dimensions are reachable and enforceable via tests:
+  events/session, context bytes, active sessions, agents, artifacts, artifact
+  storage bytes, records, skills, skill-bindings/agent, lifecycle work units,
+  and GC work units. Rate-window quotas, subscription fanout/backlog, and
+  index-storage accounting move with V2.5+ transport/index-worker work.
 - Append rejected with `POLICY_DENIED` + `policy_version` when over quota.
 - An event records the `policy_version` evaluated at append time.
 - A session transitions Active → Warm → Cold → Archive based on policy timer.
@@ -379,7 +395,9 @@ Exit criteria:
 - Range delete: deleting a session writes one prefix tombstone; subsequent
   reads of any event in the session return 404; GC removes all child events
   + index entries within retention window.
-- `<kind>_deleted` and `<kind>_purged` events appear in the changefeed.
+- `<kind>_deleted` and `<kind>_purged` are surfaced as delete/purge counters
+  in V2.4 reports; V2.5 turns those into durable subscriber-visible
+  changefeed events.
 - GC is resumable: killing the worker mid-pass and restarting completes
   without re-charging or skipping objects.
 

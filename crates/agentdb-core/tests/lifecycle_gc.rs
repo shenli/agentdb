@@ -66,6 +66,8 @@ async fn session_lifecycle_transitions_from_policy() {
         .await
         .unwrap();
     assert_eq!(report.sessions_transitioned, 1);
+    assert_eq!(report.seal_segment_actions, 1);
+    assert_eq!(report.move_to_cold_actions, 1);
     let cold = rt
         .get_session(&tenant.tenant_id, &session.session_id)
         .await
@@ -78,6 +80,7 @@ async fn session_lifecycle_transitions_from_policy() {
         .await
         .unwrap();
     assert_eq!(report.sessions_transitioned, 1);
+    assert_eq!(report.archive_actions, 1);
     let archived = rt
         .get_session(&tenant.tenant_id, &session.session_id)
         .await
@@ -391,5 +394,191 @@ async fn session_delete_blocks_reads_and_gc_purges_events() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn agent_soft_delete_gc_cascades_sessions_and_bindings() {
+    let rt = Runtime::in_memory();
+    let tenant = tenant_with_policy(
+        &rt,
+        "agent-gc",
+        serde_json::json!({"retention": {"retention_ms": 0}}),
+    )
+    .await;
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: Some("worker".into()),
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "x",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    let skill = rt
+        .register_skill(
+            agentdb_core::NewSkill {
+                tenant_id: tenant.tenant_id.clone(),
+                name: "tool".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    rt.bind_skill(agentdb_core::BindSkillRequest {
+        tenant_id: tenant.tenant_id.clone(),
+        agent_id: agent.agent_id.clone(),
+        skill_id: skill.skill_id,
+        idempotency_key: None,
+    })
+    .await
+    .unwrap();
+
+    rt.delete_agent(&tenant.tenant_id, &agent.agent_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.get_agent(&tenant.tenant_id, &agent.agent_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AgentNotFound
+    );
+
+    let report = rt.gc_sweep_at(u64::MAX).await.unwrap();
+    assert_eq!(report.agents_purged, 1);
+    assert_eq!(report.sessions_purged, 1);
+    assert_eq!(report.events_purged, 1);
+    assert_eq!(report.skill_bindings_purged, 1);
+    assert_eq!(report.changefeed_purge_events, 2);
+}
+
+#[tokio::test]
+async fn tenant_soft_delete_gc_expands_to_children_then_tenant() {
+    let rt = Runtime::in_memory();
+    let tenant = tenant_with_policy(
+        &rt,
+        "tenant-gc",
+        serde_json::json!({"retention": {"retention_ms": 0}}),
+    )
+    .await;
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "x",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    let record = rt
+        .write_record(new_record(&tenant, "tenant record"))
+        .await
+        .unwrap();
+    let artifact = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: tenant.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"tenant artifact".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    rt.delete_tenant(&tenant.tenant_id).await.unwrap();
+    assert_eq!(
+        rt.get_agent(&tenant.tenant_id, &agent.agent_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AgentNotFound
+    );
+    assert_eq!(
+        rt.fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::SessionNotFound
+    );
+    assert_eq!(
+        rt.get_record_with_options(&tenant.tenant_id, &record.record_id, true)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecordNotFound
+    );
+    assert_eq!(
+        rt.get_artifact(&tenant.tenant_id, &artifact.artifact_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ArtifactNotFound
+    );
+    let report = rt.gc_sweep_at(u64::MAX).await.unwrap();
+    assert_eq!(report.tenants_purged, 1);
+    assert_eq!(report.agents_purged, 1);
+    assert_eq!(report.sessions_purged, 1);
+    assert_eq!(report.events_purged, 1);
+    assert_eq!(report.records_purged, 1);
+    assert_eq!(report.artifacts_purged, 1);
+    assert_eq!(
+        rt.get_tenant(&tenant.tenant_id).await.unwrap_err().code,
+        ErrorCode::TenantNotFound
+    );
+    assert_eq!(
+        rt.get_record_with_options(&tenant.tenant_id, &record.record_id, true)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecordNotFound
+    );
+    assert_eq!(
+        rt.get_artifact(&tenant.tenant_id, &artifact.artifact_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ArtifactNotFound
     );
 }

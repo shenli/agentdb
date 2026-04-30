@@ -47,9 +47,15 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/tenants", post(create_tenant))
-        .route("/api/tenants/:tenant_id", get(get_tenant))
+        .route(
+            "/api/tenants/:tenant_id",
+            get(get_tenant).delete(delete_tenant),
+        )
         .route("/api/tenants/:tenant_id/agents", post(create_agent))
-        .route("/api/tenants/:tenant_id/agents/:agent_id", get(get_agent))
+        .route(
+            "/api/tenants/:tenant_id/agents/:agent_id",
+            get(get_agent).delete(delete_agent),
+        )
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id/sessions",
             post(create_session),
@@ -148,6 +154,19 @@ async fn get_tenant(
     Ok(Json(s.runtime.get_tenant(&tid).await?))
 }
 
+async fn delete_tenant(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    s.runtime.delete_tenant(&tid).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_agent(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -184,6 +203,24 @@ async fn get_agent(
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
     Ok(Json(s.runtime.get_agent(&tid, &aid).await?))
+}
+
+async fn delete_agent(
+    State(s): State<AppState>,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let aid = parse_id_or(
+        &agent_id,
+        IdKind::Agent,
+        agentdb_core::ErrorCode::AgentNotFound,
+    )?;
+    s.runtime.delete_agent(&tid, &aid).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_session(

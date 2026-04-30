@@ -3,7 +3,7 @@ use agentdb_core::errors::ErrorCode;
 use agentdb_core::policy::{Priority, RuntimePolicy};
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, Runtime};
-use agentdb_core::{NewAgent, NewSession, NewTenant};
+use agentdb_core::{BindSkillRequest, NewAgent, NewSession, NewSkill, NewTenant};
 
 #[tokio::test]
 async fn tenant_policy_enforces_append_quota_and_stamps_version() {
@@ -380,4 +380,201 @@ async fn artifact_storage_quota_enforces_hard_limit_and_reports_soft_limit() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::PolicyDenied);
+}
+
+#[tokio::test]
+async fn expanded_resource_quotas_are_enforced_and_reported() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "expanded-quotas".into(),
+            policy: serde_json::json!({
+                "quota": {
+                    "soft_max_agents": 1,
+                    "max_agents": 1,
+                    "soft_max_artifacts": 1,
+                    "max_artifacts": 1,
+                    "soft_max_skills": 1,
+                    "max_skills": 2,
+                    "soft_max_skill_bindings_per_agent": 1,
+                    "max_skill_bindings_per_agent": 1
+                }
+            }),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::PolicyDenied
+    );
+
+    rt.create_artifact(
+        NewArtifact {
+            tenant_id: t.tenant_id.clone(),
+            content_type: None,
+            expected_sha256: None,
+        },
+        b"one".to_vec(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rt.create_artifact(
+            NewArtifact {
+                tenant_id: t.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"two".to_vec(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::PolicyDenied
+    );
+
+    let first_skill = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: t.tenant_id.clone(),
+                name: "tool-a".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let second_skill = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: t.tenant_id.clone(),
+                name: "tool-b".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    rt.bind_skill(BindSkillRequest {
+        tenant_id: t.tenant_id.clone(),
+        agent_id: a.agent_id.clone(),
+        skill_id: first_skill.skill_id,
+        idempotency_key: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rt.bind_skill(BindSkillRequest {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            skill_id: second_skill.skill_id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::PolicyDenied
+    );
+
+    let tenant_report = rt.backpressure_for_tenant(&t.tenant_id).await.unwrap();
+    assert_eq!(
+        tenant_report.header_value().as_deref(),
+        Some("agents=100,artifacts=100,skills=200")
+    );
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    let session_report = rt
+        .backpressure_for_session(&t.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        session_report.header_value().as_deref(),
+        Some("skill_bindings=100")
+    );
+}
+
+#[tokio::test]
+async fn append_and_fetch_enforces_and_applies_context_byte_budget() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "context-budget".into(),
+            policy: serde_json::json!({
+                "quota": {"max_context_bytes": 2_000}
+            }),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rt.append_and_fetch(
+            AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"msg": "too big"})),
+            10,
+            2_001,
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::PolicyDenied
+    );
+
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({"msg": "older"}),
+    ))
+    .await
+    .unwrap();
+    let response = rt
+        .append_and_fetch(
+            AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"msg": "newer"})),
+            10,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(response.recent.is_empty());
 }

@@ -24,8 +24,12 @@ Implementation checkpoint:
   GC sweeps.
 - V2.4g adds idempotency retention GC for in-memory and persisted idempotency
   records.
-- Current next milestone: fuller quota dimensions, remaining GC handlers, and
-  changefeed delete/purge events.
+- V2.4h completes the single-machine V2.4 prototype with expanded quota
+  dimensions, context byte budgeting, tenant/agent soft-delete plus cascading
+  GC, lifecycle/tier action counters, and purge-event counters for the future
+  changefeed transport.
+- Current next milestone: V2.5 subscription/changefeed transport and context
+  packs on top of the V2.4 lifecycle/policy foundation.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

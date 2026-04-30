@@ -29,17 +29,45 @@ pub struct QuotaPolicy {
     #[serde(default)]
     pub max_events_per_session: Option<u64>,
     #[serde(default)]
+    pub soft_max_context_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_context_bytes: Option<usize>,
+    #[serde(default)]
     pub soft_max_active_sessions: Option<usize>,
     #[serde(default)]
     pub max_active_sessions: Option<usize>,
+    #[serde(default)]
+    pub soft_max_agents: Option<usize>,
+    #[serde(default)]
+    pub max_agents: Option<usize>,
     #[serde(default)]
     pub soft_max_records: Option<usize>,
     #[serde(default)]
     pub max_records: Option<usize>,
     #[serde(default)]
+    pub soft_max_artifacts: Option<usize>,
+    #[serde(default)]
+    pub max_artifacts: Option<usize>,
+    #[serde(default)]
     pub soft_max_artifact_storage_bytes: Option<u64>,
     #[serde(default)]
     pub max_artifact_storage_bytes: Option<u64>,
+    #[serde(default)]
+    pub soft_max_skills: Option<usize>,
+    #[serde(default)]
+    pub max_skills: Option<usize>,
+    #[serde(default)]
+    pub soft_max_skill_bindings_per_agent: Option<usize>,
+    #[serde(default)]
+    pub max_skill_bindings_per_agent: Option<usize>,
+    #[serde(default)]
+    pub soft_max_lifecycle_work_per_sweep: Option<usize>,
+    #[serde(default)]
+    pub max_lifecycle_work_per_sweep: Option<usize>,
+    #[serde(default)]
+    pub soft_max_gc_work_per_sweep: Option<usize>,
+    #[serde(default)]
+    pub max_gc_work_per_sweep: Option<usize>,
 }
 
 impl Default for QuotaPolicy {
@@ -47,12 +75,26 @@ impl Default for QuotaPolicy {
         Self {
             soft_max_events_per_session: None,
             max_events_per_session: None,
+            soft_max_context_bytes: None,
+            max_context_bytes: None,
             soft_max_active_sessions: None,
             max_active_sessions: None,
+            soft_max_agents: None,
+            max_agents: None,
             soft_max_records: None,
             max_records: None,
+            soft_max_artifacts: None,
+            max_artifacts: None,
             soft_max_artifact_storage_bytes: None,
             max_artifact_storage_bytes: None,
+            soft_max_skills: None,
+            max_skills: None,
+            soft_max_skill_bindings_per_agent: None,
+            max_skill_bindings_per_agent: None,
+            soft_max_lifecycle_work_per_sweep: None,
+            max_lifecycle_work_per_sweep: None,
+            soft_max_gc_work_per_sweep: None,
+            max_gc_work_per_sweep: None,
         }
     }
 }
@@ -178,12 +220,26 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: Some(80),
                 max_events_per_session: Some(100),
+                soft_max_context_bytes: Some(512 * 1024),
+                max_context_bytes: Some(1024 * 1024),
                 soft_max_active_sessions: Some(8),
                 max_active_sessions: Some(10),
+                soft_max_agents: Some(8),
+                max_agents: Some(10),
                 soft_max_records: Some(80),
                 max_records: Some(100),
+                soft_max_artifacts: Some(80),
+                max_artifacts: Some(100),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024),
                 max_artifact_storage_bytes: Some(10 * 1024 * 1024),
+                soft_max_skills: Some(40),
+                max_skills: Some(50),
+                soft_max_skill_bindings_per_agent: Some(40),
+                max_skill_bindings_per_agent: Some(50),
+                soft_max_lifecycle_work_per_sweep: Some(80),
+                max_lifecycle_work_per_sweep: Some(100),
+                soft_max_gc_work_per_sweep: Some(80),
+                max_gc_work_per_sweep: Some(100),
             },
             artifact_size: ArtifactSizePolicy {
                 max_inline_event_bytes: 32 * 1024,
@@ -203,12 +259,26 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: Some(8_000),
                 max_events_per_session: Some(10_000),
+                soft_max_context_bytes: Some(8 * 1024 * 1024),
+                max_context_bytes: Some(10 * 1024 * 1024),
                 soft_max_active_sessions: Some(800),
                 max_active_sessions: Some(1_000),
+                soft_max_agents: Some(800),
+                max_agents: Some(1_000),
                 soft_max_records: Some(8_000),
                 max_records: Some(10_000),
+                soft_max_artifacts: Some(8_000),
+                max_artifacts: Some(10_000),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024 * 1024),
                 max_artifact_storage_bytes: Some(10 * 1024 * 1024 * 1024),
+                soft_max_skills: Some(800),
+                max_skills: Some(1_000),
+                soft_max_skill_bindings_per_agent: Some(800),
+                max_skill_bindings_per_agent: Some(1_000),
+                soft_max_lifecycle_work_per_sweep: Some(8_000),
+                max_lifecycle_work_per_sweep: Some(10_000),
+                soft_max_gc_work_per_sweep: Some(8_000),
+                max_gc_work_per_sweep: Some(10_000),
             },
             artifact_size: ArtifactSizePolicy::default(),
             retention: RetentionPolicy::default(),
@@ -225,12 +295,26 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: None,
                 max_events_per_session: None,
+                soft_max_context_bytes: None,
+                max_context_bytes: None,
                 soft_max_active_sessions: None,
                 max_active_sessions: None,
+                soft_max_agents: None,
+                max_agents: None,
                 soft_max_records: None,
                 max_records: None,
+                soft_max_artifacts: None,
+                max_artifacts: None,
                 soft_max_artifact_storage_bytes: None,
                 max_artifact_storage_bytes: None,
+                soft_max_skills: None,
+                max_skills: None,
+                soft_max_skill_bindings_per_agent: None,
+                max_skill_bindings_per_agent: None,
+                soft_max_lifecycle_work_per_sweep: None,
+                max_lifecycle_work_per_sweep: None,
+                soft_max_gc_work_per_sweep: None,
+                max_gc_work_per_sweep: None,
             },
             artifact_size: ArtifactSizePolicy {
                 max_inline_event_bytes: 256 * 1024,
