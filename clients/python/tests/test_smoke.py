@@ -20,7 +20,13 @@ from agentdb import (
     BadRequest,
     Client,
     NotFound,
+    SessionEventKind,
     Session,
+    agent_status,
+    model_message,
+    tool_call,
+    tool_result,
+    user_message,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -135,16 +141,12 @@ def test_harness_recovers_session_from_ids(server):
     session = first_client.create_session(tenant_id, agent_id, alias="agent-smoke-recovery")
 
     session.append(
-        {"role": "user", "text": "summarize the sandbox output"},
-        kind="user_message",
+        user_message("summarize the sandbox output"),
+        kind=SessionEventKind.USER_MESSAGE.value,
     )
     call = session.append(
-        {
-            "tool_call_id": "call_1",
-            "tool": "sandbox.exec",
-            "input": {"cmd": "python report.py"},
-        },
-        kind="tool_call",
+        tool_call("call_1", "sandbox.exec", {"cmd": "python report.py"}),
+        kind=SessionEventKind.TOOL_CALL.value,
     )
     artifact = first_client.put_artifact(
         tenant_id,
@@ -152,12 +154,8 @@ def test_harness_recovers_session_from_ids(server):
         content_type="text/plain",
     )
     session.append(
-        {
-            "tool_call_id": "call_1",
-            "status": "ok",
-            "summary": "Generated report with two lines.",
-        },
-        kind="tool_result",
+        tool_result("call_1", "Generated report with two lines."),
+        kind=SessionEventKind.TOOL_RESULT.value,
         artifact_refs=[
             {
                 "artifact_id": artifact["artifact_id"],
@@ -169,8 +167,8 @@ def test_harness_recovers_session_from_ids(server):
         source_refs=[{"event_id": call.event_id}],
     )
     session.append(
-        {"role": "assistant", "text": "The report has two generated lines."},
-        kind="model_message",
+        model_message("The report has two generated lines."),
+        kind=SessionEventKind.MODEL_MESSAGE.value,
     )
     context = session.context(include=["recent_events"], max_events=10)
     assert context.get("events"), "context should include recent events"
@@ -189,11 +187,8 @@ def test_harness_recovers_session_from_ids(server):
     ]
 
     resumed = recovered.append(
-        {
-            "status": "recovered",
-            "last_seen_seq": last_seq_before_crash,
-        },
-        kind="agent_status",
+        agent_status("recovered", last_seen_seq=last_seq_before_crash),
+        kind=SessionEventKind.AGENT_STATUS.value,
     )
     assert resumed.seq == last_seq_before_crash + 1
 

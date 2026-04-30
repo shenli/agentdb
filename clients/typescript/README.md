@@ -61,7 +61,7 @@ harness should keep the tenant, agent, session, and last-seen sequence IDs, then
 rebuild a session handle and continue from durable history:
 
 ```ts
-import { Client } from "agentdb";
+import { Client, SessionEventKind, agentStatus } from "agentdb";
 
 const client = new Client({ baseUrl: "http://127.0.0.1:8080" });
 const session = client.session(tenantId, sessionId, { agentId });
@@ -72,8 +72,8 @@ const context = await session.context({
 });
 
 const result = await session.append(
-  { status: "recovered", last_seen_seq: lastSeenSeq },
-  { kind: "agent_status" }
+  agentStatus("recovered", { lastSeenSeq }),
+  { kind: SessionEventKind.AgentStatus }
 );
 
 for await (const event of session.subscribe({ fromSeq: lastSeenSeq + 1 })) {
@@ -97,6 +97,34 @@ Concept mapping:
 Use `fromSeq: lastSeenSeq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled
 `seq` is the harness's cursor rule.
+
+## Event Conventions
+
+The runtime accepts arbitrary event kinds. The SDK exports advisory convention
+helpers for common brain/hand/session events:
+
+```ts
+import { SessionEventKind, toolCall, toolResult, userMessage } from "agentdb";
+
+await session.append(
+  userMessage("run the report"),
+  { kind: SessionEventKind.UserMessage }
+);
+const call = await session.append(
+  toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }),
+  { kind: SessionEventKind.ToolCall }
+);
+await session.append(
+  toolResult("call_1", "Generated report."),
+  {
+    kind: SessionEventKind.ToolResult,
+    sourceRefs: [{ event_id: call.eventId }],
+  }
+);
+```
+
+Helpers are intentionally client-side only. They do not prevent custom event
+kinds or adapter-specific payload fields.
 
 ## Testing
 

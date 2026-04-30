@@ -217,6 +217,8 @@ Exit criteria:
 
 ### P1: Advisory event convention spec
 
+Status: implemented in `session-event-conventions.md`.
+
 Document recommended event kinds and minimal payload fields for brain/hand
 interoperability.
 

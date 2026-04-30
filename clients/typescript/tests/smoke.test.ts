@@ -20,7 +20,16 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Client, Session } from "../src/index.js";
+import {
+  Client,
+  Session,
+  SessionEventKind,
+  agentStatus,
+  modelMessage,
+  toolCall,
+  toolResult,
+  userMessage,
+} from "../src/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 // dist/tests/smoke.test.js → up four levels = repo root
@@ -154,16 +163,12 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
     const session = await firstClient.createSession(tenantId, agentId, { alias: "agent-smoke-recovery" });
 
     await session.append(
-      { role: "user", text: "summarize the sandbox output" },
-      { kind: "user_message" }
+      userMessage("summarize the sandbox output"),
+      { kind: SessionEventKind.UserMessage }
     );
     const call = await session.append(
-      {
-        tool_call_id: "call_1",
-        tool: "sandbox.exec",
-        input: { cmd: "python report.py" },
-      },
-      { kind: "tool_call" }
+      toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }),
+      { kind: SessionEventKind.ToolCall }
     );
     const artifact = await firstClient.putArtifact(
       tenantId,
@@ -171,13 +176,9 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
       { contentType: "text/plain" }
     );
     await session.append(
+      toolResult("call_1", "Generated report with two lines."),
       {
-        tool_call_id: "call_1",
-        status: "ok",
-        summary: "Generated report with two lines.",
-      },
-      {
-        kind: "tool_result",
+        kind: SessionEventKind.ToolResult,
         artifactRefs: [
           {
             artifact_id: String(artifact.artifact_id),
@@ -190,8 +191,8 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
       }
     );
     await session.append(
-      { role: "assistant", text: "The report has two generated lines." },
-      { kind: "model_message" }
+      modelMessage("The report has two generated lines."),
+      { kind: SessionEventKind.ModelMessage }
     );
     const context = await session.context({ include: ["recent_events"], maxEvents: 10 });
     assert.ok(Array.isArray(context.events) && context.events.length > 0);
@@ -209,11 +210,8 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
     );
 
     const resumed = await recovered.append(
-      {
-        status: "recovered",
-        last_seen_seq: lastSeqBeforeCrash,
-      },
-      { kind: "agent_status" }
+      agentStatus("recovered", { lastSeenSeq: lastSeqBeforeCrash }),
+      { kind: SessionEventKind.AgentStatus }
     );
     assert.equal(resumed.seq, lastSeqBeforeCrash + 1);
 

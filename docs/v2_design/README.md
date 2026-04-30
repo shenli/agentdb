@@ -139,5 +139,8 @@ Start with:
 - [`session-layer-gap-audit.md`](session-layer-gap-audit.md) — current
   architecture-to-product audit for AgentDB as the durable session layer between
   stateless brains and replaceable hands.
+- [`session-event-conventions.md`](session-event-conventions.md) — advisory
+  event vocabulary for common brain/hand/session events across SDKs, adapters,
+  dashboards, and replay tools.
 - [`v2-implementation-plan.md`](v2-implementation-plan.md) — milestone roadmap
   and detailed V2.0 task-level plan.

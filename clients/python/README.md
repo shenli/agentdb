@@ -73,7 +73,7 @@ harness should keep the tenant, agent, session, and last-seen sequence IDs, then
 rebuild a session handle and continue from durable history:
 
 ```python
-from agentdb import Client
+from agentdb import Client, SessionEventKind, agent_status
 
 client = Client("http://127.0.0.1:8080")
 session = client.session(tenant_id, session_id, agent_id=agent_id)
@@ -82,8 +82,8 @@ history = session.replay(from_seq=0, limit=100)
 context = session.context(include=["recent_events", "records", "skills"])
 
 result = session.append(
-    {"status": "recovered", "last_seen_seq": last_seen_seq},
-    kind="agent_status",
+    agent_status("recovered", last_seen_seq=last_seen_seq),
+    kind=SessionEventKind.AGENT_STATUS.value,
 )
 
 for event in session.subscribe(from_seq=last_seen_seq + 1):
@@ -106,6 +106,32 @@ Concept mapping:
 Use `from_seq=last_seen_seq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled
 `seq` is the harness's cursor rule.
+
+## Event Conventions
+
+The runtime accepts arbitrary event kinds. The SDK exports advisory convention
+helpers for common brain/hand/session events:
+
+```python
+from agentdb import SessionEventKind, tool_call, tool_result, user_message
+
+session.append(
+    user_message("run the report"),
+    kind=SessionEventKind.USER_MESSAGE.value,
+)
+call = session.append(
+    tool_call("call_1", "sandbox.exec", {"cmd": "python report.py"}),
+    kind=SessionEventKind.TOOL_CALL.value,
+)
+session.append(
+    tool_result("call_1", "Generated report."),
+    kind=SessionEventKind.TOOL_RESULT.value,
+    source_refs=[{"event_id": call.event_id}],
+)
+```
+
+Helpers are intentionally client-side only. They do not prevent custom event
+kinds or adapter-specific payload fields.
 
 ## Testing
 
