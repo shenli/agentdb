@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   SessionEventKind,
+  ADAPTER_READINESS_CHECKS,
   agentStatus,
   approvalRequested,
   approvalResult,
@@ -15,9 +16,11 @@ import {
   toolError,
   toolResult,
   userMessage,
+  validateAdapterEvents,
 } from "../src/index.js";
 
 test("session event kind values match conventions", () => {
+  assert.ok(ADAPTER_READINESS_CHECKS.includes("tool_call_pairing"));
   assert.equal(SessionEventKind.UserMessage, "user_message");
   assert.equal(SessionEventKind.ModelMessage, "model_message");
   assert.equal(SessionEventKind.ToolCall, "tool_call");
@@ -115,4 +118,62 @@ test("contextSourceRefs extracts events records and skills", () => {
     { event_id: "evt_1" },
     { event_id: "evt_2" },
   ]);
+});
+
+test("validateAdapterEvents accepts ready sequences", () => {
+  const events = [
+    {
+      event_id: "evt_1",
+      seq: 0,
+      kind: "tool_call",
+      payload: { tool_call_id: "call_1" },
+    },
+    {
+      event_id: "evt_2",
+      seq: 1,
+      kind: "tool_result",
+      payload: { tool_call_id: "call_1", summary: "ok" },
+      source_refs: [{ event_id: "evt_1" }],
+      artifact_refs: [{ artifact_id: "art_1" }],
+    },
+    {
+      event_id: "evt_3",
+      seq: 2,
+      kind: "context_pack_built",
+      payload: { context_pack_id: "ctx_1" },
+      source_refs: [{ event_id: "evt_1" }],
+    },
+    {
+      event_id: "evt_4",
+      seq: 3,
+      kind: "model_message",
+      payload: { text: "done", context_pack_id: "ctx_1" },
+      source_refs: [{ event_id: "evt_3" }],
+    },
+    {
+      event_id: "evt_5",
+      seq: 4,
+      kind: "agent_status",
+      payload: { status: "recovered", last_seen_seq: 3 },
+    },
+  ];
+  assert.deepEqual(validateAdapterEvents(events), []);
+});
+
+test("validateAdapterEvents reports common adapter gaps", () => {
+  const warnings = validateAdapterEvents([
+    {
+      kind: "tool_call",
+      payload: { tool_call_id: "call_1" },
+    },
+    {
+      kind: "model_message",
+      payload: { text: "done", context_pack_id: "ctx_1" },
+    },
+  ]);
+  assert.ok(warnings.includes("tool_call_without_result_or_error:call_1"));
+  assert.ok(warnings.includes("model_message_with_context_pack_without_source_refs"));
+  assert.ok(warnings.includes("model_message_without_context_pack_built"));
+  assert.ok(warnings.includes("missing_recovered_agent_status"));
+  assert.ok(warnings.includes("events_missing_agentdb_seq"));
 });

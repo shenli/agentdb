@@ -42,6 +42,7 @@ working agent loops.
 from .client import Client, Session, AppendResult, Event, WatchItem
 from .conventions import (
     SessionEventKind,
+    ADAPTER_READINESS_CHECKS,
     agent_status,
     approval_requested,
     approval_result,
@@ -54,6 +55,7 @@ from .conventions import (
     tool_error,
     tool_result,
     user_message,
+    validate_adapter_events,
 )
 from .errors import (
     AgentDBError,
@@ -75,6 +77,7 @@ __all__ = [
     "Event",
     "WatchItem",
     "SessionEventKind",
+    "ADAPTER_READINESS_CHECKS",
     "agent_status",
     "approval_requested",
     "approval_result",
@@ -87,6 +90,7 @@ __all__ = [
     "tool_error",
     "tool_result",
     "user_message",
+    "validate_adapter_events",
     "AsyncClient",
     "AsyncSession",
     "AgentDBError",

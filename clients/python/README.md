@@ -170,6 +170,22 @@ session.append(
 This keeps the prompt/context shape model-specific while preserving the
 recoverable events and records that produced it.
 
+## Adapter Readiness
+
+Adapters can run a lightweight convention check over a recorded event sequence:
+
+```python
+from agentdb import validate_adapter_events
+
+warnings = validate_adapter_events(events)
+if warnings:
+    raise AssertionError("\n".join(warnings))
+```
+
+The validator is advisory. It catches common issues such as unpaired tool calls,
+large inline tool outputs without artifacts, missing context provenance, missing
+resume status, and event sequences that do not carry AgentDB `seq` values.
+
 ## Testing
 
 ```bash

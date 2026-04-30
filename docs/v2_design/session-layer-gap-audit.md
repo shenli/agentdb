@@ -251,6 +251,8 @@ Exit criteria:
 
 ### P3: Adapter readiness checklist
 
+Status: implemented in `adapter-readiness-checklist.md` plus SDK validators.
+
 Before adding another adapter, write down the checklist each adapter must pass.
 
 Required checks:

@@ -23,6 +23,17 @@ export const SessionEventKind = {
 export type SessionEventKind = typeof SessionEventKind[keyof typeof SessionEventKind];
 export type Payload = Record<string, unknown>;
 
+export const ADAPTER_READINESS_CHECKS = [
+  "agentdb_ordering",
+  "tool_call_pairing",
+  "artifact_large_outputs",
+  "resume_cursor",
+  "context_provenance",
+  "source_refs",
+] as const;
+
+export type AdapterReadinessCheck = typeof ADAPTER_READINESS_CHECKS[number];
+
 export function userMessage(
   text: string,
   opts: { role?: string; userId?: string; channel?: string; metadata?: Payload } = {}
@@ -243,6 +254,77 @@ export function agentStatus(
   });
 }
 
+export function validateAdapterEvents(
+  events: Payload[],
+  opts: { largeOutputChars?: number } = {}
+): string[] {
+  const largeOutputChars = opts.largeOutputChars ?? 4096;
+  const warnings: string[] = [];
+  const toolCalls = new Map<string, unknown>();
+  const pairedToolCalls = new Set<string>();
+  let hasContextPack = false;
+  let hasModelMessage = false;
+  let hasRecoveryStatus = false;
+  let sawSeq = false;
+
+  for (const event of events) {
+    const kind = field(event, "kind");
+    const payload = payloadField(event);
+    const eventId = field(event, "event_id", "eventId");
+    const seq = field(event, "seq");
+    if (seq !== undefined) sawSeq = true;
+
+    if (kind === SessionEventKind.ToolCall) {
+      const callId = stringField(payload, "tool_call_id", "toolCallId");
+      if (callId === undefined) warnings.push("tool_call_missing_tool_call_id");
+      else toolCalls.set(callId, eventId ?? callId);
+    }
+
+    if (kind === SessionEventKind.ToolResult || kind === SessionEventKind.ToolError) {
+      const callId = stringField(payload, "tool_call_id", "toolCallId");
+      if (callId === undefined) warnings.push(`${kind}_missing_tool_call_id`);
+      else if (!toolCalls.has(callId)) warnings.push(`${kind}_without_prior_tool_call:${callId}`);
+      else pairedToolCalls.add(callId);
+      const output = field(payload, "output");
+      if (typeof output === "string" && output.length > largeOutputChars) {
+        if (arrayField(field(event, "artifact_refs", "artifactRefs")).length === 0) {
+          warnings.push(`${kind}_large_output_without_artifact:${callId ?? ""}`);
+        }
+      }
+    }
+
+    if (kind === SessionEventKind.ContextPackBuilt) {
+      hasContextPack = true;
+      if (arrayField(field(event, "source_refs", "sourceRefs")).length === 0) {
+        warnings.push("context_pack_built_without_source_refs");
+      }
+    }
+
+    if (kind === SessionEventKind.ModelMessage) {
+      hasModelMessage = true;
+      const contextPackId = field(payload, "context_pack_id", "contextPackId");
+      if (contextPackId !== undefined && arrayField(field(event, "source_refs", "sourceRefs")).length === 0) {
+        warnings.push("model_message_with_context_pack_without_source_refs");
+      }
+    }
+
+    if (kind === SessionEventKind.AgentStatus && field(payload, "status") === "recovered") {
+      hasRecoveryStatus = true;
+      if (field(payload, "last_seen_seq", "lastSeenSeq") === undefined) {
+        warnings.push("recovered_status_without_last_seen_seq");
+      }
+    }
+  }
+
+  for (const callId of toolCalls.keys()) {
+    if (!pairedToolCalls.has(callId)) warnings.push(`tool_call_without_result_or_error:${callId}`);
+  }
+  if (hasModelMessage && !hasContextPack) warnings.push("model_message_without_context_pack_built");
+  if (!hasRecoveryStatus) warnings.push("missing_recovered_agent_status");
+  if (!sawSeq) warnings.push("events_missing_agentdb_seq");
+  return warnings;
+}
+
 function compact(input: Payload): Payload {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
 }
@@ -257,4 +339,15 @@ function field(value: Payload, ...names: string[]): unknown {
     if (Object.prototype.hasOwnProperty.call(value, name)) return value[name];
   }
   return undefined;
+}
+
+function payloadField(event: Payload): Payload {
+  const payload = field(event, "payload");
+  if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) return payload as Payload;
+  return {};
+}
+
+function stringField(value: Payload, ...names: string[]): string | undefined {
+  const found = field(value, ...names);
+  return typeof found === "string" ? found : undefined;
 }
