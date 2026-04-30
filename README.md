@@ -148,6 +148,7 @@ cargo build --workspace
 cargo test -p agentdb-core -p agentdb-api
 cargo test -p agentdb-meta routing
 cargo test -p agentdb-api routing_http
+cargo test -p agentdb-api
 python3 -m pytest -q clients/python/tests
 PYTHONPATH=adapters/langgraph-checkpoint-agentdb python3 -m pytest -q adapters/langgraph-checkpoint-agentdb/tests
 PYTHONPATH=clients/python:adapters/openai-agents-agentdb python3 -m pytest -q adapters/openai-agents-agentdb/tests

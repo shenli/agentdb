@@ -51,8 +51,12 @@ Implementation checkpoint:
   output now has concrete local/forward/reject outcomes, forwarding headers,
   retryable 503 unassigned responses, 421 wrong-location responses, and
   residency denial responses for the runtime data path to wire into handlers.
-- Current next milestone: handler-level forwarding/proxy wiring and
-  managed-service hardening.
+- V2.12 adds handler-facing proxy preparation: remote-owner outcomes can now
+  build same-cluster forward URIs, sanitize hop-by-hop headers, propagate
+  routing metadata, track `x-agentdb-forwarded-for`, and reject already-forwarded
+  requests to prevent loops.
+- Current next milestone: call the routing guard from session handlers and
+  attach the same-cluster HTTP client.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
