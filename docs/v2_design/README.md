@@ -142,5 +142,7 @@ Start with:
 - [`session-event-conventions.md`](session-event-conventions.md) — advisory
   event vocabulary for common brain/hand/session events across SDKs, adapters,
   dashboards, and replay tools.
+- [`adapter-readiness-checklist.md`](adapter-readiness-checklist.md) — checks
+  and SDK validator guidance for framework adapters built on AgentDB sessions.
 - [`v2-implementation-plan.md`](v2-implementation-plan.md) — milestone roadmap
   and detailed V2.0 task-level plan.

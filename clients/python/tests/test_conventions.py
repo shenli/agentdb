@@ -1,5 +1,6 @@
 from agentdb import (
     SessionEventKind,
+    ADAPTER_READINESS_CHECKS,
     agent_status,
     approval_requested,
     approval_result,
@@ -12,10 +13,12 @@ from agentdb import (
     tool_error,
     tool_result,
     user_message,
+    validate_adapter_events,
 )
 
 
 def test_session_event_kind_values_match_conventions():
+    assert "tool_call_pairing" in ADAPTER_READINESS_CHECKS
     assert SessionEventKind.USER_MESSAGE.value == "user_message"
     assert SessionEventKind.MODEL_MESSAGE.value == "model_message"
     assert SessionEventKind.TOOL_CALL.value == "tool_call"
@@ -111,3 +114,63 @@ def test_context_source_refs_extracts_events_records_and_skills():
         {"event_id": "evt_1"},
         {"event_id": "evt_2"},
     ]
+
+
+def test_validate_adapter_events_accepts_ready_sequence():
+    events = [
+        {
+            "event_id": "evt_1",
+            "seq": 0,
+            "kind": "tool_call",
+            "payload": {"tool_call_id": "call_1"},
+        },
+        {
+            "event_id": "evt_2",
+            "seq": 1,
+            "kind": "tool_result",
+            "payload": {"tool_call_id": "call_1", "summary": "ok"},
+            "source_refs": [{"event_id": "evt_1"}],
+            "artifact_refs": [{"artifact_id": "art_1"}],
+        },
+        {
+            "event_id": "evt_3",
+            "seq": 2,
+            "kind": "context_pack_built",
+            "payload": {"context_pack_id": "ctx_1"},
+            "source_refs": [{"event_id": "evt_1"}],
+        },
+        {
+            "event_id": "evt_4",
+            "seq": 3,
+            "kind": "model_message",
+            "payload": {"text": "done", "context_pack_id": "ctx_1"},
+            "source_refs": [{"event_id": "evt_3"}],
+        },
+        {
+            "event_id": "evt_5",
+            "seq": 4,
+            "kind": "agent_status",
+            "payload": {"status": "recovered", "last_seen_seq": 3},
+        },
+    ]
+    assert validate_adapter_events(events) == []
+
+
+def test_validate_adapter_events_reports_common_adapter_gaps():
+    warnings = validate_adapter_events(
+        [
+            {
+                "kind": "tool_call",
+                "payload": {"tool_call_id": "call_1"},
+            },
+            {
+                "kind": "model_message",
+                "payload": {"text": "done", "context_pack_id": "ctx_1"},
+            },
+        ]
+    )
+    assert "tool_call_without_result_or_error:call_1" in warnings
+    assert "model_message_with_context_pack_without_source_refs" in warnings
+    assert "model_message_without_context_pack_built" in warnings
+    assert "missing_recovered_agent_status" in warnings
+    assert "events_missing_agentdb_seq" in warnings

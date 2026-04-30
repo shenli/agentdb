@@ -294,6 +294,92 @@ def agent_status(
     )
 
 
+ADAPTER_READINESS_CHECKS = (
+    "agentdb_ordering",
+    "tool_call_pairing",
+    "artifact_large_outputs",
+    "resume_cursor",
+    "context_provenance",
+    "source_refs",
+)
+
+
+def validate_adapter_events(
+    events: Sequence[Any],
+    *,
+    large_output_chars: int = 4096,
+) -> list:
+    """Return advisory adapter-readiness warnings for an event sequence.
+
+    The checks intentionally stay client-side and best-effort. They help adapter
+    authors catch convention drift without turning AgentDB into a closed schema.
+    """
+
+    warnings = []
+    tool_calls = {}
+    paired_tool_calls = set()
+    has_context_pack = False
+    has_model_message = False
+    has_recovery_status = False
+    saw_seq = False
+
+    for event in events:
+        kind = _field(event, "kind")
+        payload = _field(event, "payload") or {}
+        event_id = _field(event, "event_id", "eventId")
+        seq = _field(event, "seq")
+        if seq is not None:
+            saw_seq = True
+
+        if kind == SessionEventKind.TOOL_CALL.value:
+            call_id = _field(payload, "tool_call_id", "toolCallId")
+            if call_id is None:
+                warnings.append("tool_call_missing_tool_call_id")
+            else:
+                tool_calls[call_id] = event_id or call_id
+
+        if kind in (SessionEventKind.TOOL_RESULT.value, SessionEventKind.TOOL_ERROR.value):
+            call_id = _field(payload, "tool_call_id", "toolCallId")
+            if call_id is None:
+                warnings.append(f"{kind}_missing_tool_call_id")
+            elif call_id not in tool_calls:
+                warnings.append(f"{kind}_without_prior_tool_call:{call_id}")
+            else:
+                paired_tool_calls.add(call_id)
+            output = _field(payload, "output")
+            if isinstance(output, str) and len(output) > large_output_chars:
+                if not _field(event, "artifact_refs", "artifactRefs"):
+                    warnings.append(f"{kind}_large_output_without_artifact:{call_id}")
+
+        if kind == SessionEventKind.CONTEXT_PACK_BUILT.value:
+            has_context_pack = True
+            if not _field(event, "source_refs", "sourceRefs"):
+                warnings.append("context_pack_built_without_source_refs")
+
+        if kind == SessionEventKind.MODEL_MESSAGE.value:
+            has_model_message = True
+            context_pack_id = _field(payload, "context_pack_id", "contextPackId")
+            if context_pack_id and not _field(event, "source_refs", "sourceRefs"):
+                warnings.append("model_message_with_context_pack_without_source_refs")
+
+        if kind == SessionEventKind.AGENT_STATUS.value and _field(payload, "status") == "recovered":
+            has_recovery_status = True
+            if _field(payload, "last_seen_seq", "lastSeenSeq") is None:
+                warnings.append("recovered_status_without_last_seen_seq")
+
+    for call_id in tool_calls:
+        if call_id not in paired_tool_calls:
+            warnings.append(f"tool_call_without_result_or_error:{call_id}")
+
+    if has_model_message and not has_context_pack:
+        warnings.append("model_message_without_context_pack_built")
+    if not has_recovery_status:
+        warnings.append("missing_recovered_agent_status")
+    if not saw_seq:
+        warnings.append("events_missing_agentdb_seq")
+    return warnings
+
+
 def _compact(payload: Mapping[str, Any]) -> dict:
     return {key: value for key, value in payload.items() if value is not None}
 

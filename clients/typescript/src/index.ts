@@ -28,6 +28,7 @@
 export { Client, Session } from "./client.js";
 export {
   SessionEventKind,
+  ADAPTER_READINESS_CHECKS,
   agentStatus,
   approvalRequested,
   approvalResult,
@@ -40,8 +41,13 @@ export {
   toolError,
   toolResult,
   userMessage,
+  validateAdapterEvents,
 } from "./conventions.js";
-export type { Payload, SessionEventKind as SessionEventKindValue } from "./conventions.js";
+export type {
+  AdapterReadinessCheck,
+  Payload,
+  SessionEventKind as SessionEventKindValue,
+} from "./conventions.js";
 export type {
   AppendOptions,
   AppendAndFetchOptions,

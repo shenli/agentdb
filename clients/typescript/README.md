@@ -168,6 +168,23 @@ await session.append(
 This keeps the prompt/context shape model-specific while preserving the
 recoverable events and records that produced it.
 
+## Adapter Readiness
+
+Adapters can run a lightweight convention check over a recorded event sequence:
+
+```ts
+import { validateAdapterEvents } from "agentdb";
+
+const warnings = validateAdapterEvents(events);
+if (warnings.length) {
+  throw new Error(warnings.join("\n"));
+}
+```
+
+The validator is advisory. It catches common issues such as unpaired tool calls,
+large inline tool outputs without artifacts, missing context provenance, missing
+resume status, and event sequences that do not carry AgentDB `seq` values.
+
 ## Testing
 
 ```bash
