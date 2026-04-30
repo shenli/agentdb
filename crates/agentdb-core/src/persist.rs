@@ -25,9 +25,10 @@
 use std::sync::Arc;
 
 use agentdb_storage::keys::{
-    agent_alias_key, agent_record_key, artifact_by_sha256_key, artifact_record_key,
-    event_by_id_key, event_key, record_by_namespace_key, record_key, session_alias_key,
-    session_record_key, tenant_alias_key, tenant_record_key,
+    agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
+    artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_key,
+    session_alias_key, session_record_key, skill_record_key, skill_unique_key, tenant_alias_key,
+    tenant_record_key,
 };
 use agentdb_storage::{KvStore, Result as KvResult, WriteOp};
 
@@ -37,6 +38,7 @@ use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
 use crate::session::Session;
+use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 pub(crate) struct Persist {
@@ -395,6 +397,44 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    /// Atomic write of a V2.3 skill record plus its
+    /// `(tenant_id, name, version)` uniqueness index.
+    pub fn put_skill(&self, skill: &Skill) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Put {
+                key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
+                    .into_bytes(),
+                value: serde_json::to_vec(skill).expect("skill serializes"),
+            },
+            WriteOp::Put {
+                key: skill_unique_key(skill.tenant_id.as_str(), &skill.name, &skill.version)
+                    .into_bytes(),
+                value: skill.skill_id.as_str().as_bytes().to_vec(),
+            },
+        ];
+        self.kv.write_batch(ops)
+    }
+
+    pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![WriteOp::Put {
+            key: agent_skill_binding_key(
+                binding.tenant_id.as_str(),
+                binding.agent_id.as_str(),
+                binding.skill_id.as_str(),
+            )
+            .into_bytes(),
+            value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
+        }];
+        self.kv.write_batch(ops)
+    }
+
+    pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {
+        self.kv.write_batch(vec![WriteOp::Put {
+            key: format!("record/idempotency/{full_key}").into_bytes(),
+            value: serde_json::to_vec(rec).expect("idempotency record serializes"),
+        }])
+    }
+
     /// Look up a record by primary key (tenant + record_id). Returns
     /// `None` if the row is absent. Callers are responsible for
     /// soft-delete and expiration filtering.
@@ -427,6 +467,49 @@ impl Persist {
             let (_k, v) = res?;
             let r: SearchableRecord = serde_json::from_slice(&v).expect("record decodes");
             out.push(r);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_skills(&self) -> KvResult<Vec<Skill>> {
+        let iter = self.kv.scan_prefix(b"record/skill/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let skill: Skill = serde_json::from_slice(&v).expect("skill decodes");
+            out.push(skill);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_skill_uniques(&self) -> KvResult<Vec<((String, String, String), String)>> {
+        let prefix = b"record/skill_unique/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("skill_unique key suffix is utf8");
+            let mut split = suffix.splitn(3, '/');
+            let tenant = split.next().expect("tenant_id segment").to_string();
+            let name = split.next().expect("name segment").to_string();
+            let version = split.next().expect("version segment").to_string();
+            let skill_id = std::str::from_utf8(&v)
+                .expect("skill_unique value is utf8")
+                .to_string();
+            out.push(((tenant, name, version), skill_id));
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_agent_skill_bindings(&self) -> KvResult<Vec<AgentSkillBinding>> {
+        let iter = self.kv.scan_prefix(b"record/agent_skill/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let binding: AgentSkillBinding =
+                serde_json::from_slice(&v).expect("agent skill binding decodes");
+            out.push(binding);
         }
         Ok(out)
     }

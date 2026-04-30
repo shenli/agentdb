@@ -210,6 +210,8 @@ Dependencies: V2.0 (for tenant/agent scope).
 
 ### V2.3 — Skills (~1500 LoC)
 
+Status: implemented in `feature/v2.3-skills`.
+
 **Maps to impl guide §15 step 10.**
 
 Scope:
@@ -236,6 +238,12 @@ Exit criteria:
   replay returns the same exact version even after a newer version is
   registered.
 - Duplicate `(tenant, name, version)` registration is rejected.
+
+Validation:
+
+- `cargo test -p agentdb-core --test skill --test runtime_restart`
+- `cargo test -p agentdb-api --test api_skills`
+- `cargo test -p agentdb-core -p agentdb-api`
 
 Dependencies: V2.0; V2.1 for skill-as-artifact case.
 

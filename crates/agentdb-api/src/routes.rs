@@ -20,13 +20,14 @@ use axum::{
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
     runtime::{AppendAndFetchResponse, AppendRequest, AppendResponse, FetchRequest, SearchRequest},
-    Agent, Artifact, ErrorCode, EventEnvelope, Id, IdKind, NewAgent, NewArtifact, NewSession,
-    NewTenant, Session, SourceRef, Tenant,
+    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ErrorCode, EventEnvelope, Id, IdKind,
+    NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Session, Skill, SourceRef, Tenant,
 };
 
 use crate::dto::{
-    AppendAndFetchBody, AppendBody, CreateAgentBody, CreateRecordBody, CreateSessionBody,
-    CreateTenantBody, FetchQuery, SearchRecordsBody, SearchRecordsResponse,
+    AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
+    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, ListAgentSkillsResponse,
+    SearchRecordsBody, SearchRecordsResponse,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -50,6 +51,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id/sessions",
             post(create_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/agents/:agent_id/skills",
+            get(list_agent_skills),
+        )
+        .route(
+            "/api/tenants/:tenant_id/agents/:agent_id/skills/bind",
+            post(bind_skill),
         )
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id",
@@ -95,6 +104,8 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/records/:record_id",
             get(get_record).delete(delete_record),
         )
+        .route("/api/tenants/:tenant_id/skills", post(create_skill))
+        .route("/api/tenants/:tenant_id/skills/:skill_id", get(get_skill))
 }
 
 async fn create_tenant(
@@ -571,6 +582,69 @@ async fn delete_record(
     let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
     s.runtime.delete_record(&tid, &rid).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_skill(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CreateSkillBody>,
+) -> Result<(StatusCode, Json<Skill>), ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let skill = s
+        .runtime
+        .register_skill(
+            NewSkill {
+                tenant_id: tid,
+                name: body.name,
+                version: body.version,
+                manifest: body.manifest,
+                artifact_refs: body.artifact_refs,
+            },
+            idempotency_key(&headers),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(skill)))
+}
+
+async fn get_skill(
+    State(s): State<AppState>,
+    Path((tenant_id, skill_id)): Path<(String, String)>,
+) -> Result<Json<Skill>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
+    Ok(Json(s.runtime.get_skill(&tid, &sid).await?))
+}
+
+async fn bind_skill(
+    State(s): State<AppState>,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<BindSkillBody>,
+) -> Result<(StatusCode, Json<AgentSkillBinding>), ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
+    let sid = parse_id_or(&body.skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
+    let binding = s
+        .runtime
+        .bind_skill(BindSkillRequest {
+            tenant_id: tid,
+            agent_id: aid,
+            skill_id: sid,
+            idempotency_key: idempotency_key(&headers),
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(binding)))
+}
+
+async fn list_agent_skills(
+    State(s): State<AppState>,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+) -> Result<Json<ListAgentSkillsResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
+    let skills = s.runtime.list_agent_skills(&tid, &aid).await?;
+    Ok(Json(ListAgentSkillsResponse { skills }))
 }
 
 /// Hand-rolled query-string parser for the search route. Handles the

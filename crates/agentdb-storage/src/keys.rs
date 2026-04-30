@@ -73,3 +73,19 @@ pub fn record_key(tenant_id: &str, record_id: &str) -> String {
 pub fn record_by_namespace_key(tenant_id: &str, namespace_path: &str, record_id: &str) -> String {
     format!("record/searchable_by_namespace/{tenant_id}/{namespace_path}/{record_id}")
 }
+
+/// Primary key for a V2.3 skill record.
+pub fn skill_record_key(tenant_id: &str, skill_id: &str) -> String {
+    format!("record/skill/{tenant_id}/{skill_id}")
+}
+
+/// Uniqueness index for `(tenant_id, skill_name, version)`.
+pub fn skill_unique_key(tenant_id: &str, name: &str, version: &str) -> String {
+    format!("record/skill_unique/{tenant_id}/{name}/{version}")
+}
+
+/// Agent-to-skill binding row. `skill_id` is enough because each skill row
+/// carries its exact `(name, version)`.
+pub fn agent_skill_binding_key(tenant_id: &str, agent_id: &str, skill_id: &str) -> String {
+    format!("record/agent_skill/{tenant_id}/{agent_id}/{skill_id}")
+}

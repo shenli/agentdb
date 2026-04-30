@@ -568,7 +568,9 @@ Minimum error codes:
 9. Implement searchable record write/search with simple text and caller-supplied
    vector search. Implemented in V2.2 with namespace/scope/tag/source filters
    and write-time indexing policy enforcement.
-10. Implement skill register/bind/list.
+10. Implement skill register/bind/list. Implemented in V2.3 with
+    `(tenant_id, name, version)` uniqueness, agent bindings, artifact package
+    refs, idempotency, and `skill_used` event validation.
 11. Implement session fork metadata and replay merge.
 12. Implement SSE subscribe from sequence with in-process fanout.
 13. Add minimal policy checks.

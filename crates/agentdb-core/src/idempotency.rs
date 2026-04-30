@@ -76,3 +76,13 @@ pub fn hash_request(
     serde_json::to_string(&canon).unwrap().hash(&mut h);
     h.finish()
 }
+
+/// Hash an arbitrary canonical JSON value for non-append idempotent
+/// operations. Callers should build the value with every field that affects
+/// the mutation result.
+pub fn hash_json(value: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(value).unwrap().hash(&mut h);
+    h.finish()
+}

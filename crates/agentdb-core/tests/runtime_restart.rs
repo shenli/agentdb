@@ -11,6 +11,7 @@ use agentdb_core::artifact::NewArtifact;
 use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime, SearchRequest};
 use agentdb_core::session::NewSession;
+use agentdb_core::skill::{BindSkillRequest, NewSkill};
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, LocalFsContentBackend, RocksKvStore,
@@ -373,6 +374,65 @@ async fn records_and_indexes_survive_restart() {
         .await
         .unwrap();
     assert_eq!(all.len(), 3);
+}
+
+#[tokio::test]
+async fn skills_and_bindings_survive_restart() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let (t, a, _) = rt.bootstrap_test_session().await;
+    let skill = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: t.tenant_id.clone(),
+                name: "planner".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({"entrypoint": "plan"}),
+                artifact_refs: vec![],
+            },
+            Some("register-planner".into()),
+        )
+        .await
+        .unwrap();
+    rt.bind_skill(BindSkillRequest {
+        tenant_id: t.tenant_id.clone(),
+        agent_id: a.agent_id.clone(),
+        skill_id: skill.skill_id.clone(),
+        idempotency_key: Some("bind-planner".into()),
+    })
+    .await
+    .unwrap();
+    drop(rt);
+
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
+    let listed = rt2
+        .list_agent_skills(&t.tenant_id, &a.agent_id)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "planner");
+    assert_eq!(listed[0].version, "1.0.0");
+
+    // Idempotent retries should replay rather than creating duplicates.
+    let replayed = rt2
+        .bind_skill(BindSkillRequest {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            skill_id: skill.skill_id.clone(),
+            idempotency_key: Some("bind-planner".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(replayed.skill_id, skill.skill_id);
+    assert_eq!(
+        rt2.list_agent_skills(&t.tenant_id, &a.agent_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
