@@ -485,3 +485,85 @@ async fn delete_session_then_gc_sweep_purges_session_events() {
     assert_eq!(gc["sessions_purged"].as_u64(), Some(1));
     assert_eq!(gc["events_purged"].as_u64(), Some(1));
 }
+
+#[tokio::test]
+async fn gc_sweep_reports_idempotency_purges() {
+    let app = spawn_app().await;
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "idem-gc",
+            "policy": {"retention": {"retention_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = tenant["tenant_id"].as_str().unwrap();
+    let agent: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({"alias": null, "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = agent["agent_id"].as_str().unwrap();
+    let session: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
+        .json(&json!({"alias": null}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = session["session_id"].as_str().unwrap();
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .header("Idempotency-Key", "idem-gc")
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let gc: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/policy/gc-sweep", app.base))
+        .json(&json!({"now_ms": u64::MAX}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gc["idempotency_purged"].as_u64(), Some(1));
+}

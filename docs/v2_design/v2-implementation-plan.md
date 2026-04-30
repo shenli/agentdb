@@ -262,8 +262,9 @@ V2.4d adds a deterministic policy worker tick that schedules tenant
 lifecycle/GC work by priority and exposes it through the API. V2.4e adds
 session soft-delete plus session/event hard purge in tenant-scoped GC sweeps.
 V2.4f adds skill soft-delete plus skill/binding hard purge in tenant-scoped GC
-sweeps. Full multi-dimensional quotas, remaining object GC handlers, and
-changefeed events remain for later V2.4 slices.
+sweeps. V2.4g adds idempotency retention GC for in-memory and persisted
+idempotency records. Full multi-dimensional quotas, remaining object GC
+handlers, and changefeed events remain for later V2.4 slices.
 
 **Maps to impl guide §15 step 13 + V2 §17, §18, §12.8.**
 

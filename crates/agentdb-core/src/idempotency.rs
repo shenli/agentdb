@@ -16,6 +16,8 @@ use crate::id::Id;
 pub struct IdempotencyRecord {
     pub payload_hash: u64,
     pub result_json: String,
+    #[serde(default)]
+    pub created_at_ms: u64,
 }
 
 #[derive(Default, Debug)]
@@ -29,6 +31,17 @@ impl IdempotencyStore {
     }
     pub fn put(&self, key: String, record: IdempotencyRecord) {
         self.inner.lock().unwrap().insert(key, record);
+    }
+    pub fn remove(&self, key: &str) {
+        self.inner.lock().unwrap().remove(key);
+    }
+    pub fn entries(&self) -> Vec<(String, IdempotencyRecord)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
     /// Bulk-load records (used by `Runtime::with_kv` to hydrate the in-memory
     /// idempotency table from persisted state at startup).

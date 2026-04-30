@@ -149,6 +149,56 @@ async fn idempotency_records_survive_restart() {
 }
 
 #[tokio::test]
+async fn idempotency_records_are_purged_by_gc_after_retention() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "idem-gc".into(),
+            policy: serde_json::json!({"retention": {"retention_ms": 0}}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let mut req = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"v": 1}));
+    req.idempotency_key = Some("k1".into());
+    let r1 = rt.append(req.clone()).await.unwrap();
+    let report = rt
+        .gc_sweep_for_tenant_at(&t.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(report.idempotency_purged, 1);
+    drop(rt);
+
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
+    let r2 = rt2.append(req).await.unwrap();
+    assert_ne!(
+        r1.event_id, r2.event_id,
+        "retry after idempotency GC should commit as a new request"
+    );
+    assert_eq!(r2.seq, 1);
+}
+
+#[tokio::test]
 async fn tenants_agents_and_sessions_hydrate_on_open() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
