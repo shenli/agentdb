@@ -31,8 +31,12 @@ Implementation checkpoint:
 - V2.5 adds session fork/replay, replay-style SSE subscribe, generalized
   session/tenant/agent watch cursors, and budgeted context packs over recent
   events, records, skills, and policy.
-- Current next milestone: SDK rewrites and adapter proof points on top of the
-  V2.0-V2.5 native API surface.
+- V2.6 rewrites the Python and TypeScript SDKs around the native tenant-scoped
+  V2 API surface, including opaque typed IDs, append-and-fetch, replay/fork,
+  subscribe/watch, artifacts, records, skills, context, and client-side
+  idempotency key generation.
+- Current next milestone: legacy deletion and cleanup before adapter proof
+  points on top of the V2.0-V2.6 native API surface.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

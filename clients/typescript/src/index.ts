@@ -28,12 +28,21 @@
 export { Client, Session } from "./client.js";
 export type {
   AppendOptions,
+  AppendAndFetchOptions,
   AppendResult,
   ClientOptions,
   ClientSubscribeOptions,
   Event,
   SessionOptions,
   SubscribeOptions,
+  TenantId,
+  AgentId,
+  SessionId,
+  EventId,
+  ArtifactId,
+  RecordId,
+  SkillId,
+  WatchItem,
 } from "./client.js";
 
 export {

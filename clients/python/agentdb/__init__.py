@@ -45,7 +45,7 @@ working agent loops.
 """
 
 from ._broadcast import BroadcastMessage
-from .client import Client, Session, AppendResult, Event
+from .client import Client, Session, AppendResult, Event, WatchItem
 from .errors import (
     AgentDBError,
     BadRequest,
@@ -64,6 +64,7 @@ __all__ = [
     "Session",
     "AppendResult",
     "Event",
+    "WatchItem",
     "AsyncClient",
     "AsyncSession",
     "BroadcastMessage",
@@ -96,4 +97,4 @@ def __getattr__(name: str):
         return getattr(_async_client, name)
     raise AttributeError(f"module 'agentdb' has no attribute {name!r}")
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
