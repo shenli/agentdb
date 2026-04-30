@@ -16,8 +16,9 @@ use crate::tablets::Tablet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidencyPolicy {
     /// Empty means "no placement restriction". Values are compared to the
-    /// current `Node::availability_zone` field, which acts as the prototype's
-    /// location label until region and AZ become separate columns.
+    /// owning node's durable region. Nodes without region metadata fall back
+    /// to `availability_zone` for compatibility with older deployments that
+    /// used AZ as the prototype location label.
     pub allowed_locations: Vec<String>,
     /// When false, a request carrying a location that differs from the owning
     /// node's location is rejected instead of forwarded cross-location.
@@ -122,7 +123,7 @@ pub fn plan_route(
         return unresolved(shard_id, tablet_id, RouteReason::NodeUnavailable);
     }
 
-    let owner_location = owner.availability_zone.clone();
+    let owner_location = owner_route_location(owner).map(str::to_string);
     if !request.policy.allowed_locations.is_empty()
         && !owner_location.as_deref().is_some_and(|loc| {
             request
@@ -202,10 +203,17 @@ fn reject(shard_id: i64, tablet: &Tablet, owner: &Node, reason: RouteReason) -> 
         tablet_id: tablet.tablet_id,
         owner_node_id: Some(owner.node_id.clone()),
         owner_address: Some(owner.address.clone()),
-        owner_location: owner.availability_zone.clone(),
+        owner_location: owner_route_location(owner).map(str::to_string),
         epoch: Some(tablet.epoch),
         reason: Some(reason),
     }
+}
+
+fn owner_route_location(owner: &Node) -> Option<&str> {
+    owner
+        .region
+        .as_deref()
+        .or(owner.availability_zone.as_deref())
 }
 
 #[cfg(test)]
@@ -220,7 +228,8 @@ mod tests {
             state: "alive".into(),
             last_heartbeat_ms: 100,
             joined_at_ms: 100,
-            availability_zone: Some(location.into()),
+            availability_zone: Some(format!("{location}a")),
+            region: Some(location.into()),
         }
     }
 
@@ -351,6 +360,51 @@ mod tests {
 
         assert_eq!(decision.action, RouteAction::Reject);
         assert_eq!(decision.reason, Some(RouteReason::ResidencyDenied));
+        assert_eq!(decision.owner_location.as_deref(), Some("us-west-2a"));
+    }
+
+    #[test]
+    fn residency_policy_prefers_region_over_availability_zone() {
+        let mut owner = node("node-a", "us-west-2");
+        owner.availability_zone = Some("us-west-2a".into());
+        let request = RouteRequest {
+            tenant_id: "ten_1",
+            session_locator: Some(&locator("ses_1", 1, Some(1))),
+            request_location: Some("us-west-2"),
+            local_node_id: Some("node-local"),
+            shard_count: 16,
+            now_ms: 1_000,
+            policy: ResidencyPolicy {
+                allowed_locations: vec!["us-west-2".into()],
+                allow_cross_location: false,
+            },
+        };
+        let decision = plan_route(request, &[], &[tablet(1, Some("node-a"), 2_000)], &[owner]);
+
+        assert_eq!(decision.action, RouteAction::Forward);
+        assert_eq!(decision.owner_location.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn residency_policy_falls_back_to_availability_zone_without_region() {
+        let mut owner = node("node-a", "us-west-2a");
+        owner.region = None;
+        owner.availability_zone = Some("us-west-2a".into());
+        let request = RouteRequest {
+            tenant_id: "ten_1",
+            session_locator: Some(&locator("ses_1", 1, Some(1))),
+            request_location: Some("us-west-2a"),
+            local_node_id: Some("node-local"),
+            shard_count: 16,
+            now_ms: 1_000,
+            policy: ResidencyPolicy {
+                allowed_locations: vec!["us-west-2a".into()],
+                allow_cross_location: false,
+            },
+        };
+        let decision = plan_route(request, &[], &[tablet(1, Some("node-a"), 2_000)], &[owner]);
+
+        assert_eq!(decision.action, RouteAction::Forward);
         assert_eq!(decision.owner_location.as_deref(), Some("us-west-2a"));
     }
 

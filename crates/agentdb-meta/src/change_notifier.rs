@@ -1,7 +1,8 @@
 //! Unified change-notification stream across dialects.
 //!
 //! Postgres delivers changes via `LISTEN/NOTIFY` triggers set
-//! up by migration 009 on `shards`, `nodes`, `tablets`.
+//! up by migrations 009 and 015 on `shards`, `nodes`, `tablets`,
+//! and `session_locators`.
 //! SQLite has no such primitive, so the SQLite variant
 //! returns a stream that never yields — consumers fall back
 //! to their existing periodic refresh loops.
@@ -15,8 +16,7 @@
 //! cache to refetch.
 //!
 //! `Channel` is a namespaced string (`shards`, `nodes`,
-//! `tablets`). The three are the only channels we advertise
-//! today; adding more is a one-line tuple extension.
+//! `tablets`, `session_locators`).
 
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ pub enum Channel {
     Shards,
     Nodes,
     Tablets,
+    SessionLocators,
 }
 
 impl Channel {
@@ -42,6 +43,7 @@ impl Channel {
             Channel::Shards => "agentdb_shards_changed",
             Channel::Nodes => "agentdb_nodes_changed",
             Channel::Tablets => "agentdb_tablets_changed",
+            Channel::SessionLocators => "agentdb_session_locators_changed",
         }
     }
 }
@@ -123,6 +125,7 @@ async fn run_pg_listen(
                     "agentdb_shards_changed" => Channel::Shards,
                     "agentdb_nodes_changed" => Channel::Nodes,
                     "agentdb_tablets_changed" => Channel::Tablets,
+                    "agentdb_session_locators_changed" => Channel::SessionLocators,
                     other => {
                         tracing::debug!(
                             channel = other,
@@ -170,5 +173,9 @@ mod tests {
         assert_eq!(Channel::Shards.pg_name(), "agentdb_shards_changed");
         assert_eq!(Channel::Nodes.pg_name(), "agentdb_nodes_changed");
         assert_eq!(Channel::Tablets.pg_name(), "agentdb_tablets_changed");
+        assert_eq!(
+            Channel::SessionLocators.pg_name(),
+            "agentdb_session_locators_changed"
+        );
     }
 }

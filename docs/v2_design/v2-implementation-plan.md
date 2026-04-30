@@ -815,9 +815,7 @@ Scope:
 
 Follow-up:
 
-- Split prototype location labels into durable region/AZ metadata.
-- Extend metadata notifications to `session_locators` so locator updates can
-  also wake the refresh loop immediately on Postgres.
+- Add operator-facing route metadata visibility for region/AZ decisions.
 
 ### V2.19 — Routing proxy policy knobs (~300 LoC)
 
@@ -841,9 +839,33 @@ Scope:
 
 Follow-up:
 
-- Split prototype location labels into durable region/AZ metadata.
-- Extend metadata notifications to `session_locators` so locator updates can
-  also wake the refresh loop immediately on Postgres.
+- Add operator-facing route metadata visibility for region/AZ decisions.
+
+### V2.20 — Durable region metadata and locator notifications (~350 LoC)
+
+Status: region metadata and locator notification support complete. V2.20
+replaces the prototype single location label with durable region metadata while
+preserving AZ fallback for older rows.
+
+Scope:
+
+- Migration 014 adds `nodes.region` alongside the existing
+  `nodes.availability_zone` failure-domain field.
+- `agentdb_meta::nodes::Node` persists and loads both `region` and
+  `availability_zone`.
+- Routing residency compares the owner node's `region` first and falls back to
+  `availability_zone` when region is unset.
+- `agentdb serve` exposes `--route-region` for new deployments and keeps
+  `--route-location` as a compatibility alias.
+- Migration 015 adds Postgres `session_locators` LISTEN/NOTIFY triggers.
+- Route snapshot refreshes now subscribe to shard, node, tablet, and session
+  locator change channels on Postgres.
+- Unit and smoke coverage verify region/AZ routing precedence, metadata
+  persistence, and session locator notifications.
+
+Follow-up:
+
+- Add operator-facing route metadata visibility for region/AZ decisions.
 
 ---
 

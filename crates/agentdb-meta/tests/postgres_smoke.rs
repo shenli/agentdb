@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use agentdb_meta::change_notifier::{subscribe, Channel};
-use agentdb_meta::{admin_tokens, nodes, MetaStore};
+use agentdb_meta::{admin_tokens, nodes, session_locators, tenants, MetaStore};
 
 fn pg_url() -> Option<String> {
     std::env::var("AGENTDB_TEST_PG_URL").ok()
@@ -32,15 +32,18 @@ async fn cleanup_schema(url: &str) {
         "DROP TRIGGER IF EXISTS trg_agentdb_shards_notify ON shards",
         "DROP TRIGGER IF EXISTS trg_agentdb_nodes_notify ON nodes",
         "DROP TRIGGER IF EXISTS trg_agentdb_tablets_notify ON tablets",
+        "DROP TRIGGER IF EXISTS trg_agentdb_session_locators_notify ON session_locators",
         "DROP FUNCTION IF EXISTS agentdb_notify_shards()",
         "DROP FUNCTION IF EXISTS agentdb_notify_nodes()",
         "DROP FUNCTION IF EXISTS agentdb_notify_tablets()",
+        "DROP FUNCTION IF EXISTS agentdb_notify_session_locators()",
         "DROP TABLE IF EXISTS tenant_quotas CASCADE",
         "DROP TABLE IF EXISTS admin_audit CASCADE",
         "DROP TABLE IF EXISTS admin_tokens CASCADE",
         "DROP TABLE IF EXISTS users CASCADE",
         "DROP TABLE IF EXISTS config CASCADE",
         "DROP TABLE IF EXISTS nodes CASCADE",
+        "DROP TABLE IF EXISTS session_locators CASCADE",
         "DROP TABLE IF EXISTS session_overrides CASCADE",
         "DROP TABLE IF EXISTS shards CASCADE",
         "DROP TABLE IF EXISTS tablets CASCADE",
@@ -79,6 +82,7 @@ async fn pg_migrations_apply_cleanly() {
         "config",
         "nodes",
         "schema_migrations",
+        "session_locators",
         "scheduler_leader",
         "session_overrides",
         "shards",
@@ -159,6 +163,7 @@ async fn pg_listen_notify_delivers_a_node_change() {
         "alive",
         10,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -169,6 +174,41 @@ async fn pg_listen_notify_delivers_a_node_change() {
         .expect("sender closed");
     assert_eq!(evt.channel, Channel::Nodes);
     assert_eq!(evt.payload, "pg-notify-test");
+
+    cleanup_schema(&url).await;
+}
+
+#[tokio::test]
+async fn pg_listen_notify_delivers_a_session_locator_change() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    cleanup_schema(&url).await;
+    let store = MetaStore::open_postgres(&url).await.unwrap();
+    let tenant = tenants::get_or_create(store.pool(), "ten_1", 10)
+        .await
+        .unwrap();
+    let mut rx = subscribe(&store, &[Channel::SessionLocators]);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    session_locators::upsert(
+        store.pool(),
+        "pg-session-notify-test",
+        tenant.internal_id,
+        "ten_1",
+        Some(7),
+        0,
+        10,
+    )
+    .await
+    .unwrap();
+
+    let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("no NOTIFY delivered within 3s")
+        .expect("sender closed");
+    assert_eq!(evt.channel, Channel::SessionLocators);
+    assert_eq!(evt.payload, "pg-session-notify-test");
 
     cleanup_schema(&url).await;
 }
