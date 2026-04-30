@@ -95,10 +95,19 @@ pub struct AppendAndFetchResponse {
 pub struct LifecycleSweepReport {
     pub sessions_transitioned: usize,
     pub artifacts_raw_purged: usize,
+    pub seal_segment_actions: usize,
+    pub move_to_cold_actions: usize,
+    pub archive_actions: usize,
+    pub hydrate_actions: usize,
+    pub work_units: usize,
+    pub soft_work_limit_exceeded: bool,
+    pub hard_work_limit_hit: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct GcSweepReport {
+    pub tenants_purged: usize,
+    pub agents_purged: usize,
     pub sessions_purged: usize,
     pub events_purged: usize,
     pub skills_purged: usize,
@@ -106,6 +115,11 @@ pub struct GcSweepReport {
     pub idempotency_purged: usize,
     pub records_purged: usize,
     pub artifacts_purged: usize,
+    pub changefeed_delete_events: usize,
+    pub changefeed_purge_events: usize,
+    pub work_units: usize,
+    pub soft_work_limit_exceeded: bool,
+    pub hard_work_limit_hit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,6 +252,13 @@ fn policy_for_tenant_in_state(s: &State, tenant_id: &Id) -> RuntimePolicy {
         .unwrap_or_default()
 }
 
+fn active_tenant_policy_for_id(s: &State, tenant_id: &Id) -> Option<RuntimePolicy> {
+    s.tenants
+        .get(tenant_id.as_str())
+        .filter(|t| t.deleted_at_ms.is_none())
+        .map(|t| RuntimePolicy::from_json(&t.policy))
+}
+
 fn lifecycle_rank(l: Lifecycle) -> u8 {
     match l {
         Lifecycle::Warm => 0,
@@ -245,6 +266,49 @@ fn lifecycle_rank(l: Lifecycle) -> u8 {
         Lifecycle::Archive => 2,
         Lifecycle::DerivativeOnly => 3,
     }
+}
+
+fn lifecycle_report_action(report: &mut LifecycleSweepReport, from: Lifecycle, to: Lifecycle) {
+    if lifecycle_rank(to) <= lifecycle_rank(from) {
+        return;
+    }
+    if from == Lifecycle::Warm && lifecycle_rank(to) >= lifecycle_rank(Lifecycle::Cold) {
+        report.seal_segment_actions += 1;
+        report.move_to_cold_actions += 1;
+    }
+    if lifecycle_rank(to) >= lifecycle_rank(Lifecycle::Archive) {
+        report.archive_actions += 1;
+    }
+}
+
+fn gc_work_allowed(report: &mut GcSweepReport, policy: &RuntimePolicy) -> bool {
+    if let Some(soft) = policy.quota.soft_max_gc_work_per_sweep {
+        if report.work_units >= soft {
+            report.soft_work_limit_exceeded = true;
+        }
+    }
+    if let Some(max) = policy.quota.max_gc_work_per_sweep {
+        if report.work_units >= max {
+            report.hard_work_limit_hit = true;
+            return false;
+        }
+    }
+    true
+}
+
+fn lifecycle_work_allowed(report: &mut LifecycleSweepReport, policy: &RuntimePolicy) -> bool {
+    if let Some(soft) = policy.quota.soft_max_lifecycle_work_per_sweep {
+        if report.work_units >= soft {
+            report.soft_work_limit_exceeded = true;
+        }
+    }
+    if let Some(max) = policy.quota.max_lifecycle_work_per_sweep {
+        if report.work_units >= max {
+            report.hard_work_limit_hit = true;
+            return false;
+        }
+    }
+    true
 }
 
 fn lifecycle_target(current: Lifecycle, idle_ms: u64, policy: &RuntimePolicy) -> Lifecycle {
@@ -470,21 +534,102 @@ impl Runtime {
     /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
     pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<Agent> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         s.agents
             .get(agent_id.as_str())
-            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
+            .filter(|a| {
+                tenant_live
+                    && a.deleted_at_ms.is_none()
+                    && a.tenant_id.as_str() == tenant_id.as_str()
+            })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+    }
+
+    pub async fn delete_tenant(&self, tenant_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+
+        let updated = {
+            let tenant = s
+                .tenants
+                .get_mut(tenant_id.as_str())
+                .expect("presence checked above");
+            tenant.deleted_at_ms = Some(crate::now_ms());
+            tenant.clone()
+        };
+
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_tenant(&updated) {
+                if let Some(tenant) = s.tenants.get_mut(tenant_id.as_str()) {
+                    tenant.deleted_at_ms = None;
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s.agents.get(agent_id.as_str()).is_some_and(|agent| {
+            agent.deleted_at_ms.is_none() && agent.tenant_id.as_str() == tenant_id.as_str()
+        });
+        if !live {
+            return Err(Error::new(
+                ErrorCode::AgentNotFound,
+                format!("{}", agent_id),
+            ));
+        }
+
+        let updated = {
+            let agent = s
+                .agents
+                .get_mut(agent_id.as_str())
+                .expect("presence checked above");
+            agent.deleted_at_ms = Some(crate::now_ms());
+            agent.clone()
+        };
+
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_agent(&updated) {
+                if let Some(agent) = s.agents.get_mut(agent_id.as_str()) {
+                    agent.deleted_at_ms = None;
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+        Ok(())
     }
 
     /// Look up a session by id, scoped to the given tenant. Returns
     /// `SessionNotFound` if the id is unknown or belongs to a different tenant.
     pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> Result<Session> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         s.sessions
             .get(session_id.as_str())
             .filter(|sess| {
-                sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+                tenant_live
+                    && sess.deleted_at_ms.is_none()
+                    && sess.tenant_id.as_str() == tenant_id.as_str()
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
@@ -553,7 +698,32 @@ impl Runtime {
     pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
         let a = {
             let mut s = self.state.lock().await;
-            if !s.tenants.contains_key(req.tenant_id.as_str()) {
+            let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
+                Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id))
+            })?;
+            if let Some(max) = policy.quota.max_agents {
+                let live_agents = s
+                    .agents
+                    .values()
+                    .filter(|a| {
+                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
+                    })
+                    .count();
+                if live_agents >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies agent create: agent quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
+            }
+            if !s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none())
+            {
                 return Err(Error::new(
                     ErrorCode::TenantNotFound,
                     format!("{}", req.tenant_id),
@@ -593,7 +763,9 @@ impl Runtime {
     pub async fn create_session(&self, req: NewSession) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
-            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
+            let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
+                Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id))
+            })?;
             if let Some(max) = policy.quota.max_active_sessions {
                 let active_sessions = s
                     .sessions
@@ -698,6 +870,26 @@ impl Runtime {
                     format!("{}", req.tenant_id),
                 ));
             }
+            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
+            if let Some(max) = policy.quota.max_skills {
+                let live_skills = s
+                    .skills
+                    .values()
+                    .filter(|skill| {
+                        skill.tenant_id.as_str() == req.tenant_id.as_str()
+                            && skill.deleted_at_ms.is_none()
+                    })
+                    .count();
+                if live_skills >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies skill register: skill quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
+            }
             let unique = skill_unique_state_key(req.tenant_id.as_str(), &req.name, &req.version);
             if s.skill_uniques.contains_key(&unique) {
                 return Err(Error::new(
@@ -750,10 +942,16 @@ impl Runtime {
 
     pub async fn get_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<Skill> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         s.skills
             .get(skill_id.as_str())
             .filter(|skill| {
-                skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
+                tenant_live
+                    && skill.deleted_at_ms.is_none()
+                    && skill.tenant_id.as_str() == tenant_id.as_str()
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", skill_id)))
@@ -870,6 +1068,27 @@ impl Runtime {
             if let Some(existing) = s.agent_skill_bindings.get(&key) {
                 return Ok(existing.clone());
             }
+            let policy = policy_for_tenant_in_state(&s, &req.tenant_id);
+            if let Some(max) = policy.quota.max_skill_bindings_per_agent {
+                let live_bindings = s
+                    .agent_skill_bindings
+                    .values()
+                    .filter(|binding| {
+                        binding.tenant_id.as_str() == req.tenant_id.as_str()
+                            && binding.agent_id.as_str() == req.agent_id.as_str()
+                            && binding.deleted_at_ms.is_none()
+                    })
+                    .count();
+                if live_bindings >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies skill bind: skill binding quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
+            }
             let binding =
                 AgentSkillBinding::create(req.tenant_id.clone(), req.agent_id.clone(), skill);
             if let Some(p) = &self.persist {
@@ -899,8 +1118,12 @@ impl Runtime {
         agent_id: &Id,
     ) -> Result<Vec<AgentSkillBinding>> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         let agent_live = s.agents.get(agent_id.as_str()).is_some_and(|a| {
-            a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
+            tenant_live && a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
         });
         if !agent_live {
             return Err(Error::new(
@@ -981,6 +1204,15 @@ impl Runtime {
             report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
         }
 
+        if let Some(soft) = policy.quota.soft_max_agents {
+            let live_agents = s
+                .agents
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .count();
+            report.push_if_over("agents", live_agents as u64, soft as u64);
+        }
+
         if let Some(soft) = policy.quota.soft_max_records {
             let live_records = s
                 .records
@@ -994,6 +1226,15 @@ impl Runtime {
             report.push_if_over("records", live_records as u64, soft as u64);
         }
 
+        if let Some(soft) = policy.quota.soft_max_artifacts {
+            let live_artifacts = s
+                .artifacts
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .count();
+            report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+        }
+
         if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
             let live_bytes: u64 = s
                 .artifacts
@@ -1002,6 +1243,17 @@ impl Runtime {
                 .map(|a| a.bytes)
                 .sum();
             report.push_if_over("artifact_storage", live_bytes, soft);
+        }
+
+        if let Some(soft) = policy.quota.soft_max_skills {
+            let live_skills = s
+                .skills
+                .values()
+                .filter(|skill| {
+                    skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
+                })
+                .count();
+            report.push_if_over("skills", live_skills as u64, soft as u64);
         }
 
         Ok(report)
@@ -1034,6 +1286,18 @@ impl Runtime {
         let mut report = BackpressureReport::default();
         if let Some(soft) = policy.quota.soft_max_events_per_session {
             report.push_if_over("session_events", session.next_seq, soft);
+        }
+        if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
+            let live_bindings = s
+                .agent_skill_bindings
+                .values()
+                .filter(|binding| {
+                    binding.tenant_id.as_str() == tenant_id.as_str()
+                        && binding.agent_id.as_str() == session.agent_id.as_str()
+                        && binding.deleted_at_ms.is_none()
+                })
+                .count();
+            report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
         }
         Ok(report)
     }
@@ -1077,6 +1341,24 @@ impl Runtime {
                     ErrorCode::TenantNotFound,
                     format!("{}", req.tenant_id),
                 ));
+            }
+            if let Some(max) = policy.quota.max_artifacts {
+                let live_artifacts = s
+                    .artifacts
+                    .values()
+                    .filter(|a| {
+                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
+                    })
+                    .count();
+                if live_artifacts >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies artifact write: artifact count quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
             }
             if let Some(max) = policy.quota.max_artifact_storage_bytes {
                 let live_bytes: u64 = s
@@ -1161,9 +1443,17 @@ impl Runtime {
     /// tenant B's artifact ids by error-code differential.
     pub async fn get_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<Artifact> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         s.artifacts
             .get(artifact_id.as_str())
-            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
+            .filter(|a| {
+                tenant_live
+                    && a.deleted_at_ms.is_none()
+                    && a.tenant_id.as_str() == tenant_id.as_str()
+            })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::ArtifactNotFound, format!("{}", artifact_id)))
     }
@@ -1267,11 +1557,15 @@ impl Runtime {
                     continue;
                 }
                 let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                if !lifecycle_work_allowed(&mut report, &policy) {
+                    break;
+                }
                 let idle_ms = now_ms.saturating_sub(session.last_active_at_ms);
                 let target = lifecycle_target(session.lifecycle, idle_ms, &policy);
                 if target == session.lifecycle {
                     continue;
                 }
+                let previous = session.lifecycle;
                 let mut updated = session;
                 updated.lifecycle = target;
                 updated.policy_version = policy.version;
@@ -1279,7 +1573,9 @@ impl Runtime {
                     p.put_session(&updated).map_err(internal)?;
                 }
                 s.sessions.insert(session_id, updated);
+                lifecycle_report_action(&mut report, previous, target);
                 report.sessions_transitioned += 1;
+                report.work_units += 1;
             }
 
             s.artifacts
@@ -1303,6 +1599,10 @@ impl Runtime {
         };
 
         for artifact in artifact_candidates {
+            let policy = self.resolve_policy_for_tenant(&artifact.tenant_id).await?;
+            if !lifecycle_work_allowed(&mut report, &policy) {
+                break;
+            }
             self.content
                 .delete(artifact.tenant_id.as_str(), artifact.artifact_id.as_str())
                 .await
@@ -1326,6 +1626,7 @@ impl Runtime {
                 p.put_artifact(&updated).map_err(internal)?;
             }
             report.artifacts_raw_purged += 1;
+            report.work_units += 1;
         }
 
         Ok(report)
@@ -1366,7 +1667,6 @@ impl Runtime {
             let mut tenants: Vec<(Id, Priority)> = s
                 .tenants
                 .values()
-                .filter(|tenant| tenant.deleted_at_ms.is_none())
                 .map(|tenant| {
                     let policy = RuntimePolicy::from_json(&tenant.policy);
                     (tenant.tenant_id.clone(), policy.priority)
@@ -1390,12 +1690,30 @@ impl Runtime {
         };
 
         for (tenant_id, priority) in scheduled {
-            let lifecycle = self
-                .sweep_lifecycle_for_tenant_at(&tenant_id, now_ms)
-                .await?;
-            let gc = self.gc_sweep_for_tenant_at(&tenant_id, now_ms).await?;
+            let tenant_live = {
+                let s = self.state.lock().await;
+                s.tenants
+                    .get(tenant_id.as_str())
+                    .is_some_and(|tenant| tenant.deleted_at_ms.is_none())
+            };
+            let lifecycle = if tenant_live {
+                self.sweep_lifecycle_for_tenant_at(&tenant_id, now_ms)
+                    .await?
+            } else {
+                LifecycleSweepReport::default()
+            };
+            let gc = self.gc_sweep_inner(Some(&tenant_id), now_ms).await?;
             report.lifecycle.sessions_transitioned += lifecycle.sessions_transitioned;
             report.lifecycle.artifacts_raw_purged += lifecycle.artifacts_raw_purged;
+            report.lifecycle.seal_segment_actions += lifecycle.seal_segment_actions;
+            report.lifecycle.move_to_cold_actions += lifecycle.move_to_cold_actions;
+            report.lifecycle.archive_actions += lifecycle.archive_actions;
+            report.lifecycle.hydrate_actions += lifecycle.hydrate_actions;
+            report.lifecycle.work_units += lifecycle.work_units;
+            report.lifecycle.soft_work_limit_exceeded |= lifecycle.soft_work_limit_exceeded;
+            report.lifecycle.hard_work_limit_hit |= lifecycle.hard_work_limit_hit;
+            report.gc.tenants_purged += gc.tenants_purged;
+            report.gc.agents_purged += gc.agents_purged;
             report.gc.sessions_purged += gc.sessions_purged;
             report.gc.events_purged += gc.events_purged;
             report.gc.skills_purged += gc.skills_purged;
@@ -1403,6 +1721,11 @@ impl Runtime {
             report.gc.idempotency_purged += gc.idempotency_purged;
             report.gc.records_purged += gc.records_purged;
             report.gc.artifacts_purged += gc.artifacts_purged;
+            report.gc.changefeed_delete_events += gc.changefeed_delete_events;
+            report.gc.changefeed_purge_events += gc.changefeed_purge_events;
+            report.gc.work_units += gc.work_units;
+            report.gc.soft_work_limit_exceeded |= gc.soft_work_limit_exceeded;
+            report.gc.hard_work_limit_hit |= gc.hard_work_limit_hit;
             report.tenants.push(TenantWorkerReport {
                 tenant_id,
                 priority,
@@ -1459,6 +1782,117 @@ impl Runtime {
             }
             self.idem.remove(&full_key);
             report.idempotency_purged += 1;
+            report.work_units += 1;
+        }
+
+        {
+            let mut s = self.state.lock().await;
+            let agent_ids: Vec<String> = s
+                .agents
+                .iter()
+                .filter_map(|(id, agent)| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| agent.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
+                    let tenant = s.tenants.get(agent.tenant_id.as_str())?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    let deleted_at = agent.deleted_at_ms.or(tenant.deleted_at_ms)?;
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect();
+
+            for agent_id in agent_ids {
+                let Some(agent) = s.agents.get(&agent_id).cloned() else {
+                    continue;
+                };
+                let policy = policy_for_tenant_in_state(&s, &agent.tenant_id);
+                if !gc_work_allowed(&mut report, &policy) {
+                    break;
+                }
+                let session_ids: Vec<String> = s
+                    .sessions
+                    .iter()
+                    .filter_map(|(id, session)| {
+                        (session.tenant_id.as_str() == agent.tenant_id.as_str()
+                            && session.agent_id.as_str() == agent.agent_id.as_str())
+                        .then(|| id.clone())
+                    })
+                    .collect();
+                for session_id in session_ids {
+                    let Some(session) = s.sessions.get(&session_id).cloned() else {
+                        continue;
+                    };
+                    if let Some(p) = &self.persist {
+                        report.events_purged += p
+                            .delete_session_events(
+                                session.tenant_id.as_str(),
+                                session.session_id.as_str(),
+                            )
+                            .map_err(internal)?;
+                        p.delete_session(&session).map_err(internal)?;
+                    } else {
+                        let lo = (session.session_id.as_str().to_string(), 0);
+                        let hi = (session.session_id.as_str().to_string(), u64::MAX);
+                        let event_ids: Vec<String> = s
+                            .events
+                            .range(lo..=hi)
+                            .map(|(_, event)| event.event_id.as_str().to_string())
+                            .collect();
+                        for event_id in event_ids {
+                            if let Some((_, seq)) = s.event_by_id.remove(&event_id) {
+                                s.events
+                                    .remove(&(session.session_id.as_str().to_string(), seq));
+                                report.events_purged += 1;
+                            }
+                        }
+                    }
+                    s.sessions.remove(&session_id);
+                    if let Some(alias) = session.alias.as_deref() {
+                        s.session_aliases
+                            .remove(&scoped_alias_key(session.tenant_id.as_str(), alias));
+                    }
+                    report.sessions_purged += 1;
+                    report.changefeed_purge_events += 1;
+                    report.work_units += 1;
+                }
+                if let Some(p) = &self.persist {
+                    p.delete_agent(&agent).map_err(internal)?;
+                }
+                let binding_keys: Vec<(String, String)> = s
+                    .agent_skill_bindings
+                    .iter()
+                    .filter_map(|(key, binding)| {
+                        (binding.tenant_id.as_str() == agent.tenant_id.as_str()
+                            && binding.agent_id.as_str() == agent.agent_id.as_str())
+                        .then(|| key.clone())
+                    })
+                    .collect();
+                for key in binding_keys {
+                    let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {
+                        continue;
+                    };
+                    if let Some(p) = &self.persist {
+                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                    }
+                    s.agent_skill_bindings.remove(&key);
+                    report.skill_bindings_purged += 1;
+                }
+                s.agents.remove(&agent_id);
+                if let Some(alias) = agent.alias.as_deref() {
+                    s.agent_aliases
+                        .remove(&scoped_alias_key(agent.tenant_id.as_str(), alias));
+                }
+                report.agents_purged += 1;
+                report.changefeed_purge_events += 1;
+                report.work_units += 1;
+            }
         }
 
         {
@@ -1472,8 +1906,16 @@ impl Runtime {
                     {
                         return None;
                     }
-                    let deleted_at = session.deleted_at_ms?;
-                    let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                    let tenant = s.tenants.get(session.tenant_id.as_str())?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    let agent_deleted_at = s
+                        .agents
+                        .get(session.agent_id.as_str())
+                        .and_then(|agent| agent.deleted_at_ms);
+                    let deleted_at = session
+                        .deleted_at_ms
+                        .or(agent_deleted_at)
+                        .or(tenant.deleted_at_ms)?;
                     if policy.retention.legal_hold
                         || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
                     {
@@ -1487,6 +1929,10 @@ impl Runtime {
                 let Some(session) = s.sessions.get(&session_id).cloned() else {
                     continue;
                 };
+                let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                if !gc_work_allowed(&mut report, &policy) {
+                    break;
+                }
                 if let Some(p) = &self.persist {
                     report.events_purged += p
                         .delete_session_events(
@@ -1517,6 +1963,8 @@ impl Runtime {
                         .remove(&scoped_alias_key(session.tenant_id.as_str(), alias));
                 }
                 report.sessions_purged += 1;
+                report.changefeed_purge_events += 1;
+                report.work_units += 1;
             }
         }
 
@@ -1531,8 +1979,9 @@ impl Runtime {
                     {
                         return None;
                     }
-                    let deleted_at = skill.deleted_at_ms?;
-                    let policy = policy_for_tenant_in_state(&s, &skill.tenant_id);
+                    let tenant = s.tenants.get(skill.tenant_id.as_str())?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    let deleted_at = skill.deleted_at_ms.or(tenant.deleted_at_ms)?;
                     if policy.retention.legal_hold
                         || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
                     {
@@ -1546,6 +1995,10 @@ impl Runtime {
                 let Some(skill) = s.skills.get(&skill_id).cloned() else {
                     continue;
                 };
+                let policy = policy_for_tenant_in_state(&s, &skill.tenant_id);
+                if !gc_work_allowed(&mut report, &policy) {
+                    break;
+                }
                 let binding_keys: Vec<(String, String)> = s
                     .agent_skill_bindings
                     .iter()
@@ -1575,6 +2028,8 @@ impl Runtime {
                 ));
                 s.skills.remove(&skill_id);
                 report.skills_purged += 1;
+                report.changefeed_purge_events += 1;
+                report.work_units += 1;
             }
         }
 
@@ -1589,8 +2044,9 @@ impl Runtime {
                     {
                         return None;
                     }
-                    let deleted_at = r.deleted_at_ms?;
-                    let policy = policy_for_tenant_in_state(&s, &r.tenant_id);
+                    let tenant = s.tenants.get(r.tenant_id.as_str())?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    let deleted_at = r.deleted_at_ms.or(tenant.deleted_at_ms)?;
                     if policy.retention.legal_hold
                         || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
                     {
@@ -1604,6 +2060,10 @@ impl Runtime {
                 let Some(record) = s.records.get(&record_id).cloned() else {
                     continue;
                 };
+                let policy = policy_for_tenant_in_state(&s, &record.tenant_id);
+                if !gc_work_allowed(&mut report, &policy) {
+                    break;
+                }
                 if let Some(p) = &self.persist {
                     p.delete_record(&record).map_err(internal)?;
                 }
@@ -1612,6 +2072,8 @@ impl Runtime {
                     s.doc_to_record.remove(&doc);
                 }
                 report.records_purged += 1;
+                report.changefeed_purge_events += 1;
+                report.work_units += 1;
             }
         }
 
@@ -1625,8 +2087,9 @@ impl Runtime {
                     {
                         return None;
                     }
-                    let deleted_at = a.deleted_at_ms?;
-                    let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                    let tenant = s.tenants.get(a.tenant_id.as_str())?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    let deleted_at = a.deleted_at_ms.or(tenant.deleted_at_ms)?;
                     if policy.retention.legal_hold
                         || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
                     {
@@ -1638,6 +2101,13 @@ impl Runtime {
         };
 
         for artifact in artifact_candidates {
+            let policy = {
+                let s = self.state.lock().await;
+                policy_for_tenant_in_state(&s, &artifact.tenant_id)
+            };
+            if !gc_work_allowed(&mut report, &policy) {
+                break;
+            }
             self.content
                 .delete(artifact.tenant_id.as_str(), artifact.artifact_id.as_str())
                 .await
@@ -1649,7 +2119,12 @@ impl Runtime {
             let Some(current) = s.artifacts.get(artifact.artifact_id.as_str()).cloned() else {
                 continue;
             };
-            if current.deleted_at_ms.is_none()
+            let tenant_deleted = s
+                .tenants
+                .get(current.tenant_id.as_str())
+                .and_then(|tenant| tenant.deleted_at_ms)
+                .is_some();
+            if (current.deleted_at_ms.is_none() && !tenant_deleted)
                 || current.tenant_id.as_str() != artifact.tenant_id.as_str()
             {
                 continue;
@@ -1659,6 +2134,70 @@ impl Runtime {
             }
             s.artifacts.remove(artifact.artifact_id.as_str());
             report.artifacts_purged += 1;
+            report.changefeed_purge_events += 1;
+            report.work_units += 1;
+        }
+
+        {
+            let mut s = self.state.lock().await;
+            let tenant_ids: Vec<String> = s
+                .tenants
+                .iter()
+                .filter_map(|(id, tenant)| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| tenant.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
+                    let deleted_at = tenant.deleted_at_ms?;
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect();
+
+            for tenant_id in tenant_ids {
+                let Some(tenant) = s.tenants.get(&tenant_id).cloned() else {
+                    continue;
+                };
+                let policy = RuntimePolicy::from_json(&tenant.policy);
+                if !gc_work_allowed(&mut report, &policy) {
+                    break;
+                }
+                let has_children = s
+                    .agents
+                    .values()
+                    .any(|agent| agent.tenant_id.as_str() == tenant.tenant_id.as_str())
+                    || s.sessions
+                        .values()
+                        .any(|session| session.tenant_id.as_str() == tenant.tenant_id.as_str())
+                    || s.records
+                        .values()
+                        .any(|record| record.tenant_id.as_str() == tenant.tenant_id.as_str())
+                    || s.artifacts
+                        .values()
+                        .any(|artifact| artifact.tenant_id.as_str() == tenant.tenant_id.as_str())
+                    || s.skills
+                        .values()
+                        .any(|skill| skill.tenant_id.as_str() == tenant.tenant_id.as_str());
+                if has_children {
+                    continue;
+                }
+                if let Some(p) = &self.persist {
+                    p.delete_tenant(&tenant).map_err(internal)?;
+                }
+                s.tenants.remove(&tenant_id);
+                if !tenant.external_key.is_empty() {
+                    s.tenant_aliases.remove(&tenant.external_key);
+                }
+                report.tenants_purged += 1;
+                report.changefeed_purge_events += 1;
+                report.work_units += 1;
+            }
         }
 
         Ok(report)
@@ -1991,18 +2530,30 @@ impl Runtime {
     ///
     /// # Parameters
     /// - `last`: maximum number of recent events to return.
-    /// - `max_bytes`: **reserved**; not enforced until V2.4 introduces budgeted
-    ///   context. Callers should pass a sensible cap anyway since it will become
-    ///   load-bearing without an API change.
+    /// - `max_bytes`: byte budget for returned recent event envelopes. The
+    ///   runtime keeps the newest events that fit and drops older context.
     pub async fn append_and_fetch(
         &self,
         req: AppendRequest,
         last: usize,
-        _max_bytes: usize,
+        max_bytes: usize,
     ) -> Result<AppendAndFetchResponse> {
-        // TODO(V2.4): enforce max_bytes
         let tenant_id = req.tenant_id.clone();
         let session_id = req.session_id.clone();
+        let policy = self
+            .resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
+            .await?;
+        if let Some(max) = policy.quota.max_context_bytes {
+            if max_bytes > max {
+                return Err(Error::new(
+                    ErrorCode::PolicyDenied,
+                    format!(
+                        "policy_version {} denies append_and_fetch: context byte request {max_bytes} exceeds quota {max}",
+                        policy.version
+                    ),
+                ));
+            }
+        }
         let appended = self.append(req).await?;
 
         // KV-backed: scan the session's events from storage so we don't need to
@@ -2017,6 +2568,7 @@ impl Runtime {
                 let drop_n = all.len() - last;
                 all.drain(0..drop_n);
             }
+            trim_recent_to_budget(&mut all, max_bytes);
             return Ok(AppendAndFetchResponse {
                 event_id: appended.event_id,
                 seq: appended.seq,
@@ -2035,6 +2587,7 @@ impl Runtime {
             .map(|(_, v)| v.clone())
             .collect();
         recent.reverse();
+        trim_recent_to_budget(&mut recent, max_bytes);
 
         Ok(AppendAndFetchResponse {
             event_id: appended.event_id,
@@ -2096,6 +2649,16 @@ impl Runtime {
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(req.tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::SessionNotFound,
+                format!("{}", req.session_id),
+            ));
+        }
         let session = s
             .sessions
             .get(req.session_id.as_str())
@@ -2282,10 +2845,15 @@ impl Runtime {
         include_deleted: bool,
     ) -> Result<SearchableRecord> {
         let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
         s.records
             .get(record_id.as_str())
             .filter(|r| {
-                (include_deleted || r.deleted_at_ms.is_none())
+                tenant_live
+                    && (include_deleted || r.deleted_at_ms.is_none())
                     && r.tenant_id.as_str() == tenant_id.as_str()
                     && (include_deleted || !r.is_expired())
             })
@@ -2475,6 +3043,28 @@ fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
         return None;
     }
     Some(usage.saturating_mul(100).saturating_div(soft_limit))
+}
+
+fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
+    if max_bytes == 0 {
+        recent.clear();
+        return;
+    }
+    let mut used = 0usize;
+    let mut keep_from = recent.len();
+    for (idx, event) in recent.iter().enumerate().rev() {
+        let event_bytes = serde_json::to_vec(event)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if used.saturating_add(event_bytes) > max_bytes {
+            break;
+        }
+        used += event_bytes;
+        keep_from = idx;
+    }
+    if keep_from > 0 {
+        recent.drain(0..keep_from);
+    }
 }
 
 /// Compare a record's `source` against a search filter. The filter

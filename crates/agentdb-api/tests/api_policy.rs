@@ -567,3 +567,132 @@ async fn gc_sweep_reports_idempotency_purges() {
         .unwrap();
     assert_eq!(gc["idempotency_purged"].as_u64(), Some(1));
 }
+
+#[tokio::test]
+async fn delete_agent_and_tenant_gc_are_exposed_over_api() {
+    let app = spawn_app().await;
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "api-tenant-gc",
+            "policy": {"retention": {"retention_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = tenant["tenant_id"].as_str().unwrap();
+    let agent: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({"alias": "api-agent", "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = agent["agent_id"].as_str().unwrap();
+    let session: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
+        .json(&json!({"alias": null}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = session["session_id"].as_str().unwrap();
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deleted_agent = app
+        .client
+        .delete(format!("{}/api/tenants/{tid}/agents/{aid}", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_agent.status().as_u16(), 204);
+    let gc: serde_json::Value = app
+        .client
+        .post(format!("{}/api/policy/worker/run", app.base))
+        .json(&json!({"now_ms": u64::MAX, "max_tenants": 10}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gc["gc"]["agents_purged"].as_u64(), Some(1));
+    assert_eq!(gc["gc"]["sessions_purged"].as_u64(), Some(1));
+    assert_eq!(gc["gc"]["events_purged"].as_u64(), Some(1));
+    assert!(gc["gc"]["changefeed_purge_events"].as_u64().unwrap() >= 2);
+
+    let tenant2: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "api-root-gc",
+            "policy": {"retention": {"retention_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid2 = tenant2["tenant_id"].as_str().unwrap();
+    let deleted_tenant = app
+        .client
+        .delete(format!("{}/api/tenants/{tid2}", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_tenant.status().as_u16(), 204);
+
+    let gc: serde_json::Value = app
+        .client
+        .post(format!("{}/api/policy/worker/run", app.base))
+        .json(&json!({"now_ms": u64::MAX, "max_tenants": 10}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gc["gc"]["tenants_purged"].as_u64(), Some(1));
+}

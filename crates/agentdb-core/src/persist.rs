@@ -72,6 +72,19 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    pub fn delete_tenant(&self, t: &Tenant) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Delete {
+            key: tenant_record_key(t.tenant_id.as_str()).into_bytes(),
+        });
+        if !t.external_key.is_empty() {
+            ops.push(WriteOp::Delete {
+                key: tenant_alias_key(&t.external_key).into_bytes(),
+            });
+        }
+        self.kv.write_batch(ops)
+    }
+
     pub fn put_agent(&self, a: &Agent) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Put {
@@ -83,6 +96,21 @@ impl Persist {
                 ops.push(WriteOp::Put {
                     key: agent_alias_key(a.tenant_id.as_str(), alias).into_bytes(),
                     value: a.agent_id.as_str().as_bytes().to_vec(),
+                });
+            }
+        }
+        self.kv.write_batch(ops)
+    }
+
+    pub fn delete_agent(&self, a: &Agent) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Delete {
+            key: agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str()).into_bytes(),
+        });
+        if let Some(alias) = a.alias.as_deref() {
+            if !alias.is_empty() {
+                ops.push(WriteOp::Delete {
+                    key: agent_alias_key(a.tenant_id.as_str(), alias).into_bytes(),
                 });
             }
         }
