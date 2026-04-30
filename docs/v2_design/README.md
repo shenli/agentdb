@@ -43,10 +43,10 @@ Implementation checkpoint:
   context, watch, and SSE inspection.
 - V2.9 covers the P1 integration backlog with an OpenAI Agents SDK session
   adapter, MCP stdio server, and Vercel AI SDK persistence template on top of
-  the V2 API. Multi-node scale-out remains a post-adapter follow-up.
+  the V2 API. Multi-node scale-out is tracked in V2.10+.
 - V2.10 starts the multi-node scale-out path with a pure metadata routing
   planner over nodes, tablets, shards, session locators, leases, and residency
-  policy. Runtime request forwarding remains the next follow-up.
+  policy.
 - V2.11 adds the HTTP-facing routing contract in `agentdb-api`: route planner
   output now has concrete local/forward/reject outcomes, forwarding headers,
   retryable 503 unassigned responses, 421 wrong-location responses, and
@@ -84,8 +84,8 @@ Implementation checkpoint:
 - V2.22 adds `GET /api/admin/routing/decision` dry-run diagnostics for a
   tenant and optional session id, returning the local/forward/reject decision
   without issuing a session request.
-- Current next milestone: clean stale V2 gap-summary references for completed
-  request forwarding and durable region metadata work.
+- Current next milestone: add KMS/key availability signals at storage
+  boundaries and route rejection diagnostics.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
