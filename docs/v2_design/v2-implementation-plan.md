@@ -663,6 +663,30 @@ Follow-up:
 - Add the actual HTTP client execution path and response pass-through.
 - Teach forwarded requests to validate tablet epoch before mutating state.
 
+### V2.13 — Runtime routing guard in API state (~350 LoC)
+
+Status: guard injection complete. V2.13 adds a cloneable `RouteRuntime` to
+`AppState` so the HTTP data path has a single place to evaluate routing before
+session-scoped handlers mutate or read state.
+
+Scope:
+
+- `AppState::new(runtime)` installs a disabled route runtime for current
+  single-node behavior.
+- `AppState::with_routing(...)` lets tests and future server boot code inject a
+  route runtime without changing every handler constructor.
+- `RouteRuntime::guard(...)` returns local, forward, or reject outcomes using
+  the V2.11/V2.12 contracts.
+- Fixed-decision test mode exercises forward and reject behavior before the
+  metadata snapshot loader is wired in.
+
+Follow-up:
+
+- Replace fixed-decision test mode with metadata-backed route snapshots.
+- Call `RouteRuntime::guard` from session/event handlers.
+- Execute `ForwardRequest` through an internal HTTP client and pass through the
+  owner node response.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

@@ -5,6 +5,8 @@
 //! data path can take: serve locally, forward to an owner node, or reject with a
 //! structured error response.
 
+use std::sync::Arc;
+
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -44,6 +46,25 @@ pub enum RouteHttpOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteGuardOutcome {
+    ServeLocal(HeaderMap),
+    Forward(ForwardRequest),
+    Reject(RouteRejection),
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteRuntime {
+    local_node_id: Arc<str>,
+    mode: RouteRuntimeMode,
+}
+
+#[derive(Debug, Clone)]
+enum RouteRuntimeMode {
+    Disabled,
+    Fixed(RouteDecision),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub tablet_id: i64,
     pub owner_node_id: String,
@@ -65,6 +86,47 @@ pub struct RouteRejection {
 pub struct ForwardRequest {
     pub uri: String,
     pub headers: HeaderMap,
+}
+
+impl RouteRuntime {
+    pub fn disabled() -> Self {
+        Self {
+            local_node_id: Arc::from("single-node"),
+            mode: RouteRuntimeMode::Disabled,
+        }
+    }
+
+    pub fn fixed(local_node_id: impl Into<Arc<str>>, decision: RouteDecision) -> Self {
+        Self {
+            local_node_id: local_node_id.into(),
+            mode: RouteRuntimeMode::Fixed(decision),
+        }
+    }
+
+    pub fn guard(
+        &self,
+        original_path_and_query: &str,
+        incoming_headers: &HeaderMap,
+    ) -> RouteGuardOutcome {
+        let RouteRuntimeMode::Fixed(decision) = &self.mode else {
+            return RouteGuardOutcome::ServeLocal(HeaderMap::new());
+        };
+        match route_http_outcome(decision) {
+            RouteHttpOutcome::ServeLocal(target) => RouteGuardOutcome::ServeLocal(target.headers),
+            RouteHttpOutcome::Forward(target) => {
+                match prepare_forward_request(
+                    &target,
+                    original_path_and_query,
+                    incoming_headers,
+                    &self.local_node_id,
+                ) {
+                    Ok(req) => RouteGuardOutcome::Forward(req),
+                    Err(rejection) => RouteGuardOutcome::Reject(rejection),
+                }
+            }
+            RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -443,5 +505,45 @@ mod tests {
             err.headers[HDR_ROUTE_REASON].to_str().unwrap(),
             "ROUTE_FORWARD_LOOP"
         );
+    }
+
+    #[test]
+    fn route_runtime_disabled_serves_local_without_headers() {
+        let runtime = RouteRuntime::disabled();
+        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+
+        let RouteGuardOutcome::ServeLocal(headers) = outcome else {
+            panic!("expected local");
+        };
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn route_runtime_fixed_forward_prepares_request() {
+        let runtime = RouteRuntime::fixed("node-local", decision(RouteAction::Forward, None));
+        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+
+        let RouteGuardOutcome::Forward(req) = outcome else {
+            panic!("expected forward");
+        };
+        assert_eq!(req.uri, "http://node-a:8080/api/tenants/ten_1/watch");
+        assert_eq!(
+            req.headers[HDR_FORWARDED_BY].to_str().unwrap(),
+            "node-local"
+        );
+    }
+
+    #[test]
+    fn route_runtime_fixed_reject_returns_rejection() {
+        let runtime = RouteRuntime::fixed(
+            "node-local",
+            decision(RouteAction::Reject, Some(RouteReason::WrongLocation)),
+        );
+        let outcome = runtime.guard("/api/tenants/ten_1/watch", &HeaderMap::new());
+
+        let RouteGuardOutcome::Reject(rejection) = outcome else {
+            panic!("expected rejection");
+        };
+        assert_eq!(rejection.code, "ROUTE_WRONG_LOCATION");
     }
 }
