@@ -637,6 +637,7 @@ mod tests {
             last_heartbeat_ms: 100,
             joined_at_ms: 100,
             availability_zone: Some(location.into()),
+            region: Some(location.into()),
         }
     }
 
@@ -972,6 +973,7 @@ mod tests {
             "alive",
             100,
             Some("us-west-2a"),
+            Some("us-west-2"),
         )
         .await
         .unwrap();
@@ -986,7 +988,7 @@ mod tests {
             .unwrap();
 
         let snapshot =
-            RouteSnapshot::load_from_meta(&store, 1, Some("us-west-2a".into()), Default::default())
+            RouteSnapshot::load_from_meta(&store, 1, Some("us-west-2".into()), Default::default())
                 .await
                 .unwrap();
 

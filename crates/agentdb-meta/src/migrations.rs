@@ -97,6 +97,18 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/013_nodes_availability_zone.sql"),
         include_str!("../migrations/013_nodes_availability_zone.pg.sql"),
     ),
+    (
+        14,
+        "nodes.region (durable residency routing metadata)",
+        include_str!("../migrations/014_nodes_region.sql"),
+        include_str!("../migrations/014_nodes_region.pg.sql"),
+    ),
+    (
+        15,
+        "session_locators LISTEN/NOTIFY trigger",
+        include_str!("../migrations/015_session_locator_notify.sql"),
+        include_str!("../migrations/015_session_locator_notify.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
@@ -259,6 +271,7 @@ mod tests {
             "config",
             "nodes",
             "schema_migrations",
+            "session_locators",
             "scheduler_leader",
             "session_overrides",
             "shards",

@@ -608,6 +608,7 @@ fn node(id: &str, address: &str) -> Node {
         last_heartbeat_ms: 100,
         joined_at_ms: 100,
         availability_zone: Some("us-west-2a".into()),
+        region: Some("us-west-2".into()),
     }
 }
 

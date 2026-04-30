@@ -75,8 +75,11 @@ Implementation checkpoint:
 - V2.19 adds production proxy policy knobs: forwarded requests use a bounded
   timeout and owner responses are rejected when they exceed the configured
   proxy body limit.
-- Current next milestone: split prototype location labels into durable
-  region/AZ metadata.
+- V2.20 splits the prototype routing location label into durable
+  `nodes.region` metadata with AZ fallback, adds `--route-region`, and wakes
+  route snapshot refreshes immediately on Postgres `session_locators` changes.
+- Current next milestone: add operator-facing route metadata visibility for
+  region/AZ decisions.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

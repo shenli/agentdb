@@ -54,8 +54,14 @@ struct ServeOpts {
     #[arg(long, default_value_t = agentdb_meta::shards::DEFAULT_SHARD_COUNT)]
     route_shard_count: i64,
 
-    /// Optional location label for residency-aware routing. Currently compared
-    /// with node availability_zone until region and AZ split.
+    /// Optional region for residency-aware routing. Compared with
+    /// `nodes.region`, falling back to `availability_zone` for older rows that
+    /// only populated the prototype location label.
+    #[arg(long)]
+    route_region: Option<String>,
+
+    /// Backward-compatible alias for the old prototype location label. Prefer
+    /// `--route-region` for new deployments.
     #[arg(long)]
     route_location: Option<String>,
 
@@ -115,23 +121,24 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: opts.route_proxy_timeout_ms,
             max_response_bytes: opts.route_proxy_max_response_bytes,
         });
+    let route_location = opts.route_region.clone().or(opts.route_location.clone());
     if let Some(node_id) = opts.route_node_id.as_deref() {
         let meta = agentdb_meta::MetaStore::open_from_env().await?;
         let snapshot =
-            load_route_snapshot(&meta, opts.route_shard_count, opts.route_location.clone()).await?;
+            load_route_snapshot(&meta, opts.route_shard_count, route_location.clone()).await?;
         let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
         spawn_route_snapshot_refresher(
             meta,
             routing.clone(),
             opts.route_shard_count,
-            opts.route_location.clone(),
+            route_location.clone(),
             opts.route_refresh_interval_ms,
         );
         state = state.with_routing(routing);
         tracing::info!(
             node_id,
             shard_count = opts.route_shard_count,
-            location = ?opts.route_location,
+            location = ?route_location,
             refresh_interval_ms = opts.route_refresh_interval_ms,
             "enabled metadata-backed route snapshot"
         );
@@ -171,6 +178,7 @@ fn spawn_route_snapshot_refresher(
             agentdb_meta::change_notifier::Channel::Shards,
             agentdb_meta::change_notifier::Channel::Nodes,
             agentdb_meta::change_notifier::Channel::Tablets,
+            agentdb_meta::change_notifier::Channel::SessionLocators,
         ],
     );
     tokio::spawn(async move {
@@ -195,6 +203,7 @@ fn spawn_route_snapshot_refresher(
                                     agentdb_meta::change_notifier::Channel::Shards,
                                     agentdb_meta::change_notifier::Channel::Nodes,
                                     agentdb_meta::change_notifier::Channel::Tablets,
+                                    agentdb_meta::change_notifier::Channel::SessionLocators,
                                 ],
                             );
                         }
