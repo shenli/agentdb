@@ -29,22 +29,11 @@ use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
 use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
+use crate::policy::RuntimePolicy;
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
 use crate::session::{NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
-
-/// V2.1 hardcoded artifact size cap. Picked to fit comfortably in memory
-/// since the content backend reads/writes the whole blob in one shot.
-/// TODO(V2.4): drive this from the tenant policy instead.
-const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
-
-/// V2.1 hardcoded ceiling on the serialized JSON size of an inline event
-/// payload. Anything bigger should be stored as an artifact and referenced via
-/// `artifact_refs`; the suggestion attached to `EventTooLarge` points callers
-/// at that path.
-/// TODO(V2.4): drive this from the tenant policy instead.
-const MAX_INLINE_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -684,6 +673,40 @@ impl Runtime {
             .collect())
     }
 
+    pub async fn resolve_policy_for_tenant(&self, tenant_id: &Id) -> Result<RuntimePolicy> {
+        let s = self.state.lock().await;
+        let tenant = s
+            .tenants
+            .get(tenant_id.as_str())
+            .filter(|t| t.deleted_at_ms.is_none())
+            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))?;
+        Ok(RuntimePolicy::from_json(&tenant.policy))
+    }
+
+    pub async fn resolve_policy_for_agent(
+        &self,
+        tenant_id: &Id,
+        agent_id: &Id,
+    ) -> Result<RuntimePolicy> {
+        let s = self.state.lock().await;
+        let tenant = s
+            .tenants
+            .get(tenant_id.as_str())
+            .filter(|t| t.deleted_at_ms.is_none())
+            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))?;
+        let agent = s
+            .agents
+            .get(agent_id.as_str())
+            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
+            .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))?;
+        let base = RuntimePolicy::from_json(&tenant.policy);
+        let override_json = agent
+            .config
+            .get("policy")
+            .unwrap_or(&serde_json::Value::Null);
+        Ok(base.merge_override(override_json))
+    }
+
     /// Create an artifact: write the bytes to the content backend, persist
     /// the metadata, return the metadata record. Tenant must exist.
     ///
@@ -696,13 +719,17 @@ impl Runtime {
     /// (TODO: link the reaper plan once it lands). This task accepts the
     /// orphan window in exchange for a simpler V2.1 surface.
     pub async fn create_artifact(&self, req: NewArtifact, bytes: Vec<u8>) -> Result<Artifact> {
+        let policy = self.resolve_policy_for_tenant(&req.tenant_id).await?;
         // Reject oversized blobs before touching the content backend so a
         // misbehaving caller can't fill disk by streaming a huge body.
         let len = bytes.len() as u64;
-        if len > MAX_ARTIFACT_BYTES {
+        if len > policy.artifact_size.max_artifact_bytes {
             return Err(Error::new(
                 ErrorCode::ArtifactTooLarge,
-                format!("artifact body {len} bytes exceeds cap {MAX_ARTIFACT_BYTES}"),
+                format!(
+                    "artifact body {len} bytes exceeds cap {}",
+                    policy.artifact_size.max_artifact_bytes
+                ),
             ));
         }
 
@@ -855,19 +882,23 @@ impl Runtime {
             }
         }
 
+        let policy = self
+            .resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
+            .await?;
+
         // Inline payload size guard. Done after the idempotency short-circuit
         // (a retry that already committed should replay, not re-validate) but
         // before we lock state, so a misbehaving caller can't churn the mutex
         // by hammering oversized payloads. The MAX_INLINE_EVENT_BYTES limit is
-        // hardcoded for V2.1; V2.4 will pull it from the tenant policy.
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        if payload_len > MAX_INLINE_EVENT_BYTES {
+        if payload_len > policy.artifact_size.max_inline_event_bytes {
             return Err(Error::new(
                 ErrorCode::EventTooLarge,
                 format!(
-                    "inline event payload {payload_len} bytes exceeds {MAX_INLINE_EVENT_BYTES} byte limit"
+                    "inline event payload {payload_len} bytes exceeds {} byte limit",
+                    policy.artifact_size.max_inline_event_bytes
                 ),
             )
             .with_suggestion(
@@ -914,6 +945,17 @@ impl Runtime {
                     ErrorCode::AgentNotFound,
                     format!("{}", req.agent_id),
                 ));
+            }
+            if let Some(max) = policy.quota.max_events_per_session {
+                if session.next_seq >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies append: session event quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
             }
         }
 
@@ -1010,7 +1052,7 @@ impl Runtime {
             }
         }
 
-        let (seq, policy_version, session_snapshot) = {
+        let (seq, _prior_policy_version, session_snapshot) = {
             // Re-acquire mutable access to the session row to mint the seq
             // and bump `last_active_at_ms`. The validation above already
             // confirmed the session is the right tenant + agent; no
@@ -1023,6 +1065,7 @@ impl Runtime {
             let pv = session.policy_version;
             session.next_seq += 1;
             session.last_active_at_ms = crate::now_ms();
+            session.policy_version = policy.version;
             (seq, pv, session.clone())
         };
 
@@ -1036,7 +1079,7 @@ impl Runtime {
             artifact_refs: req.artifact_refs.clone(),
             source_refs: req.source_refs.clone(),
             idempotency_key: req.idempotency_key.clone(),
-            policy_version,
+            policy_version: policy.version,
         });
         let event_id = envelope.event_id.clone();
 
@@ -1305,6 +1348,7 @@ impl Runtime {
     /// roll the indexes back to keep the runtime consistent with disk.
     pub async fn write_record(&self, req: NewRecord) -> Result<SearchableRecord> {
         let record = SearchableRecord::create(req);
+        let policy = self.resolve_policy_for_tenant(&record.tenant_id).await?;
 
         // Validate tenant exists. We hold the state lock only for the
         // tenant existence check; the index operations and persist
@@ -1320,6 +1364,26 @@ impl Runtime {
                     ErrorCode::TenantNotFound,
                     format!("{}", record.tenant_id),
                 ));
+            }
+            if let Some(max) = policy.quota.max_records {
+                let live_count = s
+                    .records
+                    .values()
+                    .filter(|r| {
+                        r.tenant_id.as_str() == record.tenant_id.as_str()
+                            && r.deleted_at_ms.is_none()
+                            && !r.is_expired()
+                    })
+                    .count();
+                if live_count >= max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies record write: record quota {max} exhausted",
+                            policy.version
+                        ),
+                    ));
+                }
             }
         }
 
@@ -1368,13 +1432,23 @@ impl Runtime {
     /// code (mirroring `get_artifact`) so a caller in tenant A cannot
     /// probe tenant B's record_ids by error-code differential.
     pub async fn get_record(&self, tenant_id: &Id, record_id: &Id) -> Result<SearchableRecord> {
+        self.get_record_with_options(tenant_id, record_id, false)
+            .await
+    }
+
+    pub async fn get_record_with_options(
+        &self,
+        tenant_id: &Id,
+        record_id: &Id,
+        include_deleted: bool,
+    ) -> Result<SearchableRecord> {
         let s = self.state.lock().await;
         s.records
             .get(record_id.as_str())
             .filter(|r| {
-                r.deleted_at_ms.is_none()
+                (include_deleted || r.deleted_at_ms.is_none())
                     && r.tenant_id.as_str() == tenant_id.as_str()
-                    && !r.is_expired()
+                    && (include_deleted || !r.is_expired())
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", record_id)))

@@ -67,6 +67,12 @@ pub struct FetchQuery {
     pub limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IncludeDeletedQuery {
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
 fn default_policy() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
 }

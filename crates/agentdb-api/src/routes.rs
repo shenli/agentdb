@@ -26,8 +26,8 @@ use agentdb_core::{
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
-    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, ListAgentSkillsResponse,
-    SearchRecordsBody, SearchRecordsResponse,
+    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, IncludeDeletedQuery,
+    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -493,10 +493,14 @@ async fn create_record(
 async fn get_record(
     State(s): State<AppState>,
     Path((tenant_id, record_id)): Path<(String, String)>,
+    Query(q): Query<IncludeDeletedQuery>,
 ) -> Result<Json<SearchableRecord>, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
-    let rec = s.runtime.get_record(&tid, &rid).await?;
+    let rec = s
+        .runtime
+        .get_record_with_options(&tid, &rid, q.include_deleted)
+        .await?;
     Ok(Json(rec))
 }
 
