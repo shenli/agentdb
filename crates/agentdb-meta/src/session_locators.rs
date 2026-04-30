@@ -190,6 +190,20 @@ pub async fn list_by_tenant_external(
     Ok(rows.into_iter().map(into_locator).collect())
 }
 
+/// Fetch every session locator, ordered by session id. Used by routing snapshot
+/// refreshes so the HTTP data path can evaluate placement without per-request
+/// metadata reads.
+pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<SessionLocator>> {
+    let rows: Vec<LocatorRow> = sqlx::query_as(
+        "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
+            FROM session_locators \
+            ORDER BY session_id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(into_locator).collect())
+}
+
 /// Cursor-style listing: every locator owned by `tenant`,
 /// ordered by `session_id`, with optional resumption after
 /// `after_session_id` (exclusive). Caps at `limit` rows.
@@ -361,6 +375,21 @@ mod tests {
         let mine = list_by_tenant_external(&p, "t-1", None, 100).await.unwrap();
         let ids: Vec<_> = mine.iter().map(|l| l.session_id.as_str()).collect();
         assert_eq!(ids, ["s-a", "s-b", "s-c"]);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_locator_ordered_by_session_id() {
+        let p = pool().await;
+        upsert(&p, "s-c", 1, "t-1", Some(3), 3, 0).await.unwrap();
+        upsert(&p, "s-a", 2, "t-2", Some(1), 1, 0).await.unwrap();
+        upsert(&p, "s-b", 1, "t-1", Some(2), 2, 0).await.unwrap();
+
+        let all = list_all(&p).await.unwrap();
+
+        let ids: Vec<_> = all.iter().map(|l| l.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-a", "s-b", "s-c"]);
+        assert_eq!(all[0].tenant_external_id.as_deref(), Some("t-2"));
+        assert_eq!(all[1].tablet_id, Some(2));
     }
 
     #[tokio::test]

@@ -6,7 +6,16 @@
 
 mod common;
 
-use common::{spawn_app, TestApp};
+use agentdb_api::{
+    routing_http::{
+        RouteRuntime, RouteSnapshot, HDR_FORWARD_URI, HDR_OWNER_NODE, HDR_ROUTE_ACTION,
+        HDR_ROUTE_REASON, HDR_TABLET_ID,
+    },
+    AppState,
+};
+use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
+use agentdb_meta::{nodes::Node, tablets::Tablet};
+use common::{spawn_app, spawn_app_with_state, TestApp};
 use serde_json::json;
 
 #[tokio::test]
@@ -133,6 +142,107 @@ async fn append_and_fetch_returns_recent() {
     assert_eq!(r["seq"].as_u64().unwrap(), 0);
     let recent = r["recent"].as_array().unwrap();
     assert_eq!(recent.len(), 1);
+}
+
+#[tokio::test]
+async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local() {
+    let app = spawn_routed_app("node-a").await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    let r = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {"i": 1},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    assert_eq!(r.headers()[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
+    assert_eq!(r.headers()[HDR_OWNER_NODE].to_str().unwrap(), "node-a");
+    assert_eq!(r.headers()[HDR_TABLET_ID].to_str().unwrap(), "0");
+}
+
+#[tokio::test]
+async fn session_handlers_short_circuit_remote_owner_before_local_append() {
+    let app = spawn_routed_app("node-b").await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    let r = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?trace=1",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {"i": 1},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 502);
+    assert_eq!(r.headers()[HDR_ROUTE_ACTION].to_str().unwrap(), "forward");
+    assert_eq!(
+        r.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
+        "ROUTE_FORWARD_UNAVAILABLE"
+    );
+    assert_eq!(r.headers()[HDR_OWNER_NODE].to_str().unwrap(), "node-b");
+    assert!(r.headers()[HDR_FORWARD_URI]
+        .to_str()
+        .unwrap()
+        .contains("/events?trace=1"));
+
+    let events = app
+        .runtime
+        .fetch_from_seq(FetchRequest {
+            tenant_id: Id::parse_kind(&tid, IdKind::Tenant).unwrap(),
+            session_id: Id::parse_kind(&sid, IdKind::Session).unwrap(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn session_handlers_return_route_rejection_for_unassigned_tablet() {
+    let app = spawn_unassigned_routed_app().await;
+    let (tid, _aid, sid) = bootstrap_session(&app).await;
+
+    let r = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=10",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(r.status().as_u16(), 503);
+    assert_eq!(r.headers()[HDR_ROUTE_ACTION].to_str().unwrap(), "reject");
+    assert_eq!(
+        r.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
+        "ROUTE_UNASSIGNED"
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "ROUTE_UNASSIGNED");
 }
 
 #[tokio::test]
@@ -330,4 +440,48 @@ async fn bootstrap_session(app: &TestApp) -> (String, String, String) {
         .unwrap();
     let sid = s["session_id"].as_str().unwrap().to_string();
     (tid, aid, sid)
+}
+
+async fn spawn_routed_app(owner_node_id: &str) -> TestApp {
+    let runtime = Runtime::in_memory();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some(owner_node_id))])
+        .with_nodes(vec![
+            node("node-a", "http://127.0.0.1:18080"),
+            node("node-b", "http://127.0.0.1:18081"),
+        ]);
+    let state = AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    spawn_app_with_state(state).await
+}
+
+async fn spawn_unassigned_routed_app() -> TestApp {
+    let runtime = Runtime::in_memory();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, None)])
+        .with_nodes(vec![node("node-a", "http://127.0.0.1:18080")]);
+    let state = AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    spawn_app_with_state(state).await
+}
+
+fn node(id: &str, address: &str) -> Node {
+    Node {
+        node_id: id.into(),
+        address: address.into(),
+        mongo_address: None,
+        state: "alive".into(),
+        last_heartbeat_ms: 100,
+        joined_at_ms: 100,
+        availability_zone: Some("us-west-2a".into()),
+    }
+}
+
+fn tablet(id: i64, owner: Option<&str>) -> Tablet {
+    Tablet {
+        tablet_id: id,
+        owner_node_id: owner.map(str::to_string),
+        epoch: 1,
+        lease_expires_at_ms: i64::MAX,
+        created_at_ms: 0,
+        handoff_target_node_id: None,
+    }
 }

@@ -7,17 +7,25 @@
 
 use agentdb_api::{build_router, AppState};
 use agentdb_core::Runtime;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 pub struct TestApp {
     pub base: String,
     pub client: reqwest::Client,
+    #[allow(dead_code)]
+    pub runtime: Arc<Runtime>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 pub async fn spawn_app() -> TestApp {
     let runtime = Runtime::in_memory();
     let state = AppState::new(runtime);
+    spawn_app_with_state(state).await
+}
+
+pub async fn spawn_app_with_state(state: AppState) -> TestApp {
+    let runtime = state.runtime.clone();
     let router = build_router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,6 +44,7 @@ pub async fn spawn_app() -> TestApp {
     TestApp {
         base: format!("http://{addr}"),
         client: reqwest::Client::new(),
+        runtime,
         _shutdown: tx,
     }
 }

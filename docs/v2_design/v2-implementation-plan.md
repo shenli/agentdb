@@ -713,6 +713,37 @@ Follow-up:
 - Execute `ForwardRequest` through an internal HTTP client and pass through the
   owner node response.
 
+### V2.15 — Session handler routing guard (~650 LoC)
+
+Status: handler guard complete. V2.15 wires metadata-backed routing snapshots
+into session-scoped HTTP handlers so non-local decisions are handled before the
+local runtime mutates or reads session state.
+
+Scope:
+
+- `session_locators::list_all(...)` supports boot-time route snapshot refreshes.
+- `RouteSnapshot::load_from_meta(...)` loads shards, tablets, nodes, and session
+  locators from `agentdb-meta`.
+- `RouteSnapshot` now carries session locators, and
+  `RouteRuntime::guard_session_id(...)` resolves a locator by session id before
+  falling back to shard/default routing.
+- Session-scoped routes call the guard and attach local route headers to served
+  responses.
+- Remote-owner decisions short-circuit with a retryable
+  `ROUTE_FORWARD_UNAVAILABLE` response until the same-cluster proxy client is
+  enabled; unassigned/reject decisions return the existing structured route
+  errors.
+- `agentdb serve --route-node-id ...` enables boot-time metadata snapshot
+  routing from `MetaStore::open_from_env()`.
+
+Follow-up:
+
+- Execute `ForwardRequest` through an internal HTTP client and pass through the
+  owner node response.
+- Refresh route snapshots after placement, lease, node, or locator changes
+  instead of loading only at boot.
+- Teach forwarded requests to validate tablet epoch before mutating state.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

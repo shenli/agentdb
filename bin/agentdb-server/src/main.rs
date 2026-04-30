@@ -44,6 +44,20 @@ struct ServeOpts {
     /// smoke testing; everything is lost on shutdown.
     #[arg(long)]
     in_memory: bool,
+
+    /// Enable metadata-backed routing for this node id. When unset, the server
+    /// keeps the single-node routing-disabled behavior.
+    #[arg(long)]
+    route_node_id: Option<String>,
+
+    /// Shard count used by the route planner when no session locator exists.
+    #[arg(long, default_value_t = agentdb_meta::shards::DEFAULT_SHARD_COUNT)]
+    route_shard_count: i64,
+
+    /// Optional location label for residency-aware routing. Currently compared
+    /// with node availability_zone until region and AZ split.
+    #[arg(long)]
+    route_location: Option<String>,
 }
 
 #[tokio::main]
@@ -81,7 +95,26 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         agentdb_core::Runtime::with_kv(kv, content)
     };
 
-    let state = agentdb_api::AppState::new(runtime);
+    let mut state = agentdb_api::AppState::new(runtime);
+    if let Some(node_id) = opts.route_node_id.as_deref() {
+        let meta = agentdb_meta::MetaStore::open_from_env().await?;
+        let snapshot = agentdb_api::routing_http::RouteSnapshot::load_from_meta(
+            &meta,
+            opts.route_shard_count,
+            opts.route_location.clone(),
+            agentdb_meta::routing::ResidencyPolicy::default(),
+        )
+        .await?;
+        state = state.with_routing(agentdb_api::routing_http::RouteRuntime::snapshot(
+            node_id, snapshot,
+        ));
+        tracing::info!(
+            node_id,
+            shard_count = opts.route_shard_count,
+            location = ?opts.route_location,
+            "enabled metadata-backed route snapshot"
+        );
+    }
     let app = agentdb_api::router(state).nest("/dashboard", agentdb_dashboard::router());
     let listener = tokio::net::TcpListener::bind(opts.bind).await?;
     tracing::info!(addr = %opts.bind, "agentdb listening");

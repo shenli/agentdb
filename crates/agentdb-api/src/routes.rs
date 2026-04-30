@@ -10,7 +10,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -24,9 +24,8 @@ use agentdb_core::{
         AppendRequest, ContextInclude, ContextRequest, FetchRequest, ForkSessionRequest,
         SearchRequest, WatchRequest, WatchScope,
     },
-    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ContextResponse,
-    ErrorCode, EventEnvelope, Id, IdKind, NewAgent, NewArtifact, NewSession, NewSkill, NewTenant,
-    ReplayResponse, Session, Skill, SourceRef, Tenant,
+    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
+    NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 
 use crate::dto::{
@@ -36,6 +35,9 @@ use crate::dto::{
     SearchRecordsBody, SearchRecordsResponse, SweepBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
+use crate::routing_http::{
+    route_forward_unavailable_response, route_rejection_response, RouteGuardOutcome,
+};
 use crate::state::AppState;
 
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
@@ -284,7 +286,9 @@ async fn create_session(
 async fn get_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
-) -> Result<Json<Session>, ApiError> {
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -295,13 +299,22 @@ async fn get_session(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    Ok(Json(s.runtime.get_session(&tid, &sid).await?))
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    Ok(with_headers(
+        Json(s.runtime.get_session(&tid, &sid).await?).into_response(),
+        route_headers,
+    ))
 }
 
 async fn delete_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -312,13 +325,21 @@ async fn delete_session(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     s.runtime.delete_session(&tid, &sid).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(with_headers(
+        StatusCode::NO_CONTENT.into_response(),
+        route_headers,
+    ))
 }
 
 async fn append_event(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     Json(body): Json<AppendBody>,
 ) -> Result<Response, ApiError> {
@@ -337,6 +358,10 @@ async fn append_event(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -354,16 +379,16 @@ async fn append_event(
         .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
-    Ok(json_with_backpressure(
-        StatusCode::OK,
-        Json(resp),
-        backpressure,
+    Ok(with_headers(
+        json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
+        route_headers,
     ))
 }
 
 async fn append_and_fetch(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     Json(body): Json<AppendAndFetchBody>,
 ) -> Result<Response, ApiError> {
@@ -382,6 +407,10 @@ async fn append_and_fetch(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let idem_key = idempotency_key(&headers);
 
     let resp = s
@@ -403,18 +432,19 @@ async fn append_and_fetch(
         .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
-    Ok(json_with_backpressure(
-        StatusCode::OK,
-        Json(resp),
-        backpressure,
+    Ok(with_headers(
+        json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
+        route_headers,
     ))
 }
 
 async fn fetch_events(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Query(q): Query<FetchQuery>,
-) -> Result<Json<Vec<EventEnvelope>>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -425,6 +455,10 @@ async fn fetch_events(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let events = s
         .runtime
         .fetch_from_seq(FetchRequest {
@@ -434,16 +468,22 @@ async fn fetch_events(
             limit: q.limit,
         })
         .await?;
-    Ok(Json(events))
+    Ok(with_headers(Json(events).into_response(), route_headers))
 }
 
 async fn fork_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<ForkSessionBody>,
-) -> Result<(StatusCode, Json<Session>), ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let child = s
         .runtime
         .fork_session(ForkSessionRequest {
@@ -453,16 +493,25 @@ async fn fork_session(
             alias: body.alias,
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(child)))
+    Ok(with_headers(
+        (StatusCode::CREATED, Json(child)).into_response(),
+        route_headers,
+    ))
 }
 
 async fn replay_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Query(q): Query<ReplayQuery>,
-) -> Result<Json<ReplayResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let mut replay = s.runtime.replay_session(&tid, &sid).await?;
     if let Some(from_seq) = q.from_seq {
         replay
@@ -470,16 +519,22 @@ async fn replay_session(
             .retain(|event| event.session_id.as_str() != sid.as_str() || event.seq >= from_seq);
     }
     replay.events.truncate(q.limit.clamp(1, 1000));
-    Ok(Json(replay))
+    Ok(with_headers(Json(replay).into_response(), route_headers))
 }
 
 async fn subscribe_session(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Query(q): Query<FetchQuery>,
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let events = s
         .runtime
         .fetch_from_seq(FetchRequest {
@@ -489,18 +544,25 @@ async fn subscribe_session(
             limit: q.limit.clamp(1, 1000),
         })
         .await?;
-    Ok(sse_response(
-        events.into_iter().map(|event| ("event", event)),
+    Ok(with_headers(
+        sse_response(events.into_iter().map(|event| ("event", event))),
+        route_headers,
     ))
 }
 
 async fn build_context(
     State(s): State<AppState>,
     Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<ContextBody>,
-) -> Result<Json<ContextResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
     let record_query = body
         .record_query
         .map(|q| search_body_to_request(tid.clone(), q));
@@ -515,7 +577,7 @@ async fn build_context(
             record_query,
         })
         .await?;
-    Ok(Json(context))
+    Ok(with_headers(Json(context).into_response(), route_headers))
 }
 
 async fn watch(
@@ -703,6 +765,34 @@ fn json_with_backpressure<T: serde::Serialize>(
         }
     }
     resp
+}
+
+fn guard_session_request(
+    state: &AppState,
+    tenant_id: &Id,
+    session_id: &Id,
+    original_uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Result<HeaderMap, Response> {
+    let path_and_query = original_uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_else(|| original_uri.path());
+    match state.routing.guard_session_id(
+        tenant_id.as_str(),
+        session_id.as_str(),
+        path_and_query,
+        headers,
+    ) {
+        RouteGuardOutcome::ServeLocal(headers) => Ok(headers),
+        RouteGuardOutcome::Forward(forward) => Err(route_forward_unavailable_response(&forward)),
+        RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
+    }
+}
+
+fn with_headers(mut response: Response, headers: HeaderMap) -> Response {
+    response.headers_mut().extend(headers);
+    response
 }
 
 /// `POST /api/tenants/:tenant_id/records`
