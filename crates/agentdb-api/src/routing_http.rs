@@ -5,7 +5,10 @@
 //! data path can take: serve locally, forward to an owner node, or reject with a
 //! structured error response.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -107,6 +110,53 @@ pub struct ForwardRequest {
     pub headers: HeaderMap,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteRuntimeStatus {
+    pub mode: &'static str,
+    pub local_node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<RouteSnapshotStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteSnapshotStatus {
+    pub shard_count: i64,
+    pub request_location: Option<String>,
+    pub allowed_locations: Vec<String>,
+    pub allow_cross_location: bool,
+    pub shard_rows: usize,
+    pub tablet_count: usize,
+    pub node_count: usize,
+    pub session_locator_count: usize,
+    pub nodes: Vec<RouteNodeStatus>,
+    pub tablets: Vec<RouteTabletStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteNodeStatus {
+    pub node_id: String,
+    pub address: String,
+    pub state: String,
+    pub region: Option<String>,
+    pub availability_zone: Option<String>,
+    pub route_location: Option<String>,
+    pub last_heartbeat_ms: i64,
+    pub joined_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteTabletStatus {
+    pub tablet_id: i64,
+    pub owner_node_id: Option<String>,
+    pub owner_state: Option<String>,
+    pub owner_region: Option<String>,
+    pub owner_availability_zone: Option<String>,
+    pub owner_route_location: Option<String>,
+    pub local_owner: bool,
+    pub epoch: i64,
+    pub lease_expires_at_ms: i64,
+}
+
 impl RouteRuntime {
     pub fn disabled() -> Self {
         Self {
@@ -136,6 +186,27 @@ impl RouteRuntime {
         }
         *mode = RouteRuntimeMode::Snapshot(snapshot);
         true
+    }
+
+    pub fn describe(&self) -> RouteRuntimeStatus {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        match &*mode {
+            RouteRuntimeMode::Disabled => RouteRuntimeStatus {
+                mode: "disabled",
+                local_node_id: self.local_node_id.to_string(),
+                snapshot: None,
+            },
+            RouteRuntimeMode::Fixed(_) => RouteRuntimeStatus {
+                mode: "fixed",
+                local_node_id: self.local_node_id.to_string(),
+                snapshot: None,
+            },
+            RouteRuntimeMode::Snapshot(snapshot) => RouteRuntimeStatus {
+                mode: "snapshot",
+                local_node_id: self.local_node_id.to_string(),
+                snapshot: Some(snapshot.describe(&self.local_node_id)),
+            },
+        }
     }
 
     pub fn guard(
@@ -359,6 +430,65 @@ impl RouteSnapshot {
                     .is_none_or(|locator_tenant| locator_tenant == tenant_id)
         })
     }
+
+    fn describe(&self, local_node_id: &str) -> RouteSnapshotStatus {
+        let nodes_by_id: BTreeMap<_, _> = self
+            .nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node))
+            .collect();
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| RouteNodeStatus {
+                node_id: node.node_id.clone(),
+                address: node.address.clone(),
+                state: node.state.clone(),
+                region: node.region.clone(),
+                availability_zone: node.availability_zone.clone(),
+                route_location: node_route_location(node).map(str::to_string),
+                last_heartbeat_ms: node.last_heartbeat_ms,
+                joined_at_ms: node.joined_at_ms,
+            })
+            .collect();
+        let tablets = self
+            .tablets
+            .iter()
+            .map(|tablet| {
+                let owner = tablet
+                    .owner_node_id
+                    .as_deref()
+                    .and_then(|node_id| nodes_by_id.get(node_id).copied());
+                RouteTabletStatus {
+                    tablet_id: tablet.tablet_id,
+                    owner_node_id: tablet.owner_node_id.clone(),
+                    owner_state: owner.map(|node| node.state.clone()),
+                    owner_region: owner.and_then(|node| node.region.clone()),
+                    owner_availability_zone: owner.and_then(|node| node.availability_zone.clone()),
+                    owner_route_location: owner.and_then(node_route_location).map(str::to_string),
+                    local_owner: tablet.owner_node_id.as_deref() == Some(local_node_id),
+                    epoch: tablet.epoch,
+                    lease_expires_at_ms: tablet.lease_expires_at_ms,
+                }
+            })
+            .collect();
+        RouteSnapshotStatus {
+            shard_count: self.shard_count,
+            request_location: self.request_location.clone(),
+            allowed_locations: self.policy.allowed_locations.clone(),
+            allow_cross_location: self.policy.allow_cross_location,
+            shard_rows: self.shards.len(),
+            tablet_count: self.tablets.len(),
+            node_count: self.nodes.len(),
+            session_locator_count: self.session_locators.len(),
+            nodes,
+            tablets,
+        }
+    }
+}
+
+fn node_route_location(node: &Node) -> Option<&str> {
+    node.region.as_deref().or(node.availability_zone.as_deref())
 }
 
 #[derive(Debug, Serialize)]

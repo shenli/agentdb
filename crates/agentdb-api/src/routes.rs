@@ -56,6 +56,7 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(health_ready))
+        .route("/api/admin/routing", get(get_routing_status))
         .route("/api/tenants", post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
@@ -157,6 +158,12 @@ pub fn routes() -> Router<AppState> {
 
 async fn health_ready() -> StatusCode {
     StatusCode::OK
+}
+
+async fn get_routing_status(
+    State(s): State<AppState>,
+) -> Json<crate::routing_http::RouteRuntimeStatus> {
+    Json(s.routing.describe())
 }
 
 async fn create_tenant(

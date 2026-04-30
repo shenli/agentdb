@@ -175,6 +175,68 @@ async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local()
 }
 
 #[tokio::test]
+async fn admin_routing_status_reports_disabled_mode() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/routing", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "disabled");
+    assert_eq!(body["local_node_id"], "single-node");
+    assert!(body.get("snapshot").is_none());
+}
+
+#[tokio::test]
+async fn admin_routing_status_reports_snapshot_metadata() {
+    let app = spawn_routed_app("node-a").await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/routing", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "snapshot");
+    assert_eq!(body["local_node_id"], "node-a");
+    assert_eq!(body["snapshot"]["shard_count"], 1);
+    assert_eq!(body["snapshot"]["tablet_count"], 1);
+    assert_eq!(body["snapshot"]["node_count"], 2);
+    assert_eq!(body["snapshot"]["session_locator_count"], 0);
+    assert_eq!(body["snapshot"]["nodes"][0]["region"], "us-west-2");
+    assert_eq!(
+        body["snapshot"]["nodes"][0]["availability_zone"],
+        "us-west-2a"
+    );
+    assert_eq!(body["snapshot"]["nodes"][0]["route_location"], "us-west-2");
+    assert_eq!(body["snapshot"]["tablets"][0]["owner_node_id"], "node-a");
+    assert_eq!(body["snapshot"]["tablets"][0]["owner_region"], "us-west-2");
+    assert_eq!(
+        body["snapshot"]["tablets"][0]["owner_availability_zone"],
+        "us-west-2a"
+    );
+    assert_eq!(
+        body["snapshot"]["tablets"][0]["owner_route_location"],
+        "us-west-2"
+    );
+    assert_eq!(body["snapshot"]["tablets"][0]["local_owner"], true);
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;

@@ -865,7 +865,29 @@ Scope:
 
 Follow-up:
 
-- Add operator-facing route metadata visibility for region/AZ decisions.
+- Add route decision dry-run diagnostics for a tenant and optional session id.
+
+### V2.21 — Operator-facing route metadata visibility (~250 LoC)
+
+Status: route metadata visibility complete. V2.21 adds a read-only admin
+surface for inspecting the active routing runtime without issuing a routed
+session request.
+
+Scope:
+
+- `RouteRuntime::describe()` returns a serializable status object for disabled,
+  fixed, and snapshot-backed routing modes.
+- Snapshot status includes local node id, request region/location, residency
+  policy, shard/tablet/node/session-locator counts, node region/AZ metadata,
+  and tablet owner region/AZ metadata.
+- `GET /api/admin/routing` exposes the current status through the existing
+  `agentdb-api` router.
+- HTTP smoke coverage verifies both disabled single-node routing and
+  metadata-backed snapshot visibility.
+
+Follow-up:
+
+- Add route decision dry-run diagnostics for a tenant and optional session id.
 
 ---
 
