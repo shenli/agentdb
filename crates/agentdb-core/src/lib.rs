@@ -36,10 +36,12 @@ pub use errors::{Error, ErrorCode};
 pub use event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 pub use id::{Id, IdKind};
 pub use idempotency::{IdempotencyRecord, IdempotencyStore};
-pub use policy::{ArtifactSizePolicy, Priority, QuotaPolicy, RetentionPolicy, RuntimePolicy};
+pub use policy::{
+    ArtifactSizePolicy, LifecyclePolicy, Priority, QuotaPolicy, RetentionPolicy, RuntimePolicy,
+};
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
-pub use runtime::Runtime;
-pub use session::{NewSession, Session};
+pub use runtime::{GcSweepReport, LifecycleSweepReport, Runtime};
+pub use session::{Lifecycle, NewSession, Session};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tenant::{NewTenant, Tenant};
 

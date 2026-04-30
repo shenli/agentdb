@@ -9,8 +9,11 @@ Implementation checkpoint:
 - V2.0 tenant/agent/session/event core, V2.1 artifacts, V2.2 searchable
   records/indexing policy, V2.3 skills, and the V2.4a hot-path policy
   enforcement slice are implemented in the Rust runtime/API prototype.
-- Current next milestone: V2.4b lifecycle transitions, derivative-only
-  artifact purge, and GC worker scheduling.
+- V2.4b adds policy-driven session lifecycle transitions, derivative-only
+  artifact raw purge, soft-deleted record/artifact GC, and legal-hold
+  retention skips in the runtime core.
+- Current next milestone: V2.4c tier templates, soft-quota backpressure, fuller
+  quota dimensions, and background worker scheduling.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

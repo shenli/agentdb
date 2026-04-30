@@ -31,7 +31,7 @@ use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, Idempotency
 use crate::persist::Persist;
 use crate::policy::RuntimePolicy;
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
-use crate::session::{NewSession, Session};
+use crate::session::{Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
 
@@ -89,6 +89,18 @@ pub struct AppendAndFetchResponse {
     pub event_id: Id,
     pub seq: u64,
     pub recent: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LifecycleSweepReport {
+    pub sessions_transitioned: usize,
+    pub artifacts_raw_purged: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcSweepReport {
+    pub records_purged: usize,
+    pub artifacts_purged: usize,
 }
 
 #[derive(Default, Debug)]
@@ -152,6 +164,45 @@ fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
 
 fn skill_unique_state_key(tenant_id: &str, name: &str, version: &str) -> String {
     format!("{tenant_id}::{name}::{version}")
+}
+
+fn policy_for_tenant_in_state(s: &State, tenant_id: &Id) -> RuntimePolicy {
+    s.tenants
+        .get(tenant_id.as_str())
+        .map(|t| RuntimePolicy::from_json(&t.policy))
+        .unwrap_or_default()
+}
+
+fn lifecycle_rank(l: Lifecycle) -> u8 {
+    match l {
+        Lifecycle::Warm => 0,
+        Lifecycle::Cold => 1,
+        Lifecycle::Archive => 2,
+        Lifecycle::DerivativeOnly => 3,
+    }
+}
+
+fn lifecycle_target(current: Lifecycle, idle_ms: u64, policy: &RuntimePolicy) -> Lifecycle {
+    let mut target = current;
+    if policy
+        .lifecycle
+        .cold_after_ms
+        .is_some_and(|threshold| idle_ms >= threshold)
+    {
+        target = Lifecycle::Cold;
+    }
+    if policy
+        .lifecycle
+        .archive_after_ms
+        .is_some_and(|threshold| idle_ms >= threshold)
+    {
+        target = Lifecycle::Archive;
+    }
+    if lifecycle_rank(target) > lifecycle_rank(current) {
+        target
+    } else {
+        current
+    }
 }
 
 pub struct Runtime {
@@ -836,6 +887,190 @@ impl Runtime {
             .get(tenant_id.as_str(), artifact_id.as_str())
             .await
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))
+    }
+
+    pub async fn delete_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s.artifacts.get(artifact_id.as_str()).is_some_and(|a| {
+            a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str()
+        });
+        if !live {
+            return Err(Error::new(
+                ErrorCode::ArtifactNotFound,
+                format!("{}", artifact_id),
+            ));
+        }
+
+        let updated = {
+            let a = s
+                .artifacts
+                .get_mut(artifact_id.as_str())
+                .expect("presence checked above");
+            a.deleted_at_ms = Some(crate::now_ms());
+            a.clone()
+        };
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_artifact(&updated) {
+                if let Some(a) = s.artifacts.get_mut(artifact_id.as_str()) {
+                    a.deleted_at_ms = None;
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn sweep_lifecycle_at(&self, now_ms: u64) -> Result<LifecycleSweepReport> {
+        let mut report = LifecycleSweepReport::default();
+        let artifact_candidates = {
+            let mut s = self.state.lock().await;
+            let session_ids: Vec<String> = s.sessions.keys().cloned().collect();
+            for session_id in session_ids {
+                let Some(session) = s.sessions.get(&session_id).cloned() else {
+                    continue;
+                };
+                if session.deleted_at_ms.is_some() {
+                    continue;
+                }
+                let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                let idle_ms = now_ms.saturating_sub(session.last_active_at_ms);
+                let target = lifecycle_target(session.lifecycle, idle_ms, &policy);
+                if target == session.lifecycle {
+                    continue;
+                }
+                let mut updated = session;
+                updated.lifecycle = target;
+                updated.policy_version = policy.version;
+                if let Some(p) = &self.persist {
+                    p.put_session(&updated).map_err(internal)?;
+                }
+                s.sessions.insert(session_id, updated);
+                report.sessions_transitioned += 1;
+            }
+
+            s.artifacts
+                .values()
+                .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
+                .filter(|a| {
+                    let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                    !policy.retention.legal_hold
+                        && policy
+                            .lifecycle
+                            .derivative_only_after_ms
+                            .is_some_and(|threshold| {
+                                now_ms.saturating_sub(a.created_at_ms) >= threshold
+                            })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for artifact in artifact_candidates {
+            self.content
+                .delete(artifact.tenant_id.as_str(), artifact.artifact_id.as_str())
+                .await
+                .map_err(|e| {
+                    Error::new(ErrorCode::Internal, format!("content delete failed: {e}"))
+                })?;
+
+            let mut s = self.state.lock().await;
+            let Some(current) = s.artifacts.get_mut(artifact.artifact_id.as_str()) else {
+                continue;
+            };
+            if current.deleted_at_ms.is_some()
+                || current.raw_purged_at_ms.is_some()
+                || current.tenant_id.as_str() != artifact.tenant_id.as_str()
+            {
+                continue;
+            }
+            current.raw_purged_at_ms = Some(now_ms);
+            let updated = current.clone();
+            if let Some(p) = &self.persist {
+                p.put_artifact(&updated).map_err(internal)?;
+            }
+            report.artifacts_raw_purged += 1;
+        }
+
+        Ok(report)
+    }
+
+    pub async fn gc_sweep_at(&self, now_ms: u64) -> Result<GcSweepReport> {
+        let mut report = GcSweepReport::default();
+        {
+            let mut s = self.state.lock().await;
+            let record_ids: Vec<String> = s
+                .records
+                .iter()
+                .filter_map(|(id, r)| {
+                    let deleted_at = r.deleted_at_ms?;
+                    let policy = policy_for_tenant_in_state(&s, &r.tenant_id);
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect();
+
+            for record_id in record_ids {
+                let Some(record) = s.records.get(&record_id).cloned() else {
+                    continue;
+                };
+                if let Some(p) = &self.persist {
+                    p.delete_record(&record).map_err(internal)?;
+                }
+                s.records.remove(&record_id);
+                if let Some(doc) = s.record_to_doc.remove(&record_id) {
+                    s.doc_to_record.remove(&doc);
+                }
+                report.records_purged += 1;
+            }
+        }
+
+        let artifact_candidates = {
+            let s = self.state.lock().await;
+            s.artifacts
+                .values()
+                .filter_map(|a| {
+                    let deleted_at = a.deleted_at_ms?;
+                    let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(a.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for artifact in artifact_candidates {
+            self.content
+                .delete(artifact.tenant_id.as_str(), artifact.artifact_id.as_str())
+                .await
+                .map_err(|e| {
+                    Error::new(ErrorCode::Internal, format!("content delete failed: {e}"))
+                })?;
+
+            let mut s = self.state.lock().await;
+            let Some(current) = s.artifacts.get(artifact.artifact_id.as_str()).cloned() else {
+                continue;
+            };
+            if current.deleted_at_ms.is_none()
+                || current.tenant_id.as_str() != artifact.tenant_id.as_str()
+            {
+                continue;
+            }
+            if let Some(p) = &self.persist {
+                p.delete_artifact(&current).map_err(internal)?;
+            }
+            s.artifacts.remove(artifact.artifact_id.as_str());
+            report.artifacts_purged += 1;
+        }
+
+        Ok(report)
     }
 
     /// Test-only convenience that creates a tenant + agent + session in one shot.
