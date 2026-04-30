@@ -28,8 +28,11 @@ Implementation checkpoint:
   dimensions, context byte budgeting, tenant/agent soft-delete plus cascading
   GC, lifecycle/tier action counters, and purge-event counters for the future
   changefeed transport.
-- Current next milestone: V2.5 subscription/changefeed transport and context
-  packs on top of the V2.4 lifecycle/policy foundation.
+- V2.5 adds session fork/replay, replay-style SSE subscribe, generalized
+  session/tenant/agent watch cursors, and budgeted context packs over recent
+  events, records, skills, and policy.
+- Current next milestone: SDK rewrites and adapter proof points on top of the
+  V2.0-V2.5 native API surface.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
