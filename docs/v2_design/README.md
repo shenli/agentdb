@@ -47,8 +47,12 @@ Implementation checkpoint:
 - V2.10 starts the multi-node scale-out path with a pure metadata routing
   planner over nodes, tablets, shards, session locators, leases, and residency
   policy. Runtime request forwarding remains the next follow-up.
-- Current next milestone: runtime request forwarding and managed-service
-  hardening.
+- V2.11 adds the HTTP-facing routing contract in `agentdb-api`: route planner
+  output now has concrete local/forward/reject outcomes, forwarding headers,
+  retryable 503 unassigned responses, 421 wrong-location responses, and
+  residency denial responses for the runtime data path to wire into handlers.
+- Current next milestone: handler-level forwarding/proxy wiring and
+  managed-service hardening.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

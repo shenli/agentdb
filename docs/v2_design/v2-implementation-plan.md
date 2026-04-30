@@ -623,6 +623,26 @@ Follow-up:
 - Split region and availability zone into distinct metadata fields.
 - Add KMS key availability signals to the same reject/forward decision shape.
 
+### V2.11 — HTTP routing contract (~500 LoC)
+
+Status: API contract complete. V2.11 adds `agentdb-api::routing_http`, which
+turns V2.10 planner decisions into data-plane outcomes:
+
+- `ServeLocal` for a local owner
+- `Forward` with owner node/address, tablet, epoch, and `x-agentdb-*` routing
+  headers for a remote owner
+- structured `Reject` responses for unassigned tablets, unavailable owners,
+  wrong-location requests, and residency denial
+- 421 `ROUTE_WRONG_LOCATION` so existing Python/TypeScript SDKs surface their
+  `Misdirected` error classes
+- retryable 503 responses for placement/failover gaps such as expired leases
+
+Follow-up:
+
+- Call the planner/contract from request handlers.
+- Add the actual same-cluster HTTP proxy path for `Forward` outcomes.
+- Add KMS/key-state reasons to the same `Reject` response shape.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan
