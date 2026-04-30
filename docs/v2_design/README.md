@@ -65,8 +65,10 @@ Implementation checkpoint:
 - V2.15 wires the metadata-backed routing guard into session-scoped handlers,
   adds boot-time route snapshot loading from `agentdb-meta`, and short-circuits
   remote/unassigned decisions before local state is mutated.
-- Current next milestone: execute same-cluster `ForwardRequest`s through an
-  internal HTTP client and pass through owner-node responses.
+- V2.16 executes same-cluster `ForwardRequest`s through an internal HTTP client
+  and passes owner-node responses back through the original handler path.
+- Current next milestone: refresh route snapshots after placement changes and
+  validate forwarded tablet epochs before mutating state.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

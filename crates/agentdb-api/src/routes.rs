@@ -11,7 +11,7 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, OriginalUri, Path, Query, RawQuery, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -36,7 +36,7 @@ use crate::dto::{
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::routing_http::{
-    route_forward_unavailable_response, route_rejection_response, RouteGuardOutcome,
+    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_ROUTE_REASON,
 };
 use crate::state::AppState;
 
@@ -299,10 +299,13 @@ async fn get_session(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
-        Ok(headers) => headers,
-        Err(response) => return Ok(response),
-    };
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
     Ok(with_headers(
         Json(s.runtime.get_session(&tid, &sid).await?).into_response(),
         route_headers,
@@ -325,7 +328,17 @@ async fn delete_session(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::DELETE,
+        None,
+    )
+    .await
+    {
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
@@ -358,7 +371,18 @@ async fn append_event(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+    let forward_body = serde_json::to_vec(&body).expect("append body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
@@ -407,7 +431,18 @@ async fn append_and_fetch(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+    let forward_body = serde_json::to_vec(&body).expect("append-and-fetch body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
@@ -455,10 +490,13 @@ async fn fetch_events(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
-        Ok(headers) => headers,
-        Err(response) => return Ok(response),
-    };
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
     let events = s
         .runtime
         .fetch_from_seq(FetchRequest {
@@ -480,7 +518,18 @@ async fn fork_session(
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+    let forward_body = serde_json::to_vec(&body).expect("fork body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
@@ -508,10 +557,13 @@ async fn replay_session(
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
-        Ok(headers) => headers,
-        Err(response) => return Ok(response),
-    };
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
     let mut replay = s.runtime.replay_session(&tid, &sid).await?;
     if let Some(from_seq) = q.from_seq {
         replay
@@ -531,10 +583,13 @@ async fn subscribe_session(
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
-        Ok(headers) => headers,
-        Err(response) => return Ok(response),
-    };
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
     let events = s
         .runtime
         .fetch_from_seq(FetchRequest {
@@ -559,7 +614,18 @@ async fn build_context(
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let route_headers = match guard_session_request(&s, &tid, &sid, &original_uri, &headers) {
+    let forward_body = serde_json::to_vec(&body).expect("context body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
         Ok(headers) => headers,
         Err(response) => return Ok(response),
     };
@@ -767,12 +833,14 @@ fn json_with_backpressure<T: serde::Serialize>(
     resp
 }
 
-fn guard_session_request(
+async fn guard_session_request(
     state: &AppState,
     tenant_id: &Id,
     session_id: &Id,
     original_uri: &axum::http::Uri,
     headers: &HeaderMap,
+    method: Method,
+    body: Option<Vec<u8>>,
 ) -> Result<HeaderMap, Response> {
     let path_and_query = original_uri
         .path_and_query()
@@ -785,9 +853,71 @@ fn guard_session_request(
         headers,
     ) {
         RouteGuardOutcome::ServeLocal(headers) => Ok(headers),
-        RouteGuardOutcome::Forward(forward) => Err(route_forward_unavailable_response(&forward)),
+        RouteGuardOutcome::Forward(forward) => {
+            Err(execute_forward(state, forward, method, body).await)
+        }
         RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
     }
+}
+
+async fn execute_forward(
+    state: &AppState,
+    forward: ForwardRequest,
+    method: Method,
+    body: Option<Vec<u8>>,
+) -> Response {
+    let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .expect("HTTP method must be valid for reqwest");
+    let mut request = state
+        .proxy
+        .request(method, &forward.uri)
+        .headers(forward.headers.clone());
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+    match request.send().await {
+        Ok(response) => proxy_response(response).await,
+        Err(err) => route_forward_failed_response(&forward, &err),
+    }
+}
+
+async fn proxy_response(response: reqwest::Response) -> Response {
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let headers = response.headers().clone();
+    let body = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return route_forward_failed_response(
+                &ForwardRequest {
+                    uri: "<response-body>".into(),
+                    headers: HeaderMap::new(),
+                },
+                &err,
+            );
+        }
+    };
+    let mut out = (status, body).into_response();
+    out.headers_mut().extend(headers);
+    out
+}
+
+fn route_forward_failed_response(forward: &ForwardRequest, err: &reqwest::Error) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": "ROUTE_FORWARD_FAILED",
+            "message": format!("failed to forward request to owner node: {err}"),
+            "retryable": true,
+            "suggestion": "retry against the owner node advertised in the routing headers"
+        }
+    });
+    let mut response = (StatusCode::BAD_GATEWAY, Json(body)).into_response();
+    response.headers_mut().extend(forward.headers.clone());
+    response.headers_mut().insert(
+        HDR_ROUTE_REASON,
+        HeaderValue::from_static("ROUTE_FORWARD_FAILED"),
+    );
+    response
 }
 
 fn with_headers(mut response: Response, headers: HeaderMap) -> Response {

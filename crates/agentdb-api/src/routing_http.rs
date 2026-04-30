@@ -31,7 +31,6 @@ pub const HDR_TABLET_EPOCH: &str = "x-agentdb-tablet-epoch";
 pub const HDR_ROUTE_REASON: &str = "x-agentdb-route-reason";
 pub const HDR_FORWARDED_BY: &str = "x-agentdb-forwarded-by";
 pub const HDR_FORWARDED_FOR: &str = "x-agentdb-forwarded-for";
-pub const HDR_FORWARD_URI: &str = "x-agentdb-forward-uri";
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -334,28 +333,6 @@ pub fn route_rejection_response(rejection: &RouteRejection) -> Response {
     };
     let mut response = (rejection.status, Json(body)).into_response();
     response.headers_mut().extend(rejection.headers.clone());
-    response
-}
-
-pub fn route_forward_unavailable_response(forward: &ForwardRequest) -> Response {
-    let body = ErrorBody {
-        error: ErrorDetail {
-            code: "ROUTE_FORWARD_UNAVAILABLE",
-            message:
-                "request must be served by another AgentDB node but proxy execution is not enabled",
-            retryable: true,
-            suggestion: Some("retry against the owner node advertised in the routing headers"),
-        },
-    };
-    let mut response = (StatusCode::BAD_GATEWAY, Json(body)).into_response();
-    response.headers_mut().extend(forward.headers.clone());
-    insert_header(response.headers_mut(), HDR_ROUTE_ACTION, "forward");
-    insert_header(
-        response.headers_mut(),
-        HDR_ROUTE_REASON,
-        "ROUTE_FORWARD_UNAVAILABLE",
-    );
-    insert_header(response.headers_mut(), HDR_FORWARD_URI, &forward.uri);
     response
 }
 

@@ -8,8 +8,8 @@ mod common;
 
 use agentdb_api::{
     routing_http::{
-        RouteRuntime, RouteSnapshot, HDR_FORWARD_URI, HDR_OWNER_NODE, HDR_ROUTE_ACTION,
-        HDR_ROUTE_REASON, HDR_TABLET_ID,
+        RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
+        HDR_TABLET_ID,
     },
     AppState,
 };
@@ -174,11 +174,11 @@ async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local()
 }
 
 #[tokio::test]
-async fn session_handlers_short_circuit_remote_owner_before_local_append() {
-    let app = spawn_routed_app("node-b").await;
+async fn session_handlers_proxy_remote_owner_append() {
+    let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
 
-    let r = app
+    let r: serde_json::Value = app
         .client
         .post(format!(
             "{}/api/tenants/{tid}/sessions/{sid}/events?trace=1",
@@ -193,19 +193,13 @@ async fn session_handlers_short_circuit_remote_owner_before_local_append() {
         }))
         .send()
         .await
-        .unwrap();
-
-    assert_eq!(r.status().as_u16(), 502);
-    assert_eq!(r.headers()[HDR_ROUTE_ACTION].to_str().unwrap(), "forward");
-    assert_eq!(
-        r.headers()[HDR_ROUTE_REASON].to_str().unwrap(),
-        "ROUTE_FORWARD_UNAVAILABLE"
-    );
-    assert_eq!(r.headers()[HDR_OWNER_NODE].to_str().unwrap(), "node-b");
-    assert!(r.headers()[HDR_FORWARD_URI]
-        .to_str()
         .unwrap()
-        .contains("/events?trace=1"));
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["seq"].as_u64().unwrap(), 0);
 
     let events = app
         .runtime
@@ -217,7 +211,8 @@ async fn session_handlers_short_circuit_remote_owner_before_local_append() {
         })
         .await
         .unwrap();
-    assert!(events.is_empty());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "x");
 }
 
 #[tokio::test]
@@ -452,6 +447,22 @@ async fn spawn_routed_app(owner_node_id: &str) -> TestApp {
         ]);
     let state = AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot));
     spawn_app_with_state(state).await
+}
+
+async fn spawn_proxy_pair() -> (TestApp, TestApp) {
+    let runtime = Runtime::in_memory();
+    let owner = spawn_app_with_state(AppState::new(runtime.clone())).await;
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-b"))])
+        .with_nodes(vec![
+            node("node-a", "http://127.0.0.1:18080"),
+            node("node-b", &owner.base),
+        ]);
+    let local = spawn_app_with_state(
+        AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot)),
+    )
+    .await;
+    (local, owner)
 }
 
 async fn spawn_unassigned_routed_app() -> TestApp {

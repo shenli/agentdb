@@ -13,6 +13,7 @@ use crate::routing_http::RouteRuntime;
 pub struct AppState {
     pub runtime: Arc<Runtime>,
     pub routing: RouteRuntime,
+    pub proxy: reqwest::Client,
 }
 
 impl AppState {
@@ -20,6 +21,7 @@ impl AppState {
         Self {
             runtime,
             routing: RouteRuntime::disabled(),
+            proxy: reqwest::Client::new(),
         }
     }
 
