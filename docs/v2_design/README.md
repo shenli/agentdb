@@ -136,5 +136,8 @@ Start with:
   — implementation handoff for AI coding agents building the local V2 prototype.
 - [`gap-analysis.md`](gap-analysis.md) — V1-to-V2 delta, including what stays,
   what changes, and which crates are deleted or rewritten.
+- [`session-layer-gap-audit.md`](session-layer-gap-audit.md) — current
+  architecture-to-product audit for AgentDB as the durable session layer between
+  stateless brains and replaceable hands.
 - [`v2-implementation-plan.md`](v2-implementation-plan.md) — milestone roadmap
   and detailed V2.0 task-level plan.

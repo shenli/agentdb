@@ -126,6 +126,84 @@ def test_fork_creates_a_child_session(server):
     assert payloads[-1] == 99
 
 
+def test_harness_recovers_session_from_ids(server):
+    first_client = Client(server)
+    tenant = first_client.create_tenant("agent-smoke-recovery")
+    tenant_id = tenant["tenant_id"]
+    agent = first_client.create_agent(tenant_id, alias="agent-smoke-recovery-agent")
+    agent_id = agent["agent_id"]
+    session = first_client.create_session(tenant_id, agent_id, alias="agent-smoke-recovery")
+
+    session.append(
+        {"role": "user", "text": "summarize the sandbox output"},
+        kind="user_message",
+    )
+    call = session.append(
+        {
+            "tool_call_id": "call_1",
+            "tool": "sandbox.exec",
+            "input": {"cmd": "python report.py"},
+        },
+        kind="tool_call",
+    )
+    artifact = first_client.put_artifact(
+        tenant_id,
+        b"generated report\nline 1\nline 2\n",
+        content_type="text/plain",
+    )
+    session.append(
+        {
+            "tool_call_id": "call_1",
+            "status": "ok",
+            "summary": "Generated report with two lines.",
+        },
+        kind="tool_result",
+        artifact_refs=[
+            {
+                "artifact_id": artifact["artifact_id"],
+                "content_type": artifact["content_type"],
+                "bytes": artifact["bytes"],
+                "sha256": artifact["sha256"],
+            }
+        ],
+        source_refs=[{"event_id": call.event_id}],
+    )
+    session.append(
+        {"role": "assistant", "text": "The report has two generated lines."},
+        kind="model_message",
+    )
+    context = session.context(include=["recent_events"], max_events=10)
+    assert context.get("events"), "context should include recent events"
+
+    last_seq_before_crash = session.fetch(from_seq=0, limit=100)[-1].seq
+
+    # Simulate a fresh harness process: only persisted IDs are carried forward.
+    recovery_client = Client(server)
+    recovered = recovery_client.session(tenant_id, session.session_id, agent_id=agent_id)
+    replayed = recovered.replay(from_seq=0, limit=100)
+    assert [event.kind for event in replayed] == [
+        "user_message",
+        "tool_call",
+        "tool_result",
+        "model_message",
+    ]
+
+    resumed = recovered.append(
+        {
+            "status": "recovered",
+            "last_seen_seq": last_seq_before_crash,
+        },
+        kind="agent_status",
+    )
+    assert resumed.seq == last_seq_before_crash + 1
+
+    seen = []
+    for event in recovered.subscribe(from_seq=last_seq_before_crash + 1):
+        seen.append(event)
+        break
+    assert [event.kind for event in seen] == ["agent_status"]
+
+
 def test_health_ready_probe(server):
     client = Client(server)
     assert client.health_ready() is True

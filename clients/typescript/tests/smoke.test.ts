@@ -145,6 +145,86 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
     assert.equal((last.payload as { i: number }).i, 99);
   });
 
+  await t.test("harness recovers a session from persisted IDs", async () => {
+    const firstClient = new Client({ baseUrl });
+    const tenant = await firstClient.createTenant("agent-smoke-recovery");
+    const tenantId = String(tenant.tenant_id);
+    const agent = await firstClient.createAgent(tenantId, { alias: "agent-smoke-recovery-agent" });
+    const agentId = String(agent.agent_id);
+    const session = await firstClient.createSession(tenantId, agentId, { alias: "agent-smoke-recovery" });
+
+    await session.append(
+      { role: "user", text: "summarize the sandbox output" },
+      { kind: "user_message" }
+    );
+    const call = await session.append(
+      {
+        tool_call_id: "call_1",
+        tool: "sandbox.exec",
+        input: { cmd: "python report.py" },
+      },
+      { kind: "tool_call" }
+    );
+    const artifact = await firstClient.putArtifact(
+      tenantId,
+      Buffer.from("generated report\nline 1\nline 2\n"),
+      { contentType: "text/plain" }
+    );
+    await session.append(
+      {
+        tool_call_id: "call_1",
+        status: "ok",
+        summary: "Generated report with two lines.",
+      },
+      {
+        kind: "tool_result",
+        artifactRefs: [
+          {
+            artifact_id: String(artifact.artifact_id),
+            content_type: String(artifact.content_type),
+            bytes: Number(artifact.bytes),
+            sha256: String(artifact.sha256),
+          },
+        ],
+        sourceRefs: [{ event_id: call.eventId }],
+      }
+    );
+    await session.append(
+      { role: "assistant", text: "The report has two generated lines." },
+      { kind: "model_message" }
+    );
+    const context = await session.context({ include: ["recent_events"], maxEvents: 10 });
+    assert.ok(Array.isArray(context.events) && context.events.length > 0);
+
+    const beforeCrash = await session.fetch({ fromSeq: 0, limit: 100 });
+    const lastSeqBeforeCrash = beforeCrash[beforeCrash.length - 1]!.seq;
+
+    // Simulate a fresh harness process: only persisted IDs are carried forward.
+    const recoveryClient = new Client({ baseUrl });
+    const recovered = recoveryClient.session(tenantId, session.sessionId, { agentId });
+    const replayed = await recovered.replay({ fromSeq: 0, limit: 100 });
+    assert.deepEqual(
+      replayed.map((event) => event.kind),
+      ["user_message", "tool_call", "tool_result", "model_message"]
+    );
+
+    const resumed = await recovered.append(
+      {
+        status: "recovered",
+        last_seen_seq: lastSeqBeforeCrash,
+      },
+      { kind: "agent_status" }
+    );
+    assert.equal(resumed.seq, lastSeqBeforeCrash + 1);
+
+    const seen: string[] = [];
+    for await (const event of recovered.subscribe({ fromSeq: lastSeqBeforeCrash + 1 })) {
+      seen.push(event.kind);
+      break;
+    }
+    assert.deepEqual(seen, ["agent_status"]);
+  });
+
   await t.test("fetchRecent on empty session returns empty array", async () => {
     const sess = await newSession("agent-smoke-fetch-empty");
     const result = await sess.fetchRecent(5);
