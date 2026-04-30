@@ -204,3 +204,9 @@ pub struct BindSkillBody {
 pub struct ListAgentSkillsResponse {
     pub skills: Vec<AgentSkillBinding>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct SweepBody {
+    #[serde(default)]
+    pub now_ms: Option<u64>,
+}

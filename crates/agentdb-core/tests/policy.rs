@@ -209,6 +209,100 @@ fn tier_template_resolves_and_allows_overrides() {
     assert_eq!(pro_override.priority, Priority::Normal);
     assert_eq!(pro_override.quota.max_records, Some(2));
     assert_eq!(pro_override.quota.soft_max_records, Some(8_000));
+    assert_eq!(pro_override.quota.max_active_sessions, Some(1_000));
+}
+
+#[tokio::test]
+async fn active_session_quota_enforces_hard_limit_and_reports_soft_limit() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "sessions".into(),
+            policy: serde_json::json!({
+                "quota": {
+                    "soft_max_active_sessions": 1,
+                    "max_active_sessions": 1
+                }
+            }),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    rt.create_session(NewSession {
+        tenant_id: t.tenant_id.clone(),
+        agent_id: a.agent_id.clone(),
+        alias: None,
+    })
+    .await
+    .unwrap();
+    let report = rt.backpressure_for_tenant(&t.tenant_id).await.unwrap();
+    assert_eq!(
+        report.header_value().as_deref(),
+        Some("active_sessions=100")
+    );
+
+    let err = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id,
+            alias: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+}
+
+#[tokio::test]
+async fn session_event_backpressure_reports_soft_limit() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "session-events".into(),
+            policy: serde_json::json!({
+                "quota": {"soft_max_events_per_session": 1, "max_events_per_session": 10}
+            }),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    let report = rt
+        .backpressure_for_session(&t.tenant_id, &s.session_id)
+        .await
+        .unwrap();
+    assert_eq!(report.header_value().as_deref(), Some("session_events=100"));
 }
 
 #[tokio::test]

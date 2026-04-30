@@ -228,3 +228,82 @@ async fn gc_respects_legal_hold() {
         .unwrap();
     assert!(deleted.deleted_at_ms.is_some());
 }
+
+#[tokio::test]
+async fn tenant_scoped_sweeps_do_not_touch_other_tenants() {
+    let rt = Runtime::in_memory();
+    let t1 = tenant_with_policy(
+        &rt,
+        "scope-1",
+        serde_json::json!({
+            "lifecycle": {"cold_after_ms": 0},
+            "retention": {"retention_ms": 0}
+        }),
+    )
+    .await;
+    let t2 = tenant_with_policy(
+        &rt,
+        "scope-2",
+        serde_json::json!({
+            "lifecycle": {"cold_after_ms": 0},
+            "retention": {"retention_ms": 0}
+        }),
+    )
+    .await;
+    let s1 = session_for(&rt, &t1).await;
+    let s2 = session_for(&rt, &t2).await;
+
+    let report = rt
+        .sweep_lifecycle_for_tenant_at(&t1.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(report.sessions_transitioned, 1);
+    assert_eq!(
+        rt.get_session(&t1.tenant_id, &s1.session_id)
+            .await
+            .unwrap()
+            .lifecycle,
+        Lifecycle::Cold
+    );
+    assert_eq!(
+        rt.get_session(&t2.tenant_id, &s2.session_id)
+            .await
+            .unwrap()
+            .lifecycle,
+        Lifecycle::Warm
+    );
+
+    let r1 = rt
+        .write_record(new_record(&t1, "tenant one"))
+        .await
+        .unwrap();
+    let r2 = rt
+        .write_record(new_record(&t2, "tenant two"))
+        .await
+        .unwrap();
+    rt.delete_record(&t1.tenant_id, &r1.record_id)
+        .await
+        .unwrap();
+    rt.delete_record(&t2.tenant_id, &r2.record_id)
+        .await
+        .unwrap();
+
+    let report = rt
+        .gc_sweep_for_tenant_at(&t1.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(report.records_purged, 1);
+    assert_eq!(
+        rt.get_record_with_options(&t1.tenant_id, &r1.record_id, true)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecordNotFound
+    );
+    assert!(rt
+        .get_record_with_options(&t2.tenant_id, &r2.record_id, true)
+        .await
+        .unwrap()
+        .deleted_at_ms
+        .is_some());
+}

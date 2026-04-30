@@ -27,7 +27,7 @@ use agentdb_core::{
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, IncludeDeletedQuery,
-    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse,
+    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse, SweepBody,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -107,6 +107,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/tenants/:tenant_id/skills", post(create_skill))
         .route("/api/tenants/:tenant_id/skills/:skill_id", get(get_skill))
+        .route(
+            "/api/tenants/:tenant_id/policy/lifecycle-sweep",
+            post(run_lifecycle_sweep),
+        )
+        .route(
+            "/api/tenants/:tenant_id/policy/gc-sweep",
+            post(run_gc_sweep),
+        )
 }
 
 async fn create_tenant(
@@ -177,7 +185,7 @@ async fn create_session(
     State(s): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<CreateSessionBody>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -191,12 +199,17 @@ async fn create_session(
     let sess = s
         .runtime
         .create_session(NewSession {
-            tenant_id: tid,
+            tenant_id: tid.clone(),
             agent_id: aid,
             alias: body.alias,
         })
         .await?;
-    Ok(Json(sess))
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    Ok(json_with_backpressure(
+        StatusCode::CREATED,
+        Json(sess),
+        backpressure,
+    ))
 }
 
 async fn get_session(
@@ -244,7 +257,7 @@ async fn append_event(
         .append(AppendRequest {
             tenant_id: tid.clone(),
             agent_id: aid,
-            session_id: sid,
+            session_id: sid.clone(),
             kind: body.kind,
             payload: body.payload,
             artifact_refs: body.artifact_refs,
@@ -252,7 +265,8 @@ async fn append_event(
             idempotency_key: idem_key,
         })
         .await?;
-    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
     Ok(json_with_backpressure(
         StatusCode::OK,
         Json(resp),
@@ -289,7 +303,7 @@ async fn append_and_fetch(
             AppendRequest {
                 tenant_id: tid.clone(),
                 agent_id: aid,
-                session_id: sid,
+                session_id: sid.clone(),
                 kind: body.kind,
                 payload: body.payload,
                 artifact_refs: body.artifact_refs,
@@ -300,7 +314,8 @@ async fn append_and_fetch(
             body.max_bytes,
         )
         .await?;
-    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
     Ok(json_with_backpressure(
         StatusCode::OK,
         Json(resp),
@@ -684,6 +699,40 @@ async fn list_agent_skills(
     let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
     let skills = s.runtime.list_agent_skills(&tid, &aid).await?;
     Ok(Json(ListAgentSkillsResponse { skills }))
+}
+
+async fn run_lifecycle_sweep(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SweepBody>,
+) -> Result<Json<agentdb_core::LifecycleSweepReport>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let report = s
+        .runtime
+        .sweep_lifecycle_for_tenant_at(&tid, body.now_ms.unwrap_or_else(current_ms))
+        .await?;
+    Ok(Json(report))
+}
+
+async fn run_gc_sweep(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SweepBody>,
+) -> Result<Json<agentdb_core::GcSweepReport>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let report = s
+        .runtime
+        .gc_sweep_for_tenant_at(&tid, body.now_ms.unwrap_or_else(current_ms))
+        .await?;
+    Ok(Json(report))
+}
+
+fn current_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Hand-rolled query-string parser for the search route. Handles the

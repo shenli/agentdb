@@ -29,6 +29,10 @@ pub struct QuotaPolicy {
     #[serde(default)]
     pub max_events_per_session: Option<u64>,
     #[serde(default)]
+    pub soft_max_active_sessions: Option<usize>,
+    #[serde(default)]
+    pub max_active_sessions: Option<usize>,
+    #[serde(default)]
     pub soft_max_records: Option<usize>,
     #[serde(default)]
     pub max_records: Option<usize>,
@@ -43,6 +47,8 @@ impl Default for QuotaPolicy {
         Self {
             soft_max_events_per_session: None,
             max_events_per_session: None,
+            soft_max_active_sessions: None,
+            max_active_sessions: None,
             soft_max_records: None,
             max_records: None,
             soft_max_artifact_storage_bytes: None,
@@ -172,6 +178,8 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: Some(80),
                 max_events_per_session: Some(100),
+                soft_max_active_sessions: Some(8),
+                max_active_sessions: Some(10),
                 soft_max_records: Some(80),
                 max_records: Some(100),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024),
@@ -195,6 +203,8 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: Some(8_000),
                 max_events_per_session: Some(10_000),
+                soft_max_active_sessions: Some(800),
+                max_active_sessions: Some(1_000),
                 soft_max_records: Some(8_000),
                 max_records: Some(10_000),
                 soft_max_artifact_storage_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -215,6 +225,8 @@ fn tier_template(name: &str) -> RuntimePolicy {
             quota: QuotaPolicy {
                 soft_max_events_per_session: None,
                 max_events_per_session: None,
+                soft_max_active_sessions: None,
+                max_active_sessions: None,
                 soft_max_records: None,
                 max_records: None,
                 soft_max_artifact_storage_bytes: None,
