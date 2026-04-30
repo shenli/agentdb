@@ -87,6 +87,7 @@ dependencies = [
  "agentdb-api",
  "agentdb-core",
  "agentdb-dashboard",
+ "agentdb-meta",
  "agentdb-storage",
  "anyhow",
  "axum",

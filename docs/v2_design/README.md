@@ -62,8 +62,11 @@ Implementation checkpoint:
   evaluation: `RouteRuntime` can compute local/forward/reject outcomes from
   node/tablet/shard/session-locator snapshots without async metadata reads
   inside request handlers.
-- Current next milestone: call the routing guard from session handlers and
-  attach the same-cluster HTTP client.
+- V2.15 wires the metadata-backed routing guard into session-scoped handlers,
+  adds boot-time route snapshot loading from `agentdb-meta`, and short-circuits
+  remote/unassigned decisions before local state is mutated.
+- Current next milestone: execute same-cluster `ForwardRequest`s through an
+  internal HTTP client and pass through owner-node responses.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

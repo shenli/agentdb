@@ -15,11 +15,12 @@ use axum::{
 use serde::Serialize;
 
 use agentdb_meta::{
-    nodes::Node,
+    nodes::{self, Node},
     routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
-    session_locators::SessionLocator,
-    shards::ShardRow,
-    tablets::Tablet,
+    session_locators::{self, SessionLocator},
+    shards::{self, ShardRow},
+    tablets::{self, Tablet},
+    MetaStore,
 };
 
 pub const HDR_ROUTE_ACTION: &str = "x-agentdb-route-action";
@@ -30,6 +31,7 @@ pub const HDR_TABLET_EPOCH: &str = "x-agentdb-tablet-epoch";
 pub const HDR_ROUTE_REASON: &str = "x-agentdb-route-reason";
 pub const HDR_FORWARDED_BY: &str = "x-agentdb-forwarded-by";
 pub const HDR_FORWARDED_FOR: &str = "x-agentdb-forwarded-for";
+pub const HDR_FORWARD_URI: &str = "x-agentdb-forward-uri";
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -79,6 +81,7 @@ pub struct RouteSnapshot {
     pub shards: Arc<[ShardRow]>,
     pub tablets: Arc<[Tablet]>,
     pub nodes: Arc<[Node]>,
+    pub session_locators: Arc<[SessionLocator]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +195,25 @@ impl RouteRuntime {
             RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
         }
     }
+
+    pub fn guard_session_id(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        original_path_and_query: &str,
+        incoming_headers: &HeaderMap,
+    ) -> RouteGuardOutcome {
+        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+            return self.guard(original_path_and_query, incoming_headers);
+        };
+        let session_locator = snapshot.session_locator(tenant_id, session_id);
+        self.guard_session(
+            tenant_id,
+            session_locator,
+            original_path_and_query,
+            incoming_headers,
+        )
+    }
 }
 
 impl RouteSnapshot {
@@ -203,7 +225,26 @@ impl RouteSnapshot {
             shards: Arc::from([]),
             tablets: Arc::from([]),
             nodes: Arc::from([]),
+            session_locators: Arc::from([]),
         }
+    }
+
+    pub async fn load_from_meta(
+        store: &MetaStore,
+        shard_count: i64,
+        request_location: Option<String>,
+        policy: ResidencyPolicy,
+    ) -> agentdb_meta::MetaResult<Self> {
+        let pool = store.pool();
+        Ok(Self {
+            shard_count,
+            request_location,
+            policy,
+            shards: Arc::from(shards::list_all(pool).await?),
+            tablets: Arc::from(tablets::list_all(pool).await?),
+            nodes: Arc::from(nodes::list_all(pool).await?),
+            session_locators: Arc::from(session_locators::list_all(pool).await?),
+        })
     }
 
     pub fn with_request_location(mut self, request_location: impl Into<String>) -> Self {
@@ -229,6 +270,21 @@ impl RouteSnapshot {
     pub fn with_nodes(mut self, nodes: Vec<Node>) -> Self {
         self.nodes = Arc::from(nodes);
         self
+    }
+
+    pub fn with_session_locators(mut self, session_locators: Vec<SessionLocator>) -> Self {
+        self.session_locators = Arc::from(session_locators);
+        self
+    }
+
+    fn session_locator(&self, tenant_id: &str, session_id: &str) -> Option<&SessionLocator> {
+        self.session_locators.iter().find(|locator| {
+            locator.session_id == session_id
+                && locator
+                    .tenant_external_id
+                    .as_deref()
+                    .is_none_or(|locator_tenant| locator_tenant == tenant_id)
+        })
     }
 }
 
@@ -278,6 +334,28 @@ pub fn route_rejection_response(rejection: &RouteRejection) -> Response {
     };
     let mut response = (rejection.status, Json(body)).into_response();
     response.headers_mut().extend(rejection.headers.clone());
+    response
+}
+
+pub fn route_forward_unavailable_response(forward: &ForwardRequest) -> Response {
+    let body = ErrorBody {
+        error: ErrorDetail {
+            code: "ROUTE_FORWARD_UNAVAILABLE",
+            message:
+                "request must be served by another AgentDB node but proxy execution is not enabled",
+            retryable: true,
+            suggestion: Some("retry against the owner node advertised in the routing headers"),
+        },
+    };
+    let mut response = (StatusCode::BAD_GATEWAY, Json(body)).into_response();
+    response.headers_mut().extend(forward.headers.clone());
+    insert_header(response.headers_mut(), HDR_ROUTE_ACTION, "forward");
+    insert_header(
+        response.headers_mut(),
+        HDR_ROUTE_REASON,
+        "ROUTE_FORWARD_UNAVAILABLE",
+    );
+    insert_header(response.headers_mut(), HDR_FORWARD_URI, &forward.uri);
     response
 }
 
@@ -757,6 +835,72 @@ mod tests {
         };
         assert_eq!(headers[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
         assert_eq!(headers[HDR_TABLET_ID].to_str().unwrap(), "42");
+    }
+
+    #[test]
+    fn route_runtime_snapshot_guard_session_id_uses_locator() {
+        let snapshot = RouteSnapshot::new(1)
+            .with_tablets(vec![
+                tablet(0, Some("node-b"), i64::MAX),
+                tablet(7, Some("node-a"), i64::MAX),
+            ])
+            .with_nodes(vec![
+                node("node-a", "us-west-2a"),
+                node("node-b", "us-west-2a"),
+            ])
+            .with_session_locators(vec![locator("ses_1", 0, Some(7))]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session_id("ten_1", "ses_1", "/api/test", &HeaderMap::new());
+
+        let RouteGuardOutcome::ServeLocal(headers) = outcome else {
+            panic!("expected local");
+        };
+        assert_eq!(headers[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
+        assert_eq!(headers[HDR_TABLET_ID].to_str().unwrap(), "7");
+    }
+
+    #[tokio::test]
+    async fn route_snapshot_loads_from_meta_store() {
+        let store = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let pool = store.pool();
+        agentdb_meta::shards::seed_shards(pool, 1, 10)
+            .await
+            .unwrap();
+        agentdb_meta::shards::set_assignment(pool, 0, Some(7), 11)
+            .await
+            .unwrap();
+        agentdb_meta::nodes::upsert(
+            pool,
+            "node-a",
+            "http://node-a:8080",
+            None,
+            "alive",
+            100,
+            Some("us-west-2a"),
+        )
+        .await
+        .unwrap();
+        agentdb_meta::tablets::get_or_create(pool, 7, 100)
+            .await
+            .unwrap();
+        agentdb_meta::tablets::assume_ownership(pool, 7, 0, "node-a", i64::MAX)
+            .await
+            .unwrap();
+        agentdb_meta::session_locators::upsert(pool, "ses_1", 1, "ten_1", Some(7), 0, 100)
+            .await
+            .unwrap();
+
+        let snapshot =
+            RouteSnapshot::load_from_meta(&store, 1, Some("us-west-2a".into()), Default::default())
+                .await
+                .unwrap();
+
+        assert_eq!(snapshot.shards.len(), 1);
+        assert_eq!(snapshot.tablets.len(), 1);
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.session_locators.len(), 1);
+        assert_eq!(snapshot.session_locators[0].session_id, "ses_1");
     }
 
     #[test]
