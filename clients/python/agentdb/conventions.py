@@ -250,6 +250,31 @@ def context_pack_built(
     )
 
 
+def context_source_refs(context: Mapping[str, Any], *, max_refs: Optional[int] = None) -> list:
+    """Build `source_refs` from a context response.
+
+    The context pack is a derived view. These refs preserve a compact pointer
+    back to the durable events, records, and skills that shaped that view.
+    """
+
+    refs = []
+    for event in context.get("events") or []:
+        event_id = _field(event, "event_id", "eventId")
+        if event_id is not None:
+            refs.append({"event_id": event_id})
+    for record in context.get("records") or []:
+        record_id = _field(record, "record_id", "recordId")
+        if record_id is not None:
+            refs.append({"record_id": record_id})
+    for skill in context.get("skills") or []:
+        skill_id = _field(skill, "skill_id", "skillId")
+        if skill_id is not None:
+            refs.append({"skill_id": skill_id})
+    if max_refs is not None:
+        return refs[:max_refs]
+    return refs
+
+
 def agent_status(
     status: str,
     *,
@@ -271,3 +296,15 @@ def agent_status(
 
 def _compact(payload: Mapping[str, Any]) -> dict:
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def _field(value: Any, *names: str) -> Any:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return None
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None

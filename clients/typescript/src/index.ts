@@ -33,6 +33,7 @@ export {
   approvalResult,
   artifactCreated,
   contextPackBuilt,
+  contextSourceRefs,
   modelMessage,
   modelThought,
   toolCall,

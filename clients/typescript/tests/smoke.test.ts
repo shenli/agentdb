@@ -25,6 +25,8 @@ import {
   Session,
   SessionEventKind,
   agentStatus,
+  contextPackBuilt,
+  contextSourceRefs,
   modelMessage,
   toolCall,
   toolResult,
@@ -190,12 +192,27 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
         sourceRefs: [{ event_id: call.eventId }],
       }
     );
-    await session.append(
-      modelMessage("The report has two generated lines."),
-      { kind: SessionEventKind.ModelMessage }
-    );
     const context = await session.context({ include: ["recent_events"], maxEvents: 10 });
     assert.ok(Array.isArray(context.events) && context.events.length > 0);
+    const contextEvent = await session.append(
+      contextPackBuilt("ctx_recovery_1", ["recent_events"], {
+        maxEvents: 10,
+        selectedEventCount: (context.events as unknown[]).length,
+      }),
+      {
+        kind: SessionEventKind.ContextPackBuilt,
+        sourceRefs: contextSourceRefs(context),
+      }
+    );
+    await session.append(
+      modelMessage("The report has two generated lines.", {
+        contextPackId: "ctx_recovery_1",
+      }),
+      {
+        kind: SessionEventKind.ModelMessage,
+        sourceRefs: [{ event_id: contextEvent.eventId }],
+      }
+    );
 
     const beforeCrash = await session.fetch({ fromSeq: 0, limit: 100 });
     const lastSeqBeforeCrash = beforeCrash[beforeCrash.length - 1]!.seq;
@@ -206,7 +223,7 @@ test("agentdb SDK end-to-end", { skip: skipReason }, async (t) => {
     const replayed = await recovered.replay({ fromSeq: 0, limit: 100 });
     assert.deepEqual(
       replayed.map((event) => event.kind),
-      ["user_message", "tool_call", "tool_result", "model_message"]
+      ["user_message", "tool_call", "tool_result", "context_pack_built", "model_message"]
     );
 
     const resumed = await recovered.append(

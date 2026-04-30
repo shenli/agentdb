@@ -133,6 +133,43 @@ session.append(
 Helpers are intentionally client-side only. They do not prevent custom event
 kinds or adapter-specific payload fields.
 
+## Context Provenance
+
+Context is a derived view over the durable session log. When a harness builds
+context for a model call, record a `context_pack_built` event with source refs,
+then link the model output to that event:
+
+```python
+from agentdb import (
+    SessionEventKind,
+    context_pack_built,
+    context_source_refs,
+    model_message,
+)
+
+context = session.context(include=["recent_events", "records"], max_events=20)
+context_event = session.append(
+    context_pack_built(
+        "ctx_1",
+        ["recent_events", "records"],
+        max_events=20,
+        selected_event_count=len(context.get("events", [])),
+        selected_record_count=len(context.get("records", [])),
+    ),
+    kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
+    source_refs=context_source_refs(context, max_refs=50),
+)
+
+session.append(
+    model_message("The report is ready.", context_pack_id="ctx_1"),
+    kind=SessionEventKind.MODEL_MESSAGE.value,
+    source_refs=[{"event_id": context_event.event_id}],
+)
+```
+
+This keeps the prompt/context shape model-specific while preserving the
+recoverable events and records that produced it.
+
 ## Testing
 
 ```bash

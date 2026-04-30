@@ -23,6 +23,8 @@ from agentdb import (
     SessionEventKind,
     Session,
     agent_status,
+    context_pack_built,
+    context_source_refs,
     model_message,
     tool_call,
     tool_result,
@@ -166,12 +168,26 @@ def test_harness_recovers_session_from_ids(server):
         ],
         source_refs=[{"event_id": call.event_id}],
     )
-    session.append(
-        model_message("The report has two generated lines."),
-        kind=SessionEventKind.MODEL_MESSAGE.value,
-    )
     context = session.context(include=["recent_events"], max_events=10)
     assert context.get("events"), "context should include recent events"
+    context_event = session.append(
+        context_pack_built(
+            "ctx_recovery_1",
+            ["recent_events"],
+            max_events=10,
+            selected_event_count=len(context.get("events", [])),
+        ),
+        kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
+        source_refs=context_source_refs(context),
+    )
+    session.append(
+        model_message(
+            "The report has two generated lines.",
+            context_pack_id="ctx_recovery_1",
+        ),
+        kind=SessionEventKind.MODEL_MESSAGE.value,
+        source_refs=[{"event_id": context_event.event_id}],
+    )
 
     last_seq_before_crash = session.fetch(from_seq=0, limit=100)[-1].seq
 
@@ -183,6 +199,7 @@ def test_harness_recovers_session_from_ids(server):
         "user_message",
         "tool_call",
         "tool_result",
+        "context_pack_built",
         "model_message",
     ]
 
