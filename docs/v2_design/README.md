@@ -69,8 +69,11 @@ Implementation checkpoint:
   and passes owner-node responses back through the original handler path.
 - V2.17 validates forwarded tablet epochs on owner nodes before session
   mutations run, rejecting stale forwarded writes when ownership changed.
-- Current next milestone: refresh route snapshots after placement, lease, node,
-  or locator changes instead of loading only at boot.
+- V2.18 refreshes route snapshots after boot: handlers share an updateable
+  routing runtime, the server reloads snapshots periodically, and Postgres
+  shard/node/tablet notifications trigger faster refreshes.
+- Current next milestone: add proxy timeout/response-size policy knobs and
+  split prototype location labels into durable region/AZ metadata.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
