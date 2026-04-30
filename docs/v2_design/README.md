@@ -89,8 +89,10 @@ Implementation checkpoint:
   unavailable tenant keys.
 - V2.25 adds pluggable envelope encryption/decryption adapters at the artifact
   content boundary while preserving plaintext artifact identity metadata.
-- Current next milestone: extend envelope encryption coverage to metadata/event
-  storage boundaries.
+- V2.26 extends envelope encryption/decryption adapters to artifact metadata
+  and event KV rows while preserving existing secondary indexes.
+- Current next milestone: record key version metadata for encrypted artifacts,
+  events, and metadata rows.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

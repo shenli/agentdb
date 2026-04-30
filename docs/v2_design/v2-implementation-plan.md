@@ -985,6 +985,33 @@ Follow-up:
 
 - Extend envelope encryption coverage to metadata/event storage boundaries.
 
+### V2.26 — Metadata/event envelope adapters (~350 LoC)
+
+Status: metadata/event envelope adapters complete. V2.26 adds a pluggable
+encryption/decryption boundary for selected KV metadata rows without changing
+tenant-first keys or secondary index semantics.
+
+Scope:
+
+- `agentdb-storage` exposes a `MetadataCryptoAdapter`, object-kind enum, and
+  `MetadataCryptoContext` for row-level metadata/event transforms.
+- The default `IdentityMetadataCryptoAdapter` preserves existing local behavior.
+- KV-backed `Persist` accepts an injected metadata crypto adapter.
+- Artifact metadata rows are encrypted before `record/artifact/...` writes and
+  decrypted during artifact hydration; the `artifact_by_sha256` index remains
+  plaintext so existing lookup/dedup paths keep their key shape.
+- Event rows are encrypted before `event/{tenant}/{session}/{seq}` writes and
+  decrypted during fetch, restart reconciliation, and session-event GC.
+- Runtime KV constructors expose an injection point for both content and
+  metadata crypto adapters.
+- Restart coverage verifies raw KV artifact/event rows are wrapped while
+  reopened runtimes can hydrate artifact metadata and fetch event payloads.
+
+Follow-up:
+
+- Record key version metadata for encrypted artifacts, events, and metadata
+  rows.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan
