@@ -66,6 +66,47 @@ IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
 `Idempotency-Key` automatically unless one is supplied.
 
+## Harness Recovery
+
+AgentDB sessions are durable state outside the harness process. A restarted
+harness should keep the tenant, agent, session, and last-seen sequence IDs, then
+rebuild a session handle and continue from durable history:
+
+```python
+from agentdb import Client
+
+client = Client("http://127.0.0.1:8080")
+session = client.session(tenant_id, session_id, agent_id=agent_id)
+
+history = session.replay(from_seq=0, limit=100)
+context = session.context(include=["recent_events", "records", "skills"])
+
+result = session.append(
+    {"status": "recovered", "last_seen_seq": last_seen_seq},
+    kind="agent_status",
+)
+
+for event in session.subscribe(from_seq=last_seen_seq + 1):
+    handle(event)
+```
+
+Concept mapping:
+
+| Durable-session concept | Python SDK |
+|---|---|
+| wake/resume handle | `client.session(tenant_id, session_id, agent_id=...)` |
+| get events | `session.fetch(...)` |
+| append event | `session.append(...)` |
+| append and fetch | `session.append_and_fetch(...)` |
+| subscribe from sequence | `session.subscribe(from_seq=...)` |
+| fork session | `session.fork(...)` |
+| build context | `session.context(...)` |
+| tenant/session watch | `client.watch(...)` |
+
+Use `from_seq=last_seen_seq + 1` when reconnecting a subscription to avoid
+replaying events the harness has already processed. Persisting the last handled
+`seq` is the harness's cursor rule.
+
 ## Testing
 
 ```bash
