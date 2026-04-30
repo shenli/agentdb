@@ -960,6 +960,31 @@ Follow-up:
 
 - Add envelope encryption/decryption adapters at the artifact content boundary.
 
+### V2.25 — Artifact content envelope adapters (~300 LoC)
+
+Status: artifact content envelope adapters complete. V2.25 wires a pluggable
+content crypto boundary into artifact writes and reads without changing the
+public artifact API or requiring a concrete KMS provider.
+
+Scope:
+
+- `agentdb-storage` exposes a `ContentCryptoAdapter` trait and
+  `ContentCryptoContext` carrying tenant, artifact, and resolved key metadata.
+- The default `IdentityContentCryptoAdapter` preserves existing local behavior.
+- `Runtime` accepts an injected content crypto adapter alongside the KMS key
+  resolver.
+- Artifact content writes resolve the tenant content-write key, encrypt bytes
+  before calling the `ContentBackend`, and keep artifact `bytes`/`sha256`
+  metadata tied to plaintext identity.
+- Artifact content reads resolve the tenant content-read key, decrypt backend
+  bytes, and verify the plaintext hash against artifact metadata.
+- Restart coverage verifies transformed storage bytes remain unreadable as
+  plaintext while runtime reads return the original payload after reopening.
+
+Follow-up:
+
+- Extend envelope encryption coverage to metadata/event storage boundaries.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan

@@ -121,9 +121,7 @@ impl ContentBackend for LocalFsContentBackend {
         let final_path = self.path_for(tenant_id, artifact_id);
         let tmp_path = self.tmp_path_for(tenant_id, artifact_id);
 
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let sha256_hex = hex_encode(&hasher.finalize());
+        let sha256_hex = sha256_hex(bytes);
 
         // Write tmp + fsync + rename. tokio::fs::rename is atomic on POSIX.
         // TODO(V2.4): fsync the parent directory to make the rename durable
@@ -184,9 +182,7 @@ pub struct InMemoryContentBackend {
 #[async_trait]
 impl ContentBackend for InMemoryContentBackend {
     async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let sha256_hex = hex_encode(&hasher.finalize());
+        let sha256_hex = sha256_hex(bytes);
 
         let mut g = self.blobs.lock().expect("blobs mutex poisoned");
         g.insert(
@@ -216,6 +212,12 @@ impl ContentBackend for InMemoryContentBackend {
         g.remove(&(tenant_id.to_string(), artifact_id.to_string()));
         Ok(())
     }
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

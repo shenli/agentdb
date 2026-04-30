@@ -19,8 +19,11 @@ use tokio::sync::Mutex;
 use agentdb_index::doc_id::DocId;
 use agentdb_index::text::{InMemoryInverted, TextIndex};
 use agentdb_index::vector::{HnswVectorIndex, VectorIndex};
-use agentdb_storage::content::{ContentBackend, InMemoryContentBackend};
-use agentdb_storage::{AllowAllKmsKeyResolver, KeyOperation, KmsError, KmsKeyResolver, KvStore};
+use agentdb_storage::content::{sha256_hex, ContentBackend, InMemoryContentBackend};
+use agentdb_storage::{
+    AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
+    IdentityContentCryptoAdapter, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KvStore,
+};
 
 use crate::agent::{Agent, NewAgent};
 use crate::artifact::{Artifact, NewArtifact};
@@ -414,6 +417,7 @@ pub struct Runtime {
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
+    content_crypto: Arc<dyn ContentCryptoAdapter>,
     kms: Arc<dyn KmsKeyResolver>,
     /// Per-(tenant, namespace) BM25 text index for V2.2 searchable
     /// records. Wrapped in a `std::sync::Mutex` because
@@ -439,6 +443,7 @@ impl Runtime {
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
+            content_crypto: Arc::new(IdentityContentCryptoAdapter),
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -451,6 +456,23 @@ impl Runtime {
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
+            content_crypto: Arc::new(IdentityContentCryptoAdapter),
+            kms,
+            text_index: StdMutex::new(InMemoryInverted::new()),
+            vector_index: StdMutex::new(HnswVectorIndex::new()),
+        })
+    }
+
+    pub fn in_memory_with_kms_and_content_crypto(
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State::default()),
+            idem: IdempotencyStore::default(),
+            persist: None,
+            content: Arc::new(InMemoryContentBackend::default()),
+            content_crypto,
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
@@ -483,6 +505,20 @@ impl Runtime {
         kv: Arc<dyn KvStore + Send + Sync>,
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
+    ) -> Arc<Self> {
+        Self::with_kv_kms_and_content_crypto(
+            kv,
+            content,
+            kms,
+            Arc::new(IdentityContentCryptoAdapter),
+        )
+    }
+
+    pub fn with_kv_kms_and_content_crypto(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
     ) -> Arc<Self> {
         let persist = Persist::new(kv);
 
@@ -602,17 +638,21 @@ impl Runtime {
             idem,
             persist: Some(persist),
             content,
+            content_crypto,
             kms,
             text_index: StdMutex::new(text_idx),
             vector_index: StdMutex::new(vector_idx),
         })
     }
 
-    fn ensure_key_available(&self, tenant_id: &Id, operation: KeyOperation) -> Result<()> {
+    fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {
         self.kms
             .resolve_tenant_key(tenant_id.as_str(), operation)
-            .map(|_| ())
             .map_err(kms_error)
+    }
+
+    fn ensure_key_available(&self, tenant_id: &Id, operation: KeyOperation) -> Result<()> {
+        self.resolve_key(tenant_id, operation).map(|_| ())
     }
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
@@ -1585,38 +1625,43 @@ impl Runtime {
             }
         }
 
-        self.ensure_key_available(&req.tenant_id, KeyOperation::ContentWrite)?;
-        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
-
         // Mint the id BEFORE the put so the content backend path is stable
         // regardless of how long the put takes.
         let artifact_id = Id::new(crate::id::IdKind::Artifact);
-        let put = self
-            .content
-            .put(req.tenant_id.as_str(), artifact_id.as_str(), &bytes)
-            .await
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content put failed: {e}")))?;
+        let plaintext_sha256 = sha256_hex(&bytes);
 
-        // Verify caller-provided sha256 against the digest the backend
-        // computed while writing. On mismatch we best-effort delete the
-        // freshly-written blob to avoid orphaning it; ignore the delete
-        // error since the caller is already getting an error and the GC
-        // reaper will clean up later.
+        // Verify caller-provided sha256 against the plaintext before any
+        // storage write. Envelope encryption is an implementation boundary;
+        // artifact identity remains the caller-visible plaintext hash.
         if let Some(expected) = req.expected_sha256.as_deref() {
-            if !expected.eq_ignore_ascii_case(&put.sha256_hex) {
-                let _ = self
-                    .content
-                    .delete(req.tenant_id.as_str(), artifact_id.as_str())
-                    .await;
+            if !expected.eq_ignore_ascii_case(&plaintext_sha256) {
                 return Err(Error::new(
                     ErrorCode::HashMismatch,
                     format!(
                         "expected sha256 {expected} but content hashed to {}",
-                        put.sha256_hex
+                        plaintext_sha256
                     ),
                 ));
             }
         }
+
+        let content_key = self.resolve_key(&req.tenant_id, KeyOperation::ContentWrite)?;
+        self.ensure_key_available(&req.tenant_id, KeyOperation::MetadataWrite)?;
+
+        let crypto_context = ContentCryptoContext {
+            tenant_id: req.tenant_id.as_str(),
+            artifact_id: artifact_id.as_str(),
+            key: &content_key,
+        };
+        let stored_bytes = self
+            .content_crypto
+            .encrypt(&crypto_context, &bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content encrypt failed: {e}")))?;
+        let _put = self
+            .content
+            .put(req.tenant_id.as_str(), artifact_id.as_str(), &stored_bytes)
+            .await
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content put failed: {e}")))?;
 
         // Build the record with the freshly-minted id rather than relying on
         // Artifact::from_put to mint one (it would mint a different id from
@@ -1625,8 +1670,8 @@ impl Runtime {
             artifact_id: artifact_id.clone(),
             tenant_id: req.tenant_id,
             content_type: req.content_type,
-            bytes: put.bytes,
-            sha256: put.sha256_hex,
+            bytes: bytes.len() as u64,
+            sha256: plaintext_sha256,
             created_at_ms: crate::now_ms(),
             deleted_at_ms: None,
             raw_purged_at_ms: None,
@@ -1677,13 +1722,32 @@ impl Runtime {
                 format!("{}", artifact_id),
             ));
         }
-        self.ensure_key_available(tenant_id, KeyOperation::ContentRead)?;
-        // TODO(V2.4): re-verify the returned bytes against art.sha256. Skipped
-        // in V2.1 to avoid hashing on every read.
-        self.content
+        let content_key = self.resolve_key(tenant_id, KeyOperation::ContentRead)?;
+        let stored_bytes = self
+            .content
             .get(tenant_id.as_str(), artifact_id.as_str())
             .await
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content get failed: {e}")))?;
+        let crypto_context = ContentCryptoContext {
+            tenant_id: tenant_id.as_str(),
+            artifact_id: artifact_id.as_str(),
+            key: &content_key,
+        };
+        let plaintext = self
+            .content_crypto
+            .decrypt(&crypto_context, &stored_bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("content decrypt failed: {e}")))?;
+        let actual_sha256 = sha256_hex(&plaintext);
+        if actual_sha256 != art.sha256 {
+            return Err(Error::new(
+                ErrorCode::HashMismatch,
+                format!(
+                    "artifact {} content hashed to {actual_sha256} but metadata expected {}",
+                    artifact_id, art.sha256
+                ),
+            ));
+        }
+        Ok(plaintext)
     }
 
     pub async fn delete_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<()> {

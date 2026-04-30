@@ -87,8 +87,10 @@ Implementation checkpoint:
 - V2.24 adds provider-neutral KMS/key availability signals at storage
   boundaries plus structured runtime/API and route rejection diagnostics for
   unavailable tenant keys.
-- Current next milestone: add envelope encryption/decryption adapters at the
-  artifact content boundary.
+- V2.25 adds pluggable envelope encryption/decryption adapters at the artifact
+  content boundary while preserving plaintext artifact identity metadata.
+- Current next milestone: extend envelope encryption coverage to metadata/event
+  storage boundaries.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

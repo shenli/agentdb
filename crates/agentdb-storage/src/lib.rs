@@ -5,6 +5,7 @@
 //! string keys) to guarantee tenant-scoped prefix scans.
 
 pub mod content;
+pub mod content_crypto;
 pub mod error;
 pub mod keys;
 pub mod kms;
@@ -12,7 +13,12 @@ pub mod kv;
 pub mod rocks;
 pub mod slate;
 
-pub use content::{ContentBackend, InMemoryContentBackend, LocalFsContentBackend, PutResult};
+pub use content::{
+    sha256_hex, ContentBackend, InMemoryContentBackend, LocalFsContentBackend, PutResult,
+};
+pub use content_crypto::{
+    ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
+};
 pub use error::{Error, Result};
 pub use kms::{
     AllowAllKmsKeyResolver, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KmsResult,
