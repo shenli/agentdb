@@ -384,3 +384,104 @@ async fn policy_worker_endpoint_schedules_by_priority() {
         Some(1)
     );
 }
+
+#[tokio::test]
+async fn delete_session_then_gc_sweep_purges_session_events() {
+    let app = spawn_app().await;
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "session-delete",
+            "policy": {"retention": {"retention_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = tenant["tenant_id"].as_str().unwrap();
+    let agent: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({"alias": null, "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = agent["agent_id"].as_str().unwrap();
+    let session: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
+        .json(&json!({"alias": "delete-me"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = session["session_id"].as_str().unwrap();
+
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deleted = app
+        .client
+        .delete(format!("{}/api/tenants/{tid}/sessions/{sid}", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status().as_u16(), 204);
+    let fetched = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=10",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status().as_u16(), 404);
+
+    let gc: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/policy/gc-sweep", app.base))
+        .json(&json!({"now_ms": u64::MAX}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gc["sessions_purged"].as_u64(), Some(1));
+    assert_eq!(gc["events_purged"].as_u64(), Some(1));
+}

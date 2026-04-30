@@ -18,8 +18,10 @@ Implementation checkpoint:
   lifecycle/GC sweep API endpoints.
 - V2.4d adds a deterministic policy worker tick that schedules tenant
   lifecycle/GC work by priority and exposes it through the API.
-- Current next milestone: V2.4e fuller quota dimensions, broader GC handlers,
-  and changefeed delete/purge events.
+- V2.4e adds session soft-delete plus session/event hard purge in tenant-scoped
+  GC sweeps.
+- Current next milestone: fuller quota dimensions, remaining GC handlers, and
+  changefeed delete/purge events.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

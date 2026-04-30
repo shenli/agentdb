@@ -136,6 +136,41 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    pub fn delete_session(&self, s: &Session) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        ops.push(WriteOp::Delete {
+            key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
+        });
+        if let Some(alias) = s.alias.as_deref() {
+            if !alias.is_empty() {
+                ops.push(WriteOp::Delete {
+                    key: session_alias_key(s.tenant_id.as_str(), alias).into_bytes(),
+                });
+            }
+        }
+        self.kv.write_batch(ops)
+    }
+
+    pub fn delete_session_events(&self, tenant_id: &str, session_id: &str) -> KvResult<usize> {
+        let prefix = format!("event/{tenant_id}/{session_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut ops: Vec<WriteOp> = Vec::new();
+        let mut count = 0;
+        for res in iter {
+            let (k, v) = res?;
+            let env: EventEnvelope = serde_json::from_slice(&v).expect("event envelope decodes");
+            ops.push(WriteOp::Delete { key: k });
+            ops.push(WriteOp::Delete {
+                key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),
+            });
+            count += 1;
+        }
+        if !ops.is_empty() {
+            self.kv.write_batch(ops)?;
+        }
+        Ok(count)
+    }
+
     /// Atomic multi-write for the append commit path. Bundles the event row,
     /// the updated session row, the `event_by_id` secondary index row, and
     /// (optionally) the idempotency record so that on crash recovery either

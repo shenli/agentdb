@@ -1,7 +1,7 @@
 use agentdb_core::artifact::NewArtifact;
 use agentdb_core::errors::ErrorCode;
 use agentdb_core::record::{IndexingPolicy, NewRecord};
-use agentdb_core::runtime::{Runtime, SearchRequest};
+use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime, SearchRequest};
 use agentdb_core::session::Lifecycle;
 use agentdb_core::{NewAgent, NewSession, NewTenant, Tenant};
 
@@ -306,4 +306,90 @@ async fn tenant_scoped_sweeps_do_not_touch_other_tenants() {
         .unwrap()
         .deleted_at_ms
         .is_some());
+}
+
+#[tokio::test]
+async fn session_delete_blocks_reads_and_gc_purges_events() {
+    let rt = Runtime::in_memory();
+    let tenant = tenant_with_policy(
+        &rt,
+        "session-gc",
+        serde_json::json!({"retention": {"retention_ms": 0}}),
+    )
+    .await;
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: Some("gone".into()),
+        })
+        .await
+        .unwrap();
+    let appended = rt
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "x",
+            serde_json::json!({"i": 1}),
+        ))
+        .await
+        .unwrap();
+
+    rt.delete_session(&tenant.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.get_session(&tenant.tenant_id, &session.session_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::SessionNotFound
+    );
+    assert_eq!(
+        rt.fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::SessionNotFound
+    );
+    assert_eq!(
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "x",
+            serde_json::json!({"i": 2}),
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::SessionNotFound
+    );
+
+    let report = rt
+        .gc_sweep_for_tenant_at(&tenant.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(report.sessions_purged, 1);
+    assert_eq!(report.events_purged, 1);
+    assert_eq!(
+        rt.lookup_event_by_id(&tenant.tenant_id, &appended.event_id)
+            .await
+            .unwrap(),
+        None
+    );
 }

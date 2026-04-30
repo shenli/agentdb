@@ -64,7 +64,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id",
-            get(get_session),
+            get(get_session).delete(delete_session),
         )
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/events",
@@ -229,6 +229,24 @@ async fn get_session(
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
     Ok(Json(s.runtime.get_session(&tid, &sid).await?))
+}
+
+async fn delete_session(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let sid = parse_id_or(
+        &session_id,
+        IdKind::Session,
+        agentdb_core::ErrorCode::SessionNotFound,
+    )?;
+    s.runtime.delete_session(&tid, &sid).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn append_event(
