@@ -35,8 +35,11 @@ Implementation checkpoint:
   V2 API surface, including opaque typed IDs, append-and-fetch, replay/fork,
   subscribe/watch, artifacts, records, skills, context, and client-side
   idempotency key generation.
-- Current next milestone: legacy deletion and cleanup before adapter proof
-  points on top of the V2.0-V2.6 native API surface.
+- V2.7 removes the remaining legacy SDK/test/doc surface around the old
+  tenantless routes, Mongo wire facade, Go SDK, and broadcast channel helpers,
+  leaving the native V2 HTTP API as the supported runtime surface.
+- Current next milestone: adapter proof points on top of the V2.0-V2.7 native
+  API surface.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus

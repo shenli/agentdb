@@ -9,7 +9,6 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import requests
 
-from ._broadcast import BroadcastMessage
 from ._sse import parse_lines
 from .errors import AgentDBError, SubscriptionClosed, from_response
 
@@ -241,38 +240,6 @@ class Client:
         data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/watch", params=params)
         return [WatchItem.from_dict(item) for item in data]
 
-    def broadcast(self, *, channel: str, payload: Any) -> None:
-        resp = self._raw_request(
-            "POST",
-            f"/api/channels/{_quote(channel)}/publish",
-            json=payload,
-            channel_auth=True,
-        )
-        if resp.status_code == 204:
-            return
-        raise from_response(resp.status_code, _response_body(resp))
-
-    def subscribe_channel(self, *, channel: str, no_echo: bool = False) -> Iterator[BroadcastMessage]:
-        params = {"no_echo": "true"} if no_echo else None
-        resp = self._raw_request(
-            "GET",
-            f"/api/channels/{_quote(channel)}/subscribe",
-            params=params,
-            stream=True,
-            channel_auth=True,
-            headers={"Accept": "text/event-stream"},
-        )
-        try:
-            if resp.status_code != 200:
-                raise from_response(resp.status_code, _response_body(resp))
-            for frame in parse_lines(resp.iter_lines(decode_unicode=True)):
-                if frame.event and frame.event != "message":
-                    continue
-                if frame.data:
-                    yield BroadcastMessage.from_envelope(jsonlib.loads(frame.data))
-        finally:
-            resp.close()
-
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         resp = self._raw_request(method, path, **kwargs)
         return _decode(resp)
@@ -287,12 +254,8 @@ class Client:
         params: Optional[dict] = None,
         headers: Optional[dict] = None,
         stream: bool = False,
-        channel_auth: bool = False,
     ) -> requests.Response:
         hdrs = dict(headers or {})
-        token = self._bearer_token() if channel_auth else None
-        if token is not None:
-            hdrs["Authorization"] = f"Bearer {token}"
         kwargs: dict = {"timeout": (self.timeout, None) if stream else self.timeout}
         if params:
             kwargs["params"] = params

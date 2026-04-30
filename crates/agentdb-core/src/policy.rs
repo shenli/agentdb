@@ -7,22 +7,17 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
+    #[default]
     Normal,
     High,
     Critical,
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaPolicy {
     #[serde(default)]
     pub soft_max_events_per_session: Option<u64>,
@@ -70,35 +65,6 @@ pub struct QuotaPolicy {
     pub max_gc_work_per_sweep: Option<usize>,
 }
 
-impl Default for QuotaPolicy {
-    fn default() -> Self {
-        Self {
-            soft_max_events_per_session: None,
-            max_events_per_session: None,
-            soft_max_context_bytes: None,
-            max_context_bytes: None,
-            soft_max_active_sessions: None,
-            max_active_sessions: None,
-            soft_max_agents: None,
-            max_agents: None,
-            soft_max_records: None,
-            max_records: None,
-            soft_max_artifacts: None,
-            max_artifacts: None,
-            soft_max_artifact_storage_bytes: None,
-            max_artifact_storage_bytes: None,
-            soft_max_skills: None,
-            max_skills: None,
-            soft_max_skill_bindings_per_agent: None,
-            max_skill_bindings_per_agent: None,
-            soft_max_lifecycle_work_per_sweep: None,
-            max_lifecycle_work_per_sweep: None,
-            soft_max_gc_work_per_sweep: None,
-            max_gc_work_per_sweep: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactSizePolicy {
     pub max_inline_event_bytes: usize,
@@ -130,7 +96,7 @@ impl Default for RetentionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecyclePolicy {
     #[serde(default)]
     pub cold_after_ms: Option<u64>,
@@ -138,16 +104,6 @@ pub struct LifecyclePolicy {
     pub archive_after_ms: Option<u64>,
     #[serde(default)]
     pub derivative_only_after_ms: Option<u64>,
-}
-
-impl Default for LifecyclePolicy {
-    fn default() -> Self {
-        Self {
-            cold_after_ms: None,
-            archive_after_ms: None,
-            derivative_only_after_ms: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

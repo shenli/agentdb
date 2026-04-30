@@ -23,9 +23,8 @@ type NodeRow = (
 pub struct Node {
     pub node_id: String,
     pub address: String,
-    /// Mongo wire listener advertised for cross-node
-    /// forwarding. `None` when the node predates migration
-    /// 008 or didn't set `AGENTDB_NODE_MONGO_ADDRESS`.
+    /// Legacy peer listener address retained for migration compatibility.
+    /// New V2 deployments do not use this field.
     pub mongo_address: Option<String>,
     pub state: String,
     pub last_heartbeat_ms: i64,

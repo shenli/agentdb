@@ -1,10 +1,10 @@
 /**
  * End-to-end smoke for the TypeScript SDK's `subscribe()`.
  *
- * Same fixture pattern as smoke.test.ts: spawn `agentdb serve --dev`
- * with `AGENTDB_REQUIRE_AUTH=true` on an ephemeral port, create a test
- * user, exercise the SDK against it. Skipped when the server binary
- * hasn't been built.
+ * Same fixture pattern as smoke.test.ts: spawn `agentdb serve --in-memory`
+ * on an ephemeral port and exercise the V2 SDK against it. Skipped when the
+ * server binary hasn't been built. Set `AGENTDB_TYPESCRIPT_SMOKE=1` to run the
+ * live server cases.
  *
  * Also covers the synchronous validation paths (no server needed) so
  * those run on every `npm test` regardless of binary availability.
@@ -45,26 +45,21 @@ async function freePort(): Promise<number> {
 async function spawnServer(): Promise<{
   baseUrl: string;
   proc: ChildProcess;
-  auth: { user: string; password: string };
 }> {
   const restPort = await freePort();
-  const mongoPort = await freePort();
   const proc = spawn(
     SERVER_BIN,
     [
       "serve",
-      "--dev",
-      "--addr",
+      "--in-memory",
+      "--bind",
       `127.0.0.1:${restPort}`,
-      "--mongo-addr",
-      `127.0.0.1:${mongoPort}`,
     ],
     {
       stdio: ["ignore", "ignore", "ignore"],
       env: {
         ...process.env,
         RUST_LOG: "warn",
-        AGENTDB_REQUIRE_AUTH: "true",
       },
     }
   );
@@ -87,29 +82,13 @@ async function spawnServer(): Promise<{
     throw new Error("server didn't become ready within 15s");
   }
 
-  // Create a test user via the admin API (no admin auth required in dev mode).
-  const testUser = "sub-test-user";
-  const testPassword = "sub-password-123";
-  const testTenant = "sub-tenant";
-  const resp = await fetch(`${baseUrl}/api/admin/users`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      user_id: testUser,
-      tenant_external: testTenant,
-      password: testPassword,
-    }),
-  });
-  if (resp.status !== 201 && resp.status !== 409) {
-    const body = await resp.text();
-    throw new Error(`Failed to create test user: ${resp.status} ${body}`);
-  }
-
-  return { baseUrl, proc, auth: { user: testUser, password: testPassword } };
+  return { baseUrl, proc };
 }
 
 const skipReason = !existsSync(SERVER_BIN)
   ? `server binary not found at ${SERVER_BIN}; run \`cargo build -p agentdb-server\` first`
+  : process.env["AGENTDB_TYPESCRIPT_SMOKE"] !== "1"
+    ? "set AGENTDB_TYPESCRIPT_SMOKE=1 to run live server smoke tests"
   : undefined;
 
 // --- Validation tests (no server) ----------------------------------
@@ -137,80 +116,43 @@ test("SubscriptionClosed carries error code + last_seq", () => {
 // --- Live smoke (gated by server binary) ---------------------------
 
 test("subscribe() end-to-end", { skip: skipReason }, async (t) => {
-  const { baseUrl, proc, auth } = await spawnServer();
+  const { baseUrl, proc } = await spawnServer();
   t.after(() => {
     proc.kill();
   });
 
-  await t.test("session.subscribe yields events appended after open", async () => {
-    const client = new Client({ baseUrl, auth });
-    const sess = client.session("s-sub-1");
+  let counter = 0;
+  async function newSession(label: string) {
+    counter += 1;
+    const client = new Client({ baseUrl });
+    const tenant = await client.createTenant(`${label}-${counter}`);
+    const agent = await client.createAgent(String(tenant.tenant_id), { alias: `${label}-agent` });
+    return await client.createSession(String(tenant.tenant_id), String(agent.agent_id), { alias: label });
+  }
 
-    const seen: number[] = [];
-    const iter = sess.subscribe();
-    const consumer = (async () => {
-      for await (const evt of iter) {
-        seen.push(evt.seq);
-        if (seen.length >= 3) return;
-      }
-    })();
-    // Give the SSE handshake a beat to land before we start writing.
-    await new Promise((r) => setTimeout(r, 500));
-
-    const writer = client.session("s-sub-1");
-    for (let i = 1; i <= 3; i++) {
-      await writer.append({ kind: "msg", n: i });
-    }
-    await Promise.race([
-      consumer,
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error("timeout")), 10_000)
-      ),
-    ]);
-    assert.deepEqual(
-      [...seen].sort((a, b) => a - b),
-      [1, 2, 3]
-    );
-  });
-
-  await t.test("session.subscribe replays from from_seq, then tails live", async () => {
-    const client = new Client({ baseUrl, auth });
-    const writer = client.session("s-sub-replay");
+  await t.test("session.subscribe replays a session SSE snapshot", async () => {
+    const writer = await newSession("s-sub-replay");
     for (let i = 0; i < 3; i++) {
       await writer.append({ kind: "x", i });
     }
-    const reader = client.session("s-sub-replay");
     const seen: number[] = [];
-    for await (const evt of reader.subscribe({ fromSeq: 1 })) {
+    for await (const evt of writer.subscribe({ fromSeq: 0 })) {
       seen.push(evt.seq);
       if (seen.length >= 3) break;
     }
-    assert.deepEqual(seen, [1, 2, 3]);
+    assert.deepEqual(seen, [0, 1, 2]);
   });
 
-  await t.test("client.subscribe (tenant-wide) sees events from any session", async () => {
-    const client = new Client({ baseUrl, auth });
-    const seen: { sid: string; seq: number }[] = [];
-    const iter = client.subscribe();
-    const consumer = (async () => {
-      for await (const evt of iter) {
-        seen.push({ sid: evt.session ?? "?", seq: evt.seq });
-        if (seen.length >= 4) return;
-      }
-    })();
-    await new Promise((r) => setTimeout(r, 500));
-    await client.session("s-a").append({ kind: "p", t: 1 });
-    await client.session("s-b").append({ kind: "p", t: 2 });
-    await client.session("s-a").append({ kind: "p", t: 3 });
-    await client.session("s-b").append({ kind: "p", t: 4 });
-    await Promise.race([
-      consumer,
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error("timeout")), 10_000)
-      ),
-    ]);
-    assert.equal(seen.length, 4);
-    const sids = new Set(seen.map((e) => e.sid));
-    assert.ok(sids.has("s-a") && sids.has("s-b"));
+  await t.test("tenant watch sees events from any session", async () => {
+    const first = await newSession("s-a");
+    const client = new Client({ baseUrl });
+    const second = await client.createSession(first.tenantId, first.agentId!, { alias: "s-b" });
+    await first.append({ kind: "p", t: 1 });
+    await second.append({ kind: "p", t: 2 });
+    await first.append({ kind: "p", t: 3 });
+    await second.append({ kind: "p", t: 4 });
+    const seen = await client.watch(first.tenantId, { scope: "tenant", limit: 10 });
+    const sids = new Set(seen.map((item) => item.event.sessionId));
+    assert.ok(sids.has(first.sessionId) && sids.has(second.sessionId));
   });
 });

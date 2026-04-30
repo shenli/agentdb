@@ -486,6 +486,12 @@ Dependencies: V2.0–V2.5 (full V2 surface).
 
 ### V2.7 — Legacy deletion and cleanup (~−5000 LoC net)
 
+Status: complete for the V2 prototype cleanup. The workspace no longer contains
+the legacy Mongo wire crate or Go SDK, the server exposes the native V2 router
+directly without a V2 compatibility flag, the package docs describe the V2-only
+surface, stale SDK smoke tests were migrated to tenant-scoped V2 setup, and the
+old broadcast-channel SDK helpers/tests were removed.
+
 **Maps to spec §22 non-goals + change-list §11.2.**
 
 Scope:

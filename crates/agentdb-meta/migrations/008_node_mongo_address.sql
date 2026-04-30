@@ -1,7 +1,5 @@
--- Advertise the Mongo wire listener address alongside the
--- REST address so peer nodes can forward `find` / `insert` /
--- `update` / `delete` commands targeting a session this
--- node doesn't own.
+-- Legacy peer listener address retained for migration compatibility.
+-- New V2 deployments do not use this field.
 --
 -- Nullable so clusters mid-upgrade don't crash: existing
 -- rows keep `mongo_address = NULL` until the node rewrites

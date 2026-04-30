@@ -1155,12 +1155,12 @@ impl Runtime {
         let binding_keys: Vec<(String, String)> = s
             .agent_skill_bindings
             .iter()
-            .filter_map(|(key, binding)| {
-                (binding.tenant_id.as_str() == tenant_id.as_str()
+            .filter(|(_, binding)| {
+                binding.tenant_id.as_str() == tenant_id.as_str()
                     && binding.skill_id.as_str() == skill_id.as_str()
-                    && binding.deleted_at_ms.is_none())
-                .then(|| key.clone())
+                    && binding.deleted_at_ms.is_none()
             })
+            .map(|(key, _)| key.clone())
             .collect();
         let mut updated_bindings = Vec::new();
         for key in binding_keys {
@@ -1756,7 +1756,9 @@ impl Runtime {
                 .values()
                 .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
                 .filter(|a| {
-                    tenant_scope.is_none_or(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                    tenant_scope
+                        .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                        .unwrap_or(true)
                 })
                 .filter(|a| {
                     let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
@@ -1993,11 +1995,11 @@ impl Runtime {
                 let session_ids: Vec<String> = s
                     .sessions
                     .iter()
-                    .filter_map(|(id, session)| {
-                        (session.tenant_id.as_str() == agent.tenant_id.as_str()
-                            && session.agent_id.as_str() == agent.agent_id.as_str())
-                        .then(|| id.clone())
+                    .filter(|(_, session)| {
+                        session.tenant_id.as_str() == agent.tenant_id.as_str()
+                            && session.agent_id.as_str() == agent.agent_id.as_str()
                     })
+                    .map(|(id, _)| id.clone())
                     .collect();
                 for session_id in session_ids {
                     let Some(session) = s.sessions.get(&session_id).cloned() else {
@@ -2042,11 +2044,11 @@ impl Runtime {
                 let binding_keys: Vec<(String, String)> = s
                     .agent_skill_bindings
                     .iter()
-                    .filter_map(|(key, binding)| {
-                        (binding.tenant_id.as_str() == agent.tenant_id.as_str()
-                            && binding.agent_id.as_str() == agent.agent_id.as_str())
-                        .then(|| key.clone())
+                    .filter(|(_, binding)| {
+                        binding.tenant_id.as_str() == agent.tenant_id.as_str()
+                            && binding.agent_id.as_str() == agent.agent_id.as_str()
                     })
+                    .map(|(key, _)| key.clone())
                     .collect();
                 for key in binding_keys {
                     let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {
@@ -2176,11 +2178,11 @@ impl Runtime {
                 let binding_keys: Vec<(String, String)> = s
                     .agent_skill_bindings
                     .iter()
-                    .filter_map(|(key, binding)| {
-                        (binding.tenant_id.as_str() == skill.tenant_id.as_str()
-                            && binding.skill_id.as_str() == skill.skill_id.as_str())
-                        .then(|| key.clone())
+                    .filter(|(_, binding)| {
+                        binding.tenant_id.as_str() == skill.tenant_id.as_str()
+                            && binding.skill_id.as_str() == skill.skill_id.as_str()
                     })
+                    .map(|(key, _)| key.clone())
                     .collect();
                 for key in binding_keys {
                     let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {

@@ -36,7 +36,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist dist-tests",
-    "test": "tsc -p tsconfig.test.json && find dist-tests/tests -name '*.test.js' -exec node --test {} +"
+    "test": "rm -rf dist-tests && tsc -p tsconfig.test.json && find dist-tests/tests -name '*.test.js' -exec node --test {} +"
   },
   "devDependencies": {
     "typescript": "^5.4.0",

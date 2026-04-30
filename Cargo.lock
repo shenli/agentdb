@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "agentdb-server"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "agentdb-api",
  "agentdb-core",

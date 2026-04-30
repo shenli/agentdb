@@ -1,22 +1,18 @@
-"""Python client for AgentDB.
+"""Python client for AgentDB V2.
 
-Typical usage in auth mode:
+Typical usage:
 
     from agentdb import Client
 
-    client = Client(
-        base_url="http://127.0.0.1:7878",
-        auth=("alice", "hunter2"),
-    )
-    session = client.session("agent-1")
+    client = Client("http://127.0.0.1:8080")
+    tenant = client.create_tenant("acme")
+    agent = client.create_agent(tenant["tenant_id"])
+    session = client.create_session(tenant["tenant_id"], agent["agent_id"])
     result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
     print(result.seq, [e.payload for e in result.recent])
 
 The `append + fetch_last_n` pattern is the canonical hot path —
 write one event and read the last N back in the same round trip.
-Tenant is derived from the auth credentials server-side; no
-`tenant` arg is needed anywhere.
-
 For async code (LangChain, LlamaIndex, the Anthropic / OpenAI
 SDKs, etc.) install the optional `[async]` extra and use
 `AsyncClient`:
@@ -27,11 +23,10 @@ SDKs, etc.) install the optional `[async]` extra and use
     from agentdb import AsyncClient
 
     async def main():
-        async with AsyncClient(
-            base_url="http://127.0.0.1:7878",
-            auth=("alice", "hunter2"),
-        ) as client:
-            session = client.session("agent-1")
+        async with AsyncClient("http://127.0.0.1:8080") as client:
+            tenant = await client.create_tenant("acme-async")
+            agent = await client.create_agent(tenant["tenant_id"])
+            session = await client.create_session(tenant["tenant_id"], agent["agent_id"])
             result = await session.append(
                 {"role": "user", "text": "hi"}, fetch_last_n=5
             )
@@ -44,7 +39,6 @@ See `examples/agents/python/quickstart.py` (sync) and
 working agent loops.
 """
 
-from ._broadcast import BroadcastMessage
 from .client import Client, Session, AppendResult, Event, WatchItem
 from .errors import (
     AgentDBError,
@@ -67,7 +61,6 @@ __all__ = [
     "WatchItem",
     "AsyncClient",
     "AsyncSession",
-    "BroadcastMessage",
     "AgentDBError",
     "BadRequest",
     "Unauthorized",

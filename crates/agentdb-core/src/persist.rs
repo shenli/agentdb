@@ -41,6 +41,8 @@ use crate::session::Session;
 use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
+type SkillUniqueRecord = ((String, String, String), String);
+
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
 }
@@ -605,7 +607,7 @@ impl Persist {
         Ok(out)
     }
 
-    pub fn scan_all_skill_uniques(&self) -> KvResult<Vec<((String, String, String), String)>> {
+    pub fn scan_all_skill_uniques(&self) -> KvResult<Vec<SkillUniqueRecord>> {
         let prefix = b"record/skill_unique/";
         let iter = self.kv.scan_prefix(prefix)?;
         let mut out = Vec::new();
