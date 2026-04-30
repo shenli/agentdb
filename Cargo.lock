@@ -7,6 +7,7 @@ name = "agentdb-api"
 version = "0.1.0"
 dependencies = [
  "agentdb-core",
+ "agentdb-meta",
  "agentdb-storage",
  "axum",
  "reqwest",

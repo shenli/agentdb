@@ -7,6 +7,7 @@
 pub mod dto;
 pub mod errors;
 pub mod routes;
+pub mod routing_http;
 pub mod state;
 
 pub use errors::ApiError;
