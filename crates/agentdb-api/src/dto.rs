@@ -60,9 +60,38 @@ pub struct AppendAndFetchBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ForkSessionBody {
+    pub at_seq: u64,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FetchQuery {
     #[serde(default)]
     pub from_seq: u64,
+    #[serde(default = "default_fetch_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplayQuery {
+    #[serde(default)]
+    pub from_seq: Option<u64>,
+    #[serde(default = "default_fetch_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatchQuery {
+    #[serde(default = "default_watch_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub from_cursor: Option<String>,
     #[serde(default = "default_fetch_limit")]
     pub limit: usize,
 }
@@ -87,6 +116,10 @@ fn default_max_bytes() -> usize {
 
 fn default_fetch_limit() -> usize {
     100
+}
+
+fn default_watch_scope() -> String {
+    "tenant".into()
 }
 
 /// Request body for `POST /api/tenants/:tenant_id/records`.
@@ -174,6 +207,26 @@ pub struct SearchRecordsBody {
     pub source: Option<SourceRef>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContextBody {
+    #[serde(default = "default_context_max_events")]
+    pub max_events: usize,
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_context_include")]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub record_query: Option<SearchRecordsBody>,
+}
+
+fn default_context_max_events() -> usize {
+    20
+}
+
+fn default_context_include() -> Vec<String> {
+    vec!["recent_events".into()]
 }
 
 /// Response body for `GET` or `POST /api/tenants/:tenant_id/records/search`.

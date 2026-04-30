@@ -16,19 +16,24 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
 
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
-    runtime::{AppendRequest, FetchRequest, SearchRequest},
-    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ErrorCode, EventEnvelope, Id, IdKind,
-    NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Session, Skill, SourceRef, Tenant,
+    runtime::{
+        AppendRequest, ContextInclude, ContextRequest, FetchRequest, ForkSessionRequest,
+        SearchRequest, WatchRequest, WatchScope,
+    },
+    Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ContextResponse,
+    ErrorCode, EventEnvelope, Id, IdKind, NewAgent, NewArtifact, NewSession, NewSkill, NewTenant,
+    ReplayResponse, Session, Skill, SourceRef, Tenant,
 };
 
 use crate::dto::{
-    AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
-    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, IncludeDeletedQuery,
-    ListAgentSkillsResponse, PolicyWorkerRunBody, SearchRecordsBody, SearchRecordsResponse,
-    SweepBody,
+    AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
+    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, ForkSessionBody,
+    IncludeDeletedQuery, ListAgentSkillsResponse, PolicyWorkerRunBody, ReplayQuery,
+    SearchRecordsBody, SearchRecordsResponse, SweepBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -80,6 +85,23 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/sessions/:session_id/append-and-fetch",
             post(append_and_fetch),
         )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/fork",
+            post(fork_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/replay",
+            get(replay_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
+            get(subscribe_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/context",
+            post(build_context),
+        )
+        .route("/api/tenants/:tenant_id/watch", get(watch))
         .route(
             "/api/tenants/:tenant_id/artifacts",
             post(create_artifact)
@@ -410,6 +432,122 @@ async fn fetch_events(
     Ok(Json(events))
 }
 
+async fn fork_session(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    Json(body): Json<ForkSessionBody>,
+) -> Result<(StatusCode, Json<Session>), ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let child = s
+        .runtime
+        .fork_session(ForkSessionRequest {
+            tenant_id: tid,
+            session_id: sid,
+            at_seq: body.at_seq,
+            alias: body.alias,
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(child)))
+}
+
+async fn replay_session(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    Query(q): Query<ReplayQuery>,
+) -> Result<Json<ReplayResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let mut replay = s.runtime.replay_session(&tid, &sid).await?;
+    if let Some(from_seq) = q.from_seq {
+        replay
+            .events
+            .retain(|event| event.session_id.as_str() != sid.as_str() || event.seq >= from_seq);
+    }
+    replay.events.truncate(q.limit.clamp(1, 1000));
+    Ok(Json(replay))
+}
+
+async fn subscribe_session(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    Query(q): Query<FetchQuery>,
+) -> Result<Response, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let events = s
+        .runtime
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tid,
+            session_id: sid,
+            from_seq: q.from_seq,
+            limit: q.limit.clamp(1, 1000),
+        })
+        .await?;
+    Ok(sse_response(
+        events.into_iter().map(|event| ("event", event)),
+    ))
+}
+
+async fn build_context(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    Json(body): Json<ContextBody>,
+) -> Result<Json<ContextResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let record_query = body
+        .record_query
+        .map(|q| search_body_to_request(tid.clone(), q));
+    let context = s
+        .runtime
+        .build_context(ContextRequest {
+            tenant_id: tid,
+            session_id: sid,
+            max_events: body.max_events.clamp(0, 1000),
+            max_bytes: body.max_bytes,
+            include: parse_context_includes(&body.include),
+            record_query,
+        })
+        .await?;
+    Ok(Json(context))
+}
+
+async fn watch(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<WatchQuery>,
+) -> Result<Json<Vec<ChangefeedItem>>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let scope = match q.scope.as_str() {
+        "session" => WatchScope::Session,
+        "agent" => WatchScope::Agent,
+        _ => WatchScope::Tenant,
+    };
+    let session_id = q
+        .session_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Session, ErrorCode::SessionNotFound))
+        .transpose()?;
+    let agent_id = q
+        .agent_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
+        .transpose()?;
+    let items = s
+        .runtime
+        .watch(WatchRequest {
+            tenant_id: tid,
+            scope,
+            session_id,
+            agent_id,
+            from_cursor: q.from_cursor,
+            limit: q.limit.clamp(1, 1000),
+        })
+        .await?;
+    Ok(Json(items))
+}
+
 /// `POST /api/tenants/:tenant_id/artifacts`
 ///
 /// Body: raw bytes (the artifact content). NO multipart, NO base64 — content
@@ -671,15 +809,7 @@ async fn search_records_json(
     Json(body): Json<SearchRecordsBody>,
 ) -> Result<Json<SearchRecordsResponse>, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let req = SearchRequest {
-        tenant_id: tid,
-        namespace: body.namespace,
-        text: body.text,
-        embedding: body.embedding,
-        tags: body.tags,
-        source_filter: body.source,
-        limit: body.limit.clamp(1, 100),
-    };
+    let req = search_body_to_request(tid, body);
     let records = s.runtime.search_records(req).await?;
     Ok(Json(SearchRecordsResponse { records }))
 }
@@ -938,6 +1068,55 @@ fn build_source_filter(q: &ParsedSearchQuery) -> Result<Option<SourceRef>, ApiEr
         record_id,
         skill_id,
     }))
+}
+
+fn search_body_to_request(tenant_id: Id, body: SearchRecordsBody) -> SearchRequest {
+    SearchRequest {
+        tenant_id,
+        namespace: body.namespace,
+        text: body.text,
+        embedding: body.embedding,
+        tags: body.tags,
+        source_filter: body.source,
+        limit: body.limit.clamp(1, 100),
+    }
+}
+
+fn parse_context_includes(raw: &[String]) -> Vec<ContextInclude> {
+    let mut out = Vec::new();
+    for item in raw {
+        match item.as_str() {
+            "recent_events" => out.push(ContextInclude::RecentEvents),
+            "records" | "search_records" => out.push(ContextInclude::Records),
+            "skills" | "skill_instructions" => out.push(ContextInclude::Skills),
+            "policy" => out.push(ContextInclude::Policy),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        out.push(ContextInclude::RecentEvents);
+    }
+    out
+}
+
+fn sse_response<T: Serialize>(events: impl Iterator<Item = (&'static str, T)>) -> Response {
+    let mut body = String::new();
+    for (event, data) in events {
+        body.push_str("event: ");
+        body.push_str(event);
+        body.push('\n');
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(&data).expect("sse payload serializes"));
+        body.push_str("\n\n");
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// Parse an optional id string into an Id of the given kind. Bad parses

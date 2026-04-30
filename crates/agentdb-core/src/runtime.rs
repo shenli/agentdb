@@ -31,7 +31,7 @@ use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, Idempotency
 use crate::persist::Persist;
 use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
-use crate::session::{Lifecycle, NewSession, Session};
+use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
 
@@ -89,6 +89,72 @@ pub struct AppendAndFetchResponse {
     pub event_id: Id,
     pub seq: u64,
     pub recent: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkSessionRequest {
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub at_seq: u64,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayResponse {
+    pub session_id: Id,
+    pub events: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextInclude {
+    RecentEvents,
+    Records,
+    Skills,
+    Policy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextRequest {
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub include: Vec<ContextInclude>,
+    pub record_query: Option<SearchRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextResponse {
+    pub session_id: Id,
+    pub events: Vec<EventEnvelope>,
+    pub records: Vec<SearchableRecord>,
+    pub skills: Vec<AgentSkillBinding>,
+    pub policy: Option<RuntimePolicy>,
+    pub bytes_used: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchScope {
+    Session,
+    Tenant,
+    Agent,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchRequest {
+    pub tenant_id: Id,
+    pub scope: WatchScope,
+    pub session_id: Option<Id>,
+    pub agent_id: Option<Id>,
+    pub from_cursor: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangefeedItem {
+    pub cursor: String,
+    pub event: EventEnvelope,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -830,6 +896,114 @@ impl Runtime {
             p.put_session(&sess).map_err(internal)?;
         }
         Ok(sess)
+    }
+
+    pub async fn fork_session(&self, req: ForkSessionRequest) -> Result<Session> {
+        let child = {
+            let mut s = self.state.lock().await;
+            let parent = s
+                .sessions
+                .get(req.session_id.as_str())
+                .filter(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session.tenant_id.as_str() == req.tenant_id.as_str()
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+                })?;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+            if req.at_seq >= parent.next_seq {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    format!(
+                        "fork at_seq {} is outside parent session next_seq {}",
+                        req.at_seq, parent.next_seq
+                    ),
+                ));
+            }
+            if let Some(alias) = req.alias.as_deref() {
+                if !alias.is_empty() {
+                    let key = scoped_alias_key(req.tenant_id.as_str(), alias);
+                    if s.session_aliases.contains_key(&key) {
+                        return Err(Error::new(
+                            ErrorCode::AliasConflict,
+                            format!("session alias already in use in tenant: {alias}"),
+                        ));
+                    }
+                }
+            }
+            let mut child = Session::create(NewSession {
+                tenant_id: req.tenant_id.clone(),
+                agent_id: parent.agent_id.clone(),
+                alias: req.alias,
+            });
+            child.forked_from = Some(ForkRef {
+                session_id: parent.session_id,
+                at_seq: req.at_seq,
+            });
+            child.policy_version = parent.policy_version;
+            s.sessions
+                .insert(child.session_id.as_str().to_string(), child.clone());
+            if let Some(alias) = child.alias.as_deref() {
+                if !alias.is_empty() {
+                    s.session_aliases.insert(
+                        scoped_alias_key(child.tenant_id.as_str(), alias),
+                        child.session_id.as_str().to_string(),
+                    );
+                }
+            }
+            child
+        };
+        if let Some(p) = &self.persist {
+            p.put_session(&child).map_err(internal)?;
+        }
+        Ok(child)
+    }
+
+    pub async fn replay_session(&self, tenant_id: &Id, session_id: &Id) -> Result<ReplayResponse> {
+        let mut segments: Vec<(Id, Option<u64>)> = Vec::new();
+        let mut current_id = session_id.clone();
+        let mut current_cutoff = None;
+        loop {
+            let session = self.get_session(tenant_id, &current_id).await?;
+            segments.push((session.session_id.clone(), current_cutoff));
+            let Some(parent) = session.forked_from else {
+                break;
+            };
+            current_id = parent.session_id.clone();
+            current_cutoff = Some(parent.at_seq);
+        }
+
+        segments.reverse();
+        let mut events = Vec::new();
+        for (sid, cutoff) in segments {
+            let mut segment = self
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: tenant_id.clone(),
+                    session_id: sid,
+                    from_seq: 0,
+                    limit: usize::MAX,
+                })
+                .await?;
+            if let Some(max_seq) = cutoff {
+                segment.retain(|event| event.seq <= max_seq);
+            }
+            events.extend(segment);
+        }
+        Ok(ReplayResponse {
+            session_id: session_id.clone(),
+            events,
+        })
     }
 
     /// Register a V2.3 skill. `(tenant_id, name, version)` is unique.
@@ -2596,6 +2770,191 @@ impl Runtime {
         })
     }
 
+    pub async fn build_context(&self, req: ContextRequest) -> Result<ContextResponse> {
+        let session = self.get_session(&req.tenant_id, &req.session_id).await?;
+        let include_events = req.include.contains(&ContextInclude::RecentEvents);
+        let include_records = req.include.contains(&ContextInclude::Records);
+        let include_skills = req.include.contains(&ContextInclude::Skills);
+        let include_policy = req.include.contains(&ContextInclude::Policy);
+
+        let mut response = ContextResponse {
+            session_id: req.session_id.clone(),
+            events: Vec::new(),
+            records: Vec::new(),
+            skills: Vec::new(),
+            policy: None,
+            bytes_used: 0,
+            truncated: false,
+        };
+
+        if include_events {
+            let mut events = self
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: req.tenant_id.clone(),
+                    session_id: req.session_id.clone(),
+                    from_seq: 0,
+                    limit: usize::MAX,
+                })
+                .await?;
+            if events.len() > req.max_events {
+                events.drain(0..events.len() - req.max_events);
+                response.truncated = true;
+            }
+            for event in events {
+                if push_budgeted(&mut response.bytes_used, req.max_bytes, &event) {
+                    response.events.push(event);
+                } else {
+                    response.truncated = true;
+                    break;
+                }
+            }
+        }
+
+        if include_records {
+            if let Some(record_query) = req.record_query {
+                let records = self.search_records(record_query).await?;
+                for record in records {
+                    if push_budgeted(&mut response.bytes_used, req.max_bytes, &record) {
+                        response.records.push(record);
+                    } else {
+                        response.truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if include_skills {
+            let skills = self
+                .list_agent_skills(&req.tenant_id, &session.agent_id)
+                .await?;
+            for skill in skills {
+                if push_budgeted(&mut response.bytes_used, req.max_bytes, &skill) {
+                    response.skills.push(skill);
+                } else {
+                    response.truncated = true;
+                    break;
+                }
+            }
+        }
+
+        if include_policy {
+            let policy = self
+                .resolve_policy_for_agent(&req.tenant_id, &session.agent_id)
+                .await?;
+            if push_budgeted(&mut response.bytes_used, req.max_bytes, &policy) {
+                response.policy = Some(policy);
+            } else {
+                response.truncated = true;
+            }
+        }
+
+        Ok(response)
+    }
+
+    pub async fn watch(&self, req: WatchRequest) -> Result<Vec<ChangefeedItem>> {
+        let session_ids: Vec<Id> = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|tenant| tenant.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+            match req.scope {
+                WatchScope::Session => {
+                    let session_id = req.session_id.clone().ok_or_else(|| {
+                        Error::new(ErrorCode::SessionNotFound, "watch session_id is required")
+                    })?;
+                    let live = s.sessions.get(session_id.as_str()).is_some_and(|session| {
+                        session.deleted_at_ms.is_none()
+                            && session.tenant_id.as_str() == req.tenant_id.as_str()
+                    });
+                    if !live {
+                        return Err(Error::new(
+                            ErrorCode::SessionNotFound,
+                            format!("{}", session_id),
+                        ));
+                    }
+                    vec![session_id]
+                }
+                WatchScope::Tenant => s
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session.deleted_at_ms.is_none()
+                            && session.tenant_id.as_str() == req.tenant_id.as_str()
+                    })
+                    .map(|session| session.session_id.clone())
+                    .collect(),
+                WatchScope::Agent => {
+                    let agent_id = req.agent_id.clone().ok_or_else(|| {
+                        Error::new(ErrorCode::AgentNotFound, "watch agent_id is required")
+                    })?;
+                    let live = s.agents.get(agent_id.as_str()).is_some_and(|agent| {
+                        agent.deleted_at_ms.is_none()
+                            && agent.tenant_id.as_str() == req.tenant_id.as_str()
+                    });
+                    if !live {
+                        return Err(Error::new(
+                            ErrorCode::AgentNotFound,
+                            format!("{}", agent_id),
+                        ));
+                    }
+                    s.sessions
+                        .values()
+                        .filter(|session| {
+                            session.deleted_at_ms.is_none()
+                                && session.tenant_id.as_str() == req.tenant_id.as_str()
+                                && session.agent_id.as_str() == agent_id.as_str()
+                        })
+                        .map(|session| session.session_id.clone())
+                        .collect()
+                }
+            }
+        };
+
+        let mut events = Vec::new();
+        for session_id in session_ids {
+            events.extend(
+                self.fetch_from_seq(FetchRequest {
+                    tenant_id: req.tenant_id.clone(),
+                    session_id,
+                    from_seq: 0,
+                    limit: usize::MAX,
+                })
+                .await?,
+            );
+        }
+        events.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+                .then_with(|| left.seq.cmp(&right.seq))
+        });
+
+        let mut out = Vec::new();
+        for event in events {
+            let cursor = event_cursor(&event);
+            if req
+                .from_cursor
+                .as_ref()
+                .is_some_and(|from| cursor.as_str() <= from.as_str())
+            {
+                continue;
+            }
+            out.push(ChangefeedItem { cursor, event });
+            if out.len() >= req.limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolve an `event_id` to its `(session_id, seq)` location.
     ///
     /// KV-backed runtime resolves through the persisted `event_by_id`
@@ -3065,6 +3424,24 @@ fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
     if keep_from > 0 {
         recent.drain(0..keep_from);
     }
+}
+
+fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) -> bool {
+    let bytes = serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if used.saturating_add(bytes) > max_bytes {
+        return false;
+    }
+    *used += bytes;
+    true
+}
+
+fn event_cursor(event: &EventEnvelope) -> String {
+    format!(
+        "{:020}:{}:{:020}",
+        event.created_at_ms, event.session_id, event.seq
+    )
 }
 
 /// Compare a record's `source` against a search filter. The filter

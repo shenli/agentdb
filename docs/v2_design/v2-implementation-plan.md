@@ -405,6 +405,14 @@ Dependencies: V2.0, V2.1, V2.2.
 
 ### V2.5 — Fork + subscribe + context builder (~2000 LoC)
 
+Status: complete for the single-machine V2 prototype. V2.5 adds runtime/API
+session forks with child-local sequence numbers, fork-aware replay, replay-style
+SSE snapshots, generalized session/tenant/agent watch cursors, and budgeted
+context packs that combine recent events, searched records, active skill
+bindings, and resolved policy. The current SSE endpoint provides deterministic
+replay-from-seq frames; long-held live push can be layered on the same watch
+cursor model when the process-local event bus is introduced.
+
 **Maps to impl guide §15 steps 11–12, 14.**
 
 Scope:
@@ -413,6 +421,7 @@ Scope:
   `session_id` and child-local `seq` starting at 0
 - Replay merging: parent events through `at_seq`, then child events
 - `GET /api/.../sessions/{ses}/subscribe` — SSE replay-from-seq + live tail
+  (prototype: replay-from-seq SSE snapshot; live tail is a transport follow-up)
 - `GET /api/.../sessions/{ses}/replay` for explicit replay endpoint (impl guide
   §8.3)
 - Generalized changefeed: `watch(stream_id | tenant_id | agent_id, from_cursor)`
