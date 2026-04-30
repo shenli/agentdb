@@ -298,3 +298,89 @@ async fn policy_sweep_endpoints_run_lifecycle_and_gc_for_tenant() {
         .unwrap();
     assert_eq!(missing.status().as_u16(), 404);
 }
+
+#[tokio::test]
+async fn policy_worker_endpoint_schedules_by_priority() {
+    let app = spawn_app().await;
+    let low: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "worker-low",
+            "policy": {"priority": "low", "lifecycle": {"cold_after_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let high: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "worker-high",
+            "policy": {"priority": "high", "lifecycle": {"cold_after_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let low_tid = low["tenant_id"].as_str().unwrap();
+    let high_tid = high["tenant_id"].as_str().unwrap();
+
+    for tid in [low_tid, high_tid] {
+        let agent: serde_json::Value = app
+            .client
+            .post(format!("{}/api/tenants/{tid}/agents", app.base))
+            .json(&json!({"alias": null, "config": {}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/agents/{}/sessions",
+                app.base,
+                agent["agent_id"].as_str().unwrap()
+            ))
+            .json(&json!({"alias": null}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let report: serde_json::Value = app
+        .client
+        .post(format!("{}/api/policy/worker/run", app.base))
+        .json(&json!({"now_ms": u64::MAX, "max_tenants": 1}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(report["tenants_considered"].as_u64(), Some(2));
+    assert_eq!(report["tenants_scheduled"].as_u64(), Some(1));
+    assert_eq!(report["tenants"][0]["tenant_id"], high_tid);
+    assert_eq!(report["tenants"][0]["priority"], "high");
+    assert_eq!(
+        report["lifecycle"]["sessions_transitioned"].as_u64(),
+        Some(1)
+    );
+}

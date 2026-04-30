@@ -210,3 +210,15 @@ pub struct SweepBody {
     #[serde(default)]
     pub now_ms: Option<u64>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct PolicyWorkerRunBody {
+    #[serde(default)]
+    pub now_ms: Option<u64>,
+    #[serde(default = "default_policy_worker_max_tenants")]
+    pub max_tenants: usize,
+}
+
+fn default_policy_worker_max_tenants() -> usize {
+    64
+}

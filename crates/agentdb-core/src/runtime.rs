@@ -29,7 +29,7 @@ use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
 use crate::id::Id;
 use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
-use crate::policy::RuntimePolicy;
+use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
 use crate::session::{Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
@@ -146,6 +146,23 @@ impl BackpressureReport {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TenantWorkerReport {
+    pub tenant_id: Id,
+    pub priority: Priority,
+    pub lifecycle: LifecycleSweepReport,
+    pub gc: GcSweepReport,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct PolicyWorkerReport {
+    pub tenants_considered: usize,
+    pub tenants_scheduled: usize,
+    pub lifecycle: LifecycleSweepReport,
+    pub gc: GcSweepReport,
+    pub tenants: Vec<TenantWorkerReport>,
+}
+
 #[derive(Default, Debug)]
 struct State {
     tenants: BTreeMap<String, Tenant>,
@@ -245,6 +262,15 @@ fn lifecycle_target(current: Lifecycle, idle_ms: u64, policy: &RuntimePolicy) ->
         target
     } else {
         current
+    }
+}
+
+fn priority_rank(p: Priority) -> u8 {
+    match p {
+        Priority::Low => 0,
+        Priority::Normal => 1,
+        Priority::High => 2,
+        Priority::Critical => 3,
     }
 }
 
@@ -1223,6 +1249,59 @@ impl Runtime {
             }
         }
         self.gc_sweep_inner(Some(tenant_id), now_ms).await
+    }
+
+    pub async fn run_policy_worker_once_at(
+        &self,
+        now_ms: u64,
+        max_tenants: usize,
+    ) -> Result<PolicyWorkerReport> {
+        let mut scheduled = {
+            let s = self.state.lock().await;
+            let mut tenants: Vec<(Id, Priority)> = s
+                .tenants
+                .values()
+                .filter(|tenant| tenant.deleted_at_ms.is_none())
+                .map(|tenant| {
+                    let policy = RuntimePolicy::from_json(&tenant.policy);
+                    (tenant.tenant_id.clone(), policy.priority)
+                })
+                .collect();
+            tenants.sort_by(|(left_id, left_priority), (right_id, right_priority)| {
+                priority_rank(*right_priority)
+                    .cmp(&priority_rank(*left_priority))
+                    .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+            });
+            tenants
+        };
+
+        let tenants_considered = scheduled.len();
+        scheduled.truncate(max_tenants);
+
+        let mut report = PolicyWorkerReport {
+            tenants_considered,
+            tenants_scheduled: scheduled.len(),
+            ..PolicyWorkerReport::default()
+        };
+
+        for (tenant_id, priority) in scheduled {
+            let lifecycle = self
+                .sweep_lifecycle_for_tenant_at(&tenant_id, now_ms)
+                .await?;
+            let gc = self.gc_sweep_for_tenant_at(&tenant_id, now_ms).await?;
+            report.lifecycle.sessions_transitioned += lifecycle.sessions_transitioned;
+            report.lifecycle.artifacts_raw_purged += lifecycle.artifacts_raw_purged;
+            report.gc.records_purged += gc.records_purged;
+            report.gc.artifacts_purged += gc.artifacts_purged;
+            report.tenants.push(TenantWorkerReport {
+                tenant_id,
+                priority,
+                lifecycle,
+                gc,
+            });
+        }
+
+        Ok(report)
     }
 
     async fn gc_sweep_inner(

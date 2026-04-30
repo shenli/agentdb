@@ -16,8 +16,10 @@ Implementation checkpoint:
   quota backpressure headers, active-session and session-event pressure
   signals, hard active-session and artifact-storage quotas, and tenant-scoped
   lifecycle/GC sweep API endpoints.
-- Current next milestone: V2.4d fuller quota dimensions, background worker
-  scheduling, broader GC handlers, and changefeed delete/purge events.
+- V2.4d adds a deterministic policy worker tick that schedules tenant
+  lifecycle/GC work by priority and exposes it through the API.
+- Current next milestone: V2.4e fuller quota dimensions, broader GC handlers,
+  and changefeed delete/purge events.
 
 This directory contains the V2 design direction for AgentDB. It does not replace
 the current implementation docs yet. It captures the architectural consensus
