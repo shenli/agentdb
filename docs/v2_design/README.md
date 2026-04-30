@@ -55,6 +55,9 @@ Implementation checkpoint:
   build same-cluster forward URIs, sanitize hop-by-hop headers, propagate
   routing metadata, track `x-agentdb-forwarded-for`, and reject already-forwarded
   requests to prevent loops.
+- V2.13 adds the runtime routing guard to `AppState`: single-node deployments
+  stay disabled by default, while tests and future handler wiring can inject
+  fixed planner decisions and receive local/forward/reject guard outcomes.
 - Current next milestone: call the routing guard from session handlers and
   attach the same-cluster HTTP client.
 

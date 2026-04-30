@@ -17,7 +17,7 @@ pub struct TestApp {
 
 pub async fn spawn_app() -> TestApp {
     let runtime = Runtime::in_memory();
-    let state = AppState { runtime };
+    let state = AppState::new(runtime);
     let router = build_router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

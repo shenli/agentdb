@@ -81,7 +81,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         agentdb_core::Runtime::with_kv(kv, content)
     };
 
-    let state = agentdb_api::AppState { runtime };
+    let state = agentdb_api::AppState::new(runtime);
     let app = agentdb_api::router(state).nest("/dashboard", agentdb_dashboard::router());
     let listener = tokio::net::TcpListener::bind(opts.bind).await?;
     tracing::info!(addr = %opts.bind, "agentdb listening");
