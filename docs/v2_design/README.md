@@ -22,6 +22,8 @@ Implementation checkpoint:
   GC sweeps.
 - V2.4f adds skill soft-delete plus skill/binding hard purge in tenant-scoped
   GC sweeps.
+- V2.4g adds idempotency retention GC for in-memory and persisted idempotency
+  records.
 - Current next milestone: fuller quota dimensions, remaining GC handlers, and
   changefeed delete/purge events.
 

@@ -524,6 +524,12 @@ impl Persist {
         }])
     }
 
+    pub fn delete_idempotency(&self, full_key: &str) -> KvResult<()> {
+        self.kv.write_batch(vec![WriteOp::Delete {
+            key: format!("record/idempotency/{full_key}").into_bytes(),
+        }])
+    }
+
     /// Look up a record by primary key (tenant + record_id). Returns
     /// `None` if the row is absent. Callers are responsible for
     /// soft-delete and expiration filtering.

@@ -103,6 +103,7 @@ pub struct GcSweepReport {
     pub events_purged: usize,
     pub skills_purged: usize,
     pub skill_bindings_purged: usize,
+    pub idempotency_purged: usize,
     pub records_purged: usize,
     pub artifacts_purged: usize,
 }
@@ -737,6 +738,7 @@ impl Runtime {
             let rec = IdempotencyRecord {
                 payload_hash: req_hash,
                 result_json: serde_json::to_string(&skill).unwrap(),
+                created_at_ms: crate::now_ms(),
             };
             if let Some(p) = &self.persist {
                 p.put_idempotency(&full, &rec).map_err(internal)?;
@@ -881,6 +883,7 @@ impl Runtime {
             let rec = IdempotencyRecord {
                 payload_hash: req_hash,
                 result_json: serde_json::to_string(&binding).unwrap(),
+                created_at_ms: crate::now_ms(),
             };
             if let Some(p) = &self.persist {
                 p.put_idempotency(&full, &rec).map_err(internal)?;
@@ -1397,6 +1400,7 @@ impl Runtime {
             report.gc.events_purged += gc.events_purged;
             report.gc.skills_purged += gc.skills_purged;
             report.gc.skill_bindings_purged += gc.skill_bindings_purged;
+            report.gc.idempotency_purged += gc.idempotency_purged;
             report.gc.records_purged += gc.records_purged;
             report.gc.artifacts_purged += gc.artifacts_purged;
             report.tenants.push(TenantWorkerReport {
@@ -1416,6 +1420,47 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<GcSweepReport> {
         let mut report = GcSweepReport::default();
+        let idempotency_candidates = {
+            let s = self.state.lock().await;
+            let mut out = Vec::new();
+            let persisted = self
+                .persist
+                .as_ref()
+                .map(|p| p.scan_all_idempotency().map_err(internal))
+                .transpose()?;
+            let records: Vec<(String, IdempotencyRecord)> = if let Some(records) = persisted {
+                records
+            } else {
+                self.idem.entries()
+            };
+            for (full_key, record) in records {
+                let Some((tenant_id_raw, _)) = full_key.split_once("::") else {
+                    continue;
+                };
+                if tenant_scope.is_some_and(|tenant_id| tenant_id.as_str() != tenant_id_raw) {
+                    continue;
+                }
+                let Some(tenant) = s.tenants.get(tenant_id_raw) else {
+                    continue;
+                };
+                let policy = RuntimePolicy::from_json(&tenant.policy);
+                if policy.retention.legal_hold
+                    || now_ms.saturating_sub(record.created_at_ms) < policy.retention.retention_ms
+                {
+                    continue;
+                }
+                out.push(full_key);
+            }
+            out
+        };
+        for full_key in idempotency_candidates {
+            if let Some(p) = &self.persist {
+                p.delete_idempotency(&full_key).map_err(internal)?;
+            }
+            self.idem.remove(&full_key);
+            report.idempotency_purged += 1;
+        }
+
         {
             let mut s = self.state.lock().await;
             let session_ids: Vec<String> = s
@@ -1888,6 +1933,7 @@ impl Runtime {
                 &req.source_refs,
             ),
             result_json: serde_json::to_string(&resp).unwrap(),
+            created_at_ms: crate::now_ms(),
         });
 
         // Atomic commit. With persist=Some, we use KvStore::write_batch to bind
