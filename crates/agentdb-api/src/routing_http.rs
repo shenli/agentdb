@@ -14,7 +14,13 @@ use axum::{
 };
 use serde::Serialize;
 
-use agentdb_meta::routing::{RouteAction, RouteDecision, RouteReason};
+use agentdb_meta::{
+    nodes::Node,
+    routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
+    session_locators::SessionLocator,
+    shards::ShardRow,
+    tablets::Tablet,
+};
 
 pub const HDR_ROUTE_ACTION: &str = "x-agentdb-route-action";
 pub const HDR_OWNER_NODE: &str = "x-agentdb-owner-node";
@@ -62,6 +68,17 @@ pub struct RouteRuntime {
 enum RouteRuntimeMode {
     Disabled,
     Fixed(RouteDecision),
+    Snapshot(RouteSnapshot),
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteSnapshot {
+    pub shard_count: i64,
+    pub request_location: Option<String>,
+    pub policy: ResidencyPolicy,
+    pub shards: Arc<[ShardRow]>,
+    pub tablets: Arc<[Tablet]>,
+    pub nodes: Arc<[Node]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +120,13 @@ impl RouteRuntime {
         }
     }
 
+    pub fn snapshot(local_node_id: impl Into<Arc<str>>, snapshot: RouteSnapshot) -> Self {
+        Self {
+            local_node_id: local_node_id.into(),
+            mode: RouteRuntimeMode::Snapshot(snapshot),
+        }
+    }
+
     pub fn guard(
         &self,
         original_path_and_query: &str,
@@ -126,6 +150,85 @@ impl RouteRuntime {
             }
             RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
         }
+    }
+
+    pub fn guard_session(
+        &self,
+        tenant_id: &str,
+        session_locator: Option<&SessionLocator>,
+        original_path_and_query: &str,
+        incoming_headers: &HeaderMap,
+    ) -> RouteGuardOutcome {
+        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+            return self.guard(original_path_and_query, incoming_headers);
+        };
+        let decision = plan_route(
+            RouteRequest {
+                tenant_id,
+                session_locator,
+                request_location: snapshot.request_location.as_deref(),
+                local_node_id: Some(&self.local_node_id),
+                shard_count: snapshot.shard_count,
+                now_ms: now_ms(),
+                policy: snapshot.policy.clone(),
+            },
+            &snapshot.shards,
+            &snapshot.tablets,
+            &snapshot.nodes,
+        );
+        match route_http_outcome(&decision) {
+            RouteHttpOutcome::ServeLocal(target) => RouteGuardOutcome::ServeLocal(target.headers),
+            RouteHttpOutcome::Forward(target) => {
+                match prepare_forward_request(
+                    &target,
+                    original_path_and_query,
+                    incoming_headers,
+                    &self.local_node_id,
+                ) {
+                    Ok(req) => RouteGuardOutcome::Forward(req),
+                    Err(rejection) => RouteGuardOutcome::Reject(rejection),
+                }
+            }
+            RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
+        }
+    }
+}
+
+impl RouteSnapshot {
+    pub fn new(shard_count: i64) -> Self {
+        Self {
+            shard_count,
+            request_location: None,
+            policy: ResidencyPolicy::default(),
+            shards: Arc::from([]),
+            tablets: Arc::from([]),
+            nodes: Arc::from([]),
+        }
+    }
+
+    pub fn with_request_location(mut self, request_location: impl Into<String>) -> Self {
+        self.request_location = Some(request_location.into());
+        self
+    }
+
+    pub fn with_policy(mut self, policy: ResidencyPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_shards(mut self, shards: Vec<ShardRow>) -> Self {
+        self.shards = Arc::from(shards);
+        self
+    }
+
+    pub fn with_tablets(mut self, tablets: Vec<Tablet>) -> Self {
+        self.tablets = Arc::from(tablets);
+        self
+    }
+
+    pub fn with_nodes(mut self, nodes: Vec<Node>) -> Self {
+        self.nodes = Arc::from(nodes);
+        self
     }
 }
 
@@ -338,10 +441,54 @@ fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
     headers.insert(name, value);
 }
 
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agentdb_meta::routing::{RouteAction, RouteDecision, RouteReason};
+
+    fn node(id: &str, location: &str) -> Node {
+        Node {
+            node_id: id.into(),
+            address: format!("http://{id}:8080"),
+            mongo_address: None,
+            state: "alive".into(),
+            last_heartbeat_ms: 100,
+            joined_at_ms: 100,
+            availability_zone: Some(location.into()),
+        }
+    }
+
+    fn tablet(id: i64, owner: Option<&str>, lease_expires_at_ms: i64) -> Tablet {
+        Tablet {
+            tablet_id: id,
+            owner_node_id: owner.map(str::to_string),
+            epoch: 3,
+            lease_expires_at_ms,
+            created_at_ms: 0,
+            handoff_target_node_id: None,
+        }
+    }
+
+    fn locator(session_id: &str, shard_id: i32, tablet_id: Option<i64>) -> SessionLocator {
+        SessionLocator {
+            session_id: session_id.into(),
+            tenant_internal_id: 1,
+            tenant_external_id: Some("ten_1".into()),
+            tablet_id,
+            shard_id,
+            created_at_ms: 0,
+        }
+    }
 
     fn decision(action: RouteAction, reason: Option<RouteReason>) -> RouteDecision {
         RouteDecision {
@@ -545,5 +692,87 @@ mod tests {
             panic!("expected rejection");
         };
         assert_eq!(rejection.code, "ROUTE_WRONG_LOCATION");
+    }
+
+    #[test]
+    fn route_runtime_snapshot_serves_local_owner() {
+        let loc = locator("ses_1", 1, Some(7));
+        let snapshot = RouteSnapshot::new(16)
+            .with_request_location("us-west-2a")
+            .with_tablets(vec![tablet(7, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![node("node-a", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session("ten_1", Some(&loc), "/api/test", &HeaderMap::new());
+
+        let RouteGuardOutcome::ServeLocal(headers) = outcome else {
+            panic!("expected local");
+        };
+        assert_eq!(headers[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
+        assert_eq!(headers[HDR_TABLET_ID].to_str().unwrap(), "7");
+    }
+
+    #[test]
+    fn route_runtime_snapshot_forwards_remote_owner() {
+        let loc = locator("ses_1", 1, Some(7));
+        let snapshot = RouteSnapshot::new(16)
+            .with_request_location("us-west-2a")
+            .with_tablets(vec![tablet(7, Some("node-b"), i64::MAX)])
+            .with_nodes(vec![node("node-b", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session(
+            "ten_1",
+            Some(&loc),
+            "/api/tenants/ten_1/sessions/ses_1/events",
+            &HeaderMap::new(),
+        );
+
+        let RouteGuardOutcome::Forward(req) = outcome else {
+            panic!("expected forward");
+        };
+        assert_eq!(
+            req.uri,
+            "http://node-b:8080/api/tenants/ten_1/sessions/ses_1/events"
+        );
+        assert_eq!(req.headers[HDR_FORWARDED_BY].to_str().unwrap(), "node-a");
+    }
+
+    #[test]
+    fn route_runtime_snapshot_uses_shard_override_without_locator() {
+        let snapshot = RouteSnapshot::new(1)
+            .with_shards(vec![ShardRow {
+                shard_id: 0,
+                tablet_id: Some(42),
+                updated_at_ms: 10,
+            }])
+            .with_tablets(vec![tablet(42, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![node("node-a", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session("ten_1", None, "/api/test", &HeaderMap::new());
+
+        let RouteGuardOutcome::ServeLocal(headers) = outcome else {
+            panic!("expected local");
+        };
+        assert_eq!(headers[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
+        assert_eq!(headers[HDR_TABLET_ID].to_str().unwrap(), "42");
+    }
+
+    #[test]
+    fn route_runtime_snapshot_rejects_unassigned_tablet() {
+        let loc = locator("ses_1", 1, Some(7));
+        let snapshot = RouteSnapshot::new(16)
+            .with_tablets(vec![tablet(7, None, i64::MAX)])
+            .with_nodes(vec![node("node-b", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session("ten_1", Some(&loc), "/api/test", &HeaderMap::new());
+
+        let RouteGuardOutcome::Reject(rejection) = outcome else {
+            panic!("expected reject");
+        };
+        assert_eq!(rejection.code, "ROUTE_UNASSIGNED");
+        assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
