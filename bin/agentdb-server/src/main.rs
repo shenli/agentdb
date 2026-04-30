@@ -58,6 +58,12 @@ struct ServeOpts {
     /// with node availability_zone until region and AZ split.
     #[arg(long)]
     route_location: Option<String>,
+
+    /// Route snapshot refresh interval in milliseconds. Periodic refresh is the
+    /// correctness path for SQLite and session locator changes; Postgres
+    /// LISTEN/NOTIFY can trigger faster refreshes for shard/node/tablet changes.
+    #[arg(long, default_value_t = 5_000)]
+    route_refresh_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -98,20 +104,22 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let mut state = agentdb_api::AppState::new(runtime);
     if let Some(node_id) = opts.route_node_id.as_deref() {
         let meta = agentdb_meta::MetaStore::open_from_env().await?;
-        let snapshot = agentdb_api::routing_http::RouteSnapshot::load_from_meta(
-            &meta,
+        let snapshot =
+            load_route_snapshot(&meta, opts.route_shard_count, opts.route_location.clone()).await?;
+        let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
+        spawn_route_snapshot_refresher(
+            meta,
+            routing.clone(),
             opts.route_shard_count,
             opts.route_location.clone(),
-            agentdb_meta::routing::ResidencyPolicy::default(),
-        )
-        .await?;
-        state = state.with_routing(agentdb_api::routing_http::RouteRuntime::snapshot(
-            node_id, snapshot,
-        ));
+            opts.route_refresh_interval_ms,
+        );
+        state = state.with_routing(routing);
         tracing::info!(
             node_id,
             shard_count = opts.route_shard_count,
             location = ?opts.route_location,
+            refresh_interval_ms = opts.route_refresh_interval_ms,
             "enabled metadata-backed route snapshot"
         );
     }
@@ -120,4 +128,83 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     tracing::info!(addr = %opts.bind, "agentdb listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn load_route_snapshot(
+    meta: &agentdb_meta::MetaStore,
+    shard_count: i64,
+    route_location: Option<String>,
+) -> agentdb_meta::MetaResult<agentdb_api::routing_http::RouteSnapshot> {
+    agentdb_api::routing_http::RouteSnapshot::load_from_meta(
+        meta,
+        shard_count,
+        route_location,
+        agentdb_meta::routing::ResidencyPolicy::default(),
+    )
+    .await
+}
+
+fn spawn_route_snapshot_refresher(
+    meta: agentdb_meta::MetaStore,
+    routing: agentdb_api::routing_http::RouteRuntime,
+    shard_count: i64,
+    route_location: Option<String>,
+    refresh_interval_ms: u64,
+) {
+    let refresh_interval_ms = refresh_interval_ms.max(100);
+    let mut changes = agentdb_meta::change_notifier::subscribe(
+        &meta,
+        &[
+            agentdb_meta::change_notifier::Channel::Shards,
+            agentdb_meta::change_notifier::Channel::Nodes,
+            agentdb_meta::change_notifier::Channel::Tablets,
+        ],
+    );
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(refresh_interval_ms));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    refresh_route_snapshot(&meta, &routing, shard_count, route_location.clone()).await;
+                }
+                change = changes.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!(channel = ?change.channel, payload = %change.payload, "route metadata change received");
+                            refresh_route_snapshot(&meta, &routing, shard_count, route_location.clone()).await;
+                        }
+                        None => {
+                            tracing::warn!("route metadata change stream closed; continuing with periodic refresh");
+                            changes = agentdb_meta::change_notifier::subscribe(
+                                &meta,
+                                &[
+                                    agentdb_meta::change_notifier::Channel::Shards,
+                                    agentdb_meta::change_notifier::Channel::Nodes,
+                                    agentdb_meta::change_notifier::Channel::Tablets,
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn refresh_route_snapshot(
+    meta: &agentdb_meta::MetaStore,
+    routing: &agentdb_api::routing_http::RouteRuntime,
+    shard_count: i64,
+    route_location: Option<String>,
+) {
+    match load_route_snapshot(meta, shard_count, route_location).await {
+        Ok(snapshot) => {
+            routing.refresh_snapshot(snapshot);
+            tracing::debug!("refreshed route snapshot");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to refresh route snapshot");
+        }
+    }
 }

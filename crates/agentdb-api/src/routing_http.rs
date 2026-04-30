@@ -5,7 +5,7 @@
 //! data path can take: serve locally, forward to an owner node, or reject with a
 //! structured error response.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -62,7 +62,7 @@ pub enum RouteGuardOutcome {
 #[derive(Debug, Clone)]
 pub struct RouteRuntime {
     local_node_id: Arc<str>,
-    mode: RouteRuntimeMode,
+    mode: Arc<RwLock<RouteRuntimeMode>>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,22 +111,31 @@ impl RouteRuntime {
     pub fn disabled() -> Self {
         Self {
             local_node_id: Arc::from("single-node"),
-            mode: RouteRuntimeMode::Disabled,
+            mode: Arc::new(RwLock::new(RouteRuntimeMode::Disabled)),
         }
     }
 
     pub fn fixed(local_node_id: impl Into<Arc<str>>, decision: RouteDecision) -> Self {
         Self {
             local_node_id: local_node_id.into(),
-            mode: RouteRuntimeMode::Fixed(decision),
+            mode: Arc::new(RwLock::new(RouteRuntimeMode::Fixed(decision))),
         }
     }
 
     pub fn snapshot(local_node_id: impl Into<Arc<str>>, snapshot: RouteSnapshot) -> Self {
         Self {
             local_node_id: local_node_id.into(),
-            mode: RouteRuntimeMode::Snapshot(snapshot),
+            mode: Arc::new(RwLock::new(RouteRuntimeMode::Snapshot(snapshot))),
         }
+    }
+
+    pub fn refresh_snapshot(&self, snapshot: RouteSnapshot) -> bool {
+        let mut mode = self.mode.write().expect("route runtime lock poisoned");
+        if !matches!(&*mode, RouteRuntimeMode::Snapshot(_)) {
+            return false;
+        }
+        *mode = RouteRuntimeMode::Snapshot(snapshot);
+        true
     }
 
     pub fn guard(
@@ -134,7 +143,8 @@ impl RouteRuntime {
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
     ) -> RouteGuardOutcome {
-        let RouteRuntimeMode::Fixed(decision) = &self.mode else {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        let RouteRuntimeMode::Fixed(decision) = &*mode else {
             return RouteGuardOutcome::ServeLocal(HeaderMap::new());
         };
         match route_http_outcome(decision) {
@@ -161,38 +171,17 @@ impl RouteRuntime {
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
     ) -> RouteGuardOutcome {
-        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        let RouteRuntimeMode::Snapshot(snapshot) = &*mode else {
             return self.guard(original_path_and_query, incoming_headers);
         };
-        let decision = plan_route(
-            RouteRequest {
-                tenant_id,
-                session_locator,
-                request_location: snapshot.request_location.as_deref(),
-                local_node_id: Some(&self.local_node_id),
-                shard_count: snapshot.shard_count,
-                now_ms: now_ms(),
-                policy: snapshot.policy.clone(),
-            },
-            &snapshot.shards,
-            &snapshot.tablets,
-            &snapshot.nodes,
-        );
-        match route_http_outcome(&decision) {
-            RouteHttpOutcome::ServeLocal(target) => RouteGuardOutcome::ServeLocal(target.headers),
-            RouteHttpOutcome::Forward(target) => {
-                match prepare_forward_request(
-                    &target,
-                    original_path_and_query,
-                    incoming_headers,
-                    &self.local_node_id,
-                ) {
-                    Ok(req) => RouteGuardOutcome::Forward(req),
-                    Err(rejection) => RouteGuardOutcome::Reject(rejection),
-                }
-            }
-            RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
-        }
+        self.guard_snapshot(
+            snapshot,
+            tenant_id,
+            session_locator,
+            original_path_and_query,
+            incoming_headers,
+        )
     }
 
     pub fn guard_session_id(
@@ -202,11 +191,13 @@ impl RouteRuntime {
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
     ) -> RouteGuardOutcome {
-        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        let RouteRuntimeMode::Snapshot(snapshot) = &*mode else {
             return self.guard(original_path_and_query, incoming_headers);
         };
         let session_locator = snapshot.session_locator(tenant_id, session_id);
-        self.guard_session(
+        self.guard_snapshot(
+            snapshot,
             tenant_id,
             session_locator,
             original_path_and_query,
@@ -221,7 +212,8 @@ impl RouteRuntime {
         if !incoming_headers.contains_key(HDR_FORWARDED_BY) {
             return Ok(());
         }
-        let RouteRuntimeMode::Snapshot(snapshot) = &self.mode else {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        let RouteRuntimeMode::Snapshot(snapshot) = &*mode else {
             return Ok(());
         };
         let tablet_id = parse_i64_header(incoming_headers, HDR_TABLET_ID)?;
@@ -255,6 +247,45 @@ impl RouteRuntime {
             ));
         }
         Ok(())
+    }
+
+    fn guard_snapshot(
+        &self,
+        snapshot: &RouteSnapshot,
+        tenant_id: &str,
+        session_locator: Option<&SessionLocator>,
+        original_path_and_query: &str,
+        incoming_headers: &HeaderMap,
+    ) -> RouteGuardOutcome {
+        let decision = plan_route(
+            RouteRequest {
+                tenant_id,
+                session_locator,
+                request_location: snapshot.request_location.as_deref(),
+                local_node_id: Some(&self.local_node_id),
+                shard_count: snapshot.shard_count,
+                now_ms: now_ms(),
+                policy: snapshot.policy.clone(),
+            },
+            &snapshot.shards,
+            &snapshot.tablets,
+            &snapshot.nodes,
+        );
+        match route_http_outcome(&decision) {
+            RouteHttpOutcome::ServeLocal(target) => RouteGuardOutcome::ServeLocal(target.headers),
+            RouteHttpOutcome::Forward(target) => {
+                match prepare_forward_request(
+                    &target,
+                    original_path_and_query,
+                    incoming_headers,
+                    &self.local_node_id,
+                ) {
+                    Ok(req) => RouteGuardOutcome::Forward(req),
+                    Err(rejection) => RouteGuardOutcome::Reject(rejection),
+                }
+            }
+            RouteHttpOutcome::Reject(rejection) => RouteGuardOutcome::Reject(rejection),
+        }
     }
 }
 
@@ -1013,5 +1044,46 @@ mod tests {
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(err.code, "ROUTE_STALE_TABLET_EPOCH");
         assert_eq!(err.headers[HDR_TABLET_EPOCH].to_str().unwrap(), "3");
+    }
+
+    #[test]
+    fn refresh_snapshot_updates_cloned_runtime_decisions() {
+        let initial = RouteSnapshot::new(1)
+            .with_tablets(vec![tablet(0, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![
+                node("node-a", "us-west-2a"),
+                node("node-b", "us-west-2a"),
+            ]);
+        let runtime = RouteRuntime::snapshot("node-a", initial);
+        let cloned = runtime.clone();
+
+        let before = cloned.guard_session_id("ten_1", "ses_1", "/api/test", &HeaderMap::new());
+        let RouteGuardOutcome::ServeLocal(_) = before else {
+            panic!("expected initial local owner");
+        };
+
+        let refreshed = RouteSnapshot::new(1)
+            .with_tablets(vec![tablet(0, Some("node-b"), i64::MAX)])
+            .with_nodes(vec![
+                node("node-a", "us-west-2a"),
+                node("node-b", "us-west-2a"),
+            ]);
+        assert!(runtime.refresh_snapshot(refreshed));
+
+        let after = cloned.guard_session_id("ten_1", "ses_1", "/api/test", &HeaderMap::new());
+        let RouteGuardOutcome::Forward(req) = after else {
+            panic!("expected refreshed remote owner");
+        };
+        assert_eq!(req.uri, "http://node-b:8080/api/test");
+    }
+
+    #[test]
+    fn refresh_snapshot_is_ignored_for_disabled_runtime() {
+        let runtime = RouteRuntime::disabled();
+        let refreshed = RouteSnapshot::new(1)
+            .with_tablets(vec![tablet(0, Some("node-b"), i64::MAX)])
+            .with_nodes(vec![node("node-b", "us-west-2a")]);
+
+        assert!(!runtime.refresh_snapshot(refreshed));
     }
 }

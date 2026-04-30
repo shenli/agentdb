@@ -792,6 +792,34 @@ Follow-up:
   instead of loading only at boot.
 - Add proxy timeout and response-size policy knobs for production deployment.
 
+### V2.18 — Route snapshot refresh loop (~400 LoC)
+
+Status: snapshot refresh complete. V2.18 changes `RouteRuntime` from a
+by-value snapshot holder into a cloneable shared runtime whose snapshot can be
+replaced after server boot.
+
+Scope:
+
+- `RouteRuntime` stores its mode behind a shared lock so all cloned `AppState`
+  values see refreshed routing metadata.
+- `RouteRuntime::refresh_snapshot(...)` atomically replaces the current
+  metadata-backed snapshot and ignores disabled/fixed runtimes.
+- `agentdb serve` starts a route snapshot refresh task when
+  `--route-node-id ...` is enabled.
+- The refresh task reloads periodically for correctness across SQLite and
+  session locator changes.
+- On Postgres, existing shard/node/tablet LISTEN/NOTIFY events trigger earlier
+  refreshes between periodic ticks.
+- Unit coverage verifies cloned runtimes observe refreshed local/forward
+  decisions.
+
+Follow-up:
+
+- Add proxy timeout and response-size policy knobs for production deployment.
+- Split prototype location labels into durable region/AZ metadata.
+- Extend metadata notifications to `session_locators` so locator updates can
+  also wake the refresh loop immediately on Postgres.
+
 ---
 
 ## §3 V2.0 Scaffolding — Task-Level Plan
