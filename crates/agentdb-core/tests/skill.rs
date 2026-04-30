@@ -2,6 +2,7 @@ use agentdb_core::artifact::NewArtifact;
 use agentdb_core::errors::ErrorCode;
 use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::skill::{BindSkillRequest, NewSkill};
+use agentdb_core::{NewAgent, NewSession, NewTenant};
 
 #[tokio::test]
 async fn register_skill_assigns_typed_id_and_enforces_unique_version() {
@@ -172,4 +173,105 @@ async fn skill_used_event_requires_exact_registered_version() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::SkillNotFound);
+}
+
+#[tokio::test]
+async fn delete_skill_hides_skill_bindings_and_gc_purges_them() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "skill-gc".into(),
+            policy: serde_json::json!({"retention": {"retention_ms": 0}}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    let skill = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: t.tenant_id.clone(),
+                name: "tool".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    rt.bind_skill(BindSkillRequest {
+        tenant_id: t.tenant_id.clone(),
+        agent_id: a.agent_id.clone(),
+        skill_id: skill.skill_id.clone(),
+        idempotency_key: None,
+    })
+    .await
+    .unwrap();
+
+    rt.delete_skill(&t.tenant_id, &skill.skill_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rt.get_skill(&t.tenant_id, &skill.skill_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::SkillNotFound
+    );
+    assert!(rt
+        .list_agent_skills(&t.tenant_id, &a.agent_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "skill_used",
+            serde_json::json!({
+                "skill_id": skill.skill_id.as_str(),
+                "version": "1.0.0"
+            }),
+        ))
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::SkillNotFound
+    );
+
+    let report = rt
+        .gc_sweep_for_tenant_at(&t.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(report.skills_purged, 1);
+    assert_eq!(report.skill_bindings_purged, 1);
+
+    rt.register_skill(
+        NewSkill {
+            tenant_id: t.tenant_id.clone(),
+            name: "tool".into(),
+            version: "1.0.0".into(),
+            manifest: serde_json::json!({}),
+            artifact_refs: vec![],
+        },
+        None,
+    )
+    .await
+    .unwrap();
 }

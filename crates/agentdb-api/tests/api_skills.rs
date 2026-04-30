@@ -171,6 +171,103 @@ async fn skill_used_wrong_version_returns_404() {
     assert_eq!(err["code"], "SKILL_NOT_FOUND");
 }
 
+#[tokio::test]
+async fn delete_skill_hides_binding_and_gc_purges_skill() {
+    let app = spawn_app().await;
+    let t: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "skill-delete",
+            "policy": {"retention": {"retention_ms": 0}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = t["tenant_id"].as_str().unwrap();
+    let a: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({"alias": null, "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = a["agent_id"].as_str().unwrap();
+    let skill: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/skills", app.base))
+        .json(&json!({"name": "tool", "version": "1.0.0", "manifest": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let skill_id = skill["skill_id"].as_str().unwrap();
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/skills/bind",
+            app.base
+        ))
+        .json(&json!({"skill_id": skill_id}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deleted = app
+        .client
+        .delete(format!("{}/api/tenants/{tid}/skills/{skill_id}", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status().as_u16(), 204);
+
+    let listed: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/skills",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed["skills"].as_array().unwrap().is_empty());
+
+    let gc: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/policy/gc-sweep", app.base))
+        .json(&json!({"now_ms": u64::MAX}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gc["skills_purged"].as_u64(), Some(1));
+    assert_eq!(gc["skill_bindings_purged"].as_u64(), Some(1));
+}
+
 async fn bootstrap_session(app: &TestApp) -> (String, String, String) {
     let t: serde_json::Value = app
         .client

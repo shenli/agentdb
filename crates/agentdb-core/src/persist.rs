@@ -479,6 +479,20 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    pub fn delete_skill(&self, skill: &Skill) -> KvResult<()> {
+        let ops: Vec<WriteOp> = vec![
+            WriteOp::Delete {
+                key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
+                    .into_bytes(),
+            },
+            WriteOp::Delete {
+                key: skill_unique_key(skill.tenant_id.as_str(), &skill.name, &skill.version)
+                    .into_bytes(),
+            },
+        ];
+        self.kv.write_batch(ops)
+    }
+
     pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
         let ops: Vec<WriteOp> = vec![WriteOp::Put {
             key: agent_skill_binding_key(
@@ -490,6 +504,17 @@ impl Persist {
             value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
         }];
         self.kv.write_batch(ops)
+    }
+
+    pub fn delete_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
+        self.kv.write_batch(vec![WriteOp::Delete {
+            key: agent_skill_binding_key(
+                binding.tenant_id.as_str(),
+                binding.agent_id.as_str(),
+                binding.skill_id.as_str(),
+            )
+            .into_bytes(),
+        }])
     }
 
     pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {

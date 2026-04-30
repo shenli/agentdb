@@ -101,6 +101,8 @@ pub struct LifecycleSweepReport {
 pub struct GcSweepReport {
     pub sessions_purged: usize,
     pub events_purged: usize,
+    pub skills_purged: usize,
+    pub skill_bindings_purged: usize,
     pub records_purged: usize,
     pub artifacts_purged: usize,
 }
@@ -755,6 +757,71 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", skill_id)))
     }
 
+    pub async fn delete_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s.skills.get(skill_id.as_str()).is_some_and(|skill| {
+            skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
+        });
+        if !live {
+            return Err(Error::new(
+                ErrorCode::SkillNotFound,
+                format!("{}", skill_id),
+            ));
+        }
+
+        let now = crate::now_ms();
+        let updated_skill = {
+            let skill = s
+                .skills
+                .get_mut(skill_id.as_str())
+                .expect("presence checked above");
+            skill.deleted_at_ms = Some(now);
+            skill.clone()
+        };
+        let binding_keys: Vec<(String, String)> = s
+            .agent_skill_bindings
+            .iter()
+            .filter_map(|(key, binding)| {
+                (binding.tenant_id.as_str() == tenant_id.as_str()
+                    && binding.skill_id.as_str() == skill_id.as_str()
+                    && binding.deleted_at_ms.is_none())
+                .then(|| key.clone())
+            })
+            .collect();
+        let mut updated_bindings = Vec::new();
+        for key in binding_keys {
+            if let Some(binding) = s.agent_skill_bindings.get_mut(&key) {
+                binding.deleted_at_ms = Some(now);
+                updated_bindings.push(binding.clone());
+            }
+        }
+
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_skill(&updated_skill) {
+                if let Some(skill) = s.skills.get_mut(skill_id.as_str()) {
+                    skill.deleted_at_ms = None;
+                }
+                for binding in &updated_bindings {
+                    if let Some(current) = s.agent_skill_bindings.get_mut(&(
+                        binding.agent_id.as_str().to_string(),
+                        binding.skill_id.as_str().to_string(),
+                    )) {
+                        current.deleted_at_ms = None;
+                    }
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+            for binding in &updated_bindings {
+                if let Err(e) = p.put_agent_skill_binding(binding) {
+                    drop(s);
+                    return Err(internal(e));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Bind an exact skill version to an agent. Rebinding the same skill id is
     /// idempotent even without an Idempotency-Key.
     pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
@@ -1328,6 +1395,8 @@ impl Runtime {
             report.lifecycle.artifacts_raw_purged += lifecycle.artifacts_raw_purged;
             report.gc.sessions_purged += gc.sessions_purged;
             report.gc.events_purged += gc.events_purged;
+            report.gc.skills_purged += gc.skills_purged;
+            report.gc.skill_bindings_purged += gc.skill_bindings_purged;
             report.gc.records_purged += gc.records_purged;
             report.gc.artifacts_purged += gc.artifacts_purged;
             report.tenants.push(TenantWorkerReport {
@@ -1403,6 +1472,64 @@ impl Runtime {
                         .remove(&scoped_alias_key(session.tenant_id.as_str(), alias));
                 }
                 report.sessions_purged += 1;
+            }
+        }
+
+        {
+            let mut s = self.state.lock().await;
+            let skill_ids: Vec<String> = s
+                .skills
+                .iter()
+                .filter_map(|(id, skill)| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| skill.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
+                    let deleted_at = skill.deleted_at_ms?;
+                    let policy = policy_for_tenant_in_state(&s, &skill.tenant_id);
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect();
+
+            for skill_id in skill_ids {
+                let Some(skill) = s.skills.get(&skill_id).cloned() else {
+                    continue;
+                };
+                let binding_keys: Vec<(String, String)> = s
+                    .agent_skill_bindings
+                    .iter()
+                    .filter_map(|(key, binding)| {
+                        (binding.tenant_id.as_str() == skill.tenant_id.as_str()
+                            && binding.skill_id.as_str() == skill.skill_id.as_str())
+                        .then(|| key.clone())
+                    })
+                    .collect();
+                for key in binding_keys {
+                    let Some(binding) = s.agent_skill_bindings.get(&key).cloned() else {
+                        continue;
+                    };
+                    if let Some(p) = &self.persist {
+                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                    }
+                    s.agent_skill_bindings.remove(&key);
+                    report.skill_bindings_purged += 1;
+                }
+                if let Some(p) = &self.persist {
+                    p.delete_skill(&skill).map_err(internal)?;
+                }
+                s.skill_uniques.remove(&skill_unique_state_key(
+                    skill.tenant_id.as_str(),
+                    &skill.name,
+                    &skill.version,
+                ));
+                s.skills.remove(&skill_id);
+                report.skills_purged += 1;
             }
         }
 
