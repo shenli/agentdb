@@ -391,6 +391,23 @@ async fn delete_record_removes_from_search() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
+
+    // Admin/audit read can include the soft-deleted marker.
+    let deleted: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/{rid}?include_deleted=true",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(deleted["deleted_at_ms"].as_u64().is_some());
 }
 
 #[tokio::test]
