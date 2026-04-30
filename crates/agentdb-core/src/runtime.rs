@@ -99,6 +99,8 @@ pub struct LifecycleSweepReport {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct GcSweepReport {
+    pub sessions_purged: usize,
+    pub events_purged: usize,
     pub records_purged: usize,
     pub artifacts_purged: usize,
 }
@@ -483,6 +485,39 @@ impl Runtime {
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+    }
+
+    pub async fn delete_session(&self, tenant_id: &Id, session_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let live = s.sessions.get(session_id.as_str()).is_some_and(|sess| {
+            sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+        });
+        if !live {
+            return Err(Error::new(
+                ErrorCode::SessionNotFound,
+                format!("{}", session_id),
+            ));
+        }
+
+        let updated = {
+            let sess = s
+                .sessions
+                .get_mut(session_id.as_str())
+                .expect("presence checked above");
+            sess.deleted_at_ms = Some(crate::now_ms());
+            sess.clone()
+        };
+
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_session(&updated) {
+                if let Some(sess) = s.sessions.get_mut(session_id.as_str()) {
+                    sess.deleted_at_ms = None;
+                }
+                drop(s);
+                return Err(internal(e));
+            }
+        }
+        Ok(())
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
@@ -1291,6 +1326,8 @@ impl Runtime {
             let gc = self.gc_sweep_for_tenant_at(&tenant_id, now_ms).await?;
             report.lifecycle.sessions_transitioned += lifecycle.sessions_transitioned;
             report.lifecycle.artifacts_raw_purged += lifecycle.artifacts_raw_purged;
+            report.gc.sessions_purged += gc.sessions_purged;
+            report.gc.events_purged += gc.events_purged;
             report.gc.records_purged += gc.records_purged;
             report.gc.artifacts_purged += gc.artifacts_purged;
             report.tenants.push(TenantWorkerReport {
@@ -1310,6 +1347,65 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<GcSweepReport> {
         let mut report = GcSweepReport::default();
+        {
+            let mut s = self.state.lock().await;
+            let session_ids: Vec<String> = s
+                .sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    if tenant_scope
+                        .is_some_and(|tenant_id| session.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        return None;
+                    }
+                    let deleted_at = session.deleted_at_ms?;
+                    let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                    if policy.retention.legal_hold
+                        || now_ms.saturating_sub(deleted_at) < policy.retention.retention_ms
+                    {
+                        return None;
+                    }
+                    Some(id.clone())
+                })
+                .collect();
+
+            for session_id in session_ids {
+                let Some(session) = s.sessions.get(&session_id).cloned() else {
+                    continue;
+                };
+                if let Some(p) = &self.persist {
+                    report.events_purged += p
+                        .delete_session_events(
+                            session.tenant_id.as_str(),
+                            session.session_id.as_str(),
+                        )
+                        .map_err(internal)?;
+                    p.delete_session(&session).map_err(internal)?;
+                } else {
+                    let lo = (session.session_id.as_str().to_string(), 0);
+                    let hi = (session.session_id.as_str().to_string(), u64::MAX);
+                    let event_ids: Vec<String> = s
+                        .events
+                        .range(lo..=hi)
+                        .map(|(_, event)| event.event_id.as_str().to_string())
+                        .collect();
+                    for event_id in event_ids {
+                        if let Some((_, seq)) = s.event_by_id.remove(&event_id) {
+                            s.events
+                                .remove(&(session.session_id.as_str().to_string(), seq));
+                            report.events_purged += 1;
+                        }
+                    }
+                }
+                s.sessions.remove(&session_id);
+                if let Some(alias) = session.alias.as_deref() {
+                    s.session_aliases
+                        .remove(&scoped_alias_key(session.tenant_id.as_str(), alias));
+                }
+                report.sessions_purged += 1;
+            }
+        }
+
         {
             let mut s = self.state.lock().await;
             let record_ids: Vec<String> = s
@@ -1484,6 +1580,12 @@ impl Runtime {
             let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
                 Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
             })?;
+            if session.deleted_at_ms.is_some() {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", req.session_id),
+                ));
+            }
             // Tenant isolation: a session id from tenant B is "not found" from
             // tenant A's perspective, otherwise an attacker who learns a
             // cross-tenant session id could append events into another
@@ -1825,6 +1927,12 @@ impl Runtime {
             .sessions
             .get(req.session_id.as_str())
             .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)))?;
+        if session.deleted_at_ms.is_some() {
+            return Err(Error::new(
+                ErrorCode::SessionNotFound,
+                format!("{}", req.session_id),
+            ));
+        }
         // tenant_id on FetchRequest finally becomes load-bearing for the KV
         // backend's tenant-scoped key encoding. Refuse mismatches outright so
         // callers can't sidestep tenancy by passing the wrong tenant.
