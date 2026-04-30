@@ -41,7 +41,8 @@ pub use policy::{
 };
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
 pub use runtime::{
-    BackpressureReport, BackpressureSignal, GcSweepReport, LifecycleSweepReport, Runtime,
+    BackpressureReport, BackpressureSignal, GcSweepReport, LifecycleSweepReport,
+    PolicyWorkerReport, Runtime, TenantWorkerReport,
 };
 pub use session::{Lifecycle, NewSession, Session};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};

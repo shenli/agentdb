@@ -27,7 +27,8 @@ use agentdb_core::{
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, IncludeDeletedQuery,
-    ListAgentSkillsResponse, SearchRecordsBody, SearchRecordsResponse, SweepBody,
+    ListAgentSkillsResponse, PolicyWorkerRunBody, SearchRecordsBody, SearchRecordsResponse,
+    SweepBody,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::state::AppState;
@@ -115,6 +116,7 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/policy/gc-sweep",
             post(run_gc_sweep),
         )
+        .route("/api/policy/worker/run", post(run_policy_worker))
 }
 
 async fn create_tenant(
@@ -733,6 +735,18 @@ fn current_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+async fn run_policy_worker(
+    State(s): State<AppState>,
+    Json(body): Json<PolicyWorkerRunBody>,
+) -> Result<Json<agentdb_core::PolicyWorkerReport>, ApiError> {
+    let max_tenants = body.max_tenants.clamp(1, 1024);
+    let report = s
+        .runtime
+        .run_policy_worker_once_at(body.now_ms.unwrap_or_else(current_ms), max_tenants)
+        .await?;
+    Ok(Json(report))
 }
 
 /// Hand-rolled query-string parser for the search route. Handles the
