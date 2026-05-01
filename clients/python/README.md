@@ -1,7 +1,7 @@
 # agentdb (Python)
 
-Python client for AgentDB V2, the tenant-scoped native `/api/...` runtime
-database for agent sessions, artifacts, records, skills, replay, and context.
+Python client for AgentDB V2, the runtime database for agent sessions,
+artifacts, records, skills, replay, and context.
 
 ## Install
 
@@ -19,20 +19,21 @@ cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
 ## Sync Quick Start
 
 ```python
-from agentdb import Client
+from agentdb import AgentDB
 
-client = Client("http://127.0.0.1:8080")
+db = AgentDB("http://127.0.0.1:8080")
+workspace = db.workspace("acme")
+agent = workspace.agent("sales-agent")
+session = agent.session("ticket-42")
 
-tenant = client.create_tenant("acme")
-agent = client.create_agent(tenant["tenant_id"], alias="sales-agent")
-session = client.create_session(tenant["tenant_id"], agent["agent_id"])
-
-result = session.append(
-    {"role": "user", "text": "hello"},
-    fetch_last_n=5,
-)
+result = session.append_user("hello", fetch_last_n=5)
 print(result.seq, [event.payload for event in result.recent])
 ```
+
+`tenant_id` is infrastructure state. Normal agent code binds a workspace once
+and then works with agents, sessions, artifacts, records, and skills from that
+handle. Raw tenant-scoped calls remain available through `Client` for internal
+tests and admin-style tooling.
 
 ## Async Quick Start
 
@@ -53,14 +54,13 @@ asyncio.run(main())
 
 ## Core Surface
 
-- `Client.create_tenant`, `get_tenant`
-- `Client.create_agent`, `create_session`, `session`
-- `Session.append`, `append_and_fetch`, `fetch`, `fetch_recent`
-- `Session.replay`, `fork`, `subscribe`, `context`
-- `Client.watch`
-- `Client.put_artifact`, `get_artifact`, `get_artifact_blob`
-- `Client.write_record`, `search_records`
-- `Client.register_skill`, `bind_skill`
+- `AgentDB.workspace`
+- `Workspace.agent`, `Workspace.session`, `Workspace.watch`
+- `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
+- `AgentHandle.session`, `AgentHandle.bind_skill`
+- `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`
+- `SessionHandle.fetch`, `fetch_recent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.artifacts`, `records`, `skills`
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
@@ -73,18 +73,16 @@ harness should keep the tenant, agent, session, and last-seen sequence IDs, then
 rebuild a session handle and continue from durable history:
 
 ```python
-from agentdb import Client, SessionEventKind, agent_status
+from agentdb import AgentDB
 
-client = Client("http://127.0.0.1:8080")
-session = client.session(tenant_id, session_id, agent_id=agent_id)
+db = AgentDB("http://127.0.0.1:8080")
+agent = db.workspace(tenant_id=tenant_id).agent(agent_id=agent_id)
+session = agent.session(session_id=session_id)
 
 history = session.replay(from_seq=0, limit=100)
 context = session.context(include=["recent_events", "records", "skills"])
 
-result = session.append(
-    agent_status("recovered", last_seen_seq=last_seen_seq),
-    kind=SessionEventKind.AGENT_STATUS.value,
-)
+result = session.agent_status("recovered", last_seen_seq=last_seen_seq)
 
 for event in session.subscribe(from_seq=last_seen_seq + 1):
     handle(event)
@@ -94,14 +92,14 @@ Concept mapping:
 
 | Durable-session concept | Python SDK |
 |---|---|
-| wake/resume handle | `client.session(tenant_id, session_id, agent_id=...)` |
+| wake/resume handle | `agent.session(session_id=...)` |
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
 | append and fetch | `session.append_and_fetch(...)` |
 | subscribe from sequence | `session.subscribe(from_seq=...)` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
-| tenant/session watch | `client.watch(...)` |
+| workspace/session watch | `workspace.watch(...)` |
 
 Use `from_seq=last_seen_seq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled
@@ -128,6 +126,14 @@ session.append(
     kind=SessionEventKind.TOOL_RESULT.value,
     source_refs=[{"event_id": call.event_id}],
 )
+```
+
+For common events, `SessionHandle` also provides shortcuts:
+
+```python
+session.append_user("run the report")
+call = session.tool_call("call_1", "sandbox.exec", {"cmd": "python report.py"})
+session.tool_result("call_1", "Generated report.", source_refs=[{"event_id": call.event_id}])
 ```
 
 Helpers are intentionally client-side only. They do not prevent custom event
@@ -160,9 +166,9 @@ context_event = session.append(
     source_refs=context_source_refs(context, max_refs=50),
 )
 
-session.append(
-    model_message("The report is ready.", context_pack_id="ctx_1"),
-    kind=SessionEventKind.MODEL_MESSAGE.value,
+session.model_message(
+    "The report is ready.",
+    context_pack_id="ctx_1",
     source_refs=[{"event_id": context_event.event_id}],
 )
 ```

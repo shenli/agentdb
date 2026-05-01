@@ -25,9 +25,10 @@ import time
 from typing import Any, Optional
 
 from agentdb import (
-    Client,
+    AgentDB,
     SessionEventKind,
     agent_status,
+    artifact_ref,
     context_pack_built,
     context_source_refs,
     model_message,
@@ -44,18 +45,15 @@ PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
 TENANT_KEY = os.environ.get("AGENTDB_TENANT", "session-first-demo")
 
 
-def run_demo(client: Any, *, tenant_key: str = TENANT_KEY) -> dict:
+def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
     """Run the session-first demo flow using a real or fake AgentDB client."""
 
-    tenant = client.create_tenant(f"{tenant_key}-{int(time.time() * 1000)}")
-    tenant_id = tenant["tenant_id"]
-    agent = client.create_agent(
-        tenant_id,
-        alias="session-first-demo-agent",
+    workspace = db.workspace(f"{tenant_key}-{int(time.time() * 1000)}")
+    agent = workspace.agent(
+        "session-first-demo-agent",
         config={"runtime": "demo-harness", "purpose": "session-first walkthrough"},
     )
-    agent_id = agent["agent_id"]
-    session = client.create_session(tenant_id, agent_id, alias="support-ticket-42")
+    session = agent.session("support-ticket-42")
 
     observed: list[dict] = []
 
@@ -89,29 +87,26 @@ def run_demo(client: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         b"retryable=true\n"
         b"orders affected=1\n"
     )
-    artifact = client.put_artifact(
-        tenant_id,
+    artifact = session.artifacts.put(
         log_blob,
         content_type="text/plain",
         sha256=hashlib.sha256(log_blob).hexdigest(),
     )
-    artifact_ref = {
-        "artifact_id": artifact["artifact_id"],
-        "content_type": artifact.get("content_type", "text/plain"),
-        "bytes": artifact.get("bytes", len(log_blob)),
-        "sha256": artifact.get("sha256"),
-    }
+    log_artifact_ref = artifact_ref(artifact)
     _append_observed(
         session,
         observed,
         tool_result(
             tool_call_id,
             "Collected checkout logs; one retryable gateway timeout was found.",
-            output={"artifact_id": artifact_ref["artifact_id"], "preview": "retryable=true"},
+            output={
+                "artifact_id": log_artifact_ref["artifact_id"],
+                "preview": "retryable=true",
+            },
             duration_ms=412,
         ),
         kind=SessionEventKind.TOOL_RESULT.value,
-        artifact_refs=[artifact_ref],
+        artifact_refs=[log_artifact_ref],
         source_refs=[{"event_id": call_event["event_id"]}],
     )
 
@@ -147,7 +142,7 @@ def run_demo(client: Any, *, tenant_key: str = TENANT_KEY) -> dict:
     last_seq_before_recovery = observed[-1]["seq"]
 
     # Simulate a fresh harness process: only durable IDs and last seq survive.
-    recovered = client.session(tenant_id, session.session_id, agent_id=agent_id)
+    recovered = agent.session(session_id=session.id)
     replayed = recovered.replay(from_seq=0, limit=100)
     replayed_kinds = [event.kind for event in replayed]
     recovered_event = _append_observed(
@@ -168,10 +163,10 @@ def run_demo(client: Any, *, tenant_key: str = TENANT_KEY) -> dict:
 
     warnings = validate_adapter_events(observed)
     return {
-        "tenant_id": tenant_id,
-        "agent_id": agent_id,
-        "session_id": session.session_id,
-        "artifact_id": artifact_ref["artifact_id"],
+        "workspace_id": workspace.id,
+        "agent_id": agent.id,
+        "session_id": session.id,
+        "artifact_id": log_artifact_ref["artifact_id"],
         "event_kinds": [event["kind"] for event in observed],
         "replayed_kinds": replayed_kinds,
         "last_seq_before_recovery": last_seq_before_recovery,
@@ -209,16 +204,16 @@ def _append_observed(
 
 
 def main() -> None:
-    client = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
-    if not client.health_ready():
+    db = AgentDB(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    if not db.health_ready():
         raise SystemExit(
             f"AgentDB not ready at {SERVER_URL}. Start it with:\n"
             f"    cargo run -p agentdb-server -- serve --dev"
         )
 
-    result = run_demo(client)
-    print(f"# tenant:  {result['tenant_id']}")
-    print(f"# agent:   {result['agent_id']}")
+    result = run_demo(db)
+    print(f"# workspace: {result['workspace_id']}")
+    print(f"# agent:     {result['agent_id']}")
     print(f"# session: {result['session_id']}")
     print(f"# artifact:{result['artifact_id']}")
     print("\n# ordered session timeline")

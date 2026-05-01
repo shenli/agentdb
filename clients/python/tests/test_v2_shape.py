@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agentdb import Client
+from agentdb import AgentDB, Client
 
 
 def response(status=200, body=None):
@@ -82,6 +82,43 @@ def test_v2_urls_cover_core_flow():
     assert any("/replay" in url for url in urls)
     assert any("/context" in url for url in urls)
     assert any("/watch" in url for url in urls)
+
+
+def test_friendly_api_binds_workspace_agent_and_session_context():
+    c = Client("http://x", auth=("u", "p"))
+    calls, patched = capture(c)
+    with patched:
+        db = AgentDB(_client=c)
+        workspace = db.workspace("acme")
+        agent = workspace.agent("sales-agent")
+        session = agent.session("ticket-42")
+
+        result = session.append_user("hello", fetch_last_n=5)
+        artifact = session.artifacts.put(b"blob", content_type="text/plain")
+        session.tool_result(
+            "call_1",
+            "Generated report.",
+            artifacts=[artifact],
+            source_refs=[{"event_id": result.event_id}],
+        )
+        workspace.records.write(namespace=["mem"], text="x")
+        workspace.records.search(namespace=["mem"], text="x")
+        skill = workspace.skills.register(name="tool", version="1")
+        agent.bind_skill(skill["skill_id"])
+        workspace.watch(scope="agent", agent_id=agent.id)
+        recovered = agent.session(session_id=session.id)
+        recovered.replay()
+
+    urls = [url for _, url, _ in calls]
+    assert urls[0].endswith("/api/tenants")
+    assert any("/api/tenants/ten_1/agents" in url for url in urls)
+    assert any("/api/tenants/ten_1/agents/agt_1/sessions" in url for url in urls)
+    assert any("/api/tenants/ten_1/sessions/ses_1/append-and-fetch" in url for url in urls)
+    assert any("/api/tenants/ten_1/artifacts" in url for url in urls)
+    assert any("/api/tenants/ten_1/records" in url for url in urls)
+    assert any("/api/tenants/ten_1/skills" in url for url in urls)
+    assert any("/api/tenants/ten_1/watch" in url for url in urls)
+    assert any("/api/tenants/ten_1/sessions/ses_1/replay" in url for url in urls)
 
 
 def test_idempotency_key_is_generated_for_mutations():

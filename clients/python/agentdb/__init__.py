@@ -2,13 +2,13 @@
 
 Typical usage:
 
-    from agentdb import Client
+    from agentdb import AgentDB
 
-    client = Client("http://127.0.0.1:8080")
-    tenant = client.create_tenant("acme")
-    agent = client.create_agent(tenant["tenant_id"])
-    session = client.create_session(tenant["tenant_id"], agent["agent_id"])
-    result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
+    db = AgentDB("http://127.0.0.1:8080")
+    workspace = db.workspace("acme")
+    agent = workspace.agent("support-agent")
+    session = agent.session("ticket-42")
+    result = session.append_user("hello", fetch_last_n=5)
     print(result.seq, [e.payload for e in result.recent])
 
 The `append + fetch_last_n` pattern is the canonical hot path —
@@ -39,7 +39,21 @@ See `examples/agents/python/quickstart.py` (sync) and
 working agent loops.
 """
 
-from .client import Client, Session, AppendResult, Event, WatchItem
+from .client import (
+    AgentDB,
+    AgentHandle,
+    ArtifactCollection,
+    Client,
+    RecordCollection,
+    Session,
+    SessionHandle,
+    SkillCollection,
+    Workspace,
+    AppendResult,
+    Event,
+    WatchItem,
+    artifact_ref,
+)
 from .conventions import (
     SessionEventKind,
     ADAPTER_READINESS_CHECKS,
@@ -72,10 +86,18 @@ from .errors import (
 
 __all__ = [
     "Client",
+    "AgentDB",
+    "Workspace",
+    "AgentHandle",
+    "SessionHandle",
+    "ArtifactCollection",
+    "RecordCollection",
+    "SkillCollection",
     "Session",
     "AppendResult",
     "Event",
     "WatchItem",
+    "artifact_ref",
     "SessionEventKind",
     "ADAPTER_READINESS_CHECKS",
     "agent_status",
