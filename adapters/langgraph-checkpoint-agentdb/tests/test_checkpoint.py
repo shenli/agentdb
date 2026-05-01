@@ -61,16 +61,23 @@ class FakeAsyncSession(FakeSession):
 class FakeAsyncClient:
     def __init__(self):
         self.fake_session = FakeAsyncSession()
+        self.sessions = {}
         self.records = []
         self.searches = []
         self.created = []
+        self.next_session = 0
 
     async def create_session(self, tenant_id, agent_id, *, alias=None):
         self.created.append((tenant_id, agent_id, alias))
-        return AsyncSessionRecord(session_id="ses_created", agent_id=agent_id)
+        self.next_session += 1
+        session_id = "ses_created" if self.next_session == 1 else f"ses_created_{self.next_session}"
+        self.sessions.setdefault(session_id, FakeAsyncSession())
+        self.fake_session = self.sessions[session_id]
+        return AsyncSessionRecord(session_id=session_id, agent_id=agent_id)
 
     def session(self, tenant_id, session_id, *, agent_id=None):
         self.session_args = (tenant_id, session_id, agent_id)
+        self.fake_session = self.sessions.setdefault(session_id, FakeAsyncSession())
         return self.fake_session
 
     async def write_record(self, tenant_id, **body):
@@ -194,8 +201,51 @@ def test_async_saver_creates_thread_session_and_maps_checkpoint():
         assert client.records[0][1]["namespace"] == ["langgraph", "threads"]
         payload, kind, idem = client.fake_session.appends[0]
         assert kind == "langgraph_checkpoint"
-        assert idem == "langgraph-checkpoint:thread-a:ckpt-1"
+        assert idem == "langgraph-checkpoint:thread-a::ckpt-1"
         assert payload["metadata"] == {"step": 1}
+
+    asyncio.run(run())
+
+
+def test_async_saver_isolates_multiple_threads():
+    async def run():
+        client = FakeAsyncClient()
+        saver = AgentDBAsyncSaver(client, tenant_id="ten_1", agent_id="agt_1")
+
+        await saver.aput(
+            {"configurable": {"thread_id": "thread-a"}},
+            {"id": "ckpt-a", "channel_values": {"x": "thread-a"}},
+            {},
+        )
+        await saver.aput(
+            {"configurable": {"thread_id": "thread-b"}},
+            {"id": "ckpt-b", "channel_values": {"x": "thread-b"}},
+            {},
+        )
+
+        row_a = await saver.aget_tuple({"configurable": {"thread_id": "thread-a"}})
+        row_b = await saver.aget_tuple({"configurable": {"thread_id": "thread-b"}})
+
+        assert row_a is not None
+        assert row_b is not None
+        assert row_a.checkpoint["channel_values"] == {"x": "thread-a"}
+        assert row_b.checkpoint["channel_values"] == {"x": "thread-b"}
+
+    asyncio.run(run())
+
+
+def test_async_saver_aget_returns_checkpoint_only():
+    async def run():
+        client = FakeAsyncClient()
+        saver = AgentDBAsyncSaver(client, tenant_id="ten_1", agent_id="agt_1")
+
+        config = await saver.aput(
+            {"configurable": {"thread_id": "thread-a"}},
+            {"id": "ckpt-1", "channel_values": {"x": 1}},
+            {},
+        )
+
+        assert await saver.aget(config) == {"id": "ckpt-1", "channel_values": {"x": 1}}
 
     asyncio.run(run())
 

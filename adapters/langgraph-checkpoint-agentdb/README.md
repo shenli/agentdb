@@ -15,8 +15,8 @@ that should be treated as an AgentDB runtime gap.
 
 ## LangSmith / Deep Agents deployment
 
-LangSmith Agent Server can load custom checkpointer and store backends from
-`langgraph.json`. This package exposes async factories for that path:
+LangSmith Agent Server can load a custom checkpointer from `langgraph.json`.
+This package exposes an async factory for that path:
 
 ```json
 {
@@ -30,13 +30,13 @@ LangSmith Agent Server can load custom checkpointer and store backends from
   },
   "env": ".env",
   "checkpointer": {
-    "path": "langgraph_checkpoint_agentdb.langsmith:generate_checkpointer"
-  },
-  "store": {
-    "path": "langgraph_checkpoint_agentdb.langsmith:generate_store"
+    "path": "langgraph_checkpoint_agentdb.langsmith.generate_checkpointer"
   }
 }
 ```
+
+`langgraph-api` 0.8.5 expects dotted import paths for package checkpointers.
+Use `./path/to/file.py:factory` only for file-based factories.
 
 Required environment:
 
@@ -63,7 +63,7 @@ that preserve the cursor explicitly.
 Before deploying, validate the checkpointer against LangGraph's conformance
 suite when `langgraph-checkpoint-conformance` is available. The async surface
 implements the required Agent Server methods: `aput`, `aput_writes`,
-`aget_tuple`, `alist`, and `adelete_thread`.
+`aget`, `aget_tuple`, `alist`, and `adelete_thread`.
 
 Deep Agents Deploy itself also has convention-based `AGENTS.md`, `skills/`,
 `user/`, `subagents/`, `mcp.json`, sandbox, auth, and frontend behavior. AgentDB
