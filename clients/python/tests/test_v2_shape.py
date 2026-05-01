@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agentdb import AgentDB, Client
+from agentdb import AgentDB, Client, Event
 
 
 def response(status=200, body=None):
@@ -134,3 +134,29 @@ def test_idempotency_key_is_generated_for_mutations():
 def test_session_append_requires_agent_id():
     with pytest.raises(ValueError):
         Client("http://x").session("ten_1", "ses_1").append({"x": 1})
+
+
+def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
+    event = Event.from_dict(
+        {
+            "tenant_id": "ten_1",
+            "agent_id": "agt_1",
+            "session_id": "ses_1",
+            "event_id": "evt_1",
+            "seq": 7,
+            "kind": "tool_result",
+            "payload": {"tool_call_id": "call_1"},
+            "schema_version": 1,
+            "artifact_refs": [{"artifact_id": "art_1", "bytes": 4}],
+            "source_refs": [{"event_id": "evt_call"}],
+            "metadata_key_id": "tenant:ten_1:default",
+            "metadata_key_version": "v3",
+            "created_at_ms": 123,
+        }
+    )
+
+    assert event.artifact_refs == [{"artifact_id": "art_1", "bytes": 4}]
+    assert event.source_refs == [{"event_id": "evt_call"}]
+    assert event.metadata_key_id == "tenant:ten_1:default"
+    assert event.metadata_key_version == "v3"
+    assert event.created_at_ms == 123

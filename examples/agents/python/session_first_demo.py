@@ -161,13 +161,14 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         resumed_events.append(event)
         break
 
-    warnings = validate_adapter_events(observed)
+    validated_events = recovered.replay(from_seq=0, limit=100)
+    warnings = validate_adapter_events(validated_events)
     return {
         "workspace_id": workspace.id,
         "agent_id": agent.id,
         "session_id": session.id,
         "artifact_id": log_artifact_ref["artifact_id"],
-        "event_kinds": [event["kind"] for event in observed],
+        "event_kinds": [event.kind for event in validated_events],
         "replayed_kinds": replayed_kinds,
         "last_seq_before_recovery": last_seq_before_recovery,
         "recovered_seq": recovered_event["seq"],
