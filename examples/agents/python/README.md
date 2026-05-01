@@ -1,10 +1,9 @@
-# Quickstart agent (Python)
+# Python agent examples
 
-A 60-line agent loop that uses AgentDB for working memory. Three
-turns of "thought / action / observation" plus a session fork
-that branches into an alternate timeline.
+Small agent loops that use AgentDB for working memory, coordination,
+and durable runtime state.
 
-## Run it
+## Quickstart
 
 ```bash
 # 1. Start the server (one terminal)
@@ -15,9 +14,21 @@ pip install -e clients/python
 python examples/agents/python/quickstart.py
 ```
 
-You should see three turns of output, each showing the rolling
-working memory grow by one event, then a fork that inherits the
-parent's events at fork time.
+You should see three turns of output, each showing the rolling working memory
+grow by one event, then a fork that inherits the parent's events at fork time.
+
+## Session-first runtime demo
+
+```bash
+cargo run -p agentdb-server -- serve --dev
+pip install -e clients/python
+python examples/agents/python/session_first_demo.py
+```
+
+This demo treats AgentDB as the runtime database for an agent harness. It
+records user input, tool calls, tool results, artifact refs, context provenance,
+model output, a simulated harness restart, replay, and resume-from-`seq` in one
+ordered session timeline.
 
 ## What it shows
 
@@ -27,6 +38,13 @@ parent's events at fork time.
 - **`session.fork(child_id)`** — branch a session into an
   alternate timeline. The child sees a frozen snapshot of the
   parent's events at fork time, MVCC-backed.
+- **`session.context(...)` + `context_pack_built`** — persist the
+  context that shaped a model response and link it back with
+  `source_refs`.
+- **`put_artifact(...)` + `artifact_refs`** — keep large tool outputs
+  out of inline event payloads while preserving provenance.
+- **`replay(from_seq=...)` / `subscribe(from_seq=...)`** — recover an
+  agent harness after restart and resume without gaps.
 
 ## Customize
 
