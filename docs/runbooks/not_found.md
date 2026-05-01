@@ -25,7 +25,7 @@ Behavior depends on which `resource` is missing.
 
 **`session` or `tenant`:**
 
-1. Decide whether the id should already exist. V2 sessions are created under
+1. Decide whether the id should already exist. Sessions are created under
    an agent before events are appended. A 404 here usually means the client is
    reading before session creation, using the wrong tenant, or using a session
    that used to exist.

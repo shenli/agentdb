@@ -1,4 +1,4 @@
-# V2 Adapter Readiness Checklist
+# Adapter Readiness Checklist
 
 Status: draft
 

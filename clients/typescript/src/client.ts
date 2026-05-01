@@ -531,7 +531,7 @@ export class Client {
   }
 
   async *subscribe(_opts: ClientSubscribeOptions = {}): AsyncIterable<Event> {
-    throw new Error("tenant-wide streaming requires watch(tenantId, ...) in V2");
+    throw new Error("tenant-wide streaming requires watch(tenantId, ...)");
   }
 
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {

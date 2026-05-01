@@ -1,4 +1,4 @@
-# V2 Session Event Conventions
+# Session Event Conventions
 
 Status: draft
 
@@ -29,7 +29,7 @@ custom `kind` values and adapter-specific payload fields.
 
 ## 2. Envelope Rules
 
-All conventions use the existing V2 event envelope:
+All conventions use the existing event envelope:
 
 ```json
 {

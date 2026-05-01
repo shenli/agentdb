@@ -13,7 +13,7 @@ SESSION_CLEARED = "openai_agents_session_cleared"
 
 
 class AgentDBSession:
-    """Custom Agents SDK session implementation over an AgentDB V2 session."""
+    """Custom Agents SDK session implementation over an AgentDB session."""
 
     def __init__(
         self,

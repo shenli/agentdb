@@ -1,6 +1,6 @@
 # AgentDB Design
 
-AgentDB V2 is a runtime database for AI agent platforms. It is designed around
+AgentDB is a runtime database for AI agent platforms. It is designed around
 agent-native objects rather than a document-store compatibility facade.
 
 ## Product Thesis
@@ -41,16 +41,24 @@ skills to pass to a model, but AgentDB preserves the underlying execution truth.
 
 ## Active Interfaces
 
-The supported public interface is the native V2 HTTP API mounted under
-`/api/...`, plus the Python and TypeScript SDKs. Route paths are tenant-scoped
-and use typed opaque IDs.
+The supported public interface is the native HTTP API mounted under `/api/...`,
+plus the Python and TypeScript SDKs. Route paths are tenant-scoped and use typed
+opaque IDs.
 
-The V2 prototype intentionally does not maintain:
+The current prototype intentionally does not maintain:
 
 - a MongoDB wire-protocol facade
 - a Go SDK
-- tenantless V1 session routes
-- a `--v2` server flag
+- tenantless session routes from earlier prototypes
+- a version-gating server flag
+
+HTTP is the right public API for the current product shape: agent frameworks,
+SDKs, dashboards, and local operators can use it without custom database
+drivers, it handles JSON/event payloads naturally, and SSE gives a simple
+subscription path. AgentDB should not pretend HTTP is a universal database wire
+protocol. If the data plane needs lower overhead later, the right evolution is
+to keep HTTP as the public/operational surface and add a binary SDK transport
+or gRPC-style internal node protocol for hot paths.
 
 ## Identity
 
@@ -126,7 +134,7 @@ and blob bytes can be placed, retained, and purged independently.
 
 ## SDKs And Adapters
 
-Python and TypeScript are the maintained SDKs for V2. The next validation step
-is framework adapters, starting with LangGraph, to prove the native primitives
-cover real agent framework persistence needs without recreating ordering,
-forking, idempotency, artifact, search, and replay behavior in adapter code.
+Python and TypeScript are the maintained SDKs. Framework adapters prove that the
+native primitives cover real agent framework persistence needs without
+recreating ordering, forking, idempotency, artifact, search, and replay behavior
+in adapter code.

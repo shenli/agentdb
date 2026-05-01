@@ -1,6 +1,6 @@
 # AgentDB Adapters
 
-Framework adapter proof points for the V2 runtime API.
+Framework adapter proof points for the runtime API.
 
 | Adapter | Purpose |
 |---|---|

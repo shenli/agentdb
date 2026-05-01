@@ -25,14 +25,13 @@ user turns) in **sessions**, plus artifacts, searchable records,
 skills, fork lineage, replay streams, and context packs. One
 runtime surface, one agent memory model.
 
-You talk to it through the native V2 HTTP API:
+You talk to it through the native HTTP API:
 
 - **HTTP** at `http://<host>:7878` or the configured bind port.
   Every official SDK uses this API for writes, reads, replay,
   search, artifacts, and context.
 
-The legacy Mongo wire facade is not part of the current V2
-workspace.
+The legacy Mongo wire facade is not part of the current workspace.
 
 ---
 
@@ -150,7 +149,7 @@ GET /health/ready
 
 ## 4. SDK shortcuts (Python, TypeScript)
 
-Every SDK wraps the V2 HTTP surface in the same shape. Pick one:
+Every SDK wraps the HTTP surface in the same shape. Pick one:
 
 **Python** (`pip install agentdb`, or `pip install 'agentdb[async]'`):
 
@@ -190,9 +189,8 @@ const child = await session.fork("ticket-42-branch-a");
   call.
 - **Mixing tenant in the path AND in auth.** When auth is on,
   the `Authorization` header IS the tenant identity. The path
-  variant `/api/sessions/{sid}/append-and-fetch` is the
-  v2-clean shape. The legacy `/api/tenants/{tid}/...` still
-  works but the auth middleware enforces match.
+  path and the tenant identity in auth must agree. Prefer SDK
+  handles so this is managed for you.
 - **Throwing away canonical IDs.** Aliases are for humans and
   apps. Persist the canonical `workspace.id`, `agent.id`, and
   `session.id` when you need exact recovery after restart.

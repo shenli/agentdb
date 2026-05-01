@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-agentdb"
 version = "0.1.0"
-description = "MCP stdio server exposing AgentDB V2 sessions, artifacts, records, and replay"
+description = "MCP stdio server exposing AgentDB sessions, artifacts, records, and replay"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

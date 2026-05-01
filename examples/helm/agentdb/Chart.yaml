@@ -1,7 +1,7 @@
 apiVersion: v2
 name: agentdb
 description: |
-  AgentDB — an agent-native runtime database. V2 HTTP API,
+  AgentDB — an agent-native runtime database. Native HTTP API,
   event log, artifacts, records, and context packs. This chart is
   a skeleton for evaluation, not a production-hardened
   deployment. See docs/ARCHITECTURE.md for the full design.

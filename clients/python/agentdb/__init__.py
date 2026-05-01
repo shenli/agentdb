@@ -1,10 +1,10 @@
-"""Python client for AgentDB V2.
+"""Python client for AgentDB.
 
 Typical usage:
 
     from agentdb import AgentDB
 
-    db = AgentDB("http://127.0.0.1:8080")
+    db = AgentDB("http://127.0.0.1:7878")
     workspace = db.workspace("acme")
     agent = workspace.agent("support-agent")
     session = agent.session("ticket-42")
@@ -23,7 +23,7 @@ SDKs, etc.) install the optional `[async]` extra and use
     from agentdb import AsyncClient
 
     async def main():
-        async with AsyncClient("http://127.0.0.1:8080") as client:
+        async with AsyncClient("http://127.0.0.1:7878") as client:
             tenant = await client.create_tenant("acme-async")
             agent = await client.create_agent(tenant["tenant_id"])
             session = await client.create_session(tenant["tenant_id"], agent["agent_id"])

@@ -2,19 +2,18 @@
 
 AgentDB is an agent-native runtime database. It stores tenant-scoped agents,
 sessions, ordered events, artifacts, searchable records, skills, policy state,
-fork lineage, replay streams, and context packs behind one native V2 HTTP API.
+fork lineage, replay streams, and context packs behind one native HTTP API.
 
 ## Current Status
 
-This repository is on the V2 prototype line. The legacy Mongo wire facade and
-Go SDK are no longer part of the workspace. The supported surfaces are:
+This repository is a pre-release prototype. The legacy Mongo wire facade and Go
+SDK are no longer part of the workspace. The supported surfaces are:
 
 - Rust runtime/API crates in `crates/agentdb-core` and `crates/agentdb-api`
 - Python SDK in `clients/python`
 - TypeScript SDK in `clients/typescript`
 - Framework adapters and templates in `adapters/`
 - Session dashboard mounted at `/dashboard`
-- V2 design notes in `docs/v2_design`
 
 ## Run Locally
 
@@ -42,7 +41,7 @@ The readiness probe is:
 curl -i http://127.0.0.1:7878/health/ready
 ```
 
-The V2 session dashboard is available at:
+The session dashboard is available at:
 
 ```text
 http://127.0.0.1:7878/dashboard/
@@ -53,7 +52,7 @@ For install, Docker, backup, and maintenance notes, see
 
 ## API Shape
 
-Core V2 routes are tenant-scoped:
+Core routes are tenant-scoped:
 
 ```text
 POST /api/tenants
@@ -128,9 +127,9 @@ console.log(result.seq, result.recent.map((event) => event.payload));
 ## Workspace Layout
 
 ```text
-bin/agentdb-server           V2 server binary
+bin/agentdb-server           server binary
 crates/agentdb-core          runtime model and tenant/session/event semantics
-crates/agentdb-api           native V2 HTTP routes
+crates/agentdb-api           native HTTP routes
 crates/agentdb-storage       RocksDB/SlateDB KV and artifact content backends
 crates/agentdb-index         text/vector indexing helpers
 crates/agentdb-meta          control-plane metadata and routing planner
@@ -144,7 +143,6 @@ adapters/vercel-ai-sdk-agentdb-template
                               Vercel AI SDK persistence template
 clients/python               Python SDK
 clients/typescript           TypeScript SDK
-docs/v2_design               V2 design and implementation plan
 ```
 
 ## Validation
@@ -166,9 +164,10 @@ PYTHONPATH=clients/python:adapters/mcp-agentdb python3 -m pytest -q adapters/mcp
 
 ## Reading Order
 
-- `docs/v2_design/README.md`
 - `docs/SINGLE_NODE.md`
-- `docs/v2_design/agent-runtime-database.md`
-- `docs/v2_design/v2-implementation-plan.md`
 - `docs/ARCHITECTURE.md`
 - `docs/DESIGN.md`
+- `docs/agent-db.md`
+- `docs/session-event-conventions.md`
+- `docs/adapter-readiness-checklist.md`
+- `docs/ROADMAP.md`

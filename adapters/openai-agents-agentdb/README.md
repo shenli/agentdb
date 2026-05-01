@@ -1,6 +1,6 @@
 # openai-agents-agentdb
 
-OpenAI Agents SDK session adapter backed by AgentDB V2 sessions.
+OpenAI Agents SDK session adapter backed by AgentDB sessions.
 
 The current Agents SDK custom session protocol uses async methods:
 
@@ -17,7 +17,7 @@ auditable while the effective session view matches the SDK protocol.
 from agentdb import AsyncClient
 from openai_agents_agentdb import AgentDBSession
 
-client = AsyncClient("http://127.0.0.1:8080")
+client = AsyncClient("http://127.0.0.1:7878")
 session = AgentDBSession(
     client,
     tenant_id="ten_...",

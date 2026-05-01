@@ -1,7 +1,7 @@
 # agentdb (Python)
 
-Python client for AgentDB V2, the runtime database for agent sessions,
-artifacts, records, skills, replay, and context.
+Python client for AgentDB, the runtime database for agent sessions, artifacts,
+records, skills, replay, and context.
 
 ## Install
 
@@ -13,7 +13,7 @@ pip install -e 'clients/python[async]'  # AsyncClient + httpx
 ## Start A Local Server
 
 ```bash
-cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
+cargo run -p agentdb-server -- serve --dev
 ```
 
 ## Sync Quick Start
@@ -21,7 +21,7 @@ cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
 ```python
 from agentdb import AgentDB
 
-db = AgentDB("http://127.0.0.1:8080")
+db = AgentDB("http://127.0.0.1:7878")
 workspace = db.workspace("acme")
 agent = workspace.agent("sales-agent")
 session = agent.session("ticket-42")
@@ -49,7 +49,7 @@ import asyncio
 from agentdb import AsyncClient
 
 async def main():
-    async with AsyncClient("http://127.0.0.1:8080") as client:
+    async with AsyncClient("http://127.0.0.1:7878") as client:
         tenant = await client.create_tenant("acme-async")
         agent = await client.create_agent(tenant["tenant_id"])
         session = await client.create_session(tenant["tenant_id"], agent["agent_id"])
@@ -83,7 +83,7 @@ rebuild a session handle and continue from durable history:
 ```python
 from agentdb import AgentDB
 
-db = AgentDB("http://127.0.0.1:8080")
+db = AgentDB("http://127.0.0.1:7878")
 agent = db.workspace(tenant_id=tenant_id).agent_by_id(agent_id)
 session = agent.session_by_id(session_id)
 
