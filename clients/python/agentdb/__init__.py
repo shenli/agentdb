@@ -53,6 +53,7 @@ from .client import (
     Event,
     WatchItem,
     artifact_ref,
+    event_ref,
 )
 from .conventions import (
     SessionEventKind,
@@ -98,6 +99,7 @@ __all__ = [
     "Event",
     "WatchItem",
     "artifact_ref",
+    "event_ref",
     "SessionEventKind",
     "ADAPTER_READINESS_CHECKS",
     "agent_status",
