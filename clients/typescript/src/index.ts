@@ -3,21 +3,19 @@
  *
  * Basic usage:
  *
- *   import { Client } from "agentdb";
+ *   import { AgentDB } from "agentdb";
  *
- *   const client = new Client({
+ *   const db = new AgentDB({
  *     baseUrl: "http://127.0.0.1:7878",
  *     auth: { user: "alice", password: "hunter2" },
  *   });
- *   const session = client.session("agent-1");
- *   const result = await session.append(
- *     { role: "user", text: "hello" },
- *     { fetchLastN: 5 }
- *   );
+ *   const workspace = await db.workspace("acme");
+ *   const agent = await workspace.agent("support-agent");
+ *   const session = await agent.session("ticket-42");
+ *   const result = await session.appendUser("hello", { fetchLastN: 5 });
  *   console.log(result.seq, result.recent.map(e => e.payload));
  *
- * Tenant is derived from the bearer token / Basic-auth user record
- * server-side — no `tenant` param on the client or per-method calls.
+ * `Client` remains available for low-level tenant-scoped calls.
  *
  * See `examples/agents/typescript/quickstart.ts` for a working
  * agent loop. The `append + fetchLastN` pattern is the canonical
@@ -25,7 +23,20 @@
  * round trip.
  */
 
-export { Client, Session } from "./client.js";
+export {
+  AgentDB,
+  AgentHandle,
+  ArtifactCollection,
+  Client,
+  RecordCollection,
+  Session,
+  SessionHandle,
+  SkillCollection,
+  Workspace,
+  appendResultRef,
+  artifactRef,
+  eventRef,
+} from "./client.js";
 export {
   SessionEventKind,
   ADAPTER_READINESS_CHECKS,
@@ -52,14 +63,19 @@ export type {
   AppendOptions,
   AppendAndFetchOptions,
   AppendResult,
+  ContextPackBuiltOptions,
   ClientOptions,
   ClientSubscribeOptions,
   Event,
+  ModelMessageOptions,
   SessionOptions,
   SubscribeOptions,
+  ToolCallOptions,
+  ToolResultOptions,
   TenantId,
   AgentId,
   SessionId,
+  UserMessageOptions,
   EventId,
   ArtifactId,
   RecordId,

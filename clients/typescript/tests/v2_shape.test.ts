@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { Client } from "../src/index.js";
+import { AgentDB, Client, appendResultRef, artifactRef, eventRef } from "../src/index.js";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -55,6 +55,95 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   assert.ok(calls.some((url) => url.includes("/replay")));
   assert.ok(calls.some((url) => url.includes("/context")));
   assert.ok(calls.some((url) => url.includes("/watch")));
+});
+
+test("friendly SDK binds workspace agent session aliases and canonical ids", async () => {
+  const calls: { url: string; body?: unknown }[] = [];
+  const mockFetch = async (url: string | URL, init?: RequestInit) => {
+    const raw = String(url);
+    calls.push({
+      url: raw,
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    if (raw.endsWith("/api/tenants")) return json({ tenant_id: "ten_1" });
+    if (raw.endsWith("/agents")) return json({ agent_id: "agt_1" });
+    if (raw.endsWith("/sessions")) return json({ session_id: "ses_1", agent_id: "agt_1" });
+    if (raw.endsWith("/append-and-fetch")) return json({ event_id: "evt_fetch", seq: 1, recent: [] });
+    if (raw.endsWith("/events") && init?.method === "GET") return json([]);
+    if (raw.endsWith("/events")) return json({ event_id: "evt_1", seq: 0 });
+    if (raw.includes("/replay")) {
+      return json({
+        events: [
+          {
+            tenant_id: "ten_1",
+            agent_id: "agt_1",
+            session_id: "ses_1",
+            event_id: "evt_1",
+            seq: 0,
+            kind: "tool_result",
+            payload: { tool_call_id: "call_1" },
+            artifact_refs: [{ artifact_id: "art_1" }],
+            source_refs: [{ event_id: "evt_call" }],
+            metadata_key_id: "tenant:ten_1:default",
+            metadata_key_version: "v1",
+          },
+        ],
+      });
+    }
+    if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
+    if (raw.endsWith("/artifacts")) {
+      return json({ artifact_id: "art_1", content_type: "text/plain", bytes: 4, sha256: "abcd" });
+    }
+    if (raw.endsWith("/records/search")) return json({ records: [] });
+    if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
+    if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
+    if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
+    if (raw.includes("/watch")) return json([]);
+    return json({});
+  };
+
+  const db = new AgentDB({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const workspace = await db.workspace("acme");
+  const agent = await workspace.agent("sales-agent");
+  const session = await agent.session("ticket-42");
+
+  const user = await session.appendUser("hello", { fetchLastN: 5 });
+  const call = await session.toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }, {
+    sourceRefs: [eventRef(user)],
+  });
+  const artifact = await session.artifacts.put(new Blob(["blob"]), { contentType: "text/plain" });
+  await session.toolResult("call_1", "Generated report.", {
+    artifacts: [artifact],
+    sourceRefs: [eventRef(call)],
+  });
+  const context = await session.context({ include: ["recent_events"] });
+  const contextEvent = await session.contextPackBuilt("ctx_1", ["recent_events"], {
+    selectedEventCount: Array.isArray(context.events) ? context.events.length : 0,
+  });
+  await session.modelMessage("done", { contextPackId: "ctx_1", sourceRefs: [eventRef(contextEvent)] });
+  await session.agentStatus("recovered", { lastSeenSeq: 4 });
+  const recovered = agent.sessionById(session.id);
+  const replayed = await recovered.replay();
+  await db.sessionById(session.id, { tenantId: workspace.id, agentId: agent.id }).fetch();
+  await workspace.records.write({ namespace: ["mem"], text: "x" });
+  await workspace.records.search({ namespace: ["mem"], text: "x" });
+  const skill = await workspace.skills.register({ name: "tool", version: "1" });
+  await agent.bindSkill(String(skill.skill_id));
+  await workspace.watch({ scope: "agent", agentId: agent.id });
+
+  assert.equal(user.ref().event_id, "evt_fetch");
+  assert.deepEqual(appendResultRef(call), { event_id: "evt_1" });
+  assert.deepEqual(artifactRef(artifact), {
+    artifact_id: "art_1",
+    content_type: "text/plain",
+    bytes: 4,
+    sha256: "abcd",
+  });
+  assert.deepEqual(replayed[0]?.artifactRefs, [{ artifact_id: "art_1" }]);
+  assert.deepEqual(replayed[0]?.sourceRefs, [{ event_id: "evt_call" }]);
+  assert.equal(replayed[0]?.metadataKeyId, "tenant:ten_1:default");
+  assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/agents/agt_1/sessions")));
+  assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
 });
 
 test("append requires an agent id", async () => {
