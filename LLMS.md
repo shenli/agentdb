@@ -170,7 +170,7 @@ GET /health/ready
 
 ---
 
-## 4. SDK shortcuts (Python, TypeScript, Go)
+## 4. SDK shortcuts (Python, TypeScript)
 
 Every SDK wraps the REST surface in the same shape. Pick one:
 
@@ -194,18 +194,6 @@ const session = client.session("agent-1", { tenant: "demo" });
 const result = await session.append({ role: "user", text: "hi" },
                                     { fetchLastN: 5 });
 const child = await session.fork("agent-1-branch-a");
-```
-
-**Go** (`go get github.com/shenli/agentdb/clients/go/agentdb`):
-
-```go
-client := agentdb.New("http://127.0.0.1:7878",
-    agentdb.WithDefaultTenant("demo"))
-sess := client.Session("agent-1")
-res, _ := sess.Append(ctx,
-    map[string]any{"role": "user", "text": "hi"},
-    agentdb.AppendOptions{FetchLastN: 5})
-child, _ := sess.Fork(ctx, "agent-1-branch-a")
 ```
 
 ---
