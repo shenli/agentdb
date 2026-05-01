@@ -1,13 +1,16 @@
 # AgentDB Architecture
 
-This document describes the current prototype. Older Mongo-wire material has
-been removed from the active architecture docs; historical implementation notes
-remain under `docs/superpowers/`.
+This document describes the current implementation shape. The product thesis is
+in [`agent-db.md`](agent-db.md), and the design commitments are in
+[`DESIGN.md`](DESIGN.md).
 
 ## Layers
 
 ```text
-SDKs / HTTP clients
+agentdb.toml / CLI overrides
+        |
+        v
+bin/agentdb-server
         |
         v
 crates/agentdb-api        native tenant-scoped /api/... HTTP routes
@@ -22,10 +25,31 @@ crates/agentdb-core       runtime semantics: tenants, agents, sessions,
         +--> crates/agentdb-meta      control-plane metadata helpers
 ```
 
-`bin/agentdb-server` wires a `Runtime` into the API router. In-memory mode is
-used for smoke tests and local throwaway runs. Persistent local mode stores
-runtime metadata in RocksDB under `<data-dir>/runtime` and artifact content in
-`<data-dir>/content` unless `--content-dir` is provided.
+SDKs and raw HTTP clients talk to `agentdb-api`. The API layer should stay thin:
+decode requests, apply route-level validation, call runtime methods, and encode
+responses.
+
+`agentdb-core` owns durable runtime semantics. Framework adapters and SDKs
+should not need to recreate ordering, idempotency, fork visibility, lifecycle, or
+policy behavior in client code.
+
+## Server Startup
+
+The server is config-file first:
+
+```bash
+agentdb init-config
+agentdb doctor --config agentdb.toml
+agentdb serve --config agentdb.toml
+```
+
+`agentdb.toml` describes the bind address, storage mode, data directory, content
+directory, and development-mode behavior. CLI flags are explicit overrides for
+local runs and tests.
+
+Normal single-node runtime settings are not configured through environment
+variables. Docker, Compose, and Helm should mount a config file and start the
+server with `--config`.
 
 ## Runtime Model
 
@@ -35,13 +59,13 @@ runtime metadata in RocksDB under `<data-dir>/runtime` and artifact content in
 - **Event**: append-only payload with tenant, agent, session, event ID, `seq`,
   kind, artifact refs, source refs, idempotency key, policy version, and time.
 - **Artifact**: metadata in the runtime store plus bytes in the content backend.
-- **Record**: searchable memory/document entry with namespace, scope, tags, and
+- **Record**: searchable memory or observation with namespace, scope, tags, and
   optional source refs.
 - **Skill**: registered tool/package manifest and agent binding.
 - **Policy**: quota, lifecycle, retention, legal hold, and priority settings.
 
 All public IDs are opaque typed strings: `ten_*`, `agt_*`, `ses_*`, `evt_*`,
-`art_*`, `rec_*`, and `skl_*`.
+`art_*`, `rec_*`, `skl_*`, and `pol_*`.
 
 ## HTTP Surface
 
@@ -101,12 +125,31 @@ live push can be layered onto the same watch cursor model.
 
 ## Storage
 
-The runtime persists records through `KvStore`. The local implementation uses
-RocksDB. Artifact content is intentionally separated from metadata through a
-`ContentBackend`; local mode uses a filesystem content backend.
+The runtime persists metadata through `KvStore`. The local implementation uses
+RocksDB. Persistent single-node mode stores runtime metadata under
+`<data-dir>/runtime`.
+
+Artifact content is separated from metadata through a `ContentBackend`. Local
+mode stores content under the configured `content_dir`; if no content directory
+is configured, it uses `<data-dir>/content`.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
+
+## Deployment Shapes
+
+- **In-memory dev/test**: throwaway runtime state for smoke tests and quick
+  local experiments.
+- **Persistent single-node**: RocksDB metadata plus local filesystem artifact
+  content, configured by `agentdb.toml`.
+- **Docker and Compose**: containerized single-node server with a mounted config
+  file and data volume.
+- **Helm**: evaluation-oriented Kubernetes deployment that mounts config through
+  a ConfigMap and uses the same health endpoints as the binary.
+
+Distributed control-plane behavior is not the current user-facing deployment
+target. The priority is making one node easy to start, inspect, back up, upgrade,
+and maintain.
 
 ## Policy And GC
 
@@ -115,8 +158,12 @@ context byte budgets, active-session quotas, lifecycle work units, and GC work
 units. Soft deletes mark runtime objects first; tenant-scoped GC sweeps later
 purge metadata, index entries, and artifact content when policy allows.
 
-## SDKs
+## SDKs And Adapters
 
 The Python and TypeScript SDKs map directly to the native API. They generate
-idempotency keys for mutating calls and expose the typed ID aliases as opaque
+idempotency keys for mutating calls and expose typed ID aliases as opaque
 strings.
+
+Framework adapters should be thin. Their job is to map framework concepts onto
+AgentDB tenants, agents, sessions, events, records, artifacts, and skills while
+leaving runtime semantics on the server.
