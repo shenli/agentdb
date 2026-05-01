@@ -22,19 +22,12 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from typing import Any, Optional
+from typing import Any
 
 from agentdb import (
     AgentDB,
-    SessionEventKind,
-    agent_status,
-    artifact_ref,
-    context_pack_built,
     context_source_refs,
-    model_message,
-    tool_call,
-    tool_result,
-    user_message,
+    event_ref,
     validate_adapter_events,
 )
 
@@ -55,30 +48,18 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
     )
     session = agent.session("support-ticket-42")
 
-    observed: list[dict] = []
-
-    user_event = _append_observed(
-        session,
-        observed,
-        user_message(
-            "Summarize the checkout failure logs and tell me whether retry is safe.",
-            metadata={"ticket_id": "SUP-42"},
-        ),
-        kind=SessionEventKind.USER_MESSAGE.value,
+    user_event = session.append_user(
+        "Summarize the checkout failure logs and tell me whether retry is safe.",
+        metadata={"ticket_id": "SUP-42"},
     )
     tool_call_id = "call_collect_checkout_logs"
-    call_event = _append_observed(
-        session,
-        observed,
-        tool_call(
-            tool_call_id,
-            "sandbox.exec",
-            {"cmd": "python tools/collect_checkout_logs.py --ticket SUP-42"},
-            timeout_ms=30_000,
-            idempotency_key="collect-checkout-logs-SUP-42",
-        ),
-        kind=SessionEventKind.TOOL_CALL.value,
-        source_refs=[{"event_id": user_event["event_id"]}],
+    call_event = session.tool_call(
+        tool_call_id,
+        "sandbox.exec",
+        {"cmd": "python tools/collect_checkout_logs.py --ticket SUP-42"},
+        timeout_ms=30_000,
+        idempotency_key="collect-checkout-logs-SUP-42",
+        source_refs=[event_ref(user_event)],
     )
 
     log_blob = (
@@ -92,68 +73,47 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         content_type="text/plain",
         sha256=hashlib.sha256(log_blob).hexdigest(),
     )
-    log_artifact_ref = artifact_ref(artifact)
-    _append_observed(
-        session,
-        observed,
-        tool_result(
-            tool_call_id,
-            "Collected checkout logs; one retryable gateway timeout was found.",
-            output={
-                "artifact_id": log_artifact_ref["artifact_id"],
-                "preview": "retryable=true",
-            },
-            duration_ms=412,
-        ),
-        kind=SessionEventKind.TOOL_RESULT.value,
-        artifact_refs=[log_artifact_ref],
-        source_refs=[{"event_id": call_event["event_id"]}],
+    session.tool_result(
+        tool_call_id,
+        "Collected checkout logs; one retryable gateway timeout was found.",
+        artifacts=[artifact],
+        output={
+            "artifact_id": artifact["artifact_id"],
+            "preview": "retryable=true",
+        },
+        duration_ms=412,
+        source_refs=[event_ref(call_event)],
     )
 
     context = session.context(include=["recent_events"], max_events=10)
     context_pack_id = "ctx_checkout_recovery_1"
-    context_event = _append_observed(
-        session,
-        observed,
-        context_pack_built(
-            context_pack_id,
-            ["recent_events"],
-            max_events=10,
-            selected_event_count=len(context.get("events", [])),
-        ),
-        kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
+    context_event = session.context_pack_built(
+        context_pack_id,
+        ["recent_events"],
+        max_events=10,
+        selected_event_count=len(context.get("events", [])),
         source_refs=context_source_refs(context, max_refs=50),
     )
-    _append_observed(
-        session,
-        observed,
-        model_message(
-            "The checkout failure was a retryable payment gateway timeout. "
-            "A retry is safe for the single affected order.",
-            model="demo-model",
-            provider="demo",
-            finish_reason="stop",
-            context_pack_id=context_pack_id,
-        ),
-        kind=SessionEventKind.MODEL_MESSAGE.value,
-        source_refs=[{"event_id": context_event["event_id"]}],
+    model_event = session.model_message(
+        "The checkout failure was a retryable payment gateway timeout. "
+        "A retry is safe for the single affected order.",
+        model="demo-model",
+        provider="demo",
+        finish_reason="stop",
+        context_pack_id=context_pack_id,
+        source_refs=[event_ref(context_event)],
     )
 
-    last_seq_before_recovery = observed[-1]["seq"]
+    last_seq_before_recovery = model_event.seq
 
     # Simulate a fresh harness process: only durable IDs and last seq survive.
-    recovered = agent.session(session_id=session.id)
+    recovered = agent.session_by_id(session.id)
     replayed = recovered.replay(from_seq=0, limit=100)
     replayed_kinds = [event.kind for event in replayed]
-    recovered_event = _append_observed(
-        recovered,
-        observed,
-        agent_status(
-            "recovered",
-            summary="Harness restored session from AgentDB replay.",
-            last_seen_seq=last_seq_before_recovery,
-        ),
-        kind=SessionEventKind.AGENT_STATUS.value,
+    recovered_event = recovered.agent_status(
+        "recovered",
+        summary="Harness restored session from AgentDB replay.",
+        last_seen_seq=last_seq_before_recovery,
     )
 
     resumed_events = []
@@ -167,41 +127,14 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         "workspace_id": workspace.id,
         "agent_id": agent.id,
         "session_id": session.id,
-        "artifact_id": log_artifact_ref["artifact_id"],
+        "artifact_id": artifact["artifact_id"],
         "event_kinds": [event.kind for event in validated_events],
         "replayed_kinds": replayed_kinds,
         "last_seq_before_recovery": last_seq_before_recovery,
-        "recovered_seq": recovered_event["seq"],
+        "recovered_seq": recovered_event.seq,
         "resumed_kinds": [event.kind for event in resumed_events],
         "warnings": warnings,
     }
-
-
-def _append_observed(
-    session: Any,
-    observed: list[dict],
-    payload: dict,
-    *,
-    kind: str,
-    artifact_refs: Optional[list[dict]] = None,
-    source_refs: Optional[list[dict]] = None,
-) -> dict:
-    result = session.append(
-        payload,
-        kind=kind,
-        artifact_refs=artifact_refs,
-        source_refs=source_refs,
-    )
-    event = {
-        "event_id": result.event_id,
-        "seq": result.seq,
-        "kind": kind,
-        "payload": payload,
-        "artifact_refs": artifact_refs or [],
-        "source_refs": source_refs or [],
-    }
-    observed.append(event)
-    return event
 
 
 def main() -> None:

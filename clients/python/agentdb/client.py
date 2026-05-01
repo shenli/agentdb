@@ -14,6 +14,7 @@ from ._sse import parse_lines
 from .conventions import (
     SessionEventKind,
     agent_status as agent_status_payload,
+    context_pack_built as context_pack_built_payload,
     model_message as model_message_payload,
     tool_call as tool_call_payload,
     tool_result as tool_result_payload,
@@ -64,6 +65,9 @@ class Event:
             created_at_ms=d.get("created_at_ms", 0),
         )
 
+    def ref(self) -> dict:
+        return {"event_id": self.event_id}
+
 
 @dataclasses.dataclass
 class AppendResult:
@@ -78,6 +82,9 @@ class AppendResult:
             seq=d["seq"],
             recent=[Event.from_dict(e) for e in d.get("recent") or []],
         )
+
+    def ref(self) -> dict:
+        return {"event_id": self.event_id}
 
 
 @dataclasses.dataclass
@@ -153,6 +160,15 @@ class AgentDB:
     ) -> "SessionHandle":
         return Workspace(self.client, tenant_id).session(session_id, agent_id=agent_id)
 
+    def session_by_id(
+        self,
+        session_id: SessionId,
+        *,
+        tenant_id: TenantId,
+        agent_id: Optional[AgentId] = None,
+    ) -> "SessionHandle":
+        return self.session(session_id, tenant_id=tenant_id, agent_id=agent_id)
+
 
 class Workspace:
     def __init__(
@@ -182,10 +198,15 @@ class Workspace:
         agent_id: Optional[AgentId] = None,
         config: Optional[dict] = None,
     ) -> "AgentHandle":
+        """Create an agent by alias, or bind an existing canonical agent id."""
+
         if agent_id is not None:
             return AgentHandle(self, agent_id, alias=alias)
         data = self._client.create_agent(self.tenant_id, alias=alias, config=config)
         return AgentHandle(self, data["agent_id"], alias=alias, data=data)
+
+    def agent_by_id(self, agent_id: AgentId, *, alias: Optional[str] = None) -> "AgentHandle":
+        return self.agent(alias=alias, agent_id=agent_id)
 
     def session(
         self,
@@ -194,6 +215,14 @@ class Workspace:
         agent_id: Optional[AgentId] = None,
     ) -> "SessionHandle":
         return SessionHandle(self, self._client.session(self.tenant_id, session_id, agent_id=agent_id))
+
+    def session_by_id(
+        self,
+        session_id: SessionId,
+        *,
+        agent_id: Optional[AgentId] = None,
+    ) -> "SessionHandle":
+        return self.session(session_id, agent_id=agent_id)
 
     def watch(
         self,
@@ -238,6 +267,8 @@ class AgentHandle:
         *,
         session_id: Optional[SessionId] = None,
     ) -> "SessionHandle":
+        """Create a session by alias, or bind an existing canonical session id."""
+
         if session_id is not None:
             session = self.workspace._client.session(
                 self.workspace.tenant_id,
@@ -251,6 +282,9 @@ class AgentHandle:
             alias=alias,
         )
         return SessionHandle(self.workspace, session, agent=self)
+
+    def session_by_id(self, session_id: SessionId) -> "SessionHandle":
+        return self.session(session_id=session_id)
 
     def bind_skill(self, skill_id: SkillId, *, idempotency_key: Optional[str] = None) -> dict:
         return self.workspace._client.bind_skill(
@@ -374,6 +408,22 @@ class SessionHandle:
             kind=SessionEventKind.AGENT_STATUS.value,
         )
 
+    def context_pack_built(
+        self,
+        context_pack_id: str,
+        include: Sequence[str],
+        *,
+        source_refs: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AppendResult:
+        return self.append(
+            context_pack_built_payload(context_pack_id, include, **kwargs),
+            kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
+            source_refs=source_refs,
+            idempotency_key=idempotency_key,
+        )
+
     def fetch(self, **kwargs: Any) -> List[Event]:
         return self._session.fetch(**kwargs)
 
@@ -461,6 +511,14 @@ def artifact_ref(artifact: dict) -> dict:
         if artifact.get(key) is not None:
             ref[key] = artifact[key]
     return ref
+
+
+def event_ref(event: Any) -> dict:
+    if hasattr(event, "ref"):
+        return event.ref()
+    if isinstance(event, dict):
+        return {"event_id": event["event_id"]}
+    return {"event_id": event.event_id}
 
 
 class Client:

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agentdb import AgentDB, Client, Event
+from agentdb import AgentDB, AppendResult, Client, Event, event_ref
 
 
 def response(status=200, body=None):
@@ -27,6 +27,8 @@ def capture(client):
             return response(body={"agent_id": "agt_1"})
         if url.endswith("/sessions"):
             return response(body={"session_id": "ses_1", "agent_id": "agt_1"})
+        if method == "GET" and url.endswith("/events"):
+            return response(body=[])
         if url.endswith("/events"):
             return response(body={"event_id": "evt_1", "seq": 0})
         if url.endswith("/append-and-fetch"):
@@ -106,8 +108,9 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
         skill = workspace.skills.register(name="tool", version="1")
         agent.bind_skill(skill["skill_id"])
         workspace.watch(scope="agent", agent_id=agent.id)
-        recovered = agent.session(session_id=session.id)
+        recovered = agent.session_by_id(session.id)
         recovered.replay()
+        db.session_by_id(session.id, tenant_id=workspace.id, agent_id=agent.id).fetch()
 
     urls = [url for _, url, _ in calls]
     assert urls[0].endswith("/api/tenants")
@@ -160,3 +163,24 @@ def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
     assert event.metadata_key_id == "tenant:ten_1:default"
     assert event.metadata_key_version == "v3"
     assert event.created_at_ms == 123
+
+
+def test_event_ref_accepts_append_results_events_and_dicts():
+    result = AppendResult("evt_result", 1, [])
+    event = Event.from_dict(
+        {
+            "tenant_id": "ten_1",
+            "agent_id": "agt_1",
+            "session_id": "ses_1",
+            "event_id": "evt_event",
+            "seq": 2,
+            "kind": "message",
+            "payload": {},
+        }
+    )
+
+    assert result.ref() == {"event_id": "evt_result"}
+    assert event.ref() == {"event_id": "evt_event"}
+    assert event_ref(result) == {"event_id": "evt_result"}
+    assert event_ref(event) == {"event_id": "evt_event"}
+    assert event_ref({"event_id": "evt_dict"}) == {"event_id": "evt_dict"}

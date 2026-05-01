@@ -100,9 +100,12 @@ class FakeSession:
         payload: dict,
         *,
         kind: str = "message",
+        fetch_last_n: int = 0,
         artifact_refs: Optional[list[dict]] = None,
         source_refs: Optional[list[dict]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> FakeAppendResult:
+        del fetch_last_n, idempotency_key
         seq = len(self._events)
         event = FakeEvent(
             event_id=f"evt_{seq + 1}",

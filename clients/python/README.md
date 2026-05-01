@@ -35,6 +35,13 @@ and then works with agents, sessions, artifacts, records, and skills from that
 handle. Raw tenant-scoped calls remain available through `Client` for internal
 tests and admin-style tooling.
 
+`workspace("acme")`, `workspace.agent("sales-agent")`, and
+`agent.session("ticket-42")` use application-facing names/aliases. AgentDB still
+assigns canonical opaque IDs (`ten_*`, `agt_*`, `ses_*`) and exposes them on the
+returned handles as `.id`. Use `agent.session_by_id(session_id)` or
+`agent.session(session_id=session_id)` when recovering from a persisted canonical
+session ID.
+
 ## Async Quick Start
 
 ```python
@@ -54,13 +61,14 @@ asyncio.run(main())
 
 ## Core Surface
 
-- `AgentDB.workspace`
-- `Workspace.agent`, `Workspace.session`, `Workspace.watch`
+- `AgentDB.workspace`, `AgentDB.session_by_id`
+- `Workspace.agent`, `Workspace.agent_by_id`, `Workspace.session_by_id`, `Workspace.watch`
 - `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
-- `AgentHandle.session`, `AgentHandle.bind_skill`
-- `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`
+- `AgentHandle.session`, `AgentHandle.session_by_id`, `AgentHandle.bind_skill`
+- `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
 - `SessionHandle.fetch`, `fetch_recent`, `replay`, `fork`, `subscribe`, `context`
 - `SessionHandle.artifacts`, `records`, `skills`
+- `event_ref`, `artifact_ref`
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
@@ -76,8 +84,8 @@ rebuild a session handle and continue from durable history:
 from agentdb import AgentDB
 
 db = AgentDB("http://127.0.0.1:8080")
-agent = db.workspace(tenant_id=tenant_id).agent(agent_id=agent_id)
-session = agent.session(session_id=session_id)
+agent = db.workspace(tenant_id=tenant_id).agent_by_id(agent_id)
+session = agent.session_by_id(session_id)
 
 history = session.replay(from_seq=0, limit=100)
 context = session.context(include=["recent_events", "records", "skills"])
@@ -92,7 +100,7 @@ Concept mapping:
 
 | Durable-session concept | Python SDK |
 |---|---|
-| wake/resume handle | `agent.session(session_id=...)` |
+| wake/resume handle | `agent.session_by_id(...)` |
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
 | append and fetch | `session.append_and_fetch(...)` |
@@ -111,29 +119,16 @@ The runtime accepts arbitrary event kinds. The SDK exports advisory convention
 helpers for common brain/hand/session events:
 
 ```python
-from agentdb import SessionEventKind, tool_call, tool_result, user_message
+from agentdb import event_ref
 
-session.append(
-    user_message("run the report"),
-    kind=SessionEventKind.USER_MESSAGE.value,
+user = session.append_user("run the report")
+call = session.tool_call(
+    "call_1",
+    "sandbox.exec",
+    {"cmd": "python report.py"},
+    source_refs=[event_ref(user)],
 )
-call = session.append(
-    tool_call("call_1", "sandbox.exec", {"cmd": "python report.py"}),
-    kind=SessionEventKind.TOOL_CALL.value,
-)
-session.append(
-    tool_result("call_1", "Generated report."),
-    kind=SessionEventKind.TOOL_RESULT.value,
-    source_refs=[{"event_id": call.event_id}],
-)
-```
-
-For common events, `SessionHandle` also provides shortcuts:
-
-```python
-session.append_user("run the report")
-call = session.tool_call("call_1", "sandbox.exec", {"cmd": "python report.py"})
-session.tool_result("call_1", "Generated report.", source_refs=[{"event_id": call.event_id}])
+session.tool_result("call_1", "Generated report.", source_refs=[event_ref(call)])
 ```
 
 Helpers are intentionally client-side only. They do not prevent custom event
@@ -147,29 +142,24 @@ then link the model output to that event:
 
 ```python
 from agentdb import (
-    SessionEventKind,
-    context_pack_built,
     context_source_refs,
-    model_message,
+    event_ref,
 )
 
 context = session.context(include=["recent_events", "records"], max_events=20)
-context_event = session.append(
-    context_pack_built(
-        "ctx_1",
-        ["recent_events", "records"],
-        max_events=20,
-        selected_event_count=len(context.get("events", [])),
-        selected_record_count=len(context.get("records", [])),
-    ),
-    kind=SessionEventKind.CONTEXT_PACK_BUILT.value,
+context_event = session.context_pack_built(
+    "ctx_1",
+    ["recent_events", "records"],
+    max_events=20,
+    selected_event_count=len(context.get("events", [])),
+    selected_record_count=len(context.get("records", [])),
     source_refs=context_source_refs(context, max_refs=50),
 )
 
 session.model_message(
     "The report is ready.",
     context_pack_id="ctx_1",
-    source_refs=[{"event_id": context_event.event_id}],
+    source_refs=[event_ref(context_event)],
 )
 ```
 
