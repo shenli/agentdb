@@ -138,6 +138,28 @@ metadata, filesystem content storage, explicit config, and operational commands.
 Future distributed storage should preserve the same runtime semantics rather
 than exposing a different product model.
 
+Agent platforms will want far more state to remain cheaply searchable and
+recoverable than memory-first architectures can afford. turbopuffer is a useful
+proof point outside AgentDB's domain: by building search around object storage as
+the durable source of truth with cache/index layers above it, it shows how a
+focused architecture can change product economics rather than merely improve an
+implementation detail.
+
+The lesson for AgentDB is not that AgentDB should become a vector database. It
+is that architecture has to match the workload. Cold and derived state should be
+designed around cheap durable storage, while the product API stays focused on
+runtime semantics.
+
+For AgentDB, this suggests a split:
+
+- The live runtime path needs strict session semantics: ordered append,
+  idempotency, replay, fork, watch, and policy.
+- Large artifacts, cold event history, and derived searchable records should be
+  designed so they can eventually sit on cheap durable storage with a cache and
+  index layer above them.
+- Search should be scoped by the runtime model: tenant, agent, session,
+  namespace, source refs, policy, and lifecycle. Search alone is not enough.
+
 ### Query Patterns Are Concentrated
 
 Agent runtime queries cluster into a small set:
@@ -267,6 +289,113 @@ artifact semantics are duplicated across services.
 
 Appropriate scale: early products, low to moderate event volume, and teams that
 benefit more from familiarity than specialized runtime semantics.
+
+### Why Common Databases Are Not Ideal As The Runtime Layer
+
+Several existing database families look close to AgentDB at first glance. The
+right comparison is not "can this database store JSON events?" Almost all of
+them can. The better question is: **what runtime guarantees does the application
+still have to build above the database?**
+
+AgentDB's claim is that agent-runtime state needs a product-level abstraction:
+tenant, agent, session, event, artifact, record, skill, policy, replay, fork,
+watch, and lifecycle. Existing databases can implement parts of this, but they
+do not expose that abstraction directly.
+
+**Wide-column stores, such as HBase.** HBase is strong when the application can
+design row keys around known access patterns. Rows are stored in row-key order,
+which makes colocated range scans efficient. That is attractive for session
+logs: `(tenant, session, seq)` is a natural row-key shape.
+
+The tradeoff is that row-key design becomes the runtime design. Keeping all
+events for a session adjacent helps replay, but hot sessions or time-ordered
+keys can hotspot a region. Salting or hashing spreads writes, but makes ordered
+session reads and lifecycle scans more complex. HBase gives powerful storage
+building blocks; it does not give native idempotent append-and-fetch, fork-aware
+replay, artifact retention, scoped records, policy, or SDK ergonomics.
+
+HBase is a plausible storage engine component for a large future AgentDB data
+plane. It is not, by itself, the agent runtime product.
+
+**Key-value and serverless NoSQL stores, such as DynamoDB.** DynamoDB is strong
+for keyed access at high operational scale. A session log can be modeled with a
+partition key and sort key, and sort-key range queries can retrieve related
+session events efficiently. For many products, this is a reasonable first
+implementation.
+
+The mismatch shows up when the agent runtime grows beyond a single access
+pattern:
+
+- Partition-key design must balance locality against hot-key risk. A hot
+  session wants locality for replay but distribution for throughput.
+- Item-size limits push large model/tool outputs into separate blob storage,
+  requiring explicit artifact semantics.
+- Secondary indexes are separate data paths with their own capacity and
+  consistency concerns, so records, lifecycle scans, and dashboard queries need
+  careful extra modeling.
+- Transactions exist but are bounded; broad runtime invariants still become
+  application-managed protocols.
+- Streams can notify consumers of table changes, but they are not the same as a
+  session-aware replay, fork, and watch model.
+
+DynamoDB is excellent infrastructure for some keyed runtime data. AgentDB's
+value is making the agent-session semantics the API rather than asking every
+platform to rediscover the same single-table design and operational conventions.
+
+**Document databases, such as MongoDB.** MongoDB is appealing because agent
+events and metadata are semi-structured. It supports flexible documents,
+indexes, transactions, and change streams. For moderate event volume, it can be
+a practical session store.
+
+The core issue is that a document is not the right top-level abstraction for an
+agent runtime. Large event histories force an early modeling decision: one large
+session document, one document per event, or buckets of events. Each option
+creates different failure modes around document size, append contention, index
+growth, and replay cost.
+
+MongoDB change streams are useful for reacting to database changes, but they are
+not a substitute for durable session replay and scoped runtime subscriptions.
+They observe collection changes; AgentDB needs to expose domain events with
+session sequence, fork visibility, idempotency, artifact refs, source refs, and
+policy metadata.
+
+MongoDB can back an implementation, especially early. But exposing a
+MongoDB-shaped product would optimize for document CRUD while the user is
+actually asking for session runtime semantics.
+
+**Columnar analytics stores, such as ClickHouse.** ClickHouse is excellent for
+high-volume analytical ingestion, aggregation, dashboards, and log-style
+queries. Agent platforms may reasonably export AgentDB events into ClickHouse
+for observability, product analytics, cost analysis, or run comparison.
+
+The mismatch is that ClickHouse is optimized for analytical reads over columns,
+not the live agent loop:
+
+- The hot path is append one event, deduplicate retries, fetch recent context,
+  and continue the run.
+- Runtime state needs ordered per-session semantics, fork-aware replay,
+  artifact coordination, and policy decisions.
+- Lifecycle operations are operational semantics, not just analytical filters.
+- Updates and deletes are possible in ClickHouse, but they are not its natural
+  row-level mutation path.
+
+ClickHouse is a strong downstream analytical sink for AgentDB events. It is not
+the right primary runtime database for waking an agent, appending the next event,
+and continuing work.
+
+The pattern is consistent: these systems are valuable, and some may be useful
+inside or beside AgentDB. The product gap is the missing runtime layer. AgentDB
+should make agent-session behavior native instead of requiring every team to
+compose it from generic database primitives.
+
+turbopuffer is a good counterexample to "just use the existing database shape."
+It demonstrates that when a workload becomes important enough, a purpose-built
+architecture can make previously uneconomic product experiences practical. For
+search, the winning abstraction is not "Postgres table with embeddings"; it is a
+search-native system with different storage economics. For agent runtime state,
+the analogous abstraction is not "documents plus streams plus blob storage"; it
+is a runtime-native system with sessions, events, artifacts, records, replay,
+fork, watch, policy, and lifecycle as first-class behavior.
 
 ### Multi-Tool Decomposition
 
@@ -447,6 +576,13 @@ AgentDB needs scoped search over records and runtime state. It should not become
 a full search product. The right line between built-in retrieval and integration
 with dedicated search/vector systems will depend on real workloads.
 
+Making more historical state searchable is valuable for agents, but AgentDB's
+differentiator is not raw search quality. It is the combination of search with
+runtime truth: source events, artifact references, fork points, retention policy,
+tenant scope, and replay. The likely product shape is built-in scoped retrieval
+for common agent context paths, plus clean export or integration with dedicated
+search systems when the search workload becomes a product in its own right.
+
 ### What Is The Right Distributed Shape?
 
 The current priority is excellent single-node operation. Future distributed
@@ -458,4 +594,10 @@ and artifact storage without making self-hosting too complex.
 
 - Anthropic. [How we built our multi-agent research system](https://www.anthropic.com/engineering/managed-agents).
 - Ankur Goyal. [AI observability is a database problem: how Brainstore works](https://x.com/ankrgyl/status/2041206959848735107).
-- PingCAP. [How Manus 1.5 uses TiDB X to let agents ship full-stack apps at scale](https://www.pingcap.com/blog/how-manus-1-5-uses-tidb-x-to-let-agents-ship-full-stack-apps-at-scale/).
+- Apache HBase. [Reference Guide: rowkey design and hotspotting](https://hbase.apache.org/book.html#rowkey.design).
+- AWS. [DynamoDB partition key design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html).
+- AWS. [DynamoDB constraints](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html).
+- MongoDB. [Change streams](https://www.mongodb.com/docs/manual/changestreams/).
+- ClickHouse. [Updating and deleting data](https://clickhouse.com/docs/en/guides/developer/mutations).
+- turbopuffer. [Serverless vector and full-text search built on object storage](https://turbopuffer.com/).
+- AWS Startups. [How turbopuffer is refactoring the economics of search](https://aws.amazon.com/startups/learn/how-turbopuffer-is-refactoring-the-economics-of-search).
