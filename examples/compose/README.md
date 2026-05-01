@@ -47,9 +47,20 @@ docker compose down -v     # wipe volumes (fresh start next up)
 
 ## Configuration
 
-Edit the `environment:` block in `docker-compose.yml` to override
-single-node settings such as `AGENTDB_BIND`, `AGENTDB_DATA_DIR`, and
-`AGENTDB_CONTENT_DIR`.
+The image ships with `/data/agentdb.toml`:
+
+```toml
+[server]
+bind = "0.0.0.0:7878"
+dev = false
+
+[storage]
+data_dir = "/data/runtime"
+content_dir = "/data/content"
+```
+
+To override it, bind-mount your own config file and set the command to
+`serve --config /path/to/agentdb.toml`.
 
 ## Known limitations
 

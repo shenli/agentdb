@@ -31,8 +31,9 @@ Persistent single-node state uses RocksDB metadata and filesystem artifact
 content:
 
 ```bash
-cargo run -p agentdb-server -- serve \
-  --data-dir ./agentdb-data
+cargo run -p agentdb-server -- init-config
+cargo run -p agentdb-server -- doctor
+cargo run -p agentdb-server -- serve --config agentdb.toml
 ```
 
 The readiness probe is:

@@ -30,26 +30,25 @@ different root causes. Check the server log for the full backtrace.
 - Check free disk on the node:
 
   ```
-  df -h $(dirname ${AGENTDB_DATA_DIR:-./data})
+  df -h ./agentdb-data
   ```
 
   A full disk is the single most common cause of RocksDB 500s. The
   DB stops accepting writes with a generic IO error.
 
-- Check fs permissions on `AGENTDB_DATA_DIR`. If this directory got
-  created by a different user (e.g. root during first boot, then
-  the server started as a less-privileged user), reads and
-  compactions start failing.
+- Check fs permissions on the configured `storage.data_dir`. If this directory
+  got created by a different user (e.g. root during first boot, then the server
+  started as a less-privileged user), reads and compactions start failing.
 
 **Artifact content failure (local filesystem):**
 
-- Look for local filesystem errors under
-  `AGENTDB_CONTENT_DIR` (or `<data-dir>/content` when unset).
+- Look for local filesystem errors under configured `storage.content_dir` (or
+  `<data_dir>/content` when unset).
 - Check free disk and permissions for the artifact content directory.
 
 ## Verify
 
-- For KV: `du -sh ${AGENTDB_DATA_DIR:-./data}` and inspect the
+- For KV: `du -sh ./agentdb-data` and inspect the
   RocksDB `LOG` file under the runtime subdirectory. These checks
   tell you whether the DB is growing or stuck. A stuck DB usually
   means a background compaction failed; check the RocksDB error log
@@ -61,7 +60,7 @@ different root causes. Check the server log for the full backtrace.
    move the data/content directories to a larger disk. The server resumes
    accepting writes once disk space comes back.
 2. **Permission mismatch.** Stop the server, fix ownership/permissions on
-   `AGENTDB_DATA_DIR` and `AGENTDB_CONTENT_DIR`, then restart.
+   `storage.data_dir` and `storage.content_dir`, then restart.
 3. **Corruption.** Stop the server and snapshot the data/content directories
    before attempting recovery. Don't try to repair RocksDB in place unless
    you have a backup.

@@ -21,6 +21,7 @@ open http://localhost:7878/dashboard
 
 - **StatefulSet** with one replica (intentional — see
   above), persistent `/data` volume.
+- **ConfigMap** with `/etc/agentdb/agentdb.toml`.
 - **Service** exposing REST (7878) and the dashboard.
 - **Readiness** hits `/health/ready`; **liveness** hits
   `/health/live`. Both already carry structured error
