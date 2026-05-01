@@ -27,13 +27,9 @@ spec:
           ports:
             - name: rest
               containerPort: {{ .Values.service.restPort }}
-            - name: mongo
-              containerPort: {{ .Values.service.mongoPort }}
           env:
             - name: AGENTDB_HTTP_ADDR
               value: "0.0.0.0:{{ .Values.service.restPort }}"
-            - name: AGENTDB_MONGO_ADDR
-              value: "0.0.0.0:{{ .Values.service.mongoPort }}"
             - name: AGENTDB_DATA_DIR
               value: /data
             {{- if .Values.admin.requireAuth }}

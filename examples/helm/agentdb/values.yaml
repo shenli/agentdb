@@ -22,9 +22,8 @@ resources:
     memory: 2Gi
 
 service:
-  # Two ports: REST (+ dashboard + /metrics) and Mongo wire.
+  # REST (+ dashboard + /metrics).
   restPort: 7878
-  mongoPort: 7879
 
 # Persistent storage: 10Gi for the RocksDB KV dir + meta
 # SQLite + index snapshots. Object-store segments are NOT

@@ -16,8 +16,7 @@
 # within ~one tick.
 #
 # What you get:
-#   * One AgentDB node on :7878 (REST + /dashboard + /metrics)
-#     and :7879 (Mongo wire protocol subset).
+#   * One AgentDB node on :7878 (REST + /dashboard + /metrics).
 #   * MinIO on :9000 (S3 API) and :9001 (web console at
 #     http://localhost:9001, user `minio` / password `minio123`).
 #   * SlateDB KV layered on top of MinIO, so every byte of warm /
@@ -106,7 +105,6 @@ services:
       RUST_LOG: info
     ports:
       - "7878:7878"   # REST + /dashboard + /metrics
-      - "7879:7879"   # Mongo wire
     volumes:
       - agentdb-data:/data
     healthcheck:

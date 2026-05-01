@@ -1,7 +1,0 @@
-# Workspace artifacts — tracked on this branch for traceability,
-# but not part of the shipped sample.
-PI_MONO_NOTES.md
-
-node_modules/
-dist/
-.DS_Store

@@ -13,12 +13,10 @@
 set -euo pipefail
 
 PORT=$((10000 + RANDOM % 50000))
-MONGO_PORT=$((PORT + 1))
 BASE="http://127.0.0.1:${PORT}"
 
-echo "==> Booting agentdb-server on ${BASE} (mongo on :${MONGO_PORT})"
+echo "==> Booting agentdb-server on ${BASE}"
 AGENTDB_ADDR="127.0.0.1:${PORT}" \
-AGENTDB_MONGO_ADDR="127.0.0.1:${MONGO_PORT}" \
 cargo run --quiet -p agentdb-server -- serve --dev &
 SERVER_PID=$!
 trap "kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true" EXIT

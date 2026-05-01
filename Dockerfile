@@ -72,8 +72,8 @@ WORKDIR /data
 
 COPY --from=builder --chown=agentdb:agentdb /src/target/release/agentdb /usr/local/bin/agentdb
 
-# REST + Mongo wire. Dashboard shares the REST port.
-EXPOSE 7878 7879
+# REST API. Dashboard shares the REST port.
+EXPOSE 7878
 
 # Point the binary at the data dir we just made writable. These
 # envs are still overridable at runtime.
@@ -81,7 +81,6 @@ ENV AGENTDB_DATA=/data/rocksdb \
     AGENTDB_OBJECTS=/data/objects \
     AGENTDB_META_PATH=/data/meta.sqlite \
     AGENTDB_ADDR=0.0.0.0:7878 \
-    AGENTDB_MONGO_ADDR=0.0.0.0:7879 \
     RUST_LOG=info
 
 # Tini reaps zombies cleanly when docker sends SIGTERM. The binary

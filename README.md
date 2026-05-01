@@ -76,12 +76,12 @@ pip install -e clients/python
 ```
 
 ```python
-from agentdb import Client
+from agentdb import AgentDB
 
-client = Client("http://127.0.0.1:8080")
-tenant = client.create_tenant("acme")
-agent = client.create_agent(tenant["tenant_id"], alias="sales-agent")
-session = client.create_session(tenant["tenant_id"], agent["agent_id"])
+db = AgentDB("http://127.0.0.1:8080")
+workspace = db.workspace("acme")
+agent = workspace.agent("sales-agent")
+session = agent.session("support-ticket-42")
 
 result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print(result.seq, [event.payload for event in result.recent])
@@ -102,15 +102,12 @@ npm run build
 ```
 
 ```ts
-import { Client } from "agentdb";
+import { AgentDB } from "agentdb";
 
-const client = new Client({ baseUrl: "http://127.0.0.1:8080" });
-const tenant = await client.createTenant("acme");
-const agent = await client.createAgent(String(tenant.tenant_id));
-const session = await client.createSession(
-  String(tenant.tenant_id),
-  String(agent.agent_id)
-);
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const workspace = await db.workspace("acme");
+const agent = await workspace.agent("sales-agent");
+const session = await agent.session("support-ticket-42");
 
 const result = await session.append(
   { role: "user", text: "hello" },

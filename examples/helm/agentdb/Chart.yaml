@@ -1,9 +1,9 @@
 apiVersion: v2
 name: agentdb
 description: |
-  AgentDB — an agent-native operational database. Event log
-  + Mongo-wire CRUD + hybrid retrieval. This chart is a
-  skeleton for evaluation, not a production-hardened
+  AgentDB — an agent-native runtime database. V2 HTTP API,
+  event log, artifacts, records, and context packs. This chart is
+  a skeleton for evaluation, not a production-hardened
   deployment. See docs/ARCHITECTURE.md for the full design.
 type: application
 version: 0.1.0
@@ -13,5 +13,4 @@ sources:
 keywords:
   - agentdb
   - event-log
-  - mongodb
   - vector-search

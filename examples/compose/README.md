@@ -67,12 +67,6 @@ open http://localhost:9001   # user minio / password minio123
 pip install -e clients/python
 python examples/agents/python/quickstart.py
 
-# Mongo wire — works with any MongoDB driver
-mongosh "mongodb://localhost:7879" --eval '
-  db.getSiblingDB("t-1").events.insertOne({session_id:"s-1",payload:"hello"});
-  db.getSiblingDB("t-1").events.find({}).limit(5).toArray();
-'
-
 # REST — easy from any HTTP client
 curl -s -XPOST http://localhost:7878/api/tenants/t-1/sessions/s-1/append_and_fetch \
   -H 'Content-Type: application/json' \

@@ -734,15 +734,6 @@ await session.append(
   layer.
 - No schema enforcement. Up to the application to validate patches.
 
-### Reference implementation
-
-- Sample app using this pattern:
-  [`examples/agents/typescript/pi-company/`](../examples/agents/typescript/pi-company/) —
-  see `src/config.ts` (the loader) and `src/tools/update_agent_config.ts`
-  (the CEO tool that appends overrides).
-
----
-
 ## Recommended pattern: plan-as-events
 
 Plans are mutable. A real agent revises its plan as it learns what
@@ -777,12 +768,6 @@ Why event-sourced plans:
     disturbing the main run.
   - **Observability**: tool calls auto-emit observation events into the
     same log. The plan session reads like an executive briefing.
-
-A 150-line reference implementation:
-[`examples/agents/typescript/pi-company/src/plan.ts`](../examples/agents/typescript/pi-company/src/plan.ts).
-The autonomous-CEO loop in
-[`pi-company/src/ceo.ts`](../examples/agents/typescript/pi-company/src/ceo.ts)
-shows the read-reduce-revise loop end to end.
 
 ---
 

@@ -19,23 +19,20 @@ operations**.
 
 ## 1. What AgentDB is
 
-AgentDB is an **agent-native operational database**. It stores
-the events your agent produces (thoughts, tool calls, tool
-outputs, user turns) in **sessions**. The same database also
-serves the **retrieval** an agent needs at the next turn (text
-+ vector search) over those same events. One system, one wire.
+AgentDB is an **agent-native runtime database**. It stores the
+events your agent produces (thoughts, tool calls, tool outputs,
+user turns) in **sessions**, plus artifacts, searchable records,
+skills, fork lineage, replay streams, and context packs. One
+runtime surface, one agent memory model.
 
-You talk to it two ways:
+You talk to it through the native V2 HTTP API:
 
-- **REST** at `http://<host>:7878` — the canonical surface for
-  writes (`append_and_fetch`) and forks. Every official SDK
-  uses this.
-- **MongoDB wire protocol** at `mongodb://<host>:7879` — every
-  Mongo driver works. Use it for retrieval (`$search`,
-  `$vectorSearch`) and ad-hoc reads.
+- **HTTP** at `http://<host>:7878` or the configured bind port.
+  Every official SDK uses this API for writes, reads, replay,
+  search, artifacts, and context.
 
-There is no Postgres tier, no separate vector store, no
-external indexer. Append, retrieve, fork — same database.
+The legacy Mongo wire facade is not part of the current V2
+workspace.
 
 ---
 
@@ -43,120 +40,101 @@ external indexer. Append, retrieve, fork — same database.
 
 | term | one-line definition |
 |---|---|
-| **tenant** | Top-level isolation unit. Auth-bound (Basic Auth → tenant). One tenant per app/customer/etc. |
-| **session** | A linear sequence of events under a tenant. The unit of working memory for an agent. Identified by an external `session_id` you choose. |
-| **event** | One JSON object you appended. Server assigns `seq` (monotonic) and `ts_ms`. Your data lives under `payload`. |
-| **`append_and_fetch`** | The hot-path primitive: write one event, return the last N events of the same session, in one round trip. |
+| **workspace / tenant** | Top-level isolation unit. SDKs expose this as a workspace handle; the server stores it as a tenant. |
+| **agent** | Runtime actor under a workspace. Sessions belong to agents. |
+| **session** | A linear sequence of events. The unit of working memory for an agent. SDKs let you create sessions by stable aliases while the server assigns canonical `ses_*` IDs. |
+| **event** | One typed JSON envelope you appended. Server assigns `event_id`, `seq`, and `created_at_ms`; your data lives under `payload`. |
+| **`append-and-fetch`** | The hot-path primitive: write one event, return the last N events of the same session, in one round trip. |
 | **fork** | Create a child session that inherits the parent's events at fork time, MVCC-backed. Use to branch into "what if" timelines without copying. |
-| **hybrid retrieval** | `$search` (BM25 over `payload.<field>`) + `$vectorSearch` (cosine over `payload.<embedding-field>`) over the same event log. |
-| **tier** | Each session is `Warm` → `Cold` → `Archive` over its lifetime. Reads are tier-transparent: you don't query differently. |
+| **records** | Searchable durable facts linked back to source events or artifacts. |
+| **artifacts** | Larger binary/text objects referenced from events instead of being inlined into payloads. |
+| **context pack** | A recorded bundle of selected context with source references, so prompts are reproducible. |
 
 ---
 
 ## 3. The five operations
 
-> Defaults below assume the dev-mode server: `agentdb serve --dev`,
-> tenant `demo`, session `agent-1`. Swap as needed.
+> Defaults below assume the dev-mode server: `agentdb serve --dev`.
+> Prefer the SDK handles for new agent code.
 
 ### 3.1 Append an event (and read recent context)
 
 The single most-used operation. Every turn writes *something*
 and almost always wants the recent history for context.
 
-**REST**:
+**Python**:
 
+```python
+from agentdb import AgentDB
+
+db = AgentDB("http://127.0.0.1:7878")
+workspace = db.workspace("demo")
+agent = workspace.agent("support-agent")
+session = agent.session("ticket-42")
+
+result = session.append(
+    {"role": "user", "text": "checkout failed"},
+    fetch_last_n=5,
+)
 ```
-POST /api/tenants/{tenant}/sessions/{session}/append_and_fetch
-Content-Type: application/json
 
-{
-  "event":       <any JSON>,
-  "fetch_last_n": 5,
-  "actor_id":     null
-}
-```
+**TypeScript**:
 
-**Response**:
+```ts
+import { AgentDB } from "agentdb";
 
-```json
-{
-  "seq": 7,
-  "recent": [
-    {"seq": 3, "ts_ms": 1714060000000, "payload": {...}, "actor_id": null},
-    {"seq": 4, "ts_ms": 1714060000123, "payload": {...}, "actor_id": null},
-    ...
-  ]
-}
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
+const workspace = await db.workspace("demo");
+const agent = await workspace.agent("support-agent");
+const session = await agent.session("ticket-42");
+
+const result = await session.append(
+  { role: "user", text: "checkout failed" },
+  { fetchLastN: 5 }
+);
 ```
 
 `fetch_last_n: 0` skips the read-back (cheaper if you don't
 need context).
-
-**Auth-bound shorthand** (when `AGENTDB_REQUIRE_AUTH=true`):
-`POST /api/sessions/{session}/append_and_fetch` — tenant comes
-from your `Authorization: Basic <user:password>` header.
 
 ### 3.2 Fork a session
 
 Branch into an alternate timeline. The child sees the parent's
 events at fork time; subsequent writes diverge.
 
-```
-POST /api/sessions/{parent_session}/fork
-Content-Type: application/json
-
-{ "new_session_id": "agent-1-branch-a" }
+```python
+branch = session.fork("ticket-42-branch-a")
+branch.append({"role": "user", "text": "try the refund path"})
 ```
 
-**Response**:
+### 3.3 Search records
 
-```json
-{
-  "new_session_id":      "agent-1-branch-a",
-  "parent_session_id":   "agent-1",
-  "parent_seq_at_fork":  6
-}
+Use records for durable facts you want to retrieve later. Records
+can carry source refs back to the events or artifacts that produced
+them.
+
+```python
+record = workspace.records.write(
+    namespace=["support"],
+    text="Checkout retry is safe after inventory lock timeout.",
+    source_refs=[result.ref()],
+)
+matches = workspace.records.search(
+    namespace=["support"],
+    text="checkout retry safe",
+    limit=5,
+)
 ```
 
-After the fork, write to the child via `append_and_fetch` with
-`session_id = "agent-1-branch-a"`. The fork is metadata-only;
-no events are copied.
+### 3.4 Build context
 
-### 3.3 Text search over past events (BM25)
+Context packs record what an agent selected for a prompt. That
+makes future replay/debugging possible because the prompt context
+has provenance.
 
-Use the Mongo wire. Path is `payload.<field>` because everything
-you appended lands under `payload`.
-
-```js
-db.events.aggregate([
-  { $search: {
-      text: { query: "refund", path: "payload.text" },
-      limit: 10
-  }}
-])
+```python
+pack = session.context(max_events=20, include=["recent_events", "records"])
 ```
-
-Returns a cursor of event documents whose `payload.text` field
-matches the query. Order is BM25 score, descending.
-
-### 3.4 Vector search over past events
-
-Same wire, same collection. Embed the query yourself; AgentDB
-doesn't run a model.
-
-```js
-db.events.aggregate([
-  { $vectorSearch: {
-      queryVector:   [0.13, -0.42, ..., 0.07],   // 16+ dims
-      path:          "payload.embedding",
-      limit:          5,
-      numCandidates: 50
-  }}
-])
-```
-
-Returns a cursor of event documents ranked by cosine similarity
-to `queryVector`.
 
 ### 3.5 Health probe
 
@@ -170,51 +148,39 @@ GET /health/ready
 
 ---
 
-## 4. SDK shortcuts (Python, TypeScript, Go)
+## 4. SDK shortcuts (Python, TypeScript)
 
-Every SDK wraps the REST surface in the same shape. Pick one:
+Every SDK wraps the V2 HTTP surface in the same shape. Pick one:
 
 **Python** (`pip install agentdb`, or `pip install 'agentdb[async]'`):
 
 ```python
-from agentdb import Client
-client = Client("http://127.0.0.1:7878")
-session = client.session("agent-1", tenant="demo")
+from agentdb import AgentDB
+
+db = AgentDB("http://127.0.0.1:7878")
+session = db.workspace("demo").agent("agent-1").session("ticket-42")
 result = session.append({"role": "user", "text": "hi"}, fetch_last_n=5)
-child = session.fork("agent-1-branch-a")
+child = session.fork("ticket-42-branch-a")
 ```
 
 **TypeScript** (`npm install agentdb` once published; for now
 build from `clients/typescript/`):
 
 ```ts
-import { Client } from "agentdb";
-const client = new Client("http://127.0.0.1:7878");
-const session = client.session("agent-1", { tenant: "demo" });
+import { AgentDB } from "agentdb";
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
+const workspace = await db.workspace("demo");
+const agent = await workspace.agent("agent-1");
+const session = await agent.session("ticket-42");
 const result = await session.append({ role: "user", text: "hi" },
                                     { fetchLastN: 5 });
-const child = await session.fork("agent-1-branch-a");
-```
-
-**Go** (`go get github.com/shenli/agentdb/clients/go/agentdb`):
-
-```go
-client := agentdb.New("http://127.0.0.1:7878",
-    agentdb.WithDefaultTenant("demo"))
-sess := client.Session("agent-1")
-res, _ := sess.Append(ctx,
-    map[string]any{"role": "user", "text": "hi"},
-    agentdb.AppendOptions{FetchLastN: 5})
-child, _ := sess.Fork(ctx, "agent-1-branch-a")
+const child = await session.fork("ticket-42-branch-a");
 ```
 
 ---
 
 ## 5. Common mistakes
 
-- **Searching the wrong path.** Your data is at
-  `payload.<field>`, not `<field>`. `$search.text.path` should
-  be `"payload.text"`, not `"text"`.
 - **Forgetting `fetch_last_n` on the very first append.** A
   fresh session returns one event in `recent` (the one you just
   wrote). That's correct — it's not a bug.
@@ -224,12 +190,12 @@ child, _ := sess.Fork(ctx, "agent-1-branch-a")
   call.
 - **Mixing tenant in the path AND in auth.** When auth is on,
   the `Authorization` header IS the tenant identity. The path
-  variant `/api/sessions/{sid}/append_and_fetch` is the
+  variant `/api/sessions/{sid}/append-and-fetch` is the
   v2-clean shape. The legacy `/api/tenants/{tid}/...` still
   works but the auth middleware enforces match.
-- **Treating Mongo wire reads as a separate database.** It's
-  the same data — events you wrote via REST are immediately
-  searchable via `$search` / `$vectorSearch`. No syncing step.
+- **Throwing away canonical IDs.** Aliases are for humans and
+  apps. Persist the canonical `workspace.id`, `agent.id`, and
+  `session.id` when you need exact recovery after restart.
 
 ---
 

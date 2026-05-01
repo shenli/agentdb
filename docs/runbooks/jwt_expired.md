@@ -53,9 +53,8 @@ with the `jwt_invalid` HTTP 401 path instead.
 ## Remediate
 
 1. **From an SDK with token refresh configured.** No operator
-   action. The Python / TypeScript / Go SDKs auto-reconnect when
-   constructed with `get_token` / `getToken` /
-   `WithTokenProvider`: on the close frame they call the
+   action. The Python and TypeScript SDKs auto-reconnect when
+   constructed with `get_token` / `getToken`: on the close frame they call the
    provider for a fresh token and reconnect with
    `from_seq = last_seq + 1` (or per-session map for the
    tenant-wide endpoint). Consumers see no gap.

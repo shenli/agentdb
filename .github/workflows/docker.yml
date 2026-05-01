@@ -4,7 +4,7 @@
 #
 #   * Push to main → `:edge` and `:edge-<short-sha>` tags. Lets
 #     someone run the latest committed code without waiting for
-#     a release: `docker run -p 7878:7878 -p 7879:7879 \
+#     a release: `docker run -p 7878:7878 \
 #                  ghcr.io/<org>/agentdb:edge serve --dev`.
 #
 #   * Tag push (`v*.*.*`) → `:vX.Y.Z` and `:latest`. The

@@ -4,7 +4,6 @@
 set -euo pipefail
 
 PORT_HTTP=${PORT_HTTP:-7878}
-PORT_MONGO=${PORT_MONGO:-7879}
 DATA_DIR=$(mktemp -d -t agentdb-perf-XXXXXX)
 OBJ_DIR=$(mktemp -d -t agentdb-perf-obj-XXXXXX)
 OUT_DIR="perf-out"
@@ -22,7 +21,6 @@ trap cleanup EXIT
 AGENTDB_DATA="$DATA_DIR" \
 AGENTDB_OBJECTS="$OBJ_DIR" \
 AGENTDB_ADDR="127.0.0.1:$PORT_HTTP" \
-AGENTDB_MONGO_ADDR="127.0.0.1:$PORT_MONGO" \
 AGENTDB_T_COLD_SECS="${AGENTDB_T_COLD_SECS:-60}" \
 AGENTDB_TICK_SECS="${AGENTDB_TICK_SECS:-2}" \
 ./target/release/agentdb-server > "$OUT_DIR/suite.server.log" 2>&1 &
