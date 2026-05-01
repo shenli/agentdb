@@ -11,9 +11,6 @@ spec:
     - name: rest
       port: {{ .Values.service.restPort }}
       targetPort: rest
-    - name: mongo
-      port: {{ .Values.service.mongoPort }}
-      targetPort: mongo
   selector:
     app.kubernetes.io/name: agentdb
     app.kubernetes.io/instance: {{ .Release.Name }}

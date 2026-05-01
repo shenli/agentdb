@@ -59,6 +59,3 @@ AGENTDB_TENANT=t-myapp python quickstart.py
 ## Next steps
 
 - The full SDK reference lives at [`clients/python/README.md`](../../../clients/python/README.md).
-- Wire-protocol clients (any MongoDB driver) work too — the
-  AgentDB Mongo wire port is `:7879` by default. See the main
-  [`README.md`](../../../README.md) for examples.

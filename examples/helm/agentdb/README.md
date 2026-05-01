@@ -12,17 +12,16 @@ that the one-replica single-statefulset shape sidesteps).
 helm install my-agentdb ./examples/helm/agentdb
 
 # Port-forward to check
-kubectl port-forward svc/my-agentdb-agentdb 7878:7878 7879:7879
+kubectl port-forward svc/my-agentdb-agentdb 7878:7878
 curl http://localhost:7878/health/ready
 open http://localhost:7878/dashboard
-mongosh "mongodb://127.0.0.1:7879/?directConnection=true"
 ```
 
 ## What the chart ships
 
 - **StatefulSet** with one replica (intentional — see
   above), persistent `/data` volume.
-- **Service** exposing REST (7878) and Mongo wire (7879).
+- **Service** exposing REST (7878), the dashboard, and metrics.
 - **Readiness** hits `/health/ready`; **liveness** hits
   `/health/live`. Both already carry structured error
   bodies with doc URLs.
