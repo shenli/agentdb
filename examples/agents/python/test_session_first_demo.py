@@ -21,6 +21,8 @@ class FakeEvent:
     seq: int
     kind: str
     payload: Any
+    artifact_refs: list[dict]
+    source_refs: list[dict]
 
 
 class FakeClient:
@@ -101,13 +103,14 @@ class FakeSession:
         artifact_refs: Optional[list[dict]] = None,
         source_refs: Optional[list[dict]] = None,
     ) -> FakeAppendResult:
-        del artifact_refs, source_refs
         seq = len(self._events)
         event = FakeEvent(
             event_id=f"evt_{seq + 1}",
             seq=seq,
             kind=kind,
             payload=payload,
+            artifact_refs=artifact_refs or [],
+            source_refs=source_refs or [],
         )
         self._events.append(event)
         return FakeAppendResult(event_id=event.event_id, seq=event.seq, recent=[])

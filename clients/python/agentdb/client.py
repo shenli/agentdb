@@ -39,6 +39,11 @@ class Event:
     seq: int
     kind: str
     payload: Any
+    schema_version: int = 1
+    artifact_refs: List[dict] = dataclasses.field(default_factory=list)
+    source_refs: List[dict] = dataclasses.field(default_factory=list)
+    metadata_key_id: Optional[str] = None
+    metadata_key_version: Optional[str] = None
     created_at_ms: int = 0
 
     @classmethod
@@ -51,6 +56,11 @@ class Event:
             seq=d["seq"],
             kind=d["kind"],
             payload=d.get("payload"),
+            schema_version=d.get("schema_version", 1),
+            artifact_refs=list(d.get("artifact_refs") or []),
+            source_refs=list(d.get("source_refs") or []),
+            metadata_key_id=d.get("metadata_key_id"),
+            metadata_key_version=d.get("metadata_key_version"),
             created_at_ms=d.get("created_at_ms", 0),
         )
 
