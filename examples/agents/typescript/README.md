@@ -28,10 +28,12 @@ parent's events at fork time.
 
 ## What it shows
 
+- **`agent.session("quickstart-agent-ts")`** — create a session by
+  application-facing alias while AgentDB assigns the canonical `ses_*` ID.
 - **`session.append(event, { fetchLastN: 5 })`** — the AgentDB
   hot-path primitive: write one event and read the last N back
   in the same round trip. The canonical agent loop shape.
-- **`session.fork(childId)`** — branch a session into an
+- **`session.fork(childAlias)`** — branch a session into an
   alternate timeline. The child sees a frozen snapshot of the
   parent's events at fork time, MVCC-backed.
 
@@ -42,8 +44,8 @@ parent's events at fork time.
 AGENTDB_URL=http://prod.example.com:7878 \
   node --experimental-strip-types examples/agents/typescript/quickstart.ts
 
-# Use a different tenant (dev mode only — auth-mode derives it)
-AGENTDB_TENANT=t-myapp \
+# Use a different workspace alias
+AGENTDB_WORKSPACE=t-myapp \
   node --experimental-strip-types examples/agents/typescript/quickstart.ts
 ```
 

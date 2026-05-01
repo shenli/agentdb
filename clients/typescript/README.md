@@ -20,27 +20,36 @@ cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
 ## Quick Start
 
 ```ts
-import { Client } from "agentdb";
+import { AgentDB } from "agentdb";
 
-const client = new Client({ baseUrl: "http://127.0.0.1:8080" });
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const workspace = await db.workspace("acme");
+const agent = await workspace.agent("sales-agent");
+const session = await agent.session("ticket-42");
 
-const tenant = await client.createTenant("acme");
-const agent = await client.createAgent(String(tenant.tenant_id), {
-  alias: "sales-agent",
-});
-const session = await client.createSession(
-  String(tenant.tenant_id),
-  String(agent.agent_id)
-);
-
-const result = await session.append(
-  { role: "user", text: "hello" },
-  { fetchLastN: 5 }
-);
+const result = await session.appendUser("hello", { fetchLastN: 5 });
 console.log(result.seq, result.recent.map((event) => event.payload));
 ```
 
+`workspace("acme")`, `workspace.agent("sales-agent")`, and
+`agent.session("ticket-42")` use application-facing names/aliases. AgentDB still
+assigns canonical opaque IDs (`ten_*`, `agt_*`, `ses_*`) and exposes them on the
+returned handles as `.id`. Use `agent.sessionById(sessionId)` or
+`db.sessionById(sessionId, { tenantId, agentId })` when recovering from a
+persisted canonical session ID.
+
 ## Core Surface
+
+- `AgentDB.workspace`, `AgentDB.sessionById`
+- `Workspace.agent`, `Workspace.agentById`, `Workspace.sessionById`, `Workspace.watch`
+- `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
+- `AgentHandle.session`, `AgentHandle.sessionById`, `AgentHandle.bindSkill`
+- `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
+- `SessionHandle.fetch`, `fetchRecent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.artifacts`, `records`, `skills`
+- `eventRef`, `artifactRef`
+
+The low-level tenant-scoped API remains available:
 
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
 - `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
@@ -61,20 +70,17 @@ harness should keep the tenant, agent, session, and last-seen sequence IDs, then
 rebuild a session handle and continue from durable history:
 
 ```ts
-import { Client, SessionEventKind, agentStatus } from "agentdb";
+import { AgentDB } from "agentdb";
 
-const client = new Client({ baseUrl: "http://127.0.0.1:8080" });
-const session = client.session(tenantId, sessionId, { agentId });
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const session = db.sessionById(sessionId, { tenantId, agentId });
 
 const history = await session.replay({ fromSeq: 0, limit: 100 });
 const context = await session.context({
   include: ["recent_events", "records", "skills"],
 });
 
-const result = await session.append(
-  agentStatus("recovered", { lastSeenSeq }),
-  { kind: SessionEventKind.AgentStatus }
-);
+const result = await session.agentStatus("recovered", { lastSeenSeq });
 
 for await (const event of session.subscribe({ fromSeq: lastSeenSeq + 1 })) {
   handle(event);
@@ -85,7 +91,7 @@ Concept mapping:
 
 | Durable-session concept | TypeScript SDK |
 |---|---|
-| wake/resume handle | `client.session(tenantId, sessionId, { agentId })` |
+| wake/resume handle | `agent.sessionById(...)` / `db.sessionById(...)` |
 | get events | `session.fetch(...)` |
 | append event | `session.append(...)` |
 | append and fetch | `session.appendAndFetch(...)` |
@@ -104,23 +110,16 @@ The runtime accepts arbitrary event kinds. The SDK exports advisory convention
 helpers for common brain/hand/session events:
 
 ```ts
-import { SessionEventKind, toolCall, toolResult, userMessage } from "agentdb";
+import { eventRef } from "agentdb";
 
-await session.append(
-  userMessage("run the report"),
-  { kind: SessionEventKind.UserMessage }
+const user = await session.appendUser("run the report");
+const call = await session.toolCall(
+  "call_1",
+  "sandbox.exec",
+  { cmd: "python report.py" },
+  { sourceRefs: [eventRef(user)] }
 );
-const call = await session.append(
-  toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }),
-  { kind: SessionEventKind.ToolCall }
-);
-await session.append(
-  toolResult("call_1", "Generated report."),
-  {
-    kind: SessionEventKind.ToolResult,
-    sourceRefs: [{ event_id: call.eventId }],
-  }
-);
+await session.toolResult("call_1", "Generated report.", { sourceRefs: [eventRef(call)] });
 ```
 
 Helpers are intentionally client-side only. They do not prevent custom event
@@ -134,35 +133,29 @@ then link the model output to that event:
 
 ```ts
 import {
-  SessionEventKind,
-  contextPackBuilt,
   contextSourceRefs,
-  modelMessage,
+  eventRef,
 } from "agentdb";
 
 const context = await session.context({
   include: ["recent_events", "records"],
   maxEvents: 20,
 });
-const contextEvent = await session.append(
-  contextPackBuilt("ctx_1", ["recent_events", "records"], {
+const contextEvent = await session.contextPackBuilt(
+  "ctx_1",
+  ["recent_events", "records"],
+  {
     maxEvents: 20,
     selectedEventCount: Array.isArray(context.events) ? context.events.length : 0,
     selectedRecordCount: Array.isArray(context.records) ? context.records.length : 0,
-  }),
-  {
-    kind: SessionEventKind.ContextPackBuilt,
     sourceRefs: contextSourceRefs(context, { maxRefs: 50 }),
   }
 );
 
-await session.append(
-  modelMessage("The report is ready.", { contextPackId: "ctx_1" }),
-  {
-    kind: SessionEventKind.ModelMessage,
-    sourceRefs: [{ event_id: contextEvent.eventId }],
-  }
-);
+await session.modelMessage("The report is ready.", {
+  contextPackId: "ctx_1",
+  sourceRefs: [eventRef(contextEvent)],
+});
 ```
 
 This keeps the prompt/context shape model-specific while preserving the

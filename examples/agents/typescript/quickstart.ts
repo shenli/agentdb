@@ -36,11 +36,12 @@
  * time.
  */
 
-import { Client } from "../../../clients/typescript/dist/src/index.js";
+import { AgentDB } from "../../../clients/typescript/dist/index.js";
 
 const SERVER_URL = process.env.AGENTDB_URL ?? "http://127.0.0.1:7878";
 const USER = process.env.AGENTDB_USER ?? "demo";
 const PASSWORD = process.env.AGENTDB_PASSWORD ?? "demo-secret";
+const WORKSPACE = process.env.AGENTDB_WORKSPACE ?? process.env.AGENTDB_TENANT ?? "quickstart-ts";
 const SESSION_ID = "quickstart-agent-ts";
 
 interface ChatPayload {
@@ -70,11 +71,11 @@ function thoughtForTurn(turn: number, recentTexts: string[]): ChatPayload {
 }
 
 async function main(): Promise<void> {
-  const client = new Client({
+  const db = new AgentDB({
     baseUrl: SERVER_URL,
     auth: { user: USER, password: PASSWORD },
   });
-  if (!(await client.healthReady())) {
+  if (!(await db.healthReady())) {
     console.error(
       `AgentDB not ready at ${SERVER_URL}. Start it with:\n` +
         `    cargo run -p agentdb-server -- serve --dev`
@@ -82,8 +83,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const sess = client.session(SESSION_ID);
-  console.log(`# Session: ${sess.toString()}`);
+  const workspace = await db.workspace(WORKSPACE);
+  const agent = await workspace.agent("quickstart-agent-ts");
+  const sess = await agent.session(SESSION_ID);
+  console.log(`# Workspace: ${workspace.id}`);
+  console.log(`# Agent:    ${agent.id}`);
+  console.log(`# Session:  ${sess.id}`);
 
   for (let turn = 0; turn < 3; turn++) {
     const newEvent = thoughtForTurn(turn, []);
