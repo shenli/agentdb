@@ -3,7 +3,7 @@
 //! One row per globally-unique external session id, recording
 //! the tenant that owns it, the tablet that currently hosts
 //! it, and the shard slot it lives in. This is the metadata
-//! that the v2 design centres on — every routing decision for
+//! that the runtime routing design centers on — every routing decision for
 //! an existing session, once the M26 work lands fully, is a
 //! lookup into this table rather than `FNV(tenant) % num_boxes`.
 //!
@@ -15,7 +15,7 @@
 //! a follow-up PR is reverted, the locator rows are harmless
 //! historical metadata.
 //!
-//! See `docs/2026-04-24-next-step-design.md` §1.
+//! See `docs/ARCHITECTURE.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

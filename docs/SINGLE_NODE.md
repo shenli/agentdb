@@ -2,7 +2,7 @@
 
 Single-node mode is the default operating shape for local development,
 prototypes, demos, and small self-hosted agent runtimes. It runs one AgentDB
-process with the native V2 HTTP API, local runtime metadata, local artifact
+process with the native HTTP API, local runtime metadata, local artifact
 content, and the dashboard on one port.
 
 ## Fast Start
@@ -106,8 +106,8 @@ AGENTDB_CONTENT_DIR=/data/objects
 
 ## Docker Compose
 
-The compose example is for evaluating the production-shaped object-storage
-path with MinIO:
+The compose example is for evaluating the container packaging path with a named
+local volume:
 
 ```bash
 cd examples/compose
@@ -115,7 +115,8 @@ docker compose up --build
 ```
 
 Use plain `agentdb serve --dev` for the fastest local loop. Use compose when
-you specifically want to exercise S3-compatible artifact/object storage.
+you specifically want the server to run in a container with persisted local
+state.
 
 ## Maintenance
 
@@ -178,4 +179,3 @@ Need to start fresh:
 rm -rf ./agentdb-data
 agentdb serve --data-dir ./agentdb-data
 ```
-

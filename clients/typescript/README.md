@@ -1,7 +1,7 @@
 # agentdb (TypeScript / Node)
 
-TypeScript client for AgentDB V2. It targets the tenant-scoped native
-`/api/...` runtime surface and uses Node 20+'s built-in `fetch`.
+TypeScript client for AgentDB. It targets the tenant-scoped native `/api/...`
+runtime surface and uses Node 20+'s built-in `fetch`.
 
 ## Install
 
@@ -14,7 +14,7 @@ npm run build
 ## Start A Local Server
 
 ```bash
-cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
+cargo run -p agentdb-server -- serve --dev
 ```
 
 ## Quick Start
@@ -22,7 +22,7 @@ cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
 const workspace = await db.workspace("acme");
 const agent = await workspace.agent("sales-agent");
 const session = await agent.session("ticket-42");
@@ -72,7 +72,7 @@ rebuild a session handle and continue from durable history:
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
 const session = db.sessionById(sessionId, { tenantId, agentId });
 
 const history = await session.replay({ fromSeq: 0, limit: 100 });

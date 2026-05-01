@@ -1,8 +1,8 @@
 # AgentDB Architecture
 
-This document describes the current V2 prototype. Older V1/Mongo-wire material
-has been removed from the active architecture docs; historical notes remain
-under `docs/superpowers/` and `docs/v2_design/gap-analysis.md`.
+This document describes the current prototype. Older Mongo-wire material has
+been removed from the active architecture docs; historical implementation notes
+remain under `docs/superpowers/`.
 
 ## Layers
 
@@ -45,7 +45,7 @@ All public IDs are opaque typed strings: `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 
 ## HTTP Surface
 
-The active API is the native V2 `/api/...` route family:
+The active API is the native `/api/...` route family:
 
 ```text
 POST /api/tenants
@@ -74,8 +74,8 @@ POST /api/policy/worker/run
 GET  /health/ready
 ```
 
-There is no V2 flag, Mongo wire listener, or maintained Go SDK in the current
-workspace.
+There is no version-gating server flag, Mongo wire listener, or maintained Go
+SDK in the current workspace.
 
 ## Event Append
 
@@ -106,7 +106,7 @@ RocksDB. Artifact content is intentionally separated from metadata through a
 `ContentBackend`; local mode uses a filesystem content backend.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
-contract tests because V2 reuses those foundations.
+contract tests because the runtime reuses those foundations.
 
 ## Policy And GC
 
@@ -117,6 +117,6 @@ purge metadata, index entries, and artifact content when policy allows.
 
 ## SDKs
 
-The Python and TypeScript SDKs are versioned at `2.0.0` and map directly to the
-native V2 API. They generate idempotency keys for mutating calls and expose the
-typed ID aliases as opaque strings.
+The Python and TypeScript SDKs map directly to the native API. They generate
+idempotency keys for mutating calls and expose the typed ID aliases as opaque
+strings.

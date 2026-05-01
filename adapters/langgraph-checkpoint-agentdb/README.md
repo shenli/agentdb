@@ -1,6 +1,6 @@
 # langgraph-checkpoint-agentdb
 
-LangGraph adapter for AgentDB V2 sessions.
+LangGraph adapter for AgentDB sessions.
 
 The adapter maps LangGraph checkpoint traffic onto AgentDB primitives:
 
@@ -19,7 +19,7 @@ that should be treated as an AgentDB runtime gap.
 from agentdb import Client
 from langgraph_checkpoint_agentdb import AgentDBSaver, AgentDBStore
 
-client = Client("http://127.0.0.1:8080")
+client = Client("http://127.0.0.1:7878")
 saver = AgentDBSaver(client, tenant_id="ten_...", agent_id="agt_...")
 store = AgentDBStore(client, tenant_id="ten_...")
 

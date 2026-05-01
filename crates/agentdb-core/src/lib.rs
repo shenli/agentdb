@@ -1,6 +1,6 @@
 //! AgentDB runtime database.
 //!
-//! See `docs/v2_design/agent-runtime-database.md` for the design and
+//! See `docs/DESIGN.md` for the design and
 //! `docs/ARCHITECTURE.md` for the implementation map.
 //!
 //! Top-level types:

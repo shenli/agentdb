@@ -1,4 +1,4 @@
-"""Asynchronous Python SDK for the AgentDB V2 native API."""
+"""Asynchronous Python SDK for the AgentDB native API."""
 
 from __future__ import annotations
 

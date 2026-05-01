@@ -249,7 +249,7 @@ def serve_stdio(server: AgentDBMcpServer, stdin: Any = sys.stdin, stdout: Any = 
 
 def main() -> None:
     client = Client(
-        os.environ.get("AGENTDB_BASE_URL", "http://127.0.0.1:8080"),
+        os.environ.get("AGENTDB_BASE_URL", "http://127.0.0.1:7878"),
         token=os.environ.get("AGENTDB_TOKEN") or None,
     )
     serve_stdio(AgentDBMcpServer(client))

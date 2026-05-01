@@ -93,7 +93,7 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
     ),
     (
         13,
-        "nodes.availability_zone (cross-AZ failure-domain awareness, agent-db-v2.md §2.7)",
+        "nodes.availability_zone (cross-AZ failure-domain awareness)",
         include_str!("../migrations/013_nodes_availability_zone.sql"),
         include_str!("../migrations/013_nodes_availability_zone.pg.sql"),
     ),

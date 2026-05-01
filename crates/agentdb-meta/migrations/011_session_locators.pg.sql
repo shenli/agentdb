@@ -8,7 +8,7 @@
 -- This row is *populated* in this PR but not yet *consulted*
 -- on the read/write path — wiring follows in subsequent
 -- M26 PRs (per-session lock, fanout reads, archive-complete
--- index). See docs/2026-04-24-next-step-design.md.
+-- index). See docs/ARCHITECTURE.md.
 CREATE TABLE session_locators (
     session_id            TEXT    PRIMARY KEY,
     tenant_internal_id    BIGINT  NOT NULL,

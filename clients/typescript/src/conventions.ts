@@ -1,5 +1,5 @@
 /**
- * Advisory V2 session event conventions.
+ * Advisory session event conventions.
  *
  * The runtime accepts arbitrary event kinds and payloads. These helpers provide
  * a shared vocabulary for SDK examples and framework adapters without making

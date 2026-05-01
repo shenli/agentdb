@@ -1,10 +1,9 @@
-//! Tenant-first logical key encoders for V2 runtime objects.
+//! Tenant-first logical key encoders for runtime objects.
 //!
-//! See `docs/v2_design/minimal-single-machine-implementation.md` §7 for the
-//! canonical key namespace. Every key starts with the namespace, then the
-//! tenant_id, then the object identity. This guarantees that a tenant-scoped
-//! prefix scan returns only that tenant's data and that range delete is a
-//! single prefix operation.
+//! See `docs/ARCHITECTURE.md` for the runtime/storage layout this module
+//! supports. Every key starts with the namespace, then the tenant_id, then the
+//! object identity. This guarantees that a tenant-scoped prefix scan returns
+//! only that tenant's data and that range delete is a single prefix operation.
 
 pub fn tenant_record_key(tenant_id: &str) -> String {
     format!("record/tenant/{tenant_id}")
@@ -52,13 +51,13 @@ pub fn artifact_record_key(tenant_id: &str, artifact_id: &str) -> String {
 }
 
 /// Secondary index keyed by sha256 hex digest. Populated on every artifact
-/// write so a future dedup pass (V2.1+) can land without rewriting the
-/// batched-write path; V2.1 itself does not expose a lookup-by-sha256 API.
+/// write so a future dedup pass can land without rewriting the batched-write
+/// path; the current API does not expose lookup by sha256.
 pub fn artifact_by_sha256_key(tenant_id: &str, sha256_hex: &str) -> String {
     format!("record/artifact_by_sha256/{tenant_id}/{sha256_hex}")
 }
 
-/// Primary key for a V2.2 searchable record. Disjoint from
+/// Primary key for a searchable record. Disjoint from
 /// `record/{tenant,agent,session,artifact}/...` because the segment after
 /// `record/` is `searchable`, and disjoint from
 /// `record/searchable_by_namespace/...` because the prefix `record/searchable/`
@@ -74,7 +73,7 @@ pub fn record_by_namespace_key(tenant_id: &str, namespace_path: &str, record_id:
     format!("record/searchable_by_namespace/{tenant_id}/{namespace_path}/{record_id}")
 }
 
-/// Primary key for a V2.3 skill record.
+/// Primary key for a skill record.
 pub fn skill_record_key(tenant_id: &str, skill_id: &str) -> String {
     format!("record/skill/{tenant_id}/{skill_id}")
 }

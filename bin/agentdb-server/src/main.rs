@@ -1,6 +1,6 @@
-//! `agentdb` binary — V2 server entrypoint.
+//! `agentdb` binary — server entrypoint.
 //!
-//! Mounts the V2 HTTP routes from `agentdb-api` against a `Runtime`. By default
+//! Mounts the HTTP routes from `agentdb-api` against a `Runtime`. By default
 //! the runtime is RocksDB-backed at `--data-dir/runtime`; pass `--dev` or
 //! `--in-memory` to get the ephemeral backend (useful for smoke tests and
 //! local dev).
@@ -14,7 +14,7 @@ use axum::routing::get;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "agentdb", version, about = "AgentDB runtime database (v2)")]
+#[command(name = "agentdb", version, about = "AgentDB runtime database")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
-    /// Start the HTTP server with the V2 router.
+    /// Start the HTTP server with the runtime router.
     Serve(ServeOpts),
 }
 
