@@ -37,7 +37,9 @@ open http://127.0.0.1:7878/dashboard/
 ## Persistent Local Server
 
 ```bash
-agentdb serve --data-dir ./agentdb-data
+agentdb init-config
+agentdb doctor
+agentdb serve --config agentdb.toml
 ```
 
 This creates:
@@ -52,32 +54,47 @@ Use a separate artifact directory when large outputs should live on another
 disk:
 
 ```bash
-agentdb serve \
-  --data-dir /var/lib/agentdb \
-  --content-dir /mnt/agentdb-artifacts
+agentdb init-config --output /etc/agentdb/agentdb.toml
+```
+
+Then edit:
+
+```toml
+[server]
+bind = "127.0.0.1:7878"
+dev = false
+
+[storage]
+data_dir = "/var/lib/agentdb"
+content_dir = "/mnt/agentdb-artifacts"
 ```
 
 ## Configuration
 
-CLI flags are the clearest way to configure a single node:
+For a maintained node, prefer a config file over a long command line:
 
 ```bash
-agentdb serve \
-  --bind 0.0.0.0:7878 \
-  --data-dir /var/lib/agentdb \
-  --content-dir /var/lib/agentdb/content
+agentdb init-config --output /etc/agentdb/agentdb.toml
+agentdb doctor --config /etc/agentdb/agentdb.toml
+agentdb serve --config /etc/agentdb/agentdb.toml
 ```
 
-The same settings can come from environment variables:
+Minimal config:
 
-| Setting | Preferred env | Compatibility env |
-|---|---|---|
-| Bind address | `AGENTDB_BIND` | `AGENTDB_ADDR`, `AGENTDB_HTTP_ADDR` |
-| Runtime data dir | `AGENTDB_DATA_DIR` | `AGENTDB_DATA` |
-| Artifact content dir | `AGENTDB_CONTENT_DIR` | `AGENTDB_OBJECTS` |
-| In-memory dev mode | `AGENTDB_DEV=true` | `AGENTDB_IN_MEMORY=true` |
+```toml
+[server]
+bind = "0.0.0.0:7878"
+dev = false
 
-CLI flags win over environment variables. Empty env vars are ignored.
+[storage]
+data_dir = "/var/lib/agentdb"
+# Optional. Defaults to "<data_dir>/content".
+content_dir = "/var/lib/agentdb/content"
+```
+
+The repository also includes a template at `config/agentdb.toml`. CLI flags
+override config values when you need a temporary one-off change. The server does
+not read runtime settings from environment variables.
 
 ## Docker
 
@@ -96,12 +113,16 @@ docker run --rm \
   agentdb:local
 ```
 
-The image defaults to:
+The image ships with `/data/agentdb.toml`:
 
-```text
-AGENTDB_BIND=0.0.0.0:7878
-AGENTDB_DATA_DIR=/data/rocksdb
-AGENTDB_CONTENT_DIR=/data/objects
+```toml
+[server]
+bind = "0.0.0.0:7878"
+dev = false
+
+[storage]
+data_dir = "/data/runtime"
+content_dir = "/data/content"
 ```
 
 ## Docker Compose

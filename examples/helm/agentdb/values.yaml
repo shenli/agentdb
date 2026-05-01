@@ -32,16 +32,3 @@ persistence:
   size: 10Gi
   # Leave storageClassName empty to use the cluster default.
   storageClassName: ""
-
-# Extra env passed straight to the container.
-env: {}
-
-# Values pulled from a Secret rather than inline. Chart does
-# NOT create the Secret — operator provisions it separately
-# so a `helm install` doesn't dump credentials into state.
-secretEnv: {}
-# Example:
-#   secretEnv:
-#     AGENTDB_TOKEN:
-#       secretName: agentdb-runtime
-#       key: token

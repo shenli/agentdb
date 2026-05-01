@@ -1,0 +1,15 @@
+# AgentDB single-node configuration.
+#
+# Run with:
+#   agentdb doctor --config config/agentdb.toml
+#   agentdb serve --config config/agentdb.toml
+
+[server]
+bind = "127.0.0.1:7878"
+# dev = true uses ephemeral in-memory state.
+dev = false
+
+[storage]
+data_dir = "./agentdb-data"
+# content_dir defaults to "<data_dir>/content" when omitted.
+# content_dir = "./agentdb-data/content"
