@@ -13,6 +13,63 @@ The package intentionally keeps framework-specific code thin. If an adapter
 needs to invent ordering, fork lineage, artifact references, or scoped search,
 that should be treated as an AgentDB runtime gap.
 
+## LangSmith / Deep Agents deployment
+
+LangSmith Agent Server can load custom checkpointer and store backends from
+`langgraph.json`. This package exposes async factories for that path:
+
+```json
+{
+  "dependencies": [
+    ".",
+    "./adapters/langgraph-checkpoint-agentdb",
+    "./clients/python[async]"
+  ],
+  "graphs": {
+    "agent": "./src/agent/graph.py:graph"
+  },
+  "env": ".env",
+  "checkpointer": {
+    "path": "langgraph_checkpoint_agentdb.langsmith:generate_checkpointer"
+  },
+  "store": {
+    "path": "langgraph_checkpoint_agentdb.langsmith:generate_store"
+  }
+}
+```
+
+Required environment:
+
+```text
+AGENTDB_BASE_URL=http://127.0.0.1:7878
+AGENTDB_TENANT_ID=ten_...
+AGENTDB_AGENT_ID=agt_...
+```
+
+Optional auth environment:
+
+```text
+AGENTDB_TOKEN=...
+AGENTDB_BASIC_USER=...
+AGENTDB_BASIC_PASSWORD=...
+```
+
+The checkpointer accepts normal LangGraph configs with only `thread_id`; it
+creates an AgentDB session for the thread and records the thread-to-session
+mapping under `["langgraph", "threads"]` so later workers can recover the same
+session. Returned configs include `configurable.agentdb_session_id` for callers
+that preserve the cursor explicitly.
+
+Before deploying, validate the checkpointer against LangGraph's conformance
+suite when `langgraph-checkpoint-conformance` is available. The async surface
+implements the required Agent Server methods: `aput`, `aput_writes`,
+`aget_tuple`, `alist`, and `adelete_thread`.
+
+Deep Agents Deploy itself also has convention-based `AGENTS.md`, `skills/`,
+`user/`, `subagents/`, `mcp.json`, sandbox, auth, and frontend behavior. AgentDB
+does not replace those surfaces; it backs the LangGraph checkpoint/store layer
+inside the deployment.
+
 ## Minimal usage
 
 ```python

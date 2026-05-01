@@ -1,6 +1,7 @@
+import asyncio
 from dataclasses import dataclass
 
-from langgraph_checkpoint_agentdb import AgentDBSaver
+from langgraph_checkpoint_agentdb import AgentDBAsyncSaver, AgentDBSaver
 
 
 @dataclass
@@ -41,6 +42,51 @@ class FakeClient:
     def write_record(self, tenant_id, **body):
         self.records.append((tenant_id, body))
         return {"record_id": "rec_1", **body}
+
+
+@dataclass
+class AsyncSessionRecord:
+    session_id: str
+    agent_id: str
+
+
+class FakeAsyncSession(FakeSession):
+    async def append(self, payload, *, kind, idempotency_key):
+        return super().append(payload, kind=kind, idempotency_key=idempotency_key)
+
+    async def replay(self, *, limit):
+        return super().replay(limit=limit)
+
+
+class FakeAsyncClient:
+    def __init__(self):
+        self.fake_session = FakeAsyncSession()
+        self.records = []
+        self.searches = []
+        self.created = []
+
+    async def create_session(self, tenant_id, agent_id, *, alias=None):
+        self.created.append((tenant_id, agent_id, alias))
+        return AsyncSessionRecord(session_id="ses_created", agent_id=agent_id)
+
+    def session(self, tenant_id, session_id, *, agent_id=None):
+        self.session_args = (tenant_id, session_id, agent_id)
+        return self.fake_session
+
+    async def write_record(self, tenant_id, **body):
+        self.records.append((tenant_id, body))
+        return {"record_id": f"rec_{len(self.records)}", **body}
+
+    async def search_records(self, tenant_id, **body):
+        self.searches.append((tenant_id, body))
+        for _, record in reversed(self.records):
+            if record.get("namespace") != body.get("namespace"):
+                continue
+            wanted = set(body.get("tags") or [])
+            existing = set(record.get("tags") or [])
+            if wanted.issubset(existing):
+                return [{"record_id": "rec_found", "metadata": record.get("metadata") or {}}]
+        return []
 
 
 def test_put_maps_checkpoint_to_event_and_record():
@@ -133,3 +179,65 @@ def test_assert_ready_raises_on_warnings():
         assert "langgraph_no_session_events" in str(exc)
     else:
         raise AssertionError("assert_ready should fail when readiness warnings exist")
+
+
+def test_async_saver_creates_thread_session_and_maps_checkpoint():
+    async def run():
+        client = FakeAsyncClient()
+        saver = AgentDBAsyncSaver(client, tenant_id="ten_1", agent_id="agt_1")
+        config = {"configurable": {"thread_id": "thread-a"}}
+
+        next_config = await saver.aput(config, {"id": "ckpt-1"}, {"step": 1})
+
+        assert next_config["configurable"]["agentdb_session_id"] == "ses_created"
+        assert client.created == [("ten_1", "agt_1", "thread-a")]
+        assert client.records[0][1]["namespace"] == ["langgraph", "threads"]
+        payload, kind, idem = client.fake_session.appends[0]
+        assert kind == "langgraph_checkpoint"
+        assert idem == "langgraph-checkpoint:thread-a:ckpt-1"
+        assert payload["metadata"] == {"step": 1}
+
+    asyncio.run(run())
+
+
+def test_async_saver_recovers_thread_session_from_record():
+    async def run():
+        client = FakeAsyncClient()
+        client.records.append(
+            (
+                "ten_1",
+                {
+                    "namespace": ["langgraph", "threads"],
+                    "metadata": {"thread_id": "thread-a", "session_id": "ses_existing"},
+                    "tags": ["langgraph", "thread", "thread:thread-a"],
+                },
+            )
+        )
+        saver = AgentDBAsyncSaver(client, tenant_id="ten_1", agent_id="agt_1")
+
+        next_config = await saver.aput(
+            {"configurable": {"thread_id": "thread-a"}},
+            {"id": "ckpt-1"},
+            {},
+        )
+
+        assert next_config["configurable"]["agentdb_session_id"] == "ses_existing"
+        assert client.created == []
+
+    asyncio.run(run())
+
+
+def test_async_saver_delete_thread_hides_checkpoints():
+    async def run():
+        client = FakeAsyncClient()
+        saver = AgentDBAsyncSaver(client, tenant_id="ten_1", agent_id="agt_1")
+        config = await saver.aput({"configurable": {"thread_id": "thread-a"}}, {"id": "ckpt-1"}, {})
+
+        rows = [row async for row in saver.alist(config, limit=10)]
+        assert len(rows) == 1
+
+        await saver.adelete_thread("thread-a")
+        rows = [row async for row in saver.alist(config, limit=10)]
+        assert rows == []
+
+    asyncio.run(run())

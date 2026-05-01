@@ -11,7 +11,7 @@ requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "AgentDB contributors" }]
 dependencies = [
-    "agentdb>=2.0.0",
+    "agentdb[async]>=2.0.0",
 ]
 
 [project.optional-dependencies]
