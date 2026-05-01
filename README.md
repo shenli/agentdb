@@ -19,28 +19,37 @@ Go SDK are no longer part of the workspace. The supported surfaces are:
 ## Run Locally
 
 ```bash
-cargo run -p agentdb-server -- serve --in-memory --bind 127.0.0.1:8080
+cargo run -p agentdb-server -- serve --dev
 ```
 
-Persistent local state uses RocksDB metadata and filesystem artifact content:
+This starts an in-memory dev server at:
+
+```text
+http://127.0.0.1:7878
+```
+
+Persistent single-node state uses RocksDB metadata and filesystem artifact
+content:
 
 ```bash
 cargo run -p agentdb-server -- serve \
-  --bind 127.0.0.1:8080 \
-  --data-dir ./data
+  --data-dir ./agentdb-data
 ```
 
 The readiness probe is:
 
 ```bash
-curl -i http://127.0.0.1:8080/health/ready
+curl -i http://127.0.0.1:7878/health/ready
 ```
 
 The V2 session dashboard is available at:
 
 ```text
-http://127.0.0.1:8080/dashboard/
+http://127.0.0.1:7878/dashboard/
 ```
+
+For install, Docker, backup, and maintenance notes, see
+[`docs/SINGLE_NODE.md`](docs/SINGLE_NODE.md).
 
 ## API Shape
 
@@ -78,7 +87,7 @@ pip install -e clients/python
 ```python
 from agentdb import AgentDB
 
-db = AgentDB("http://127.0.0.1:8080")
+db = AgentDB("http://127.0.0.1:7878")
 workspace = db.workspace("acme")
 agent = workspace.agent("sales-agent")
 session = agent.session("support-ticket-42")
@@ -104,7 +113,7 @@ npm run build
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:8080" });
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
 const workspace = await db.workspace("acme");
 const agent = await workspace.agent("sales-agent");
 const session = await agent.session("support-ticket-42");
@@ -158,6 +167,7 @@ PYTHONPATH=clients/python:adapters/mcp-agentdb python3 -m pytest -q adapters/mcp
 ## Reading Order
 
 - `docs/v2_design/README.md`
+- `docs/SINGLE_NODE.md`
 - `docs/v2_design/agent-runtime-database.md`
 - `docs/v2_design/v2-implementation-plan.md`
 - `docs/ARCHITECTURE.md`

@@ -140,6 +140,12 @@ main() {
     bold "Installed."
     info "Try it:"
     info "  ${PREFIX}/agentdb serve --dev"
+    info ""
+    info "Persistent single-node:"
+    info "  ${PREFIX}/agentdb serve --data-dir ./agentdb-data"
+    info ""
+    info "Dashboard:"
+    info "  http://127.0.0.1:7878/dashboard/"
     case ":${PATH}:" in
         *":${PREFIX}:"*) ;;
         *)

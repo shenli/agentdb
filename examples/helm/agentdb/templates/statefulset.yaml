@@ -28,33 +28,23 @@ spec:
             - name: rest
               containerPort: {{ .Values.service.restPort }}
           env:
-            - name: AGENTDB_HTTP_ADDR
+            - name: AGENTDB_BIND
               value: "0.0.0.0:{{ .Values.service.restPort }}"
             - name: AGENTDB_DATA_DIR
-              value: /data
-            {{- if .Values.admin.requireAuth }}
-            - name: AGENTDB_REQUIRE_ADMIN_AUTH
-              value: "true"
-            {{- end }}
-            {{- if .Values.backup.enabled }}
-            - name: AGENTDB_BACKUP_INTERVAL_SECS
-              value: "{{ .Values.backup.intervalSeconds }}"
-            - name: AGENTDB_BACKUP_DIR
-              value: "{{ .Values.backup.path }}"
-            - name: AGENTDB_BACKUP_RETAIN
-              value: "{{ .Values.backup.retain }}"
-            {{- end }}
-            {{- range $k, $v := .Values.env }}
+              value: /data/runtime
+            - name: AGENTDB_CONTENT_DIR
+              value: /data/content
+            {{ range $k, $v := .Values.env }}
             - name: {{ $k }}
               value: "{{ $v }}"
-            {{- end }}
-            {{- range $k, $v := .Values.secretEnv }}
+            {{ end }}
+            {{ range $k, $v := .Values.secretEnv }}
             - name: {{ $k }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $v.secretName }}
                   key: {{ $v.key }}
-            {{- end }}
+            {{ end }}
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -72,25 +62,6 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-            {{- if .Values.backup.enabled }}
-            - name: backups
-              mountPath: {{ .Values.backup.path }}
-            {{- end }}
-            {{- if .Values.tls.enabled }}
-            - name: tls
-              mountPath: /etc/agentdb/tls
-              readOnly: true
-            {{- end }}
-      volumes:
-        {{- if .Values.tls.enabled }}
-        - name: tls
-          secret:
-            secretName: {{ .Values.tls.secretName }}
-        {{- end }}
-        {{- if .Values.backup.enabled }}
-        - name: backups
-          emptyDir: {}
-        {{- end }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
