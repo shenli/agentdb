@@ -20,21 +20,60 @@ trap cleanup EXIT
 AGENTDB_DATA="$DATA_DIR" \
 AGENTDB_OBJECTS="$OBJ_DIR" \
 AGENTDB_ADDR="127.0.0.1:$PORT_HTTP" \
-cargo run -p agentdb-server &
+cargo run -p agentdb-server -- serve &
 SERVER_PID=$!
 
-# Wait for the HTTP port
-for i in $(seq 1 30); do
-    if curl -s -o /dev/null "http://127.0.0.1:$PORT_HTTP/api/admin/boxes"; then
+# Wait for the HTTP port. Cold source-checkout runs may spend most of this
+# budget compiling before the server process starts.
+for i in $(seq 1 180); do
+    if curl -s -o /dev/null "http://127.0.0.1:$PORT_HTTP/health/ready"; then
         break
     fi
     sleep 1
 done
+if ! curl -s -o /dev/null "http://127.0.0.1:$PORT_HTTP/health/ready"; then
+    echo "server did not become ready within 180s"
+    exit 1
+fi
 
 # Poke the endpoints
-curl -s -X POST "http://127.0.0.1:$PORT_HTTP/api/tenants/t-smoke/sessions/s/append_and_fetch" \
-    -H 'Content-Type: application/json' \
-    -d '{"event":{"text":"hi"},"fetch_last_n":0}' > /dev/null
+python3 - "$PORT_HTTP" <<'PY'
+import json
+import sys
+import urllib.request
+
+base = f"http://127.0.0.1:{sys.argv[1]}"
+
+def post(path, body):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        base + path,
+        data=data,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.load(resp)
+
+tenant = post("/api/tenants", {"external_key": "smoke", "policy": {}})
+agent = post(f"/api/tenants/{tenant['tenant_id']}/agents", {"alias": "smoke-agent", "config": {}})
+session = post(
+    f"/api/tenants/{tenant['tenant_id']}/agents/{agent['agent_id']}/sessions",
+    {"alias": "smoke-session"},
+)
+post(
+    f"/api/tenants/{tenant['tenant_id']}/sessions/{session['session_id']}/append-and-fetch",
+    {
+        "agent_id": agent["agent_id"],
+        "kind": "message",
+        "payload": {"text": "hi"},
+        "artifact_refs": [],
+        "source_refs": [],
+        "last": 1,
+        "max_bytes": 1000000,
+    },
+)
+PY
 
 # Dashboard root
 status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT_HTTP/dashboard/")

@@ -25,11 +25,10 @@ Behavior depends on which `resource` is missing.
 
 **`session` or `tenant`:**
 
-1. Decide whether the id should already exist. A client's first write
-   to a never-seen session id would *not* 404 — `append_and_fetch`
-   mints the session on write. A 404 here means the client is
-   reading before first write, or reading against a session that
-   used to exist.
+1. Decide whether the id should already exist. V2 sessions are created under
+   an agent before events are appended. A 404 here usually means the client is
+   reading before session creation, using the wrong tenant, or using a session
+   that used to exist.
 2. Check the tenant view for that id:
 
    ```
@@ -63,10 +62,9 @@ Behavior depends on which `resource` is missing.
 
 ## Remediate
 
-1. **Session not written yet.** Have the client issue a write
-   (`POST /api/tenants/:tenant_id/sessions/:session_id/append_and_fetch`)
-   first. The write mints the session row and subsequent reads
-   succeed.
+1. **Session not created yet.** Create the session first with
+   `POST /api/tenants/:tenant_id/agents/:agent_id/sessions`, then append via
+   `POST /api/tenants/:tenant_id/sessions/:session_id/append-and-fetch`.
 2. **Session was archived and is now missing.** If the session
    should still exist, this is a data-loss bug — escalate with the
    session id and the last known tier. Check segment-gc logs for

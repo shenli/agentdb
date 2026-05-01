@@ -36,7 +36,7 @@ AGENTDB_OBJECTS="$OBJ_DIR" \
 AGENTDB_ADDR="127.0.0.1:$PORT_HTTP" \
 AGENTDB_T_COLD_SECS="${AGENTDB_T_COLD_SECS:-60}" \
 AGENTDB_TICK_SECS="${AGENTDB_TICK_SECS:-2}" \
-./target/release/agentdb-server > "$OUT_DIR/${LABEL}.server.log" 2>&1 &
+./target/release/agentdb serve > "$OUT_DIR/${LABEL}.server.log" 2>&1 &
 SERVER_PID=$!
 
 for i in $(seq 1 30); do

@@ -10,6 +10,6 @@ pub fn router() -> Router {
         .fallback_service(ServeDir::new(static_dir))
 }
 
-async fn index() -> Html<&'static str> {
+pub async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }

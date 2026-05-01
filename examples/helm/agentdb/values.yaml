@@ -22,26 +22,19 @@ resources:
     memory: 2Gi
 
 service:
-  # REST (+ dashboard + /metrics).
+  # REST (+ dashboard).
   restPort: 7878
 
-# Persistent storage: 10Gi for the RocksDB KV dir + meta
-# SQLite + index snapshots. Object-store segments are NOT
-# kept here — point `agentdb` at S3 / GCS / MinIO for the
-# cold tier.
+# Persistent storage: 10Gi for RocksDB runtime metadata and local artifact
+# content.
 persistence:
   enabled: true
   size: 10Gi
   # Leave storageClassName empty to use the cluster default.
   storageClassName: ""
 
-# Env passed straight to the container. Inline any
-# AGENTDB_* the design doc describes. Sensitive values
-# should come from secretEnv (below) in production.
-env:
-  AGENTDB_OBJECT_STORE: "local"
-  AGENTDB_BOXES: "4"
-  AGENTDB_ADMISSION_CAPACITY: "64"
+# Extra env passed straight to the container.
+env: {}
 
 # Values pulled from a Secret rather than inline. Chart does
 # NOT create the Secret — operator provisions it separately
@@ -49,28 +42,6 @@ env:
 secretEnv: {}
 # Example:
 #   secretEnv:
-#     AGENTDB_S3_SECRET_KEY:
-#       secretName: agentdb-s3
-#       key: secret-access-key
-
-# TLS is off by default. To terminate TLS inside the pod
-# instead of at the ingress, mount the cert/key via a Secret
-# and set `tls.enabled: true`.
-tls:
-  enabled: false
-  secretName: ""
-
-# Admin bearer-token auth. `false` leaves /api/admin/* open
-# (dev-mode-ish). Production should always set this.
-admin:
-  requireAuth: false
-
-# Optional scheduled backup. Writes to an emptyDir by
-# default — operators should mount a PVC or object-store
-# CSI when they actually care about the backups surviving
-# the pod.
-backup:
-  enabled: false
-  intervalSeconds: 86400  # daily
-  retain: 7
-  path: "/backups"
+#     AGENTDB_TOKEN:
+#       secretName: agentdb-runtime
+#       key: token
