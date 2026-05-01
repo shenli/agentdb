@@ -5,7 +5,6 @@ set -euo pipefail
 # via HTTP, checks the dashboard is served, and tears down.
 
 PORT_HTTP=${PORT_HTTP:-7878}
-PORT_MONGO=${PORT_MONGO:-7879}
 DATA_DIR=$(mktemp -d -t agentdb-smoke-XXXXXX)
 OBJ_DIR=$(mktemp -d -t agentdb-smoke-obj-XXXXXX)
 
@@ -21,7 +20,6 @@ trap cleanup EXIT
 AGENTDB_DATA="$DATA_DIR" \
 AGENTDB_OBJECTS="$OBJ_DIR" \
 AGENTDB_ADDR="127.0.0.1:$PORT_HTTP" \
-AGENTDB_MONGO_ADDR="127.0.0.1:$PORT_MONGO" \
 cargo run -p agentdb-server &
 SERVER_PID=$!
 

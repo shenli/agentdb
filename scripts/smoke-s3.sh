@@ -11,7 +11,6 @@ command -v docker >/dev/null || { echo "[smoke-s3] docker required"; exit 1; }
 command -v aws >/dev/null || { echo "[smoke-s3] aws cli required"; exit 1; }
 
 PORT_HTTP=${PORT_HTTP:-7878}
-PORT_MONGO=${PORT_MONGO:-7879}
 PORT_MINIO=${PORT_MINIO:-9000}
 MINIO_CONTAINER="agentdb-minio-smoke"
 BUCKET="agentdb-test"
@@ -66,7 +65,6 @@ AGENTDB_S3_BUCKET="$BUCKET" \
 AGENTDB_S3_REGION=us-east-1 \
 AGENTDB_S3_ENDPOINT="$ENDPOINT" \
 AGENTDB_ADDR="127.0.0.1:${PORT_HTTP}" \
-AGENTDB_MONGO_ADDR="127.0.0.1:${PORT_MONGO}" \
 AGENTDB_T_COLD_SECS=2 \
 AGENTDB_SEGMENT_GC_TICK_SECS=2 \
 AGENTDB_SEGMENT_GC_GRACE_SECS=2 \
