@@ -9,7 +9,7 @@ minor version they run.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, Iterator, Mapping, Optional
 
 from agentdb import SessionEventKind, agent_status, validate_adapter_events
 
@@ -236,6 +236,314 @@ class AgentDBSaver:
         if not report.ready:
             raise AssertionError("\n".join(report.warnings))
         return report
+
+
+class AgentDBAsyncSaver:
+    """Agent Server compatible async checkpointer backed by AgentDB.
+
+    LangSmith Agent Server loads custom checkpointers through async
+    `BaseCheckpointSaver` methods. This wrapper keeps the tested synchronous
+    mapping above intact while adding the async method names Agent Server
+    expects: `aput`, `aput_writes`, `aget_tuple`, `alist`, and
+    `adelete_thread`.
+    """
+
+    checkpoint_namespace = AgentDBSaver.checkpoint_namespace
+    writes_namespace = AgentDBSaver.writes_namespace
+    thread_namespace = ["langgraph", "threads"]
+    replay_limit = 10_000
+
+    def __init__(self, client: Any, *, tenant_id: str, agent_id: str) -> None:
+        self.client = client
+        self.tenant_id = tenant_id
+        self.agent_id = agent_id
+
+    async def aput(
+        self,
+        config: Mapping[str, Any],
+        checkpoint: Mapping[str, Any],
+        metadata: Optional[Mapping[str, Any]] = None,
+        new_versions: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        configurable = _configurable(config)
+        thread_id = _required(configurable, "thread_id")
+        checkpoint_ns = str(configurable.get("checkpoint_ns") or "")
+        parent_checkpoint_id = configurable.get("checkpoint_id")
+        session_id = await self._ensure_session_id(configurable)
+        checkpoint_id = str(checkpoint.get("id") or checkpoint.get("checkpoint_id") or "")
+        if not checkpoint_id:
+            raise ValueError("checkpoint must contain id or checkpoint_id")
+
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "checkpoint_ns": checkpoint_ns,
+            "checkpoint_id": checkpoint_id,
+            "parent_checkpoint_id": parent_checkpoint_id,
+            "checkpoint": dict(checkpoint),
+            "metadata": dict(metadata or {}),
+            "new_versions": dict(new_versions or {}),
+        }
+        session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
+        result = await session.append(
+            payload,
+            kind="langgraph_checkpoint",
+            idempotency_key=f"langgraph-checkpoint:{thread_id}:{checkpoint_ns}:{checkpoint_id}",
+        )
+        await self.client.write_record(
+            self.tenant_id,
+            namespace=self.checkpoint_namespace,
+            text=_compact(payload),
+            metadata={**payload, "seq": result.seq},
+            tags=["langgraph", "checkpoint", f"thread:{thread_id}", f"checkpoint:{checkpoint_id}"],
+            source={"session_id": session_id, "seq": result.seq},
+        )
+        return {
+            "configurable": {
+                **configurable,
+                "thread_id": thread_id,
+                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_id": checkpoint_id,
+                "agentdb_session_id": session_id,
+            }
+        }
+
+    async def aput_writes(
+        self,
+        config: Mapping[str, Any],
+        writes: Iterable[Any],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        configurable = _configurable(config)
+        thread_id = _required(configurable, "thread_id")
+        checkpoint_ns = str(configurable.get("checkpoint_ns") or "")
+        session_id = await self._ensure_session_id(configurable)
+        checkpoint_id = configurable.get("checkpoint_id")
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "thread_id": thread_id,
+            "checkpoint_ns": checkpoint_ns,
+            "checkpoint_id": checkpoint_id,
+            "task_id": task_id,
+            "task_path": task_path,
+            "writes": list(writes),
+        }
+        session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
+        result = await session.append(
+            payload,
+            kind="langgraph_pending_writes",
+            idempotency_key=f"langgraph-writes:{thread_id}:{checkpoint_ns}:{checkpoint_id}:{task_id}:{task_path}",
+        )
+        await self.client.write_record(
+            self.tenant_id,
+            namespace=self.writes_namespace,
+            text=_compact(payload),
+            metadata={**payload, "seq": result.seq},
+            tags=["langgraph", "pending_writes", f"thread:{thread_id}", f"task:{task_id}"],
+            source={"session_id": session_id, "seq": result.seq},
+        )
+
+    async def aget_tuple(self, config: Mapping[str, Any]) -> Optional[CheckpointTuple]:
+        configurable = _configurable(config)
+        session_id = await self._ensure_session_id(configurable)
+        events = await self._thread_events(session_id)
+        if self._is_deleted(events):
+            return None
+
+        checkpoint_ns = str(configurable.get("checkpoint_ns") or "")
+        checkpoint_id = configurable.get("checkpoint_id")
+        checkpoint_events = [
+            event
+            for event in events
+            if event.kind == "langgraph_checkpoint"
+            and (event.payload or {}).get("checkpoint_ns", "") == checkpoint_ns
+        ]
+        if checkpoint_id is not None:
+            for event in checkpoint_events:
+                if (event.payload or {}).get("checkpoint_id") == checkpoint_id:
+                    return self._tuple_from_event(event, events, session_id)
+            return None
+        if checkpoint_events:
+            return self._tuple_from_event(checkpoint_events[-1], events, session_id)
+        return None
+
+    async def aget(self, config: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        value = await self.aget_tuple(config)
+        return value.checkpoint if value else None
+
+    async def alist(
+        self,
+        config: Optional[Mapping[str, Any]],
+        *,
+        limit: int = 10,
+        before: Optional[Mapping[str, Any]] = None,
+        filter: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        configurable = _configurable(config or {})
+        if "thread_id" not in configurable:
+            return
+        session_id = await self._ensure_session_id(configurable)
+        events = await self._thread_events(session_id)
+        if self._is_deleted(events):
+            return
+
+        checkpoint_ns = str(configurable.get("checkpoint_ns") or "")
+        before_id = _configurable(before or {}).get("checkpoint_id")
+        metadata_filter = dict(filter or {})
+        checkpoint_events = [
+            event
+            for event in events
+            if event.kind == "langgraph_checkpoint"
+            and (event.payload or {}).get("checkpoint_ns", "") == checkpoint_ns
+        ]
+        if before_id is not None:
+            before_index = None
+            for idx, event in enumerate(checkpoint_events):
+                if (event.payload or {}).get("checkpoint_id") == before_id:
+                    before_index = idx
+                    break
+            checkpoint_events = checkpoint_events[: before_index or 0]
+
+        emitted = 0
+        max_items = limit if limit is not None else len(checkpoint_events)
+        for event in reversed(checkpoint_events):
+            payload = event.payload or {}
+            metadata = payload.get("metadata") or {}
+            if any(metadata.get(key) != value for key, value in metadata_filter.items()):
+                continue
+            if emitted >= max_items:
+                break
+            yield self._tuple_from_event(event, events, session_id)
+            emitted += 1
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        configurable = {"thread_id": thread_id}
+        session_id = await self._ensure_session_id(configurable)
+        payload = {"schema_version": SCHEMA_VERSION, "thread_id": thread_id}
+        session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
+        result = await session.append(
+            payload,
+            kind="langgraph_thread_deleted",
+            idempotency_key=f"langgraph-thread-delete:{thread_id}",
+        )
+        await self.client.write_record(
+            self.tenant_id,
+            namespace=self.thread_namespace,
+            text=_compact({**payload, "session_id": session_id, "deleted": True}),
+            metadata={**payload, "session_id": session_id, "deleted": True, "seq": result.seq},
+            tags=["langgraph", "thread", f"thread:{thread_id}", "deleted"],
+            source={"session_id": session_id, "seq": result.seq},
+        )
+
+    async def _ensure_session_id(self, configurable: Mapping[str, Any]) -> str:
+        existing = configurable.get("agentdb_session_id")
+        if existing:
+            return str(existing)
+
+        thread_id = _required(configurable, "thread_id")
+        rows = await self.client.search_records(
+            self.tenant_id,
+            namespace=self.thread_namespace,
+            tags=[f"thread:{thread_id}"],
+            limit=1,
+        )
+        if rows:
+            metadata = rows[0].get("metadata") or {}
+            session_id = metadata.get("session_id")
+            if session_id:
+                return str(session_id)
+
+        try:
+            session = await self.client.create_session(self.tenant_id, self.agent_id, alias=thread_id)
+        except Exception:
+            rows = await self.client.search_records(
+                self.tenant_id,
+                namespace=self.thread_namespace,
+                tags=[f"thread:{thread_id}"],
+                limit=1,
+            )
+            if rows:
+                metadata = rows[0].get("metadata") or {}
+                session_id = metadata.get("session_id")
+                if session_id:
+                    return str(session_id)
+            raise
+
+        session_id = session.session_id
+        payload = {"schema_version": SCHEMA_VERSION, "thread_id": thread_id, "session_id": session_id}
+        await self.client.write_record(
+            self.tenant_id,
+            namespace=self.thread_namespace,
+            text=_compact(payload),
+            metadata=payload,
+            tags=["langgraph", "thread", f"thread:{thread_id}", f"session:{session_id}"],
+        )
+        return session_id
+
+    async def _thread_events(self, session_id: str) -> list:
+        session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
+        return await session.replay(limit=self.replay_limit)
+
+    def _is_deleted(self, events: Iterable[Any]) -> bool:
+        return any(event.kind == "langgraph_thread_deleted" for event in events)
+
+    def _tuple_from_event(self, event: Any, events: Iterable[Any], session_id: str) -> CheckpointTuple:
+        payload = event.payload or {}
+        thread_id = payload.get("thread_id")
+        checkpoint_ns = payload.get("checkpoint_ns", "")
+        checkpoint_id = payload.get("checkpoint_id")
+        parent_checkpoint_id = payload.get("parent_checkpoint_id")
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_id": checkpoint_id,
+                "agentdb_session_id": session_id,
+            }
+        }
+        parent_config = None
+        if parent_checkpoint_id:
+            parent_config = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
+                    "checkpoint_id": parent_checkpoint_id,
+                    "agentdb_session_id": session_id,
+                }
+            }
+        return CheckpointTuple(
+            config=config,
+            checkpoint=dict(payload.get("checkpoint") or {}),
+            metadata=dict(payload.get("metadata") or {}),
+            parent_config=parent_config,
+            pending_writes=self._pending_writes(events, checkpoint_ns, checkpoint_id),
+        )
+
+    def _pending_writes(
+        self,
+        events: Iterable[Any],
+        checkpoint_ns: str,
+        checkpoint_id: Optional[str],
+    ) -> tuple:
+        writes = []
+        seen = set()
+        for event in events:
+            if event.kind != "langgraph_pending_writes":
+                continue
+            payload = event.payload or {}
+            if payload.get("checkpoint_ns", "") != checkpoint_ns:
+                continue
+            if payload.get("checkpoint_id") != checkpoint_id:
+                continue
+            task_id = payload.get("task_id")
+            for channel, value in payload.get("writes") or []:
+                key = (task_id, channel)
+                if key in seen:
+                    continue
+                seen.add(key)
+                writes.append((task_id, channel, value))
+        return tuple(writes)
 
 
 def _configurable(config: Mapping[str, Any]) -> Dict[str, Any]:
