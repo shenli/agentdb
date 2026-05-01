@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import dataclasses
 import json as jsonlib
+import os
 import uuid
 from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import requests
 
 from ._sse import parse_lines
+from .conventions import (
+    SessionEventKind,
+    agent_status as agent_status_payload,
+    model_message as model_message_payload,
+    tool_call as tool_call_payload,
+    tool_result as tool_result_payload,
+    user_message as user_message_payload,
+)
 from .errors import AgentDBError, SubscriptionClosed, from_response
 
 TenantId = str
@@ -69,6 +78,379 @@ class WatchItem:
     @classmethod
     def from_dict(cls, d: dict) -> "WatchItem":
         return cls(cursor=d["cursor"], event=Event.from_dict(d["event"]))
+
+
+class AgentDB:
+    """Developer-friendly AgentDB entry point.
+
+    `Client` remains the low-level tenant-scoped API. `AgentDB` binds that
+    tenant once as a workspace so normal agent code does not thread `tenant_id`
+    through every call.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "",
+        *,
+        auth: Optional[tuple] = None,
+        token: Optional[str] = None,
+        get_token: Optional[Callable[[], str]] = None,
+        timeout: float = 30.0,
+        _client: Optional["Client"] = None,
+    ) -> None:
+        self.client = _client or Client(
+            base_url,
+            auth=auth,
+            token=token,
+            get_token=get_token,
+            timeout=timeout,
+        )
+
+    def health_ready(self) -> bool:
+        return self.client.health_ready()
+
+    def workspace(
+        self,
+        name: Optional[str] = None,
+        *,
+        tenant_id: Optional[TenantId] = None,
+        policy: Optional[dict] = None,
+    ) -> "Workspace":
+        """Create a workspace or bind an existing tenant id.
+
+        Pass `tenant_id` when the caller already has a tenant from auth/admin
+        setup. Pass `name` for local/dev flows that bootstrap a tenant by
+        external key.
+        """
+
+        if tenant_id is not None:
+            return Workspace(self.client, tenant_id, name=name)
+        external_key = name or os.environ.get("AGENTDB_WORKSPACE") or "default"
+        tenant = self.client.create_tenant(external_key, policy=policy)
+        return Workspace(
+            self.client,
+            tenant["tenant_id"],
+            name=external_key,
+            data=tenant,
+        )
+
+    def session(
+        self,
+        session_id: SessionId,
+        *,
+        tenant_id: TenantId,
+        agent_id: Optional[AgentId] = None,
+    ) -> "SessionHandle":
+        return Workspace(self.client, tenant_id).session(session_id, agent_id=agent_id)
+
+
+class Workspace:
+    def __init__(
+        self,
+        client: "Client",
+        tenant_id: TenantId,
+        *,
+        name: Optional[str] = None,
+        data: Optional[dict] = None,
+    ) -> None:
+        self._client = client
+        self.tenant_id = tenant_id
+        self.name = name
+        self.data = data or {"tenant_id": tenant_id}
+        self.artifacts = ArtifactCollection(self)
+        self.records = RecordCollection(self)
+        self.skills = SkillCollection(self)
+
+    @property
+    def id(self) -> TenantId:
+        return self.tenant_id
+
+    def agent(
+        self,
+        alias: Optional[str] = None,
+        *,
+        agent_id: Optional[AgentId] = None,
+        config: Optional[dict] = None,
+    ) -> "AgentHandle":
+        if agent_id is not None:
+            return AgentHandle(self, agent_id, alias=alias)
+        data = self._client.create_agent(self.tenant_id, alias=alias, config=config)
+        return AgentHandle(self, data["agent_id"], alias=alias, data=data)
+
+    def session(
+        self,
+        session_id: SessionId,
+        *,
+        agent_id: Optional[AgentId] = None,
+    ) -> "SessionHandle":
+        return SessionHandle(self, self._client.session(self.tenant_id, session_id, agent_id=agent_id))
+
+    def watch(
+        self,
+        *,
+        scope: str = "tenant",
+        session_id: Optional[SessionId] = None,
+        agent_id: Optional[AgentId] = None,
+        from_cursor: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[WatchItem]:
+        return self._client.watch(
+            self.tenant_id,
+            scope=scope,
+            session_id=session_id,
+            agent_id=agent_id,
+            from_cursor=from_cursor,
+            limit=limit,
+        )
+
+
+class AgentHandle:
+    def __init__(
+        self,
+        workspace: Workspace,
+        agent_id: AgentId,
+        *,
+        alias: Optional[str] = None,
+        data: Optional[dict] = None,
+    ) -> None:
+        self.workspace = workspace
+        self.agent_id = agent_id
+        self.alias = alias
+        self.data = data or {"agent_id": agent_id}
+
+    @property
+    def id(self) -> AgentId:
+        return self.agent_id
+
+    def session(
+        self,
+        alias: Optional[str] = None,
+        *,
+        session_id: Optional[SessionId] = None,
+    ) -> "SessionHandle":
+        if session_id is not None:
+            session = self.workspace._client.session(
+                self.workspace.tenant_id,
+                session_id,
+                agent_id=self.agent_id,
+            )
+            return SessionHandle(self.workspace, session, agent=self)
+        session = self.workspace._client.create_session(
+            self.workspace.tenant_id,
+            self.agent_id,
+            alias=alias,
+        )
+        return SessionHandle(self.workspace, session, agent=self)
+
+    def bind_skill(self, skill_id: SkillId, *, idempotency_key: Optional[str] = None) -> dict:
+        return self.workspace._client.bind_skill(
+            self.workspace.tenant_id,
+            self.agent_id,
+            skill_id,
+            idempotency_key=idempotency_key,
+        )
+
+
+class SessionHandle:
+    def __init__(
+        self,
+        workspace: Workspace,
+        session: "Session",
+        *,
+        agent: Optional[AgentHandle] = None,
+    ) -> None:
+        self.workspace = workspace
+        self._session = session
+        self.agent = agent
+        self.artifacts = ArtifactCollection(workspace)
+        self.records = RecordCollection(workspace)
+        self.skills = SkillCollection(workspace)
+
+    @property
+    def id(self) -> SessionId:
+        return self._session.session_id
+
+    @property
+    def session_id(self) -> SessionId:
+        return self._session.session_id
+
+    @property
+    def agent_id(self) -> Optional[AgentId]:
+        return self._session.agent_id
+
+    def append(self, payload: Any, **kwargs: Any) -> AppendResult:
+        return self._session.append(payload, **kwargs)
+
+    def append_and_fetch(self, payload: Any, **kwargs: Any) -> AppendResult:
+        return self._session.append_and_fetch(payload, **kwargs)
+
+    def append_user(
+        self,
+        text: str,
+        *,
+        role: str = "user",
+        user_id: Optional[str] = None,
+        channel: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        fetch_last_n: int = 0,
+        idempotency_key: Optional[str] = None,
+    ) -> AppendResult:
+        return self.append(
+            user_message_payload(
+                text,
+                role=role,
+                user_id=user_id,
+                channel=channel,
+                metadata=metadata,
+            ),
+            kind=SessionEventKind.USER_MESSAGE.value,
+            fetch_last_n=fetch_last_n,
+            idempotency_key=idempotency_key,
+        )
+
+    def model_message(
+        self,
+        text: str,
+        *,
+        source_refs: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AppendResult:
+        return self.append(
+            model_message_payload(text, **kwargs),
+            kind=SessionEventKind.MODEL_MESSAGE.value,
+            source_refs=source_refs,
+            idempotency_key=idempotency_key,
+        )
+
+    def tool_call(
+        self,
+        tool_call_id: str,
+        tool: str,
+        input: dict,
+        *,
+        source_refs: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AppendResult:
+        return self.append(
+            tool_call_payload(tool_call_id, tool, input, **kwargs),
+            kind=SessionEventKind.TOOL_CALL.value,
+            source_refs=source_refs,
+            idempotency_key=idempotency_key,
+        )
+
+    def tool_result(
+        self,
+        tool_call_id: str,
+        summary: str,
+        *,
+        artifacts: Optional[Sequence[dict]] = None,
+        source_refs: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
+        **kwargs: Any,
+    ) -> AppendResult:
+        return self.append(
+            tool_result_payload(tool_call_id, summary, **kwargs),
+            kind=SessionEventKind.TOOL_RESULT.value,
+            artifact_refs=[artifact_ref(artifact) for artifact in artifacts or []],
+            source_refs=source_refs,
+            idempotency_key=idempotency_key,
+        )
+
+    def agent_status(self, status: str, **kwargs: Any) -> AppendResult:
+        return self.append(
+            agent_status_payload(status, **kwargs),
+            kind=SessionEventKind.AGENT_STATUS.value,
+        )
+
+    def fetch(self, **kwargs: Any) -> List[Event]:
+        return self._session.fetch(**kwargs)
+
+    def fetch_recent(self, **kwargs: Any) -> List[Event]:
+        return self._session.fetch_recent(**kwargs)
+
+    def replay(self, **kwargs: Any) -> List[Event]:
+        return self._session.replay(**kwargs)
+
+    def fork(self, child_session_id: Optional[str] = None, **kwargs: Any) -> "SessionHandle":
+        return SessionHandle(self.workspace, self._session.fork(child_session_id, **kwargs), agent=self.agent)
+
+    def subscribe(self, **kwargs: Any) -> Iterator[Event]:
+        return self._session.subscribe(**kwargs)
+
+    def context(self, **kwargs: Any) -> dict:
+        return self._session.context(**kwargs)
+
+    def raw(self) -> "Session":
+        return self._session
+
+
+class ArtifactCollection:
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
+    def put(
+        self,
+        data: bytes,
+        *,
+        content_type: Optional[str] = None,
+        sha256: Optional[str] = None,
+    ) -> dict:
+        return self._workspace._client.put_artifact(
+            self._workspace.tenant_id,
+            data,
+            content_type=content_type,
+            sha256=sha256,
+        )
+
+    def get(self, artifact_id: ArtifactId) -> dict:
+        return self._workspace._client.get_artifact(self._workspace.tenant_id, artifact_id)
+
+    def blob(self, artifact_id: ArtifactId) -> bytes:
+        return self._workspace._client.get_artifact_blob(self._workspace.tenant_id, artifact_id)
+
+
+class RecordCollection:
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
+    def write(self, **body: Any) -> dict:
+        return self._workspace._client.write_record(self._workspace.tenant_id, **body)
+
+    def search(self, **body: Any) -> list:
+        return self._workspace._client.search_records(self._workspace.tenant_id, **body)
+
+
+class SkillCollection:
+    def __init__(self, workspace: Workspace) -> None:
+        self._workspace = workspace
+
+    def register(
+        self,
+        *,
+        name: str,
+        version: str,
+        manifest: Optional[dict] = None,
+        artifact_refs: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        return self._workspace._client.register_skill(
+            self._workspace.tenant_id,
+            name=name,
+            version=version,
+            manifest=manifest,
+            artifact_refs=artifact_refs,
+            idempotency_key=idempotency_key,
+        )
+
+
+def artifact_ref(artifact: dict) -> dict:
+    ref = {"artifact_id": artifact["artifact_id"]}
+    for key in ("content_type", "bytes", "sha256"):
+        if artifact.get(key) is not None:
+            ref[key] = artifact[key]
+    return ref
 
 
 class Client:
@@ -289,6 +671,10 @@ class Session:
         self.tenant_id = tenant_id
         self.session_id = session_id
         self.agent_id = agent_id
+
+    @property
+    def id(self) -> SessionId:
+        return self.session_id
 
     def append(
         self,

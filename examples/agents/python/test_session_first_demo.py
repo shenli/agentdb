@@ -4,6 +4,7 @@ import itertools
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from agentdb import AgentDB
 from session_first_demo import run_demo
 
 
@@ -138,7 +139,7 @@ class FakeSession:
 
 
 def test_session_first_demo_replays_recovers_and_validates() -> None:
-    result = run_demo(FakeClient(), tenant_key="offline-demo")
+    result = run_demo(AgentDB(_client=FakeClient()), tenant_key="offline-demo")
 
     assert result["event_kinds"] == [
         "user_message",
