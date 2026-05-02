@@ -1,6 +1,6 @@
 <div align="center">
   <h1>AgentDB</h1>
-  <h3>Cost-efficient runtime state for AI agents.</h3>
+  <h3>Scalable, durable, cost-efficient runtime state for AI agents.</h3>
 </div>
 
 <div align="center">
@@ -11,23 +11,24 @@
 
 <br>
 
-AgentDB is a runtime database for AI agent platforms. It gives agent harnesses
-a durable session log outside the model context window, so progress survives
-process restarts, context truncation, tool failures, and long-running workflows.
+AgentDB is a runtime database for AI agent platforms, built for the workload
+shape of autonomous agents: many ordered session events, large tool/model
+outputs, long-running tasks, sparse tenant traffic, and retained history. It
+stores durable execution state outside the model context window so agents can
+resume, replay, fork, inspect, and stream work without forcing every application
+to rebuild session semantics on top of a generic database.
 
 **What AgentDB gives you:**
 
-- **Recoverable sessions** — stateless harnesses can wake from `session_id`,
-  read the event log, append the next event, replay history, or fork a run
-- **Debuggable execution history** — model outputs, tool calls, tool results,
-  artifacts, and policy decisions are preserved as ordered session events
-- **Cost-efficient state** — hot session metadata stays focused; large
-  artifacts and cold state can live in cheaper durable storage instead of hot
-  global indexes
-- **Agent-native primitives** — tenants, agents, sessions, events, artifacts,
-  searchable records, skills, policy, context packs, and lifecycle state
-- **Operational visibility** — dashboard, watch streams, structured errors,
-  runbooks, health checks, and deployment docs
+- **Session-native runtime semantics** — tenant-scoped agents, sessions,
+  ordered events, artifacts, records, skills, policy, replay, fork, subscribe,
+  context, and lifecycle state
+- **Object-store based storage engine** — scale retained history and keep costs
+  predictable by separating hot session metadata from cold events, large
+  artifacts, and derived state
+- **Operate and debug agent runs** — dashboard, watch streams, structured
+  errors, runbooks, health checks, and deployment docs make runtime state
+  inspectable
 - **SDK and adapter surfaces** — Python and TypeScript clients plus LangGraph,
   OpenAI Agents SDK, MCP, and Vercel AI SDK integration paths
 
