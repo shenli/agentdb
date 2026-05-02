@@ -4,6 +4,10 @@ import itertools
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from _bootstrap import ensure_repo_python_client_on_path
+
+ensure_repo_python_client_on_path()
+
 from agentdb import AgentDB
 from session_first_demo import run_demo
 

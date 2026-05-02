@@ -19,7 +19,7 @@ pub struct Skill {
     pub manifest: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_refs: Vec<ArtifactRef>,
-    pub schema_version: String,
+    pub runtime_version: String,
     pub created_at_ms: u64,
     pub deleted_at_ms: Option<u64>,
 }
@@ -42,7 +42,7 @@ impl Skill {
             version: req.version,
             manifest: req.manifest,
             artifact_refs: req.artifact_refs,
-            schema_version: crate::VERSION.to_string(),
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
             created_at_ms: crate::now_ms(),
             deleted_at_ms: None,
         }

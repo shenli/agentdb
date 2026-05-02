@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
-from .checkpoint import SCHEMA_VERSION, _compact
+from .checkpoint import PAYLOAD_SCHEMA_VERSION, RUNTIME_VERSION, _compact
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,8 @@ class AgentDBStore:
     ) -> Mapping[str, Any]:
         ns = self._namespace(namespace)
         body = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "key": key,
             "value": value,
             "metadata": dict(metadata or {}),
@@ -112,7 +113,8 @@ class AgentDBAsyncStore:
     ) -> Mapping[str, Any]:
         ns = self._namespace(namespace)
         body = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "key": key,
             "value": value,
             "metadata": dict(metadata or {}),
@@ -159,7 +161,8 @@ class AgentDBAsyncStore:
     async def adelete(self, namespace: Sequence[str], key: str) -> None:
         ns = self._namespace(namespace)
         body = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "key": key,
             "value": None,
             "metadata": {},

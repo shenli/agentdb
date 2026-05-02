@@ -22,7 +22,12 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from urllib.parse import urlencode
 from typing import Any
+
+from _bootstrap import ensure_repo_python_client_on_path
+
+ensure_repo_python_client_on_path()
 
 from agentdb import (
     AgentDB,
@@ -146,10 +151,21 @@ def main() -> None:
         )
 
     result = run_demo(db)
+    dashboard_url = (
+        f"{SERVER_URL.rstrip('/')}/dashboard/?"
+        + urlencode(
+            {
+                "tenant_id": result["workspace_id"],
+                "agent_id": result["agent_id"],
+                "session_id": result["session_id"],
+            }
+        )
+    )
     print(f"# workspace: {result['workspace_id']}")
     print(f"# agent:     {result['agent_id']}")
     print(f"# session: {result['session_id']}")
     print(f"# artifact:{result['artifact_id']}")
+    print(f"# dashboard:{dashboard_url}")
     print("\n# ordered session timeline")
     for index, kind in enumerate(result["event_kinds"]):
         print(f"  {index:>2}: {kind}")

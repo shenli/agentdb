@@ -39,7 +39,7 @@ All conventions use the existing event envelope:
   "event_id": "evt_...",
   "seq": 42,
   "kind": "tool_result",
-  "schema_version": "2026-04-28",
+  "runtime_version": "2026-04-28",
   "payload": {},
   "artifact_refs": [],
   "source_refs": [],
@@ -56,8 +56,10 @@ Rules:
   `payload`.
 - `source_refs` points to the session events, artifacts, records, or skills that
   caused or informed this event.
-- `schema_version` is the runtime envelope schema version. Payloads that need
-  their own independent version should include `payload.schema_version`.
+- `runtime_version` is the release identifier of the runtime that wrote the
+  event. Treat it as opaque provenance, not as a compatibility contract.
+- Payloads that need their own independent version should include
+  `payload.schema_version`.
 - Unknown payload fields must be ignored by readers.
 - Missing optional payload fields must not make replay impossible.
 

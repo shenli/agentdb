@@ -13,8 +13,10 @@
 //!   resources.
 //! - [`Error`] / [`ErrorCode`] — structured runtime errors.
 
-/// Schema/API version, ISO date — opaque, do not parse.
-pub const VERSION: &str = "2026-04-28";
+/// Runtime release identifier, ISO date — opaque, do not parse.
+pub const RUNTIME_VERSION: &str = "2026-04-28";
+/// Backward-compatible alias for callers that still use the old name.
+pub const VERSION: &str = RUNTIME_VERSION;
 
 pub mod agent;
 pub mod artifact;

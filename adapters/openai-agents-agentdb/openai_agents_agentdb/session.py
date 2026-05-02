@@ -6,7 +6,8 @@ import uuid
 from typing import Any, Iterable, List, Optional
 
 
-SCHEMA_VERSION = "2026-04-28"
+PAYLOAD_SCHEMA_VERSION = 1
+RUNTIME_VERSION = "2026-04-28"
 ITEM_ADDED = "openai_agents_session_items_added"
 ITEM_POPPED = "openai_agents_session_item_popped"
 SESSION_CLEARED = "openai_agents_session_cleared"
@@ -59,7 +60,8 @@ class AgentDBSession:
             return
         await self._session().append(
             {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": PAYLOAD_SCHEMA_VERSION,
+                "runtime_version": RUNTIME_VERSION,
                 "session_id": self.session_id,
                 "items": normalized,
             },
@@ -74,7 +76,8 @@ class AgentDBSession:
         item = items[-1]
         await self._session().append(
             {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": PAYLOAD_SCHEMA_VERSION,
+                "runtime_version": RUNTIME_VERSION,
                 "session_id": self.session_id,
                 "item": item,
             },
@@ -86,7 +89,8 @@ class AgentDBSession:
     async def clear_session(self) -> None:
         await self._session().append(
             {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": PAYLOAD_SCHEMA_VERSION,
+                "runtime_version": RUNTIME_VERSION,
                 "session_id": self.session_id,
             },
             kind=SESSION_CLEARED,

@@ -17,6 +17,30 @@
     </header>
 
     <main class="shell">
+      <section class="workspace browser-shell">
+        <section class="panel" aria-label="Tenant browser">
+          <div class="section-head">
+            <h2>Tenants</h2>
+            <span id="tenantCount">0 tenants</span>
+          </div>
+          <div class="actions compact-actions">
+            <button data-action="tenants">Refresh tenants</button>
+          </div>
+          <div id="tenants" class="rows browser-rows"></div>
+        </section>
+
+        <section class="panel" aria-label="Session browser">
+          <div class="section-head">
+            <h2>Sessions</h2>
+            <span id="sessionCount">0 sessions</span>
+          </div>
+          <div class="actions compact-actions">
+            <button data-action="sessions">Refresh sessions</button>
+          </div>
+          <div id="sessions" class="rows browser-rows"></div>
+        </section>
+      </section>
+
       <section class="panel context-panel" aria-label="Session context">
         <div class="grid ids">
           <label>Tenant ID <input id="tenantId" autocomplete="off" placeholder="ten_..." /></label>

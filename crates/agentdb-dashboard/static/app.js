@@ -3,6 +3,8 @@ const storeKey = "agentdb.v28.dashboard";
 const state = {
   events: [],
   forks: [],
+  tenants: [],
+  sessions: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -14,10 +16,16 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   renderTimeline();
   renderForkTree();
+  renderTenantBrowser();
+  renderSessionBrowser();
+  loadTenants();
+  maybeAutoloadFromUrl();
 });
 
 function dispatch(action) {
   const actions = {
+    tenants: loadTenants,
+    sessions: loadSessions,
     load: loadTimeline,
     replay: replaySession,
     subscribe: subscribeSession,
@@ -32,7 +40,7 @@ function dispatch(action) {
   return actions[action] && actions[action]();
 }
 
-function readConfig() {
+function readConfig(requireIds = true) {
   const cfg = {
     tenantId: $("tenantId").value.trim(),
     sessionId: $("sessionId").value.trim(),
@@ -42,22 +50,88 @@ function readConfig() {
     token: $("token").value.trim(),
   };
   localStorage.setItem(storeKey, JSON.stringify(cfg));
-  if (!cfg.tenantId) throw new Error("tenant_id is required");
-  if (!cfg.sessionId) throw new Error("session_id is required");
+  syncUrl(cfg);
+  if (requireIds) {
+    if (!cfg.tenantId) throw new Error("tenant_id is required");
+    if (!cfg.sessionId) throw new Error("session_id is required");
+  }
   return cfg;
 }
 
 function restoreInputs() {
   try {
-    const cfg = JSON.parse(localStorage.getItem(storeKey) || "{}");
+    const cfg = {
+      ...JSON.parse(localStorage.getItem(storeKey) || "{}"),
+      ...configFromQuery(),
+    };
     for (const [key, value] of Object.entries(cfg)) {
       if ($(key) && value !== undefined) $(key).value = value;
     }
   } catch (_) {}
 }
 
+function configFromQuery() {
+  const params = new URLSearchParams(window.location.search);
+  const cfg = {};
+  mapQueryParam(params, cfg, "tenantId", ["tenantId", "tenant_id"]);
+  mapQueryParam(params, cfg, "sessionId", ["sessionId", "session_id"]);
+  mapQueryParam(params, cfg, "agentId", ["agentId", "agent_id"]);
+  mapQueryParam(params, cfg, "fromSeq", ["fromSeq", "from_seq"]);
+  mapQueryParam(params, cfg, "limit", ["limit"]);
+  mapQueryParam(params, cfg, "token", ["token"]);
+  return cfg;
+}
+
+function mapQueryParam(params, cfg, key, names) {
+  for (const name of names) {
+    const value = params.get(name);
+    if (value) {
+      cfg[key] = value;
+      return;
+    }
+  }
+}
+
+function syncUrl(cfg) {
+  const url = new URL(window.location.href);
+  setQueryValue(url.searchParams, "tenant_id", cfg.tenantId);
+  setQueryValue(url.searchParams, "session_id", cfg.sessionId);
+  setQueryValue(url.searchParams, "agent_id", cfg.agentId);
+  setQueryValue(url.searchParams, "from_seq", String(cfg.fromSeq || 0));
+  setQueryValue(url.searchParams, "limit", String(cfg.limit || 100));
+  if (cfg.token) {
+    setQueryValue(url.searchParams, "token", cfg.token);
+  } else {
+    url.searchParams.delete("token");
+  }
+  window.history.replaceState({}, "", url);
+}
+
+function setQueryValue(params, key, value) {
+  if (value && value !== "0" && value !== "100") {
+    params.set(key, value);
+    return;
+  }
+  if ((key === "from_seq" && value === "0") || (key === "limit" && value === "100")) {
+    params.delete(key);
+    return;
+  }
+  if (value) {
+    params.set(key, value);
+  } else {
+    params.delete(key);
+  }
+}
+
+function maybeAutoloadFromUrl() {
+  const cfg = configFromQuery();
+  if (cfg.tenantId && cfg.sessionId) {
+    loadTimeline();
+  }
+}
+
 async function request(path, options = {}) {
-  const cfg = readConfig();
+  const cfg = readConfig(options.requireIds !== false);
   const headers = new Headers(options.headers || {});
   applyAuth(headers, cfg);
   if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -68,6 +142,35 @@ async function request(path, options = {}) {
   setConnection("ok");
   setRaw(body);
   return body;
+}
+
+async function loadTenants() {
+  try {
+    const data = await request("/api/tenants", { requireIds: false });
+    state.tenants = data.tenants || [];
+    renderTenantBrowser();
+    if ($("tenantId").value.trim()) {
+      loadSessions();
+    }
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function loadSessions() {
+  try {
+    const cfg = readConfig(false);
+    if (!cfg.tenantId) {
+      state.sessions = [];
+      renderSessionBrowser();
+      return;
+    }
+    const data = await request(`/api/tenants/${enc(cfg.tenantId)}/sessions`, { requireIds: false });
+    state.sessions = data.sessions || [];
+    renderSessionBrowser();
+  } catch (err) {
+    fail(err);
+  }
 }
 
 async function loadTimeline() {
@@ -231,10 +334,18 @@ function renderTimeline() {
           <span>${escapeHtml(event.kind || "event")}</span>
           <time>${formatTime(event.created_at_ms)}</time>
         </div>
-        <div class="summary">${escapeHtml(summary(event.payload))}</div>
+        <pre class="summary">${escapeHtml(summary(event))}</pre>
         <div class="refs">${artifactRefs(event)}</div>
       `;
       item.addEventListener("click", () => setRaw(event));
+      item.querySelectorAll("[data-artifact]").forEach((button) => {
+        button.addEventListener("click", (clickEvent) => {
+          clickEvent.stopPropagation();
+          const artifactId = button.dataset.artifact || "";
+          $("artifactId").value = artifactId;
+          loadArtifact();
+        });
+      });
       root.append(item);
     });
 }
@@ -251,6 +362,62 @@ function renderForkTree() {
     row.className = "edge";
     row.textContent = `${edge.parent_session_id || edge.parent || "parent"} -> ${edge.child_session_id || edge.child || "child"} @ ${edge.at_seq ?? "-"}`;
     root.append(row);
+  });
+}
+
+function renderTenantBrowser() {
+  $("tenantCount").textContent = `${state.tenants.length} tenants`;
+  const root = $("tenants");
+  root.textContent = "";
+  if (!state.tenants.length) {
+    root.append(empty("No tenants"));
+    return;
+  }
+  state.tenants.forEach((tenant) => {
+    const node = document.createElement("button");
+    node.className = "row browser-row";
+    node.type = "button";
+    node.innerHTML = `
+      <strong>${escapeHtml(tenant.external_key || "(no external key)")}</strong>
+      <span>${escapeHtml(tenant.tenant_id || "")}</span>
+    `;
+    node.addEventListener("click", () => {
+      $("tenantId").value = tenant.tenant_id || "";
+      $("sessionId").value = "";
+      $("agentId").value = "";
+      state.sessions = [];
+      renderSessionBrowser();
+      readConfig(false);
+      loadSessions();
+    });
+    root.append(node);
+  });
+}
+
+function renderSessionBrowser() {
+  $("sessionCount").textContent = `${state.sessions.length} sessions`;
+  const root = $("sessions");
+  root.textContent = "";
+  if (!state.sessions.length) {
+    root.append(empty("No sessions for selected tenant"));
+    return;
+  }
+  state.sessions.forEach((session) => {
+    const node = document.createElement("button");
+    node.className = "row browser-row";
+    node.type = "button";
+    node.innerHTML = `
+      <strong>${escapeHtml(session.alias || "(no alias)")}</strong>
+      <span>${escapeHtml(session.session_id || "")}</span>
+      <span>agent ${escapeHtml(session.agent_id || "")}</span>
+    `;
+    node.addEventListener("click", () => {
+      $("sessionId").value = session.session_id || "";
+      $("agentId").value = session.agent_id || "";
+      readConfig(false);
+      loadTimeline();
+    });
+    root.append(node);
   });
 }
 
@@ -321,9 +488,40 @@ function setRaw(value) {
   $("raw").textContent = typeof value === "string" ? value : stringify(value);
 }
 
-function summary(value) {
-  const text = stringify(value);
+function summary(event) {
+  const payload = event && event.payload ? event.payload : {};
+  const text = eventSummary(event.kind, payload);
   return text.length > 220 ? `${text.slice(0, 220)}...` : text;
+}
+
+function eventSummary(kind, payload) {
+  const lines = [];
+  if (kind === "user_message" || kind === "model_message") {
+    if (payload.role) lines.push(`role: ${payload.role}`);
+    if (payload.text) lines.push(payload.text);
+  } else if (kind === "tool_call") {
+    if (payload.tool) lines.push(`tool: ${payload.tool}`);
+    if (payload.tool_call_id) lines.push(`call: ${payload.tool_call_id}`);
+    if (payload.input && payload.input.cmd) lines.push(`cmd: ${payload.input.cmd}`);
+    if (payload.timeout_ms !== undefined) lines.push(`timeout: ${payload.timeout_ms}ms`);
+  } else if (kind === "tool_result") {
+    if (payload.status) lines.push(`status: ${payload.status}`);
+    if (payload.summary) lines.push(payload.summary);
+    if (payload.output && payload.output.preview) lines.push(`preview: ${payload.output.preview}`);
+    if (payload.duration_ms !== undefined) lines.push(`duration: ${payload.duration_ms}ms`);
+  } else if (kind === "context_pack_built") {
+    if (payload.context_pack_id) lines.push(`context pack: ${payload.context_pack_id}`);
+    if (payload.include) lines.push(`include: ${payload.include.join(", ")}`);
+    if (payload.selected_event_count !== undefined) {
+      lines.push(`selected events: ${payload.selected_event_count}`);
+    }
+  } else if (kind === "agent_status") {
+    if (payload.status) lines.push(`status: ${payload.status}`);
+    if (payload.summary) lines.push(payload.summary);
+    if (payload.last_seen_seq !== undefined) lines.push(`last seen seq: ${payload.last_seen_seq}`);
+  }
+  if (!lines.length) return stringify(payload);
+  return lines.join("\n");
 }
 
 function stringify(value) {

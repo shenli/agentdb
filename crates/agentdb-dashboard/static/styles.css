@@ -121,10 +121,19 @@ label {
   margin-top: 14px;
 }
 
+.compact-actions {
+  margin-top: 0;
+  margin-bottom: 12px;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(280px, 0.8fr);
   gap: 16px;
+}
+
+.browser-shell {
+  grid-template-columns: minmax(280px, 0.9fr) minmax(280px, 1.1fr);
 }
 
 .lower {
@@ -187,10 +196,12 @@ label {
 
 .summary {
   margin-top: 6px;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.45;
+  margin-bottom: 0;
 }
 
 .refs {
@@ -230,6 +241,21 @@ label {
   width: 100%;
   text-align: left;
   overflow-wrap: anywhere;
+}
+
+.browser-rows {
+  max-height: 280px;
+  overflow: auto;
+}
+
+.browser-row {
+  display: grid;
+  gap: 4px;
+}
+
+.browser-row span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .preview, .raw {

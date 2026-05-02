@@ -40,7 +40,7 @@ class Event:
     seq: int
     kind: str
     payload: Any
-    schema_version: int = 1
+    runtime_version: str = ""
     artifact_refs: List[dict] = dataclasses.field(default_factory=list)
     source_refs: List[dict] = dataclasses.field(default_factory=list)
     metadata_key_id: Optional[str] = None
@@ -57,7 +57,7 @@ class Event:
             seq=d["seq"],
             kind=d["kind"],
             payload=d.get("payload"),
-            schema_version=d.get("schema_version", 1),
+            runtime_version=_runtime_version_from_dict(d),
             artifact_refs=list(d.get("artifact_refs") or []),
             source_refs=list(d.get("source_refs") or []),
             metadata_key_id=d.get("metadata_key_id"),
@@ -85,6 +85,12 @@ class AppendResult:
 
     def ref(self) -> dict:
         return {"event_id": self.event_id}
+
+def _runtime_version_from_dict(d: dict) -> str:
+    runtime_version = d.get("runtime_version")
+    if isinstance(runtime_version, str):
+        return runtime_version
+    return ""
 
 
 @dataclasses.dataclass

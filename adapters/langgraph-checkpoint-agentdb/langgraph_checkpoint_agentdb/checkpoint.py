@@ -14,7 +14,8 @@ from typing import Any, AsyncIterator, Dict, Iterable, Iterator, Mapping, Option
 from agentdb import SessionEventKind, agent_status, validate_adapter_events
 
 
-SCHEMA_VERSION = "2026-04-28"
+PAYLOAD_SCHEMA_VERSION = 1
+RUNTIME_VERSION = "2026-04-28"
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,8 @@ class AgentDBSaver:
             raise ValueError("checkpoint must contain id or checkpoint_id")
 
         payload = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "thread_id": thread_id,
             "checkpoint_id": checkpoint_id,
             "checkpoint": dict(checkpoint),
@@ -111,7 +113,8 @@ class AgentDBSaver:
         session_id = _required(configurable, "agentdb_session_id")
         checkpoint_id = configurable.get("checkpoint_id")
         payload = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "thread_id": thread_id,
             "checkpoint_id": checkpoint_id,
             "task_id": task_id,
@@ -275,7 +278,8 @@ class AgentDBAsyncSaver:
             raise ValueError("checkpoint must contain id or checkpoint_id")
 
         payload = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
             "checkpoint_id": checkpoint_id,
@@ -321,7 +325,8 @@ class AgentDBAsyncSaver:
         session_id = await self._ensure_session_id(configurable)
         checkpoint_id = configurable.get("checkpoint_id")
         payload = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
             "checkpoint_id": checkpoint_id,
@@ -420,7 +425,11 @@ class AgentDBAsyncSaver:
     async def adelete_thread(self, thread_id: str) -> None:
         configurable = {"thread_id": thread_id}
         session_id = await self._ensure_session_id(configurable)
-        payload = {"schema_version": SCHEMA_VERSION, "thread_id": thread_id}
+        payload = {
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
+            "thread_id": thread_id,
+        }
         session = self.client.session(self.tenant_id, session_id, agent_id=self.agent_id)
         result = await session.append(
             payload,
@@ -471,7 +480,12 @@ class AgentDBAsyncSaver:
             raise
 
         session_id = session.session_id
-        payload = {"schema_version": SCHEMA_VERSION, "thread_id": thread_id, "session_id": session_id}
+        payload = {
+            "schema_version": PAYLOAD_SCHEMA_VERSION,
+            "runtime_version": RUNTIME_VERSION,
+            "thread_id": thread_id,
+            "session_id": session_id,
+        }
         await self.client.write_record(
             self.tenant_id,
             namespace=self.thread_namespace,
