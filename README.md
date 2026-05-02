@@ -1,34 +1,99 @@
-# AgentDB
+<div align="center">
+  <h1>AgentDB</h1>
+  <h3>Cost-efficient runtime state for AI agents.</h3>
+</div>
 
-AgentDB is an agent-native runtime database. It stores tenant-scoped agents,
-sessions, ordered events, artifacts, searchable records, skills, policy state,
-fork lineage, replay streams, and context packs behind one native HTTP API.
+<div align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
+  <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-local-0f766e" alt="Docs"></a>
+  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-single--node-7c3aed" alt="Deployment"></a>
+</div>
 
-## Current Status
+<br>
 
-This repository is a pre-release prototype. The legacy Mongo wire facade and Go
-SDK are no longer part of the workspace. The supported surfaces are:
+AgentDB is a runtime database for AI agent platforms. It gives agent harnesses
+a durable session log outside the model context window and outside the
+tool/sandbox environment, so brains and hands can fail, restart, scale, and
+change independently.
 
-- Rust runtime/API crates in `crates/agentdb-core` and `crates/agentdb-api`
+**What AgentDB gives you:**
+
+- **Recoverable sessions** — stateless harnesses can wake from `session_id`,
+  read the event log, append the next event, replay history, or fork a run
+- **Brain/hand decoupling** — model loops, sandboxes, tools, and MCP servers
+  stay replaceable because the durable session state lives outside them
+- **Cost-efficient state** — hot session metadata stays focused; large
+  artifacts and cold state can live in cheaper durable storage instead of hot
+  global indexes
+- **Agent-native primitives** — tenants, agents, sessions, events, artifacts,
+  searchable records, skills, policy, context packs, and lifecycle state
+- **Operational visibility** — dashboard, watch streams, structured errors,
+  runbooks, health checks, and deployment docs
+- **SDK and adapter surfaces** — Python and TypeScript clients plus LangGraph,
+  OpenAI Agents SDK, MCP, and Vercel AI SDK integration paths
+
+AgentDB is not a memory store, vector database, workflow engine, sandbox, or
+application OLTP database. It owns the durable session layer in an AI agent
+architecture:
+
+```text
+                 AI agent platform
+
+        brain / harness              hands
+    model loop, planning,      tools, sandboxes, MCP,
+    context management         code execution, APIs
+             |                         |
+             | append/read/replay      | tool calls/results
+             v                         v
+      +---------------------------------------+
+      |                AgentDB                |
+      | durable sessions, events, artifacts,  |
+      | replay, fork, records, policy, watch  |
+      +---------------------------------------+
+             |                         |
+             v                         v
+    memory / knowledge          application data
+    vector DB, RAG,             Postgres/MySQL/etc.
+    summaries                   users, billing, CRM
+```
+
+This repository is a pre-release prototype. The supported developer surfaces
+are:
+
+- Rust runtime and HTTP API crates in `crates/`
+- Server binary in `bin/agentdb-server`
 - Python SDK in `clients/python`
 - TypeScript SDK in `clients/typescript`
 - Framework adapters and templates in `adapters/`
 - Session dashboard mounted at `/dashboard`
 
-## Run Locally
+## Quick Start
+
+Run an in-memory development server:
 
 ```bash
 cargo run -p agentdb-server -- serve --dev
 ```
 
-This starts an in-memory dev server at:
+The API listens on:
 
 ```text
 http://127.0.0.1:7878
 ```
 
-Persistent single-node state uses RocksDB metadata and filesystem artifact
-content:
+Check readiness:
+
+```bash
+curl -i http://127.0.0.1:7878/health/ready
+```
+
+Open the session dashboard at:
+
+```text
+http://127.0.0.1:7878/dashboard/
+```
+
+For persistent single-node state:
 
 ```bash
 cargo run -p agentdb-server -- init-config
@@ -36,53 +101,58 @@ cargo run -p agentdb-server -- doctor
 cargo run -p agentdb-server -- serve --config agentdb.toml
 ```
 
-The readiness probe is:
+See [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) for
+deployment guidance and
+[docs/operations/SINGLE_NODE.md](docs/operations/SINGLE_NODE.md) for concrete
+single-node commands.
 
-```bash
-curl -i http://127.0.0.1:7878/health/ready
-```
+## Documentation
 
-The session dashboard is available at:
+Start with [docs/README.md](docs/README.md) for the full documentation map.
 
-```text
-http://127.0.0.1:7878/dashboard/
-```
+- **Run and deploy**:
+  [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) covers
+  supported deployment paths; [docs/operations/SINGLE_NODE.md](docs/operations/SINGLE_NODE.md)
+  has exact single-node commands, config, Docker, backup, and troubleshooting.
 
-For install, Docker, backup, and maintenance notes, see
-[`docs/SINGLE_NODE.md`](docs/SINGLE_NODE.md).
+- **Understand the server**:
+  [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)
+  documents the current crate and request-flow shape;
+  [docs/architecture/DESIGN.md](docs/architecture/DESIGN.md) captures
+  constraints and non-goals; [docs/architecture/agent-db.md](docs/architecture/agent-db.md)
+  is the long-form product and systems rationale.
 
-## API Shape
+- **Build SDKs and adapters**:
+  [docs/reference/api-sdk.md](docs/reference/api-sdk.md) lists the native HTTP
+  API and SDK surfaces;
+  [docs/reference/session-event-conventions.md](docs/reference/session-event-conventions.md)
+  defines event payload conventions, and
+  [docs/reference/adapter-readiness-checklist.md](docs/reference/adapter-readiness-checklist.md)
+  defines adapter expectations.
 
-Core routes are tenant-scoped:
+- **Operate and debug**:
+  [docs/operations/PERFORMANCE.md](docs/operations/PERFORMANCE.md) has
+  benchmark notes, and [docs/runbooks/README.md](docs/runbooks/README.md)
+  links runbooks for API errors that include `doc_url`.
 
-```text
-POST /api/tenants
-GET  /api/tenants/{tenant_id}
-POST /api/tenants/{tenant_id}/agents
-POST /api/tenants/{tenant_id}/agents/{agent_id}/sessions
-POST /api/tenants/{tenant_id}/sessions/{session_id}/events
-GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
-POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
-GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
-POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
-GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
-POST /api/tenants/{tenant_id}/sessions/{session_id}/context
-GET  /api/tenants/{tenant_id}/watch
-POST /api/tenants/{tenant_id}/artifacts
-POST /api/tenants/{tenant_id}/records
-POST /api/tenants/{tenant_id}/records/search
-POST /api/tenants/{tenant_id}/skills
-POST /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
-```
+- **Roadmap and planning archive**:
+  [docs/roadmap.md](docs/roadmap.md) covers future direction; historical plans
+  live under [docs/superpowers/](docs/superpowers/).
 
-IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
-`art_*`, `rec_*`, and `skl_*`.
+## API and SDKs
+
+See [docs/reference/api-sdk.md](docs/reference/api-sdk.md) for the full native
+HTTP API and Python/TypeScript SDK surface.
 
 ## Python SDK
+
+Install the local client:
 
 ```bash
 pip install -e clients/python
 ```
+
+Append an event and fetch recent session history:
 
 ```python
 from agentdb import AgentDB
@@ -96,7 +166,7 @@ result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print(result.seq, [event.payload for event in result.recent])
 ```
 
-Async support is available with:
+Async support is available through the optional extra:
 
 ```bash
 pip install -e 'clients/python[async]'
@@ -104,11 +174,15 @@ pip install -e 'clients/python[async]'
 
 ## TypeScript SDK
 
+Build the local client:
+
 ```bash
 cd clients/typescript
 npm install
 npm run build
 ```
+
+Append an event and fetch recent session history:
 
 ```ts
 import { AgentDB } from "agentdb";
@@ -128,25 +202,31 @@ console.log(result.seq, result.recent.map((event) => event.payload));
 ## Workspace Layout
 
 ```text
-bin/agentdb-server           server binary
-crates/agentdb-core          runtime model and tenant/session/event semantics
-crates/agentdb-api           native HTTP routes
-crates/agentdb-storage       RocksDB/SlateDB KV and artifact content backends
-crates/agentdb-index         text/vector indexing helpers
-crates/agentdb-meta          control-plane metadata and routing planner
-crates/agentdb-dashboard     session-first dashboard assets
+bin/agentdb-server            Server binary
+crates/agentdb-api            Native HTTP routes
+crates/agentdb-core           Runtime model and tenant/session/event semantics
+crates/agentdb-dashboard      Session-first dashboard assets
+crates/agentdb-index          Text/vector indexing helpers
+crates/agentdb-meta           Control-plane metadata and routing planner
+crates/agentdb-storage        RocksDB/SlateDB KV and artifact content backends
+clients/python                Python SDK
+clients/typescript            TypeScript SDK
 adapters/langgraph-checkpoint-agentdb
-                              LangGraph checkpoint/store adapter
+                               LangGraph checkpoint/store adapter
 adapters/openai-agents-agentdb
-                              OpenAI Agents SDK session adapter
-adapters/mcp-agentdb          MCP stdio server for AgentDB
+                               OpenAI Agents SDK session adapter
+adapters/mcp-agentdb           MCP stdio server for AgentDB
 adapters/vercel-ai-sdk-agentdb-template
-                              Vercel AI SDK persistence template
-clients/python               Python SDK
-clients/typescript           TypeScript SDK
+                               Vercel AI SDK persistence template
+config/agentdb.toml            Example server config
+docs/                          Architecture, operation, design, and runbooks
+examples/                      Usage examples
+workload/                      Load-generation and benchmark helpers
 ```
 
 ## Validation
+
+Rust:
 
 ```bash
 cargo build --workspace
@@ -155,20 +235,20 @@ cargo test -p agentdb-meta routing
 cargo test -p agentdb-api routing_http
 cargo test -p agentdb-api
 cargo test -p agentdb-server
+```
+
+Python:
+
+```bash
 python3 -m pytest -q clients/python/tests
 PYTHONPATH=adapters/langgraph-checkpoint-agentdb python3 -m pytest -q adapters/langgraph-checkpoint-agentdb/tests
 PYTHONPATH=clients/python:adapters/openai-agents-agentdb python3 -m pytest -q adapters/openai-agents-agentdb/tests
 PYTHONPATH=clients/python:adapters/mcp-agentdb python3 -m pytest -q adapters/mcp-agentdb/tests
-(cd adapters/vercel-ai-sdk-agentdb-template && npm test && npm run check)
-(cd clients/typescript && npm test && npm run build)
 ```
 
-## Reading Order
+TypeScript:
 
-- `docs/SINGLE_NODE.md`
-- `docs/ARCHITECTURE.md`
-- `docs/DESIGN.md`
-- `docs/agent-db.md`
-- `docs/session-event-conventions.md`
-- `docs/adapter-readiness-checklist.md`
-- `docs/ROADMAP.md`
+```bash
+(cd clients/typescript && npm test && npm run build)
+(cd adapters/vercel-ai-sdk-agentdb-template && npm test && npm run check)
+```
