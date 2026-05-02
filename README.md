@@ -31,9 +31,10 @@ process restarts, context truncation, tool failures, and long-running workflows.
 - **SDK and adapter surfaces** — Python and TypeScript clients plus LangGraph,
   OpenAI Agents SDK, MCP, and Vercel AI SDK integration paths
 
-AgentDB is not a memory store, vector database, workflow engine, sandbox, or
-application OLTP database. It owns the durable session layer in an AI agent
-architecture:
+In a typical AI agent architecture, AgentDB is the durable runtime state service
+between the agent harness and its tools. The harness writes every model output,
+tool call, tool result, artifact, policy decision, and lifecycle transition to
+AgentDB, then reads it back to resume, replay, fork, inspect, or stream a run.
 
 ```text
                  AI agent platform
