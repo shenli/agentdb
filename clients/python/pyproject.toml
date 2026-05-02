@@ -40,7 +40,7 @@ test = [
 
 [project.urls]
 Homepage = "https://github.com/shenli/agentdb"
-Documentation = "https://github.com/shenli/agentdb/blob/main/docs/ARCHITECTURE.md"
+Documentation = "https://github.com/shenli/agentdb/blob/main/docs/architecture/ARCHITECTURE.md"
 Source = "https://github.com/shenli/agentdb"
 
 [tool.hatch.build.targets.wheel]
