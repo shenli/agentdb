@@ -12,16 +12,15 @@
 <br>
 
 AgentDB is a runtime database for AI agent platforms. It gives agent harnesses
-a durable session log outside the model context window and outside the
-tool/sandbox environment, so brains and hands can fail, restart, scale, and
-change independently.
+a durable session log outside the model context window, so progress survives
+process restarts, context truncation, tool failures, and long-running workflows.
 
 **What AgentDB gives you:**
 
 - **Recoverable sessions** — stateless harnesses can wake from `session_id`,
   read the event log, append the next event, replay history, or fork a run
-- **Brain/hand decoupling** — model loops, sandboxes, tools, and MCP servers
-  stay replaceable because the durable session state lives outside them
+- **Debuggable execution history** — model outputs, tool calls, tool results,
+  artifacts, and policy decisions are preserved as ordered session events
 - **Cost-efficient state** — hot session metadata stays focused; large
   artifacts and cold state can live in cheaper durable storage instead of hot
   global indexes
