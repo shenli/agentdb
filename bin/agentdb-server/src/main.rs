@@ -18,6 +18,8 @@ use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
+const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
+const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -170,12 +172,15 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             KvBackendKind::SlateDb => {
                 let object_store = build_object_store(
                     config
-                        .kv_object_store
+                        .object_store
                         .as_ref()
                         .expect("slatedb requires object store config"),
                 )?;
-                tracing::info!(prefix = %config.kv_prefix, "opened SlateDB runtime backend");
-                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &config.kv_prefix).await?)
+                tracing::info!(prefix = %SLATEDB_RUNTIME_PREFIX, "opened SlateDB runtime backend");
+                Arc::new(
+                    agentdb_storage::SlateKvStore::open(object_store, SLATEDB_RUNTIME_PREFIX)
+                        .await?,
+                )
             }
         };
 
@@ -189,14 +194,14 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             ContentBackendKind::ObjectStore => {
                 let object_store = build_object_store(
                     config
-                        .content_object_store
+                        .object_store
                         .as_ref()
                         .expect("object-store content backend requires object store config"),
                 )?;
-                tracing::info!(prefix = %config.content_prefix, "opened object-store artifact content backend");
+                tracing::info!(prefix = %OBJECT_STORE_CONTENT_PREFIX, "opened object-store artifact content backend");
                 Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
                     object_store,
-                    config.content_prefix.clone(),
+                    OBJECT_STORE_CONTENT_PREFIX,
                 ))
             }
         };
@@ -249,11 +254,8 @@ struct ResolvedServeConfig {
     data_dir: PathBuf,
     content_dir: PathBuf,
     kv_backend: KvBackendKind,
-    kv_object_store: Option<ResolvedObjectStoreConfig>,
-    kv_prefix: String,
     content_backend: ContentBackendKind,
-    content_object_store: Option<ResolvedObjectStoreConfig>,
-    content_prefix: String,
+    object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<String>,
     route_shard_count: i64,
@@ -306,35 +308,18 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
         let content_backend = resolve_content_backend(&file.storage.content)?;
-        let kv_object_store = resolve_object_store_config(
-            file.storage.kv.object_store.as_ref(),
-            data_dir.join("kv-object-store"),
+        let object_store = resolve_object_store_config(
+            file.storage.object_store.as_ref(),
+            data_dir.join("object-store"),
         )?;
-        let content_object_store = resolve_object_store_config(
-            file.storage.content.object_store.as_ref(),
-            data_dir.join("content-object-store"),
-        )?;
-        validate_storage_backend_config(kv_backend, kv_object_store.as_ref(), content_backend, content_object_store.as_ref())?;
+        validate_storage_backend_config(kv_backend, content_backend, object_store.as_ref())?;
         Ok(Self {
             bind,
             data_dir,
             content_dir,
             kv_backend,
-            kv_object_store,
-            kv_prefix: file
-                .storage
-                .kv
-                .prefix
-                .clone()
-                .unwrap_or_else(|| "agentdb/runtime".into()),
             content_backend,
-            content_object_store,
-            content_prefix: file
-                .storage
-                .content
-                .prefix
-                .clone()
-                .unwrap_or_else(|| "agentdb/content".into()),
+            object_store,
             in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
             route_node_id: opts.route_node_id.or(file.routing.node_id),
             route_shard_count: opts
@@ -371,35 +356,18 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
         let content_backend = resolve_content_backend(&file.storage.content)?;
-        let kv_object_store = resolve_object_store_config(
-            file.storage.kv.object_store.as_ref(),
-            data_dir.join("kv-object-store"),
+        let object_store = resolve_object_store_config(
+            file.storage.object_store.as_ref(),
+            data_dir.join("object-store"),
         )?;
-        let content_object_store = resolve_object_store_config(
-            file.storage.content.object_store.as_ref(),
-            data_dir.join("content-object-store"),
-        )?;
-        validate_storage_backend_config(kv_backend, kv_object_store.as_ref(), content_backend, content_object_store.as_ref())?;
+        validate_storage_backend_config(kv_backend, content_backend, object_store.as_ref())?;
         Ok(Self {
             bind,
             data_dir,
             content_dir,
             kv_backend,
-            kv_object_store,
-            kv_prefix: file
-                .storage
-                .kv
-                .prefix
-                .clone()
-                .unwrap_or_else(|| "agentdb/runtime".into()),
             content_backend,
-            content_object_store,
-            content_prefix: file
-                .storage
-                .content
-                .prefix
-                .clone()
-                .unwrap_or_else(|| "agentdb/content".into()),
+            object_store,
             in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
             route_node_id: file.routing.node_id,
             route_shard_count: file
@@ -442,20 +410,17 @@ struct StorageFileConfig {
     kv: KvFileConfig,
     #[serde(default)]
     content: ContentFileConfig,
+    object_store: Option<ObjectStoreFileConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct KvFileConfig {
     backend: Option<String>,
-    prefix: Option<String>,
-    object_store: Option<ObjectStoreFileConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ContentFileConfig {
     backend: Option<String>,
-    prefix: Option<String>,
-    object_store: Option<ObjectStoreFileConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -558,18 +523,14 @@ fn build_object_store(
 
 fn validate_storage_backend_config(
     kv_backend: KvBackendKind,
-    kv_object_store: Option<&ResolvedObjectStoreConfig>,
     content_backend: ContentBackendKind,
-    content_object_store: Option<&ResolvedObjectStoreConfig>,
+    object_store: Option<&ResolvedObjectStoreConfig>,
 ) -> anyhow::Result<()> {
-    if matches!(kv_backend, KvBackendKind::SlateDb) && kv_object_store.is_none() {
-        anyhow::bail!("storage.kv.backend=slatedb requires storage.kv.object_store");
+    if matches!(kv_backend, KvBackendKind::SlateDb) && object_store.is_none() {
+        anyhow::bail!("storage.kv.backend=slatedb requires storage.object_store");
     }
-    if matches!(content_backend, ContentBackendKind::ObjectStore) && content_object_store.is_none()
-    {
-        anyhow::bail!(
-            "storage.content.backend=object_store requires storage.content.object_store"
-        );
+    if matches!(content_backend, ContentBackendKind::ObjectStore) && object_store.is_none() {
+        anyhow::bail!("storage.content.backend=object_store requires storage.object_store");
     }
     Ok(())
 }
@@ -645,7 +606,7 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
                 failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
             }
             KvBackendKind::SlateDb => {
-                failed |= !check_object_store_config("kv object store", config.kv_object_store.as_ref());
+                failed |= !check_object_store_config("shared object store", config.object_store.as_ref());
             }
         }
         match config.content_backend {
@@ -653,10 +614,7 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
                 failed |= !check_writable_dir("content dir", &config.content_dir);
             }
             ContentBackendKind::ObjectStore => {
-                failed |= !check_object_store_config(
-                    "content object store",
-                    config.content_object_store.as_ref(),
-                );
+                failed |= !check_object_store_config("shared object store", config.object_store.as_ref());
             }
         }
     }
@@ -682,7 +640,9 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
 fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
     match config.kv_backend {
         KvBackendKind::RocksDb => "rocksdb".into(),
-        KvBackendKind::SlateDb => format!("slatedb@{}", describe_object_store(config.kv_object_store.as_ref())),
+        KvBackendKind::SlateDb => {
+            format!("slatedb@{}", describe_object_store(config.object_store.as_ref()))
+        }
     }
 }
 
@@ -690,7 +650,7 @@ fn describe_content_backend(config: &ResolvedServeConfig) -> String {
     match config.content_backend {
         ContentBackendKind::LocalFs => "localfs".into(),
         ContentBackendKind::ObjectStore => {
-            format!("object_store@{}", describe_object_store(config.content_object_store.as_ref()))
+            format!("object_store@{}", describe_object_store(config.object_store.as_ref()))
         }
     }
 }

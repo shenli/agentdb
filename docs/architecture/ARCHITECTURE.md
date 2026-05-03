@@ -131,8 +131,8 @@ The runtime persists metadata through `KvStore`. The server now supports:
 - `SlateKvStore` for object-store-backed runtime metadata
 
 Persistent single-node RocksDB mode stores runtime metadata under
-`<data-dir>/runtime`. SlateDB mode stores runtime metadata under a configured
-object-store prefix such as `agentdb/runtime`.
+`<data-dir>/runtime`. SlateDB mode stores runtime metadata under the fixed
+object-store prefix `agentdb/runtime`.
 
 Artifact content is separated from metadata through a `ContentBackend`. The
 server now supports:
@@ -143,8 +143,8 @@ server now supports:
 
 Local mode stores content under the configured `content_dir`; if no content
 directory is configured, it uses `<data-dir>/content`. Object-store mode stores
-artifacts, sealed cold segments, and archive bundles under a configured prefix
-such as `agentdb/content`.
+artifacts, sealed cold segments, and archive bundles under the fixed prefix
+`agentdb/content`.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
