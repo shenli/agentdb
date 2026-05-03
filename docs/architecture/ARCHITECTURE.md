@@ -165,39 +165,18 @@ Session history now has three physical forms:
 Reads stay logical and session-centric: the runtime merges archive bundle,
 sealed segments, and warm-head events into one ordered event stream.
 
-```text
-append / append-and-fetch
-        |
-        v
-  Warm head events
-  KvStore metadata + event rows
-        |
-        | seal to cold
-        v
-  Session row
-  - lifecycle = cold
-  - warm_head_from_seq = next_seq
-  - sealed_segments = [seg_...]
-        |
-        +----> ContentBackend blob: seg_...json.enc
-        |         full-fidelity events for a seq range
-        |
-        | compact to archive
-        v
-  Session row
-  - lifecycle = archive
-  - archive_manifest = seg_...
-  - sealed_segments = []
-        |
-        +----> ContentBackend blob: seg_...archive.json.enc
-                  compact full-history archive bundle
-        |
-        | restore
-        v
-  Session row
-  - lifecycle = cold or warm
-  - archive_manifest = null
-  - sealed_segments = [seg_...]
+```mermaid
+flowchart TD
+    A["append / append-and-fetch"] --> B["Warm session head<br/>KvStore metadata + hot event rows"]
+
+    B -->|seal to cold| C["Session row<br/>lifecycle = cold<br/>warm_head_from_seq = next_seq<br/>sealed_segments = [seg_...]"]
+    C --> D["ContentBackend segment blob<br/>seg_....json.enc<br/>full-fidelity events for one seq range"]
+
+    C -->|compact to archive| E["Session row<br/>lifecycle = archive<br/>archive_manifest = seg_...<br/>sealed_segments = []"]
+    E --> F["ContentBackend archive blob<br/>seg_....archive.json.enc<br/>compact full-history archive bundle"]
+
+    E -->|restore| G["Session row<br/>lifecycle = cold or warm<br/>archive_manifest = null<br/>sealed_segments = [seg_...]"]
+    G --> H["ContentBackend segment blob<br/>restored sealed history"]
 ```
 
 Operationally:
