@@ -125,22 +125,33 @@ live push can be layered onto the same watch cursor model.
 
 ## Storage
 
-The runtime persists metadata through `KvStore`. The local implementation uses
-RocksDB. Persistent single-node mode stores runtime metadata under
-`<data-dir>/runtime`.
+The runtime persists metadata through `KvStore`. The server now supports:
 
-Artifact content is separated from metadata through a `ContentBackend`. Local
-mode stores content under the configured `content_dir`; if no content directory
-is configured, it uses `<data-dir>/content`.
+- `RocksKvStore` for local-disk runtime metadata
+- `SlateKvStore` for object-store-backed runtime metadata
+
+Persistent single-node RocksDB mode stores runtime metadata under
+`<data-dir>/runtime`. SlateDB mode stores runtime metadata under a configured
+object-store prefix such as `agentdb/runtime`.
+
+Artifact content is separated from metadata through a `ContentBackend`. The
+server now supports:
+
+- `LocalFsContentBackend` for local-disk blobs
+- `ObjectStoreContentBackend` for S3-compatible or other `object_store`
+  backends
+
+Local mode stores content under the configured `content_dir`; if no content
+directory is configured, it uses `<data-dir>/content`. Object-store mode stores
+artifacts, sealed cold segments, and archive bundles under a configured prefix
+such as `agentdb/content`.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
 
 The runtime code itself is `KvStore`-agnostic, so tiered session metadata works
-with either `RocksKvStore` or `SlateKvStore`. The current `agentdb-server`
-binary still boots with RocksDB plus `LocalFsContentBackend`; a production S3
-story needs the server/config layer to wire `SlateKvStore` and an S3-compatible
-content backend together.
+with either `RocksKvStore` or `SlateKvStore`. The `agentdb-server` binary now
+selects the KV backend and content backend from `agentdb.toml`.
 
 ## Session Tiered Storage
 

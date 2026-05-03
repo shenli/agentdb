@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "object_store",
  "serde",
  "tempfile",
  "tokio",

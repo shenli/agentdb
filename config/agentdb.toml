@@ -13,3 +13,33 @@ dev = false
 data_dir = "./agentdb-data"
 # content_dir defaults to "<data_dir>/content" when omitted.
 # content_dir = "./agentdb-data/content"
+
+[storage.kv]
+backend = "rocksdb" # or "slatedb"
+
+# Used when storage.kv.backend = "slatedb".
+# [storage.kv.object_store]
+# backend = "s3" # or "localfs" for local testing
+# bucket = "my-agentdb-runtime"
+# region = "us-west-2"
+# endpoint = "http://127.0.0.1:9000" # optional, useful for MinIO
+# allow_http = true                   # optional, useful for MinIO
+# local_root = "./agentdb-data/kv-object-store" # for backend = "localfs"
+#
+# SlateDB prefix inside the object store:
+# prefix = "agentdb/runtime"
+
+[storage.content]
+backend = "localfs" # or "object_store"
+
+# Used when storage.content.backend = "object_store".
+# [storage.content.object_store]
+# backend = "s3" # or "localfs" for local testing
+# bucket = "my-agentdb-content"
+# region = "us-west-2"
+# endpoint = "http://127.0.0.1:9000"
+# allow_http = true
+# local_root = "./agentdb-data/content-object-store" # for backend = "localfs"
+#
+# Object-store prefix for artifacts, cold segments, and archive bundles:
+# prefix = "agentdb/content"

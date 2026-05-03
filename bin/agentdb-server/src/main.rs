@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use clap::Parser;
+use object_store::aws::AmazonS3Builder;
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use serde::Deserialize;
 
 const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
@@ -156,21 +159,47 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         tracing::info!("using in-memory runtime (state lost on shutdown)");
         agentdb_core::Runtime::in_memory()
     } else {
-        let kv_path = config.data_dir.join("runtime");
-        std::fs::create_dir_all(&kv_path)?;
-        let kv = Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
-            as Arc<dyn agentdb_storage::KvStore + Send + Sync>;
-        tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
+        std::fs::create_dir_all(&config.data_dir)?;
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = match config.kv_backend {
+            KvBackendKind::RocksDb => {
+                let kv_path = config.data_dir.join("runtime");
+                std::fs::create_dir_all(&kv_path)?;
+                tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
+                Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
+            }
+            KvBackendKind::SlateDb => {
+                let object_store = build_object_store(
+                    config
+                        .kv_object_store
+                        .as_ref()
+                        .expect("slatedb requires object store config"),
+                )?;
+                tracing::info!(prefix = %config.kv_prefix, "opened SlateDB runtime backend");
+                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &config.kv_prefix).await?)
+            }
+        };
 
-        // Artifact content lives in a separate filesystem tree so the
-        // RocksDB metadata directory stays small and operators can mount the
-        // content tree on a different disk if they need to. Default is
-        // `<data_dir>/content`; `--content-dir` overrides it.
-        let content_dir = config.content_dir.clone();
-        std::fs::create_dir_all(&content_dir)?;
-        tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
-        let content: Arc<dyn agentdb_storage::ContentBackend> =
-            Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
+        let content: Arc<dyn agentdb_storage::ContentBackend> = match config.content_backend {
+            ContentBackendKind::LocalFs => {
+                let content_dir = config.content_dir.clone();
+                std::fs::create_dir_all(&content_dir)?;
+                tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
+                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir))
+            }
+            ContentBackendKind::ObjectStore => {
+                let object_store = build_object_store(
+                    config
+                        .content_object_store
+                        .as_ref()
+                        .expect("object-store content backend requires object store config"),
+                )?;
+                tracing::info!(prefix = %config.content_prefix, "opened object-store artifact content backend");
+                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
+                    object_store,
+                    config.content_prefix.clone(),
+                ))
+            }
+        };
         agentdb_core::Runtime::with_kv(kv, content)
     };
 
@@ -219,6 +248,12 @@ struct ResolvedServeConfig {
     bind: SocketAddr,
     data_dir: PathBuf,
     content_dir: PathBuf,
+    kv_backend: KvBackendKind,
+    kv_object_store: Option<ResolvedObjectStoreConfig>,
+    kv_prefix: String,
+    content_backend: ContentBackendKind,
+    content_object_store: Option<ResolvedObjectStoreConfig>,
+    content_prefix: String,
     in_memory: bool,
     route_node_id: Option<String>,
     route_shard_count: i64,
@@ -227,6 +262,34 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvBackendKind {
+    RocksDb,
+    SlateDb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentBackendKind {
+    LocalFs,
+    ObjectStore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectStoreBackendKind {
+    LocalFs,
+    S3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedObjectStoreConfig {
+    backend: ObjectStoreBackendKind,
+    local_root: Option<PathBuf>,
+    bucket: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    allow_http: bool,
 }
 
 impl ResolvedServeConfig {
@@ -241,10 +304,37 @@ impl ResolvedServeConfig {
             .content_dir
             .or(file.storage.content_dir)
             .unwrap_or_else(|| data_dir.join("content"));
+        let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let content_backend = resolve_content_backend(&file.storage.content)?;
+        let kv_object_store = resolve_object_store_config(
+            file.storage.kv.object_store.as_ref(),
+            data_dir.join("kv-object-store"),
+        )?;
+        let content_object_store = resolve_object_store_config(
+            file.storage.content.object_store.as_ref(),
+            data_dir.join("content-object-store"),
+        )?;
+        validate_storage_backend_config(kv_backend, kv_object_store.as_ref(), content_backend, content_object_store.as_ref())?;
         Ok(Self {
             bind,
             data_dir,
             content_dir,
+            kv_backend,
+            kv_object_store,
+            kv_prefix: file
+                .storage
+                .kv
+                .prefix
+                .clone()
+                .unwrap_or_else(|| "agentdb/runtime".into()),
+            content_backend,
+            content_object_store,
+            content_prefix: file
+                .storage
+                .content
+                .prefix
+                .clone()
+                .unwrap_or_else(|| "agentdb/content".into()),
             in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
             route_node_id: opts.route_node_id.or(file.routing.node_id),
             route_shard_count: opts
@@ -279,10 +369,37 @@ impl ResolvedServeConfig {
             .content_dir
             .or(file.storage.content_dir)
             .unwrap_or_else(|| data_dir.join("content"));
+        let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let content_backend = resolve_content_backend(&file.storage.content)?;
+        let kv_object_store = resolve_object_store_config(
+            file.storage.kv.object_store.as_ref(),
+            data_dir.join("kv-object-store"),
+        )?;
+        let content_object_store = resolve_object_store_config(
+            file.storage.content.object_store.as_ref(),
+            data_dir.join("content-object-store"),
+        )?;
+        validate_storage_backend_config(kv_backend, kv_object_store.as_ref(), content_backend, content_object_store.as_ref())?;
         Ok(Self {
             bind,
             data_dir,
             content_dir,
+            kv_backend,
+            kv_object_store,
+            kv_prefix: file
+                .storage
+                .kv
+                .prefix
+                .clone()
+                .unwrap_or_else(|| "agentdb/runtime".into()),
+            content_backend,
+            content_object_store,
+            content_prefix: file
+                .storage
+                .content
+                .prefix
+                .clone()
+                .unwrap_or_else(|| "agentdb/content".into()),
             in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
             route_node_id: file.routing.node_id,
             route_shard_count: file
@@ -321,6 +438,34 @@ struct ServerFileConfig {
 struct StorageFileConfig {
     data_dir: Option<PathBuf>,
     content_dir: Option<PathBuf>,
+    #[serde(default)]
+    kv: KvFileConfig,
+    #[serde(default)]
+    content: ContentFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KvFileConfig {
+    backend: Option<String>,
+    prefix: Option<String>,
+    object_store: Option<ObjectStoreFileConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ContentFileConfig {
+    backend: Option<String>,
+    prefix: Option<String>,
+    object_store: Option<ObjectStoreFileConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ObjectStoreFileConfig {
+    backend: Option<String>,
+    local_root: Option<PathBuf>,
+    bucket: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    allow_http: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +477,101 @@ struct RoutingFileConfig {
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
     proxy_max_response_bytes: Option<u64>,
+}
+
+fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
+    match cfg.backend.as_deref().unwrap_or("rocksdb") {
+        "rocksdb" => Ok(KvBackendKind::RocksDb),
+        "slatedb" => Ok(KvBackendKind::SlateDb),
+        other => anyhow::bail!("unknown storage.kv.backend: {other}"),
+    }
+}
+
+fn resolve_content_backend(cfg: &ContentFileConfig) -> anyhow::Result<ContentBackendKind> {
+    match cfg.backend.as_deref().unwrap_or("localfs") {
+        "localfs" => Ok(ContentBackendKind::LocalFs),
+        "object_store" => Ok(ContentBackendKind::ObjectStore),
+        other => anyhow::bail!("unknown storage.content.backend: {other}"),
+    }
+}
+
+fn resolve_object_store_config(
+    cfg: Option<&ObjectStoreFileConfig>,
+    default_local_root: PathBuf,
+) -> anyhow::Result<Option<ResolvedObjectStoreConfig>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    let backend = match cfg.backend.as_deref().unwrap_or("localfs") {
+        "localfs" => ObjectStoreBackendKind::LocalFs,
+        "s3" => ObjectStoreBackendKind::S3,
+        other => anyhow::bail!("unknown object store backend: {other}"),
+    };
+    Ok(Some(ResolvedObjectStoreConfig {
+        backend,
+        local_root: match backend {
+            ObjectStoreBackendKind::LocalFs => Some(
+                cfg.local_root
+                    .clone()
+                    .unwrap_or(default_local_root),
+            ),
+            ObjectStoreBackendKind::S3 => None,
+        },
+        bucket: cfg.bucket.clone(),
+        region: cfg.region.clone(),
+        endpoint: cfg.endpoint.clone(),
+        allow_http: cfg.allow_http.unwrap_or(false),
+    }))
+}
+
+fn build_object_store(
+    config: &ResolvedObjectStoreConfig,
+) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    match config.backend {
+        ObjectStoreBackendKind::LocalFs => {
+            let root = config
+                .local_root
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("localfs object store requires local_root"))?;
+            std::fs::create_dir_all(&root)?;
+            Ok(Arc::new(LocalFileSystem::new_with_prefix(root)?))
+        }
+        ObjectStoreBackendKind::S3 => {
+            let bucket = config
+                .bucket
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("s3 object store requires bucket"))?;
+            let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+            if let Some(region) = &config.region {
+                builder = builder.with_region(region);
+            }
+            if let Some(endpoint) = &config.endpoint {
+                builder = builder.with_endpoint(endpoint);
+            }
+            if config.allow_http {
+                builder = builder.with_allow_http(true);
+            }
+            Ok(Arc::new(builder.build()?))
+        }
+    }
+}
+
+fn validate_storage_backend_config(
+    kv_backend: KvBackendKind,
+    kv_object_store: Option<&ResolvedObjectStoreConfig>,
+    content_backend: ContentBackendKind,
+    content_object_store: Option<&ResolvedObjectStoreConfig>,
+) -> anyhow::Result<()> {
+    if matches!(kv_backend, KvBackendKind::SlateDb) && kv_object_store.is_none() {
+        anyhow::bail!("storage.kv.backend=slatedb requires storage.kv.object_store");
+    }
+    if matches!(content_backend, ContentBackendKind::ObjectStore) && content_object_store.is_none()
+    {
+        anyhow::bail!(
+            "storage.content.backend=object_store requires storage.content.object_store"
+        );
+    }
+    Ok(())
 }
 
 fn load_config(path: Option<&PathBuf>) -> anyhow::Result<FileConfig> {
@@ -369,7 +609,9 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
         "dev in-memory (state is lost on shutdown)".to_string()
     } else {
         format!(
-            "persistent (data: {}, artifacts: {})",
+            "persistent (kv: {}, content: {}, data: {}, artifacts: {})",
+            describe_kv_backend(config),
+            describe_content_backend(config),
             config.data_dir.display(),
             config.content_dir.display()
         )
@@ -391,13 +633,32 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
         println!("  storage: skipped");
     } else {
         println!(
-            "  mode: persistent (data: {}, artifacts: {})",
+            "  mode: persistent (kv: {}, content: {}, data: {}, artifacts: {})",
+            describe_kv_backend(&config),
+            describe_content_backend(&config),
             config.data_dir.display(),
             config.content_dir.display()
         );
         failed |= !check_writable_dir("data dir", &config.data_dir);
-        failed |= !check_writable_dir("content dir", &config.content_dir);
-        failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
+        match config.kv_backend {
+            KvBackendKind::RocksDb => {
+                failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
+            }
+            KvBackendKind::SlateDb => {
+                failed |= !check_object_store_config("kv object store", config.kv_object_store.as_ref());
+            }
+        }
+        match config.content_backend {
+            ContentBackendKind::LocalFs => {
+                failed |= !check_writable_dir("content dir", &config.content_dir);
+            }
+            ContentBackendKind::ObjectStore => {
+                failed |= !check_object_store_config(
+                    "content object store",
+                    config.content_object_store.as_ref(),
+                );
+            }
+        }
     }
 
     match std::net::TcpListener::bind(config.bind) {
@@ -416,6 +677,69 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
     }
     println!("  ok: single-node configuration looks usable");
     Ok(())
+}
+
+fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
+    match config.kv_backend {
+        KvBackendKind::RocksDb => "rocksdb".into(),
+        KvBackendKind::SlateDb => format!("slatedb@{}", describe_object_store(config.kv_object_store.as_ref())),
+    }
+}
+
+fn describe_content_backend(config: &ResolvedServeConfig) -> String {
+    match config.content_backend {
+        ContentBackendKind::LocalFs => "localfs".into(),
+        ContentBackendKind::ObjectStore => {
+            format!("object_store@{}", describe_object_store(config.content_object_store.as_ref()))
+        }
+    }
+}
+
+fn describe_object_store(config: Option<&ResolvedObjectStoreConfig>) -> String {
+    let Some(config) = config else {
+        return "unconfigured".into();
+    };
+    match config.backend {
+        ObjectStoreBackendKind::LocalFs => format!(
+            "localfs:{}",
+            config
+                .local_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<missing>".into())
+        ),
+        ObjectStoreBackendKind::S3 => format!(
+            "s3:{}",
+            config.bucket.as_deref().unwrap_or("<missing-bucket>")
+        ),
+    }
+}
+
+fn check_object_store_config(label: &str, config: Option<&ResolvedObjectStoreConfig>) -> bool {
+    let Some(config) = config else {
+        println!("  error: {label} is not configured");
+        return false;
+    };
+    match config.backend {
+        ObjectStoreBackendKind::LocalFs => {
+            let Some(root) = &config.local_root else {
+                println!("  error: {label} localfs backend is missing local_root");
+                return false;
+            };
+            check_writable_dir(label, root)
+        }
+        ObjectStoreBackendKind::S3 => {
+            if config.bucket.as_deref().unwrap_or("").is_empty() {
+                println!("  error: {label} s3 backend is missing bucket");
+                return false;
+            }
+            println!(
+                "  ok: {label} configured for s3 bucket {}",
+                config.bucket.as_deref().unwrap_or("<missing-bucket>")
+            );
+            true
+        }
+    }
 }
 
 fn check_writable_dir(label: &str, path: &PathBuf) -> bool {
