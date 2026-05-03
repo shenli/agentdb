@@ -83,6 +83,7 @@ class FakeSession:
         self.lifecycle = "warm"
         self.warm_head_from_seq = 0
         self.sealed_segment_count = 0
+        self.archive_manifest: Optional[dict] = None
         self._events: list[FakeEvent] = []
 
     def append(
@@ -124,6 +125,12 @@ class FakeSession:
             self.lifecycle = "warm"
         elif target == "archive":
             self.lifecycle = "archive"
+            self.archive_manifest = {
+                "manifest_id": f"seg_archive_{self.session_id}",
+                "event_count": len(self._events),
+            }
+            self.sealed_segment_count = 0
+            self.warm_head_from_seq = len(self._events)
         return self.storage()
 
     def storage(self) -> dict:
@@ -134,6 +141,7 @@ class FakeSession:
             "warm_head_from_seq": self.warm_head_from_seq,
             "sealed_segment_count": self.sealed_segment_count,
             "sealed_segments": [],
+            "archive_manifest": self.archive_manifest,
         }
 
 
@@ -142,9 +150,13 @@ def test_session_tiering_demo_seals_reads_and_resumes() -> None:
 
     assert result["warm_event_count"] == 3
     assert result["cold_event_count"] == 3
+    assert result["archive_event_count"] == 3
     assert result["merged_event_count"] == 4
     assert result["cold_storage"]["lifecycle"] == "cold"
     assert result["cold_storage"]["sealed_segment_count"] == 1
+    assert result["archive_storage"]["lifecycle"] == "archive"
+    assert result["archive_storage"]["sealed_segment_count"] == 0
+    assert result["archive_storage"]["archive_manifest"]["event_count"] == 3
     assert result["warm_storage"]["lifecycle"] == "warm"
     assert result["resumed_seq"] == 3
     assert result["event_seqs"] == [0, 1, 2, 3]

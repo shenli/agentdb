@@ -4,8 +4,9 @@ This example shows the first tiered-storage slice in a developer-friendly way:
 
   1. write a few events to a normal warm session
   2. seal the session into the cold tier
-  3. verify reads still work unchanged
-  4. append again and observe a new warm head open on top of sealed history
+  3. compact the sealed history into the archive tier
+  4. verify reads still work unchanged
+  5. append again and observe a new warm head open on top of archived history
 
 Run me:
 
@@ -43,6 +44,8 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
     warm_events = session.fetch(from_seq=0, limit=100)
     cold_storage = session.transition_lifecycle("cold")
     cold_events = session.fetch(from_seq=0, limit=100)
+    archive_storage = session.transition_lifecycle("archive")
+    archive_events = session.fetch(from_seq=0, limit=100)
 
     resumed = session.append({"i": 99}, kind="message")
     warm_storage = session.storage()
@@ -54,8 +57,10 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
         "session_id": session.id,
         "warm_event_count": len(warm_events),
         "cold_event_count": len(cold_events),
+        "archive_event_count": len(archive_events),
         "merged_event_count": len(merged_events),
         "cold_storage": cold_storage,
+        "archive_storage": archive_storage,
         "warm_storage": warm_storage,
         "resumed_seq": resumed.seq,
         "event_seqs": [event.seq for event in merged_events],
@@ -82,6 +87,14 @@ def main() -> None:
             head=result["cold_storage"]["warm_head_from_seq"],
         )
     )
+    print("\n# archive storage after compact")
+    print(
+        "  lifecycle={lifecycle} archive_manifest={manifest} sealed_segments={segments}".format(
+            lifecycle=result["archive_storage"]["lifecycle"],
+            manifest=(result["archive_storage"].get("archive_manifest") or {}).get("manifest_id", "-"),
+            segments=result["archive_storage"]["sealed_segment_count"],
+        )
+    )
     print("\n# warm storage after resume")
     print(
         "  lifecycle={lifecycle} sealed_segments={segments} warm_head_from_seq={head}".format(
@@ -93,6 +106,7 @@ def main() -> None:
     print("\n# counts")
     print(f"  warm read before seal: {result['warm_event_count']}")
     print(f"  cold read after seal:  {result['cold_event_count']}")
+    print(f"  archive read after compact: {result['archive_event_count']}")
     print(f"  merged read after append: {result['merged_event_count']}")
     print(f"\n# resumed append seq: {result['resumed_seq']}")
     print(f"# merged seqs: {result['event_seqs']}")

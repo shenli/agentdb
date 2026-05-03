@@ -306,6 +306,67 @@ async fn lifecycle_transition_to_cold_preserves_fetch_and_reports_storage() {
 }
 
 #[tokio::test]
+async fn lifecycle_transition_to_archive_preserves_fetch_and_reports_manifest() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    for i in 0..3 {
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/sessions/{sid}/events",
+                app.base
+            ))
+            .json(&json!({
+                "agent_id": aid,
+                "kind": "message",
+                "payload": {"i": i},
+                "artifact_refs": [],
+                "source_refs": []
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let storage: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/lifecycle",
+            app.base
+        ))
+        .json(&json!({"target": "archive"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(storage["lifecycle"], "archive");
+    assert_eq!(storage["sealed_segment_count"].as_u64().unwrap(), 0);
+    assert!(storage["archive_manifest"].is_object());
+
+    let events: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=100",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local() {
     let app = spawn_routed_app("node-a").await;
     let (tid, aid, sid) = bootstrap_session(&app).await;

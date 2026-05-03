@@ -31,6 +31,32 @@ pub struct SessionSegmentFile {
     pub events: Vec<EventEnvelope>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionArchiveManifest {
+    pub manifest_id: Id,
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub source_segment_ids: Vec<Id>,
+    pub event_count: u64,
+    pub bytes: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_version: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveFile {
+    pub runtime_version: String,
+    pub manifest_id: Id,
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub source_segment_ids: Vec<Id>,
+    pub events: Vec<EventEnvelope>,
+}
+
 impl SessionSegment {
     pub fn new(
         tenant_id: crate::Id,
@@ -67,6 +93,23 @@ impl SessionSegmentFile {
             session_id: segment.session_id.clone(),
             seq_start: segment.seq_start,
             seq_end: segment.seq_end,
+            events,
+        }
+    }
+}
+
+impl SessionArchiveFile {
+    pub fn from_events(
+        manifest: &SessionArchiveManifest,
+        source_segment_ids: Vec<Id>,
+        events: Vec<EventEnvelope>,
+    ) -> Self {
+        Self {
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
+            manifest_id: manifest.manifest_id.clone(),
+            tenant_id: manifest.tenant_id.clone(),
+            session_id: manifest.session_id.clone(),
+            source_segment_ids,
             events,
         }
     }

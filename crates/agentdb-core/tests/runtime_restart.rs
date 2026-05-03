@@ -454,6 +454,97 @@ async fn cold_session_segments_survive_restart_and_resume() {
 }
 
 #[tokio::test]
+async fn archived_sessions_survive_restart_and_resume() {
+    let dir = TempDir::new().unwrap();
+    let kv_path = dir.path().join("kv");
+    let content_root = dir.path().join("content");
+
+    let (tenant, agent, session) = {
+        let kv = open_kv(&kv_path);
+        let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
+        let rt = Runtime::with_kv(kv, content);
+        let tenant = rt
+            .create_tenant(NewTenant {
+                external_key: "archive-session".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let agent = rt
+            .create_agent(NewAgent {
+                tenant_id: tenant.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let session = rt
+            .create_session(NewSession {
+                tenant_id: tenant.tenant_id.clone(),
+                agent_id: agent.agent_id.clone(),
+                alias: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            rt.append(AppendRequest::simple(
+                &tenant,
+                &agent,
+                &session,
+                "message",
+                serde_json::json!({ "i": i }),
+            ))
+            .await
+            .unwrap();
+        }
+        let storage = rt
+            .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+            .await
+            .unwrap();
+        assert!(storage.archive_manifest.is_some());
+        (tenant, agent, session)
+    };
+
+    let kv2 = open_kv(&kv_path);
+    let content2: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
+    let rt2 = Runtime::with_kv(kv2, content2);
+
+    let storage = rt2
+        .get_session_storage(&tenant.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(storage.lifecycle, Lifecycle::Archive);
+    assert!(storage.archive_manifest.is_some());
+    assert_eq!(storage.sealed_segment_count, 0);
+
+    let events = rt2
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let resumed = rt2
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({ "i": 99 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.seq, 3);
+}
+
+#[tokio::test]
 async fn records_and_indexes_survive_restart() {
     // V2.2: SearchableRecord persistence plus index hydration. Three
     // records with different metadata should still come back from

@@ -36,7 +36,9 @@ use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, Idempotency
 use crate::persist::Persist;
 use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
-use crate::segment::{SessionSegment, SessionSegmentFile};
+use crate::segment::{
+    SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
+};
 use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
@@ -119,6 +121,7 @@ pub struct SessionStorageSummary {
     pub warm_head_from_seq: u64,
     pub sealed_segment_count: usize,
     pub sealed_segments: Vec<SessionSegment>,
+    pub archive_manifest: Option<SessionArchiveManifest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +461,7 @@ impl Runtime {
             warm_head_from_seq: session.warm_head_from_seq,
             sealed_segment_count: session.sealed_segments.len(),
             sealed_segments: session.sealed_segments.clone(),
+            archive_manifest: session.archive_manifest.clone(),
         }
     }
 
@@ -543,6 +547,88 @@ impl Runtime {
             seq_start,
             seq_end,
             event_count: (seq_end - seq_start) + 1,
+            bytes: plaintext.len() as u64,
+            sha256: plaintext_sha256,
+            content_key_id: Some(content_key.key_id.clone()),
+            content_key_version: content_key.key_version.clone(),
+            created_at_ms: crate::now_ms(),
+        })
+    }
+
+    async fn read_session_archive_events(
+        &self,
+        manifest: &SessionArchiveManifest,
+    ) -> Result<Vec<EventEnvelope>> {
+        let current_key = self.resolve_key(&manifest.tenant_id, KeyOperation::ContentRead)?;
+        let stored_bytes = self
+            .content
+            .get(manifest.tenant_id.as_str(), manifest.manifest_id.as_str())
+            .await
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive get failed: {e}")))?;
+        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive envelope failed: {e}")))?
+        {
+            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
+            None => (
+                key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
+                    .unwrap_or(current_key),
+                stored_bytes,
+            ),
+        };
+        let crypto_context = ContentCryptoContext {
+            tenant_id: manifest.tenant_id.as_str(),
+            artifact_id: manifest.manifest_id.as_str(),
+            key: &content_key,
+        };
+        let plaintext = self
+            .content_crypto
+            .decrypt(&crypto_context, &ciphertext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive decrypt failed: {e}")))?;
+        let file: SessionArchiveFile = serde_json::from_slice(&plaintext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive decode failed: {e}")))?;
+        Ok(file.events)
+    }
+
+    async fn write_session_archive(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        source_segment_ids: Vec<Id>,
+        events: Vec<EventEnvelope>,
+    ) -> Result<SessionArchiveManifest> {
+        let manifest_id = Id::new(IdKind::Segment);
+        let content_key = self.resolve_key(tenant_id, KeyOperation::ContentWrite)?;
+        let file = SessionArchiveFile {
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
+            manifest_id: manifest_id.clone(),
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            source_segment_ids: source_segment_ids.clone(),
+            events,
+        };
+        let plaintext =
+            serde_json::to_vec(&file).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        let plaintext_sha256 = sha256_hex(&plaintext);
+        let crypto_context = ContentCryptoContext {
+            tenant_id: tenant_id.as_str(),
+            artifact_id: manifest_id.as_str(),
+            key: &content_key,
+        };
+        let encrypted_bytes = self
+            .content_crypto
+            .encrypt(&crypto_context, &plaintext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive encrypt failed: {e}")))?;
+        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        self.content
+            .put(tenant_id.as_str(), manifest_id.as_str(), &stored_bytes)
+            .await
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("archive put failed: {e}")))?;
+        Ok(SessionArchiveManifest {
+            manifest_id,
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            source_segment_ids,
+            event_count: file.events.len() as u64,
             bytes: plaintext.len() as u64,
             sha256: plaintext_sha256,
             content_key_id: Some(content_key.key_id.clone()),
@@ -993,29 +1079,7 @@ impl Runtime {
             }
             Lifecycle::Cold => self.seal_session_to_cold(tenant_id, session_id).await,
             Lifecycle::Archive => {
-                let session = self.get_session(tenant_id, session_id).await?;
-                if session.lifecycle == Lifecycle::Warm {
-                    self.seal_session_to_cold(tenant_id, session_id).await?;
-                }
-                let updated = {
-                    let mut s = self.state.lock().await;
-                    let session = s
-                        .sessions
-                        .get_mut(session_id.as_str())
-                        .filter(|sess| {
-                            sess.deleted_at_ms.is_none()
-                                && sess.tenant_id.as_str() == tenant_id.as_str()
-                        })
-                        .ok_or_else(|| {
-                            Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
-                        })?;
-                    session.lifecycle = Lifecycle::Archive;
-                    session.clone()
-                };
-                if let Some(p) = &self.persist {
-                    p.put_session(&updated).map_err(internal)?;
-                }
-                Ok(Self::session_storage_summary(&updated))
+                self.archive_session(tenant_id, session_id).await
             }
             Lifecycle::DerivativeOnly => Err(Error::new(
                 ErrorCode::PolicyDenied,
@@ -1156,6 +1220,66 @@ impl Runtime {
             );
         }
 
+        Ok(Self::session_storage_summary(&updated))
+    }
+
+    async fn archive_session(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<SessionStorageSummary> {
+        let session = self.get_session(tenant_id, session_id).await?;
+        if session.lifecycle == Lifecycle::Warm {
+            self.seal_session_to_cold(tenant_id, session_id).await?;
+        }
+        let snapshot = self.get_session(tenant_id, session_id).await?;
+        let history = self
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                from_seq: 0,
+                limit: usize::MAX,
+            })
+            .await?;
+        let source_segment_ids = snapshot
+            .sealed_segments
+            .iter()
+            .map(|segment| segment.segment_id.clone())
+            .collect::<Vec<_>>();
+        let old_manifest = snapshot.archive_manifest.clone();
+        let manifest = self
+            .write_session_archive(tenant_id, session_id, source_segment_ids, history)
+            .await?;
+        let updated = {
+            let mut s = self.state.lock().await;
+            let session = s
+                .sessions
+                .get_mut(session_id.as_str())
+                .filter(|sess| {
+                    sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+                })
+                .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+            session.archive_manifest = Some(manifest.clone());
+            session.sealed_segments.clear();
+            session.warm_head_from_seq = session.next_seq;
+            session.lifecycle = Lifecycle::Archive;
+            session.clone()
+        };
+        if let Some(p) = &self.persist {
+            p.put_session(&updated).map_err(internal)?;
+        }
+        for segment in snapshot.sealed_segments {
+            let _ = self
+                .content
+                .delete(tenant_id.as_str(), segment.segment_id.as_str())
+                .await;
+        }
+        if let Some(manifest) = old_manifest {
+            let _ = self
+                .content
+                .delete(tenant_id.as_str(), manifest.manifest_id.as_str())
+                .await;
+        }
         Ok(Self::session_storage_summary(&updated))
     }
 
@@ -3583,20 +3707,30 @@ impl Runtime {
         };
 
         let mut out = Vec::new();
-        let mut segments = session.sealed_segments.clone();
-        segments.sort_by_key(|segment| segment.seq_start);
-        for segment in segments {
-            if segment.seq_end < req.from_seq {
-                continue;
-            }
-            let mut events = self.read_session_segment_events(&segment).await?;
-            if req.from_seq > segment.seq_start {
-                events.retain(|event| event.seq >= req.from_seq);
-            }
-            out.extend(events);
+        if let Some(manifest) = &session.archive_manifest {
+            let mut archived = self.read_session_archive_events(manifest).await?;
+            archived.retain(|event| event.seq >= req.from_seq);
+            out.extend(archived);
             if out.len() >= req.limit {
                 out.truncate(req.limit);
                 return Ok(out);
+            }
+        } else {
+            let mut segments = session.sealed_segments.clone();
+            segments.sort_by_key(|segment| segment.seq_start);
+            for segment in segments {
+                if segment.seq_end < req.from_seq {
+                    continue;
+                }
+                let mut events = self.read_session_segment_events(&segment).await?;
+                if req.from_seq > segment.seq_start {
+                    events.retain(|event| event.seq >= req.from_seq);
+                }
+                out.extend(events);
+                if out.len() >= req.limit {
+                    out.truncate(req.limit);
+                    return Ok(out);
+                }
             }
         }
 

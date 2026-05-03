@@ -667,6 +667,7 @@ function renderOverview() {
   $("storageSegments").textContent = String(
     state.sessionStorage?.sealed_segment_count || 0
   );
+  $("storageArchive").textContent = archiveSummary(state.sessionStorage);
   $("selectionLabel").textContent = cfg.sessionId ? "Session selected" : "No session selected";
   $("selectionMeta").textContent = cfg.sessionId
     ? `Inspecting ${cfg.sessionId}`
@@ -949,8 +950,22 @@ function normalizedText(value) {
   return String(value || "").toLowerCase();
 }
 
+function archiveSummary(storage) {
+  const manifest = storage?.archive_manifest;
+  if (!manifest) return "-";
+  const id = shortId(manifest.manifest_id || "");
+  const count = manifest.event_count ?? 0;
+  return `${id} • ${count} evt`;
+}
+
 function enc(value) {
   return encodeURIComponent(value);
+}
+
+function shortId(value) {
+  const text = String(value || "");
+  if (!text) return "-";
+  return text.length > 18 ? `${text.slice(0, 18)}...` : text;
 }
 
 function formatTime(ms) {

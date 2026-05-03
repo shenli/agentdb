@@ -48,7 +48,9 @@ pub use runtime::{
     ContextResponse, ForkSessionRequest, GcSweepReport, LifecycleSweepReport, PolicyWorkerReport,
     ReplayResponse, Runtime, SessionStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
 };
-pub use segment::{SessionSegment, SessionSegmentFile};
+pub use segment::{
+    SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
+};
 pub use session::{Lifecycle, NewSession, Session};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tenant::{NewTenant, Tenant};

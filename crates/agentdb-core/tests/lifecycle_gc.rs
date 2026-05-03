@@ -202,6 +202,107 @@ async fn cold_transition_seals_history_and_append_reopens_warm_head() {
 }
 
 #[tokio::test]
+async fn archive_transition_compacts_history_and_append_reopens_warm_head() {
+    let rt = Runtime::in_memory();
+    let tenant = tenant_with_policy(
+        &rt,
+        "archive-tiering",
+        serde_json::json!({
+            "version": 4,
+            "lifecycle": {"cold_after_ms": 10, "archive_after_ms": 20}
+        }),
+    )
+    .await;
+    let agent = rt
+        .create_agent(agentdb_core::NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(agentdb_core::NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({"i": i}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let storage = rt
+        .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+        .await
+        .unwrap();
+    assert_eq!(storage.lifecycle, Lifecycle::Archive);
+    assert_eq!(storage.sealed_segment_count, 0);
+    assert!(storage.archive_manifest.is_some());
+
+    let archived_fetch = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_fetch
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let resumed = rt
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({"i": 99}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.seq, 3);
+
+    let warm_storage = rt
+        .get_session_storage(&tenant.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(warm_storage.lifecycle, Lifecycle::Warm);
+    assert!(warm_storage.archive_manifest.is_some());
+    assert_eq!(warm_storage.warm_head_from_seq, 3);
+
+    let merged = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[tokio::test]
 async fn derivative_only_purges_raw_artifact_but_keeps_metadata() {
     let rt = Runtime::in_memory();
     let tenant = tenant_with_policy(
