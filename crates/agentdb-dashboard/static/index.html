@@ -99,6 +99,26 @@
             <strong id="overviewLatestKind">-</strong>
           </div>
         </div>
+        <div class="storage-strip">
+          <div class="storage-summary">
+            <span class="storage-label">Lifecycle</span>
+            <strong id="storageLifecycle">-</strong>
+          </div>
+          <div class="storage-summary">
+            <span class="storage-label">Warm head from seq</span>
+            <strong id="storageWarmHead">-</strong>
+          </div>
+          <div class="storage-summary">
+            <span class="storage-label">Sealed segments</span>
+            <strong id="storageSegments">0</strong>
+          </div>
+          <div class="storage-actions">
+            <button data-action="storage">Refresh storage</button>
+            <button data-action="to-warm">Warm</button>
+            <button data-action="to-cold">Cold</button>
+            <button data-action="to-archive">Archive</button>
+          </div>
+        </div>
       </section>
 
       <section class="workspace browser-shell view-overview">
@@ -203,6 +223,14 @@
             </div>
             <label>Artifact ID <input id="artifactId" placeholder="art_..." /></label>
             <pre id="artifactView" class="preview"></pre>
+          </section>
+
+          <section class="panel" aria-label="Storage detail">
+            <div class="section-head">
+              <h2>Storage detail</h2>
+              <span id="storageDetailLabel">No storage loaded</span>
+            </div>
+            <pre id="storageView" class="preview"></pre>
           </section>
         </aside>
       </section>

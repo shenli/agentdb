@@ -10,7 +10,7 @@ use agentdb_core::agent::NewAgent;
 use agentdb_core::artifact::NewArtifact;
 use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime, SearchRequest};
-use agentdb_core::session::NewSession;
+use agentdb_core::session::{Lifecycle, NewSession};
 use agentdb_core::skill::{BindSkillRequest, NewSkill};
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
@@ -345,6 +345,112 @@ async fn artifacts_survive_restart() {
         .await
         .unwrap();
     assert_eq!(blob, b"hello");
+}
+
+#[tokio::test]
+async fn cold_session_segments_survive_restart_and_resume() {
+    let dir = TempDir::new().unwrap();
+    let kv_path = dir.path().join("kv");
+    let content_root = dir.path().join("content");
+
+    let (tenant, agent, session) = {
+        let kv = open_kv(&kv_path);
+        let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
+        let rt = Runtime::with_kv(kv, content);
+        let tenant = rt
+            .create_tenant(NewTenant {
+                external_key: "cold-session".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let agent = rt
+            .create_agent(NewAgent {
+                tenant_id: tenant.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let session = rt
+            .create_session(NewSession {
+                tenant_id: tenant.tenant_id.clone(),
+                agent_id: agent.agent_id.clone(),
+                alias: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            rt.append(AppendRequest::simple(
+                &tenant,
+                &agent,
+                &session,
+                "message",
+                serde_json::json!({ "i": i }),
+            ))
+            .await
+            .unwrap();
+        }
+        let storage = rt
+            .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Cold)
+            .await
+            .unwrap();
+        assert_eq!(storage.sealed_segment_count, 1);
+        (tenant, agent, session)
+    };
+
+    let kv2 = open_kv(&kv_path);
+    let content2: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
+    let rt2 = Runtime::with_kv(kv2, content2);
+
+    let storage = rt2
+        .get_session_storage(&tenant.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    assert_eq!(storage.lifecycle, Lifecycle::Cold);
+    assert_eq!(storage.sealed_segment_count, 1);
+    assert_eq!(storage.warm_head_from_seq, 3);
+
+    let events = rt2
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let resumed = rt2
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({ "i": 99 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resumed.seq, 3);
+
+    let merged = rt2
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 }
 
 #[tokio::test]

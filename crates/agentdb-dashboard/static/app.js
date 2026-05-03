@@ -11,6 +11,7 @@ const state = {
   tenantSummaries: [],
   recentSessions: [],
   selectedEventId: null,
+  sessionStorage: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -97,6 +98,10 @@ function dispatch(action) {
     subscribe: subscribeSession,
     watch: watchScope,
     context: buildContext,
+    storage: loadSessionStorage,
+    "to-warm": () => transitionLifecycle("warm"),
+    "to-cold": () => transitionLifecycle("cold"),
+    "to-archive": () => transitionLifecycle("archive"),
     fork: forkSession,
     artifact: loadArtifact,
     records: searchRecords,
@@ -265,6 +270,7 @@ async function loadSessionView() {
       $("agentId").value = session.agent_id || "";
     }
     readConfig(false);
+    await loadSessionStorage();
     await loadTimeline();
   } catch (err) {
     fail(err);
@@ -298,6 +304,38 @@ async function loadTimeline() {
     renderOverview();
     renderTimeline();
     renderInspector();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function loadSessionStorage() {
+  try {
+    const cfg = readConfig();
+    state.sessionStorage = await request(
+      `/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/storage`
+    );
+    renderOverview();
+    renderStorageDetail();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function transitionLifecycle(target) {
+  try {
+    const cfg = readConfig();
+    state.sessionStorage = await request(
+      `/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/lifecycle`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target }),
+      }
+    );
+    refreshSelectedSession(target);
+    await loadTimeline();
+    renderOverview();
+    renderStorageDetail();
   } catch (err) {
     fail(err);
   }
@@ -544,7 +582,7 @@ function renderSessionBrowser() {
       <strong>${escapeHtml(session.alias || "(no alias)")}</strong>
       <span>${escapeHtml(session.session_id || "")}</span>
       <span>agent ${escapeHtml(session.agent_id || "")}</span>
-      <span>${escapeHtml(session.status || "unknown")} • active ${escapeHtml(formatTime(session.last_active_at_ms) || "-")}</span>
+      <span>${escapeHtml(session.status || "unknown")} • ${escapeHtml(session.lifecycle || "warm")} • active ${escapeHtml(formatTime(session.last_active_at_ms) || "-")}</span>
     `;
     node.addEventListener("click", () => selectSession(session.tenant_id, session.session_id, session.agent_id));
     root.append(node);
@@ -601,7 +639,7 @@ function renderRecentSessions() {
     node.innerHTML = `
       <strong>${escapeHtml(session.alias || "(no alias)")}</strong>
       <span>${escapeHtml(session.tenant.external_key || session.tenant.tenant_id || "")}</span>
-      <span>${escapeHtml(session.status || "unknown")} • ${escapeHtml(formatTime(session.last_active_at_ms) || "-")}</span>
+      <span>${escapeHtml(session.status || "unknown")} • ${escapeHtml(session.lifecycle || "warm")} • ${escapeHtml(formatTime(session.last_active_at_ms) || "-")}</span>
     `;
     node.addEventListener("click", () => selectSession(session.tenant_id, session.session_id, session.agent_id));
     root.append(node);
@@ -623,10 +661,25 @@ function renderOverview() {
   $("overviewSession").textContent = cfg.sessionId || "-";
   $("overviewEventCount").textContent = String(state.events.length);
   $("overviewLatestKind").textContent = latest?.kind || "-";
+  $("storageLifecycle").textContent = state.sessionStorage?.lifecycle || "-";
+  $("storageWarmHead").textContent =
+    state.sessionStorage?.warm_head_from_seq ?? "-";
+  $("storageSegments").textContent = String(
+    state.sessionStorage?.sealed_segment_count || 0
+  );
   $("selectionLabel").textContent = cfg.sessionId ? "Session selected" : "No session selected";
   $("selectionMeta").textContent = cfg.sessionId
     ? `Inspecting ${cfg.sessionId}`
     : "Choose a session from tenant health or recent sessions";
+}
+
+function renderStorageDetail() {
+  $("storageDetailLabel").textContent = state.sessionStorage
+    ? `${state.sessionStorage.lifecycle || "unknown"}`
+    : "No storage loaded";
+  $("storageView").textContent = state.sessionStorage
+    ? stringify(state.sessionStorage)
+    : "";
 }
 
 function renderInspector() {
@@ -744,10 +797,12 @@ function selectTenant(tenantId) {
   state.sessions = state.sessionsByTenant[tenantId] || [];
   state.events = [];
   state.selectedEventId = null;
+  state.sessionStorage = null;
   renderSessionBrowser();
   renderOverview();
   renderTimeline();
   renderInspector();
+  renderStorageDetail();
   readConfig(false);
 }
 
@@ -762,9 +817,22 @@ function selectSession(tenantId, sessionId, agentId) {
   $("agentId").value = agentId || "";
   state.sessions = state.sessionsByTenant[tenantId] || [];
   state.selectedEventId = null;
+  state.sessionStorage = null;
   renderSessionBrowser();
   readConfig(false);
   loadTimeline();
+  loadSessionStorage();
+}
+
+function refreshSelectedSession(target) {
+  const cfg = readConfig(false);
+  const collections = [state.sessions, state.recentSessions, state.sessionsByTenant[cfg.tenantId] || []];
+  collections.forEach((sessions) => {
+    const session = sessions.find((item) => item.session_id === cfg.sessionId);
+    if (session) session.lifecycle = target;
+  });
+  renderRecentSessions();
+  renderSessionBrowser();
 }
 
 function upsertEvent(event) {
