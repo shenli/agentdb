@@ -137,6 +137,26 @@ async fn list_tenants_and_sessions_returns_counts_and_rows() {
             .any(|tenant| tenant["tenant_id"] == tid)
     );
 
+    let agents: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/agents", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(agents["count"].as_u64().unwrap() >= 1);
+    assert!(
+        agents["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["agent_id"] == aid)
+    );
+
     let sessions: serde_json::Value = app
         .client
         .get(format!("{}/api/tenants/{tid}/sessions", app.base))

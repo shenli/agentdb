@@ -7,6 +7,7 @@ pub fn router() -> Router {
     let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
     Router::new()
         .route("/", get(index))
+        .route("/sessions/:tenant_id/:session_id", get(index))
         .fallback_service(ServeDir::new(static_dir))
 }
 

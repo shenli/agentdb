@@ -63,7 +63,7 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id",
             get(get_tenant).delete(delete_tenant),
         )
-        .route("/api/tenants/:tenant_id/agents", post(create_agent))
+        .route("/api/tenants/:tenant_id/agents", get(list_agents).post(create_agent))
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id",
             get(get_agent).delete(delete_agent),
@@ -278,6 +278,28 @@ async fn create_agent(
         })
         .await?;
     Ok(Json(a))
+}
+
+#[derive(Debug, Serialize)]
+struct ListAgentsResponse {
+    count: usize,
+    agents: Vec<Agent>,
+}
+
+async fn list_agents(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<ListAgentsResponse>, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let agents = s.runtime.list_agents(&tid).await?;
+    Ok(Json(ListAgentsResponse {
+        count: agents.len(),
+        agents,
+    }))
 }
 
 async fn get_agent(

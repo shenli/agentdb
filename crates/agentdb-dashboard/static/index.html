@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AgentDB Session Dashboard</title>
+    <title>AgentDB Dashboard</title>
     <link rel="stylesheet" href="/dashboard/styles.css" />
     <script defer src="/dashboard/app.js"></script>
   </head>
@@ -11,16 +11,100 @@
     <header class="top">
       <div>
         <p class="eyebrow">AgentDB</p>
-        <h1>Session timeline</h1>
+        <h1>Runtime dashboard</h1>
+        <p class="subhead">Fleet overview first, session inspection second.</p>
       </div>
-      <div class="connection" id="connection">idle</div>
+      <div class="top-actions">
+        <a class="ghost-link" id="backToOverview" href="/dashboard/">Back to overview</a>
+        <div class="connection" id="connection">idle</div>
+      </div>
     </header>
 
     <main class="shell">
-      <section class="workspace browser-shell">
+      <section class="panel overview-panel view-overview" aria-label="System overview">
+        <div class="section-head">
+          <h2>Fleet overview</h2>
+          <span id="selectionLabel">No session selected</span>
+        </div>
+        <div class="overview-grid">
+          <div class="metric">
+            <span class="metric-label">Tenants</span>
+            <strong id="overviewTenantCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Agents</span>
+            <strong id="overviewAgentCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Sessions</span>
+            <strong id="overviewSessionCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Active sessions</span>
+            <strong id="overviewActiveSessionCount">0</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace ops-shell view-overview">
+        <section class="panel" aria-label="Tenant health">
+          <div class="section-head">
+            <h2>Tenant health</h2>
+            <span id="tenantHealthCount">0 tenants</span>
+          </div>
+          <div class="toolbar">
+            <label class="search-field">
+              <span>Search tenants</span>
+              <input id="tenantSearch" placeholder="external key or tenant id" />
+            </label>
+          </div>
+          <div id="tenantCards" class="tenant-cards"></div>
+        </section>
+
+        <section class="panel" aria-label="Recent sessions">
+          <div class="section-head">
+            <h2>Recent sessions</h2>
+            <span id="recentSessionCount">0 sessions</span>
+          </div>
+          <div class="toolbar">
+            <label class="search-field">
+              <span>Search sessions</span>
+              <input id="sessionSearch" placeholder="alias, session id, tenant, agent" />
+            </label>
+          </div>
+          <div id="recentSessions" class="rows recent-rows"></div>
+        </section>
+      </section>
+
+      <section class="panel selection-panel" aria-label="Current selection">
+        <div class="section-head">
+          <h2 id="selectionTitle">Session explorer</h2>
+          <span id="selectionMeta">Choose a session from the overview</span>
+        </div>
+        <div class="overview-grid selection-grid">
+          <div class="metric">
+            <span class="metric-label">Tenant</span>
+            <strong id="overviewTenant">-</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Session</span>
+            <strong id="overviewSession">-</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Events</span>
+            <strong id="overviewEventCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Latest</span>
+            <strong id="overviewLatestKind">-</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace browser-shell view-overview">
         <section class="panel" aria-label="Tenant browser">
           <div class="section-head">
-            <h2>Tenants</h2>
+            <h2>Tenant explorer</h2>
             <span id="tenantCount">0 tenants</span>
           </div>
           <div class="actions compact-actions">
@@ -31,7 +115,7 @@
 
         <section class="panel" aria-label="Session browser">
           <div class="section-head">
-            <h2>Sessions</h2>
+            <h2>Sessions in tenant</h2>
             <span id="sessionCount">0 sessions</span>
           </div>
           <div class="actions compact-actions">
@@ -42,21 +126,24 @@
       </section>
 
       <section class="panel context-panel" aria-label="Session context">
-        <div class="grid ids">
-          <label>Tenant ID <input id="tenantId" autocomplete="off" placeholder="ten_..." /></label>
-          <label>Session ID <input id="sessionId" autocomplete="off" placeholder="ses_..." /></label>
-          <label>Agent ID <input id="agentId" autocomplete="off" placeholder="agt_..." /></label>
-          <label>From seq <input id="fromSeq" type="number" min="0" value="0" /></label>
-          <label>Limit <input id="limit" type="number" min="1" max="1000" value="100" /></label>
-          <label>Bearer token <input id="token" type="password" autocomplete="off" placeholder="optional" /></label>
-        </div>
-        <div class="actions">
-          <button data-action="load">Refresh timeline</button>
-          <button data-action="replay">Replay</button>
-          <button data-action="subscribe">Open SSE snapshot</button>
-          <button data-action="watch">Watch scope</button>
-          <button data-action="context">Build context</button>
-        </div>
+        <details class="advanced-panel">
+          <summary>Advanced API controls</summary>
+          <div class="grid ids">
+            <label>Tenant ID <input id="tenantId" autocomplete="off" placeholder="ten_..." /></label>
+            <label>Session ID <input id="sessionId" autocomplete="off" placeholder="ses_..." /></label>
+            <label>Agent ID <input id="agentId" autocomplete="off" placeholder="agt_..." /></label>
+            <label>From seq <input id="fromSeq" type="number" min="0" value="0" /></label>
+            <label>Limit <input id="limit" type="number" min="1" max="1000" value="100" /></label>
+            <label>Bearer token <input id="token" type="password" autocomplete="off" placeholder="optional" /></label>
+          </div>
+          <div class="actions">
+            <button data-action="load">Refresh timeline</button>
+            <button data-action="replay">Replay</button>
+            <button data-action="subscribe">Open SSE snapshot</button>
+            <button data-action="watch">Watch scope</button>
+            <button data-action="context">Build context</button>
+          </div>
+        </details>
       </section>
 
       <section class="workspace">
@@ -65,10 +152,38 @@
             <h2>Timeline</h2>
             <span id="eventCount">0 events</span>
           </div>
+          <div class="toolbar timeline-toolbar">
+            <label class="search-field">
+              <span>Search events</span>
+              <input id="eventSearch" placeholder="text, tool, status, preview" />
+            </label>
+            <label class="filter-field">
+              <span>Kind</span>
+              <select id="eventKindFilter">
+                <option value="">All kinds</option>
+                <option value="user_message">user_message</option>
+                <option value="tool_call">tool_call</option>
+                <option value="tool_result">tool_result</option>
+                <option value="context_pack_built">context_pack_built</option>
+                <option value="model_message">model_message</option>
+                <option value="agent_status">agent_status</option>
+              </select>
+            </label>
+          </div>
           <div class="timeline" id="timeline"></div>
         </section>
 
         <aside class="side">
+          <section class="panel" aria-label="Event inspector">
+            <div class="section-head">
+              <h2>Event inspector</h2>
+              <span id="selectedEventLabel">No event selected</span>
+            </div>
+            <div id="eventInspector" class="inspector empty-state">
+              Select an event to inspect its payload, refs, and metadata.
+            </div>
+          </section>
+
           <section class="panel" aria-label="Fork tree">
             <div class="section-head">
               <h2>Fork tree</h2>
@@ -118,7 +233,7 @@
 
       <section class="panel" aria-label="Raw output">
         <div class="section-head">
-          <h2>Raw response</h2>
+          <h2>Last response</h2>
           <button data-action="clear">Clear</button>
         </div>
         <pre id="raw" class="raw"></pre>

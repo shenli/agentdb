@@ -3,7 +3,8 @@ fn dashboard_targets_v2_session_surface() {
     let index = include_str!("../static/index.html");
     let app = include_str!("../static/app.js");
 
-    assert!(index.contains("Session timeline"));
+    assert!(index.contains("Runtime dashboard"));
+    assert!(index.contains("Session explorer"));
     assert!(app.contains("/events"));
     assert!(app.contains("/replay"));
     assert!(app.contains("/subscribe"));

@@ -709,6 +709,35 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
     }
 
+    pub async fn list_agents(&self, tenant_id: &Id) -> Result<Vec<Agent>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut agents: Vec<Agent> = s
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.deleted_at_ms.is_none() && agent.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect();
+        agents.sort_by(|a, b| {
+            a.alias
+                .as_deref()
+                .unwrap_or(a.agent_id.as_str())
+                .cmp(b.alias.as_deref().unwrap_or(b.agent_id.as_str()))
+        });
+        Ok(agents)
+    }
+
     pub async fn delete_tenant(&self, tenant_id: &Id) -> Result<()> {
         let mut s = self.state.lock().await;
         let live = s
