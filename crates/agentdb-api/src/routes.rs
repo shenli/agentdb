@@ -34,7 +34,8 @@ use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
     CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, ForkSessionBody,
     IncludeDeletedQuery, ListAgentSkillsResponse, PolicyWorkerRunBody, ReplayQuery,
-    SearchRecordsBody, SearchRecordsResponse, SweepBody, WatchQuery,
+    RestoreSessionStorageBody, SearchRecordsBody, SearchRecordsResponse, SweepBody,
+    TransitionSessionLifecycleBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::routing_http::{
@@ -58,6 +59,7 @@ pub fn routes() -> Router<AppState> {
         .route("/health/ready", get(health_ready))
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/storage/summary", get(get_fleet_storage_summary))
         .route("/api/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
@@ -83,6 +85,22 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id",
             get(get_session).delete(delete_session),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/lifecycle",
+            post(transition_session_lifecycle),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/storage",
+            get(get_session_storage),
+        )
+        .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/restore",
+            post(restore_session_storage),
+        )
+        .route(
+            "/api/tenants/:tenant_id/storage-summary",
+            get(get_tenant_storage_summary),
         )
         .route("/api/tenants/:tenant_id/sessions", get(list_sessions))
         .route(
@@ -210,6 +228,12 @@ async fn list_tenants(State(s): State<AppState>) -> Json<ListTenantsResponse> {
         count: tenants.len(),
         tenants,
     })
+}
+
+async fn get_fleet_storage_summary(
+    State(s): State<AppState>,
+) -> Json<agentdb_core::FleetStorageSummary> {
+    Json(s.runtime.fleet_storage_summary().await)
 }
 
 async fn get_tenant(
@@ -433,6 +457,156 @@ async fn delete_session(
     s.runtime.delete_session(&tid, &sid).await?;
     Ok(with_headers(
         StatusCode::NO_CONTENT.into_response(),
+        route_headers,
+    ))
+}
+
+async fn get_session_storage(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let sid = parse_id_or(
+        &session_id,
+        IdKind::Session,
+        agentdb_core::ErrorCode::SessionNotFound,
+    )?;
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::GET, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
+    Ok(with_headers(
+        Json(s.runtime.get_session_storage(&tid, &sid).await?).into_response(),
+        route_headers,
+    ))
+}
+
+async fn get_tenant_storage_summary(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<agentdb_core::TenantStorageSummary>, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    Ok(Json(s.runtime.tenant_storage_summary(&tid).await?))
+}
+
+async fn transition_session_lifecycle(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<TransitionSessionLifecycleBody>,
+) -> Result<Response, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let sid = parse_id_or(
+        &session_id,
+        IdKind::Session,
+        agentdb_core::ErrorCode::SessionNotFound,
+    )?;
+    let forward_body = serde_json::to_vec(&body).expect("lifecycle body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let target = match body.target.to_ascii_lowercase().as_str() {
+        "warm" => agentdb_core::Lifecycle::Warm,
+        "cold" => agentdb_core::Lifecycle::Cold,
+        "archive" => agentdb_core::Lifecycle::Archive,
+        "derivative_only" => agentdb_core::Lifecycle::DerivativeOnly,
+        other => {
+            return Err(ApiError::from(agentdb_core::Error::new(
+                ErrorCode::PolicyDenied,
+                format!("unknown lifecycle target: {other}"),
+            )))
+        }
+    };
+    Ok(with_headers(
+        Json(
+            s.runtime
+                .transition_session_lifecycle(&tid, &sid, target)
+                .await?,
+        )
+        .into_response(),
+        route_headers,
+    ))
+}
+
+async fn restore_session_storage(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Json(body): Json<RestoreSessionStorageBody>,
+) -> Result<Response, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let sid = parse_id_or(
+        &session_id,
+        IdKind::Session,
+        agentdb_core::ErrorCode::SessionNotFound,
+    )?;
+    let forward_body = serde_json::to_vec(&body).expect("restore body must serialize");
+    let route_headers = match guard_session_request(
+        &s,
+        &tid,
+        &sid,
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let target = match body.target.to_ascii_lowercase().as_str() {
+        "warm" => agentdb_core::Lifecycle::Warm,
+        "cold" => agentdb_core::Lifecycle::Cold,
+        other => {
+            return Err(ApiError::from(agentdb_core::Error::new(
+                ErrorCode::PolicyDenied,
+                format!("unknown restore target: {other}"),
+            )))
+        }
+    };
+    Ok(with_headers(
+        Json(s.runtime.restore_session_from_archive(&tid, &sid, target).await?).into_response(),
         route_headers,
     ))
 }

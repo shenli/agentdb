@@ -28,6 +28,7 @@ pub(crate) mod persist;
 pub mod policy;
 pub mod record;
 pub mod runtime;
+pub mod segment;
 pub mod session;
 pub mod skill;
 pub mod tenant;
@@ -44,8 +45,12 @@ pub use policy::{
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
-    ContextResponse, ForkSessionRequest, GcSweepReport, LifecycleSweepReport, PolicyWorkerReport,
-    ReplayResponse, Runtime, TenantWorkerReport, WatchRequest, WatchScope,
+    ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
+    LifecycleSweepReport, PolicyWorkerReport, ReplayResponse, Runtime, SessionStorageSummary,
+    TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
+};
+pub use segment::{
+    SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
 };
 pub use session::{Lifecycle, NewSession, Session};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};

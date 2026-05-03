@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+dnf update -y
+dnf install -y git rsync jq python3 python3-pip gcc openssl-devel
+
+cat >/home/ec2-user/agentdb.toml <<EOF
+[server]
+bind = "0.0.0.0:7878"
+dev = false
+
+[storage]
+data_dir = "./agentdb-data"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "${bucket}"
+region = "${region}"
+EOF
+
+chown ec2-user:ec2-user /home/ec2-user/agentdb.toml

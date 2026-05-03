@@ -15,7 +15,8 @@ pub mod rocks;
 pub mod slate;
 
 pub use content::{
-    sha256_hex, ContentBackend, InMemoryContentBackend, LocalFsContentBackend, PutResult,
+    sha256_hex, ContentBackend, InMemoryContentBackend, LocalFsContentBackend,
+    ObjectStoreContentBackend, PutResult,
 };
 pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,

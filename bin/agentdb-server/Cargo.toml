@@ -18,6 +18,7 @@ agentdb-storage = { path = "../../crates/agentdb-storage" }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
+object_store = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = "0.8"

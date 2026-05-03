@@ -125,16 +125,73 @@ live push can be layered onto the same watch cursor model.
 
 ## Storage
 
-The runtime persists metadata through `KvStore`. The local implementation uses
-RocksDB. Persistent single-node mode stores runtime metadata under
-`<data-dir>/runtime`.
+The runtime persists metadata through `KvStore`. The server now supports:
 
-Artifact content is separated from metadata through a `ContentBackend`. Local
-mode stores content under the configured `content_dir`; if no content directory
-is configured, it uses `<data-dir>/content`.
+- `RocksKvStore` for local-disk runtime metadata
+- `SlateKvStore` for object-store-backed runtime metadata
+
+Persistent single-node RocksDB mode stores runtime metadata under
+`<data-dir>/runtime`. SlateDB mode stores runtime metadata under the fixed
+object-store prefix `agentdb/runtime`.
+
+Artifact content is separated from metadata through a `ContentBackend`. The
+server now supports:
+
+- `LocalFsContentBackend` for local-disk blobs
+- `ObjectStoreContentBackend` for S3-compatible or other `object_store`
+  backends
+
+Local mode stores content under the configured `content_dir`; if no content
+directory is configured, it uses `<data-dir>/content`. Object-store mode stores
+artifacts, sealed cold segments, and archive bundles under the fixed prefix
+`agentdb/content`.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
+
+The runtime code itself is `KvStore`-agnostic, so tiered session metadata works
+with either `RocksKvStore` or `SlateKvStore`. The `agentdb-server` binary now
+selects the KV backend and content backend from `agentdb.toml`.
+
+## Session Tiered Storage
+
+Session history now has three physical forms:
+
+- `Warm`: appendable head in the runtime event store
+- `Cold`: immutable sealed session segments in the content backend
+- `Archive`: one compact archive bundle in the content backend plus a manifest
+  in session metadata
+
+Reads stay logical and session-centric: the runtime merges archive bundle,
+sealed segments, and warm-head events into one ordered event stream.
+
+```mermaid
+flowchart TD
+    A["append / append-and-fetch"] --> B["Warm session head<br/>KvStore metadata + hot event rows"]
+
+    B -->|seal to cold| C["Session row<br/>lifecycle = cold<br/>warm_head_from_seq = next_seq<br/>sealed_segments = [seg_...]"]
+    C --> D["ContentBackend segment blob<br/>seg_....json.enc<br/>full-fidelity events for one seq range"]
+
+    C -->|compact to archive| E["Session row<br/>lifecycle = archive<br/>archive_manifest = seg_...<br/>sealed_segments = []"]
+    E --> F["ContentBackend archive blob<br/>seg_....archive.json.enc<br/>compact full-history archive bundle"]
+
+    E -->|restore| G["Session row<br/>lifecycle = cold or warm<br/>archive_manifest = null<br/>sealed_segments = [seg_...]"]
+    G --> H["ContentBackend segment blob<br/>restored sealed history"]
+```
+
+Operationally:
+
+- `transition_lifecycle(cold)` seals the current warm head into an immutable
+  segment and removes hot event rows for that range.
+- `transition_lifecycle(archive)` compacts full session history into one
+  archive bundle and clears sealed-segment references.
+- `restore(target=cold|warm)` materializes archived history back into a sealed
+  segment so the session is no longer archive-backed.
+- Appending to an archived or cold session reopens a warm head without
+  rewriting old history.
+
+This logic is implemented in `agentdb-core`; the API and SDKs expose it through
+session lifecycle, storage, and restore endpoints.
 
 ## Deployment Shapes
 

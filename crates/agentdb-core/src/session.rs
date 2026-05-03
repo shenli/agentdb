@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::id::{Id, IdKind};
+use crate::segment::{SessionArchiveManifest, SessionSegment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,6 +42,12 @@ pub struct Session {
     pub created_at_ms: u64,
     pub last_active_at_ms: u64,
     pub policy_version: u64,
+    #[serde(default)]
+    pub warm_head_from_seq: u64,
+    #[serde(default)]
+    pub sealed_segments: Vec<SessionSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_manifest: Option<SessionArchiveManifest>,
     /// See `Tenant::deleted_at_ms` for the soft-delete contract that applies
     /// uniformly to every V2 runtime object.
     pub deleted_at_ms: Option<u64>,
@@ -68,6 +75,9 @@ impl Session {
             created_at_ms: now,
             last_active_at_ms: now,
             policy_version: 1,
+            warm_head_from_seq: 0,
+            sealed_segments: vec![],
+            archive_manifest: None,
             deleted_at_ms: None,
         }
     }

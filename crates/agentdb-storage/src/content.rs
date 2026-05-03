@@ -8,9 +8,9 @@
 //!   Used by the persistent runtime and exercised by the restart tests.
 //! - [`InMemoryContentBackend`]: holds blobs in a process-local map. Used by
 //!   `Runtime::in_memory()` and unit tests.
-//!
-//! A future S3-compatible backend (V2.4+) implements the same trait and
-//! becomes a swap for `LocalFsContentBackend` without touching the runtime.
+//! - [`ObjectStoreContentBackend`]: stores blobs in any `object_store`
+//!   backend. S3 is the primary target today; the same implementation also
+//!   works with local/object-store adapters used in tests.
 //!
 //! ## Atomicity
 //!
@@ -30,6 +30,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use object_store::path::Path as ObjectPath;
+use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -211,6 +213,99 @@ impl ContentBackend for InMemoryContentBackend {
         let mut g = self.blobs.lock().expect("blobs mutex poisoned");
         g.remove(&(tenant_id.to_string(), artifact_id.to_string()));
         Ok(())
+    }
+}
+
+// ----- ObjectStoreContentBackend ----------------------------------------------
+
+/// Object-store-backed content store. Stores blobs under
+/// `{prefix}/artifact_content/{tenant_id}/{artifact_id}/blob`.
+pub struct ObjectStoreContentBackend {
+    store: std::sync::Arc<dyn ObjectStore>,
+    prefix: String,
+}
+
+impl ObjectStoreContentBackend {
+    pub fn new(
+        store: std::sync::Arc<dyn ObjectStore>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        let prefix = prefix.into().trim_matches('/').to_string();
+        Self { store, prefix }
+    }
+
+    fn path_for(&self, tenant_id: &str, artifact_id: &str) -> ObjectPath {
+        let mut path = String::new();
+        if !self.prefix.is_empty() {
+            path.push_str(&self.prefix);
+            path.push('/');
+        }
+        path.push_str("artifact_content/");
+        path.push_str(tenant_id);
+        path.push('/');
+        path.push_str(artifact_id);
+        path.push_str("/blob");
+        ObjectPath::from(path)
+    }
+}
+
+#[async_trait]
+impl ContentBackend for ObjectStoreContentBackend {
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
+        let sha256_hex = sha256_hex(bytes);
+        self.store
+            .put(&self.path_for(tenant_id, artifact_id), bytes.to_vec().into())
+            .await
+            .map_err(|err| io::Error::other(format!("object store put failed: {err}")))?;
+        Ok(PutResult {
+            bytes: bytes.len() as u64,
+            sha256_hex,
+        })
+    }
+
+    async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
+        let path = self.path_for(tenant_id, artifact_id);
+        let result = self
+            .store
+            .get(&path)
+            .await
+            .map_err(map_object_store_get_error)?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|err| io::Error::other(format!("object store read failed: {err}")))?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn head(&self, tenant_id: &str, artifact_id: &str) -> io::Result<bool> {
+        let path = self.path_for(tenant_id, artifact_id);
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(err) => Err(io::Error::other(format!(
+                "object store head failed: {err}"
+            ))),
+        }
+    }
+
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        let path = self.path_for(tenant_id, artifact_id);
+        match self.store.delete(&path).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(io::Error::other(format!(
+                "object store delete failed: {err}"
+            ))),
+        }
+    }
+}
+
+fn map_object_store_get_error(err: object_store::Error) -> io::Error {
+    match err {
+        object_store::Error::NotFound { .. } => {
+            io::Error::new(io::ErrorKind::NotFound, "artifact blob not found")
+        }
+        other => io::Error::other(format!("object store get failed: {other}")),
     }
 }
 

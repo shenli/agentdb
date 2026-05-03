@@ -32,6 +32,17 @@ pub struct CreateSessionBody {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct TransitionSessionLifecycleBody {
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RestoreSessionStorageBody {
+    #[serde(default = "default_restore_target")]
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AppendBody {
     pub agent_id: String,
     pub kind: String,
@@ -116,6 +127,10 @@ fn default_max_bytes() -> usize {
 
 fn default_fetch_limit() -> usize {
     100
+}
+
+fn default_restore_target() -> String {
+    "cold".into()
 }
 
 fn default_watch_scope() -> String {

@@ -7,7 +7,11 @@
 
 use std::sync::Arc;
 
-use agentdb_storage::{ContentBackend, InMemoryContentBackend, LocalFsContentBackend};
+use agentdb_storage::{
+    ContentBackend, InMemoryContentBackend, LocalFsContentBackend, ObjectStoreContentBackend,
+};
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use tempfile::TempDir;
 
 // Precomputed sha256("hello world") — used to pin that the put result
@@ -20,6 +24,12 @@ fn local(dir: &TempDir) -> Arc<dyn ContentBackend> {
 
 fn in_memory() -> Arc<dyn ContentBackend> {
     Arc::new(InMemoryContentBackend::default())
+}
+
+fn object_store_local(dir: &TempDir) -> Arc<dyn ContentBackend> {
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    Arc::new(ObjectStoreContentBackend::new(store, "agentdb/content"))
 }
 
 async fn put_get_round_trip_against(backend: Arc<dyn ContentBackend>) {
@@ -45,6 +55,12 @@ async fn in_memory_put_get_round_trip() {
     put_get_round_trip_against(in_memory()).await;
 }
 
+#[tokio::test]
+async fn object_store_put_get_round_trip() {
+    let dir = TempDir::new().unwrap();
+    put_get_round_trip_against(object_store_local(&dir)).await;
+}
+
 async fn head_reflects_existence(backend: Arc<dyn ContentBackend>) {
     assert!(!backend.head("ten_a", "art_x").await.unwrap());
     backend.put("ten_a", "art_x", b"x").await.unwrap();
@@ -64,6 +80,12 @@ async fn in_memory_head_reflects_existence() {
     head_reflects_existence(in_memory()).await;
 }
 
+#[tokio::test]
+async fn object_store_head_reflects_existence() {
+    let dir = TempDir::new().unwrap();
+    head_reflects_existence(object_store_local(&dir)).await;
+}
+
 async fn put_overwrites_atomically(backend: Arc<dyn ContentBackend>) {
     backend.put("ten_a", "art_x", b"first").await.unwrap();
     backend.put("ten_a", "art_x", b"second").await.unwrap();
@@ -79,6 +101,12 @@ async fn local_put_overwrites_atomically() {
 #[tokio::test]
 async fn in_memory_put_overwrites_atomically() {
     put_overwrites_atomically(in_memory()).await;
+}
+
+#[tokio::test]
+async fn object_store_put_overwrites_atomically() {
+    let dir = TempDir::new().unwrap();
+    put_overwrites_atomically(object_store_local(&dir)).await;
 }
 
 async fn cross_tenant_isolation(backend: Arc<dyn ContentBackend>) {
@@ -99,6 +127,12 @@ async fn in_memory_cross_tenant_isolation() {
     cross_tenant_isolation(in_memory()).await;
 }
 
+#[tokio::test]
+async fn object_store_cross_tenant_isolation() {
+    let dir = TempDir::new().unwrap();
+    cross_tenant_isolation(object_store_local(&dir)).await;
+}
+
 async fn delete_missing_is_ok(backend: Arc<dyn ContentBackend>) {
     backend.delete("ten_a", "art_does_not_exist").await.unwrap();
 }
@@ -112,6 +146,12 @@ async fn local_delete_missing_is_ok() {
 #[tokio::test]
 async fn in_memory_delete_missing_is_ok() {
     delete_missing_is_ok(in_memory()).await;
+}
+
+#[tokio::test]
+async fn object_store_delete_missing_is_ok() {
+    let dir = TempDir::new().unwrap();
+    delete_missing_is_ok(object_store_local(&dir)).await;
 }
 
 #[tokio::test]
@@ -152,4 +192,24 @@ async fn local_persists_across_backend_instances() {
     }
     let b2 = LocalFsContentBackend::new(dir.path());
     assert_eq!(b2.get("ten_a", "art_x").await.unwrap(), b"persisted");
+}
+
+#[tokio::test]
+async fn object_store_uses_artifact_content_layout() {
+    let dir = TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let backend = ObjectStoreContentBackend::new(store, "agentdb/content");
+    backend.put("ten_a", "art_x", b"hi").await.unwrap();
+    let expected = dir
+        .path()
+        .join("agentdb")
+        .join("content")
+        .join("artifact_content")
+        .join("ten_a")
+        .join("art_x")
+        .join("blob");
+    assert!(expected.exists(), "blob not at expected path: {expected:?}");
+    let got = std::fs::read(&expected).unwrap();
+    assert_eq!(got, b"hi");
 }

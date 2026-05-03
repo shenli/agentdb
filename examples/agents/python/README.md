@@ -36,6 +36,65 @@ records user input, tool calls, tool results, artifact refs, context provenance,
 model output, a simulated harness restart, replay, and resume-from-`seq` in one
 ordered session timeline.
 
+## Session tiering demo
+
+```bash
+cargo run -p agentdb-server -- serve --dev
+python examples/agents/python/session_tiering_demo.py
+```
+
+This demo shows the first tiered-storage slice for developers:
+
+- write to a normal warm session
+- seal it into the cold tier
+- compact the sealed history into the archive tier
+- restore the archive into a normal cold session layout
+- confirm reads are unchanged
+- append again and watch a new warm head reopen on top of restored history
+
+## Ticket agent tiered demo
+
+```bash
+cargo run -p agentdb-server -- serve --config config/agentdb.toml
+python examples/agents/python/ticket_agent_tiered_demo.py
+```
+
+This is the best end-to-end demo app for a SlateDB + object-store deployment:
+
+- realistic support-ticket session flow
+- tool call and tool result persistence
+- artifact upload
+- model output and context provenance
+- cold transition
+- archive transition
+- restore
+- append after restore
+
+## AWS automation
+
+The repo also includes AWS deployment scaffolding for a real SlateDB + S3 run:
+
+```bash
+terraform -chdir=infra/aws/terraform init
+terraform -chdir=infra/aws/terraform apply
+
+scripts/aws/deploy-demo.sh <ec2-public-ip>
+scripts/aws/run-tiered-storage-smoke.sh http://<ec2-public-ip>:7878
+```
+
+Terraform provisions:
+
+- one S3 bucket
+- one EC2 instance
+- IAM role and instance profile
+- security group
+
+The smoke script runs:
+
+- `session_first_demo.py`
+- `session_tiering_demo.py`
+- `ticket_agent_tiered_demo.py`
+
 ## What it shows
 
 - **`session.append(event, fetch_last_n=5)`** — the AgentDB hot-

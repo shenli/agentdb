@@ -212,6 +212,302 @@ async fn append_and_fetch_returns_recent() {
 }
 
 #[tokio::test]
+async fn lifecycle_transition_to_cold_preserves_fetch_and_reports_storage() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    for i in 0..3 {
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/sessions/{sid}/events",
+                app.base
+            ))
+            .json(&json!({
+                "agent_id": aid,
+                "kind": "message",
+                "payload": {"i": i},
+                "artifact_refs": [],
+                "source_refs": []
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let before: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=100",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before.as_array().unwrap().len(), 3);
+
+    let storage: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/lifecycle",
+            app.base
+        ))
+        .json(&json!({"target": "cold"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(storage["lifecycle"], "cold");
+    assert_eq!(storage["sealed_segment_count"].as_u64().unwrap(), 1);
+    assert_eq!(storage["warm_head_from_seq"].as_u64().unwrap(), 3);
+
+    let after: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=100",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after.as_array().unwrap().len(), 3);
+
+    let storage_get: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/storage",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(storage_get["sealed_segment_count"].as_u64().unwrap(), 1);
+    assert_eq!(storage_get["next_seq"].as_u64().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn lifecycle_transition_to_archive_preserves_fetch_and_reports_manifest() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    for i in 0..3 {
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/sessions/{sid}/events",
+                app.base
+            ))
+            .json(&json!({
+                "agent_id": aid,
+                "kind": "message",
+                "payload": {"i": i},
+                "artifact_refs": [],
+                "source_refs": []
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let storage: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/lifecycle",
+            app.base
+        ))
+        .json(&json!({"target": "archive"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(storage["lifecycle"], "archive");
+    assert_eq!(storage["sealed_segment_count"].as_u64().unwrap(), 0);
+    assert!(storage["archive_manifest"].is_object());
+
+    let events: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=100",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn restore_archived_session_materializes_a_cold_segment() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    for i in 0..3 {
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/sessions/{sid}/events",
+                app.base
+            ))
+            .json(&json!({
+                "agent_id": aid,
+                "kind": "message",
+                "payload": {"i": i},
+                "artifact_refs": [],
+                "source_refs": []
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/lifecycle",
+            app.base
+        ))
+        .json(&json!({"target": "archive"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let restored: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/restore",
+            app.base
+        ))
+        .json(&json!({"target": "cold"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restored["lifecycle"], "cold");
+    assert_eq!(restored["sealed_segment_count"].as_u64().unwrap(), 1);
+    assert!(restored["archive_manifest"].is_null());
+
+    let events: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events?from_seq=0&limit=100",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(events.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn storage_summary_reports_lifecycle_counts() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    for i in 0..2 {
+        app.client
+            .post(format!(
+                "{}/api/tenants/{tid}/sessions/{sid}/events",
+                app.base
+            ))
+            .json(&json!({
+                "agent_id": aid,
+                "kind": "message",
+                "payload": {"i": i},
+                "artifact_refs": [],
+                "source_refs": []
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/lifecycle",
+            app.base
+        ))
+        .json(&json!({"target": "archive"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let fleet: serde_json::Value = app
+        .client
+        .get(format!("{}/api/storage/summary", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(fleet["session_count"].as_u64().unwrap() >= 1);
+    assert!(fleet["lifecycle_counts"]["archive"].as_u64().unwrap() >= 1);
+    assert!(fleet["archive_manifest_count"].as_u64().unwrap() >= 1);
+
+    let tenant: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/storage-summary", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tenant["tenant_id"], tid);
+    assert_eq!(tenant["lifecycle_counts"]["archive"].as_u64().unwrap(), 1);
+    assert_eq!(tenant["archive_manifest_count"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local() {
     let app = spawn_routed_app("node-a").await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
