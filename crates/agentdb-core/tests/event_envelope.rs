@@ -26,7 +26,7 @@ fn envelope_carries_required_fields() {
     assert_eq!(e.session_id, session);
     assert_eq!(e.seq, 0);
     assert_eq!(e.kind, "tool_result");
-    assert_eq!(e.schema_version, agentdb_core::VERSION);
+    assert_eq!(e.runtime_version, agentdb_core::RUNTIME_VERSION);
     assert_eq!(e.idempotency_key.as_deref(), Some("client-1"));
     assert_eq!(e.policy_version, 1);
     assert!(e.deleted_at_ms.is_none());
@@ -58,7 +58,7 @@ fn envelope_round_trips_through_json() {
     assert_eq!(back.seq, 7);
     assert_eq!(back.kind, "skill_used");
     assert_eq!(back.idempotency_key, None);
-    assert_eq!(back.schema_version, agentdb_core::VERSION);
+    assert_eq!(back.runtime_version, agentdb_core::RUNTIME_VERSION);
 }
 
 #[test]

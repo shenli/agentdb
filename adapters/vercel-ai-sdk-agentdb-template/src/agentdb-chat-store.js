@@ -1,4 +1,5 @@
-const SCHEMA_VERSION = "2026-04-28";
+const PAYLOAD_SCHEMA_VERSION = 1;
+const RUNTIME_VERSION = "2026-04-28";
 const MESSAGE_EVENT = "vercel_ai_message";
 const STREAM_STATE_NAMESPACE = ["vercel", "ai", "stream_state"];
 
@@ -20,7 +21,8 @@ export class AgentDBChatStore {
 
   async appendMessage(message, options = {}) {
     const payload = {
-      schema_version: SCHEMA_VERSION,
+      schema_version: PAYLOAD_SCHEMA_VERSION,
+      runtime_version: RUNTIME_VERSION,
       message,
       parts: message.parts ?? null,
       stream_id: options.streamId ?? null,
@@ -51,7 +53,8 @@ export class AgentDBChatStore {
       namespace: STREAM_STATE_NAMESPACE,
       text: JSON.stringify({ streamId, state }),
       metadata: {
-        schema_version: SCHEMA_VERSION,
+        schema_version: PAYLOAD_SCHEMA_VERSION,
+        runtime_version: RUNTIME_VERSION,
         session_id: this.sessionId,
         stream_id: streamId,
         state,

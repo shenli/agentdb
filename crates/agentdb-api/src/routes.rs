@@ -58,12 +58,12 @@ pub fn routes() -> Router<AppState> {
         .route("/health/ready", get(health_ready))
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
-        .route("/api/tenants", post(create_tenant))
+        .route("/api/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/api/tenants/:tenant_id",
             get(get_tenant).delete(delete_tenant),
         )
-        .route("/api/tenants/:tenant_id/agents", post(create_agent))
+        .route("/api/tenants/:tenant_id/agents", get(list_agents).post(create_agent))
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id",
             get(get_agent).delete(delete_agent),
@@ -84,6 +84,7 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/sessions/:session_id",
             get(get_session).delete(delete_session),
         )
+        .route("/api/tenants/:tenant_id/sessions", get(list_sessions))
         .route(
             "/api/tenants/:tenant_id/sessions/:session_id/events",
             post(append_event).get(fetch_events),
@@ -197,6 +198,20 @@ async fn create_tenant(
     Ok(Json(t))
 }
 
+#[derive(Debug, Serialize)]
+struct ListTenantsResponse {
+    count: usize,
+    tenants: Vec<Tenant>,
+}
+
+async fn list_tenants(State(s): State<AppState>) -> Json<ListTenantsResponse> {
+    let tenants = s.runtime.list_tenants().await;
+    Json(ListTenantsResponse {
+        count: tenants.len(),
+        tenants,
+    })
+}
+
 async fn get_tenant(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
@@ -207,6 +222,28 @@ async fn get_tenant(
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
     Ok(Json(s.runtime.get_tenant(&tid).await?))
+}
+
+#[derive(Debug, Serialize)]
+struct ListSessionsResponse {
+    count: usize,
+    sessions: Vec<agentdb_core::Session>,
+}
+
+async fn list_sessions(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<ListSessionsResponse>, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let sessions = s.runtime.list_sessions(&tid).await?;
+    Ok(Json(ListSessionsResponse {
+        count: sessions.len(),
+        sessions,
+    }))
 }
 
 async fn delete_tenant(
@@ -241,6 +278,28 @@ async fn create_agent(
         })
         .await?;
     Ok(Json(a))
+}
+
+#[derive(Debug, Serialize)]
+struct ListAgentsResponse {
+    count: usize,
+    agents: Vec<Agent>,
+}
+
+async fn list_agents(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<ListAgentsResponse>, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    let agents = s.runtime.list_agents(&tid).await?;
+    Ok(Json(ListAgentsResponse {
+        count: agents.len(),
+        agents,
+    }))
 }
 
 async fn get_agent(

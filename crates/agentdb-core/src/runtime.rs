@@ -681,6 +681,15 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
     }
 
+    pub async fn list_tenants(&self) -> Vec<Tenant> {
+        let s = self.state.lock().await;
+        s.tenants
+            .values()
+            .filter(|t| t.deleted_at_ms.is_none())
+            .cloned()
+            .collect()
+    }
+
     /// Look up an agent by id, scoped to the given tenant. Returns
     /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
     pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<Agent> {
@@ -698,6 +707,35 @@ impl Runtime {
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+    }
+
+    pub async fn list_agents(&self, tenant_id: &Id) -> Result<Vec<Agent>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut agents: Vec<Agent> = s
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.deleted_at_ms.is_none() && agent.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect();
+        agents.sort_by(|a, b| {
+            a.alias
+                .as_deref()
+                .unwrap_or(a.agent_id.as_str())
+                .cmp(b.alias.as_deref().unwrap_or(b.agent_id.as_str()))
+        });
+        Ok(agents)
     }
 
     pub async fn delete_tenant(&self, tenant_id: &Id) -> Result<()> {
@@ -784,6 +822,34 @@ impl Runtime {
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+    }
+
+    pub async fn list_sessions(&self, tenant_id: &Id) -> Result<Vec<Session>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut sessions: Vec<Session> = s
+            .sessions
+            .values()
+            .filter(|sess| {
+                sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect();
+        sessions.sort_by(|a, b| {
+            b.last_active_at_ms
+                .cmp(&a.last_active_at_ms)
+                .then_with(|| a.session_id.as_str().cmp(b.session_id.as_str()))
+        });
+        Ok(sessions)
     }
 
     pub async fn delete_session(&self, tenant_id: &Id, session_id: &Id) -> Result<()> {

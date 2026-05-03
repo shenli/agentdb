@@ -113,6 +113,72 @@ async fn create_tenant_agent_session_append_fetch_round_trip() {
 }
 
 #[tokio::test]
+async fn list_tenants_and_sessions_returns_counts_and_rows() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    let tenants: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tenants["count"].as_u64().unwrap() >= 1);
+    assert!(
+        tenants["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tenant| tenant["tenant_id"] == tid)
+    );
+
+    let agents: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/agents", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(agents["count"].as_u64().unwrap() >= 1);
+    assert!(
+        agents["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["agent_id"] == aid)
+    );
+
+    let sessions: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/sessions", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(sessions["count"].as_u64().unwrap() >= 1);
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"] == sid && session["agent_id"] == aid)
+    );
+}
+
+#[tokio::test]
 async fn append_and_fetch_returns_recent() {
     let app = spawn_app().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;

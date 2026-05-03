@@ -9,7 +9,10 @@ and durable runtime state.
 # 1. Start the server (one terminal)
 cargo run -p agentdb-server -- serve --dev
 
-# 2. Install the SDK + run the example (another terminal)
+# 2. Run from the repo checkout (another terminal)
+python examples/agents/python/quickstart.py
+
+# Optional: install the SDK if you want the package in your env
 pip install -e clients/python
 python examples/agents/python/quickstart.py
 ```
@@ -21,6 +24,9 @@ grow by one event, then a fork that inherits the parent's events at fork time.
 
 ```bash
 cargo run -p agentdb-server -- serve --dev
+python examples/agents/python/session_first_demo.py
+
+# Optional: install the SDK into your environment instead
 pip install -e clients/python
 python examples/agents/python/session_first_demo.py
 ```

@@ -38,7 +38,7 @@ export interface Event {
   seq: number;
   kind: string;
   payload: unknown;
-  schemaVersion: number;
+  runtimeVersion?: string;
   artifactRefs: Record<string, unknown>[];
   sourceRefs: Record<string, unknown>[];
   metadataKeyId?: string;
@@ -817,7 +817,7 @@ function eventFromDict(d: unknown): Event {
     seq: Number(rec.seq),
     kind: String(rec.kind),
     payload: rec.payload,
-    schemaVersion: Number(rec.schema_version ?? 1),
+    runtimeVersion: stringOrUndefined(rec.runtime_version),
     artifactRefs: arrayRecords(rec.artifact_refs),
     sourceRefs: arrayRecords(rec.source_refs),
     metadataKeyId: stringOrUndefined(rec.metadata_key_id),

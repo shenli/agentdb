@@ -23,7 +23,7 @@ async fn register_skill_assigns_typed_id_and_enforces_unique_version() {
         .await
         .unwrap();
     assert!(skill.skill_id.as_str().starts_with("skl_"));
-    assert_eq!(skill.schema_version, agentdb_core::VERSION);
+    assert_eq!(skill.runtime_version, agentdb_core::RUNTIME_VERSION);
 
     let err = rt
         .register_skill(

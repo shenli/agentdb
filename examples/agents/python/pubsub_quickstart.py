@@ -30,6 +30,10 @@ import os
 import threading
 import time
 
+from _bootstrap import ensure_repo_python_client_on_path
+
+ensure_repo_python_client_on_path()
+
 from agentdb import Client
 
 
