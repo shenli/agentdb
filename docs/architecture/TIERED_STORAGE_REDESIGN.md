@@ -307,6 +307,16 @@ The product must report restore state clearly.
 
 Search should not depend on whether raw history is warm or cold.
 
+AgentDB should treat raw session history and derived searchable state as
+separate storage concerns.
+
+- Raw session history exists for replay, recovery, fork, and audit.
+- Derived searchable state exists for discovery, retrieval, filtering, and
+  lightweight context loading.
+
+Tier transitions should move raw history between storage contracts without
+implicitly destroying the index/search contract.
+
 Recommended model:
 
 - index on append for warm sessions
@@ -321,6 +331,74 @@ Derived state may include:
 - source refs
 - searchable observations
 - embeddings
+
+### Index Behavior By Lifecycle
+
+#### Warm
+
+- Raw history is mutable and appendable.
+- Derived search/index documents are built incrementally on append.
+- Expensive derivative work may be throttled or batched, but the system should
+  not require a later cold/archive pass just to make warm data discoverable.
+
+#### Warm To Cold
+
+- Move raw session-history bytes into sealed immutable segments.
+- Keep existing search/index documents live.
+- Do not force queries to scan sealed segment blobs just because the raw
+  history left the warm store.
+
+Cold should change storage cost and mutability, not basic discoverability.
+
+#### Cold
+
+- Full replay should remain available from sealed segments.
+- Search should continue to resolve against derived/indexed state rather than
+  depending on direct reads of cold segment blobs.
+- Index/search data should remain logically valid even though raw history is no
+  longer in the warm mutable path.
+
+#### Cold To Archive
+
+- Compact or move raw session-history bytes into an archive bundle or colder
+  storage class.
+- Preserve derived search/index state by default.
+- Optionally compact the archive-side search representation if the platform
+  wants lower index cost for old data.
+
+Archive should not require rebuilding search results by opening full archive
+bundles for every query.
+
+#### Archive
+
+- Raw history may have higher latency or reduced read behavior depending on the
+  archive contract.
+- Search should continue to operate from derived/indexed state.
+- Platforms may choose between multiple archive search modes:
+  - full index retained
+  - compact index retained
+  - summary-only search retained
+
+The chosen archive search mode should be explicit in storage policy and product
+documentation.
+
+#### Archive To DerivativeOnly
+
+- Purge raw session-history bytes.
+- Keep summaries, refs, searchable observations, and other derived/indexed
+  state that remains useful without full replay.
+- Treat derived/indexed state as the surviving searchable representation of the
+  session.
+
+### Design Rules
+
+- Do not treat secondary indexes as an implementation detail of the warm tier.
+- Do not require direct scans of archive blobs for ordinary search paths.
+- Do not tie search correctness to physical placement of raw history bytes.
+- Make any degradation in archive search capability explicit rather than
+  accidental.
+- Let lifecycle policy decide whether old data keeps a full index, compact
+  index, or summary-only representation.
 
 This keeps lifecycle movement independent from the search contract.
 

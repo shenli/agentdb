@@ -13,6 +13,8 @@ material.
   systems design
 - [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
   - forward-looking redesign for real hot/cold/archive session storage
+- [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
+  - forward-looking optimization plan for large artifact blobs and content backends
 - [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) - supported deployment
   paths and operational checklist
 - [operations/SINGLE_NODE.md](operations/SINGLE_NODE.md) - single-node commands,
