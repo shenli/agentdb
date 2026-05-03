@@ -124,6 +124,39 @@ pub struct SessionStorageSummary {
     pub archive_manifest: Option<SessionArchiveManifest>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleCounts {
+    pub warm: usize,
+    pub cold: usize,
+    pub archive: usize,
+    pub derivative_only: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantStorageSummary {
+    pub tenant_id: Id,
+    pub session_count: usize,
+    pub active_session_count: usize,
+    pub lifecycle_counts: LifecycleCounts,
+    pub sealed_segment_count: usize,
+    pub archive_manifest_count: usize,
+    pub sealed_bytes: u64,
+    pub archived_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetStorageSummary {
+    pub tenant_count: usize,
+    pub session_count: usize,
+    pub active_session_count: usize,
+    pub lifecycle_counts: LifecycleCounts,
+    pub sealed_segment_count: usize,
+    pub archive_manifest_count: usize,
+    pub sealed_bytes: u64,
+    pub archived_bytes: u64,
+    pub tenants: Vec<TenantStorageSummary>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextInclude {
     RecentEvents,
@@ -453,6 +486,48 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    fn bump_lifecycle_counts(counts: &mut LifecycleCounts, lifecycle: Lifecycle) {
+        match lifecycle {
+            Lifecycle::Warm => counts.warm += 1,
+            Lifecycle::Cold => counts.cold += 1,
+            Lifecycle::Archive => counts.archive += 1,
+            Lifecycle::DerivativeOnly => counts.derivative_only += 1,
+        }
+    }
+
+    fn summarize_tenant_storage(tenant_id: &Id, sessions: &[Session]) -> TenantStorageSummary {
+        let mut lifecycle_counts = LifecycleCounts::default();
+        let mut active_session_count = 0usize;
+        let mut sealed_segment_count = 0usize;
+        let mut archive_manifest_count = 0usize;
+        let mut sealed_bytes = 0u64;
+        let mut archived_bytes = 0u64;
+
+        for session in sessions {
+            Self::bump_lifecycle_counts(&mut lifecycle_counts, session.lifecycle);
+            if session.status == crate::session::Status::Active {
+                active_session_count += 1;
+            }
+            sealed_segment_count += session.sealed_segments.len();
+            sealed_bytes += session.sealed_segments.iter().map(|segment| segment.bytes).sum::<u64>();
+            if let Some(manifest) = &session.archive_manifest {
+                archive_manifest_count += 1;
+                archived_bytes += manifest.bytes;
+            }
+        }
+
+        TenantStorageSummary {
+            tenant_id: tenant_id.clone(),
+            session_count: sessions.len(),
+            active_session_count,
+            lifecycle_counts,
+            sealed_segment_count,
+            archive_manifest_count,
+            sealed_bytes,
+            archived_bytes,
+        }
+    }
+
     fn session_storage_summary(session: &Session) -> SessionStorageSummary {
         SessionStorageSummary {
             session_id: session.session_id.clone(),
@@ -1046,6 +1121,66 @@ impl Runtime {
         Ok(Self::session_storage_summary(&session))
     }
 
+    pub async fn tenant_storage_summary(&self, tenant_id: &Id) -> Result<TenantStorageSummary> {
+        let sessions = self.list_sessions(tenant_id).await?;
+        Ok(Self::summarize_tenant_storage(tenant_id, &sessions))
+    }
+
+    pub async fn fleet_storage_summary(&self) -> FleetStorageSummary {
+        let s = self.state.lock().await;
+        let live_tenants: Vec<Tenant> = s
+            .tenants
+            .values()
+            .filter(|tenant| tenant.deleted_at_ms.is_none())
+            .cloned()
+            .collect();
+
+        let mut tenant_summaries = Vec::with_capacity(live_tenants.len());
+        let mut lifecycle_counts = LifecycleCounts::default();
+        let mut session_count = 0usize;
+        let mut active_session_count = 0usize;
+        let mut sealed_segment_count = 0usize;
+        let mut archive_manifest_count = 0usize;
+        let mut sealed_bytes = 0u64;
+        let mut archived_bytes = 0u64;
+
+        for tenant in &live_tenants {
+            let sessions: Vec<Session> = s
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session.tenant_id.as_str() == tenant.tenant_id.as_str()
+                })
+                .cloned()
+                .collect();
+            let summary = Self::summarize_tenant_storage(&tenant.tenant_id, &sessions);
+            session_count += summary.session_count;
+            active_session_count += summary.active_session_count;
+            sealed_segment_count += summary.sealed_segment_count;
+            archive_manifest_count += summary.archive_manifest_count;
+            sealed_bytes += summary.sealed_bytes;
+            archived_bytes += summary.archived_bytes;
+            lifecycle_counts.warm += summary.lifecycle_counts.warm;
+            lifecycle_counts.cold += summary.lifecycle_counts.cold;
+            lifecycle_counts.archive += summary.lifecycle_counts.archive;
+            lifecycle_counts.derivative_only += summary.lifecycle_counts.derivative_only;
+            tenant_summaries.push(summary);
+        }
+
+        FleetStorageSummary {
+            tenant_count: live_tenants.len(),
+            session_count,
+            active_session_count,
+            lifecycle_counts,
+            sealed_segment_count,
+            archive_manifest_count,
+            sealed_bytes,
+            archived_bytes,
+            tenants: tenant_summaries,
+        }
+    }
+
     pub async fn transition_session_lifecycle(
         &self,
         tenant_id: &Id,
@@ -1086,6 +1221,110 @@ impl Runtime {
                 "derivative_only transition is driven by lifecycle/gc policy, not direct session transition",
             )),
         }
+    }
+
+    pub async fn restore_session_from_archive(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        target: Lifecycle,
+    ) -> Result<SessionStorageSummary> {
+        if !matches!(target, Lifecycle::Warm | Lifecycle::Cold) {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "archive restore target must be warm or cold",
+            ));
+        }
+
+        let snapshot = self.get_session(tenant_id, session_id).await?;
+        let manifest = snapshot.archive_manifest.clone().ok_or_else(|| {
+            Error::new(
+                ErrorCode::PolicyDenied,
+                format!("session {} has no archive manifest to restore", session_id),
+            )
+        })?;
+
+        let history = self
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                from_seq: 0,
+                limit: usize::MAX,
+            })
+            .await?;
+        let restored_segment = if history.is_empty() {
+            None
+        } else {
+            Some(
+                self.write_session_segment(tenant_id, session_id, history)
+                    .await?,
+            )
+        };
+
+        let updated = {
+            let mut s = self.state.lock().await;
+            {
+                let session = s
+                    .sessions
+                    .get_mut(session_id.as_str())
+                    .filter(|sess| {
+                        sess.deleted_at_ms.is_none()
+                            && sess.tenant_id.as_str() == tenant_id.as_str()
+                    })
+                    .ok_or_else(|| {
+                        Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
+                    })?;
+                if session.next_seq != snapshot.next_seq
+                    || session.warm_head_from_seq != snapshot.warm_head_from_seq
+                {
+                    return Err(Error::new(
+                        ErrorCode::Internal,
+                        "session changed during archive restore; retry the restore",
+                    ));
+                }
+                session.archive_manifest = None;
+                session.sealed_segments = restored_segment.clone().into_iter().collect();
+                session.warm_head_from_seq = session.next_seq;
+                session.lifecycle = target;
+            }
+            if self.persist.is_none() {
+                let lo = (
+                    session_id.as_str().to_string(),
+                    snapshot.warm_head_from_seq,
+                );
+                let hi = (session_id.as_str().to_string(), u64::MAX);
+                let keys: Vec<(String, u64)> =
+                    s.events.range(lo..=hi).map(|(k, _)| k.clone()).collect();
+                for key in keys {
+                    if let Some(event) = s.events.remove(&key) {
+                        s.event_by_id.remove(event.event_id.as_str());
+                    }
+                }
+            }
+            s.sessions
+                .get(session_id.as_str())
+                .expect("session exists after archive restore")
+                .clone()
+        };
+
+        if let Some(p) = &self.persist {
+            if let Some(segment) = &restored_segment {
+                p.put_session_segment(segment).map_err(internal)?;
+            }
+            p.put_session(&updated).map_err(internal)?;
+            let _ = p.delete_events_from_seq(
+                tenant_id.as_str(),
+                session_id.as_str(),
+                snapshot.warm_head_from_seq,
+            );
+        }
+
+        let _ = self
+            .content
+            .delete(tenant_id.as_str(), manifest.manifest_id.as_str())
+            .await;
+
+        Ok(Self::session_storage_summary(&updated))
     }
 
     async fn seal_session_to_cold(

@@ -136,6 +136,73 @@ is configured, it uses `<data-dir>/content`.
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
 
+The runtime code itself is `KvStore`-agnostic, so tiered session metadata works
+with either `RocksKvStore` or `SlateKvStore`. The current `agentdb-server`
+binary still boots with RocksDB plus `LocalFsContentBackend`; a production S3
+story needs the server/config layer to wire `SlateKvStore` and an S3-compatible
+content backend together.
+
+## Session Tiered Storage
+
+Session history now has three physical forms:
+
+- `Warm`: appendable head in the runtime event store
+- `Cold`: immutable sealed session segments in the content backend
+- `Archive`: one compact archive bundle in the content backend plus a manifest
+  in session metadata
+
+Reads stay logical and session-centric: the runtime merges archive bundle,
+sealed segments, and warm-head events into one ordered event stream.
+
+```text
+append / append-and-fetch
+        |
+        v
+  Warm head events
+  KvStore metadata + event rows
+        |
+        | seal to cold
+        v
+  Session row
+  - lifecycle = cold
+  - warm_head_from_seq = next_seq
+  - sealed_segments = [seg_...]
+        |
+        +----> ContentBackend blob: seg_...json.enc
+        |         full-fidelity events for a seq range
+        |
+        | compact to archive
+        v
+  Session row
+  - lifecycle = archive
+  - archive_manifest = seg_...
+  - sealed_segments = []
+        |
+        +----> ContentBackend blob: seg_...archive.json.enc
+                  compact full-history archive bundle
+        |
+        | restore
+        v
+  Session row
+  - lifecycle = cold or warm
+  - archive_manifest = null
+  - sealed_segments = [seg_...]
+```
+
+Operationally:
+
+- `transition_lifecycle(cold)` seals the current warm head into an immutable
+  segment and removes hot event rows for that range.
+- `transition_lifecycle(archive)` compacts full session history into one
+  archive bundle and clears sealed-segment references.
+- `restore(target=cold|warm)` materializes archived history back into a sealed
+  segment so the session is no longer archive-backed.
+- Appending to an archived or cold session reopens a warm head without
+  rewriting old history.
+
+This logic is implemented in `agentdb-core`; the API and SDKs expose it through
+session lifecycle, storage, and restore endpoints.
+
 ## Deployment Shapes
 
 - **In-memory dev/test**: throwaway runtime state for smoke tests and quick

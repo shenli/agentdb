@@ -12,6 +12,7 @@ const state = {
   recentSessions: [],
   selectedEventId: null,
   sessionStorage: null,
+  storageSummary: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -102,6 +103,7 @@ function dispatch(action) {
     "to-warm": () => transitionLifecycle("warm"),
     "to-cold": () => transitionLifecycle("cold"),
     "to-archive": () => transitionLifecycle("archive"),
+    "restore-cold": () => restoreStorage("cold"),
     fork: forkSession,
     artifact: loadArtifact,
     records: searchRecords,
@@ -230,6 +232,7 @@ async function loadTenants() {
 
 async function loadOverview() {
   try {
+    state.storageSummary = await request("/api/storage/summary", { requireIds: false });
     await loadTenants();
     const tenants = state.tenants.slice();
     const agentPairs = await Promise.all(
@@ -334,6 +337,27 @@ async function transitionLifecycle(target) {
     );
     refreshSelectedSession(target);
     await loadTimeline();
+    await loadOverview();
+    renderOverview();
+    renderStorageDetail();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function restoreStorage(target) {
+  try {
+    const cfg = readConfig();
+    state.sessionStorage = await request(
+      `/api/tenants/${enc(cfg.tenantId)}/sessions/${enc(cfg.sessionId)}/restore`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target }),
+      }
+    );
+    refreshSelectedSession(state.sessionStorage?.lifecycle || target);
+    await loadTimeline();
+    await loadOverview();
     renderOverview();
     renderStorageDetail();
   } catch (err) {
@@ -653,10 +677,17 @@ function renderOverview() {
   const agentCount = state.tenantSummaries.reduce((sum, item) => sum + item.agentCount, 0);
   const sessionCount = state.tenantSummaries.reduce((sum, item) => sum + item.sessionCount, 0);
   const activeSessionCount = state.tenantSummaries.reduce((sum, item) => sum + item.activeSessionCount, 0);
+  const lifecycleCounts = state.storageSummary?.lifecycle_counts || {};
   $("overviewTenantCount").textContent = String(tenantCount);
   $("overviewAgentCount").textContent = String(agentCount);
   $("overviewSessionCount").textContent = String(sessionCount);
   $("overviewActiveSessionCount").textContent = String(activeSessionCount);
+  $("overviewWarmCount").textContent = String(lifecycleCounts.warm || 0);
+  $("overviewColdCount").textContent = String(lifecycleCounts.cold || 0);
+  $("overviewArchiveCount").textContent = String(lifecycleCounts.archive || 0);
+  $("overviewArchiveBundleCount").textContent = String(
+    state.storageSummary?.archive_manifest_count || 0
+  );
   $("overviewTenant").textContent = cfg.tenantId || "-";
   $("overviewSession").textContent = cfg.sessionId || "-";
   $("overviewEventCount").textContent = String(state.events.length);

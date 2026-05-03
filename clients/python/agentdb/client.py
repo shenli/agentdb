@@ -132,6 +132,9 @@ class AgentDB:
     def health_ready(self) -> bool:
         return self.client.health_ready()
 
+    def storage_summary(self) -> dict:
+        return self.client.get_fleet_storage_summary()
+
     def workspace(
         self,
         name: Optional[str] = None,
@@ -247,6 +250,9 @@ class Workspace:
             from_cursor=from_cursor,
             limit=limit,
         )
+
+    def storage_summary(self) -> dict:
+        return self._client.get_tenant_storage_summary(self.tenant_id)
 
 
 class AgentHandle:
@@ -456,6 +462,9 @@ class SessionHandle:
 
     def transition_lifecycle(self, target: str) -> dict:
         return self._session.transition_lifecycle(target)
+
+    def restore(self, target: str = "cold") -> dict:
+        return self._session.restore(target)
 
 
 class ArtifactCollection:
@@ -708,6 +717,24 @@ class Client:
             f"/api/tenants/{_quote(tenant_id)}/sessions/{_quote(session_id)}/storage",
         )
 
+    def get_tenant_storage_summary(self, tenant_id: TenantId) -> dict:
+        return self._request(
+            "GET",
+            f"/api/tenants/{_quote(tenant_id)}/storage-summary",
+        )
+
+    def get_fleet_storage_summary(self) -> dict:
+        return self._request("GET", "/api/storage/summary")
+
+    def restore_session_storage(
+        self, tenant_id: TenantId, session_id: SessionId, target: str = "cold"
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/api/tenants/{_quote(tenant_id)}/sessions/{_quote(session_id)}/restore",
+            json={"target": target},
+        )
+
     def transition_session_lifecycle(
         self, tenant_id: TenantId, session_id: SessionId, target: str
     ) -> dict:
@@ -896,6 +923,11 @@ class Session:
 
     def transition_lifecycle(self, target: str) -> dict:
         return self._client.transition_session_lifecycle(
+            self.tenant_id, self.session_id, target
+        )
+
+    def restore(self, target: str = "cold") -> dict:
+        return self._client.restore_session_storage(
             self.tenant_id, self.session_id, target
         )
 

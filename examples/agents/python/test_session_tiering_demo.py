@@ -133,6 +133,16 @@ class FakeSession:
             self.warm_head_from_seq = len(self._events)
         return self.storage()
 
+    def restore(self, target: str = "cold") -> dict:
+        if target.lower() == "cold":
+            self.lifecycle = "cold"
+        else:
+            self.lifecycle = "warm"
+        self.archive_manifest = None
+        self.sealed_segment_count = 1 if self._events else 0
+        self.warm_head_from_seq = len(self._events)
+        return self.storage()
+
     def storage(self) -> dict:
         return {
             "session_id": self.session_id,
@@ -151,12 +161,16 @@ def test_session_tiering_demo_seals_reads_and_resumes() -> None:
     assert result["warm_event_count"] == 3
     assert result["cold_event_count"] == 3
     assert result["archive_event_count"] == 3
+    assert result["restored_event_count"] == 3
     assert result["merged_event_count"] == 4
     assert result["cold_storage"]["lifecycle"] == "cold"
     assert result["cold_storage"]["sealed_segment_count"] == 1
     assert result["archive_storage"]["lifecycle"] == "archive"
     assert result["archive_storage"]["sealed_segment_count"] == 0
     assert result["archive_storage"]["archive_manifest"]["event_count"] == 3
+    assert result["restored_storage"]["lifecycle"] == "cold"
+    assert result["restored_storage"]["sealed_segment_count"] == 1
+    assert result["restored_storage"]["archive_manifest"] is None
     assert result["warm_storage"]["lifecycle"] == "warm"
     assert result["resumed_seq"] == 3
     assert result["event_seqs"] == [0, 1, 2, 3]

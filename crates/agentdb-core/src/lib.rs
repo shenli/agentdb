@@ -45,8 +45,9 @@ pub use policy::{
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
-    ContextResponse, ForkSessionRequest, GcSweepReport, LifecycleSweepReport, PolicyWorkerReport,
-    ReplayResponse, Runtime, SessionStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
+    ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
+    LifecycleSweepReport, PolicyWorkerReport, ReplayResponse, Runtime, SessionStorageSummary,
+    TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
 };
 pub use segment::{
     SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,

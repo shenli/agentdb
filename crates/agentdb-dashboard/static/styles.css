@@ -237,7 +237,7 @@ label {
 
 .storage-actions {
   display: grid;
-  grid-template-columns: repeat(4, auto);
+  grid-template-columns: repeat(5, auto);
   gap: 8px;
   align-content: start;
 }

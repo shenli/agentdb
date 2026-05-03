@@ -23,6 +23,7 @@ dependencies = [
  "agentdb-index",
  "agentdb-storage",
  "anyhow",
+ "object_store",
  "serde",
  "serde_json",
  "serial_test",

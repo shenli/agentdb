@@ -12,11 +12,14 @@ fn dashboard_targets_v2_session_surface() {
     assert!(app.contains("/artifacts/"));
     assert!(app.contains("/skills"));
     assert!(app.contains("/storage"));
+    assert!(app.contains("/api/storage/summary"));
     assert!(app.contains("/lifecycle"));
+    assert!(app.contains("/restore"));
     assert!(index.contains("Storage detail"));
     assert!(index.contains("Warm"));
     assert!(index.contains("Cold"));
     assert!(index.contains("Archive"));
+    assert!(index.contains("Restore cold"));
 }
 
 #[test]

@@ -48,8 +48,9 @@ This demo shows the first tiered-storage slice for developers:
 - write to a normal warm session
 - seal it into the cold tier
 - compact the sealed history into the archive tier
+- restore the archive into a normal cold session layout
 - confirm reads are unchanged
-- append again and watch a new warm head reopen on top of archived history
+- append again and watch a new warm head reopen on top of restored history
 
 ## What it shows
 

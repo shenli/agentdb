@@ -44,6 +44,24 @@
             <strong id="overviewActiveSessionCount">0</strong>
           </div>
         </div>
+        <div class="overview-grid storage-overview-grid">
+          <div class="metric">
+            <span class="metric-label">Warm sessions</span>
+            <strong id="overviewWarmCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Cold sessions</span>
+            <strong id="overviewColdCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Archived sessions</span>
+            <strong id="overviewArchiveCount">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Archive bundles</span>
+            <strong id="overviewArchiveBundleCount">0</strong>
+          </div>
+        </div>
       </section>
 
       <section class="workspace ops-shell view-overview">
@@ -121,6 +139,7 @@
             <button data-action="to-warm">Warm</button>
             <button data-action="to-cold">Cold</button>
             <button data-action="to-archive">Archive</button>
+            <button data-action="restore-cold">Restore cold</button>
           </div>
         </div>
       </section>
