@@ -11,6 +11,8 @@ material.
   non-goals, and durable design decisions
 - [architecture/agent-db.md](architecture/agent-db.md) - long-form product and
   systems design
+- [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
+  - forward-looking redesign for real hot/cold/archive session storage
 - [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) - supported deployment
   paths and operational checklist
 - [operations/SINGLE_NODE.md](operations/SINGLE_NODE.md) - single-node commands,
@@ -33,3 +35,5 @@ material.
 - [superpowers/plans](superpowers/plans) - implementation plans
 - [superpowers/notes](superpowers/notes) - investigation notes and decision
   records
+- [superpowers/plans/2026-05-02-tiered-storage-redesign-implementation.md](superpowers/plans/2026-05-02-tiered-storage-redesign-implementation.md)
+  - phased implementation plan for the tiered-storage redesign

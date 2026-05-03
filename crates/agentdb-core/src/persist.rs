@@ -28,8 +28,8 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
     artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_key,
-    session_alias_key, session_record_key, skill_record_key, skill_unique_key, tenant_alias_key,
-    tenant_record_key,
+    session_alias_key, session_record_key, session_segment_key, skill_record_key,
+    skill_unique_key, tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
@@ -42,6 +42,7 @@ use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
+use crate::segment::SessionSegment;
 use crate::session::Session;
 use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
@@ -273,6 +274,18 @@ impl Persist {
         self.kv.write_batch(ops)
     }
 
+    pub fn put_session_segment(&self, segment: &SessionSegment) -> KvResult<()> {
+        self.kv.write_batch(vec![WriteOp::Put {
+            key: session_segment_key(
+                segment.tenant_id.as_str(),
+                segment.session_id.as_str(),
+                segment.segment_id.as_str(),
+            )
+            .into_bytes(),
+            value: serde_json::to_vec(segment).expect("session segment serializes"),
+        }])
+    }
+
     pub fn delete_session(&self, s: &Session) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Delete {
@@ -299,6 +312,37 @@ impl Persist {
             let plaintext = self.decrypt_metadata(&context, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
+            ops.push(WriteOp::Delete { key: k });
+            ops.push(WriteOp::Delete {
+                key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),
+            });
+            count += 1;
+        }
+        if !ops.is_empty() {
+            self.kv.write_batch(ops)?;
+        }
+        Ok(count)
+    }
+
+    pub fn delete_events_from_seq(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        from_seq: u64,
+    ) -> KvResult<usize> {
+        let prefix = format!("event/{tenant_id}/{session_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut ops: Vec<WriteOp> = Vec::new();
+        let mut count = 0;
+        for res in iter {
+            let (k, v) = res?;
+            let context = self.event_context_from_key(tenant_id, session_id, 0);
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            let env: EventEnvelope =
+                serde_json::from_slice(&plaintext).expect("event envelope decodes");
+            if env.seq < from_seq {
+                continue;
+            }
             ops.push(WriteOp::Delete { key: k });
             ops.push(WriteOp::Delete {
                 key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),

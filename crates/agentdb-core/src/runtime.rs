@@ -31,11 +31,12 @@ use crate::agent::{Agent, NewAgent};
 use crate::artifact::{Artifact, NewArtifact};
 use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
-use crate::id::Id;
+use crate::id::{Id, IdKind};
 use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::Persist;
 use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
+use crate::segment::{SessionSegment, SessionSegmentFile};
 use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tenant::{NewTenant, Tenant};
@@ -108,6 +109,16 @@ pub struct ForkSessionRequest {
 pub struct ReplayResponse {
     pub session_id: Id,
     pub events: Vec<EventEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStorageSummary {
+    pub session_id: Id,
+    pub lifecycle: Lifecycle,
+    pub next_seq: u64,
+    pub warm_head_from_seq: u64,
+    pub sealed_segment_count: usize,
+    pub sealed_segments: Vec<SessionSegment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +450,122 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    fn session_storage_summary(session: &Session) -> SessionStorageSummary {
+        SessionStorageSummary {
+            session_id: session.session_id.clone(),
+            lifecycle: session.lifecycle,
+            next_seq: session.next_seq,
+            warm_head_from_seq: session.warm_head_from_seq,
+            sealed_segment_count: session.sealed_segments.len(),
+            sealed_segments: session.sealed_segments.clone(),
+        }
+    }
+
+    async fn read_session_segment_events(&self, segment: &SessionSegment) -> Result<Vec<EventEnvelope>> {
+        let current_key = self.resolve_key(&segment.tenant_id, KeyOperation::ContentRead)?;
+        let stored_bytes = self
+            .content
+            .get(segment.tenant_id.as_str(), segment.segment_id.as_str())
+            .await
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment get failed: {e}")))?;
+        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment envelope failed: {e}")))?
+        {
+            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
+            None => (
+                key_from_parts(&segment.content_key_id, &segment.content_key_version)
+                    .unwrap_or(current_key),
+                stored_bytes,
+            ),
+        };
+        let crypto_context = ContentCryptoContext {
+            tenant_id: segment.tenant_id.as_str(),
+            artifact_id: segment.segment_id.as_str(),
+            key: &content_key,
+        };
+        let plaintext = self
+            .content_crypto
+            .decrypt(&crypto_context, &ciphertext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment decrypt failed: {e}")))?;
+        let file: SessionSegmentFile = serde_json::from_slice(&plaintext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment decode failed: {e}")))?;
+        Ok(file.events)
+    }
+
+    async fn write_session_segment(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        events: Vec<EventEnvelope>,
+    ) -> Result<SessionSegment> {
+        let Some((seq_start, seq_end)) = events
+            .first()
+            .zip(events.last())
+            .map(|(first, last)| (first.seq, last.seq))
+        else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "cannot seal empty session segment",
+            ));
+        };
+        let segment_id = Id::new(IdKind::Segment);
+        let content_key = self.resolve_key(tenant_id, KeyOperation::ContentWrite)?;
+        let file = SessionSegmentFile {
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
+            segment_id: segment_id.clone(),
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            seq_start,
+            seq_end,
+            events,
+        };
+        let plaintext =
+            serde_json::to_vec(&file).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        let plaintext_sha256 = sha256_hex(&plaintext);
+        let crypto_context = ContentCryptoContext {
+            tenant_id: tenant_id.as_str(),
+            artifact_id: segment_id.as_str(),
+            key: &content_key,
+        };
+        let encrypted_bytes = self
+            .content_crypto
+            .encrypt(&crypto_context, &plaintext)
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment encrypt failed: {e}")))?;
+        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        self.content
+            .put(tenant_id.as_str(), segment_id.as_str(), &stored_bytes)
+            .await
+            .map_err(|e| Error::new(ErrorCode::Internal, format!("segment put failed: {e}")))?;
+        Ok(SessionSegment {
+            segment_id,
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            seq_start,
+            seq_end,
+            event_count: (seq_end - seq_start) + 1,
+            bytes: plaintext.len() as u64,
+            sha256: plaintext_sha256,
+            content_key_id: Some(content_key.key_id.clone()),
+            content_key_version: content_key.key_version.clone(),
+            created_at_ms: crate::now_ms(),
+        })
+    }
+
+    async fn read_hot_events_from_persist(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>> {
+        if let Some(p) = &self.persist {
+            return p
+                .scan_events(tenant_id.as_str(), session_id.as_str(), from_seq, limit)
+                .map_err(internal);
+        }
+        Ok(vec![])
+    }
+
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
@@ -822,6 +949,214 @@ impl Runtime {
             })
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+    }
+
+    pub async fn get_session_storage(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<SessionStorageSummary> {
+        let session = self.get_session(tenant_id, session_id).await?;
+        Ok(Self::session_storage_summary(&session))
+    }
+
+    pub async fn transition_session_lifecycle(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        target: Lifecycle,
+    ) -> Result<SessionStorageSummary> {
+        match target {
+            Lifecycle::Warm => {
+                let updated = {
+                    let mut s = self.state.lock().await;
+                    let session = s
+                        .sessions
+                        .get_mut(session_id.as_str())
+                        .filter(|sess| {
+                            sess.deleted_at_ms.is_none()
+                                && sess.tenant_id.as_str() == tenant_id.as_str()
+                        })
+                        .ok_or_else(|| {
+                            Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
+                        })?;
+                    session.lifecycle = Lifecycle::Warm;
+                    if session.warm_head_from_seq > session.next_seq {
+                        session.warm_head_from_seq = session.next_seq;
+                    }
+                    session.clone()
+                };
+                if let Some(p) = &self.persist {
+                    p.put_session(&updated).map_err(internal)?;
+                }
+                Ok(Self::session_storage_summary(&updated))
+            }
+            Lifecycle::Cold => self.seal_session_to_cold(tenant_id, session_id).await,
+            Lifecycle::Archive => {
+                let session = self.get_session(tenant_id, session_id).await?;
+                if session.lifecycle == Lifecycle::Warm {
+                    self.seal_session_to_cold(tenant_id, session_id).await?;
+                }
+                let updated = {
+                    let mut s = self.state.lock().await;
+                    let session = s
+                        .sessions
+                        .get_mut(session_id.as_str())
+                        .filter(|sess| {
+                            sess.deleted_at_ms.is_none()
+                                && sess.tenant_id.as_str() == tenant_id.as_str()
+                        })
+                        .ok_or_else(|| {
+                            Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
+                        })?;
+                    session.lifecycle = Lifecycle::Archive;
+                    session.clone()
+                };
+                if let Some(p) = &self.persist {
+                    p.put_session(&updated).map_err(internal)?;
+                }
+                Ok(Self::session_storage_summary(&updated))
+            }
+            Lifecycle::DerivativeOnly => Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "derivative_only transition is driven by lifecycle/gc policy, not direct session transition",
+            )),
+        }
+    }
+
+    async fn seal_session_to_cold(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<SessionStorageSummary> {
+        let (snapshot, hot_events) = {
+            let s = self.state.lock().await;
+            let session = s
+                .sessions
+                .get(session_id.as_str())
+                .filter(|sess| {
+                    sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+                })
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+            let hot_events = if self.persist.is_none() {
+                let lo = (session_id.as_str().to_string(), session.warm_head_from_seq);
+                let hi = (session_id.as_str().to_string(), u64::MAX);
+                s.events
+                    .range(lo..=hi)
+                    .map(|(_, event)| event.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (session, hot_events)
+        };
+
+        if snapshot.lifecycle == Lifecycle::Cold {
+            return Ok(Self::session_storage_summary(&snapshot));
+        }
+
+        if snapshot.warm_head_from_seq >= snapshot.next_seq {
+            let updated = {
+                let mut s = self.state.lock().await;
+                let session = s
+                    .sessions
+                    .get_mut(session_id.as_str())
+                    .expect("session exists");
+                session.lifecycle = Lifecycle::Cold;
+                session.clone()
+            };
+            if let Some(p) = &self.persist {
+                p.put_session(&updated).map_err(internal)?;
+            }
+            return Ok(Self::session_storage_summary(&updated));
+        }
+
+        let events = if self.persist.is_some() {
+            self.read_hot_events_from_persist(
+                tenant_id,
+                session_id,
+                snapshot.warm_head_from_seq,
+                usize::MAX,
+            )
+            .await?
+        } else {
+            hot_events
+        };
+
+        if events.is_empty() {
+            let updated = {
+                let mut s = self.state.lock().await;
+                let session = s
+                    .sessions
+                    .get_mut(session_id.as_str())
+                    .expect("session exists");
+                session.lifecycle = Lifecycle::Cold;
+                session.clone()
+            };
+            if let Some(p) = &self.persist {
+                p.put_session(&updated).map_err(internal)?;
+            }
+            return Ok(Self::session_storage_summary(&updated));
+        }
+
+        let segment = self
+            .write_session_segment(tenant_id, session_id, events.clone())
+            .await?;
+
+        let updated = {
+            let mut s = self.state.lock().await;
+            {
+                let session = s
+                    .sessions
+                    .get_mut(session_id.as_str())
+                    .filter(|sess| {
+                        sess.deleted_at_ms.is_none()
+                            && sess.tenant_id.as_str() == tenant_id.as_str()
+                    })
+                    .ok_or_else(|| {
+                        Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
+                    })?;
+                if session.next_seq != snapshot.next_seq
+                    || session.warm_head_from_seq != snapshot.warm_head_from_seq
+                {
+                    return Err(Error::new(
+                        ErrorCode::Internal,
+                        "session changed during cold transition; retry the transition",
+                    ));
+                }
+                session.sealed_segments.push(segment.clone());
+                session.warm_head_from_seq = session.next_seq;
+                session.lifecycle = Lifecycle::Cold;
+            }
+            if self.persist.is_none() {
+                let lo = (session_id.as_str().to_string(), snapshot.warm_head_from_seq);
+                let hi = (session_id.as_str().to_string(), u64::MAX);
+                let keys: Vec<(String, u64)> =
+                    s.events.range(lo..=hi).map(|(k, _)| k.clone()).collect();
+                for key in keys {
+                    if let Some(event) = s.events.remove(&key) {
+                        s.event_by_id.remove(event.event_id.as_str());
+                    }
+                }
+            }
+            s.sessions
+                .get(session_id.as_str())
+                .expect("session exists after cold seal")
+                .clone()
+        };
+
+        if let Some(p) = &self.persist {
+            p.put_session_segment(&segment).map_err(internal)?;
+            p.put_session(&updated).map_err(internal)?;
+            let _ = p.delete_events_from_seq(
+                tenant_id.as_str(),
+                session_id.as_str(),
+                snapshot.warm_head_from_seq,
+            );
+        }
+
+        Ok(Self::session_storage_summary(&updated))
     }
 
     pub async fn list_sessions(&self, tenant_id: &Id) -> Result<Vec<Session>> {
@@ -1909,13 +2244,10 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<LifecycleSweepReport> {
         let mut report = LifecycleSweepReport::default();
-        let artifact_candidates = {
-            let mut s = self.state.lock().await;
-            let session_ids: Vec<String> = s.sessions.keys().cloned().collect();
-            for session_id in session_ids {
-                let Some(session) = s.sessions.get(&session_id).cloned() else {
-                    continue;
-                };
+        let (session_candidates, artifact_candidates) = {
+            let s = self.state.lock().await;
+            let mut candidates = Vec::new();
+            for session in s.sessions.values() {
                 if session.deleted_at_ms.is_some() {
                     continue;
                 }
@@ -1925,28 +2257,15 @@ impl Runtime {
                     continue;
                 }
                 let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
-                if !lifecycle_work_allowed(&mut report, &policy) {
-                    break;
-                }
                 let idle_ms = now_ms.saturating_sub(session.last_active_at_ms);
                 let target = lifecycle_target(session.lifecycle, idle_ms, &policy);
-                if target == session.lifecycle {
-                    continue;
+                if target != session.lifecycle {
+                    candidates.push((session.clone(), target, policy));
                 }
-                let previous = session.lifecycle;
-                let mut updated = session;
-                updated.lifecycle = target;
-                updated.policy_version = policy.version;
-                if let Some(p) = &self.persist {
-                    p.put_session(&updated).map_err(internal)?;
-                }
-                s.sessions.insert(session_id, updated);
-                lifecycle_report_action(&mut report, previous, target);
-                report.sessions_transitioned += 1;
-                report.work_units += 1;
             }
 
-            s.artifacts
+            let artifacts = s
+                .artifacts
                 .values()
                 .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
                 .filter(|a| {
@@ -1965,8 +2284,32 @@ impl Runtime {
                             })
                 })
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (candidates, artifacts)
         };
+
+        for (session, target, policy) in session_candidates {
+            if !lifecycle_work_allowed(&mut report, &policy) {
+                break;
+            }
+            self.transition_session_lifecycle(&session.tenant_id, &session.session_id, target)
+                .await?;
+            let updated = {
+                let mut s = self.state.lock().await;
+                let current = s
+                    .sessions
+                    .get_mut(session.session_id.as_str())
+                    .expect("session exists after lifecycle transition");
+                current.policy_version = policy.version;
+                current.clone()
+            };
+            if let Some(p) = &self.persist {
+                p.put_session(&updated).map_err(internal)?;
+            }
+            lifecycle_report_action(&mut report, session.lifecycle, target);
+            report.sessions_transitioned += 1;
+            report.work_units += 1;
+        }
 
         for artifact in artifact_candidates {
             let policy = self.resolve_policy_for_tenant(&artifact.tenant_id).await?;
@@ -2804,6 +3147,10 @@ impl Runtime {
                 .sessions
                 .get_mut(req.session_id.as_str())
                 .expect("session presence checked above");
+            if session.lifecycle != Lifecycle::Warm {
+                session.lifecycle = Lifecycle::Warm;
+                session.warm_head_from_seq = session.next_seq;
+            }
             let seq = session.next_seq;
             let pv = session.policy_version;
             session.next_seq += 1;
@@ -2931,36 +3278,21 @@ impl Runtime {
         let appended = self.append(req).await?;
 
         // KV-backed: scan the session's events from storage so we don't need to
-        // also keep an in-memory copy. We bound the scan with `last` by reading
-        // from seq 0 with a high enough limit; for V2.0 sessions are small.
-        if let Some(p) = &self.persist {
-            let mut all = p
-                .scan_events(tenant_id.as_str(), session_id.as_str(), 0, usize::MAX)
-                .map_err(internal)?;
-            // Tail of length `last`, in ascending seq order.
-            if all.len() > last {
-                let drop_n = all.len() - last;
-                all.drain(0..drop_n);
-            }
-            trim_recent_to_budget(&mut all, max_bytes);
-            return Ok(AppendAndFetchResponse {
-                event_id: appended.event_id,
-                seq: appended.seq,
-                recent: all,
-            });
+        // also keep an in-memory copy. `fetch_from_seq` now merges sealed
+        // cold segments with the warm head transparently, so use it as the
+        // canonical read path and then keep only the newest `last`.
+        let mut recent = self
+            .fetch_from_seq(FetchRequest {
+                tenant_id,
+                session_id,
+                from_seq: 0,
+                limit: usize::MAX,
+            })
+            .await?;
+        if recent.len() > last {
+            let drop_n = recent.len() - last;
+            recent.drain(0..drop_n);
         }
-
-        let s = self.state.lock().await;
-        let lo = (session_id.as_str().to_string(), 0);
-        let hi = (session_id.as_str().to_string(), u64::MAX);
-        let mut recent: Vec<EventEnvelope> = s
-            .events
-            .range(lo..=hi)
-            .rev()
-            .take(last)
-            .map(|(_, v)| v.clone())
-            .collect();
-        recent.reverse();
         trim_recent_to_budget(&mut recent, max_bytes);
 
         Ok(AppendAndFetchResponse {
@@ -3207,56 +3539,83 @@ impl Runtime {
     /// exist. Returns an empty vec if `from_seq` is past the session's last
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(req.tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::SessionNotFound,
-                format!("{}", req.session_id),
-            ));
-        }
-        let session = s
-            .sessions
-            .get(req.session_id.as_str())
-            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)))?;
-        if session.deleted_at_ms.is_some() {
-            return Err(Error::new(
-                ErrorCode::SessionNotFound,
-                format!("{}", req.session_id),
-            ));
-        }
-        // tenant_id on FetchRequest finally becomes load-bearing for the KV
-        // backend's tenant-scoped key encoding. Refuse mismatches outright so
-        // callers can't sidestep tenancy by passing the wrong tenant.
-        if session.tenant_id.as_str() != req.tenant_id.as_str() {
-            return Err(Error::new(
-                ErrorCode::SessionNotFound,
-                format!("{}", req.session_id),
-            ));
+        let (session, hot_in_memory) = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", req.session_id),
+                ));
+            }
+            let session = s
+                .sessions
+                .get(req.session_id.as_str())
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+                })?;
+            if session.deleted_at_ms.is_some()
+                || session.tenant_id.as_str() != req.tenant_id.as_str()
+            {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", req.session_id),
+                ));
+            }
+            let hot = if self.persist.is_none() {
+                let lo = (
+                    req.session_id.as_str().to_string(),
+                    req.from_seq.max(session.warm_head_from_seq),
+                );
+                let hi = (req.session_id.as_str().to_string(), u64::MAX);
+                s.events
+                    .range(lo..=hi)
+                    .take(req.limit)
+                    .map(|(_, v)| v.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (session.clone(), hot)
+        };
+
+        let mut out = Vec::new();
+        let mut segments = session.sealed_segments.clone();
+        segments.sort_by_key(|segment| segment.seq_start);
+        for segment in segments {
+            if segment.seq_end < req.from_seq {
+                continue;
+            }
+            let mut events = self.read_session_segment_events(&segment).await?;
+            if req.from_seq > segment.seq_start {
+                events.retain(|event| event.seq >= req.from_seq);
+            }
+            out.extend(events);
+            if out.len() >= req.limit {
+                out.truncate(req.limit);
+                return Ok(out);
+            }
         }
 
-        if let Some(p) = &self.persist {
-            // Drop the lock before the KV scan to avoid blocking other appends.
-            drop(s);
-            return p
-                .scan_events(
-                    req.tenant_id.as_str(),
-                    req.session_id.as_str(),
-                    req.from_seq,
-                    req.limit,
-                )
-                .map_err(internal);
+        let remaining = req.limit.saturating_sub(out.len());
+        if remaining == 0 {
+            return Ok(out);
         }
-        let lo = (req.session_id.as_str().to_string(), req.from_seq);
-        let hi = (req.session_id.as_str().to_string(), u64::MAX);
-        Ok(s.events
-            .range(lo..=hi)
-            .take(req.limit)
-            .map(|(_, v)| v.clone())
-            .collect())
+        let hot_from_seq = req.from_seq.max(session.warm_head_from_seq);
+        let hot = if self.persist.is_some() {
+            self.read_hot_events_from_persist(&req.tenant_id, &req.session_id, hot_from_seq, remaining)
+                .await?
+        } else {
+            hot_in_memory
+        };
+        out.extend(hot);
+        if out.len() > req.limit {
+            out.truncate(req.limit);
+        }
+        Ok(out)
     }
 }
 

@@ -32,6 +32,11 @@ pub struct CreateSessionBody {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct TransitionSessionLifecycleBody {
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AppendBody {
     pub agent_id: String,
     pub kind: String,

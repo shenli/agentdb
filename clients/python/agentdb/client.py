@@ -451,6 +451,12 @@ class SessionHandle:
     def raw(self) -> "Session":
         return self._session
 
+    def storage(self) -> dict:
+        return self._session.storage()
+
+    def transition_lifecycle(self, target: str) -> dict:
+        return self._session.transition_lifecycle(target)
+
 
 class ArtifactCollection:
     def __init__(self, workspace: Workspace) -> None:
@@ -696,6 +702,21 @@ class Client:
         data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/watch", params=params)
         return [WatchItem.from_dict(item) for item in data]
 
+    def get_session_storage(self, tenant_id: TenantId, session_id: SessionId) -> dict:
+        return self._request(
+            "GET",
+            f"/api/tenants/{_quote(tenant_id)}/sessions/{_quote(session_id)}/storage",
+        )
+
+    def transition_session_lifecycle(
+        self, tenant_id: TenantId, session_id: SessionId, target: str
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/api/tenants/{_quote(tenant_id)}/sessions/{_quote(session_id)}/lifecycle",
+            json={"target": target},
+        )
+
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         resp = self._raw_request(method, path, **kwargs)
         return _decode(resp)
@@ -868,6 +889,14 @@ class Session:
                 "include": list(include or ["recent_events"]),
                 "record_query": record_query,
             },
+        )
+
+    def storage(self) -> dict:
+        return self._client.get_session_storage(self.tenant_id, self.session_id)
+
+    def transition_lifecycle(self, target: str) -> dict:
+        return self._client.transition_session_lifecycle(
+            self.tenant_id, self.session_id, target
         )
 
     def _append_body(

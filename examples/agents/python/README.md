@@ -36,6 +36,20 @@ records user input, tool calls, tool results, artifact refs, context provenance,
 model output, a simulated harness restart, replay, and resume-from-`seq` in one
 ordered session timeline.
 
+## Session tiering demo
+
+```bash
+cargo run -p agentdb-server -- serve --dev
+python examples/agents/python/session_tiering_demo.py
+```
+
+This demo shows the first tiered-storage slice for developers:
+
+- write to a normal warm session
+- seal it into the cold tier
+- confirm reads are unchanged
+- append again and watch a new warm head reopen on top of sealed history
+
 ## What it shows
 
 - **`session.append(event, fetch_last_n=5)`** — the AgentDB hot-
