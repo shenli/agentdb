@@ -250,6 +250,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedServeConfig {
+    deployment_mode: DeploymentMode,
     bind: SocketAddr,
     data_dir: PathBuf,
     content_dir: PathBuf,
@@ -264,6 +265,12 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentMode {
+    SingleNode,
+    Cluster,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,22 +313,33 @@ impl ResolvedServeConfig {
             .content_dir
             .or(file.storage.content_dir)
             .unwrap_or_else(|| data_dir.join("content"));
+        let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
             data_dir.join("object-store"),
         )?;
-        validate_storage_backend_config(kv_backend, content_backend, object_store.as_ref())?;
+        let in_memory = opts.in_memory || opts.dev || file.server.dev.unwrap_or(false);
+        let route_node_id = opts.route_node_id.or(file.routing.node_id);
+        validate_storage_backend_config(
+            deployment_mode,
+            kv_backend,
+            content_backend,
+            object_store.as_ref(),
+            in_memory,
+            route_node_id.as_deref(),
+        )?;
         Ok(Self {
+            deployment_mode,
             bind,
             data_dir,
             content_dir,
             kv_backend,
             content_backend,
             object_store,
-            in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
-            route_node_id: opts.route_node_id.or(file.routing.node_id),
+            in_memory,
+            route_node_id,
             route_shard_count: opts
                 .route_shard_count
                 .or(file.routing.shard_count)
@@ -354,22 +372,33 @@ impl ResolvedServeConfig {
             .content_dir
             .or(file.storage.content_dir)
             .unwrap_or_else(|| data_dir.join("content"));
+        let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
             data_dir.join("object-store"),
         )?;
-        validate_storage_backend_config(kv_backend, content_backend, object_store.as_ref())?;
+        let in_memory = opts.in_memory || opts.dev || file.server.dev.unwrap_or(false);
+        let route_node_id = file.routing.node_id;
+        validate_storage_backend_config(
+            deployment_mode,
+            kv_backend,
+            content_backend,
+            object_store.as_ref(),
+            in_memory,
+            route_node_id.as_deref(),
+        )?;
         Ok(Self {
+            deployment_mode,
             bind,
             data_dir,
             content_dir,
             kv_backend,
             content_backend,
             object_store,
-            in_memory: opts.in_memory || opts.dev || file.server.dev.unwrap_or(false),
-            route_node_id: file.routing.node_id,
+            in_memory,
+            route_node_id,
             route_shard_count: file
                 .routing
                 .shard_count
@@ -389,11 +418,18 @@ impl ResolvedServeConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
+    deployment: DeploymentFileConfig,
+    #[serde(default)]
     server: ServerFileConfig,
     #[serde(default)]
     storage: StorageFileConfig,
     #[serde(default)]
     routing: RoutingFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeploymentFileConfig {
+    mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -449,6 +485,14 @@ fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
         "rocksdb" => Ok(KvBackendKind::RocksDb),
         "slatedb" => Ok(KvBackendKind::SlateDb),
         other => anyhow::bail!("unknown storage.kv.backend: {other}"),
+    }
+}
+
+fn resolve_deployment_mode(cfg: &DeploymentFileConfig) -> anyhow::Result<DeploymentMode> {
+    match cfg.mode.as_deref().unwrap_or("single_node") {
+        "single_node" => Ok(DeploymentMode::SingleNode),
+        "cluster" => Ok(DeploymentMode::Cluster),
+        other => anyhow::bail!("unknown deployment.mode: {other}"),
     }
 }
 
@@ -522,15 +566,38 @@ fn build_object_store(
 }
 
 fn validate_storage_backend_config(
+    deployment_mode: DeploymentMode,
     kv_backend: KvBackendKind,
     content_backend: ContentBackendKind,
     object_store: Option<&ResolvedObjectStoreConfig>,
+    in_memory: bool,
+    route_node_id: Option<&str>,
 ) -> anyhow::Result<()> {
     if matches!(kv_backend, KvBackendKind::SlateDb) && object_store.is_none() {
         anyhow::bail!("storage.kv.backend=slatedb requires storage.object_store");
     }
     if matches!(content_backend, ContentBackendKind::ObjectStore) && object_store.is_none() {
         anyhow::bail!("storage.content.backend=object_store requires storage.object_store");
+    }
+    if matches!(deployment_mode, DeploymentMode::Cluster) {
+        if in_memory {
+            anyhow::bail!("deployment.mode=cluster does not support in-memory/dev mode");
+        }
+        if !matches!(kv_backend, KvBackendKind::SlateDb) {
+            anyhow::bail!("deployment.mode=cluster requires storage.kv.backend=slatedb");
+        }
+        if !matches!(content_backend, ContentBackendKind::ObjectStore) {
+            anyhow::bail!("deployment.mode=cluster requires storage.content.backend=object_store");
+        }
+        let Some(object_store) = object_store else {
+            anyhow::bail!("deployment.mode=cluster requires storage.object_store");
+        };
+        if !matches!(object_store.backend, ObjectStoreBackendKind::S3) {
+            anyhow::bail!("deployment.mode=cluster requires storage.object_store.backend=s3");
+        }
+        if route_node_id.is_none() {
+            anyhow::bail!("deployment.mode=cluster requires routing.node_id or --route-node-id");
+        }
     }
     Ok(())
 }
@@ -578,7 +645,11 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
         )
     };
     println!("AgentDB listening on http://{}", config.bind);
+    println!("  deployment: {}", describe_deployment_mode(config));
     println!("  mode: {mode}");
+    if let Some(note) = deployment_support_note(config) {
+        println!("  note: {note}");
+    }
     println!("  health:    http://{}/health/ready", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
 }
@@ -589,6 +660,7 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
 
     println!("AgentDB doctor");
     println!("  bind: {}", config.bind);
+    println!("  deployment: {}", describe_deployment_mode(&config));
     if config.in_memory {
         println!("  mode: dev in-memory");
         println!("  storage: skipped");
@@ -633,8 +705,40 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
     if failed {
         anyhow::bail!("doctor found configuration problems");
     }
-    println!("  ok: single-node configuration looks usable");
+    if let Some(note) = deployment_support_note(&config) {
+        println!("  note: {note}");
+    }
+    println!("  ok: {} configuration looks usable", describe_deployment_mode(&config));
     Ok(())
+}
+
+fn describe_deployment_mode(config: &ResolvedServeConfig) -> &'static str {
+    match config.deployment_mode {
+        DeploymentMode::SingleNode => "single_node",
+        DeploymentMode::Cluster => "cluster",
+    }
+}
+
+fn deployment_support_note(config: &ResolvedServeConfig) -> Option<&'static str> {
+    match (
+        config.deployment_mode,
+        config.kv_backend,
+        config.content_backend,
+        config.object_store.as_ref().map(|cfg| cfg.backend),
+    ) {
+        (
+            DeploymentMode::SingleNode,
+            KvBackendKind::SlateDb,
+            ContentBackendKind::ObjectStore,
+            Some(ObjectStoreBackendKind::S3),
+        ) => Some(
+            "single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment",
+        ),
+        (DeploymentMode::Cluster, ..) => Some(
+            "cluster mode is forward-looking; operator APIs and automation are still incomplete",
+        ),
+        _ => None,
+    }
 }
 
 fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
@@ -852,6 +956,7 @@ mod tests {
     fn default_single_node_config_matches_public_quickstarts() {
         let config = ResolvedServeConfig::from_serve_opts(base_opts()).unwrap();
 
+        assert_eq!(config.deployment_mode, DeploymentMode::SingleNode);
         assert_eq!(config.bind, default_bind());
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.content_dir, PathBuf::from("./data/content"));
@@ -937,5 +1042,170 @@ data_dir = "/tmp/from-config"
         assert_eq!(config.bind, "127.0.0.1:8989".parse().unwrap());
         assert_eq!(config.data_dir, PathBuf::from("/tmp/from-cli"));
         assert!(config.in_memory);
+    }
+
+    #[test]
+    fn cluster_mode_requires_slatedb() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "rocksdb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+
+[routing]
+node_id = "node-a"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires storage.kv.backend=slatedb"));
+    }
+
+    #[test]
+    fn cluster_mode_requires_object_store_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "localfs"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+
+[routing]
+node_id = "node-a"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires storage.content.backend=object_store"));
+    }
+
+    #[test]
+    fn cluster_mode_requires_s3_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "localfs"
+local_root = "/tmp/agentdb-test"
+
+[routing]
+node_id = "node-a"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires storage.object_store.backend=s3"));
+    }
+
+    #[test]
+    fn cluster_mode_requires_node_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires routing.node_id or --route-node-id"));
+    }
+
+    #[test]
+    fn single_node_slatedb_s3_remains_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "single_node"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        assert_eq!(config.deployment_mode, DeploymentMode::SingleNode);
+        assert_eq!(
+            deployment_support_note(&config),
+            Some("single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment")
+        );
     }
 }
