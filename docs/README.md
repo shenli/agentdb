@@ -16,9 +16,11 @@ material.
 - [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
   - forward-looking optimization plan for large artifact blobs and content backends
 - [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) - supported deployment
-  paths and operational checklist
-- [operations/SINGLE_NODE.md](operations/SINGLE_NODE.md) - single-node commands,
-  config, Docker, backup, and troubleshooting
+  paths, packaging modes, and current cluster status
+- [operations/OPERATIONS.md](operations/OPERATIONS.md) - start/stop, backup,
+  restore, upgrade, and troubleshooting for the supported single-node shape
+- [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
+  of multi-node support and the missing operator workflows today
 - [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
   and current performance notes
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
