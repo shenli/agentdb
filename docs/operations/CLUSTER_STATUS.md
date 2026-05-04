@@ -107,9 +107,21 @@ The honest operational message today is:
   Helm
 - **future work**: true multi-node clustered AgentDB
 
+Forward-looking target-state docs exist for that future work:
+
+- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md)
+- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md)
+
+Those documents describe the intended operator model, not a current support
+claim.
+
 ## Related Docs
 
 - [DEPLOYMENT.md](DEPLOYMENT.md) - deployment choices and current support
 - [OPERATIONS.md](OPERATIONS.md) - day-2 single-node operations
+- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
+  bootstrap model
+- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
+  procedures
 - [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
   implementation shape

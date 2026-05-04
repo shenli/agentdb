@@ -10,7 +10,9 @@ It covers:
 
 For start/stop, backup, restore, upgrade, and troubleshooting, see
 [OPERATIONS.md](OPERATIONS.md). For the current distributed-story status, see
-[CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+[CLUSTER_STATUS.md](CLUSTER_STATUS.md). For the intended future cluster model,
+see [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) and
+[CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md).
 
 ## Current Support Summary
 
@@ -183,6 +185,10 @@ Before exposing a maintained node:
   troubleshooting
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current multi-node status and
   missing operator workflows
+- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
+  bootstrap model
+- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
+  procedures
 - [PERFORMANCE.md](PERFORMANCE.md) - benchmark notes and current caveats
 - [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
   process, storage, routing, and lifecycle implementation

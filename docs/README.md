@@ -21,6 +21,10 @@ material.
   restore, upgrade, and troubleshooting for the supported single-node shape
 - [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
   of multi-node support and the missing operator workflows today
+- [operations/CLUSTER_DEPLOYMENT.md](operations/CLUSTER_DEPLOYMENT.md) -
+  forward-looking target deployment model for a real AgentDB cluster
+- [operations/CLUSTER_OPERATIONS.md](operations/CLUSTER_OPERATIONS.md) -
+  forward-looking target day-2 workflows for add/remove/replace/drain/upgrade
 - [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
   and current performance notes
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
