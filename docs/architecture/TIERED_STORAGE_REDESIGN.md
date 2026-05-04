@@ -84,6 +84,8 @@ behind one logical session-history interface.
 - session history is retained at lower cost than cold
 - storage may move to a cheaper object class or an archive package
 - reads still work, but latency and some capabilities may be degraded
+- appending does not mutate archived history in place; the runtime reopens a
+  warm head above the archived base history
 - any degraded behavior must be explicit in API and product documentation
 
 ### DerivativeOnly
@@ -261,6 +263,21 @@ When a client appends to a cold session:
 This avoids full-history rehydration in the common case and keeps resumed
 sessions cheap to reactivate.
 
+When a client appends to an archived session:
+
+- the runtime does not modify archive bundles in place
+- the runtime either reopens a new warm head directly or restores to cold first
+- archived history remains immutable base history for replay and reads
+- newly appended events land in the warm head
+
+In both cases, the logical session timeline is assembled from:
+
+- older immutable history in sealed segments or archive bundles
+- newer mutable history in the warm head
+
+This is the core append contract for tiered session storage: old history stays
+immutable, while new activity grows from a fresh warm tail.
+
 ## Lifecycle Transitions
 
 ### Warm To Cold
@@ -296,6 +313,10 @@ Two acceptable designs:
 - explicit async restore state for slow archive backends
 
 The product must report restore state clearly.
+
+Append-on-archive may reuse this transition, or it may reopen a warm head
+without eager full restore. In either design, archive bundles remain immutable
+and new writes do not rewrite old archived history.
 
 ### Archive To DerivativeOnly
 

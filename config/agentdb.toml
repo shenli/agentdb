@@ -4,6 +4,9 @@
 #   agentdb doctor --config config/agentdb.toml
 #   agentdb serve --config config/agentdb.toml
 
+[deployment]
+mode = "single_node" # or "cluster"
+
 [server]
 bind = "127.0.0.1:7878"
 # dev = true uses ephemeral in-memory state.
@@ -16,6 +19,18 @@ data_dir = "./agentdb-data"
 
 [storage.kv]
 backend = "rocksdb" # or "slatedb"
+
+# Support matrix:
+# - single_node + rocksdb + localfs: primary supported deployment
+# - single_node + slatedb + s3: testing/evaluation
+# - cluster + slatedb + s3: target clustered deployment
+#
+# Cluster mode requirements:
+# - deployment.mode = "cluster"
+# - storage.kv.backend = "slatedb"
+# - storage.content.backend = "object_store"
+# - storage.object_store.backend = "s3"
+# - routing.node_id must be set
 
 # Shared object-store config. Required when:
 # - storage.kv.backend = "slatedb"
@@ -33,3 +48,7 @@ backend = "rocksdb" # or "slatedb"
 
 [storage.content]
 backend = "localfs" # or "object_store"
+
+[routing]
+# Required in cluster mode.
+# node_id = "node-a"

@@ -6,7 +6,7 @@
 <div align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-local-0f766e" alt="Docs"></a>
-  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-single--node-7c3aed" alt="Deployment"></a>
+  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-single--node%20today-7c3aed" alt="Deployment"></a>
 </div>
 
 <br>
@@ -103,9 +103,8 @@ cargo run -p agentdb-server -- serve --config agentdb.toml
 ```
 
 See [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) for
-deployment guidance and
-[docs/operations/SINGLE_NODE.md](docs/operations/SINGLE_NODE.md) for concrete
-single-node commands.
+deployment guidance and [docs/operations/OPERATIONS.md](docs/operations/OPERATIONS.md)
+for concrete start/stop, backup, and upgrade commands.
 
 ## Documentation
 
@@ -113,8 +112,11 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 
 - **Run and deploy**:
   [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) covers
-  supported deployment paths; [docs/operations/SINGLE_NODE.md](docs/operations/SINGLE_NODE.md)
-  has exact single-node commands, config, Docker, backup, and troubleshooting.
+  supported deployment paths and current cluster status;
+  [docs/operations/OPERATIONS.md](docs/operations/OPERATIONS.md) has exact
+  start/stop, backup, upgrade, and troubleshooting guidance for the supported
+  single-node shape; [docs/operations/CLUSTER_STATUS.md](docs/operations/CLUSTER_STATUS.md)
+  explains what multi-node workflows are not yet supported.
 
 - **Understand the server**:
   [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)
