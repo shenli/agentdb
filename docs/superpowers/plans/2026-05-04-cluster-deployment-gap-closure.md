@@ -160,6 +160,15 @@ Cluster mode needs a stable operator surface.
 - `GET /api/admin/backups`
 - `GET /api/admin/restores`
 
+Status:
+
+- `GET /api/admin/routing` exists
+- `GET /api/admin/cluster/health` exists
+- `GET /api/admin/cluster/readiness` exists
+- `GET /api/admin/nodes` and `GET /api/admin/tablets` are part of the
+  broader control-plane/admin direction but are not yet presented here as a
+  complete supported operator surface
+
 ### Write APIs
 
 - `POST /api/admin/nodes/register`

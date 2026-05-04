@@ -8,7 +8,7 @@
 //! Wire DTOs live in `crate::dto`. Status codes for `agentdb_core::Error` live
 //! in `crate::errors`.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
@@ -57,6 +57,8 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(health_ready))
+        .route("/api/admin/cluster/health", get(get_cluster_health))
+        .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -187,6 +189,72 @@ async fn get_routing_status(
 }
 
 #[derive(Debug, Deserialize)]
+struct ClusterAdminQuery {
+    stale_threshold_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterHealthSummary {
+    node_count: usize,
+    alive_node_count: usize,
+    stale_node_count: usize,
+    draining_node_count: usize,
+    dead_node_count: usize,
+    tablet_count: usize,
+    unowned_tablet_count: usize,
+    tablets_with_stale_owner_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterHealthResponse {
+    mode: &'static str,
+    local_node_id: String,
+    status: &'static str,
+    stale_threshold_ms: i64,
+    single_node: bool,
+    local_node_found: bool,
+    local_node_stale: bool,
+    local_node_state: Option<String>,
+    summary: ClusterHealthSummary,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClusterReadinessResponse {
+    mode: &'static str,
+    local_node_id: String,
+    ready: bool,
+    stale_threshold_ms: i64,
+    reasons: Vec<String>,
+}
+
+async fn get_cluster_health(
+    State(s): State<AppState>,
+    Query(query): Query<ClusterAdminQuery>,
+) -> Json<ClusterHealthResponse> {
+    Json(build_cluster_health(
+        &s.routing.describe(),
+        query.stale_threshold_ms.unwrap_or(15_000),
+    ))
+}
+
+async fn get_cluster_readiness(
+    State(s): State<AppState>,
+    Query(query): Query<ClusterAdminQuery>,
+) -> Response {
+    let readiness = build_cluster_readiness(
+        &s.routing.describe(),
+        query.stale_threshold_ms.unwrap_or(15_000),
+    );
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(readiness)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
 struct RouteDecisionQuery {
     tenant_id: String,
     session_id: Option<String>,
@@ -234,6 +302,185 @@ async fn get_fleet_storage_summary(
     State(s): State<AppState>,
 ) -> Json<agentdb_core::FleetStorageSummary> {
     Json(s.runtime.fleet_storage_summary().await)
+}
+
+fn build_cluster_health(
+    status: &crate::routing_http::RouteRuntimeStatus,
+    stale_threshold_ms: i64,
+) -> ClusterHealthResponse {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let mut issues = Vec::new();
+    match status.snapshot.as_ref() {
+        None => ClusterHealthResponse {
+            mode: status.mode,
+            local_node_id: status.local_node_id.clone(),
+            status: "ok",
+            stale_threshold_ms,
+            single_node: true,
+            local_node_found: true,
+            local_node_stale: false,
+            local_node_state: Some("single-node".into()),
+            summary: ClusterHealthSummary {
+                node_count: 1,
+                alive_node_count: 1,
+                stale_node_count: 0,
+                draining_node_count: 0,
+                dead_node_count: 0,
+                tablet_count: 0,
+                unowned_tablet_count: 0,
+                tablets_with_stale_owner_count: 0,
+            },
+            issues,
+        },
+        Some(snapshot) => {
+            let local_node = snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == status.local_node_id);
+            let local_node_found = local_node.is_some();
+            let local_node_stale = local_node
+                .map(|node| now_ms - node.last_heartbeat_ms > stale_threshold_ms)
+                .unwrap_or(true);
+            let local_node_state = local_node.map(|node| node.state.clone());
+            let stale_node_count = snapshot
+                .nodes
+                .iter()
+                .filter(|node| now_ms - node.last_heartbeat_ms > stale_threshold_ms)
+                .count();
+            let draining_node_count = snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.state == "draining")
+                .count();
+            let dead_node_count = snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.state == "dead")
+                .count();
+            let alive_node_count = snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.state == "alive")
+                .count();
+            let tablets_with_stale_owner_count = snapshot
+                .tablets
+                .iter()
+                .filter(|tablet| {
+                    tablet.owner_node_id.as_ref().is_some_and(|owner_id| {
+                        snapshot.nodes.iter().find(|node| &node.node_id == owner_id).is_some_and(
+                            |node| now_ms - node.last_heartbeat_ms > stale_threshold_ms,
+                        )
+                    })
+                })
+                .count();
+            let unowned_tablet_count = snapshot
+                .tablets
+                .iter()
+                .filter(|tablet| tablet.owner_node_id.is_none())
+                .count();
+
+            if !local_node_found {
+                issues.push("local node is missing from the routing snapshot".into());
+            }
+            if local_node_stale {
+                issues.push("local node heartbeat is stale".into());
+            }
+            if unowned_tablet_count > 0 {
+                issues.push(format!("{unowned_tablet_count} tablet(s) are currently unowned"));
+            }
+            if tablets_with_stale_owner_count > 0 {
+                issues.push(format!(
+                    "{tablets_with_stale_owner_count} tablet(s) are owned by stale nodes"
+                ));
+            }
+            if dead_node_count > 0 {
+                issues.push(format!("{dead_node_count} node(s) are marked dead"));
+            }
+            if draining_node_count > 0 {
+                issues.push(format!("{draining_node_count} node(s) are draining"));
+            }
+
+            let overall_status = if !local_node_found || local_node_stale {
+                "error"
+            } else if !issues.is_empty() {
+                "degraded"
+            } else {
+                "ok"
+            };
+
+            ClusterHealthResponse {
+                mode: status.mode,
+                local_node_id: status.local_node_id.clone(),
+                status: overall_status,
+                stale_threshold_ms,
+                single_node: false,
+                local_node_found,
+                local_node_stale,
+                local_node_state,
+                summary: ClusterHealthSummary {
+                    node_count: snapshot.node_count,
+                    alive_node_count,
+                    stale_node_count,
+                    draining_node_count,
+                    dead_node_count,
+                    tablet_count: snapshot.tablet_count,
+                    unowned_tablet_count,
+                    tablets_with_stale_owner_count,
+                },
+                issues,
+            }
+        }
+    }
+}
+
+fn build_cluster_readiness(
+    status: &crate::routing_http::RouteRuntimeStatus,
+    stale_threshold_ms: i64,
+) -> ClusterReadinessResponse {
+    let health = build_cluster_health(status, stale_threshold_ms);
+    if health.single_node {
+        return ClusterReadinessResponse {
+            mode: health.mode,
+            local_node_id: health.local_node_id,
+            ready: true,
+            stale_threshold_ms,
+            reasons: Vec::new(),
+        };
+    }
+
+    let mut reasons = Vec::new();
+    if !health.local_node_found {
+        reasons.push("local node is missing from the routing snapshot".into());
+    }
+    if health.local_node_stale {
+        reasons.push("local node heartbeat is stale".into());
+    }
+    if health.local_node_state.as_deref() == Some("draining") {
+        reasons.push("local node is draining".into());
+    }
+    if health.summary.unowned_tablet_count > 0 {
+        reasons.push(format!(
+            "{} tablet(s) are currently unowned",
+            health.summary.unowned_tablet_count
+        ));
+    }
+    if health.summary.tablets_with_stale_owner_count > 0 {
+        reasons.push(format!(
+            "{} tablet(s) are owned by stale nodes",
+            health.summary.tablets_with_stale_owner_count
+        ));
+    }
+
+    ClusterReadinessResponse {
+        mode: health.mode,
+        local_node_id: health.local_node_id,
+        ready: reasons.is_empty(),
+        stale_threshold_ms,
+        reasons,
+    }
 }
 
 async fn get_tenant(
