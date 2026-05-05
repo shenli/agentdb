@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use agentdb_core::Runtime;
+use agentdb_meta::MetaStore;
 
 use crate::routing_http::RouteRuntime;
 
@@ -27,6 +28,7 @@ impl Default for ProxyPolicy {
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<Runtime>,
+    pub meta: Option<MetaStore>,
     pub routing: RouteRuntime,
     pub proxy: reqwest::Client,
     pub proxy_policy: ProxyPolicy,
@@ -36,10 +38,16 @@ impl AppState {
     pub fn new(runtime: Arc<Runtime>) -> Self {
         Self {
             runtime,
+            meta: None,
             routing: RouteRuntime::disabled(),
             proxy: reqwest::Client::new(),
             proxy_policy: ProxyPolicy::default(),
         }
+    }
+
+    pub fn with_meta(mut self, meta: MetaStore) -> Self {
+        self.meta = Some(meta);
+        self
     }
 
     pub fn with_routing(mut self, routing: RouteRuntime) -> Self {

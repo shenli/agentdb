@@ -229,7 +229,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             route_location.clone(),
             config.route_refresh_interval_ms,
         );
-        state = state.with_routing(routing);
+        state = state.with_meta(meta.clone()).with_routing(routing);
         tracing::info!(
             node_id,
             shard_count = config.route_shard_count,
@@ -519,11 +519,9 @@ fn resolve_object_store_config(
     Ok(Some(ResolvedObjectStoreConfig {
         backend,
         local_root: match backend {
-            ObjectStoreBackendKind::LocalFs => Some(
-                cfg.local_root
-                    .clone()
-                    .unwrap_or(default_local_root),
-            ),
+            ObjectStoreBackendKind::LocalFs => {
+                Some(cfg.local_root.clone().unwrap_or(default_local_root))
+            }
             ObjectStoreBackendKind::S3 => None,
         },
         bucket: cfg.bucket.clone(),
@@ -533,9 +531,7 @@ fn resolve_object_store_config(
     }))
 }
 
-fn build_object_store(
-    config: &ResolvedObjectStoreConfig,
-) -> anyhow::Result<Arc<dyn ObjectStore>> {
+fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
     match config.backend {
         ObjectStoreBackendKind::LocalFs => {
             let root = config
@@ -678,7 +674,8 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
                 failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
             }
             KvBackendKind::SlateDb => {
-                failed |= !check_object_store_config("shared object store", config.object_store.as_ref());
+                failed |=
+                    !check_object_store_config("shared object store", config.object_store.as_ref());
             }
         }
         match config.content_backend {
@@ -686,7 +683,8 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
                 failed |= !check_writable_dir("content dir", &config.content_dir);
             }
             ContentBackendKind::ObjectStore => {
-                failed |= !check_object_store_config("shared object store", config.object_store.as_ref());
+                failed |=
+                    !check_object_store_config("shared object store", config.object_store.as_ref());
             }
         }
     }
@@ -708,7 +706,10 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
     if let Some(note) = deployment_support_note(&config) {
         println!("  note: {note}");
     }
-    println!("  ok: {} configuration looks usable", describe_deployment_mode(&config));
+    println!(
+        "  ok: {} configuration looks usable",
+        describe_deployment_mode(&config)
+    );
     Ok(())
 }
 
@@ -745,7 +746,10 @@ fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
     match config.kv_backend {
         KvBackendKind::RocksDb => "rocksdb".into(),
         KvBackendKind::SlateDb => {
-            format!("slatedb@{}", describe_object_store(config.object_store.as_ref()))
+            format!(
+                "slatedb@{}",
+                describe_object_store(config.object_store.as_ref())
+            )
         }
     }
 }
@@ -754,7 +758,10 @@ fn describe_content_backend(config: &ResolvedServeConfig) -> String {
     match config.content_backend {
         ContentBackendKind::LocalFs => "localfs".into(),
         ContentBackendKind::ObjectStore => {
-            format!("object_store@{}", describe_object_store(config.object_store.as_ref()))
+            format!(
+                "object_store@{}",
+                describe_object_store(config.object_store.as_ref())
+            )
         }
     }
 }

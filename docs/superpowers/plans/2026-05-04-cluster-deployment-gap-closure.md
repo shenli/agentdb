@@ -165,9 +165,12 @@ Status:
 - `GET /api/admin/routing` exists
 - `GET /api/admin/cluster/health` exists
 - `GET /api/admin/cluster/readiness` exists
-- `GET /api/admin/nodes` and `GET /api/admin/tablets` are part of the
-  broader control-plane/admin direction but are not yet presented here as a
-  complete supported operator surface
+- `GET /api/admin/nodes` exists
+- `GET /api/admin/tablets` exists
+- node registration and metadata cleanup now have a minimal surface via
+  `POST /api/admin/nodes` and `DELETE /api/admin/nodes/{node_id}`
+- the broader operator surface is still incomplete: there is no supported
+  drain, handoff, rebalance, backup, or restore API yet
 
 ### Write APIs
 
