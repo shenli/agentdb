@@ -16,6 +16,11 @@ use crate::error::{WireError, WireResult};
 const COLLECTIONS: &[&str] = &["sessions", "events", "records", "artifacts", "skills"];
 const DEFAULT_AGENT_ALIAS: &str = "mongo-default";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommandOptions {
+    pub auth_enabled: bool,
+}
+
 #[derive(Clone)]
 pub struct CommandContext {
     runtime: Arc<Runtime>,
@@ -27,9 +32,18 @@ impl CommandContext {
     }
 
     pub async fn handle(&self, request: Document) -> WireResult<Document> {
+        self.handle_with_options(request, CommandOptions::default())
+            .await
+    }
+
+    pub async fn handle_with_options(
+        &self,
+        request: Document,
+        options: CommandOptions,
+    ) -> WireResult<Document> {
         let command = command_name(&request)?;
         match command.as_str() {
-            "hello" | "isMaster" | "ismaster" => Ok(hello_response()),
+            "hello" | "isMaster" | "ismaster" => Ok(hello_response(options.auth_enabled)),
             "ping" => Ok(doc! { "ok": 1.0 }),
             "buildInfo" | "buildinfo" => Ok(doc! {
                 "version": env!("CARGO_PKG_VERSION"),
@@ -748,7 +762,7 @@ impl CommandContext {
     }
 }
 
-fn command_name(request: &Document) -> WireResult<String> {
+pub fn command_name(request: &Document) -> WireResult<String> {
     request
         .keys()
         .find(|key| !key.starts_with('$') && key.as_str() != "lsid")
@@ -756,8 +770,8 @@ fn command_name(request: &Document) -> WireResult<String> {
         .ok_or_else(|| WireError::Protocol("empty Mongo command".to_string()))
 }
 
-fn hello_response() -> Document {
-    doc! {
+fn hello_response(auth_enabled: bool) -> Document {
+    let mut response = doc! {
         "ok": 1.0,
         "isWritablePrimary": true,
         "ismaster": true,
@@ -769,7 +783,14 @@ fn hello_response() -> Document {
         "maxWriteBatchSize": 100_000_i32,
         "logicalSessionTimeoutMinutes": 30_i32,
         "connectionId": 1_i32,
+    };
+    if auth_enabled {
+        response.insert(
+            "saslSupportedMechs",
+            Bson::Array(vec![Bson::String("PLAIN".into())]),
+        );
     }
+    response
 }
 
 fn cursor_response(db: &str, collection: &str, first_batch: Vec<Bson>) -> Document {

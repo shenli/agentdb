@@ -11,8 +11,12 @@ the stable backend contract for SDKs, automation, and the CLI.
 
 AgentDB also has an opt-in MongoDB wire-protocol compatibility listener for a
 narrow driver/tool subset. Enable it with `agentdb serve --mongo-bind
-127.0.0.1:7879` or `[mongodb].bind` in config. The native API remains canonical
-for agent runtime operations.
+127.0.0.1:7879` or `[mongodb].bind` in config. Optional MongoDB `PLAIN`
+username/password auth is available with `--mongo-username` and
+`--mongo-password`. The native API remains canonical for agent runtime
+operations. See
+[mongodb-compatibility.md](mongodb-compatibility.md) for a tutorial, mapping
+rules, limitations, and AI coding-agent guidance.
 
 ## MongoDB Compatibility Subset
 
@@ -23,6 +27,7 @@ Supported initial commands:
 
 ```text
 hello / isMaster
+saslStart / saslContinue   PLAIN auth only, when configured
 ping
 buildInfo
 endSessions

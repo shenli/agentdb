@@ -3,7 +3,8 @@
 This file is written for an LLM agent that's learning AgentDB
 in one ingest. Sections are short, copy-pasteable, and ordered
 by how often a working agent needs them. Human devs may prefer
-[`README.md`](README.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+[`README.md`](README.md) and
+[`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
 
 If you (the agent) only read one section: go to **§3 The five
 operations**.
@@ -31,7 +32,13 @@ You talk to it through the native HTTP API:
   Every official SDK uses this API for writes, reads, replay,
   search, artifacts, and context.
 
-The legacy Mongo wire facade is not part of the current workspace.
+AgentDB also has an optional MongoDB client compatibility listener:
+
+- **MongoDB wire adapter** at the configured `--mongo-bind` port
+  (for example `mongodb://127.0.0.1:7879/?directConnection=true`).
+  This is MongoDB client compatibility, not MongoDB database
+  compatibility. Use it only for fixed AgentDB runtime collections
+  and AgentDB extension commands.
 
 ---
 
@@ -178,7 +185,83 @@ const child = await session.fork("ticket-42-branch-a");
 
 ---
 
-## 5. Common mistakes
+## 5. MongoDB client compatibility
+
+Prefer the native SDKs for full integrations. Use the MongoDB listener
+for inspection, simple event/record writes, and clients that already
+have a MongoDB driver.
+
+Start the listener:
+
+```bash
+cargo run -p agentdb-server -- serve --dev --mongo-bind 127.0.0.1:7879
+```
+
+Safe MongoDB-client rules:
+
+- Always connect with `directConnection=true`.
+- If username/password auth is configured, use
+  `authMechanism=PLAIN&authSource=%24external`.
+- Do not generate SCRAM, role, user-management, or database-auth
+  code. AgentDB's MongoDB listener supports only basic `PLAIN`
+  authentication.
+- Bind to localhost unless separate infrastructure provides
+  access control and TLS.
+- The MongoDB database name is the AgentDB tenant external key.
+- Use only fixed collections: `sessions`, `events`, `records`,
+  `artifacts`, `skills`.
+- Do not create arbitrary collections such as `users`, `orders`,
+  or `tasks`.
+- Do not rely on `createIndexes`; it is accepted as a no-op.
+- Do not generate `updateOne`, `deleteOne`, transactions, change
+  streams, or arbitrary aggregation pipelines.
+- Write events with `db.events.insertOne(...)` or
+  `agentdbAppendAndFetch`.
+- Use `db.runCommand(...)` for fork, replay, context, lifecycle,
+  and restore.
+
+Example with `mongosh`:
+
+```javascript
+use demo
+
+db.events.insertOne({
+  session_alias: "ticket-42",
+  kind: "message",
+  payload: {
+    role: "user",
+    content: "checkout failed"
+  }
+})
+
+db.runCommand({
+  agentdbAppendAndFetch: "events",
+  session_alias: "ticket-42",
+  kind: "message",
+  payload: {
+    role: "assistant",
+    content: "I'll inspect the order state."
+  },
+  fetch_last_n: 20
+})
+```
+
+Mental mapping:
+
+```text
+use demo                         -> tenant external_key "demo"
+db.events.insertOne(...)         -> append one AgentDB event
+session_alias                    -> create/reuse a session alias
+omitted agent_id                 -> create/reuse agent alias "mongo-default"
+db.runCommand({agentdbFork...})  -> AgentDB fork primitive
+```
+
+Detailed rules live in
+[`docs/reference/mongodb-compatibility.md`](docs/reference/mongodb-compatibility.md).
+
+---
+
+## 6. Common mistakes
 
 - **Forgetting `fetch_last_n` on the very first append.** A
   fresh session returns one event in `recent` (the one you just
@@ -194,10 +277,13 @@ const child = await session.fork("ticket-42-branch-a");
 - **Throwing away canonical IDs.** Aliases are for humans and
   apps. Persist the canonical `workspace.id`, `agent.id`, and
   `session.id` when you need exact recovery after restart.
+- **Treating AgentDB as full MongoDB.** MongoDB client compatibility
+  is a limited adapter. Do not generate arbitrary collections,
+  indexes, update/delete, transactions, or change streams.
 
 ---
 
-## 6. Errors you'll see
+## 7. Errors you'll see
 
 Every error response carries `{"error": {"code", "kind",
 "message"}}` plus an HTTP status. SDKs map these to typed
@@ -215,7 +301,7 @@ exceptions. The ones an agent should know:
 
 ---
 
-## 7. Where to go next
+## 8. Where to go next
 
 - **Try it locally**: `cargo run -p agentdb-server -- serve --dev`
   prints a banner with copy-pasteable curl commands.
@@ -223,11 +309,13 @@ exceptions. The ones an agent should know:
   [`examples/agents/python/quickstart.py`](examples/agents/python/quickstart.py)
   is a 60-line three-turn agent loop;
   [`examples/agents/python/async_quickstart.py`](examples/agents/python/async_quickstart.py)
-  shows the async variant with parallel writes.
+  shows the async variant with parallel writes;
+  [`examples/mongodb/node/quickstart.js`](examples/mongodb/node/quickstart.js)
+  shows safe MongoDB client compatibility usage.
 - **Why this database exists** (motivation, requirements,
-  principles): [`docs/agent-db.md`](docs/agent-db.md).
+  principles): [`docs/architecture/agent-db.md`](docs/architecture/agent-db.md).
 - **What the architecture commits to** (identity, layering,
-  real-time, deployment): [`docs/DESIGN.md`](docs/DESIGN.md).
+  real-time, deployment): [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md).
 - **What the code does today**:
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+  [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
 - **OpenAPI spec**: `GET /openapi.json` on a running server.

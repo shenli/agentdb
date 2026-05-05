@@ -109,6 +109,17 @@ Then connect with `mongosh`:
 mongosh "mongodb://127.0.0.1:7879/?directConnection=true"
 ```
 
+Optional basic authentication uses MongoDB `PLAIN`:
+
+```bash
+cargo run -p agentdb-server -- serve --dev \
+  --mongo-bind 127.0.0.1:7879 \
+  --mongo-username agentdb \
+  --mongo-password secret
+
+mongosh "mongodb://agentdb:secret@127.0.0.1:7879/?directConnection=true&authMechanism=PLAIN&authSource=%24external"
+```
+
 Use normal collection helpers for simple document access:
 
 ```javascript
@@ -145,7 +156,9 @@ db.runCommand({
 
 The MongoDB listener is an adapter for driver/tool access, not a full MongoDB
 replacement. The native HTTP API and SDKs remain the canonical AgentDB runtime
-surface.
+surface. See
+[docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md)
+for the mapping rules, supported subset, and AI coding-agent guidance.
 
 For persistent single-node state:
 
