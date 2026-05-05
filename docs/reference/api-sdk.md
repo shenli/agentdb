@@ -19,10 +19,46 @@ GET  /api/admin/nodes[?stale_threshold_ms={ms}]
 POST /api/admin/nodes
 DELETE /api/admin/nodes/{node_id}
 GET  /api/admin/tablets
+POST /api/admin/tablets/create
+POST /api/admin/tablets/rebalance
+POST /api/admin/tablets/{tablet_id}/assign
+POST /api/admin/tablets/{tablet_id}/relinquish
+POST /api/admin/tablets/{tablet_id}/handoff
+POST /api/admin/tablets/{tablet_id}/handoff/complete
+POST /api/admin/tablets/{tablet_id}/handoff/cancel
 GET  /api/admin/routing
 GET  /api/admin/routing/decision?tenant_id={tenant_id}[&session_id={session_id}]
 POST /api/policy/worker/run
 ```
+
+Tablet admin request bodies:
+
+```json
+POST /api/admin/tablets/create
+{ "tablet_id": 0 }
+
+POST /api/admin/tablets/{tablet_id}/assign
+{ "node_id": "node-a" }
+
+POST /api/admin/tablets/{tablet_id}/handoff
+{ "target_node_id": "node-b" }
+
+POST /api/admin/tablets/{tablet_id}/handoff/complete
+{ "expected_source_node_id": "node-a" }
+
+POST /api/admin/tablets/rebalance
+{
+  "dry_run": true,
+  "stale_threshold_ms": 15000,
+  "max_movements": 10
+}
+```
+
+`assign` only pre-claims an unowned tablet for a fresh `alive` node. `handoff`
+sets a cooperative movement target and keeps the source owner active until the
+source completes the handoff. `rebalance` assigns unowned tablets, moves tablets
+off fresh draining nodes through handoff, and balances load across fresh `alive`
+nodes; it does not force-move tablets from stale or dead owners.
 
 Tenants, agents, and sessions:
 

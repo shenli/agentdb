@@ -172,30 +172,39 @@ Status:
 - `GET /api/admin/tablets` exists
 - node registration and metadata cleanup now have a minimal surface via
   `POST /api/admin/nodes` and `DELETE /api/admin/nodes/{node_id}`
+- tablet ownership movement now has an operator surface:
+  `POST /api/admin/tablets/create`, `POST /api/admin/tablets/{tablet_id}/assign`,
+  `POST /api/admin/tablets/{tablet_id}/relinquish`,
+  `POST /api/admin/tablets/{tablet_id}/handoff`,
+  `POST /api/admin/tablets/{tablet_id}/handoff/complete`,
+  `POST /api/admin/tablets/{tablet_id}/handoff/cancel`, and
+  `POST /api/admin/tablets/rebalance`
 - the first live convergence loop now exists in cluster mode:
   node heartbeat/upsert, scheduler leader lease, stale-node marking, and
   expired-tablet ownership clearing
 - the broader operator surface is still incomplete: there is no supported
-  maintenance/undrain, handoff, rebalance, backup, or restore API yet
+  maintenance/undrain, backup, or restore API yet
 
 ### Write APIs
 
-- `POST /api/admin/nodes/register`
+- `POST /api/admin/nodes`
 - `POST /api/admin/drain`
 - `POST /api/admin/nodes/{node_id}/maintenance`
 - `POST /api/admin/tablets/create`
 - `POST /api/admin/tablets/{tablet_id}/handoff`
+- `POST /api/admin/tablets/{tablet_id}/handoff/complete`
+- `POST /api/admin/tablets/{tablet_id}/handoff/cancel`
+- `POST /api/admin/tablets/{tablet_id}/assign`
+- `POST /api/admin/tablets/{tablet_id}/relinquish`
 - `POST /api/admin/tablets/rebalance`
 - `POST /api/admin/backups`
 - `POST /api/admin/restores`
 
 ### Missing capabilities to close
 
-- explicit node join/register
-- explicit ownership handoff
-- explicit rebalance control
-- explicit cluster-level health/readiness
 - explicit backup/restore job surface
+- explicit node maintenance/undrain API
+- automated handoff/rebalance reconciler beyond the operator-triggered API
 
 Acceptance:
 
@@ -481,10 +490,11 @@ Acceptance:
 - node join/drain/maintenance APIs
 - stale-node and lease reconciliation
 - ownership handoff API
+- tablet rebalance API
 
 ### M3
 
-- rebalance control loop
+- automated rebalance control loop
 - bootstrap automation
 - cluster smoke test
 

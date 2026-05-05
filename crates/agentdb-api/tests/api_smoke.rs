@@ -846,6 +846,243 @@ async fn admin_tablets_returns_rows() {
 }
 
 #[tokio::test]
+async fn admin_tablet_ownership_mutations_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-b",
+        "http://127.0.0.1:18081",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2b"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/create", app.base))
+        .json(&json!({"tablet_id": 9}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["action"], "create");
+    assert_eq!(created["changed"], true);
+    assert_eq!(created["tablet"]["tablet_id"], 9);
+
+    let assigned: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/9/assign", app.base))
+        .json(&json!({"node_id": "node-a"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(assigned["changed"], true);
+    assert_eq!(assigned["tablet"]["owner_node_id"], "node-a");
+    assert_eq!(assigned["tablet"]["epoch"], 0);
+
+    let handoff: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/9/handoff", app.base))
+        .json(&json!({"target_node_id": "node-b"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(handoff["changed"], true);
+    assert_eq!(handoff["tablet"]["owner_node_id"], "node-a");
+    assert_eq!(handoff["tablet"]["handoff_target_node_id"], "node-b");
+
+    let completed: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/9/handoff/complete", app.base))
+        .json(&json!({"expected_source_node_id": "node-a"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed["changed"], true);
+    assert_eq!(completed["new_owner_node_id"], "node-b");
+    assert_eq!(completed["tablet"]["owner_node_id"], "node-b");
+    assert_eq!(
+        completed["tablet"]["handoff_target_node_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(completed["tablet"]["epoch"], 1);
+
+    let relinquished: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/9/relinquish", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(relinquished["changed"], true);
+    assert_eq!(
+        relinquished["tablet"]["owner_node_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(relinquished["tablet"]["epoch"], 2);
+}
+
+#[tokio::test]
+async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-b",
+        "http://127.0.0.1:18081",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2b"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-c",
+        "http://127.0.0.1:18082",
+        None,
+        "draining",
+        i64::MAX,
+        Some("us-west-2c"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    for id in 1..=5 {
+        agentdb_meta::tablets::get_or_create(meta.pool(), id, 100)
+            .await
+            .unwrap();
+    }
+    agentdb_meta::tablets::assign_to(meta.pool(), 1, "node-a")
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assign_to(meta.pool(), 2, "node-a")
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assign_to(meta.pool(), 3, "node-a")
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assign_to(meta.pool(), 4, "node-c")
+        .await
+        .unwrap();
+
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let dry_run: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/rebalance", app.base))
+        .json(&json!({"dry_run": true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["eligible_node_count"], 2);
+    assert!(dry_run["actions"].as_array().unwrap().iter().any(|action| {
+        action["action"] == "assign" && action["tablet_id"] == 5 && action["reason"] == "unowned"
+    }));
+    assert!(dry_run["actions"].as_array().unwrap().iter().any(|action| {
+        action["action"] == "handoff"
+            && action["source_node_id"] == "node-c"
+            && action["reason"] == "source_draining"
+    }));
+
+    let applied: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/rebalance", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(applied["dry_run"], false);
+    assert!(applied["actions"].as_array().unwrap().len() >= 2);
+
+    let tablets: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tablets", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = tablets.as_array().unwrap();
+    assert!(rows.iter().any(|row| row["tablet_id"] == 5
+        && (row["owner_node_id"] == "node-a" || row["owner_node_id"] == "node-b")));
+    assert!(rows.iter().any(|row| {
+        row["handoff_target_node_id"] == "node-a" || row["handoff_target_node_id"] == "node-b"
+    }));
+}
+
+#[tokio::test]
 async fn admin_nodes_returns_503_when_meta_is_missing() {
     let app = spawn_app().await;
 
