@@ -530,7 +530,11 @@ impl Runtime {
                 active_session_count += 1;
             }
             sealed_segment_count += session.sealed_segments.len();
-            sealed_bytes += session.sealed_segments.iter().map(|segment| segment.bytes).sum::<u64>();
+            sealed_bytes += session
+                .sealed_segments
+                .iter()
+                .map(|segment| segment.bytes)
+                .sum::<u64>();
             if let Some(manifest) = &session.archive_manifest {
                 archive_manifest_count += 1;
                 archived_bytes += manifest.bytes;
@@ -561,7 +565,10 @@ impl Runtime {
         }
     }
 
-    async fn read_session_segment_events(&self, segment: &SessionSegment) -> Result<Vec<EventEnvelope>> {
+    async fn read_session_segment_events(
+        &self,
+        segment: &SessionSegment,
+    ) -> Result<Vec<EventEnvelope>> {
         let current_key = self.resolve_key(&segment.tenant_id, KeyOperation::ContentRead)?;
         let stored_bytes = self
             .content
@@ -619,8 +626,8 @@ impl Runtime {
             seq_end,
             events,
         };
-        let plaintext =
-            serde_json::to_vec(&file).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        let plaintext = serde_json::to_vec(&file)
+            .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
         let plaintext_sha256 = sha256_hex(&plaintext);
         let crypto_context = ContentCryptoContext {
             tenant_id: tenant_id.as_str(),
@@ -702,8 +709,8 @@ impl Runtime {
             source_segment_ids: source_segment_ids.clone(),
             events,
         };
-        let plaintext =
-            serde_json::to_vec(&file).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        let plaintext = serde_json::to_vec(&file)
+            .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
         let plaintext_sha256 = sha256_hex(&plaintext);
         let crypto_context = ContentCryptoContext {
             tenant_id: tenant_id.as_str(),
@@ -1341,10 +1348,7 @@ impl Runtime {
                 session.lifecycle = target;
             }
             if self.persist.is_none() {
-                let lo = (
-                    session_id.as_str().to_string(),
-                    snapshot.warm_head_from_seq,
-                );
+                let lo = (session_id.as_str().to_string(), snapshot.warm_head_from_seq);
                 let hi = (session_id.as_str().to_string(), u64::MAX);
                 let keys: Vec<(String, u64)> =
                     s.events.range(lo..=hi).map(|(k, _)| k.clone()).collect();
@@ -2033,6 +2037,35 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::SkillNotFound, format!("{}", skill_id)))
     }
 
+    pub async fn list_skills(&self, tenant_id: &Id) -> Result<Vec<Skill>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut skills = s
+            .skills
+            .values()
+            .filter(|skill| {
+                skill.deleted_at_ms.is_none() && skill.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        skills.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.version.cmp(&b.version))
+                .then_with(|| a.skill_id.as_str().cmp(b.skill_id.as_str()))
+        });
+        Ok(skills)
+    }
+
     pub async fn delete_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<()> {
         let mut s = self.state.lock().await;
         let live = s.skills.get(skill_id.as_str()).is_some_and(|skill| {
@@ -2547,6 +2580,35 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::ArtifactNotFound, format!("{}", artifact_id)))
     }
 
+    pub async fn list_artifacts(&self, tenant_id: &Id) -> Result<Vec<Artifact>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut artifacts = s
+            .artifacts
+            .values()
+            .filter(|artifact| {
+                artifact.deleted_at_ms.is_none()
+                    && artifact.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.artifact_id.as_str().cmp(b.artifact_id.as_str()))
+        });
+        Ok(artifacts)
+    }
+
     /// Read the bytes for an artifact. Same scoping rules as `get_artifact`.
     /// Once raw is purged (V2.4 derivative-only lifecycle) the bytes are
     /// gone but the metadata stays — a `get_artifact_blob` against a
@@ -2660,49 +2722,47 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<LifecycleSweepReport> {
         let mut report = LifecycleSweepReport::default();
-        let (session_candidates, artifact_candidates) = {
-            let s = self.state.lock().await;
-            let mut candidates = Vec::new();
-            for session in s.sessions.values() {
-                if session.deleted_at_ms.is_some() {
-                    continue;
+        let (session_candidates, artifact_candidates) =
+            {
+                let s = self.state.lock().await;
+                let mut candidates = Vec::new();
+                for session in s.sessions.values() {
+                    if session.deleted_at_ms.is_some() {
+                        continue;
+                    }
+                    if tenant_scope
+                        .is_some_and(|tenant_id| session.tenant_id.as_str() != tenant_id.as_str())
+                    {
+                        continue;
+                    }
+                    let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
+                    let idle_ms = now_ms.saturating_sub(session.last_active_at_ms);
+                    let target = lifecycle_target(session.lifecycle, idle_ms, &policy);
+                    if target != session.lifecycle {
+                        candidates.push((session.clone(), target, policy));
+                    }
                 }
-                if tenant_scope
-                    .is_some_and(|tenant_id| session.tenant_id.as_str() != tenant_id.as_str())
-                {
-                    continue;
-                }
-                let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
-                let idle_ms = now_ms.saturating_sub(session.last_active_at_ms);
-                let target = lifecycle_target(session.lifecycle, idle_ms, &policy);
-                if target != session.lifecycle {
-                    candidates.push((session.clone(), target, policy));
-                }
-            }
 
-            let artifacts = s
-                .artifacts
-                .values()
-                .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
-                .filter(|a| {
-                    tenant_scope
-                        .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
-                        .unwrap_or(true)
-                })
-                .filter(|a| {
-                    let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
-                    !policy.retention.legal_hold
-                        && policy
-                            .lifecycle
-                            .derivative_only_after_ms
-                            .is_some_and(|threshold| {
-                                now_ms.saturating_sub(a.created_at_ms) >= threshold
-                            })
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            (candidates, artifacts)
-        };
+                let artifacts =
+                    s.artifacts
+                        .values()
+                        .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
+                        .filter(|a| {
+                            tenant_scope
+                                .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                                .unwrap_or(true)
+                        })
+                        .filter(|a| {
+                            let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                            !policy.retention.legal_hold
+                                && policy.lifecycle.derivative_only_after_ms.is_some_and(
+                                    |threshold| now_ms.saturating_sub(a.created_at_ms) >= threshold,
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                (candidates, artifacts)
+            };
 
         for (session, target, policy) in session_candidates {
             if !lifecycle_work_allowed(&mut report, &policy) {
@@ -3967,12 +4027,9 @@ impl Runtime {
                     format!("{}", req.session_id),
                 ));
             }
-            let session = s
-                .sessions
-                .get(req.session_id.as_str())
-                .ok_or_else(|| {
-                    Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
-                })?;
+            let session = s.sessions.get(req.session_id.as_str()).ok_or_else(|| {
+                Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+            })?;
             if session.deleted_at_ms.is_some()
                 || session.tenant_id.as_str() != req.tenant_id.as_str()
             {
@@ -4032,8 +4089,13 @@ impl Runtime {
         }
         let hot_from_seq = req.from_seq.max(session.warm_head_from_seq);
         let hot = if self.persist.is_some() {
-            self.read_hot_events_from_persist(&req.tenant_id, &req.session_id, hot_from_seq, remaining)
-                .await?
+            self.read_hot_events_from_persist(
+                &req.tenant_id,
+                &req.session_id,
+                hot_from_seq,
+                remaining,
+            )
+            .await?
         } else {
             hot_in_memory
         };
@@ -4222,11 +4284,14 @@ impl Runtime {
             .insert(record.record_id.as_str().to_string(), commit_seq);
         s.local_record_index_watermark = commit_seq;
         if self.persist.is_none() {
-            if let Err(error) = self.global_record_index.apply(global_index_mutation_for_record(
-                &record,
-                commit_seq,
-                GlobalIndexMutationOp::Upsert,
-            )) {
+            if let Err(error) = self
+                .global_record_index
+                .apply(global_index_mutation_for_record(
+                    &record,
+                    commit_seq,
+                    GlobalIndexMutationOp::Upsert,
+                ))
+            {
                 s.global_record_index_apply_failures_total += 1;
                 drop(s);
                 return Err(error);
@@ -4334,13 +4399,15 @@ impl Runtime {
             let mut advanced = false;
             if mutation.commit_seq > s.global_record_index_watermark {
                 let global_mutation = match mutation.op {
-                    RecordIndexMutationOp::Upsert => s.records.get(&mutation.record_id).map(|record| {
-                        global_index_mutation_for_record(
-                            record,
-                            mutation.commit_seq,
-                            GlobalIndexMutationOp::Upsert,
-                        )
-                    }),
+                    RecordIndexMutationOp::Upsert => {
+                        s.records.get(&mutation.record_id).map(|record| {
+                            global_index_mutation_for_record(
+                                record,
+                                mutation.commit_seq,
+                                GlobalIndexMutationOp::Upsert,
+                            )
+                        })
+                    }
                     RecordIndexMutationOp::Delete => Some(GlobalIndexMutation {
                         tenant_id: mutation.tenant_id.clone(),
                         record_id: mutation.record_id.clone(),
@@ -4453,11 +4520,7 @@ impl Runtime {
                 ));
             }
         }
-        let terms = req
-            .text
-            .as_deref()
-            .map(repair_tokens)
-            .unwrap_or_default();
+        let terms = req.text.as_deref().map(repair_tokens).unwrap_or_default();
         let result = self.global_record_index.search(GlobalIndexQuery {
             tenant_id: req.tenant_id.as_str().to_string(),
             namespace: req.namespace.clone(),
@@ -4482,8 +4545,7 @@ impl Runtime {
             candidates.push((record.clone(), repair_score(&record, &req)));
         }
         drop(s);
-        candidates
-            .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(filter_search_candidates(candidates, &req))
     }

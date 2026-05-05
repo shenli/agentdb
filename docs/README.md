@@ -9,6 +9,8 @@ material.
   boundaries, request flow, storage, routing, and operational model
 - [architecture/DESIGN.md](architecture/DESIGN.md) - product constraints,
   non-goals, and durable design decisions
+- [architecture/TRADEOFFS.md](architecture/TRADEOFFS.md) - explicit goals,
+  non-goals, fit, and non-fit for AgentDB's AI agent runtime database scope
 - [architecture/agent-db.md](architecture/agent-db.md) - long-form product and
   systems design
 - [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)

@@ -4,6 +4,7 @@ members = [
     "crates/agentdb-storage",
     "crates/agentdb-core",
     "crates/agentdb-api",
+    "crates/agentdb-wire",
     "crates/agentdb-dashboard",
     "crates/agentdb-index",
     "crates/agentdb-meta",
@@ -21,6 +22,7 @@ anyhow = "1"
 async-broadcast = "0.7"
 bytes = "1"
 byteorder = "1"
+bson = "2"
 instant-distance = "0.6"
 parking_lot = "0.12"
 thiserror = "1"
@@ -62,3 +64,4 @@ rustls-pemfile = "2"
 # Dev-only: generate ephemeral self-signed certs for
 # `agentdb serve --dev-tls` and integration tests.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
+mongodb = { version = "2.8.2", default-features = false, features = ["tokio-runtime"] }

@@ -113,6 +113,10 @@ struct ServeOpts {
     /// through to the original caller.
     #[arg(long)]
     route_proxy_max_response_bytes: Option<u64>,
+
+    /// Optional MongoDB wire-protocol compatibility listener, e.g. 127.0.0.1:7879.
+    #[arg(long)]
+    mongo_bind: Option<SocketAddr>,
 }
 
 #[derive(Parser, Debug)]
@@ -230,6 +234,17 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         "started record index outbox worker"
     );
 
+    if let Some(mongo_bind) = config.mongo_bind {
+        let mongo_listener = tokio::net::TcpListener::bind(mongo_bind).await?;
+        let mongo_runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = agentdb_wire::server::serve(mongo_listener, mongo_runtime).await {
+                tracing::error!(?error, "MongoDB compatibility listener stopped");
+            }
+        });
+        tracing::info!(addr = %mongo_bind, "MongoDB compatibility listener enabled");
+    }
+
     let mut state =
         agentdb_api::AppState::new(runtime).with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
@@ -301,6 +316,7 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
+    mongo_bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +455,7 @@ impl ResolvedServeConfig {
                 .route_proxy_max_response_bytes
                 .or(file.routing.proxy_max_response_bytes)
                 .unwrap_or(16 * 1024 * 1024),
+            mongo_bind: opts.mongo_bind.or(file.mongodb.bind),
         })
     }
 
@@ -492,6 +509,7 @@ impl ResolvedServeConfig {
                 .routing
                 .proxy_max_response_bytes
                 .unwrap_or(16 * 1024 * 1024),
+            mongo_bind: file.mongodb.bind,
         })
     }
 }
@@ -506,6 +524,8 @@ struct FileConfig {
     storage: StorageFileConfig,
     #[serde(default)]
     routing: RoutingFileConfig,
+    #[serde(default)]
+    mongodb: MongoDbFileConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -559,6 +579,11 @@ struct RoutingFileConfig {
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
     proxy_max_response_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MongoDbFileConfig {
+    bind: Option<SocketAddr>,
 }
 
 fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
@@ -729,6 +754,9 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
     }
     println!("  health:    http://{}/health/ready", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
+    if let Some(mongo_bind) = config.mongo_bind {
+        println!("  mongodb:   mongodb://{mongo_bind}/");
+    }
 }
 
 fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
