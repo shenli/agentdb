@@ -19,6 +19,8 @@ material.
   paths, packaging modes, and current cluster status
 - [operations/OPERATIONS.md](operations/OPERATIONS.md) - start/stop, backup,
   restore, upgrade, and troubleshooting for the supported single-node shape
+- [operations/AGENTDBCTL.md](operations/AGENTDBCTL.md) - human and AI-agent
+  friendly operations CLI for AgentDB admin workflows
 - [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
   of multi-node support and the missing operator workflows today
 - [operations/CLUSTER_DEPLOYMENT.md](operations/CLUSTER_DEPLOYMENT.md) -

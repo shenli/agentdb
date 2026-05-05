@@ -7,6 +7,7 @@ It is forward-looking. Use it as the intended operator contract for cluster
 mode, not as a claim that all workflows already exist in the current server.
 
 For the current support boundary, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+For the recommended human CLI, see [AGENTDBCTL.md](AGENTDBCTL.md).
 
 ## Goals
 
