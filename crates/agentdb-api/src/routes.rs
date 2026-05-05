@@ -9,7 +9,8 @@
 //! in `crate::errors`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    fs,
+    path::{Path as FsPath, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,7 +33,7 @@ use agentdb_core::{
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
-use agentdb_meta::{nodes, tablets};
+use agentdb_meta::{nodes, tablet_rebalance, tablets};
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
@@ -73,6 +74,10 @@ pub fn routes() -> Router<AppState> {
             get(get_admin_nodes).post(register_admin_node),
         )
         .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
+        .route(
+            "/api/admin/nodes/:node_id/maintenance",
+            post(set_admin_node_maintenance),
+        )
         .route("/api/admin/tablets", get(get_admin_tablets))
         .route("/api/admin/tablets/create", post(create_admin_tablet))
         .route(
@@ -101,6 +106,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/admin/backups", post(create_admin_backup))
+        .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
         .route("/api/tenants", get(list_tenants).post(create_tenant))
         .route(
@@ -290,6 +297,11 @@ struct RegisterNodeBody {
     region: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NodeMaintenanceBody {
+    state: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DeleteAdminNodeResponse {
     node_id: String,
@@ -326,14 +338,6 @@ struct CompleteHandoffBody {
     expected_source_node_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RebalanceTabletsBody {
-    #[serde(default)]
-    dry_run: bool,
-    stale_threshold_ms: Option<i64>,
-    max_movements: Option<usize>,
-}
-
 #[derive(Debug, Serialize)]
 struct AdminTabletMutationResponse {
     action: &'static str,
@@ -347,28 +351,6 @@ struct AdminTabletHandoffCompleteResponse {
     changed: bool,
     new_owner_node_id: Option<String>,
     tablet: AdminTabletView,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AdminTabletRebalanceAction {
-    action: &'static str,
-    tablet_id: i64,
-    source_node_id: Option<String>,
-    target_node_id: Option<String>,
-    changed: bool,
-    reason: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct AdminTabletRebalanceResponse {
-    dry_run: bool,
-    stale_threshold_ms: i64,
-    eligible_node_count: usize,
-    tablet_count: usize,
-    owner_counts_before: HashMap<String, usize>,
-    owner_counts_after: HashMap<String, usize>,
-    actions: Vec<AdminTabletRebalanceAction>,
-    skipped: Vec<AdminTabletRebalanceAction>,
 }
 
 #[derive(Debug, Serialize)]
@@ -388,6 +370,40 @@ struct SchedulerStatusResponse {
     dead_nodes_marked_total: u64,
     tablet_reassignments_total: u64,
     last_tick_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBackupBody {
+    backup_id: Option<String>,
+    directory: Option<String>,
+    include_meta: Option<bool>,
+    include_runtime_summary: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminBackupResponse {
+    job_id: String,
+    status: &'static str,
+    manifest_path: String,
+    backup_dir: String,
+    meta_backup_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreBody {
+    manifest_path: String,
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminRestoreResponse {
+    job_id: String,
+    status: &'static str,
+    dry_run: bool,
+    manifest_path: String,
+    backup_id: Option<String>,
+    checks: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -499,6 +515,154 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
     })
 }
 
+async fn create_admin_backup(
+    State(s): State<AppState>,
+    Json(body): Json<CreateBackupBody>,
+) -> Result<Json<AdminBackupResponse>, ApiError> {
+    let now_ms = now_ms_i64();
+    let backup_id = body.backup_id.unwrap_or_else(|| format!("bak_{now_ms}"));
+    if !is_safe_backup_id(&backup_id) {
+        return Err(invalid_admin_request(
+            "backup_id may only contain ASCII letters, digits, '_', '-', and '.'",
+        ));
+    }
+    let root = body
+        .directory
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("agentdb-backups"));
+    let backup_dir = root.join(&backup_id);
+    if backup_dir.exists() {
+        return Err(invalid_admin_request(format!(
+            "backup directory already exists: {}",
+            backup_dir.display()
+        )));
+    }
+    fs::create_dir_all(&backup_dir).map_err(internal_error)?;
+
+    let include_meta = body.include_meta.unwrap_or(true);
+    let include_runtime_summary = body.include_runtime_summary.unwrap_or(true);
+    let mut meta_backup_path = None;
+    if include_meta {
+        if let Some(meta) = s.meta.as_ref() {
+            let extension = match meta.dialect() {
+                agentdb_meta::MetaDialect::Sqlite => "sqlite",
+                agentdb_meta::MetaDialect::Postgres => "sql",
+            };
+            let path = backup_dir.join(format!("meta.{extension}"));
+            meta.backup(&path).await.map_err(internal_error)?;
+            meta_backup_path = Some(path.display().to_string());
+        }
+    }
+
+    let runtime_summary = if include_runtime_summary {
+        Some(
+            serde_json::to_value(s.runtime.fleet_storage_summary().await)
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
+    let nodes = if let Some(meta) = s.meta.as_ref() {
+        let rows = nodes::list_all(meta.pool()).await.map_err(internal_error)?;
+        Some(
+            serde_json::to_value(
+                rows.into_iter()
+                    .map(|node| admin_node_view(node, now_ms, 15_000))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
+    let tablets = if let Some(meta) = s.meta.as_ref() {
+        Some(serde_json::to_value(list_tablets_for_backup(meta).await?).map_err(internal_error)?)
+    } else {
+        None
+    };
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "backup_id": backup_id,
+        "created_at_ms": now_ms,
+        "status": "completed",
+        "meta_backup_path": meta_backup_path,
+        "runtime_summary": runtime_summary,
+        "nodes": nodes,
+        "tablets": tablets,
+        "notes": [
+            "This is an online backup manifest.",
+            "Runtime summary is observability metadata, not a full runtime data copy.",
+            "Restore API currently validates manifests only; destructive apply must be done offline."
+        ]
+    });
+    let manifest_path = backup_dir.join("manifest.json");
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(internal_error)?;
+    fs::write(&manifest_path, manifest_bytes).map_err(internal_error)?;
+
+    Ok(Json(AdminBackupResponse {
+        job_id: format!("job_backup_{now_ms}"),
+        status: "completed",
+        manifest_path: manifest_path.display().to_string(),
+        backup_dir: backup_dir.display().to_string(),
+        meta_backup_path,
+    }))
+}
+
+async fn validate_admin_restore(
+    Json(body): Json<RestoreBody>,
+) -> Result<Json<AdminRestoreResponse>, ApiError> {
+    if !body.dry_run {
+        return Err(invalid_admin_request(
+            "online restore apply is not supported; rerun with dry_run=true to validate the backup manifest",
+        ));
+    }
+    let manifest_path = PathBuf::from(&body.manifest_path);
+    let raw = fs::read_to_string(&manifest_path).map_err(internal_error)?;
+    let manifest: serde_json::Value = serde_json::from_str(&raw).map_err(internal_error)?;
+    if manifest["schema_version"].as_i64() != Some(1) {
+        return Err(invalid_admin_request(
+            "unsupported backup manifest schema_version; expected 1",
+        ));
+    }
+    let mut checks = vec!["schema_version=1".to_string()];
+    let backup_id = manifest["backup_id"].as_str().map(str::to_string);
+    if backup_id.is_some() {
+        checks.push("backup_id present".to_string());
+    }
+    if let Some(meta_path) = manifest["meta_backup_path"].as_str() {
+        let meta_path = FsPath::new(meta_path);
+        if !meta_path.exists() {
+            return Err(invalid_admin_request(format!(
+                "meta backup path is missing: {}",
+                meta_path.display()
+            )));
+        }
+        checks.push("meta backup exists".to_string());
+    }
+    if manifest.get("runtime_summary").is_some() {
+        checks.push("runtime summary present".to_string());
+    }
+    Ok(Json(AdminRestoreResponse {
+        job_id: format!("job_restore_validate_{}", now_ms_i64()),
+        status: "validated",
+        dry_run: true,
+        manifest_path: body.manifest_path,
+        backup_id,
+        checks,
+    }))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_safe_backup_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 async fn get_admin_nodes(
     State(s): State<AppState>,
     Query(query): Query<ClusterAdminQuery>,
@@ -586,17 +750,7 @@ async fn register_admin_node(
                 ),
             ))
         })?;
-    Ok(Json(AdminNodeView {
-        is_stale: false,
-        node_id: node.node_id,
-        address: node.address,
-        mongo_address: node.mongo_address,
-        state: node.state,
-        last_heartbeat_ms: node.last_heartbeat_ms,
-        joined_at_ms: node.joined_at_ms,
-        availability_zone: node.availability_zone,
-        region: node.region,
-    }))
+    Ok(Json(admin_node_view(node, now_ms, 15_000)))
 }
 
 async fn delete_admin_node(
@@ -616,6 +770,36 @@ async fn delete_admin_node(
         ))
     })?;
     Ok(Json(DeleteAdminNodeResponse { node_id, removed }))
+}
+
+async fn set_admin_node_maintenance(
+    State(s): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(body): Json<NodeMaintenanceBody>,
+) -> Result<Json<AdminNodeView>, ApiError> {
+    let meta = meta_required(&s)?;
+    let state = body.state.as_str();
+    if !matches!(state, "alive" | "draining" | "maintenance") {
+        return Err(invalid_admin_request(
+            "maintenance state must be one of: alive, draining, maintenance",
+        ));
+    }
+    let now_ms = now_ms_i64();
+    nodes::set_state(meta.pool(), &node_id, state, now_ms)
+        .await
+        .map_err(internal_error)?;
+    if node_id == s.drain.node_id() {
+        if state == "alive" {
+            s.drain.deactivate();
+        } else {
+            s.drain.activate(now_ms);
+        }
+    }
+    let node = nodes::get(meta.pool(), &node_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_admin_request(format!("node {node_id} does not exist")))?;
+    Ok(Json(admin_node_view(node, now_ms, 15_000)))
 }
 
 fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
@@ -639,6 +823,20 @@ fn invalid_admin_request(message: impl Into<String>) -> ApiError {
         ErrorCode::PolicyDenied,
         message.into(),
     ))
+}
+
+fn admin_node_view(node: nodes::Node, now_ms: i64, stale_threshold_ms: i64) -> AdminNodeView {
+    AdminNodeView {
+        is_stale: now_ms - node.last_heartbeat_ms > stale_threshold_ms,
+        node_id: node.node_id,
+        address: node.address,
+        mongo_address: node.mongo_address,
+        state: node.state,
+        last_heartbeat_ms: node.last_heartbeat_ms,
+        joined_at_ms: node.joined_at_ms,
+        availability_zone: node.availability_zone,
+        region: node.region,
+    }
 }
 
 fn tablet_view(tablet: tablets::Tablet) -> AdminTabletView {
@@ -822,258 +1020,37 @@ async fn cancel_admin_tablet_handoff(
 async fn rebalance_admin_tablets(
     State(s): State<AppState>,
     Json(body): Json<RebalanceTabletsBody>,
-) -> Result<Json<AdminTabletRebalanceResponse>, ApiError> {
+) -> Result<Json<tablet_rebalance::RebalanceReport>, ApiError> {
     let meta = meta_required(&s)?;
-    let stale_threshold_ms = body.stale_threshold_ms.unwrap_or(15_000);
-    let max_movements = body.max_movements.unwrap_or(usize::MAX);
-    let now_ms = now_ms_i64();
-    let nodes = nodes::list_all(meta.pool()).await.map_err(internal_error)?;
-    let tablets = tablets::list_all(meta.pool())
+    let report = tablet_rebalance::run(
+        meta.pool(),
+        tablet_rebalance::RebalanceRequest {
+            dry_run: body.dry_run,
+            stale_threshold_ms: body.stale_threshold_ms.unwrap_or(15_000),
+            max_movements: body.max_movements.unwrap_or(usize::MAX),
+        },
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(report))
+}
+
+#[derive(Debug, Deserialize)]
+struct RebalanceTabletsBody {
+    #[serde(default)]
+    dry_run: bool,
+    stale_threshold_ms: Option<i64>,
+    max_movements: Option<usize>,
+}
+
+async fn list_tablets_for_backup(
+    meta: &agentdb_meta::MetaStore,
+) -> Result<Vec<AdminTabletView>, ApiError> {
+    let rows = tablets::list_all(meta.pool())
         .await
         .map_err(internal_error)?;
-
-    let fresh_alive_nodes: HashSet<String> = nodes
-        .iter()
-        .filter(|node| {
-            node.state == "alive" && now_ms - node.last_heartbeat_ms <= stale_threshold_ms
-        })
-        .map(|node| node.node_id.clone())
-        .collect();
-    let node_state: HashMap<String, (String, bool)> = nodes
-        .iter()
-        .map(|node| {
-            (
-                node.node_id.clone(),
-                (
-                    node.state.clone(),
-                    now_ms - node.last_heartbeat_ms > stale_threshold_ms,
-                ),
-            )
-        })
-        .collect();
-    let mut counts_before = owner_counts(&tablets);
-    for node_id in &fresh_alive_nodes {
-        counts_before.entry(node_id.clone()).or_insert(0);
-    }
-    let mut counts_after: HashMap<String, usize> = fresh_alive_nodes
-        .iter()
-        .map(|node_id| {
-            let count = tablets
-                .iter()
-                .filter(|tablet| tablet.owner_node_id.as_ref() == Some(node_id))
-                .count();
-            (node_id.clone(), count)
-        })
-        .collect();
-    let mut actions = Vec::new();
-    let mut skipped = Vec::new();
-
-    if fresh_alive_nodes.is_empty() {
-        for tablet in tablets
-            .iter()
-            .filter(|tablet| tablet.owner_node_id.is_none())
-        {
-            skipped.push(AdminTabletRebalanceAction {
-                action: "assign",
-                tablet_id: tablet.tablet_id,
-                source_node_id: None,
-                target_node_id: None,
-                changed: false,
-                reason: "no_eligible_target",
-            });
-        }
-        return Ok(Json(AdminTabletRebalanceResponse {
-            dry_run: body.dry_run,
-            stale_threshold_ms,
-            eligible_node_count: 0,
-            tablet_count: tablets.len(),
-            owner_counts_before: counts_before,
-            owner_counts_after: counts_after,
-            actions,
-            skipped,
-        }));
-    }
-
-    for tablet in tablets
-        .iter()
-        .filter(|tablet| tablet.owner_node_id.is_none())
-    {
-        if actions.len() >= max_movements {
-            break;
-        }
-        let target = least_loaded_node(&counts_after).ok_or_else(|| {
-            invalid_admin_request("no eligible target node for unowned tablet assignment")
-        })?;
-        let changed = if body.dry_run {
-            true
-        } else {
-            tablets::assign_to(meta.pool(), tablet.tablet_id, &target)
-                .await
-                .map_err(internal_error)?
-        };
-        if changed {
-            *counts_after.entry(target.clone()).or_insert(0) += 1;
-        }
-        actions.push(AdminTabletRebalanceAction {
-            action: "assign",
-            tablet_id: tablet.tablet_id,
-            source_node_id: None,
-            target_node_id: Some(target),
-            changed,
-            reason: "unowned",
-        });
-    }
-
-    for tablet in tablets.iter().filter(|tablet| {
-        tablet
-            .owner_node_id
-            .as_ref()
-            .and_then(|owner| node_state.get(owner).map(|(state, stale)| (state, *stale)))
-            .is_some_and(|(state, stale)| state == "draining" && !stale)
-    }) {
-        if actions.len() >= max_movements {
-            break;
-        }
-        let source = tablet.owner_node_id.clone();
-        let target = least_loaded_node(&counts_after).ok_or_else(|| {
-            invalid_admin_request("no eligible target node for draining-owner handoff")
-        })?;
-        if source.as_deref() == Some(target.as_str()) {
-            continue;
-        }
-        let changed = if body.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(meta.pool(), tablet.tablet_id, &target)
-                .await
-                .map_err(internal_error)?
-        };
-        if changed {
-            *counts_after.entry(target.clone()).or_insert(0) += 1;
-        }
-        actions.push(AdminTabletRebalanceAction {
-            action: "handoff",
-            tablet_id: tablet.tablet_id,
-            source_node_id: source,
-            target_node_id: Some(target),
-            changed,
-            reason: "source_draining",
-        });
-    }
-
-    let mut balance_candidates: Vec<tablets::Tablet> = tablets
-        .iter()
-        .filter(|tablet| tablet.handoff_target_node_id.is_none())
-        .filter(|tablet| {
-            tablet
-                .owner_node_id
-                .as_ref()
-                .is_some_and(|owner| fresh_alive_nodes.contains(owner))
-        })
-        .cloned()
-        .collect();
-    balance_candidates.sort_by_key(|tablet| tablet.tablet_id);
-    while actions.len() < max_movements {
-        let Some((source, source_count)) = most_loaded_node(&counts_after) else {
-            break;
-        };
-        let Some((target, target_count)) = least_loaded_node_with_count(&counts_after) else {
-            break;
-        };
-        if source_count <= target_count + 1 {
-            break;
-        }
-        let Some(candidate_index) = balance_candidates
-            .iter()
-            .position(|tablet| tablet.owner_node_id.as_deref() == Some(source.as_str()))
-        else {
-            break;
-        };
-        let tablet = balance_candidates.remove(candidate_index);
-        let changed = if body.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(meta.pool(), tablet.tablet_id, &target)
-                .await
-                .map_err(internal_error)?
-        };
-        if changed {
-            *counts_after.entry(source.clone()).or_insert(0) -= 1;
-            *counts_after.entry(target.clone()).or_insert(0) += 1;
-        }
-        actions.push(AdminTabletRebalanceAction {
-            action: "handoff",
-            tablet_id: tablet.tablet_id,
-            source_node_id: Some(source),
-            target_node_id: Some(target),
-            changed,
-            reason: "load_balance",
-        });
-    }
-
-    for tablet in tablets.iter().filter(|tablet| {
-        tablet.owner_node_id.as_ref().is_some_and(|owner| {
-            node_state
-                .get(owner)
-                .is_none_or(|(state, stale)| *stale || state == "dead")
-        })
-    }) {
-        skipped.push(AdminTabletRebalanceAction {
-            action: "handoff",
-            tablet_id: tablet.tablet_id,
-            source_node_id: tablet.owner_node_id.clone(),
-            target_node_id: least_loaded_node(&counts_after),
-            changed: false,
-            reason: "source_not_cooperative",
-        });
-    }
-
-    Ok(Json(AdminTabletRebalanceResponse {
-        dry_run: body.dry_run,
-        stale_threshold_ms,
-        eligible_node_count: fresh_alive_nodes.len(),
-        tablet_count: tablets.len(),
-        owner_counts_before: counts_before,
-        owner_counts_after: counts_after,
-        actions,
-        skipped,
-    }))
-}
-
-fn owner_counts(tablets: &[tablets::Tablet]) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for tablet in tablets {
-        if let Some(owner) = &tablet.owner_node_id {
-            *counts.entry(owner.clone()).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-fn least_loaded_node(counts: &HashMap<String, usize>) -> Option<String> {
-    least_loaded_node_with_count(counts).map(|(node, _)| node)
-}
-
-fn least_loaded_node_with_count(counts: &HashMap<String, usize>) -> Option<(String, usize)> {
-    counts
-        .iter()
-        .min_by(|(left_node, left_count), (right_node, right_count)| {
-            left_count
-                .cmp(right_count)
-                .then_with(|| left_node.cmp(right_node))
-        })
-        .map(|(node, count)| (node.clone(), *count))
-}
-
-fn most_loaded_node(counts: &HashMap<String, usize>) -> Option<(String, usize)> {
-    counts
-        .iter()
-        .max_by(|(left_node, left_count), (right_node, right_count)| {
-            left_count
-                .cmp(right_count)
-                .then_with(|| right_node.cmp(left_node))
-        })
-        .map(|(node, count)| (node.clone(), *count))
+    Ok(rows.into_iter().map(tablet_view).collect())
 }
 
 #[derive(Debug, Deserialize)]

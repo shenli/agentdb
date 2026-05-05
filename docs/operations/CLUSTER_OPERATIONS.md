@@ -110,6 +110,10 @@ Current admin controls:
 - `POST /api/admin/tablets/rebalance` can run with `{ "dry_run": true }` first,
   then without dry-run to assign unowned tablets and mark load-balancing
   handoffs.
+- The scheduler leader also runs the same rebalance policy automatically when
+  metadata-backed cluster mode is enabled. Use `AGENTDB_REBALANCE_MAX_MOVEMENTS`
+  to cap movements per scheduler tick; set it to `0` to disable automatic
+  movement.
 
 Success criteria:
 
@@ -139,6 +143,9 @@ Current admin controls:
 
 - `POST /api/admin/drain` marks the local node as draining and refuses new
   mutating requests on that node.
+- `POST /api/admin/nodes/{node_id}/maintenance` can mark a node `draining`,
+  `maintenance`, or back to `alive`. For the local node, `alive` clears the
+  local drain flag.
 - `POST /api/admin/tablets/{tablet_id}/handoff` marks an owned tablet for
   cooperative transfer to a fresh `alive` target.
 - `POST /api/admin/tablets/{tablet_id}/handoff/complete` transfers ownership
@@ -176,7 +183,24 @@ If the node dies:
 
 Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
 the lease reaper clears expired tablet ownership. Once tablets are unowned,
-`POST /api/admin/tablets/rebalance` can assign them to fresh `alive` nodes.
+`POST /api/admin/tablets/rebalance` or the automatic scheduler rebalance pass
+can assign them to fresh `alive` nodes.
+
+### Backup And Restore
+
+Current backup controls:
+
+- `POST /api/admin/backups` writes an online backup manifest under a target
+  directory and includes a metadata snapshot when metadata is configured.
+- The manifest includes runtime storage summary data for observability. It is
+  not a full runtime KV/content backup.
+- `POST /api/admin/restores` validates a backup manifest and referenced
+  metadata snapshot.
+
+Restore apply remains an offline operator procedure. The HTTP restore endpoint
+intentionally rejects destructive apply because live restore semantics require a
+cluster-wide stop/drain contract and runtime data copy/verification that are not
+safe to fake in an online handler.
 
 ### Restart Node
 

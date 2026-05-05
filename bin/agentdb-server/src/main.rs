@@ -27,6 +27,7 @@ const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
+const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -296,6 +297,7 @@ struct ClusterWorkerConfig {
     stale_node_threshold_ms: i64,
     reaper_tick_ms: u64,
     reaper_safety_margin_ms: i64,
+    rebalance_max_movements: usize,
 }
 
 impl ClusterWorkerConfig {
@@ -324,6 +326,10 @@ impl ClusterWorkerConfig {
                 DEFAULT_REAPER_SAFETY_MARGIN_MS,
             )
             .max(0),
+            rebalance_max_movements: env_usize(
+                "AGENTDB_REBALANCE_MAX_MOVEMENTS",
+                DEFAULT_REBALANCE_MAX_MOVEMENTS,
+            ),
         }
     }
 }
@@ -995,7 +1001,8 @@ fn spawn_cluster_workers(
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
         loop {
             interval.tick().await;
             let now_ms = now_ms_i64();
@@ -1020,8 +1027,11 @@ fn spawn_cluster_workers(
     });
 
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(config.scheduler_renew_interval_ms.max(config.reaper_tick_ms)));
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            config
+                .scheduler_renew_interval_ms
+                .max(config.reaper_tick_ms),
+        ));
         loop {
             interval.tick().await;
             let now_ms = now_ms_i64();
@@ -1065,12 +1075,23 @@ async fn run_cluster_scheduler_tick(
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
-        Some(current)
-            if current.node_id == node_id && current.is_live(now_ms) =>
-        {
-            agentdb_meta::scheduler::renew(pool, node_id, current.epoch, now_ms + config.scheduler_lease_ms).await?
+        Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
+            agentdb_meta::scheduler::renew(
+                pool,
+                node_id,
+                current.epoch,
+                now_ms + config.scheduler_lease_ms,
+            )
+            .await?
         }
-        _ => match agentdb_meta::scheduler::try_acquire(pool, node_id, config.scheduler_lease_ms, now_ms).await? {
+        _ => match agentdb_meta::scheduler::try_acquire(
+            pool,
+            node_id,
+            config.scheduler_lease_ms,
+            now_ms,
+        )
+        .await?
+        {
             Some(row) => row,
             None => {
                 if let Some(current) = agentdb_meta::scheduler::get(pool).await? {
@@ -1099,7 +1120,9 @@ async fn run_cluster_scheduler_tick(
         return Ok(());
     }
 
-    let dead_nodes = agentdb_meta::nodes::mark_dead_if_stale(pool, now_ms - config.stale_node_threshold_ms).await?;
+    let dead_nodes =
+        agentdb_meta::nodes::mark_dead_if_stale(pool, now_ms - config.stale_node_threshold_ms)
+            .await?;
     if !dead_nodes.is_empty() {
         status.add_dead_nodes_marked(dead_nodes.len() as u64);
         tracing::info!(node_id = %node_id, dead_nodes = ?dead_nodes, "scheduler marked stale nodes dead");
@@ -1114,6 +1137,29 @@ async fn run_cluster_scheduler_tick(
     if !cleared.is_empty() {
         status.add_tablet_reassignments(cleared.len() as u64);
         tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
+    }
+
+    if config.rebalance_max_movements > 0 {
+        let report = agentdb_meta::tablet_rebalance::run(
+            pool,
+            agentdb_meta::tablet_rebalance::RebalanceRequest {
+                dry_run: false,
+                stale_threshold_ms: config.stale_node_threshold_ms,
+                max_movements: config.rebalance_max_movements,
+            },
+            now_ms,
+        )
+        .await?;
+        let changed_count = report.changed_count();
+        if changed_count > 0 {
+            status.add_tablet_reassignments(changed_count as u64);
+            tracing::info!(
+                node_id = %node_id,
+                changed_count,
+                actions = ?report.actions,
+                "scheduler applied tablet rebalance"
+            );
+        }
     }
     Ok(())
 }
@@ -1153,6 +1199,13 @@ fn env_i64(name: &str, default: i64) -> i64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }
 
@@ -1483,6 +1536,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -1520,6 +1574,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
             .await
@@ -1531,5 +1586,41 @@ region = "us-west-2"
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
         assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_tick_assigns_unowned_tablets() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            10_000,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
+        };
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+            .await
+            .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(status.snapshot().tablet_reassignments_total, 1);
     }
 }

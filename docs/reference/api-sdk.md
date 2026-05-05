@@ -18,6 +18,7 @@ POST /api/admin/drain
 GET  /api/admin/nodes[?stale_threshold_ms={ms}]
 POST /api/admin/nodes
 DELETE /api/admin/nodes/{node_id}
+POST /api/admin/nodes/{node_id}/maintenance
 GET  /api/admin/tablets
 POST /api/admin/tablets/create
 POST /api/admin/tablets/rebalance
@@ -28,8 +29,21 @@ POST /api/admin/tablets/{tablet_id}/handoff/complete
 POST /api/admin/tablets/{tablet_id}/handoff/cancel
 GET  /api/admin/routing
 GET  /api/admin/routing/decision?tenant_id={tenant_id}[&session_id={session_id}]
+POST /api/admin/backups
+POST /api/admin/restores
 POST /api/policy/worker/run
 ```
+
+Node maintenance body:
+
+```json
+POST /api/admin/nodes/{node_id}/maintenance
+{ "state": "draining" }
+```
+
+Allowed states are `alive`, `draining`, and `maintenance`. Setting the local
+node back to `alive` clears the local drain flag; setting it to `draining` or
+`maintenance` refuses new local mutations.
 
 Tablet admin request bodies:
 
@@ -59,6 +73,29 @@ sets a cooperative movement target and keeps the source owner active until the
 source completes the handoff. `rebalance` assigns unowned tablets, moves tablets
 off fresh draining nodes through handoff, and balances load across fresh `alive`
 nodes; it does not force-move tablets from stale or dead owners.
+
+Backup/restore admin request bodies:
+
+```json
+POST /api/admin/backups
+{
+  "backup_id": "nightly-2026-05-04",
+  "directory": "/var/lib/agentdb/backups",
+  "include_meta": true,
+  "include_runtime_summary": true
+}
+
+POST /api/admin/restores
+{
+  "manifest_path": "/var/lib/agentdb/backups/nightly-2026-05-04/manifest.json",
+  "dry_run": true
+}
+```
+
+The backup endpoint writes an online manifest and, when metadata is configured,
+a metadata snapshot. Runtime summary data is observability metadata, not a full
+copy of runtime KV/content data. The restore endpoint validates manifests only;
+destructive restore apply remains an offline operator procedure.
 
 Tenants, agents, and sessions:
 

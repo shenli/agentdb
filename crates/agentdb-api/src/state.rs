@@ -32,7 +32,7 @@ impl Default for ProxyPolicy {
 pub struct DrainState {
     node_id: Arc<str>,
     draining: Arc<AtomicBool>,
-    drained_at_ms: Arc<OnceLock<i64>>,
+    drained_at_ms: Arc<AtomicI64>,
 }
 
 impl DrainState {
@@ -40,7 +40,7 @@ impl DrainState {
         Self {
             node_id: node_id.into(),
             draining: Arc::new(AtomicBool::new(false)),
-            drained_at_ms: Arc::new(OnceLock::new()),
+            drained_at_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -61,12 +61,24 @@ impl DrainState {
     }
 
     pub fn drained_at_ms(&self) -> Option<i64> {
-        self.drained_at_ms.get().copied()
+        let value = self.drained_at_ms.load(Ordering::SeqCst);
+        (value > 0).then_some(value)
     }
 
     pub fn activate(&self, now_ms: i64) -> i64 {
         self.draining.store(true, Ordering::SeqCst);
-        *self.drained_at_ms.get_or_init(|| now_ms)
+        let existing = self.drained_at_ms.load(Ordering::SeqCst);
+        if existing > 0 {
+            existing
+        } else {
+            self.drained_at_ms.store(now_ms, Ordering::SeqCst);
+            now_ms
+        }
+    }
+
+    pub fn deactivate(&self) {
+        self.draining.store(false, Ordering::SeqCst);
+        self.drained_at_ms.store(0, Ordering::SeqCst);
     }
 }
 
@@ -109,7 +121,8 @@ impl SchedulerStatus {
     pub fn update_leader(&self, node_id: &str, epoch: i64, expires_at_ms: i64, is_leader: bool) {
         let _ = self.leader_node_id.set(node_id.to_string());
         self.leader_epoch.store(epoch, Ordering::SeqCst);
-        self.leader_expires_at_ms.store(expires_at_ms, Ordering::SeqCst);
+        self.leader_expires_at_ms
+            .store(expires_at_ms, Ordering::SeqCst);
         self.is_leader.store(is_leader, Ordering::SeqCst);
     }
 
@@ -122,7 +135,8 @@ impl SchedulerStatus {
     }
 
     pub fn add_tablet_reassignments(&self, n: u64) {
-        self.tablet_reassignments_total.fetch_add(n, Ordering::SeqCst);
+        self.tablet_reassignments_total
+            .fetch_add(n, Ordering::SeqCst);
     }
 
     pub fn set_last_tick_at_ms(&self, now_ms: i64) {

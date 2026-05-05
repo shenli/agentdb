@@ -237,6 +237,8 @@ Each node should have:
 - object-store configuration
 - lease timing
 - heartbeat timing
+- rebalance movement cap (`AGENTDB_REBALANCE_MAX_MOVEMENTS`; `0` disables
+  automatic movement)
 - routing refresh intervals
 
 ### Node-local settings

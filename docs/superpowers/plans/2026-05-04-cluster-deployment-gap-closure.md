@@ -182,8 +182,13 @@ Status:
 - the first live convergence loop now exists in cluster mode:
   node heartbeat/upsert, scheduler leader lease, stale-node marking, and
   expired-tablet ownership clearing
-- the broader operator surface is still incomplete: there is no supported
-  maintenance/undrain, backup, or restore API yet
+- scheduler-led tablet rebalance now uses the same policy as the operator API
+- node maintenance/undrain now has `POST /api/admin/nodes/{node_id}/maintenance`
+- backup/restore now has an API surface:
+  `POST /api/admin/backups` writes a manifest and optional metadata snapshot,
+  and `POST /api/admin/restores` validates manifests
+- the remaining restore gap is destructive online apply; it is intentionally
+  not supported until there is a cluster-wide offline restore contract
 
 ### Write APIs
 
@@ -202,9 +207,10 @@ Status:
 
 ### Missing capabilities to close
 
-- explicit backup/restore job surface
-- explicit node maintenance/undrain API
-- automated handoff/rebalance reconciler beyond the operator-triggered API
+- offline restore apply procedure and automation
+- full runtime KV/content backup copy and verification beyond manifest +
+  metadata snapshot
+- restore reconciler for future cluster-wide restore jobs
 
 Acceptance:
 
@@ -491,6 +497,8 @@ Acceptance:
 - stale-node and lease reconciliation
 - ownership handoff API
 - tablet rebalance API
+- node maintenance/undrain API
+- online backup manifest + metadata snapshot API
 
 ### M3
 

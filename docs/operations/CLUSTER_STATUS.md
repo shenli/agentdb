@@ -65,6 +65,9 @@ And a very small amount of direct metadata admin:
 - `POST /api/admin/drain` for one-way local drain activation
 - `POST /api/admin/nodes` for explicit node registration/upsert
 - `DELETE /api/admin/nodes/{node_id}` for operator cleanup of a stale node row
+- `POST /api/admin/nodes/{node_id}/maintenance` for marking nodes `alive`,
+  `draining`, or `maintenance`; setting the local node to `alive` clears the
+  local drain flag
 - `POST /api/admin/tablets/create` for idempotent tablet metadata creation
 - `POST /api/admin/tablets/{tablet_id}/assign` for pre-claiming an unowned
   tablet on a fresh `alive` node
@@ -79,6 +82,10 @@ And a very small amount of direct metadata admin:
 - `POST /api/admin/tablets/rebalance` for a dry-run/apply pass that assigns
   unowned tablets, moves tablets away from fresh draining nodes, and evens out
   fresh `alive` node load
+- `POST /api/admin/backups` for an online backup manifest and optional
+  metadata snapshot
+- `POST /api/admin/restores` for backup manifest validation; online destructive
+  restore apply is intentionally not supported
 
 These help operators and developers inspect control-plane state and clean up
 obviously-bad metadata rows. They also provide the first useful node
@@ -93,6 +100,9 @@ when metadata-backed cluster mode is enabled:
 - singleton scheduler-leader lease acquisition/renewal
 - stale-node detection (`alive` -> `dead`)
 - expired-tablet ownership clearing
+- automatic tablet rebalance attempts that assign unowned tablets, move fresh
+  draining owners through cooperative handoff, and even out fresh `alive` node
+  load
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.
