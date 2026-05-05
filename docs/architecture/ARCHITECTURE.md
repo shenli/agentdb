@@ -69,7 +69,7 @@ All public IDs are opaque typed strings: `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 
 ## HTTP Surface
 
-The active API is the native `/api/...` route family:
+The canonical API is the native `/api/...` route family:
 
 ```text
 POST /api/tenants
@@ -98,8 +98,16 @@ POST /api/policy/worker/run
 GET  /health/ready
 ```
 
-There is no version-gating server flag, Mongo wire listener, or maintained Go
-SDK in the current workspace.
+There is no version-gating server flag or maintained Go SDK in the current
+workspace.
+
+An optional MongoDB compatibility listener can be enabled with `--mongo-bind` or
+`[mongodb].bind`. It is intentionally narrow: initial support covers basic
+handshake, collection discovery, `insert`, `find`, `count`, limited
+`aggregate`, no-op `createIndexes`, and request/response AgentDB extension
+commands such as `agentdbAppendAndFetch`, `agentdbFork`, `agentdbReplay`, and
+`agentdbContext`. It is an adapter onto `agentdb-core`, not a separate storage
+path or full MongoDB clone.
 
 ## Record Index Consistency
 

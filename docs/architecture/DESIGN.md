@@ -59,19 +59,22 @@ The primary developer interface is the SDK surface. The supported public
 protocol underneath it is the native HTTP API mounted under `/api/...`. Routes
 are tenant-scoped and use typed opaque IDs.
 
-HTTP is the right public API for the current product shape: agent frameworks,
-SDKs, dashboards, examples, and local operators can use it without custom
-database drivers, it handles JSON/event payloads naturally, and SSE gives a
-simple subscription path.
+HTTP is the right canonical API for the current product shape: agent
+frameworks, SDKs, dashboards, examples, and local operators can use it without
+custom database drivers, it handles JSON/event payloads naturally, and SSE gives
+a simple subscription path.
 
 AgentDB should not pretend HTTP is a universal database wire protocol. If the
 data plane later needs lower overhead, the expected evolution is to keep HTTP as
 the public and operational surface while adding a binary SDK transport or
 internal node protocol for hot paths.
 
+The server also has an opt-in MongoDB wire-protocol compatibility listener for a
+narrow subset of driver/tool workflows. This is an adapter onto the same runtime
+methods, not the canonical performance path and not a full MongoDB replacement.
+
 The current workspace intentionally does not maintain:
 
-- a MongoDB wire-protocol facade
 - a Go SDK
 - tenantless routes from earlier prototypes
 - a version-gating server flag
