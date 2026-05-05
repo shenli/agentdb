@@ -19,6 +19,7 @@ distributed operation:
 - routing status and routing decision endpoints
 - cluster health and readiness summary endpoints
 - control-plane metadata helpers
+- explicit tablet ownership admin primitives
 - design work for placement/routing/tablets
 - runbooks that mention boxes/tablets and future cluster behavior
 - performance notes from prototype multi-box experiments
@@ -35,7 +36,7 @@ These are not currently documented as stable operator procedures:
 - remove a node
 - replace a failed node
 - drain a node
-- rebalance tenants, sessions, or placements
+- automatically rebalance tenants, sessions, or placements
 - perform a rolling restart
 - perform a rolling upgrade
 - recover a partially failed cluster
@@ -48,7 +49,7 @@ If you are looking for those workflows, the answer today is:
 
 ## What Is Implemented Now
 
-The repository now has some read-only cluster-facing visibility endpoints:
+The repository now has cluster-facing visibility endpoints:
 
 - `GET /api/admin/scheduler`
 - `GET /api/admin/drain`
@@ -64,12 +65,26 @@ And a very small amount of direct metadata admin:
 - `POST /api/admin/drain` for one-way local drain activation
 - `POST /api/admin/nodes` for explicit node registration/upsert
 - `DELETE /api/admin/nodes/{node_id}` for operator cleanup of a stale node row
+- `POST /api/admin/tablets/create` for idempotent tablet metadata creation
+- `POST /api/admin/tablets/{tablet_id}/assign` for pre-claiming an unowned
+  tablet on a fresh `alive` node
+- `POST /api/admin/tablets/{tablet_id}/relinquish` for force-clearing current
+  ownership and fencing the old epoch
+- `POST /api/admin/tablets/{tablet_id}/handoff` for cooperative ownership
+  movement
+- `POST /api/admin/tablets/{tablet_id}/handoff/complete` for source-owner
+  handoff acknowledgement
+- `POST /api/admin/tablets/{tablet_id}/handoff/cancel` for retracting a handoff
+  signal
+- `POST /api/admin/tablets/rebalance` for a dry-run/apply pass that assigns
+  unowned tablets, moves tablets away from fresh draining nodes, and evens out
+  fresh `alive` node load
 
 These help operators and developers inspect control-plane state and clean up
-obviously-bad metadata rows, and they provide the first step of planned node
-maintenance by refusing new mutations on a drained node. They still do **not**
-add the full cluster control plane or day-2 workflows described in the
-target-state docs.
+obviously-bad metadata rows. They also provide the first useful node
+maintenance path: drain the local node, mark tablet handoffs, observe movement,
+and refuse new mutations on the drained node. They still do **not** add the full
+cluster control plane or all day-2 workflows described in the target-state docs.
 
 The server also now runs a small amount of real control-plane background work
 when metadata-backed cluster mode is enabled:

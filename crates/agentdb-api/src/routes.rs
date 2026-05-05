@@ -8,7 +8,10 @@
 //! Wire DTOs live in `crate::dto`. Status codes for `agentdb_core::Error` live
 //! in `crate::errors`.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::Bytes,
@@ -61,13 +64,41 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/scheduler", get(get_admin_scheduler))
-        .route("/api/admin/drain", get(get_admin_drain).post(post_admin_drain))
+        .route(
+            "/api/admin/drain",
+            get(get_admin_drain).post(post_admin_drain),
+        )
         .route(
             "/api/admin/nodes",
             get(get_admin_nodes).post(register_admin_node),
         )
         .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
         .route("/api/admin/tablets", get(get_admin_tablets))
+        .route("/api/admin/tablets/create", post(create_admin_tablet))
+        .route(
+            "/api/admin/tablets/rebalance",
+            post(rebalance_admin_tablets),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/assign",
+            post(assign_admin_tablet),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/relinquish",
+            post(relinquish_admin_tablet),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff",
+            post(mark_admin_tablet_handoff),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff/complete",
+            post(complete_admin_tablet_handoff),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/handoff/cancel",
+            post(cancel_admin_tablet_handoff),
+        )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -211,14 +242,16 @@ fn drain_status_response(s: &AppState) -> DrainStatusResponse {
 
 fn reject_if_draining(s: &AppState) -> Result<(), ApiError> {
     if s.drain.is_draining() {
-        return Err(ApiError(agentdb_core::Error::new(
-            ErrorCode::NodeDraining,
-            format!(
-                "node {} is draining; retry at a different node",
-                s.drain.node_id()
-            ),
-        )
-        .with_suggestion("See /api/admin/drain and docs/runbooks/node_draining.md")));
+        return Err(ApiError(
+            agentdb_core::Error::new(
+                ErrorCode::NodeDraining,
+                format!(
+                    "node {} is draining; retry at a different node",
+                    s.drain.node_id()
+                ),
+            )
+            .with_suggestion("See /api/admin/drain and docs/runbooks/node_draining.md"),
+        ));
     }
     Ok(())
 }
@@ -271,6 +304,71 @@ struct AdminTabletView {
     lease_expires_at_ms: i64,
     created_at_ms: i64,
     handoff_target_node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTabletBody {
+    tablet_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignTabletBody {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffTabletBody {
+    target_node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteHandoffBody {
+    expected_source_node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RebalanceTabletsBody {
+    #[serde(default)]
+    dry_run: bool,
+    stale_threshold_ms: Option<i64>,
+    max_movements: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletMutationResponse {
+    action: &'static str,
+    changed: bool,
+    tablet: AdminTabletView,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletHandoffCompleteResponse {
+    action: &'static str,
+    changed: bool,
+    new_owner_node_id: Option<String>,
+    tablet: AdminTabletView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminTabletRebalanceAction {
+    action: &'static str,
+    tablet_id: i64,
+    source_node_id: Option<String>,
+    target_node_id: Option<String>,
+    changed: bool,
+    reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletRebalanceResponse {
+    dry_run: bool,
+    stale_threshold_ms: i64,
+    eligible_node_count: usize,
+    tablet_count: usize,
+    owner_counts_before: HashMap<String, usize>,
+    owner_counts_after: HashMap<String, usize>,
+    actions: Vec<AdminTabletRebalanceAction>,
+    skipped: Vec<AdminTabletRebalanceAction>,
 }
 
 #[derive(Debug, Serialize)]
@@ -359,12 +457,19 @@ async fn get_admin_drain(State(s): State<AppState>) -> Json<DrainStatusResponse>
     Json(drain_status_response(&s))
 }
 
-async fn post_admin_drain(State(s): State<AppState>) -> Result<Json<DrainStatusResponse>, ApiError> {
+async fn post_admin_drain(
+    State(s): State<AppState>,
+) -> Result<Json<DrainStatusResponse>, ApiError> {
     let drained_at_ms = s.drain.activate(now_ms_i64());
     if let Some(meta) = s.meta.as_ref() {
         nodes::set_state(meta.pool(), s.drain.node_id(), "draining", drained_at_ms)
             .await
-            .map_err(|err| ApiError(agentdb_core::Error::new(ErrorCode::Internal, err.to_string())))?;
+            .map_err(|err| {
+                ApiError(agentdb_core::Error::new(
+                    ErrorCode::Internal,
+                    err.to_string(),
+                ))
+            })?;
     }
     Ok(Json(drain_status_response(&s)))
 }
@@ -513,33 +618,462 @@ async fn delete_admin_node(
     Ok(Json(DeleteAdminNodeResponse { node_id, removed }))
 }
 
-async fn get_admin_tablets(
-    State(s): State<AppState>,
-) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
-    let meta = s.meta.as_ref().ok_or_else(|| {
+fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
+    s.meta.as_ref().ok_or_else(|| {
         ApiError(agentdb_core::Error::new(
             ErrorCode::KeyUnavailable,
             "metadata-backed cluster admin is not configured on this node",
         ))
-    })?;
+    })
+}
+
+fn internal_error(err: impl ToString) -> ApiError {
+    ApiError(agentdb_core::Error::new(
+        ErrorCode::Internal,
+        err.to_string(),
+    ))
+}
+
+fn invalid_admin_request(message: impl Into<String>) -> ApiError {
+    ApiError(agentdb_core::Error::new(
+        ErrorCode::PolicyDenied,
+        message.into(),
+    ))
+}
+
+fn tablet_view(tablet: tablets::Tablet) -> AdminTabletView {
+    AdminTabletView {
+        tablet_id: tablet.tablet_id,
+        owner_node_id: tablet.owner_node_id,
+        epoch: tablet.epoch,
+        lease_expires_at_ms: tablet.lease_expires_at_ms,
+        created_at_ms: tablet.created_at_ms,
+        handoff_target_node_id: tablet.handoff_target_node_id,
+    }
+}
+
+async fn get_tablet_or_404(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+) -> Result<tablets::Tablet, ApiError> {
+    tablets::get(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_admin_request(format!("tablet {tablet_id} does not exist")))
+}
+
+async fn require_assignable_node(
+    meta: &agentdb_meta::MetaStore,
+    node_id: &str,
+    now_ms: i64,
+    stale_threshold_ms: i64,
+) -> Result<nodes::Node, ApiError> {
+    let node = nodes::get(meta.pool(), node_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_admin_request(format!("node {node_id} does not exist")))?;
+    if node.state != "alive" {
+        return Err(invalid_admin_request(format!(
+            "node {node_id} is {}; target node must be alive",
+            node.state
+        )));
+    }
+    if now_ms - node.last_heartbeat_ms > stale_threshold_ms {
+        return Err(invalid_admin_request(format!(
+            "node {node_id} is stale; target node must be fresh"
+        )));
+    }
+    Ok(node)
+}
+
+async fn get_admin_tablets(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
+    let meta = meta_required(&s)?;
     let rows = tablets::list_all(meta.pool()).await.map_err(|err| {
         ApiError(agentdb_core::Error::new(
             ErrorCode::Internal,
             err.to_string(),
         ))
     })?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|tablet| AdminTabletView {
+    Ok(Json(rows.into_iter().map(tablet_view).collect()))
+}
+
+async fn create_admin_tablet(
+    State(s): State<AppState>,
+    Json(body): Json<CreateTabletBody>,
+) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    if body.tablet_id < 0 {
+        return Err(invalid_admin_request("tablet_id must be non-negative"));
+    }
+    let existed = tablets::get(meta.pool(), body.tablet_id)
+        .await
+        .map_err(internal_error)?
+        .is_some();
+    let tablet = tablets::get_or_create(meta.pool(), body.tablet_id, now_ms_i64())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(AdminTabletMutationResponse {
+        action: "create",
+        changed: !existed,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn assign_admin_tablet(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<AssignTabletBody>,
+) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let _ = get_tablet_or_404(meta, tablet_id).await?;
+    let _ = require_assignable_node(meta, &body.node_id, now_ms_i64(), 15_000).await?;
+    let changed = tablets::assign_to(meta.pool(), tablet_id, &body.node_id)
+        .await
+        .map_err(internal_error)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    Ok(Json(AdminTabletMutationResponse {
+        action: "assign",
+        changed,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn relinquish_admin_tablet(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let _ = get_tablet_or_404(meta, tablet_id).await?;
+    let changed = tablets::relinquish(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    Ok(Json(AdminTabletMutationResponse {
+        action: "relinquish",
+        changed,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn mark_admin_tablet_handoff(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<HandoffTabletBody>,
+) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    if tablet.owner_node_id.as_deref() == Some(body.target_node_id.as_str()) {
+        return Err(invalid_admin_request(
+            "handoff target must be different from the current owner",
+        ));
+    }
+    let _ = require_assignable_node(meta, &body.target_node_id, now_ms_i64(), 15_000).await?;
+    let changed = tablets::mark_for_handoff(meta.pool(), tablet_id, &body.target_node_id)
+        .await
+        .map_err(internal_error)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    Ok(Json(AdminTabletMutationResponse {
+        action: "handoff",
+        changed,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn complete_admin_tablet_handoff(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<CompleteHandoffBody>,
+) -> Result<Json<AdminTabletHandoffCompleteResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let _ = get_tablet_or_404(meta, tablet_id).await?;
+    let new_owner =
+        tablets::complete_handoff(meta.pool(), tablet_id, &body.expected_source_node_id)
+            .await
+            .map_err(internal_error)?;
+    let changed = new_owner.is_some();
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    Ok(Json(AdminTabletHandoffCompleteResponse {
+        action: "complete_handoff",
+        changed,
+        new_owner_node_id: new_owner,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn cancel_admin_tablet_handoff(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let _ = get_tablet_or_404(meta, tablet_id).await?;
+    let changed = tablets::cancel_handoff(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    Ok(Json(AdminTabletMutationResponse {
+        action: "cancel_handoff",
+        changed,
+        tablet: tablet_view(tablet),
+    }))
+}
+
+async fn rebalance_admin_tablets(
+    State(s): State<AppState>,
+    Json(body): Json<RebalanceTabletsBody>,
+) -> Result<Json<AdminTabletRebalanceResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let stale_threshold_ms = body.stale_threshold_ms.unwrap_or(15_000);
+    let max_movements = body.max_movements.unwrap_or(usize::MAX);
+    let now_ms = now_ms_i64();
+    let nodes = nodes::list_all(meta.pool()).await.map_err(internal_error)?;
+    let tablets = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+
+    let fresh_alive_nodes: HashSet<String> = nodes
+        .iter()
+        .filter(|node| {
+            node.state == "alive" && now_ms - node.last_heartbeat_ms <= stale_threshold_ms
+        })
+        .map(|node| node.node_id.clone())
+        .collect();
+    let node_state: HashMap<String, (String, bool)> = nodes
+        .iter()
+        .map(|node| {
+            (
+                node.node_id.clone(),
+                (
+                    node.state.clone(),
+                    now_ms - node.last_heartbeat_ms > stale_threshold_ms,
+                ),
+            )
+        })
+        .collect();
+    let mut counts_before = owner_counts(&tablets);
+    for node_id in &fresh_alive_nodes {
+        counts_before.entry(node_id.clone()).or_insert(0);
+    }
+    let mut counts_after: HashMap<String, usize> = fresh_alive_nodes
+        .iter()
+        .map(|node_id| {
+            let count = tablets
+                .iter()
+                .filter(|tablet| tablet.owner_node_id.as_ref() == Some(node_id))
+                .count();
+            (node_id.clone(), count)
+        })
+        .collect();
+    let mut actions = Vec::new();
+    let mut skipped = Vec::new();
+
+    if fresh_alive_nodes.is_empty() {
+        for tablet in tablets
+            .iter()
+            .filter(|tablet| tablet.owner_node_id.is_none())
+        {
+            skipped.push(AdminTabletRebalanceAction {
+                action: "assign",
                 tablet_id: tablet.tablet_id,
-                owner_node_id: tablet.owner_node_id,
-                epoch: tablet.epoch,
-                lease_expires_at_ms: tablet.lease_expires_at_ms,
-                created_at_ms: tablet.created_at_ms,
-                handoff_target_node_id: tablet.handoff_target_node_id,
-            })
-            .collect(),
-    ))
+                source_node_id: None,
+                target_node_id: None,
+                changed: false,
+                reason: "no_eligible_target",
+            });
+        }
+        return Ok(Json(AdminTabletRebalanceResponse {
+            dry_run: body.dry_run,
+            stale_threshold_ms,
+            eligible_node_count: 0,
+            tablet_count: tablets.len(),
+            owner_counts_before: counts_before,
+            owner_counts_after: counts_after,
+            actions,
+            skipped,
+        }));
+    }
+
+    for tablet in tablets
+        .iter()
+        .filter(|tablet| tablet.owner_node_id.is_none())
+    {
+        if actions.len() >= max_movements {
+            break;
+        }
+        let target = least_loaded_node(&counts_after).ok_or_else(|| {
+            invalid_admin_request("no eligible target node for unowned tablet assignment")
+        })?;
+        let changed = if body.dry_run {
+            true
+        } else {
+            tablets::assign_to(meta.pool(), tablet.tablet_id, &target)
+                .await
+                .map_err(internal_error)?
+        };
+        if changed {
+            *counts_after.entry(target.clone()).or_insert(0) += 1;
+        }
+        actions.push(AdminTabletRebalanceAction {
+            action: "assign",
+            tablet_id: tablet.tablet_id,
+            source_node_id: None,
+            target_node_id: Some(target),
+            changed,
+            reason: "unowned",
+        });
+    }
+
+    for tablet in tablets.iter().filter(|tablet| {
+        tablet
+            .owner_node_id
+            .as_ref()
+            .and_then(|owner| node_state.get(owner).map(|(state, stale)| (state, *stale)))
+            .is_some_and(|(state, stale)| state == "draining" && !stale)
+    }) {
+        if actions.len() >= max_movements {
+            break;
+        }
+        let source = tablet.owner_node_id.clone();
+        let target = least_loaded_node(&counts_after).ok_or_else(|| {
+            invalid_admin_request("no eligible target node for draining-owner handoff")
+        })?;
+        if source.as_deref() == Some(target.as_str()) {
+            continue;
+        }
+        let changed = if body.dry_run {
+            true
+        } else {
+            tablets::mark_for_handoff(meta.pool(), tablet.tablet_id, &target)
+                .await
+                .map_err(internal_error)?
+        };
+        if changed {
+            *counts_after.entry(target.clone()).or_insert(0) += 1;
+        }
+        actions.push(AdminTabletRebalanceAction {
+            action: "handoff",
+            tablet_id: tablet.tablet_id,
+            source_node_id: source,
+            target_node_id: Some(target),
+            changed,
+            reason: "source_draining",
+        });
+    }
+
+    let mut balance_candidates: Vec<tablets::Tablet> = tablets
+        .iter()
+        .filter(|tablet| tablet.handoff_target_node_id.is_none())
+        .filter(|tablet| {
+            tablet
+                .owner_node_id
+                .as_ref()
+                .is_some_and(|owner| fresh_alive_nodes.contains(owner))
+        })
+        .cloned()
+        .collect();
+    balance_candidates.sort_by_key(|tablet| tablet.tablet_id);
+    while actions.len() < max_movements {
+        let Some((source, source_count)) = most_loaded_node(&counts_after) else {
+            break;
+        };
+        let Some((target, target_count)) = least_loaded_node_with_count(&counts_after) else {
+            break;
+        };
+        if source_count <= target_count + 1 {
+            break;
+        }
+        let Some(candidate_index) = balance_candidates
+            .iter()
+            .position(|tablet| tablet.owner_node_id.as_deref() == Some(source.as_str()))
+        else {
+            break;
+        };
+        let tablet = balance_candidates.remove(candidate_index);
+        let changed = if body.dry_run {
+            true
+        } else {
+            tablets::mark_for_handoff(meta.pool(), tablet.tablet_id, &target)
+                .await
+                .map_err(internal_error)?
+        };
+        if changed {
+            *counts_after.entry(source.clone()).or_insert(0) -= 1;
+            *counts_after.entry(target.clone()).or_insert(0) += 1;
+        }
+        actions.push(AdminTabletRebalanceAction {
+            action: "handoff",
+            tablet_id: tablet.tablet_id,
+            source_node_id: Some(source),
+            target_node_id: Some(target),
+            changed,
+            reason: "load_balance",
+        });
+    }
+
+    for tablet in tablets.iter().filter(|tablet| {
+        tablet.owner_node_id.as_ref().is_some_and(|owner| {
+            node_state
+                .get(owner)
+                .is_none_or(|(state, stale)| *stale || state == "dead")
+        })
+    }) {
+        skipped.push(AdminTabletRebalanceAction {
+            action: "handoff",
+            tablet_id: tablet.tablet_id,
+            source_node_id: tablet.owner_node_id.clone(),
+            target_node_id: least_loaded_node(&counts_after),
+            changed: false,
+            reason: "source_not_cooperative",
+        });
+    }
+
+    Ok(Json(AdminTabletRebalanceResponse {
+        dry_run: body.dry_run,
+        stale_threshold_ms,
+        eligible_node_count: fresh_alive_nodes.len(),
+        tablet_count: tablets.len(),
+        owner_counts_before: counts_before,
+        owner_counts_after: counts_after,
+        actions,
+        skipped,
+    }))
+}
+
+fn owner_counts(tablets: &[tablets::Tablet]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for tablet in tablets {
+        if let Some(owner) = &tablet.owner_node_id {
+            *counts.entry(owner.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn least_loaded_node(counts: &HashMap<String, usize>) -> Option<String> {
+    least_loaded_node_with_count(counts).map(|(node, _)| node)
+}
+
+fn least_loaded_node_with_count(counts: &HashMap<String, usize>) -> Option<(String, usize)> {
+    counts
+        .iter()
+        .min_by(|(left_node, left_count), (right_node, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_node.cmp(right_node))
+        })
+        .map(|(node, count)| (node.clone(), *count))
+}
+
+fn most_loaded_node(counts: &HashMap<String, usize>) -> Option<(String, usize)> {
+    counts
+        .iter()
+        .max_by(|(left_node, left_count), (right_node, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_node.cmp(left_node))
+        })
+        .map(|(node, count)| (node.clone(), *count))
 }
 
 #[derive(Debug, Deserialize)]

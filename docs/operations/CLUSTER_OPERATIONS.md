@@ -103,6 +103,14 @@ Expected operator checks:
 - `GET /api/admin/tablets`
 - routing snapshot status
 
+Current admin controls:
+
+- `POST /api/admin/tablets/{tablet_id}/assign` can pre-claim an unowned tablet
+  for a fresh `alive` node.
+- `POST /api/admin/tablets/rebalance` can run with `{ "dry_run": true }` first,
+  then without dry-run to assign unowned tablets and mark load-balancing
+  handoffs.
+
 Success criteria:
 
 - node is healthy and visible
@@ -122,12 +130,28 @@ Target flow:
 
 1. Mark the node as draining.
 2. Stop sending new client traffic to it.
-3. Stop renewing leases or begin cooperative handoff.
+3. Begin cooperative handoff for owned tablets.
 4. Wait for in-flight writes to drain.
 5. Wait for owned placements to become unowned or reassigned.
 6. Stop the process.
 
-This aligns with the existing `node_draining` runbook direction.
+Current admin controls:
+
+- `POST /api/admin/drain` marks the local node as draining and refuses new
+  mutating requests on that node.
+- `POST /api/admin/tablets/{tablet_id}/handoff` marks an owned tablet for
+  cooperative transfer to a fresh `alive` target.
+- `POST /api/admin/tablets/{tablet_id}/handoff/complete` transfers ownership
+  after the source owner has drained the tablet.
+- `POST /api/admin/tablets/{tablet_id}/handoff/cancel` retracts a pending
+  handoff target.
+- `POST /api/admin/tablets/rebalance` moves tablets away from fresh draining
+  nodes through the same cooperative handoff signal.
+
+This aligns with the existing `node_draining` runbook direction. Stale/dead
+owners are intentionally not force-moved by rebalance; lease expiry and the
+ownership reaper must first make those tablets unowned, or an operator must use
+the explicit `relinquish` endpoint after accepting the fencing impact.
 
 ### Stop Node
 
@@ -149,6 +173,10 @@ If the node dies:
 - leases should expire
 - ownership should be reassigned or made eligible for reassignment
 - client traffic should route elsewhere
+
+Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
+the lease reaper clears expired tablet ownership. Once tablets are unowned,
+`POST /api/admin/tablets/rebalance` can assign them to fresh `alive` nodes.
 
 ### Restart Node
 
