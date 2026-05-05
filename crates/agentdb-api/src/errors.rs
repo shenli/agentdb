@@ -42,7 +42,7 @@ fn status_for(code: ErrorCode) -> StatusCode {
         }
         IdempotencyConflict | AliasConflict => StatusCode::CONFLICT,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        KeyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        NodeDraining | KeyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

@@ -60,6 +60,7 @@ pub fn routes() -> Router<AppState> {
         .route("/health/ready", get(health_ready))
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
+        .route("/api/admin/drain", get(get_admin_drain).post(post_admin_drain))
         .route(
             "/api/admin/nodes",
             get(get_admin_nodes).post(register_admin_node),
@@ -192,6 +193,35 @@ async fn health_ready() -> StatusCode {
     StatusCode::OK
 }
 
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn drain_status_response(s: &AppState) -> DrainStatusResponse {
+    DrainStatusResponse {
+        node_id: s.drain.node_id().to_string(),
+        is_draining: s.drain.is_draining(),
+        drained_at_ms: s.drain.drained_at_ms(),
+    }
+}
+
+fn reject_if_draining(s: &AppState) -> Result<(), ApiError> {
+    if s.drain.is_draining() {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::NodeDraining,
+            format!(
+                "node {} is draining; retry at a different node",
+                s.drain.node_id()
+            ),
+        )
+        .with_suggestion("See /api/admin/drain and docs/runbooks/node_draining.md")));
+    }
+    Ok(())
+}
+
 async fn get_routing_status(
     State(s): State<AppState>,
 ) -> Json<crate::routing_http::RouteRuntimeStatus> {
@@ -243,6 +273,14 @@ struct AdminTabletView {
 }
 
 #[derive(Debug, Serialize)]
+struct DrainStatusResponse {
+    node_id: String,
+    is_draining: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drained_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
 struct ClusterHealthSummary {
     node_count: usize,
     alive_node_count: usize,
@@ -283,6 +321,7 @@ async fn get_cluster_health(
 ) -> Json<ClusterHealthResponse> {
     Json(build_cluster_health(
         &s.routing.describe(),
+        s.drain.is_draining(),
         query.stale_threshold_ms.unwrap_or(15_000),
     ))
 }
@@ -293,6 +332,7 @@ async fn get_cluster_readiness(
 ) -> Response {
     let readiness = build_cluster_readiness(
         &s.routing.describe(),
+        s.drain.is_draining(),
         query.stale_threshold_ms.unwrap_or(15_000),
     );
     let status = if readiness.ready {
@@ -301,6 +341,20 @@ async fn get_cluster_readiness(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(readiness)).into_response()
+}
+
+async fn get_admin_drain(State(s): State<AppState>) -> Json<DrainStatusResponse> {
+    Json(drain_status_response(&s))
+}
+
+async fn post_admin_drain(State(s): State<AppState>) -> Result<Json<DrainStatusResponse>, ApiError> {
+    let drained_at_ms = s.drain.activate(now_ms_i64());
+    if let Some(meta) = s.meta.as_ref() {
+        nodes::set_state(meta.pool(), s.drain.node_id(), "draining", drained_at_ms)
+            .await
+            .map_err(|err| ApiError(agentdb_core::Error::new(ErrorCode::Internal, err.to_string())))?;
+    }
+    Ok(Json(drain_status_response(&s)))
 }
 
 async fn get_admin_nodes(
@@ -471,6 +525,7 @@ async fn create_tenant(
     State(s): State<AppState>,
     Json(body): Json<CreateTenantBody>,
 ) -> Result<Json<Tenant>, ApiError> {
+    reject_if_draining(&s)?;
     let t = s
         .runtime
         .create_tenant(NewTenant {
@@ -503,12 +558,10 @@ async fn get_fleet_storage_summary(
 
 fn build_cluster_health(
     status: &crate::routing_http::RouteRuntimeStatus,
+    local_is_draining: bool,
     stale_threshold_ms: i64,
 ) -> ClusterHealthResponse {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = now_ms_i64();
     let mut issues = Vec::new();
     match status.snapshot.as_ref() {
         None => ClusterHealthResponse {
@@ -541,7 +594,11 @@ fn build_cluster_health(
             let local_node_stale = local_node
                 .map(|node| now_ms - node.last_heartbeat_ms > stale_threshold_ms)
                 .unwrap_or(true);
-            let local_node_state = local_node.map(|node| node.state.clone());
+            let local_node_state = if local_is_draining {
+                Some("draining".into())
+            } else {
+                local_node.map(|node| node.state.clone())
+            };
             let stale_node_count = snapshot
                 .nodes
                 .iter()
@@ -588,6 +645,9 @@ fn build_cluster_health(
             }
             if local_node_stale {
                 issues.push("local node heartbeat is stale".into());
+            }
+            if local_is_draining {
+                issues.push("local node is draining".into());
             }
             if unowned_tablet_count > 0 {
                 issues.push(format!(
@@ -641,9 +701,10 @@ fn build_cluster_health(
 
 fn build_cluster_readiness(
     status: &crate::routing_http::RouteRuntimeStatus,
+    local_is_draining: bool,
     stale_threshold_ms: i64,
 ) -> ClusterReadinessResponse {
-    let health = build_cluster_health(status, stale_threshold_ms);
+    let health = build_cluster_health(status, local_is_draining, stale_threshold_ms);
     if health.single_node {
         return ClusterReadinessResponse {
             mode: health.mode,
@@ -724,6 +785,7 @@ async fn delete_tenant(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -738,6 +800,7 @@ async fn create_agent(
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateAgentBody>,
 ) -> Result<Json<Agent>, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -797,6 +860,7 @@ async fn delete_agent(
     State(s): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -816,6 +880,7 @@ async fn create_session(
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -877,6 +942,7 @@ async fn delete_session(
     OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -959,6 +1025,7 @@ async fn transition_session_lifecycle(
     headers: HeaderMap,
     Json(body): Json<TransitionSessionLifecycleBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -1017,6 +1084,7 @@ async fn restore_session_storage(
     headers: HeaderMap,
     Json(body): Json<RestoreSessionStorageBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -1073,6 +1141,7 @@ async fn append_event(
     headers: HeaderMap,
     Json(body): Json<AppendBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -1136,6 +1205,7 @@ async fn append_and_fetch(
     headers: HeaderMap,
     Json(body): Json<AppendAndFetchBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
@@ -1239,6 +1309,7 @@ async fn fork_session(
     headers: HeaderMap,
     Json(body): Json<ForkSessionBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
     let forward_body = serde_json::to_vec(&body).expect("fork body must serialize");
@@ -1430,6 +1501,7 @@ async fn create_artifact(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     // Bad path-id collapses to a structured 404. There's no INVALID_INPUT
     // ErrorCode in V2 — a syntactically broken id is indistinguishable from
     // a non-existent one to the caller, so TenantNotFound is the right
@@ -1701,6 +1773,7 @@ async fn create_record(
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateRecordBody>,
 ) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let rec = s
         .runtime
@@ -1813,6 +1886,7 @@ async fn delete_record(
     State(s): State<AppState>,
     Path((tenant_id, record_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
     s.runtime.delete_record(&tid, &rid).await?;
@@ -1825,6 +1899,7 @@ async fn create_skill(
     headers: HeaderMap,
     Json(body): Json<CreateSkillBody>,
 ) -> Result<(StatusCode, Json<Skill>), ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let skill = s
         .runtime
@@ -1855,6 +1930,7 @@ async fn delete_skill(
     State(s): State<AppState>,
     Path((tenant_id, skill_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
     s.runtime.delete_skill(&tid, &sid).await?;
@@ -1867,6 +1943,7 @@ async fn bind_skill(
     headers: HeaderMap,
     Json(body): Json<BindSkillBody>,
 ) -> Result<(StatusCode, Json<AgentSkillBinding>), ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let aid = parse_id_or(&agent_id, IdKind::Agent, ErrorCode::AgentNotFound)?;
     let sid = parse_id_or(&body.skill_id, IdKind::Skill, ErrorCode::SkillNotFound)?;
@@ -1897,6 +1974,7 @@ async fn run_lifecycle_sweep(
     Path(tenant_id): Path<String>,
     Json(body): Json<SweepBody>,
 ) -> Result<Json<agentdb_core::LifecycleSweepReport>, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let report = s
         .runtime
@@ -1910,6 +1988,7 @@ async fn run_gc_sweep(
     Path(tenant_id): Path<String>,
     Json(body): Json<SweepBody>,
 ) -> Result<Json<agentdb_core::GcSweepReport>, ApiError> {
+    reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let report = s
         .runtime
@@ -1930,6 +2009,7 @@ async fn run_policy_worker(
     State(s): State<AppState>,
     Json(body): Json<PolicyWorkerRunBody>,
 ) -> Result<Json<agentdb_core::PolicyWorkerReport>, ApiError> {
+    reject_if_draining(&s)?;
     let max_tenants = body.max_tenants.clamp(1, 1024);
     let report = s
         .runtime

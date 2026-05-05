@@ -207,6 +207,10 @@ impl RouteRuntime {
         true
     }
 
+    pub fn local_node_id(&self) -> &str {
+        &self.local_node_id
+    }
+
     pub fn describe(&self) -> RouteRuntimeStatus {
         let mode = self.mode.read().expect("route runtime lock poisoned");
         match &*mode {

@@ -20,6 +20,7 @@ pub enum ErrorCode {
     /// hard constraint failure on a fresh create.
     AliasConflict,
     PolicyDenied,
+    NodeDraining,
     KeyUnavailable,
     InvalidCursor,
     RateLimited,
@@ -30,7 +31,10 @@ impl ErrorCode {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            ErrorCode::RateLimited | ErrorCode::Internal | ErrorCode::KeyUnavailable
+            ErrorCode::RateLimited
+                | ErrorCode::Internal
+                | ErrorCode::KeyUnavailable
+                | ErrorCode::NodeDraining
         )
     }
 }
