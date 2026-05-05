@@ -28,6 +28,7 @@ const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
+const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -215,6 +216,19 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
         agentdb_core::Runtime::with_kv(kv, content)
     };
+
+    let record_index_worker_interval_ms = env_u64(
+        "AGENTDB_RECORD_INDEX_WORKER_INTERVAL_MS",
+        DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS,
+    )
+    .max(10);
+    runtime
+        .clone()
+        .spawn_record_index_worker(Duration::from_millis(record_index_worker_interval_ms));
+    tracing::info!(
+        interval_ms = record_index_worker_interval_ms,
+        "started record index outbox worker"
+    );
 
     let mut state =
         agentdb_api::AppState::new(runtime).with_proxy_policy(agentdb_api::state::ProxyPolicy {

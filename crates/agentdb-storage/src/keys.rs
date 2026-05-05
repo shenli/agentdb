@@ -77,6 +77,18 @@ pub fn record_by_namespace_key(tenant_id: &str, namespace_path: &str, record_id:
     format!("record/searchable_by_namespace/{tenant_id}/{namespace_path}/{record_id}")
 }
 
+/// Tenant-scoped searchable-record commit sequence. This is durable projection
+/// metadata used to repair reads when a local search index is behind.
+pub fn record_commit_key(tenant_id: &str, record_id: &str) -> String {
+    format!("record/searchable_commit/{tenant_id}/{record_id}")
+}
+
+/// Replayable local-index mutation for searchable records, ordered by the
+/// tenant-scoped commit sequence.
+pub fn record_index_outbox_key(tenant_id: &str, commit_seq: u64, record_id: &str) -> String {
+    format!("record/searchable_index_outbox/{tenant_id}/{commit_seq:020}/{record_id}")
+}
+
 /// Primary key for a skill record.
 pub fn skill_record_key(tenant_id: &str, skill_id: &str) -> String {
     format!("record/skill/{tenant_id}/{skill_id}")

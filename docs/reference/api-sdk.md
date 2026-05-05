@@ -32,6 +32,7 @@ POST /api/admin/tablets/{tablet_id}/handoff/complete
 POST /api/admin/tablets/{tablet_id}/handoff/cancel
 GET  /api/admin/routing
 GET  /api/admin/routing/decision?tenant_id={tenant_id}[&session_id={session_id}]
+GET  /api/admin/indexes/records
 POST /api/admin/backups
 POST /api/admin/restores
 POST /api/policy/worker/run
@@ -145,6 +146,16 @@ GET    /api/tenants/{tenant_id}/records/search
 POST   /api/tenants/{tenant_id}/records/search
 ```
 
+`POST /records` returns `X-AgentDB-Record-Commit-Seq`. Record search accepts
+`sharding_key` and `min_visible_record_commit_seq` in both GET query and POST
+JSON forms. With `sharding_key`, search uses the owner-local LSI-like index.
+Without it, search uses the GSI-like global index, which is eventually
+consistent. If `min_visible_record_commit_seq` is ahead of the global index
+watermark, the runtime falls back to committed base records to preserve
+same-client read-after-write visibility. `GET /api/admin/indexes/records`
+returns local/global index watermarks, lag tokens, repair counters, and async
+apply failures.
+
 Skills and policy:
 
 ```text
@@ -254,6 +265,10 @@ watch(tenant_id, scope="tenant", agent_id=None, from_cursor=None, limit=100)
 Async support mirrors the lower-level client through `AsyncClient` and
 `AsyncSession`.
 
+Python clients remember the latest `X-AgentDB-Record-Commit-Seq` observed from
+`write_record` per tenant and attach it as `min_visible_record_commit_seq` on
+later `search_records` calls unless the caller supplied one explicitly.
+
 ## TypeScript SDK
 
 Build from this workspace:
@@ -335,3 +350,8 @@ registerSkill(tenantId, body)
 bindSkill(tenantId, agentId, skillId, opts?)
 watch(tenantId, opts?)
 ```
+
+The TypeScript client mirrors Python's record visibility behavior: after
+`writeRecord`, it stores the tenant's latest record commit sequence and adds
+`min_visible_record_commit_seq` to later `searchRecords` calls unless the body
+already includes that field.

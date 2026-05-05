@@ -29,6 +29,7 @@ EventId = str
 ArtifactId = str
 RecordId = str
 SkillId = str
+_RECORD_COMMIT_SEQ_HEADER = "X-AgentDB-Record-Commit-Seq"
 
 
 @dataclasses.dataclass
@@ -561,6 +562,7 @@ class Client:
         self._get_token = get_token
         self.timeout = timeout
         self._http = _http or requests.Session()
+        self._record_commit_seq_by_tenant: dict[str, int] = {}
 
     @property
     def authenticated(self) -> bool:
@@ -645,9 +647,13 @@ class Client:
         raise from_response(resp.status_code, _response_body(resp))
 
     def write_record(self, tenant_id: TenantId, **body: Any) -> dict:
-        return self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records", json=body)
+        resp = self._raw_request("POST", f"/api/tenants/{_quote(tenant_id)}/records", json=body)
+        data = _decode(resp)
+        self._capture_record_commit_seq(tenant_id, resp)
+        return data
 
     def search_records(self, tenant_id: TenantId, **body: Any) -> list:
+        body = self._with_record_commit_seq(tenant_id, body)
         data = self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body)
         return data.get("records", [])
 
@@ -779,6 +785,25 @@ class Client:
         if self._get_token is not None:
             return self._get_token()
         return self._token
+
+    def _capture_record_commit_seq(self, tenant_id: TenantId, resp: requests.Response) -> None:
+        raw = getattr(resp, "headers", {}).get(_RECORD_COMMIT_SEQ_HEADER)
+        if not raw:
+            return
+        try:
+            seq = int(raw)
+        except ValueError:
+            return
+        if seq > 0:
+            self._record_commit_seq_by_tenant[tenant_id] = max(
+                self._record_commit_seq_by_tenant.get(tenant_id, 0), seq
+            )
+
+    def _with_record_commit_seq(self, tenant_id: TenantId, body: dict) -> dict:
+        seq = self._record_commit_seq_by_tenant.get(tenant_id)
+        if seq is None or "min_visible_record_commit_seq" in body:
+            return body
+        return {**body, "min_visible_record_commit_seq": seq}
 
 
 class Session:

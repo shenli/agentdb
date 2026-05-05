@@ -128,6 +128,14 @@ Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant, session, and agent watch returns changefeed items with cursors for
 higher-level consumers.
 
+Record indexes follow local/global semantics. A search with `sharding_key` uses
+the owner-local index and is the strong read-after-write boundary. A search
+without `sharding_key` uses the global index, which is GSI-like and eventually
+consistent. Record writes return a tenant-scoped commit sequence; callers can
+pass `min_visible_record_commit_seq`, and SDKs propagate the latest sequence
+automatically, so same-client reads repair from committed base records when an
+async index is behind.
+
 The canonical harness flow is:
 
 ```text

@@ -63,6 +63,12 @@ IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
 `Idempotency-Key` automatically unless one is supplied.
 
+For records, `writeRecord` captures the server's
+`X-AgentDB-Record-Commit-Seq` header per tenant. Later `searchRecords` calls
+automatically include `min_visible_record_commit_seq` unless the body already
+sets it. Use `sharding_key` in the search body when you want the owner-local
+LSI-like index; omit it for GSI-like global discovery.
+
 ## Harness Recovery
 
 AgentDB sessions are durable state outside the harness process. A restarted

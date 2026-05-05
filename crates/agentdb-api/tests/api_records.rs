@@ -60,6 +60,88 @@ async fn record_round_trip() {
 }
 
 #[tokio::test]
+async fn record_create_returns_commit_seq_accepted_by_search() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    let body = json!({
+        "namespace": ["visibility"],
+        "metadata": {"title": "fresh token"},
+        "policy": {"mode": "metadata_only", "fields": [], "vector_allowed": false}
+    });
+    let resp = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let commit_seq = resp
+        .headers()
+        .get("X-AgentDB-Record-Commit-Seq")
+        .expect("record commit sequence header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let created: serde_json::Value = resp.json().await.unwrap();
+
+    let searched: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/search?text=fresh&namespace=visibility&min_visible_record_commit_seq={commit_seq}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let recs = searched["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["record_id"], created["record_id"]);
+}
+
+#[tokio::test]
+async fn admin_record_index_status_reports_watermarks() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "namespace": ["visibility"],
+            "metadata": {"title": "indexed"},
+            "policy": {"mode": "metadata_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let status: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/indexes/records", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(status["local_index_watermark"].as_u64().unwrap() >= 1);
+    assert!(status["global_index_watermark"].as_u64().unwrap() >= 1);
+    assert_eq!(status["local_index_lag_tokens"], 0);
+    assert_eq!(status["global_index_lag_tokens"], 0);
+}
+
+#[tokio::test]
 async fn create_record_with_omitted_optional_fields() {
     // Minimal body: just a namespace. The server must apply default
     // policy + null-everything-else without erroring.

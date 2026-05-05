@@ -179,6 +179,10 @@ pub struct SearchRecordsQuery {
     /// `["agent", "support"]`. Empty list means "search at tenant root".
     #[serde(default, rename = "namespace")]
     pub namespace: Vec<String>,
+    /// Optional placement key. Present means use owner-local LSI-like index;
+    /// absent means use GSI-like global discovery.
+    #[serde(default)]
+    pub sharding_key: Option<String>,
     /// Repeatable: `?tag=foo&tag=bar` → `["foo", "bar"]`. A record must
     /// carry every requested tag to match.
     #[serde(default, rename = "tag")]
@@ -197,6 +201,8 @@ pub struct SearchRecordsQuery {
     pub source_event: Option<String>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub min_visible_record_commit_seq: Option<u64>,
 }
 
 fn default_search_limit() -> usize {
@@ -215,6 +221,8 @@ pub struct SearchRecordsBody {
     #[serde(default)]
     pub namespace: Vec<String>,
     #[serde(default)]
+    pub sharding_key: Option<String>,
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -222,6 +230,8 @@ pub struct SearchRecordsBody {
     pub source: Option<SourceRef>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub min_visible_record_commit_seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

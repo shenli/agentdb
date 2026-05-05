@@ -101,6 +101,46 @@ async fn write_and_get_record_round_trip() {
 }
 
 #[tokio::test]
+async fn search_repairs_same_client_visibility_when_local_index_lags() {
+    let rt = Runtime::in_memory();
+    let t = fresh_tenant(&rt, "t").await;
+    let written = rt
+        .write_record_with_commit(req(
+            t.tenant_id.clone(),
+            vec!["agent", "memory"],
+            None,
+            serde_json::json!({"title": "needle phrase"}),
+            metadata_policy(),
+        ))
+        .await
+        .unwrap();
+
+    rt.simulate_record_index_lag_for_test(&written.record.record_id, 0)
+        .await;
+
+    let hits = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["agent".into(), "memory".into()],
+            sharding_key: Some("agent/memory".into()),
+            text: Some("needle".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: Some(written.commit_token.seq),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].record_id.as_str(),
+        written.record.record_id.as_str()
+    );
+}
+
+#[tokio::test]
 async fn write_record_rejects_unknown_tenant() {
     let rt = Runtime::in_memory();
     let bogus = Id::new(IdKind::Tenant);
@@ -424,11 +464,13 @@ async fn search_without_query_returns_namespace_records() {
         .search_records(SearchRequest {
             tenant_id: t.tenant_id.clone(),
             namespace: vec!["ns".into()],
+            sharding_key: Some("ns".into()),
             text: None,
             embedding: None,
             tags: vec![],
             source_filter: None,
             limit: 100,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();
@@ -462,11 +504,13 @@ async fn vector_search_finds_nearest_when_policy_allows() {
         .search_records(SearchRequest {
             tenant_id: t.tenant_id.clone(),
             namespace: vec!["ns".into()],
+            sharding_key: Some("ns".into()),
             text: None,
             embedding: Some(vec![0.0, 1.0, 0.0]),
             tags: vec![],
             source_filter: None,
             limit: 3,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();
@@ -493,11 +537,13 @@ async fn vector_denied_policy_skips_vector_index() {
         .search_records(SearchRequest {
             tenant_id: t.tenant_id.clone(),
             namespace: vec!["ns".into()],
+            sharding_key: Some("ns".into()),
             text: None,
             embedding: Some(vec![1.0, 0.0, 0.0]),
             tags: vec![],
             source_filter: None,
             limit: 5,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();
@@ -535,11 +581,13 @@ async fn search_filters_by_tag() {
         .search_records(SearchRequest {
             tenant_id: t.tenant_id.clone(),
             namespace: vec!["ns".into()],
+            sharding_key: Some("ns".into()),
             text: Some("shared".into()),
             embedding: None,
             tags: vec!["red".into()],
             source_filter: None,
             limit: 10,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();
@@ -592,11 +640,13 @@ async fn search_filters_by_source_event_id() {
         .search_records(SearchRequest {
             tenant_id: t.tenant_id.clone(),
             namespace: vec!["ns".into()],
+            sharding_key: Some("ns".into()),
             text: Some("shared".into()),
             embedding: None,
             tags: vec![],
             source_filter: Some(filter),
             limit: 10,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();

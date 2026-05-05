@@ -143,6 +143,7 @@ export interface ClientSubscribeOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const RECORD_COMMIT_SEQ_HEADER = "x-agentdb-record-commit-seq";
 
 export class AgentDB {
   readonly client: Client;
@@ -401,6 +402,7 @@ export class Client {
   private readonly _fetch: typeof globalThis.fetch;
   private readonly _token?: string;
   private readonly _getToken?: () => string | Promise<string>;
+  private readonly _recordCommitSeqByTenant = new Map<TenantId, number>();
 
   constructor(opts: ClientOptions) {
     if (opts.token !== undefined && opts.getToken !== undefined) {
@@ -485,11 +487,18 @@ export class Client {
   }
 
   async writeRecord(tenantId: TenantId, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return await this._request("POST", `/api/tenants/${enc(tenantId)}/records`, body);
+    const resp = await this._rawFetch("POST", `/api/tenants/${enc(tenantId)}/records`, body);
+    if (!resp.ok) throw await errorFrom(resp);
+    this._captureRecordCommitSeq(tenantId, resp);
+    return await this._decodeObjectResponse(resp);
   }
 
   async searchRecords(tenantId: TenantId, body: Record<string, unknown>): Promise<unknown[]> {
-    const data = await this._request("POST", `/api/tenants/${enc(tenantId)}/records/search`, body);
+    const data = await this._request(
+      "POST",
+      `/api/tenants/${enc(tenantId)}/records/search`,
+      this._withRecordCommitSeq(tenantId, body)
+    );
     return Array.isArray(data.records) ? data.records : [];
   }
 
@@ -537,6 +546,10 @@ export class Client {
   async _request(method: string, path: string, json?: unknown, headers: Record<string, string> = {}): Promise<Record<string, unknown>> {
     const resp = await this._rawFetch(method, path, json, headers);
     if (!resp.ok) throw await errorFrom(resp);
+    return await this._decodeObjectResponse(resp);
+  }
+
+  private async _decodeObjectResponse(resp: Response): Promise<Record<string, unknown>> {
     const text = await resp.text();
     if (!text) return {};
     const data = JSON.parse(text) as unknown;
@@ -588,6 +601,22 @@ export class Client {
       headers["Authorization"] = `Basic ${Buffer.from(`${this._auth.user}:${this._auth.password}`).toString("base64")}`;
     }
     return headers;
+  }
+
+  private _captureRecordCommitSeq(tenantId: TenantId, resp: Response): void {
+    const raw = resp.headers.get(RECORD_COMMIT_SEQ_HEADER);
+    if (!raw) return;
+    const seq = Number(raw);
+    if (Number.isSafeInteger(seq) && seq > 0) {
+      const existing = this._recordCommitSeqByTenant.get(tenantId) ?? 0;
+      this._recordCommitSeqByTenant.set(tenantId, Math.max(existing, seq));
+    }
+  }
+
+  private _withRecordCommitSeq(tenantId: TenantId, body: Record<string, unknown>): Record<string, unknown> {
+    const seq = this._recordCommitSeqByTenant.get(tenantId);
+    if (seq === undefined || body.min_visible_record_commit_seq !== undefined) return body;
+    return { ...body, min_visible_record_commit_seq: seq };
   }
 }
 
