@@ -23,8 +23,8 @@ the write path.
 
 1. Pull the tablet view:
 
-   ```
-   curl https://<node>/api/admin/tablets
+   ```bash
+   agentdbctl --url https://<node> tablets list
    ```
 
    Look at the row with `tablet_id == box_id` from the error. If
@@ -33,8 +33,8 @@ the write path.
 
 2. Pull the node view:
 
-   ```
-   curl 'https://<node>/api/admin/nodes?stale_threshold_ms=15000'
+   ```bash
+   agentdbctl --url https://<node> nodes list --stale-threshold-ms 15000
    ```
 
    If this node's row carries `is_stale: true`, the control plane
@@ -51,10 +51,10 @@ the write path.
 
 ## Verify
 
-- If step 1 showed a different owner: confirm that the other node is
-  healthy by curling `/api/admin/nodes` on *that* node. If it
-  reports `is_stale: false` for itself, the tablet has genuinely
-  moved and this node is the stale one.
+- If step 1 showed a different owner: confirm that the other node is healthy
+  with `agentdbctl --url https://<other-node> nodes list --stale-threshold-ms 15000`.
+  If it reports `is_stale: false` for itself, the tablet has genuinely moved
+  and this node is the stale one.
 - If step 2 flagged the current node as stale: confirm the meta
   store is actually reachable:
 

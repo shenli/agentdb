@@ -7,6 +7,12 @@ It is forward-looking. Use it as the intended operator contract for cluster
 mode, not as a claim that all workflows already exist in the current server.
 
 For the current support boundary, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+For the recommended human CLI, see [AGENTDBCTL.md](AGENTDBCTL.md).
+
+Operator examples in this document use `agentdbctl` by default. Raw HTTP
+endpoints are still the backend contract and can be reached with
+`agentdbctl raw`, but humans should not need to hand-write payloads for normal
+cluster work.
 
 ## Goals
 
@@ -99,17 +105,18 @@ Target flow:
 
 Expected operator checks:
 
-- `GET /api/admin/nodes`
-- `GET /api/admin/tablets`
-- routing snapshot status
+- `agentdbctl nodes list`
+- `agentdbctl tablets list`
+- `agentdbctl status`
 
 Current admin controls:
 
-- `POST /api/admin/tablets/{tablet_id}/assign` can pre-claim an unowned tablet
-  for a fresh `alive` node.
-- `POST /api/admin/tablets/rebalance` can run with `{ "dry_run": true }` first,
-  then without dry-run to assign unowned tablets and mark load-balancing
-  handoffs.
+- `agentdbctl nodes register ...` can explicitly register or upsert a node.
+- `agentdbctl tablets assign <tablet_id> <node_id>` can pre-claim an unowned
+  tablet for a fresh `alive` node.
+- `agentdbctl tablets rebalance --dry-run` previews assignment and movement.
+- `agentdbctl tablets rebalance` assigns unowned tablets and marks
+  load-balancing handoffs.
 - The scheduler leader also runs the same rebalance policy automatically when
   metadata-backed cluster mode is enabled. Use `AGENTDB_REBALANCE_MAX_MOVEMENTS`
   to cap movements per scheduler tick; set it to `0` to disable automatic
@@ -141,19 +148,22 @@ Target flow:
 
 Current admin controls:
 
-- `POST /api/admin/drain` marks the local node as draining and refuses new
+- `agentdbctl drain start` marks the local node as draining and refuses new
   mutating requests on that node.
-- `POST /api/admin/nodes/{node_id}/maintenance` can mark a node `draining`,
-  `maintenance`, or back to `alive`. For the local node, `alive` clears the
-  local drain flag.
-- `POST /api/admin/tablets/{tablet_id}/handoff` marks an owned tablet for
-  cooperative transfer to a fresh `alive` target.
-- `POST /api/admin/tablets/{tablet_id}/handoff/complete` transfers ownership
-  after the source owner has drained the tablet.
-- `POST /api/admin/tablets/{tablet_id}/handoff/cancel` retracts a pending
-  handoff target.
-- `POST /api/admin/tablets/rebalance` moves tablets away from fresh draining
-  nodes through the same cooperative handoff signal.
+- `agentdbctl nodes maintenance <node_id> draining` marks a node as draining in
+  the control plane.
+- `agentdbctl nodes maintenance <node_id> maintenance` marks a node as out of
+  service for planned work.
+- `agentdbctl nodes maintenance <node_id> alive` marks a node alive again; for
+  the local node, this also clears the local drain flag.
+- `agentdbctl tablets handoff <tablet_id> <target_node_id>` marks an owned
+  tablet for cooperative transfer to a fresh `alive` target.
+- `agentdbctl tablets complete-handoff <tablet_id> <expected_source_node_id>`
+  transfers ownership after the source owner has drained the tablet.
+- `agentdbctl tablets cancel-handoff <tablet_id>` retracts a pending handoff
+  target.
+- `agentdbctl tablets rebalance` moves tablets away from fresh draining nodes
+  through the same cooperative handoff signal.
 
 This aligns with the existing `node_draining` runbook direction. Stale/dead
 owners are intentionally not force-moved by rebalance; lease expiry and the
@@ -183,19 +193,20 @@ If the node dies:
 
 Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
 the lease reaper clears expired tablet ownership. Once tablets are unowned,
-`POST /api/admin/tablets/rebalance` or the automatic scheduler rebalance pass
-can assign them to fresh `alive` nodes.
+`agentdbctl tablets rebalance` or the automatic scheduler rebalance pass can
+assign them to fresh `alive` nodes.
 
 ### Backup And Restore
 
 Current backup controls:
 
-- `POST /api/admin/backups` writes an online backup manifest under a target
-  directory and includes a metadata snapshot when metadata is configured.
+- `agentdbctl backup create --backup-id <id> --directory <path>` writes an
+  online backup manifest under a target directory and includes a metadata
+  snapshot when metadata is configured.
 - The manifest includes runtime storage summary data for observability. It is
   not a full runtime KV/content backup.
-- `POST /api/admin/restores` validates a backup manifest and referenced
-  metadata snapshot.
+- `agentdbctl restore validate <manifest-path>` validates a backup manifest and
+  referenced metadata snapshot.
 
 Restore apply remains an offline operator procedure. The HTTP restore endpoint
 intentionally rejects destructive apply because live restore semantics require a
@@ -327,8 +338,9 @@ Expected behavior:
 
 A usable cluster mode should expose at least:
 
-- `GET /api/admin/nodes`
-- `GET /api/admin/tablets`
+- `agentdbctl nodes list`
+- `agentdbctl tablets list`
+- `agentdbctl status`
 - node drain status
 - node staleness
 - ownership epoch / lease visibility

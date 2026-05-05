@@ -6,6 +6,9 @@ surfaces. The API is tenant-scoped and uses opaque typed IDs such as `ten_*`,
 
 ## HTTP API
 
+Humans should usually use `agentdbctl` for operations. The HTTP API below is
+the stable backend contract for SDKs, automation, and the CLI.
+
 Health and admin:
 
 ```text

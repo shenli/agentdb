@@ -14,6 +14,10 @@ For start/stop, backup, restore, upgrade, and troubleshooting, see
 see [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) and
 [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md).
 
+For human operations, prefer [agentdbctl](AGENTDBCTL.md). Raw HTTP endpoints
+are the backend contract and are still useful for load balancers, integrations,
+and emergency debugging, but normal operator docs should use the CLI.
+
 ## Current Support Summary
 
 AgentDB currently has one maintained deployment target:
@@ -173,7 +177,8 @@ Before exposing a maintained node:
 
 - use a config file instead of long CLI flag lists
 - run `agentdb doctor --config <path>`
-- monitor `GET /health/ready`
+- verify operator readiness with `agentdbctl status`
+- keep `/health/ready` available for load balancers and uptime probes
 - place runtime metadata and content on durable storage
 - decide whether content should stay local or move to object storage
 - define backup/restore procedure before production traffic
@@ -183,6 +188,8 @@ Before exposing a maintained node:
 
 - [OPERATIONS.md](OPERATIONS.md) - start, stop, backup, restore, upgrade, and
   troubleshooting
+- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+  operations
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current multi-node status and
   missing operator workflows
 - [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and

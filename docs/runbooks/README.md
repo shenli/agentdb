@@ -14,10 +14,11 @@ and then apply the pattern to every other:
 1. **Symptom** — the exact shape of the error the client sees, the
    HTTP status it carries, and the client-visible side effects. This
    is what someone searches for when grepping logs or a ticket.
-2. **Diagnose** — the first three things to check. Usually involves
-   an admin endpoint (`/api/admin/boxes`, `/api/admin/nodes`,
-   `/api/admin/tablets`, `/api/admin/hlc`), a metrics snapshot, or a
-   log line.
+2. **Diagnose** — the first three things to check. Prefer `agentdbctl`
+   for modeled admin state, for example `agentdbctl -o json status`,
+   `agentdbctl -o json nodes list`, or `agentdbctl -o json tablets list`.
+   Use raw admin endpoints only when the CLI does not model the state yet.
+   A metrics snapshot or log line is often still required.
 3. **Verify** — how to confirm the diagnosis rather than guess. A
    distinct step because "consistent with" is not the same as "caused
    by."

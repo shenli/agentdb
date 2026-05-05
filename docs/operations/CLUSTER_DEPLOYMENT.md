@@ -8,6 +8,8 @@ deployed once clustered operation becomes a supported product surface. It is
 not a claim that the repository already ships a production-ready cluster mode.
 
 For the current support boundary, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+For human and AI-agent operations, use [agentdbctl](AGENTDBCTL.md) by default.
+Raw admin endpoints remain the backend contract and an escape hatch.
 
 ## Purpose
 
@@ -226,6 +228,24 @@ The target bootstrap order should be:
 8. Allow ownership assignment and routing snapshots to converge.
 9. Put the load balancer in front of the fleet.
 
+The intended operator shape is CLI-first:
+
+```bash
+agentdbctl nodes register \
+  --node-id node-a \
+  --address http://10.0.0.10:7878 \
+  --region us-west-2 \
+  --availability-zone us-west-2a
+
+agentdbctl tablets create 0
+agentdbctl tablets rebalance --dry-run
+agentdbctl tablets rebalance
+agentdbctl status
+```
+
+Use `agentdbctl raw ...` only for endpoints that are not modeled by the CLI
+yet.
+
 ## Node Configuration Model
 
 Each node should have:
@@ -278,6 +298,8 @@ It is the target operator model, not the current product claim.
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current support boundary
 - [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
   procedures
+- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+  operations
 - [DEPLOYMENT.md](DEPLOYMENT.md) - supported deployment choices today
 - [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
   implementation shape

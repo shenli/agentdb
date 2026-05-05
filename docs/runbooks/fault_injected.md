@@ -25,8 +25,8 @@ artificially delayed; `fault_kind: "error"` means requests fail with
 
 1. Check the box's admin view:
 
-   ```
-   curl https://<node>/api/admin/boxes/<box_id>
+   ```bash
+   agentdbctl --url https://<node> raw get /api/admin/boxes/<box_id>
    ```
 
    If `fault` is set with a future `expires_at`, a fault is actively
@@ -55,10 +55,9 @@ artificially delayed; `fault_kind: "error"` means requests fail with
    (load test, failure-mode exercise, incident-response drill). Wait
    for `expires_at` to elapse, or clear it explicitly:
 
-   ```
-   curl -XPOST -H 'Content-Type: application/json' \
-     -d '{"kind":"clear"}' \
-     https://<node>/api/admin/boxes/<box_id>/inject_fault
+   ```bash
+   agentdbctl --url https://<node> raw post /api/admin/boxes/<box_id>/inject_fault \
+     --body '{"kind":"clear"}'
    ```
 
    (The `clear` endpoint is a follow-up admin addition; for now,

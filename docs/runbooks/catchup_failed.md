@@ -42,8 +42,8 @@ remaining sessions.
      missing session in the meta store.
    - **Range out of bounds.** `from_seq` is past the session's
      `next_seq`, or refers to a compacted-away prefix.
-4. Pull `/health/ready` from the same node — a `storage_error`
-   or `lease_lost` reason there points the same way.
+4. Check `agentdbctl --url https://<node> status` on the same node. A
+   `storage_error` or `lease_lost` readiness reason points the same way.
 
 ## Verify
 
@@ -73,8 +73,9 @@ remaining sessions.
    longer in the durable log; replaying from the gap isn't
    recoverable.
 4. **Persistent across retries.** Escalate. Inspect:
-   - `/api/admin/boxes` for `is_stale` / `lease_lost`
-     conditions on the box that owns the session.
+   - `agentdbctl raw get /api/admin/boxes` for `is_stale` / `lease_lost`
+     conditions on the box that owns the session until box state has a modeled
+     CLI command.
    - The KV-backend metrics (RocksDB compaction, SlateDB
      reads, S3 5xx rate).
    - The audit log for recent admin operations on the
