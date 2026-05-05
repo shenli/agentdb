@@ -162,3 +162,60 @@ async fn mongodb_driver_can_insert_and_find_agentdb_events() -> anyhow::Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn mongodb_driver_plain_auth_accepts_valid_credentials() -> anyhow::Result<()> {
+    let runtime = agentdb_core::Runtime::in_memory();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server_runtime = runtime.clone();
+    tokio::spawn(async move {
+        let _ = agentdb_wire::server::serve_with_auth(
+            listener,
+            server_runtime,
+            Some(agentdb_wire::server::AuthConfig {
+                username: "agentdb".to_string(),
+                password: "secret".to_string(),
+            }),
+        )
+        .await;
+    });
+
+    let bad_options = ClientOptions::parse(format!(
+        "mongodb://agentdb:wrong@{addr}/?directConnection=true&authMechanism=PLAIN&authSource=%24external"
+    ))
+    .await?;
+    let bad_client = Client::with_options(bad_options)?;
+    let bad_result = bad_client
+        .database("driver_auth")
+        .run_command(doc! { "ping": 1_i32 }, None)
+        .await;
+    assert!(bad_result.is_err());
+
+    let options = ClientOptions::parse(format!(
+        "mongodb://agentdb:secret@{addr}/?directConnection=true&authMechanism=PLAIN&authSource=%24external"
+    ))
+    .await?;
+    let client = Client::with_options(options)?;
+    let db = client.database("driver_auth");
+
+    db.run_command(doc! { "ping": 1_i32 }, None).await?;
+    db.collection::<Document>("events")
+        .insert_one(
+            doc! {
+                "session_alias": "auth-session",
+                "kind": "message",
+                "payload": { "content": "authenticated" },
+            },
+            None,
+        )
+        .await?;
+
+    let mut cursor = db
+        .collection::<Document>("events")
+        .find(doc! { "kind": "message" }, None)
+        .await?;
+    assert!(cursor.advance().await?);
+
+    Ok(())
+}

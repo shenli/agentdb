@@ -16,6 +16,10 @@ dev = false
 # Optional MongoDB wire-protocol compatibility listener.
 # This is a narrow AgentDB adapter for driver/tool access, not full MongoDB.
 # bind = "127.0.0.1:7879"
+# Optional MongoDB PLAIN authentication. You can also set
+# AGENTDB_MONGODB_USERNAME and AGENTDB_MONGODB_PASSWORD.
+# username = "agentdb"
+# password = "change-me"
 
 [storage]
 data_dir = "./agentdb-data"

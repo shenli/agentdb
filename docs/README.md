@@ -41,6 +41,11 @@ or implementation plans.
 
 - [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API, SDK surface,
   and MongoDB compatibility subset
+- [reference/mongodb-compatibility.md](reference/mongodb-compatibility.md) -
+  MongoDB client tutorial, mapping rules, limitations, and AI coding-agent
+  guidance
+- [../examples/mongodb/README.md](../examples/mongodb/README.md) - copyable
+  MongoDB client examples for Node and Python
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
   - canonical event payload conventions
 - [reference/adapter-readiness-checklist.md](reference/adapter-readiness-checklist.md)
