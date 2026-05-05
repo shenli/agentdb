@@ -29,6 +29,7 @@ pub mod scram;
 pub mod session_locators;
 pub mod session_overrides;
 pub mod shards;
+pub mod tablet_rebalance;
 pub mod tablets;
 pub mod tenant_quotas;
 pub mod tenants;

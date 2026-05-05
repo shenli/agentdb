@@ -1248,6 +1248,157 @@ async fn admin_drain_marks_node_and_rejects_new_mutations() {
 }
 
 #[tokio::test]
+async fn admin_node_maintenance_can_drain_and_undrain_local_node() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        now_ms_i64(),
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-a"))])
+        .with_nodes(vec![node("node-a", "http://127.0.0.1:18080")]);
+    let state = AppState::new(runtime)
+        .with_meta(meta)
+        .with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    let app = spawn_app_with_state(state).await;
+
+    let draining: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/nodes/node-a/maintenance", app.base))
+        .json(&json!({"state": "draining"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(draining["state"], "draining");
+    let drain_status: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/drain", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drain_status["is_draining"], true);
+
+    let alive: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/nodes/node-a/maintenance", app.base))
+        .json(&json!({"state": "alive"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(alive["state"], "alive");
+    let drain_status: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/drain", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drain_status["is_draining"], false);
+    assert_eq!(drain_status["drained_at_ms"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn admin_backup_and_restore_validation_round_trip() {
+    let runtime = Runtime::in_memory();
+    let dir = std::env::temp_dir().join(format!("agentdb-api-backup-test-{}", now_ms_i64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta_path = dir.join("source-meta.sqlite");
+    let meta = MetaStore::open_sqlite(&meta_path.to_string_lossy())
+        .await
+        .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        now_ms_i64(),
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablets::get_or_create(meta.pool(), 1, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+    let backup_root = dir.join("backups");
+
+    let backup: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/backups", app.base))
+        .json(&json!({
+            "backup_id": "test-backup",
+            "directory": backup_root.to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(backup["status"], "completed");
+    let manifest_path = backup["manifest_path"].as_str().unwrap().to_string();
+    assert!(std::path::Path::new(&manifest_path).exists());
+    assert!(std::path::Path::new(backup["meta_backup_path"].as_str().unwrap()).exists());
+
+    let validation: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/restores", app.base))
+        .json(&json!({
+            "manifest_path": manifest_path,
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(validation["status"], "validated");
+    assert!(validation["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check == "meta backup exists"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn admin_scheduler_reports_status_snapshot() {
     let runtime = Runtime::in_memory();
     let scheduler = agentdb_api::state::SchedulerStatus::new();
