@@ -50,6 +50,7 @@ If you are looking for those workflows, the answer today is:
 
 The repository now has some read-only cluster-facing visibility endpoints:
 
+- `GET /api/admin/drain`
 - `GET /api/admin/nodes`
 - `GET /api/admin/tablets`
 - `GET /api/admin/routing`
@@ -59,12 +60,15 @@ The repository now has some read-only cluster-facing visibility endpoints:
 
 And a very small amount of direct metadata admin:
 
+- `POST /api/admin/drain` for one-way local drain activation
 - `POST /api/admin/nodes` for explicit node registration/upsert
 - `DELETE /api/admin/nodes/{node_id}` for operator cleanup of a stale node row
 
 These help operators and developers inspect control-plane state and clean up
-obviously-bad metadata rows, but they do **not** yet add the full cluster
-control plane or day-2 workflows described in the target-state docs.
+obviously-bad metadata rows, and they provide the first step of planned node
+maintenance by refusing new mutations on a drained node. They still do **not**
+add the full cluster control plane or day-2 workflows described in the
+target-state docs.
 
 ## Kubernetes Clarification
 

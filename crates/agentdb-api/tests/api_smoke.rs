@@ -904,6 +904,113 @@ async fn admin_node_register_and_delete_round_trip() {
 }
 
 #[tokio::test]
+async fn admin_drain_marks_node_and_rejects_new_mutations() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        now_ms_i64(),
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-a"))])
+        .with_nodes(vec![node("node-a", "http://127.0.0.1:18080")]);
+    let state = AppState::new(runtime)
+        .with_meta(meta)
+        .with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    let app = spawn_app_with_state(state).await;
+    let (tid, aid, sid) = bootstrap_session(&app).await;
+
+    let drained: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/drain", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drained["node_id"], "node-a");
+    assert_eq!(drained["is_draining"], true);
+    assert!(drained["drained_at_ms"].as_i64().unwrap() > 0);
+
+    let drain_status: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/drain", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drain_status["is_draining"], true);
+
+    let readiness = app
+        .client
+        .get(format!("{}/api/admin/cluster/readiness", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let readiness_body: serde_json::Value = readiness.json().await.unwrap();
+    assert!(readiness_body["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason.as_str().unwrap().contains("draining")));
+
+    let nodes: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/nodes", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["node_id"] == "node-a" && row["state"] == "draining"));
+
+    let append = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/append-and-fetch",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {},
+            "artifact_refs": [],
+            "source_refs": [],
+            "last": 5,
+            "max_bytes": 1_000_000
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(append.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let append_body: serde_json::Value = append.json().await.unwrap();
+    assert_eq!(append_body["code"], "NODE_DRAINING");
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;

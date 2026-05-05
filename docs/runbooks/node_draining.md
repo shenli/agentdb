@@ -2,16 +2,15 @@
 
 ## Symptom
 
-Client receives a JSON body with `code: "node_draining"` and HTTP
-503. The specific node that's draining is named in `node_id`:
+Client receives a JSON body with `code: "NODE_DRAINING"` and HTTP
+503. The specific node that's draining is named in the message:
 
 ```json
 {
-  "code": "node_draining",
-  "type": "api_error",
-  "message": "node node-b7d3: draining; retry at a different node",
-  "node_id": "node-b7d3",
-  "doc_url": "https://github.com/shenli/agentdb/blob/main/docs/runbooks/node_draining.md"
+  "code": "NODE_DRAINING",
+  "message": "node node-b7d3 is draining; retry at a different node",
+  "retryable": true,
+  "suggestion": "See /api/admin/drain and docs/runbooks/node_draining.md"
 }
 ```
 
@@ -81,8 +80,8 @@ exits and restarts.
    event signal — the expectation is that clients retry at the
    load balancer, which routes to healthy peers. If your client
    hits nodes directly, either have it re-resolve the fleet on
-   `node_draining` errors or front the cluster with a balancer
-   that does.
+  `NODE_DRAINING` errors or front the cluster with a balancer
+  that does.
 
 ## Prevent
 
