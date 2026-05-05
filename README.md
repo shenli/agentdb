@@ -94,6 +94,59 @@ Open the session dashboard at:
 http://127.0.0.1:7878/dashboard/
 ```
 
+### MongoDB Client Compatibility
+
+AgentDB can also expose a narrow MongoDB-compatible listener for existing
+MongoDB clients and tools. Start the dev server with a MongoDB listener:
+
+```bash
+cargo run -p agentdb-server -- serve --dev --mongo-bind 127.0.0.1:7879
+```
+
+Then connect with `mongosh`:
+
+```bash
+mongosh "mongodb://127.0.0.1:7879/?directConnection=true"
+```
+
+Use normal collection helpers for simple document access:
+
+```javascript
+use quickstart
+
+db.events.insertOne({
+  session_alias: "support-ticket-42",
+  kind: "message",
+  payload: {
+    role: "user",
+    content: "hello from mongosh"
+  }
+})
+
+db.events.find({ kind: "message" })
+db.sessions.find({ alias: "support-ticket-42" })
+```
+
+Use AgentDB extension commands for runtime primitives that are not native
+MongoDB CRUD:
+
+```javascript
+db.runCommand({
+  agentdbAppendAndFetch: "events",
+  session_alias: "support-ticket-42",
+  kind: "message",
+  payload: {
+    role: "assistant",
+    content: "hi"
+  },
+  fetch_last_n: 20
+})
+```
+
+The MongoDB listener is an adapter for driver/tool access, not a full MongoDB
+replacement. The native HTTP API and SDKs remain the canonical AgentDB runtime
+surface.
+
 For persistent single-node state:
 
 ```bash
