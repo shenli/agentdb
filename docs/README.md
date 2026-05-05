@@ -1,44 +1,57 @@
 # AgentDB Docs
 
 This directory separates current project documentation from historical planning
-material.
+material. Start with the current docs unless you are looking for design history
+or implementation plans.
 
-## Current Docs
+## Start Here
 
+- [architecture/agent-db.md](architecture/agent-db.md) - product thesis,
+  workload requirements, positioning, and systems rationale
+- [architecture/DESIGN.md](architecture/DESIGN.md) - durable design commitments,
+  constraints, and non-goals
+- [architecture/TRADEOFFS.md](architecture/TRADEOFFS.md) - what AgentDB is
+  optimized for, where it should win, and where it should not compete
 - [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - current crate
   boundaries, request flow, storage, routing, and operational model
-- [architecture/DESIGN.md](architecture/DESIGN.md) - product constraints,
-  non-goals, and durable design decisions
-- [architecture/TRADEOFFS.md](architecture/TRADEOFFS.md) - explicit goals,
-  non-goals, fit, and non-fit for AgentDB's AI agent runtime database scope
-- [architecture/agent-db.md](architecture/agent-db.md) - long-form product and
-  systems design
-- [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
-  - forward-looking redesign for real hot/cold/archive session storage
-- [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
-  - forward-looking optimization plan for large artifact blobs and content backends
+
+## Run And Operate
+
 - [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) - supported deployment
   paths, packaging modes, and current cluster status
 - [operations/OPERATIONS.md](operations/OPERATIONS.md) - start/stop, backup,
   restore, upgrade, and troubleshooting for the supported single-node shape
 - [operations/AGENTDBCTL.md](operations/AGENTDBCTL.md) - human and AI-agent
-  friendly operations CLI for AgentDB admin workflows
+  friendly admin workflows
+- [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
+  and current performance notes
+- [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
+  codes and `doc_url` links
+
+## Cluster Work
+
 - [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
-  of multi-node support and the missing operator workflows today
+  of multi-node support and missing operator workflows today
 - [operations/CLUSTER_DEPLOYMENT.md](operations/CLUSTER_DEPLOYMENT.md) -
   forward-looking target deployment model for a real AgentDB cluster
 - [operations/CLUSTER_OPERATIONS.md](operations/CLUSTER_OPERATIONS.md) -
-  forward-looking target day-2 workflows for add/remove/replace/drain/upgrade
-- [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
-  and current performance notes
+  forward-looking day-2 workflows for add/remove/replace/drain/upgrade
+
+## Reference
+
+- [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API, SDK surface,
+  and MongoDB compatibility subset
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
   - canonical event payload conventions
 - [reference/adapter-readiness-checklist.md](reference/adapter-readiness-checklist.md)
   - adapter behavior and validation expectations
-- [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API and SDK surface
-  reference
-- [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
-  codes
+
+## Forward-Looking Designs
+
+- [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
+  - redesign for real hot/cold/archive session storage
+- [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
+  - optimization plan for large artifact blobs and content backends
 - [roadmap.md](roadmap.md) - milestone direction and open work
 
 ## Planning Archive
@@ -47,5 +60,3 @@ material.
 - [superpowers/plans](superpowers/plans) - implementation plans
 - [superpowers/notes](superpowers/notes) - investigation notes and decision
   records
-- [superpowers/plans/2026-05-02-tiered-storage-redesign-implementation.md](superpowers/plans/2026-05-02-tiered-storage-redesign-implementation.md)
-  - phased implementation plan for the tiered-storage redesign
