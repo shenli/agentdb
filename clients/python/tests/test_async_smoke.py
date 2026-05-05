@@ -13,6 +13,7 @@ Skipped automatically when:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -167,6 +168,42 @@ def test_async_unpaired_credentials_raise():
     # token + get_token together is a programmer error
     with pytest.raises(ValueError, match="get_token"):
         AsyncClient("http://127.0.0.1:7878", token="t", get_token=lambda: "t")
+
+
+def test_async_record_search_carries_last_tenant_commit_sequence():
+    async def run():
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.url.path.endswith("/records"):
+                return httpx.Response(
+                    201,
+                    json={"record_id": "rec_1"},
+                    headers={"X-AgentDB-Record-Commit-Seq": "17"},
+                )
+            if request.url.path.endswith("/records/search"):
+                return httpx.Response(200, json={"records": []})
+            return httpx.Response(200, json={})
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(base_url="http://x", transport=transport) as raw:
+            client = AsyncClient("http://x", _client=raw)
+            await client.write_record("ten_1", namespace=["mem"], text="x")
+            await client.search_records("ten_1", namespace=["mem"], text="x")
+            await client.search_records(
+                "ten_1",
+                namespace=["mem"],
+                text="x",
+                min_visible_record_commit_seq=99,
+            )
+
+        first_search = json.loads(requests[1].content)
+        second_search = json.loads(requests[2].content)
+        assert first_search["min_visible_record_commit_seq"] == 17
+        assert second_search["min_visible_record_commit_seq"] == 99
+
+    asyncio.run(run())
 
 
 def test_async_session_subscribe_replay(server):

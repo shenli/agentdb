@@ -7,12 +7,13 @@ import pytest
 from agentdb import AgentDB, AppendResult, Client, Event, event_ref
 
 
-def response(status=200, body=None):
+def response(status=200, body=None, headers=None):
     resp = MagicMock()
     resp.status_code = status
     resp.json.return_value = body if body is not None else {}
     resp.text = ""
     resp.content = b""
+    resp.headers = headers or {}
     return resp
 
 
@@ -122,6 +123,36 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any("/api/tenants/ten_1/skills" in url for url in urls)
     assert any("/api/tenants/ten_1/watch" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/replay" in url for url in urls)
+
+
+def test_record_search_carries_last_tenant_commit_sequence():
+    c = Client("http://x", auth=("u", "p"))
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if url.endswith("/records"):
+            return response(
+                status=201,
+                body={"record_id": "rec_1"},
+                headers={"X-AgentDB-Record-Commit-Seq": "17"},
+            )
+        if url.endswith("/records/search"):
+            return response(body={"records": []})
+        return response()
+
+    with patch.object(c._http, "request", side_effect=fake):
+        c.write_record("ten_1", namespace=["mem"], text="x")
+        c.search_records("ten_1", namespace=["mem"], text="x")
+        c.search_records(
+            "ten_1",
+            namespace=["mem"],
+            text="x",
+            min_visible_record_commit_seq=99,
+        )
+
+    assert calls[1][2]["json"]["min_visible_record_commit_seq"] == 17
+    assert calls[2][2]["json"]["min_visible_record_commit_seq"] == 99
 
 
 def test_idempotency_key_is_generated_for_mutations():

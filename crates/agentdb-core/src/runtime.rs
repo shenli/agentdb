@@ -12,7 +12,7 @@
 //! in-memory it's the state mutex.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
@@ -31,9 +31,13 @@ use crate::agent::{Agent, NewAgent};
 use crate::artifact::{Artifact, NewArtifact};
 use crate::errors::{Error, ErrorCode, Result};
 use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+use crate::global_index::{
+    GlobalIndexMutation, GlobalIndexMutationOp, GlobalIndexQuery, GlobalRecordIndex,
+    InMemoryGlobalRecordIndex,
+};
 use crate::id::{Id, IdKind};
 use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
-use crate::persist::Persist;
+use crate::persist::{Persist, RecordIndexMutationOp};
 use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, SearchableRecord};
 use crate::segment::{
@@ -349,6 +353,22 @@ struct State {
     /// `delete_record` to remove the index entry and the reverse
     /// mapping in one shot.
     record_to_doc: BTreeMap<String, DocId>,
+    /// Tenant-scoped searchable-record commit sequence by record id. Used by
+    /// read-after-write repair when the local index watermark lags behind a
+    /// caller's requested visibility token.
+    record_commit_seq: BTreeMap<String, u64>,
+    /// Next tenant-scoped searchable-record commit sequence.
+    next_record_commit_seq: u64,
+    /// Highest searchable-record commit sequence fully reflected in the local
+    /// text/vector indexes.
+    local_record_index_watermark: u64,
+    /// Highest searchable-record commit sequence fully reflected in the
+    /// GSI-like global placement/discovery index.
+    global_record_index_watermark: u64,
+    record_index_repairs_total: u64,
+    record_index_repair_candidates_total: u64,
+    record_index_worker_failures_total: u64,
+    global_record_index_apply_failures_total: u64,
     /// Counter behind [`mint_doc_id`]. Lives in `State` so the same
     /// state mutex serializes counter increments alongside record
     /// inserts.
@@ -483,6 +503,7 @@ pub struct Runtime {
     /// `parking_lot::Mutex` per path; the outer `StdMutex` here only
     /// guards the `&mut self` requirement of the trait surface.
     vector_index: StdMutex<HnswVectorIndex>,
+    global_record_index: Arc<dyn GlobalRecordIndex>,
 }
 
 impl Runtime {
@@ -737,6 +758,7 @@ impl Runtime {
             kms: Arc::new(AllowAllKmsKeyResolver),
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
+            global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
         })
     }
 
@@ -750,6 +772,7 @@ impl Runtime {
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
+            global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
         })
     }
 
@@ -766,6 +789,7 @@ impl Runtime {
             kms,
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
+            global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
         })
     }
 
@@ -915,6 +939,15 @@ impl Runtime {
                 .scan_all_idempotency()
                 .expect("hydrate idempotency records"),
         );
+        let mut hydrated_record_commit_seq: BTreeMap<String, u64> = persist
+            .scan_all_record_commit_seqs()
+            .expect("hydrate record commit sequences")
+            .into_iter()
+            .collect();
+        if let Some(max_commit_seq) = hydrated_record_commit_seq.values().copied().max() {
+            state.next_record_commit_seq = max_commit_seq;
+            state.local_record_index_watermark = max_commit_seq;
+        }
 
         // Build the V2.2 text + vector indexes from scratch and replay
         // every live record into them. DocIds are minted fresh per run
@@ -923,6 +956,8 @@ impl Runtime {
         // for not having to persist the doc-id assignment.
         let mut text_idx = InMemoryInverted::new();
         let mut vector_idx = HnswVectorIndex::new();
+        let global_record_index: Arc<dyn GlobalRecordIndex> =
+            Arc::new(InMemoryGlobalRecordIndex::default());
         for r in persist.scan_all_records().expect("hydrate records") {
             if r.deleted_at_ms.is_some() || r.is_expired() {
                 // GC will reap these; skip them at hydration time so
@@ -937,6 +972,23 @@ impl Runtime {
             state
                 .record_to_doc
                 .insert(r.record_id.as_str().to_string(), doc_id);
+            let commit_seq = hydrated_record_commit_seq
+                .remove(r.record_id.as_str())
+                .unwrap_or_else(|| next_record_commit_seq(&mut state));
+            state
+                .record_commit_seq
+                .insert(r.record_id.as_str().to_string(), commit_seq);
+            state.local_record_index_watermark = state.local_record_index_watermark.max(commit_seq);
+            state.next_record_commit_seq = state.next_record_commit_seq.max(commit_seq);
+            global_record_index
+                .apply(global_index_mutation_for_record(
+                    &r,
+                    commit_seq,
+                    GlobalIndexMutationOp::Upsert,
+                ))
+                .expect("hydrate global record index");
+            state.global_record_index_watermark =
+                state.global_record_index_watermark.max(commit_seq);
             state.records.insert(r.record_id.as_str().to_string(), r);
         }
 
@@ -949,6 +1001,7 @@ impl Runtime {
             kms,
             text_index: StdMutex::new(text_idx),
             vector_index: StdMutex::new(vector_idx),
+            global_record_index,
         })
     }
 
@@ -4000,6 +4053,11 @@ impl Runtime {
 pub struct SearchRequest {
     pub tenant_id: Id,
     pub namespace: Vec<String>,
+    /// Optional caller-provided placement/sharding key. When present, record
+    /// search uses the owner-local LSI-like index. When absent, record search
+    /// uses the GSI-like global index and may lag unless a visibility token
+    /// forces owner-local repair.
+    pub sharding_key: Option<String>,
     pub text: Option<String>,
     pub embedding: Option<Vec<f32>>,
     /// Post-index tag filter. A record matches when **every** tag in
@@ -4010,6 +4068,10 @@ pub struct SearchRequest {
     /// filter (unset fields don't constrain).
     pub source_filter: Option<SourceRef>,
     pub limit: usize,
+    /// Tenant-scoped searchable-record commit sequence that this read must
+    /// observe. If the local index watermark is behind, `search_records`
+    /// repairs from committed base records before replying.
+    pub min_visible_record_commit_seq: Option<u64>,
 }
 
 impl SearchRequest {
@@ -4023,13 +4085,48 @@ impl SearchRequest {
         Self {
             tenant_id,
             namespace,
+            sharding_key: None,
             text: Some(query.into()),
             embedding: None,
             tags: vec![],
             source_filter: None,
             limit,
+            min_visible_record_commit_seq: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitScope {
+    Session(Id),
+    Tenant(Id),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitToken {
+    pub placement_id: Option<i64>,
+    pub scope: CommitScope,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteRecordResult {
+    pub record: SearchableRecord,
+    pub commit_token: CommitToken,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordIndexStats {
+    pub local_index_watermark: u64,
+    pub global_index_watermark: u64,
+    pub next_record_commit_seq: u64,
+    pub local_index_lag_tokens: u64,
+    pub global_index_lag_tokens: u64,
+    pub local_index_repairs_total: u64,
+    pub local_index_repair_candidates_total: u64,
+    pub record_index_worker_failures_total: u64,
+    pub global_index_apply_failures_total: u64,
 }
 
 impl Runtime {
@@ -4040,6 +4137,10 @@ impl Runtime {
     /// hit the indexes. The persist step is last; on persist failure we
     /// roll the indexes back to keep the runtime consistent with disk.
     pub async fn write_record(&self, req: NewRecord) -> Result<SearchableRecord> {
+        Ok(self.write_record_with_commit(req).await?.record)
+    }
+
+    pub async fn write_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
         let record = SearchableRecord::create(req);
         let policy = self.resolve_policy_for_tenant(&record.tenant_id).await?;
 
@@ -4101,8 +4202,9 @@ impl Runtime {
         // `write_record`s for the same tenant + namespace mint distinct
         // DocIds (counter is under the lock) and the persist order
         // matches the index-insert order.
+        let commit_seq = next_record_commit_seq(&mut s);
         if let Some(p) = &self.persist {
-            if let Err(e) = p.put_record(&record) {
+            if let Err(e) = p.put_record_with_commit_seq(&record, Some(commit_seq)) {
                 // Persist failed: drop the cache + DocId mapping we
                 // were about to install. The index inserts above are
                 // not rolled back — see the long comment above.
@@ -4116,7 +4218,30 @@ impl Runtime {
             .insert(doc_id, record.record_id.as_str().to_string());
         s.record_to_doc
             .insert(record.record_id.as_str().to_string(), doc_id);
-        Ok(record)
+        s.record_commit_seq
+            .insert(record.record_id.as_str().to_string(), commit_seq);
+        s.local_record_index_watermark = commit_seq;
+        if self.persist.is_none() {
+            if let Err(error) = self.global_record_index.apply(global_index_mutation_for_record(
+                &record,
+                commit_seq,
+                GlobalIndexMutationOp::Upsert,
+            )) {
+                s.global_record_index_apply_failures_total += 1;
+                drop(s);
+                return Err(error);
+            }
+            s.global_record_index_watermark = commit_seq;
+        }
+        let commit_token = CommitToken {
+            placement_id: None,
+            scope: CommitScope::Tenant(record.tenant_id.clone()),
+            seq: commit_seq,
+        };
+        Ok(WriteRecordResult {
+            record,
+            commit_token,
+        })
     }
 
     /// Look up a record by primary key. Returns `RecordNotFound` if
@@ -4152,6 +4277,153 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", record_id)))
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn simulate_record_index_lag_for_test(&self, record_id: &Id, watermark: u64) {
+        let mut s = self.state.lock().await;
+        if let Some(doc) = s.record_to_doc.remove(record_id.as_str()) {
+            s.doc_to_record.remove(&doc);
+        }
+        s.local_record_index_watermark = watermark;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn record_index_outbox_counts_for_test(&self) -> Result<(usize, usize)> {
+        let Some(p) = &self.persist else {
+            return Ok((0, 0));
+        };
+        let mutations = p.scan_all_record_index_mutations().map_err(internal)?;
+        let mut upserts = 0usize;
+        let mut deletes = 0usize;
+        for mutation in mutations {
+            match mutation.op {
+                RecordIndexMutationOp::Upsert => upserts += 1,
+                RecordIndexMutationOp::Delete => deletes += 1,
+            }
+        }
+        Ok((upserts, deletes))
+    }
+
+    pub async fn record_index_stats(&self) -> RecordIndexStats {
+        let s = self.state.lock().await;
+        let head = s.next_record_commit_seq;
+        RecordIndexStats {
+            local_index_watermark: s.local_record_index_watermark,
+            global_index_watermark: s.global_record_index_watermark,
+            next_record_commit_seq: head,
+            local_index_lag_tokens: head.saturating_sub(s.local_record_index_watermark),
+            global_index_lag_tokens: head.saturating_sub(s.global_record_index_watermark),
+            local_index_repairs_total: s.record_index_repairs_total,
+            local_index_repair_candidates_total: s.record_index_repair_candidates_total,
+            record_index_worker_failures_total: s.record_index_worker_failures_total,
+            global_index_apply_failures_total: s.global_record_index_apply_failures_total,
+        }
+    }
+
+    pub async fn apply_record_index_outbox_once(&self) -> Result<usize> {
+        let Some(p) = &self.persist else {
+            return Ok(0);
+        };
+        let mut mutations = p.scan_all_record_index_mutations().map_err(internal)?;
+        mutations.sort_by_key(|mutation| mutation.commit_seq);
+
+        let mut applied = 0usize;
+        for mutation in mutations {
+            let mut s = self.state.lock().await;
+            let mut advanced = false;
+            if mutation.commit_seq > s.global_record_index_watermark {
+                let global_mutation = match mutation.op {
+                    RecordIndexMutationOp::Upsert => s.records.get(&mutation.record_id).map(|record| {
+                        global_index_mutation_for_record(
+                            record,
+                            mutation.commit_seq,
+                            GlobalIndexMutationOp::Upsert,
+                        )
+                    }),
+                    RecordIndexMutationOp::Delete => Some(GlobalIndexMutation {
+                        tenant_id: mutation.tenant_id.clone(),
+                        record_id: mutation.record_id.clone(),
+                        namespace: vec![],
+                        placement_id: 0,
+                        commit_seq: mutation.commit_seq,
+                        op: GlobalIndexMutationOp::Delete,
+                        terms: vec![],
+                    }),
+                };
+                if let Some(global_mutation) = global_mutation {
+                    if let Err(error) = self.global_record_index.apply(global_mutation) {
+                        s.global_record_index_apply_failures_total += 1;
+                        drop(s);
+                        return Err(error);
+                    }
+                }
+                s.global_record_index_watermark = mutation.commit_seq;
+                advanced = true;
+            }
+
+            if mutation.commit_seq <= s.local_record_index_watermark {
+                if advanced {
+                    applied += 1;
+                }
+                continue;
+            }
+
+            match mutation.op {
+                RecordIndexMutationOp::Upsert => {
+                    let Some(record) = s.records.get(&mutation.record_id).cloned() else {
+                        s.local_record_index_watermark = mutation.commit_seq;
+                        applied += 1;
+                        continue;
+                    };
+                    if record.deleted_at_ms.is_some() || record.is_expired() {
+                        s.local_record_index_watermark = mutation.commit_seq;
+                        applied += 1;
+                        continue;
+                    }
+                    if !s.record_to_doc.contains_key(&mutation.record_id) {
+                        let doc_id = mint_doc_id(&mut s.next_doc_seq);
+                        {
+                            let mut text = self.text_index.lock().expect("text index lock");
+                            let mut vec = self.vector_index.lock().expect("vector index lock");
+                            index_record_into(&mut text, &mut vec, &record, doc_id);
+                        }
+                        s.doc_to_record.insert(doc_id, mutation.record_id.clone());
+                        s.record_to_doc.insert(mutation.record_id.clone(), doc_id);
+                    }
+                }
+                RecordIndexMutationOp::Delete => {
+                    if let Some(doc) = s.record_to_doc.remove(&mutation.record_id) {
+                        s.doc_to_record.remove(&doc);
+                    }
+                }
+            }
+            s.local_record_index_watermark = mutation.commit_seq;
+            advanced = true;
+            if advanced {
+                applied += 1;
+            }
+        }
+        Ok(applied)
+    }
+
+    pub fn spawn_record_index_worker(
+        self: Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = self.apply_record_index_outbox_once().await {
+                    let mut s = self.state.lock().await;
+                    s.record_index_worker_failures_total += 1;
+                    drop(s);
+                    tracing::warn!(?error, "record index outbox replay failed");
+                }
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+
     /// Search the (tenant, namespace) scope. If `text` is set, run a
     /// BM25 text search; if `embedding` is set, run a cosine
     /// nearest-neighbor search; if both, run both and union by record
@@ -4161,6 +4433,62 @@ impl Runtime {
     /// Tag and source post-filters are applied after the index step.
     /// Soft-deleted and expired records are filtered out.
     pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+        if req.sharding_key.is_none() {
+            return self.search_records_global(req).await;
+        }
+        self.search_records_local(req).await
+    }
+
+    async fn search_records_global(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+        {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+        }
+        let terms = req
+            .text
+            .as_deref()
+            .map(repair_tokens)
+            .unwrap_or_default();
+        let result = self.global_record_index.search(GlobalIndexQuery {
+            tenant_id: req.tenant_id.as_str().to_string(),
+            namespace: req.namespace.clone(),
+            terms,
+            min_visible_commit_seq: req.min_visible_record_commit_seq,
+            limit: req.limit.max(1),
+        })?;
+
+        if result.stale {
+            return self.search_records_local(req).await;
+        }
+
+        let s = self.state.lock().await;
+        let mut candidates = Vec::with_capacity(result.hits.len());
+        for hit in result.hits {
+            let Some(record) = s.records.get(&hit.record_id).cloned() else {
+                continue;
+            };
+            if !record_matches_repair_query(&record, &req) {
+                continue;
+            }
+            candidates.push((record.clone(), repair_score(&record, &req)));
+        }
+        drop(s);
+        candidates
+            .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(filter_search_candidates(candidates, &req))
+    }
+
+    async fn search_records_local(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
         // Validate tenant exists. Tenant scope leaks would defeat the
         // (tenant, namespace) isolation the index `path` already
         // provides, so reject upfront.
@@ -4208,13 +4536,17 @@ impl Runtime {
             }
         }
 
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
+        let repair_range = req
+            .min_visible_record_commit_seq
+            .filter(|required| *required > s.local_record_index_watermark)
+            .map(|required| (s.local_record_index_watermark, required));
 
         // Build the candidate list. Index-driven path: walk hits in
         // descending-score order and resolve each DocId to a record.
         // Brute-force path: walk every record in the namespace. We
         // distinguish the two by whether `text` or `embedding` was set.
-        let candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some()
+        let mut candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some()
             || req.embedding.is_some()
         {
             let mut ranked: Vec<(DocId, f32)> = hits.into_iter().collect();
@@ -4236,41 +4568,35 @@ impl Runtime {
                 .map(|r| (r.clone(), 0.0))
                 .collect()
         };
-        drop(s);
-
-        // Post-filtering: tenant + namespace (defense in depth — the
-        // index `path` already isolates these, but a stale DocId from
-        // a deleted record could in principle still resolve to a
-        // record under a different namespace if the indexes ever drift),
-        // plus tags, source, soft-delete, and expiration.
-        let mut out: Vec<SearchableRecord> = Vec::new();
-        for (r, _score) in candidates {
-            if r.tenant_id.as_str() != req.tenant_id.as_str() {
-                continue;
-            }
-            if r.namespace != req.namespace {
-                continue;
-            }
-            if r.deleted_at_ms.is_some() || r.is_expired() {
-                continue;
-            }
-            if !req.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)) {
-                continue;
-            }
-            if let Some(filter) = &req.source_filter {
-                let Some(rs) = r.source.as_ref() else {
+        if let Some((applied, required)) = repair_range {
+            s.record_index_repairs_total += 1;
+            let mut repaired_candidates = 0u64;
+            let mut seen: BTreeSet<String> = candidates
+                .iter()
+                .map(|(r, _)| r.record_id.as_str().to_string())
+                .collect();
+            for r in s.records.values() {
+                let Some(commit_seq) = s.record_commit_seq.get(r.record_id.as_str()) else {
                     continue;
                 };
-                if !source_ref_matches(rs, filter) {
+                if *commit_seq <= applied || *commit_seq > required {
                     continue;
                 }
+                if !record_matches_repair_query(r, &req) {
+                    continue;
+                }
+                if seen.insert(r.record_id.as_str().to_string()) {
+                    candidates.push((r.clone(), repair_score(r, &req)));
+                    repaired_candidates += 1;
+                }
             }
-            out.push(r);
-            if out.len() >= req.limit {
-                break;
-            }
+            s.record_index_repair_candidates_total += repaired_candidates;
+            candidates
+                .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         }
-        Ok(out)
+        drop(s);
+
+        Ok(filter_search_candidates(candidates, &req))
     }
 
     /// Soft-delete a record: set `deleted_at_ms = now`, persist the
@@ -4308,7 +4634,8 @@ impl Runtime {
         };
 
         if let Some(p) = &self.persist {
-            if let Err(e) = p.put_record(&updated) {
+            let commit_seq = next_record_commit_seq(&mut s);
+            if let Err(e) = p.put_record_with_commit_seq(&updated, Some(commit_seq)) {
                 // Roll back the soft-delete in the cache so the
                 // in-memory state stays consistent with disk.
                 if let Some(r) = s.records.get_mut(record_id.as_str()) {
@@ -4317,6 +4644,28 @@ impl Runtime {
                 drop(s);
                 return Err(internal(e));
             }
+            s.record_commit_seq
+                .insert(record_id.as_str().to_string(), commit_seq);
+            s.local_record_index_watermark = commit_seq;
+        } else {
+            let commit_seq = next_record_commit_seq(&mut s);
+            s.record_commit_seq
+                .insert(record_id.as_str().to_string(), commit_seq);
+            s.local_record_index_watermark = commit_seq;
+            if let Err(error) = self.global_record_index.apply(GlobalIndexMutation {
+                tenant_id: tenant_id.as_str().to_string(),
+                record_id: record_id.as_str().to_string(),
+                namespace: vec![],
+                placement_id: 0,
+                commit_seq,
+                op: GlobalIndexMutationOp::Delete,
+                terms: vec![],
+            }) {
+                s.global_record_index_apply_failures_total += 1;
+                drop(s);
+                return Err(error);
+            }
+            s.global_record_index_watermark = commit_seq;
         }
 
         if let Some(doc) = s.record_to_doc.remove(record_id.as_str()) {
@@ -4402,6 +4751,40 @@ fn source_ref_matches(rec: &SourceRef, filter: &SourceRef) -> bool {
         && match_id(&rec.skill_id, &filter.skill_id)
 }
 
+fn filter_search_candidates(
+    candidates: Vec<(SearchableRecord, f32)>,
+    req: &SearchRequest,
+) -> Vec<SearchableRecord> {
+    let mut out = Vec::new();
+    for (r, _score) in candidates {
+        if r.tenant_id.as_str() != req.tenant_id.as_str() {
+            continue;
+        }
+        if r.namespace != req.namespace {
+            continue;
+        }
+        if r.deleted_at_ms.is_some() || r.is_expired() {
+            continue;
+        }
+        if !req.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)) {
+            continue;
+        }
+        if let Some(filter) = &req.source_filter {
+            let Some(rs) = r.source.as_ref() else {
+                continue;
+            };
+            if !source_ref_matches(rs, filter) {
+                continue;
+            }
+        }
+        out.push(r);
+        if out.len() >= req.limit {
+            break;
+        }
+    }
+    out
+}
+
 /// Mint a fresh `DocId` from the per-runtime counter. The pair
 /// `(0, seq)` plays the role `agentdb-index` reserves for
 /// `(session_internal_id, seq)` in event-driven uses. We don't have
@@ -4415,6 +4798,14 @@ fn mint_doc_id(next: &mut u64) -> DocId {
     DocId::new(0, seq)
 }
 
+fn next_record_commit_seq(state: &mut State) -> u64 {
+    state.next_record_commit_seq = state
+        .next_record_commit_seq
+        .checked_add(1)
+        .expect("record commit sequence overflow");
+    state.next_record_commit_seq
+}
+
 /// Index a record's text + (optional) embedding into the per-path
 /// indexes. Shared between `Runtime::write_record` and the hydration
 /// loop so a record that survives a restart is indexed exactly the
@@ -4426,20 +4817,7 @@ fn index_record_into(
     doc_id: DocId,
 ) {
     let path = format!("{}::{}", r.tenant_id.as_str(), r.namespace_path());
-    let indexable_text: Option<String> = match r.policy.mode {
-        IndexingMode::NoIndexing => None,
-        IndexingMode::MetadataOnly => Some(extract_metadata_strings(&r.metadata, &r.tags)),
-        IndexingMode::SelectedFields => Some(extract_selected_fields(
-            &r.metadata,
-            &r.policy.fields,
-            &r.tags,
-        )),
-        IndexingMode::SummaryOnly => r
-            .text
-            .as_ref()
-            .map(|s| s.chars().take(256).collect::<String>()),
-    };
-    if let Some(t) = indexable_text {
+    if let Some(t) = record_indexable_text(r) {
         if !t.is_empty() {
             text.insert(&path, doc_id, &t);
         }
@@ -4460,6 +4838,123 @@ fn index_record_into(
             }
         }
     }
+}
+
+fn record_indexable_text(r: &SearchableRecord) -> Option<String> {
+    match r.policy.mode {
+        IndexingMode::NoIndexing => None,
+        IndexingMode::MetadataOnly => Some(extract_metadata_strings(&r.metadata, &r.tags)),
+        IndexingMode::SelectedFields => Some(extract_selected_fields(
+            &r.metadata,
+            &r.policy.fields,
+            &r.tags,
+        )),
+        IndexingMode::SummaryOnly => r
+            .text
+            .as_ref()
+            .map(|s| s.chars().take(256).collect::<String>()),
+    }
+}
+
+fn global_index_mutation_for_record(
+    r: &SearchableRecord,
+    commit_seq: u64,
+    op: GlobalIndexMutationOp,
+) -> GlobalIndexMutation {
+    GlobalIndexMutation {
+        tenant_id: r.tenant_id.as_str().to_string(),
+        record_id: r.record_id.as_str().to_string(),
+        namespace: r.namespace.clone(),
+        placement_id: 0,
+        commit_seq,
+        op,
+        terms: record_indexable_text(r)
+            .map(|text| repair_tokens(&text))
+            .unwrap_or_default(),
+    }
+}
+
+fn record_matches_repair_query(r: &SearchableRecord, req: &SearchRequest) -> bool {
+    if r.tenant_id.as_str() != req.tenant_id.as_str() || r.namespace != req.namespace {
+        return false;
+    }
+    if let Some(query) = req.text.as_deref() {
+        let Some(text) = record_indexable_text(r) else {
+            return false;
+        };
+        if !repair_text_matches_query(&text, query) {
+            return false;
+        }
+    }
+    if let Some(query) = req.embedding.as_deref() {
+        let Some(embedding) = r.embedding.as_ref() else {
+            return false;
+        };
+        if !r.policy.vector_allowed || embedding.len() != query.len() {
+            return false;
+        }
+    }
+    true
+}
+
+fn repair_score(r: &SearchableRecord, req: &SearchRequest) -> f32 {
+    let mut score = 0.0f32;
+    if let Some(query) = req.text.as_deref() {
+        if let Some(text) = record_indexable_text(r) {
+            score = score.max(repair_text_score(&text, query));
+        }
+    }
+    if let Some(query) = req.embedding.as_deref() {
+        if r.policy.vector_allowed {
+            if let Some(embedding) = r.embedding.as_ref() {
+                score = score.max(cosine_similarity(embedding, query));
+            }
+        }
+    }
+    score
+}
+
+fn repair_text_matches_query(text: &str, query: &str) -> bool {
+    let tokens = repair_tokens(text);
+    if tokens.is_empty() {
+        return false;
+    }
+    repair_tokens(query)
+        .into_iter()
+        .all(|q| tokens.iter().any(|t| t == &q))
+}
+
+fn repair_text_score(text: &str, query: &str) -> f32 {
+    let tokens = repair_tokens(text);
+    repair_tokens(query)
+        .into_iter()
+        .filter(|q| tokens.iter().any(|t| t == q))
+        .count() as f32
+}
+
+fn repair_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 /// Concatenate every string value reachable from `metadata` plus

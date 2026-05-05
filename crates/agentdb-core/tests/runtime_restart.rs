@@ -612,15 +612,282 @@ async fn records_and_indexes_survive_restart() {
         .search_records(SearchRequest {
             tenant_id,
             namespace: vec!["kb".into()],
+            sharding_key: Some("kb".into()),
             text: None,
             embedding: None,
             tags: vec![],
             source_filter: None,
             limit: 100,
+            min_visible_record_commit_seq: None,
         })
         .await
         .unwrap();
     assert_eq!(all.len(), 3);
+}
+
+#[tokio::test]
+async fn record_commit_token_survives_restart_for_visible_search() {
+    let dir = TempDir::new().unwrap();
+
+    let (tenant_id, commit_seq, record_id) = {
+        let kv = open_kv(dir.path());
+        let rt = Runtime::with_kv(kv, in_memory_content());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "rec-token".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let written = rt
+            .write_record_with_commit(NewRecord {
+                tenant_id: t.tenant_id.clone(),
+                namespace: vec!["kb".into()],
+                scope: serde_json::json!({}),
+                text: None,
+                metadata: serde_json::json!({"title": "durable token"}),
+                tags: vec![],
+                source: None,
+                embedding: None,
+                policy: IndexingPolicy {
+                    mode: IndexingMode::MetadataOnly,
+                    fields: vec![],
+                    vector_allowed: false,
+                },
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        (
+            t.tenant_id.clone(),
+            written.commit_token.seq,
+            written.record.record_id.clone(),
+        )
+    };
+
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
+    assert_eq!(rt2.record_index_outbox_counts_for_test().unwrap(), (1, 0));
+    let hits = rt2
+        .search_records(SearchRequest {
+            tenant_id,
+            namespace: vec!["kb".into()],
+            sharding_key: Some("kb".into()),
+            text: Some("durable".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: Some(commit_seq),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].record_id.as_str(), record_id.as_str());
+}
+
+#[tokio::test]
+async fn record_index_outbox_persists_delete_mutation() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let kv = open_kv(dir.path());
+        let rt = Runtime::with_kv(kv, in_memory_content());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "rec-outbox-delete".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let written = rt
+            .write_record_with_commit(NewRecord {
+                tenant_id: t.tenant_id.clone(),
+                namespace: vec!["kb".into()],
+                scope: serde_json::json!({}),
+                text: None,
+                metadata: serde_json::json!({"title": "delete me"}),
+                tags: vec![],
+                source: None,
+                embedding: None,
+                policy: IndexingPolicy {
+                    mode: IndexingMode::MetadataOnly,
+                    fields: vec![],
+                    vector_allowed: false,
+                },
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        rt.delete_record(&t.tenant_id, &written.record.record_id)
+            .await
+            .unwrap();
+    }
+
+    let kv2 = open_kv(dir.path());
+    let rt2 = Runtime::with_kv(kv2, in_memory_content());
+    assert_eq!(rt2.record_index_outbox_counts_for_test().unwrap(), (1, 1));
+}
+
+#[tokio::test]
+async fn record_index_outbox_replay_catches_up_lagging_local_index() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "rec-outbox-replay".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let written = rt
+        .write_record_with_commit(NewRecord {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            scope: serde_json::json!({}),
+            text: None,
+            metadata: serde_json::json!({"title": "replay token"}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy: IndexingPolicy {
+                mode: IndexingMode::MetadataOnly,
+                fields: vec![],
+                vector_allowed: false,
+            },
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    rt.simulate_record_index_lag_for_test(&written.record.record_id, 0)
+        .await;
+    let missed = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: Some("kb".into()),
+            text: Some("replay".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert!(missed.is_empty());
+
+    assert_eq!(rt.apply_record_index_outbox_once().await.unwrap(), 1);
+    assert_eq!(rt.apply_record_index_outbox_once().await.unwrap(), 0);
+
+    let hits = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: Some("kb".into()),
+            text: Some("replay".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].record_id.as_str(),
+        written.record.record_id.as_str()
+    );
+}
+
+#[tokio::test]
+async fn global_record_index_is_eventually_consistent_with_token_fallback() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "rec-global-eventual".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let written = rt
+        .write_record_with_commit(NewRecord {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            scope: serde_json::json!({}),
+            text: None,
+            metadata: serde_json::json!({"title": "global token"}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy: IndexingPolicy {
+                mode: IndexingMode::MetadataOnly,
+                fields: vec![],
+                vector_allowed: false,
+            },
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let stale_global = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: None,
+            text: Some("global".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert!(stale_global.is_empty());
+
+    let token_visible = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: None,
+            text: Some("global".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: Some(written.commit_token.seq),
+        })
+        .await
+        .unwrap();
+    assert_eq!(token_visible.len(), 1);
+
+    assert_eq!(rt.apply_record_index_outbox_once().await.unwrap(), 1);
+    let caught_up = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: None,
+            text: Some("global".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(caught_up.len(), 1);
+
+    let stats = rt.record_index_stats().await;
+    assert_eq!(stats.global_index_lag_tokens, 0);
+    assert_eq!(stats.global_index_watermark, written.commit_token.seq);
 }
 
 #[tokio::test]

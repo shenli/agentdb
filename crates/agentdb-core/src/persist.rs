@@ -24,14 +24,14 @@
 
 use std::sync::Arc;
 
+use agentdb_storage::Error as StorageError;
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
-    artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_key,
-    session_alias_key, session_record_key, session_segment_key, skill_record_key,
-    skill_unique_key, tenant_alias_key, tenant_record_key,
+    artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_commit_key,
+    record_index_outbox_key, record_key, session_alias_key, session_record_key,
+    session_segment_key, skill_record_key, skill_unique_key, tenant_alias_key, tenant_record_key,
 };
-use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
     KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
     Result as KvResult, WriteOp,
@@ -48,6 +48,21 @@ use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordIndexMutationOp {
+    Upsert,
+    Delete,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordIndexMutation {
+    pub tenant_id: String,
+    pub record_id: String,
+    pub commit_seq: u64,
+    pub op: RecordIndexMutationOp,
+}
 
 fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {
     key_id.as_ref().map(|key_id| KeyResolution {
@@ -633,7 +648,11 @@ impl Persist {
     /// in one batch so a crash either reveals the new record + index
     /// pair or neither — no half-state where a record is reachable by id
     /// but missing from a namespace prefix scan (or vice versa).
-    pub fn put_record(&self, r: &SearchableRecord) -> KvResult<()> {
+    pub fn put_record_with_commit_seq(
+        &self,
+        r: &SearchableRecord,
+        commit_seq: Option<u64>,
+    ) -> KvResult<()> {
         let ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
@@ -648,7 +667,33 @@ impl Persist {
                 .into_bytes(),
                 value: r.record_id.as_str().as_bytes().to_vec(),
             },
-        ];
+        ]
+        .into_iter()
+        .chain(commit_seq.into_iter().flat_map(|seq| {
+            let op = if r.deleted_at_ms.is_some() {
+                RecordIndexMutationOp::Delete
+            } else {
+                RecordIndexMutationOp::Upsert
+            };
+            let mutation = RecordIndexMutation {
+                tenant_id: r.tenant_id.as_str().to_string(),
+                record_id: r.record_id.as_str().to_string(),
+                commit_seq: seq,
+                op,
+            };
+            [
+                WriteOp::Put {
+                    key: record_commit_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
+                    value: seq.to_be_bytes().to_vec(),
+                },
+                WriteOp::Put {
+                    key: record_index_outbox_key(r.tenant_id.as_str(), seq, r.record_id.as_str())
+                        .into_bytes(),
+                    value: serde_json::to_vec(&mutation).expect("record index mutation serializes"),
+                },
+            ]
+        }))
+        .collect();
         self.kv.write_batch(ops)
     }
 
@@ -770,6 +815,39 @@ impl Persist {
             let (_k, v) = res?;
             let r: SearchableRecord = serde_json::from_slice(&v).expect("record decodes");
             out.push(r);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_record_commit_seqs(&self) -> KvResult<Vec<(String, u64)>> {
+        let prefix = b"record/searchable_commit/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("record_commit key suffix is utf8");
+            let mut split = suffix.splitn(2, '/');
+            let _tenant_id = split.next().expect("tenant_id segment");
+            let record_id = split.next().expect("record_id segment").to_string();
+            if v.len() == 8 {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&v);
+                out.push((record_id, u64::from_be_bytes(bytes)));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_record_index_mutations(&self) -> KvResult<Vec<RecordIndexMutation>> {
+        let prefix = b"record/searchable_index_outbox/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let mutation: RecordIndexMutation =
+                serde_json::from_slice(&v).expect("record index mutation decodes");
+            out.push(mutation);
         }
         Ok(out)
     }

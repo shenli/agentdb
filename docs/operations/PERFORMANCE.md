@@ -136,6 +136,25 @@ cargo bench -p agentdb-index --bench vector_bench
 AGENTDB_HNSW_EF=400 cargo bench -p agentdb-index --bench vector_bench
 ```
 
+## Record Index Lag
+
+Record search has two index paths. Requests with `sharding_key` use the
+owner-local LSI-like index. Requests without `sharding_key` use the GSI-like
+global index, which is updated asynchronously by the record-index outbox worker
+(`AGENTDB_RECORD_INDEX_WORKER_INTERVAL_MS`, default 1000 ms).
+
+Watch `GET /api/admin/indexes/records` for:
+
+- `local_index_lag_tokens`
+- `global_index_lag_tokens`
+- `local_index_repairs_total`
+- `record_index_worker_failures_total`
+- `global_index_apply_failures_total`
+
+Sustained non-zero global lag means no-key searches can miss fresh records
+unless callers pass `min_visible_record_commit_seq`. The maintained SDKs pass
+that token automatically after writes in the same client instance.
+
 ## Snapshot read overhead (M9)
 
 All read primitives now go through a `ReadCtx` that wraps a RocksDB

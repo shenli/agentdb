@@ -51,6 +51,7 @@ use crate::state::AppState;
 const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
+const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -106,6 +107,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/admin/indexes/records", get(get_record_index_status))
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -513,6 +515,12 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         tablet_reassignments_total: snapshot.tablet_reassignments_total,
         last_tick_at_ms: snapshot.last_tick_at_ms,
     })
+}
+
+async fn get_record_index_status(
+    State(s): State<AppState>,
+) -> Json<agentdb_core::RecordIndexStats> {
+    Json(s.runtime.record_index_stats().await)
 }
 
 async fn create_admin_backup(
@@ -2323,9 +2331,9 @@ async fn create_record(
 ) -> Result<Response, ApiError> {
     reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let rec = s
+    let written = s
         .runtime
-        .write_record(NewRecord {
+        .write_record_with_commit(NewRecord {
             tenant_id: tid.clone(),
             namespace: body.namespace,
             scope: body.scope,
@@ -2339,11 +2347,11 @@ async fn create_record(
         })
         .await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
-    Ok(json_with_backpressure(
-        StatusCode::CREATED,
-        Json(rec),
-        backpressure,
-    ))
+    let mut resp = json_with_backpressure(StatusCode::CREATED, Json(written.record), backpressure);
+    if let Ok(value) = HeaderValue::from_str(&written.commit_token.seq.to_string()) {
+        resp.headers_mut().insert(RECORD_COMMIT_SEQ_HEADER, value);
+    }
+    Ok(resp)
 }
 
 /// `GET /api/tenants/:tenant_id/records/:record_id`
@@ -2398,6 +2406,7 @@ async fn search_records(
     let req = SearchRequest {
         tenant_id: tid,
         namespace: parsed.namespace,
+        sharding_key: parsed.sharding_key,
         text: parsed.text,
         // Vector search via GET is intentionally unsupported in V2.2b.
         // See route doc comment.
@@ -2405,6 +2414,7 @@ async fn search_records(
         tags: parsed.tags,
         source_filter,
         limit,
+        min_visible_record_commit_seq: parsed.min_visible_record_commit_seq,
     };
     let records = s.runtime.search_records(req).await?;
     Ok(Json(SearchRecordsResponse { records }))
@@ -2572,6 +2582,7 @@ async fn run_policy_worker(
 struct ParsedSearchQuery {
     text: Option<String>,
     namespace: Vec<String>,
+    sharding_key: Option<String>,
     tags: Vec<String>,
     source_session: Option<String>,
     source_seq: Option<u64>,
@@ -2580,12 +2591,14 @@ struct ParsedSearchQuery {
     source_skill: Option<String>,
     source_event: Option<String>,
     limit: usize,
+    min_visible_record_commit_seq: Option<u64>,
 }
 
 fn parse_search_query(raw: &str) -> ParsedSearchQuery {
     let mut out = ParsedSearchQuery {
         text: None,
         namespace: vec![],
+        sharding_key: None,
         tags: vec![],
         source_session: None,
         source_seq: None,
@@ -2594,6 +2607,7 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
         source_skill: None,
         source_event: None,
         limit: 20,
+        min_visible_record_commit_seq: None,
     };
     if raw.is_empty() {
         return out;
@@ -2611,6 +2625,7 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
         match key.as_str() {
             "text" => out.text = Some(val),
             "namespace" => out.namespace.push(val),
+            "sharding_key" => out.sharding_key = Some(val),
             "tag" => out.tags.push(val),
             "source_session" => out.source_session = Some(val),
             "source_seq" => out.source_seq = val.parse().ok(),
@@ -2622,6 +2637,9 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
                 if let Ok(n) = val.parse() {
                     out.limit = n;
                 }
+            }
+            "min_visible_record_commit_seq" => {
+                out.min_visible_record_commit_seq = val.parse().ok();
             }
             _ => {} // unknown keys are silently ignored
         }
@@ -2693,11 +2711,13 @@ fn search_body_to_request(tenant_id: Id, body: SearchRecordsBody) -> SearchReque
     SearchRequest {
         tenant_id,
         namespace: body.namespace,
+        sharding_key: body.sharding_key,
         text: body.text,
         embedding: body.embedding,
         tags: body.tags,
         source_filter: body.source,
         limit: body.limit.clamp(1, 100),
+        min_visible_record_commit_seq: body.min_visible_record_commit_seq,
     }
 }
 

@@ -101,6 +101,26 @@ GET  /health/ready
 There is no version-gating server flag, Mongo wire listener, or maintained Go
 SDK in the current workspace.
 
+## Record Index Consistency
+
+Record search follows DynamoDB-style secondary-index behavior:
+
+- Searches with `sharding_key` use the owner-local LSI-like record index. This
+  is the read-after-write path for a caller that knows the placement key.
+- Searches without `sharding_key` use the GSI-like global record index. The
+  global index is updated asynchronously from the durable record-index outbox
+  and is eventually consistent.
+- Record writes return `X-AgentDB-Record-Commit-Seq`. Reads can pass
+  `min_visible_record_commit_seq` to require visibility through that commit.
+  If the global index is stale for that token, the runtime falls back to
+  owner-local repair from committed base records before replying.
+- Python and TypeScript SDK clients remember the latest commit sequence per
+  tenant and attach it to later record searches unless the caller supplied an
+  explicit value.
+
+Operational status is exposed at `GET /api/admin/indexes/records`, including
+local/global watermarks, lag tokens, repair counters, and async apply failures.
+
 ## Event Append
 
 Append is atomic per session. The runtime assigns the next session-local `seq`,

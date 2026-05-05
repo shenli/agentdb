@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 
 import { AgentDB, Client, appendResultRef, artifactRef, eventRef } from "../src/index.js";
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -144,6 +144,31 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   assert.equal(replayed[0]?.metadataKeyId, "tenant:ten_1:default");
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/agents/agt_1/sessions")));
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
+});
+
+test("record search carries the last tenant commit sequence", async () => {
+  const bodies: unknown[] = [];
+  const mockFetch = async (url: string | URL, init?: RequestInit) => {
+    const raw = String(url);
+    bodies.push(typeof init?.body === "string" ? JSON.parse(init.body) : undefined);
+    if (raw.endsWith("/records")) {
+      return json({ record_id: "rec_1" }, 201, { "x-agentdb-record-commit-seq": "17" });
+    }
+    if (raw.endsWith("/records/search")) return json({ records: [] });
+    return json({});
+  };
+
+  const c = new Client({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  await c.writeRecord("ten_1", { namespace: ["mem"], text: "x" });
+  await c.searchRecords("ten_1", { namespace: ["mem"], text: "x" });
+  await c.searchRecords("ten_1", {
+    namespace: ["mem"],
+    text: "x",
+    min_visible_record_commit_seq: 99,
+  });
+
+  assert.equal((bodies[1] as Record<string, unknown>).min_visible_record_commit_seq, 17);
+  assert.equal((bodies[2] as Record<string, unknown>).min_visible_record_commit_seq, 99);
 });
 
 test("append requires an agent id", async () => {

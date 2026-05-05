@@ -22,6 +22,7 @@ pub mod agent;
 pub mod artifact;
 pub mod errors;
 pub mod event;
+pub mod global_index;
 pub mod id;
 pub mod idempotency;
 pub(crate) mod persist;
@@ -46,8 +47,8 @@ pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
     ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
-    LifecycleSweepReport, PolicyWorkerReport, ReplayResponse, Runtime, SessionStorageSummary,
-    TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
+    LifecycleSweepReport, PolicyWorkerReport, RecordIndexStats, ReplayResponse, Runtime,
+    SessionStorageSummary, TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
 };
 pub use segment::{
     SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,

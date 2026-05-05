@@ -30,6 +30,7 @@ from .client import (
 from .errors import AgentDBError, SubscriptionClosed, from_response
 
 TokenProvider = Callable[[], Union[str, Awaitable[str]]]
+_RECORD_COMMIT_SEQ_HEADER = "X-AgentDB-Record-Commit-Seq"
 
 
 class AsyncClient:
@@ -52,6 +53,7 @@ class AsyncClient:
         self.timeout = timeout
         self._owns_client = _client is None
         self._http = _client or httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        self._record_commit_seq_by_tenant: dict[str, int] = {}
 
     @property
     def authenticated(self) -> bool:
@@ -148,9 +150,15 @@ class AsyncClient:
         raise from_response(resp.status_code, _response_body(resp))
 
     async def write_record(self, tenant_id: TenantId, **body: Any) -> dict:
-        return await self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records", json=body)
+        resp = await self._raw_request(
+            "POST", f"/api/tenants/{_quote(tenant_id)}/records", json=body
+        )
+        data = _decode(resp)
+        self._capture_record_commit_seq(tenant_id, resp)
+        return data
 
     async def search_records(self, tenant_id: TenantId, **body: Any) -> list:
+        body = self._with_record_commit_seq(tenant_id, body)
         data = await self._request(
             "POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body
         )
@@ -254,6 +262,25 @@ class AsyncClient:
         if hasattr(result, "__await__"):
             return await result  # type: ignore[no-any-return]
         return result  # type: ignore[return-value]
+
+    def _capture_record_commit_seq(self, tenant_id: TenantId, resp: httpx.Response) -> None:
+        raw = getattr(resp, "headers", {}).get(_RECORD_COMMIT_SEQ_HEADER)
+        if not raw:
+            return
+        try:
+            seq = int(raw)
+        except ValueError:
+            return
+        if seq > 0:
+            self._record_commit_seq_by_tenant[tenant_id] = max(
+                self._record_commit_seq_by_tenant.get(tenant_id, 0), seq
+            )
+
+    def _with_record_commit_seq(self, tenant_id: TenantId, body: dict) -> dict:
+        seq = self._record_commit_seq_by_tenant.get(tenant_id)
+        if seq is None or "min_visible_record_commit_seq" in body:
+            return body
+        return {**body, "min_visible_record_commit_seq": seq}
 
 
 class AsyncSession:
