@@ -31,8 +31,8 @@ Behavior depends on which `resource` is missing.
    that used to exist.
 2. Check the tenant view for that id:
 
-   ```
-   curl https://<node>/api/admin/sessions/<id>
+   ```bash
+   agentdbctl --url https://<node> raw get /api/admin/sessions/<id>
    ```
 
    If 404 there too, the session genuinely doesn't exist on the box
@@ -46,8 +46,9 @@ Behavior depends on which `resource` is missing.
    id is out of range for this cluster's `AGENTDB_BOXES`.
 2. Compare the path id against:
 
-   ```
-   curl https://<node>/api/admin/boxes | jq '.[].id'
+   ```bash
+   agentdbctl --url https://<node> -o json raw get /api/admin/boxes \
+     | jq '.[].id'
    ```
 
 ## Verify
@@ -83,6 +84,6 @@ Behavior depends on which `resource` is missing.
   code so clients that point at the wrong tenant get a more
   actionable signal than a generic 404 (separate PR; depends on M19
   SCRAM).
-- Keep `/api/admin/sessions/{id}` in your incident-response
-  playbook so operators don't have to grep RocksDB dumps to answer
-  "does this session still exist?"
+- Keep `agentdbctl raw get /api/admin/sessions/{id}` in your
+  incident-response playbook so operators don't have to grep RocksDB dumps to
+  answer "does this session still exist?"

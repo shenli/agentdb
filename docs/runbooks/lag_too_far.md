@@ -30,8 +30,9 @@ where the SDK exposes that lower-level signal.
    similar shapes.
 2. Inspect the publisher rate on the affected session(s):
 
-   ```
-   curl -s http://<node>:7878/api/admin/sessions/<sid>?tenant_id=<tid> | jq '.next_seq'
+   ```bash
+   agentdbctl --url http://<node>:7878 -o json raw get '/api/admin/sessions/<sid>?tenant_id=<tid>' \
+     | jq '.next_seq'
    ```
 
    Watch how fast `next_seq` grows. If the gap between

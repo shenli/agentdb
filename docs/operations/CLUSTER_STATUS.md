@@ -49,6 +49,17 @@ If you are looking for those workflows, the answer today is:
 
 ## What Is Implemented Now
 
+For human and AI-agent operations, use [agentdbctl](AGENTDBCTL.md). The
+endpoint names below document the backend API surface for precision; normal
+operator workflows should use the CLI equivalents first:
+
+```bash
+agentdbctl status
+agentdbctl nodes list
+agentdbctl tablets list
+agentdbctl drain status
+```
+
 The repository now has cluster-facing visibility endpoints:
 
 - `GET /api/admin/scheduler`
@@ -62,30 +73,31 @@ The repository now has cluster-facing visibility endpoints:
 
 And a very small amount of direct metadata admin:
 
-- `POST /api/admin/drain` for one-way local drain activation
-- `POST /api/admin/nodes` for explicit node registration/upsert
-- `DELETE /api/admin/nodes/{node_id}` for operator cleanup of a stale node row
-- `POST /api/admin/nodes/{node_id}/maintenance` for marking nodes `alive`,
-  `draining`, or `maintenance`; setting the local node to `alive` clears the
-  local drain flag
-- `POST /api/admin/tablets/create` for idempotent tablet metadata creation
-- `POST /api/admin/tablets/{tablet_id}/assign` for pre-claiming an unowned
-  tablet on a fresh `alive` node
-- `POST /api/admin/tablets/{tablet_id}/relinquish` for force-clearing current
+- `agentdbctl drain start` for one-way local drain activation
+- `agentdbctl nodes register ...` for explicit node registration/upsert
+- `agentdbctl nodes delete <node_id>` for operator cleanup of a stale node row
+- `agentdbctl nodes maintenance <node_id> alive|draining|maintenance` for node
+  maintenance state; setting the local node to `alive` clears the local drain
+  flag
+- `agentdbctl tablets create <tablet_id>` for idempotent tablet metadata
+  creation
+- `agentdbctl tablets assign <tablet_id> <node_id>` for pre-claiming an
+  unowned tablet on a fresh `alive` node
+- `agentdbctl tablets relinquish <tablet_id>` for force-clearing current
   ownership and fencing the old epoch
-- `POST /api/admin/tablets/{tablet_id}/handoff` for cooperative ownership
-  movement
-- `POST /api/admin/tablets/{tablet_id}/handoff/complete` for source-owner
-  handoff acknowledgement
-- `POST /api/admin/tablets/{tablet_id}/handoff/cancel` for retracting a handoff
+- `agentdbctl tablets handoff <tablet_id> <target_node_id>` for cooperative
+  ownership movement
+- `agentdbctl tablets complete-handoff <tablet_id> <expected_source_node_id>`
+  for source-owner handoff acknowledgement
+- `agentdbctl tablets cancel-handoff <tablet_id>` for retracting a handoff
   signal
-- `POST /api/admin/tablets/rebalance` for a dry-run/apply pass that assigns
-  unowned tablets, moves tablets away from fresh draining nodes, and evens out
-  fresh `alive` node load
-- `POST /api/admin/backups` for an online backup manifest and optional
+- `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
+  for assigning unowned tablets, moving tablets away from fresh draining nodes,
+  and evening out fresh `alive` node load
+- `agentdbctl backup create ...` for an online backup manifest and optional
   metadata snapshot
-- `POST /api/admin/restores` for backup manifest validation; online destructive
-  restore apply is intentionally not supported
+- `agentdbctl restore validate <manifest-path>` for backup manifest validation;
+  online destructive restore apply is intentionally not supported
 
 These help operators and developers inspect control-plane state and clean up
 obviously-bad metadata rows. They also provide the first useful node
@@ -181,6 +193,8 @@ claim.
 
 - [DEPLOYMENT.md](DEPLOYMENT.md) - deployment choices and current support
 - [OPERATIONS.md](OPERATIONS.md) - day-2 single-node operations
+- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+  operations
 - [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
   bootstrap model
 - [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster

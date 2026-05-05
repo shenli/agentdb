@@ -30,8 +30,8 @@ honors it before retrying.
 
 2. Check the box's current quota config:
 
-   ```
-   curl https://<node>/api/admin/boxes/<box_id>
+   ```bash
+   agentdbctl --url https://<node> raw get /api/admin/boxes/<box_id>
    ```
 
    Compare `quota.max_qps`, `quota.max_tenant_qps`, and `quota.burst`
@@ -39,8 +39,9 @@ honors it before retrying.
 
 3. Pull the box metrics:
 
-   ```
-   curl https://<node>/api/admin/boxes/<box_id> | jq '.metrics.quota_hits'
+   ```bash
+   agentdbctl --url https://<node> -o json raw get /api/admin/boxes/<box_id> \
+     | jq '.metrics.quota_hits'
    ```
 
    A growing `quota_hits` counter confirms the gate is the bottleneck.
@@ -63,10 +64,9 @@ honors it before retrying.
 
 1. **Legitimate traffic growth.** Raise the relevant quota:
 
-   ```
-   curl -XPOST -H 'Content-Type: application/json' \
-     -d '{"max_qps":500,"max_tenant_qps":200,"burst":1000}' \
-     https://<node>/api/admin/boxes/<box_id>/quota
+   ```bash
+   agentdbctl --url https://<node> raw post /api/admin/boxes/<box_id>/quota \
+     --body '{"max_qps":500,"max_tenant_qps":200,"burst":1000}'
    ```
 
    Quota changes take effect at the next `admit` call for each

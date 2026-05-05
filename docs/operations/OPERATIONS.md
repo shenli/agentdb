@@ -4,7 +4,8 @@ This document covers day-2 operation of the **supported** AgentDB deployment
 shape: one server node.
 
 For deployment choices, see [DEPLOYMENT.md](DEPLOYMENT.md). For multi-node
-status, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+status, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md). For human and AI-agent
+operations, use [agentdbctl](AGENTDBCTL.md) by default.
 
 ## Scope
 
@@ -38,12 +39,17 @@ agentdb doctor --config /etc/agentdb/agentdb.toml
 agentdb serve --config /etc/agentdb/agentdb.toml
 ```
 
-Useful endpoints:
+Useful checks:
 
 ```bash
-curl -fsS http://127.0.0.1:7878/health/ready
+agentdbctl status
+agentdbctl -o json status
 open http://127.0.0.1:7878/dashboard/
 ```
+
+Load balancers and uptime probes should still use `/health/ready`. Operators
+should usually use `agentdbctl status` because it aggregates health, readiness,
+scheduler, and drain state in one command.
 
 ## Configuration
 
@@ -89,6 +95,19 @@ directory while writes are active unless you are using a crash-consistent
 filesystem snapshot.
 
 ## Backup And Restore
+
+For online backup manifests and restore validation, use `agentdbctl`:
+
+```bash
+agentdbctl backup create \
+  --backup-id nightly-2026-05-05 \
+  --directory /var/backups/agentdb
+
+agentdbctl restore validate /var/backups/agentdb/nightly-2026-05-05/manifest.json
+```
+
+The online backup command writes a manifest and optional metadata snapshot. It
+does not replace a full runtime data backup for local RocksDB deployments.
 
 ### Local Storage
 
@@ -136,7 +155,7 @@ Recommended sequence:
 3. install the new binary
 4. run `agentdb doctor --config <path>`
 5. start the node with the same config
-6. verify `/health/ready` and the dashboard
+6. verify `agentdbctl status` and the dashboard
 
 Example:
 
