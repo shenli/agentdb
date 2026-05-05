@@ -60,6 +60,7 @@ pub fn routes() -> Router<AppState> {
         .route("/health/ready", get(health_ready))
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
+        .route("/api/admin/scheduler", get(get_admin_scheduler))
         .route("/api/admin/drain", get(get_admin_drain).post(post_admin_drain))
         .route(
             "/api/admin/nodes",
@@ -281,6 +282,17 @@ struct DrainStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SchedulerStatusResponse {
+    leader_node_id: Option<String>,
+    leader_epoch: i64,
+    leader_expires_at_ms: i64,
+    is_leader: bool,
+    dead_nodes_marked_total: u64,
+    tablet_reassignments_total: u64,
+    last_tick_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct ClusterHealthSummary {
     node_count: usize,
     alive_node_count: usize,
@@ -355,6 +367,31 @@ async fn post_admin_drain(State(s): State<AppState>) -> Result<Json<DrainStatusR
             .map_err(|err| ApiError(agentdb_core::Error::new(ErrorCode::Internal, err.to_string())))?;
     }
     Ok(Json(drain_status_response(&s)))
+}
+
+async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusResponse> {
+    let snapshot = s
+        .scheduler
+        .as_ref()
+        .map(|status| status.snapshot())
+        .unwrap_or(crate::state::SchedulerStatusSnapshot {
+            leader_node_id: None,
+            leader_epoch: 0,
+            leader_expires_at_ms: 0,
+            is_leader: false,
+            dead_nodes_marked_total: 0,
+            tablet_reassignments_total: 0,
+            last_tick_at_ms: 0,
+        });
+    Json(SchedulerStatusResponse {
+        leader_node_id: snapshot.leader_node_id,
+        leader_epoch: snapshot.leader_epoch,
+        leader_expires_at_ms: snapshot.leader_expires_at_ms,
+        is_leader: snapshot.is_leader,
+        dead_nodes_marked_total: snapshot.dead_nodes_marked_total,
+        tablet_reassignments_total: snapshot.tablet_reassignments_total,
+        last_tick_at_ms: snapshot.last_tick_at_ms,
+    })
 }
 
 async fn get_admin_nodes(

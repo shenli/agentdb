@@ -50,6 +50,7 @@ If you are looking for those workflows, the answer today is:
 
 The repository now has some read-only cluster-facing visibility endpoints:
 
+- `GET /api/admin/scheduler`
 - `GET /api/admin/drain`
 - `GET /api/admin/nodes`
 - `GET /api/admin/tablets`
@@ -69,6 +70,17 @@ obviously-bad metadata rows, and they provide the first step of planned node
 maintenance by refusing new mutations on a drained node. They still do **not**
 add the full cluster control plane or day-2 workflows described in the
 target-state docs.
+
+The server also now runs a small amount of real control-plane background work
+when metadata-backed cluster mode is enabled:
+
+- periodic node heartbeat/upsert
+- singleton scheduler-leader lease acquisition/renewal
+- stale-node detection (`alive` -> `dead`)
+- expired-tablet ownership clearing
+
+This is the first live convergence loop in the product, but it is still a
+small subset of the eventual cluster control plane.
 
 ## Kubernetes Clarification
 

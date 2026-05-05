@@ -167,10 +167,14 @@ Status:
 - `GET /api/admin/cluster/readiness` exists
 - `GET /api/admin/drain` and `POST /api/admin/drain` now exist for
   one-way local drain activation and verification
+- `GET /api/admin/scheduler` now exists for leader/reaper visibility
 - `GET /api/admin/nodes` exists
 - `GET /api/admin/tablets` exists
 - node registration and metadata cleanup now have a minimal surface via
   `POST /api/admin/nodes` and `DELETE /api/admin/nodes/{node_id}`
+- the first live convergence loop now exists in cluster mode:
+  node heartbeat/upsert, scheduler leader lease, stale-node marking, and
+  expired-tablet ownership clearing
 - the broader operator surface is still incomplete: there is no supported
   maintenance/undrain, handoff, rebalance, backup, or restore API yet
 

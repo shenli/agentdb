@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::routing::get;
 use clap::Parser;
@@ -20,6 +21,12 @@ const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
 const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
+const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
+const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
+const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
+const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
+const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -219,17 +226,31 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .or(config.route_location.clone());
     if let Some(node_id) = config.route_node_id.as_deref() {
         let meta = agentdb_meta::MetaStore::open_from_env().await?;
+        let scheduler_status = agentdb_api::state::SchedulerStatus::new();
         let snapshot =
             load_route_snapshot(&meta, config.route_shard_count, route_location.clone()).await?;
         let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
         spawn_route_snapshot_refresher(
-            meta,
+            meta.clone(),
             routing.clone(),
             config.route_shard_count,
             route_location.clone(),
             config.route_refresh_interval_ms,
         );
-        state = state.with_meta(meta.clone()).with_routing(routing);
+        let node_address = format!("http://{}", config.bind);
+        spawn_cluster_workers(
+            meta.clone(),
+            node_id.to_string(),
+            node_address,
+            config.route_region.clone(),
+            scheduler_status.clone(),
+            state.drain.clone(),
+            ClusterWorkerConfig::from_env(),
+        );
+        state = state
+            .with_meta(meta.clone())
+            .with_scheduler(scheduler_status)
+            .with_routing(routing);
         tracing::info!(
             node_id,
             shard_count = config.route_shard_count,
@@ -265,6 +286,46 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClusterWorkerConfig {
+    heartbeat_interval_ms: u64,
+    scheduler_lease_ms: i64,
+    scheduler_renew_interval_ms: u64,
+    stale_node_threshold_ms: i64,
+    reaper_tick_ms: u64,
+    reaper_safety_margin_ms: i64,
+}
+
+impl ClusterWorkerConfig {
+    fn from_env() -> Self {
+        Self {
+            heartbeat_interval_ms: env_u64(
+                "AGENTDB_NODE_HEARTBEAT_MS",
+                DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS,
+            )
+            .max(100),
+            scheduler_lease_ms: env_i64("AGENTDB_SCHEDULER_LEASE_MS", DEFAULT_SCHEDULER_LEASE_MS)
+                .max(1_000),
+            scheduler_renew_interval_ms: env_u64(
+                "AGENTDB_SCHEDULER_RENEW_INTERVAL_MS",
+                DEFAULT_SCHEDULER_RENEW_INTERVAL_MS,
+            )
+            .max(100),
+            stale_node_threshold_ms: env_i64(
+                "AGENTDB_STALE_NODE_THRESHOLD_MS",
+                DEFAULT_STALE_NODE_THRESHOLD_MS,
+            )
+            .max(1_000),
+            reaper_tick_ms: env_u64("AGENTDB_REAPER_TICK_MS", DEFAULT_REAPER_TICK_MS).max(100),
+            reaper_safety_margin_ms: env_i64(
+                "AGENTDB_REAPER_SAFETY_MARGIN_MS",
+                DEFAULT_REAPER_SAFETY_MARGIN_MS,
+            )
+            .max(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -920,6 +981,143 @@ fn spawn_route_snapshot_refresher(
     });
 }
 
+fn spawn_cluster_workers(
+    meta: agentdb_meta::MetaStore,
+    node_id: String,
+    node_address: String,
+    region: Option<String>,
+    scheduler_status: agentdb_api::state::SchedulerStatus,
+    drain: agentdb_api::state::DrainState,
+    config: ClusterWorkerConfig,
+) {
+    let heartbeat_meta = meta.clone();
+    let heartbeat_node_id = node_id.clone();
+    let heartbeat_node_address = node_address.clone();
+    let heartbeat_region = region.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        loop {
+            interval.tick().await;
+            let now_ms = now_ms_i64();
+            let state = if drain.is_draining() {
+                "draining"
+            } else {
+                "alive"
+            };
+            if let Err(error) = heartbeat_node_once(
+                &heartbeat_meta,
+                &heartbeat_node_id,
+                &heartbeat_node_address,
+                heartbeat_region.as_deref(),
+                state,
+                now_ms,
+            )
+            .await
+            {
+                tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(config.scheduler_renew_interval_ms.max(config.reaper_tick_ms)));
+        loop {
+            interval.tick().await;
+            let now_ms = now_ms_i64();
+            if let Err(error) =
+                run_cluster_scheduler_tick(&meta, &node_id, now_ms, config, &scheduler_status).await
+            {
+                tracing::warn!(node_id = %node_id, error = %error, "cluster scheduler tick failed");
+            }
+        }
+    });
+}
+
+async fn heartbeat_node_once(
+    meta: &agentdb_meta::MetaStore,
+    node_id: &str,
+    node_address: &str,
+    region: Option<&str>,
+    state: &str,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<()> {
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        node_id,
+        node_address,
+        None,
+        state,
+        now_ms,
+        None,
+        region,
+    )
+    .await
+}
+
+async fn run_cluster_scheduler_tick(
+    meta: &agentdb_meta::MetaStore,
+    node_id: &str,
+    now_ms: i64,
+    config: ClusterWorkerConfig,
+    status: &agentdb_api::state::SchedulerStatus,
+) -> agentdb_meta::MetaResult<()> {
+    status.set_last_tick_at_ms(now_ms);
+    let pool = meta.pool();
+    let leader_row = match agentdb_meta::scheduler::get(pool).await? {
+        Some(current)
+            if current.node_id == node_id && current.is_live(now_ms) =>
+        {
+            agentdb_meta::scheduler::renew(pool, node_id, current.epoch, now_ms + config.scheduler_lease_ms).await?
+        }
+        _ => match agentdb_meta::scheduler::try_acquire(pool, node_id, config.scheduler_lease_ms, now_ms).await? {
+            Some(row) => row,
+            None => {
+                if let Some(current) = agentdb_meta::scheduler::get(pool).await? {
+                    status.update_leader(
+                        &current.node_id,
+                        current.epoch,
+                        current.expires_at_ms,
+                        current.node_id == node_id && current.is_live(now_ms),
+                    );
+                } else {
+                    status.set_not_leader();
+                }
+                return Ok(());
+            }
+        },
+    };
+
+    let is_leader = leader_row.node_id == node_id && leader_row.is_live(now_ms);
+    status.update_leader(
+        &leader_row.node_id,
+        leader_row.epoch,
+        leader_row.expires_at_ms,
+        is_leader,
+    );
+    if !is_leader {
+        return Ok(());
+    }
+
+    let dead_nodes = agentdb_meta::nodes::mark_dead_if_stale(pool, now_ms - config.stale_node_threshold_ms).await?;
+    if !dead_nodes.is_empty() {
+        status.add_dead_nodes_marked(dead_nodes.len() as u64);
+        tracing::info!(node_id = %node_id, dead_nodes = ?dead_nodes, "scheduler marked stale nodes dead");
+    }
+
+    let cleared = agentdb_meta::tablets::clear_expired_ownership(
+        pool,
+        config.reaper_safety_margin_ms,
+        now_ms,
+    )
+    .await?;
+    if !cleared.is_empty() {
+        status.add_tablet_reassignments(cleared.len() as u64);
+        tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
+    }
+    Ok(())
+}
+
 async fn refresh_route_snapshot(
     meta: &agentdb_meta::MetaStore,
     routing: &agentdb_api::routing_http::RouteRuntime,
@@ -937,9 +1135,31 @@ async fn refresh_route_snapshot(
     }
 }
 
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentdb_meta::{nodes, tablets, MetaStore};
 
     fn base_opts() -> ServeOpts {
         ServeOpts {
@@ -1214,5 +1434,102 @@ region = "us-west-2"
             deployment_support_note(&config),
             Some("single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment")
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_node_once_upserts_node_row() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        heartbeat_node_once(
+            &meta,
+            "node-a",
+            "http://127.0.0.1:18080",
+            Some("us-west-2"),
+            "alive",
+            1_000,
+        )
+        .await
+        .unwrap();
+        let node = nodes::get(meta.pool(), "node-a").await.unwrap().unwrap();
+        assert_eq!(node.address, "http://127.0.0.1:18080");
+        assert_eq!(node.state, "alive");
+        assert_eq!(node.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_tick_marks_stale_nodes_and_clears_expired_tablets() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 500)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+        };
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+            .await
+            .unwrap();
+
+        let stale_node = nodes::get(meta.pool(), "node-b").await.unwrap().unwrap();
+        assert_eq!(stale_node.state, "dead");
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert!(tablet.owner_node_id.is_none());
+
+        let snapshot = status.snapshot();
+        assert!(snapshot.is_leader);
+        assert_eq!(snapshot.dead_nodes_marked_total, 1);
+        assert_eq!(snapshot.tablet_reassignments_total, 1);
+        assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_tick_as_follower_does_not_reap() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "leader-a", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 500)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+        };
+        run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
+            .await
+            .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_leader);
+        assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
+        assert_eq!(snapshot.tablet_reassignments_total, 0);
     }
 }

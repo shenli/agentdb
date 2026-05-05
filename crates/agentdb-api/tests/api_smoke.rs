@@ -1011,6 +1011,38 @@ async fn admin_drain_marks_node_and_rejects_new_mutations() {
 }
 
 #[tokio::test]
+async fn admin_scheduler_reports_status_snapshot() {
+    let runtime = Runtime::in_memory();
+    let scheduler = agentdb_api::state::SchedulerStatus::new();
+    scheduler.update_leader("node-a", 7, 42_000, true);
+    scheduler.add_dead_nodes_marked(2);
+    scheduler.add_tablet_reassignments(3);
+    scheduler.set_last_tick_at_ms(41_000);
+    let state = AppState::new(runtime).with_scheduler(scheduler);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/scheduler", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["leader_node_id"], "node-a");
+    assert_eq!(body["leader_epoch"], 7);
+    assert_eq!(body["leader_expires_at_ms"], 42_000);
+    assert_eq!(body["is_leader"], true);
+    assert_eq!(body["dead_nodes_marked_total"], 2);
+    assert_eq!(body["tablet_reassignments_total"], 3);
+    assert_eq!(body["last_tick_at_ms"], 41_000);
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
