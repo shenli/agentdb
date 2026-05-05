@@ -15,7 +15,7 @@ use agentdb_api::{
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
-use agentdb_meta::{nodes::Node, tablets::Tablet};
+use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
 use common::{spawn_app, spawn_app_with_state, TestApp};
 use serde_json::json;
 
@@ -129,13 +129,11 @@ async fn list_tenants_and_sessions_returns_counts_and_rows() {
         .await
         .unwrap();
     assert!(tenants["count"].as_u64().unwrap() >= 1);
-    assert!(
-        tenants["tenants"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tenant| tenant["tenant_id"] == tid)
-    );
+    assert!(tenants["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tenant| tenant["tenant_id"] == tid));
 
     let agents: serde_json::Value = app
         .client
@@ -149,13 +147,11 @@ async fn list_tenants_and_sessions_returns_counts_and_rows() {
         .await
         .unwrap();
     assert!(agents["count"].as_u64().unwrap() >= 1);
-    assert!(
-        agents["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["agent_id"] == aid)
-    );
+    assert!(agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|agent| agent["agent_id"] == aid));
 
     let sessions: serde_json::Value = app
         .client
@@ -169,13 +165,11 @@ async fn list_tenants_and_sessions_returns_counts_and_rows() {
         .await
         .unwrap();
     assert!(sessions["count"].as_u64().unwrap() >= 1);
-    assert!(
-        sessions["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|session| session["session_id"] == sid && session["agent_id"] == aid)
-    );
+    assert!(sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["session_id"] == sid && session["agent_id"] == aid));
 }
 
 #[tokio::test]
@@ -764,6 +758,152 @@ async fn admin_cluster_readiness_rejects_stale_local_node() {
 }
 
 #[tokio::test]
+async fn admin_nodes_returns_rows_with_staleness() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-b",
+        "http://127.0.0.1:18081",
+        None,
+        "draining",
+        0,
+        Some("us-west-2b"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/nodes?stale_threshold_ms=1", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|row| row["node_id"] == "node-a" && row["is_stale"] == false));
+    assert!(rows.iter().any(|row| row["node_id"] == "node-b"
+        && row["state"] == "draining"
+        && row["is_stale"] == true));
+}
+
+#[tokio::test]
+async fn admin_tablets_returns_rows() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablets::get_or_create(meta.pool(), 7, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 500)
+        .await
+        .unwrap();
+    agentdb_meta::tablets::mark_for_handoff(meta.pool(), 7, "node-b")
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tablets", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["tablet_id"], 7);
+    assert_eq!(rows[0]["owner_node_id"], "node-a");
+    assert_eq!(rows[0]["handoff_target_node_id"], "node-b");
+}
+
+#[tokio::test]
+async fn admin_nodes_returns_503_when_meta_is_missing() {
+    let app = spawn_app().await;
+
+    let response = app
+        .client
+        .get(format!("{}/api/admin/nodes", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "KEY_UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn admin_node_register_and_delete_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let registered: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/nodes", app.base))
+        .json(&json!({
+            "node_id": "node-z",
+            "address": "http://127.0.0.1:19999",
+            "state": "alive",
+            "availability_zone": "us-west-2a",
+            "region": "us-west-2"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(registered["node_id"], "node-z");
+    assert_eq!(registered["address"], "http://127.0.0.1:19999");
+
+    let deleted: serde_json::Value = app
+        .client
+        .delete(format!("{}/api/admin/nodes/node-z", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["node_id"], "node-z");
+    assert_eq!(deleted["removed"], true);
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
@@ -1192,7 +1332,12 @@ fn node(id: &str, address: &str) -> Node {
     node_with_state_and_heartbeat(id, address, "alive", now_ms_i64())
 }
 
-fn node_with_state_and_heartbeat(id: &str, address: &str, state: &str, last_heartbeat_ms: i64) -> Node {
+fn node_with_state_and_heartbeat(
+    id: &str,
+    address: &str,
+    state: &str,
+    last_heartbeat_ms: i64,
+) -> Node {
     Node {
         node_id: id.into(),
         address: address.into(),

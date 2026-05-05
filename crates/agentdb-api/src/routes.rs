@@ -15,7 +15,7 @@ use axum::{
     extract::{DefaultBodyLimit, OriginalUri, Path, Query, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ use agentdb_core::{
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
+use agentdb_meta::{nodes, tablets};
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
@@ -59,6 +60,12 @@ pub fn routes() -> Router<AppState> {
         .route("/health/ready", get(health_ready))
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
+        .route(
+            "/api/admin/nodes",
+            get(get_admin_nodes).post(register_admin_node),
+        )
+        .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
+        .route("/api/admin/tablets", get(get_admin_tablets))
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -67,7 +74,10 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id",
             get(get_tenant).delete(delete_tenant),
         )
-        .route("/api/tenants/:tenant_id/agents", get(list_agents).post(create_agent))
+        .route(
+            "/api/tenants/:tenant_id/agents",
+            get(list_agents).post(create_agent),
+        )
         .route(
             "/api/tenants/:tenant_id/agents/:agent_id",
             get(get_agent).delete(delete_agent),
@@ -194,6 +204,45 @@ struct ClusterAdminQuery {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminNodeView {
+    node_id: String,
+    address: String,
+    mongo_address: Option<String>,
+    state: String,
+    last_heartbeat_ms: i64,
+    joined_at_ms: i64,
+    availability_zone: Option<String>,
+    region: Option<String>,
+    is_stale: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterNodeBody {
+    node_id: String,
+    address: String,
+    mongo_address: Option<String>,
+    state: Option<String>,
+    availability_zone: Option<String>,
+    region: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteAdminNodeResponse {
+    node_id: String,
+    removed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletView {
+    tablet_id: i64,
+    owner_node_id: Option<String>,
+    epoch: i64,
+    lease_expires_at_ms: i64,
+    created_at_ms: i64,
+    handoff_target_node_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ClusterHealthSummary {
     node_count: usize,
     alive_node_count: usize,
@@ -252,6 +301,154 @@ async fn get_cluster_readiness(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(readiness)).into_response()
+}
+
+async fn get_admin_nodes(
+    State(s): State<AppState>,
+    Query(query): Query<ClusterAdminQuery>,
+) -> Result<Json<Vec<AdminNodeView>>, ApiError> {
+    let meta = s.meta.as_ref().ok_or_else(|| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::KeyUnavailable,
+            "metadata-backed cluster admin is not configured on this node",
+        ))
+    })?;
+    let stale_threshold_ms = query.stale_threshold_ms.unwrap_or(15_000);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let rows = nodes::list_all(meta.pool()).await.map_err(|err| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::Internal,
+            err.to_string(),
+        ))
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|node| AdminNodeView {
+                is_stale: now_ms - node.last_heartbeat_ms > stale_threshold_ms,
+                node_id: node.node_id,
+                address: node.address,
+                mongo_address: node.mongo_address,
+                state: node.state,
+                last_heartbeat_ms: node.last_heartbeat_ms,
+                joined_at_ms: node.joined_at_ms,
+                availability_zone: node.availability_zone,
+                region: node.region,
+            })
+            .collect(),
+    ))
+}
+
+async fn register_admin_node(
+    State(s): State<AppState>,
+    Json(body): Json<RegisterNodeBody>,
+) -> Result<Json<AdminNodeView>, ApiError> {
+    let meta = s.meta.as_ref().ok_or_else(|| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::KeyUnavailable,
+            "metadata-backed cluster admin is not configured on this node",
+        ))
+    })?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let state = body.state.unwrap_or_else(|| "alive".into());
+    nodes::upsert(
+        meta.pool(),
+        &body.node_id,
+        &body.address,
+        body.mongo_address.as_deref(),
+        &state,
+        now_ms,
+        body.availability_zone.as_deref(),
+        body.region.as_deref(),
+    )
+    .await
+    .map_err(|err| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::Internal,
+            err.to_string(),
+        ))
+    })?;
+    let node = nodes::get(meta.pool(), &body.node_id)
+        .await
+        .map_err(|err| {
+            ApiError(agentdb_core::Error::new(
+                ErrorCode::Internal,
+                err.to_string(),
+            ))
+        })?
+        .ok_or_else(|| {
+            ApiError(agentdb_core::Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "registered node {} disappeared from metadata store",
+                    body.node_id
+                ),
+            ))
+        })?;
+    Ok(Json(AdminNodeView {
+        is_stale: false,
+        node_id: node.node_id,
+        address: node.address,
+        mongo_address: node.mongo_address,
+        state: node.state,
+        last_heartbeat_ms: node.last_heartbeat_ms,
+        joined_at_ms: node.joined_at_ms,
+        availability_zone: node.availability_zone,
+        region: node.region,
+    }))
+}
+
+async fn delete_admin_node(
+    State(s): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<DeleteAdminNodeResponse>, ApiError> {
+    let meta = s.meta.as_ref().ok_or_else(|| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::KeyUnavailable,
+            "metadata-backed cluster admin is not configured on this node",
+        ))
+    })?;
+    let removed = nodes::remove(meta.pool(), &node_id).await.map_err(|err| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::Internal,
+            err.to_string(),
+        ))
+    })?;
+    Ok(Json(DeleteAdminNodeResponse { node_id, removed }))
+}
+
+async fn get_admin_tablets(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
+    let meta = s.meta.as_ref().ok_or_else(|| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::KeyUnavailable,
+            "metadata-backed cluster admin is not configured on this node",
+        ))
+    })?;
+    let rows = tablets::list_all(meta.pool()).await.map_err(|err| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::Internal,
+            err.to_string(),
+        ))
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|tablet| AdminTabletView {
+                tablet_id: tablet.tablet_id,
+                owner_node_id: tablet.owner_node_id,
+                epoch: tablet.epoch,
+                lease_expires_at_ms: tablet.lease_expires_at_ms,
+                created_at_ms: tablet.created_at_ms,
+                handoff_target_node_id: tablet.handoff_target_node_id,
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,9 +567,13 @@ fn build_cluster_health(
                 .iter()
                 .filter(|tablet| {
                     tablet.owner_node_id.as_ref().is_some_and(|owner_id| {
-                        snapshot.nodes.iter().find(|node| &node.node_id == owner_id).is_some_and(
-                            |node| now_ms - node.last_heartbeat_ms > stale_threshold_ms,
-                        )
+                        snapshot
+                            .nodes
+                            .iter()
+                            .find(|node| &node.node_id == owner_id)
+                            .is_some_and(|node| {
+                                now_ms - node.last_heartbeat_ms > stale_threshold_ms
+                            })
                     })
                 })
                 .count();
@@ -389,7 +590,9 @@ fn build_cluster_health(
                 issues.push("local node heartbeat is stale".into());
             }
             if unowned_tablet_count > 0 {
-                issues.push(format!("{unowned_tablet_count} tablet(s) are currently unowned"));
+                issues.push(format!(
+                    "{unowned_tablet_count} tablet(s) are currently unowned"
+                ));
             }
             if tablets_with_stale_owner_count > 0 {
                 issues.push(format!(
@@ -853,7 +1056,12 @@ async fn restore_session_storage(
         }
     };
     Ok(with_headers(
-        Json(s.runtime.restore_session_from_archive(&tid, &sid, target).await?).into_response(),
+        Json(
+            s.runtime
+                .restore_session_from_archive(&tid, &sid, target)
+                .await?,
+        )
+        .into_response(),
         route_headers,
     ))
 }
