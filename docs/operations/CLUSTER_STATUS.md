@@ -17,6 +17,7 @@ The codebase and docs already contain pieces that point toward future
 distributed operation:
 
 - routing status and routing decision endpoints
+- cluster health and readiness summary endpoints
 - control-plane metadata helpers
 - design work for placement/routing/tablets
 - runbooks that mention boxes/tablets and future cluster behavior
@@ -44,6 +45,19 @@ If you are looking for those workflows, the answer today is:
 - there is no canonical procedure in this repo
 - there is no supported SLA for them
 - you should not infer support from prototype routing/admin endpoints
+
+## What Is Implemented Now
+
+The repository now has some read-only cluster-facing visibility endpoints:
+
+- `GET /api/admin/routing`
+- `GET /api/admin/routing/decision`
+- `GET /api/admin/cluster/health`
+- `GET /api/admin/cluster/readiness`
+
+These help operators and developers inspect snapshot metadata and reason about
+cluster state, but they do **not** yet add the full cluster control plane or
+day-2 workflows described in the target-state docs.
 
 ## Kubernetes Clarification
 

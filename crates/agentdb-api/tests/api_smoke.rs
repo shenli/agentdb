@@ -658,6 +658,112 @@ async fn admin_routing_decision_reports_snapshot_forward_dry_run() {
 }
 
 #[tokio::test]
+async fn admin_cluster_health_reports_single_node_ok() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/cluster/health", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "disabled");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["single_node"], true);
+    assert_eq!(body["summary"]["node_count"], 1);
+    assert_eq!(body["issues"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn admin_cluster_health_reports_snapshot_health() {
+    let app = spawn_routed_app("node-a").await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/cluster/health", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "snapshot");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["single_node"], false);
+    assert_eq!(body["local_node_found"], true);
+    assert_eq!(body["local_node_stale"], false);
+    assert_eq!(body["summary"]["node_count"], 2);
+    assert_eq!(body["summary"]["tablet_count"], 1);
+    assert_eq!(body["summary"]["unowned_tablet_count"], 0);
+}
+
+#[tokio::test]
+async fn admin_cluster_health_reports_degraded_unowned_tablet() {
+    let app = spawn_unassigned_routed_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/cluster/health", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["mode"], "snapshot");
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["summary"]["unowned_tablet_count"], 1);
+    assert!(body["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue.as_str().unwrap().contains("unowned")));
+}
+
+#[tokio::test]
+async fn admin_cluster_readiness_rejects_stale_local_node() {
+    let runtime = Runtime::in_memory();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-a"))])
+        .with_nodes(vec![
+            node_with_state_and_heartbeat("node-a", "http://127.0.0.1:18080", "alive", 0),
+            node_with_state_and_heartbeat("node-b", "http://127.0.0.1:18081", "alive", 0),
+        ]);
+    let state = AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .get(format!(
+            "{}/api/admin/cluster/readiness?stale_threshold_ms=1",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ready"], false);
+    assert!(body["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason.as_str().unwrap().contains("stale")));
+}
+
+#[tokio::test]
 async fn session_handlers_proxy_remote_owner_append() {
     let (app, _owner) = spawn_proxy_pair().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;
@@ -1083,16 +1189,27 @@ async fn spawn_unassigned_routed_app() -> TestApp {
 }
 
 fn node(id: &str, address: &str) -> Node {
+    node_with_state_and_heartbeat(id, address, "alive", now_ms_i64())
+}
+
+fn node_with_state_and_heartbeat(id: &str, address: &str, state: &str, last_heartbeat_ms: i64) -> Node {
     Node {
         node_id: id.into(),
         address: address.into(),
         mongo_address: None,
-        state: "alive".into(),
-        last_heartbeat_ms: 100,
+        state: state.into(),
+        last_heartbeat_ms,
         joined_at_ms: 100,
         availability_zone: Some("us-west-2a".into()),
         region: Some("us-west-2".into()),
     }
+}
+
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn tablet(id: i64, owner: Option<&str>) -> Tablet {

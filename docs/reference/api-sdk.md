@@ -10,6 +10,8 @@ Health and admin:
 
 ```text
 GET  /health/ready
+GET  /api/admin/cluster/health[?stale_threshold_ms={ms}]
+GET  /api/admin/cluster/readiness[?stale_threshold_ms={ms}]
 GET  /api/admin/routing
 GET  /api/admin/routing/decision?tenant_id={tenant_id}[&session_id={session_id}]
 POST /api/policy/worker/run
