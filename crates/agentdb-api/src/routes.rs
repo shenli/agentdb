@@ -33,7 +33,7 @@ use agentdb_core::{
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
-use agentdb_meta::{nodes, tablet_rebalance, tablets};
+use agentdb_meta::{nodes, tablet_ranges, tablet_rebalance, tablets, tenant_policies};
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
@@ -81,6 +81,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/tablets", get(get_admin_tablets))
         .route("/api/admin/tablets/create", post(create_admin_tablet))
+        .route("/api/admin/tablet-ranges", get(get_admin_tablet_ranges))
+        .route(
+            "/api/admin/tablet-ranges/replace",
+            post(replace_admin_tablet_ranges),
+        )
+        .route(
+            "/api/admin/tenant-policies",
+            get(get_admin_tenant_policies).post(upsert_admin_tenant_policy),
+        )
+        .route(
+            "/api/admin/tenant-policies/:tenant_id",
+            delete(delete_admin_tenant_policy),
+        )
         .route(
             "/api/admin/tablets/rebalance",
             post(rebalance_admin_tablets),
@@ -317,12 +330,54 @@ struct AdminTabletView {
     epoch: i64,
     lease_expires_at_ms: i64,
     created_at_ms: i64,
+    placement_scope_id: String,
+    state: String,
+    raft_group_id: Option<String>,
+    encryption_policy_version: i64,
     handoff_target_node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateTabletBody {
     tablet_id: i64,
+    placement_scope_id: Option<String>,
+    state: Option<String>,
+    raft_group_id: Option<String>,
+    encryption_policy_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertTenantPolicyBody {
+    tenant_id: String,
+    placement_class: String,
+    placement_scope_id: String,
+    encryption_class: String,
+    key_policy_id: Option<String>,
+    #[serde(default)]
+    encryption_policy_version: i64,
+    #[serde(default)]
+    policy_version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteTenantPolicyResponse {
+    tenant_id: String,
+    removed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceTabletRangesBody {
+    placement_scope_id: String,
+    old_ranges: Vec<tablet_ranges::RangeBounds>,
+    new_ranges: Vec<tablet_ranges::ReplacementRange>,
+    map_epoch: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplaceTabletRangesResponse {
+    placement_scope_id: String,
+    changed: bool,
+    ranges: Vec<tablet_ranges::TabletRange>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -854,6 +909,10 @@ fn tablet_view(tablet: tablets::Tablet) -> AdminTabletView {
         epoch: tablet.epoch,
         lease_expires_at_ms: tablet.lease_expires_at_ms,
         created_at_ms: tablet.created_at_ms,
+        placement_scope_id: tablet.placement_scope_id,
+        state: tablet.state,
+        raft_group_id: tablet.raft_group_id,
+        encryption_policy_version: tablet.encryption_policy_version,
         handoff_target_node_id: tablet.handoff_target_node_id,
     }
 }
@@ -917,14 +976,122 @@ async fn create_admin_tablet(
         .await
         .map_err(internal_error)?
         .is_some();
-    let tablet = tablets::get_or_create(meta.pool(), body.tablet_id, now_ms_i64())
+    let now_ms = now_ms_i64();
+    let tablet = if existed {
+        tablets::get(meta.pool(), body.tablet_id)
+            .await
+            .map_err(internal_error)?
+            .expect("tablet existed above")
+    } else if body.placement_scope_id.is_some()
+        || body.state.is_some()
+        || body.raft_group_id.is_some()
+        || body.encryption_policy_version.is_some()
+    {
+        tablets::create_with_placement(
+            meta.pool(),
+            body.tablet_id,
+            body.placement_scope_id.as_deref().unwrap_or("default"),
+            body.state.as_deref().unwrap_or("serving"),
+            body.raft_group_id.as_deref(),
+            body.encryption_policy_version.unwrap_or(0),
+            now_ms,
+        )
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+    } else {
+        tablets::get_or_create(meta.pool(), body.tablet_id, now_ms)
+            .await
+            .map_err(internal_error)?
+    };
     Ok(Json(AdminTabletMutationResponse {
         action: "create",
         changed: !existed,
         tablet: tablet_view(tablet),
     }))
+}
+
+async fn get_admin_tablet_ranges(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<tablet_ranges::TabletRange>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn replace_admin_tablet_ranges(
+    State(s): State<AppState>,
+    Json(body): Json<ReplaceTabletRangesBody>,
+) -> Result<Json<ReplaceTabletRangesResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    tablet_ranges::replace_ranges(
+        meta.pool(),
+        &body.placement_scope_id,
+        &body.old_ranges,
+        &body.new_ranges,
+        body.map_epoch,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == body.placement_scope_id)
+        .collect();
+    Ok(Json(ReplaceTabletRangesResponse {
+        placement_scope_id: body.placement_scope_id,
+        changed: true,
+        ranges,
+    }))
+}
+
+async fn get_admin_tenant_policies(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<tenant_policies::TenantPolicy>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = tenant_policies::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn upsert_admin_tenant_policy(
+    State(s): State<AppState>,
+    Json(body): Json<UpsertTenantPolicyBody>,
+) -> Result<Json<tenant_policies::TenantPolicy>, ApiError> {
+    let meta = meta_required(&s)?;
+    tenant_policies::upsert(
+        meta.pool(),
+        &body.tenant_id,
+        &body.placement_class,
+        &body.placement_scope_id,
+        &body.encryption_class,
+        body.key_policy_id.as_deref(),
+        body.encryption_policy_version,
+        body.policy_version,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let policy = tenant_policies::get(meta.pool(), &body.tenant_id)
+        .await
+        .map_err(internal_error)?
+        .expect("tenant policy upserted above");
+    Ok(Json(policy))
+}
+
+async fn delete_admin_tenant_policy(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<DeleteTenantPolicyResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let removed = tenant_policies::delete(meta.pool(), &tenant_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(DeleteTenantPolicyResponse { tenant_id, removed }))
 }
 
 async fn assign_admin_tablet(

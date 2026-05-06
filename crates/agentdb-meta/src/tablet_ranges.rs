@@ -10,7 +10,7 @@ use crate::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
 
 type TabletRangeRow = (String, i64, i64, i64, i64, i64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabletRange {
     pub placement_scope_id: String,
     pub start_shard: i64,
@@ -20,13 +20,13 @@ pub struct TabletRange {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RangeBounds {
     pub start_shard: i64,
     pub end_shard: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplacementRange {
     pub start_shard: i64,
     pub end_shard: i64,

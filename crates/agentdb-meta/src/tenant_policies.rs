@@ -23,7 +23,7 @@ type TenantPolicyRow = (
 pub const DEFAULT_PLACEMENT_CLASS: &str = "shared";
 pub const DEFAULT_ENCRYPTION_CLASS: &str = "pool";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TenantPolicy {
     pub tenant_id: String,
     pub placement_class: String,

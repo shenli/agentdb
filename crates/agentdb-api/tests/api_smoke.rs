@@ -843,6 +843,9 @@ async fn admin_tablets_returns_rows() {
     assert_eq!(rows[0]["tablet_id"], 7);
     assert_eq!(rows[0]["owner_node_id"], "node-a");
     assert_eq!(rows[0]["handoff_target_node_id"], "node-b");
+    assert_eq!(rows[0]["placement_scope_id"], "default");
+    assert_eq!(rows[0]["state"], "serving");
+    assert_eq!(rows[0]["encryption_policy_version"], 0);
 }
 
 #[tokio::test]
@@ -891,6 +894,7 @@ async fn admin_tablet_ownership_mutations_round_trip() {
     assert_eq!(created["action"], "create");
     assert_eq!(created["changed"], true);
     assert_eq!(created["tablet"]["tablet_id"], 9);
+    assert_eq!(created["tablet"]["placement_scope_id"], "default");
 
     let assigned: serde_json::Value = app
         .client
@@ -962,6 +966,149 @@ async fn admin_tablet_ownership_mutations_round_trip() {
         serde_json::Value::Null
     );
     assert_eq!(relinquished["tablet"]["epoch"], 2);
+}
+
+#[tokio::test]
+async fn admin_tablet_create_accepts_placement_metadata() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/create", app.base))
+        .json(&json!({
+            "tablet_id": 11,
+            "placement_scope_id": "tenant/acme",
+            "state": "creating",
+            "raft_group_id": "raft/11",
+            "encryption_policy_version": 3
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(created["changed"], true);
+    assert_eq!(created["tablet"]["tablet_id"], 11);
+    assert_eq!(created["tablet"]["placement_scope_id"], "tenant/acme");
+    assert_eq!(created["tablet"]["state"], "creating");
+    assert_eq!(created["tablet"]["raft_group_id"], "raft/11");
+    assert_eq!(created["tablet"]["encryption_policy_version"], 3);
+}
+
+#[tokio::test]
+async fn admin_tenant_policies_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let policy: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tenant-policies", app.base))
+        .json(&json!({
+            "tenant_id": "ten_acme",
+            "placement_class": "dedicated",
+            "placement_scope_id": "tenant/acme",
+            "encryption_class": "tenant",
+            "key_policy_id": "key/acme",
+            "encryption_policy_version": 2,
+            "policy_version": 5
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(policy["tenant_id"], "ten_acme");
+    assert_eq!(policy["placement_scope_id"], "tenant/acme");
+    assert_eq!(policy["key_policy_id"], "key/acme");
+    assert_eq!(policy["policy_version"], 5);
+
+    let rows: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tenant-policies", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    let deleted: serde_json::Value = app
+        .client
+        .delete(format!("{}/api/admin/tenant-policies/ten_acme", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["removed"], true);
+}
+
+#[tokio::test]
+async fn admin_tablet_ranges_replace_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let replaced: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablet-ranges/replace", app.base))
+        .json(&json!({
+            "placement_scope_id": "default",
+            "old_ranges": [{"start_shard": 0, "end_shard": 99}],
+            "new_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ],
+            "map_epoch": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["changed"], true);
+    assert_eq!(replaced["ranges"].as_array().unwrap().len(), 2);
+
+    let rows: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tablet-ranges", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row["tablet_id"] == 8));
+    assert!(rows.iter().any(|row| row["tablet_id"] == 9));
 }
 
 #[tokio::test]

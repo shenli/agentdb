@@ -969,6 +969,12 @@ single-session appends or record writes.
     applied index, compaction debt, global-index lag, snapshot age, and
     object-store upload backlog.
 
+    Current implementation status: admin surfaces expose tablet placement and
+    lifecycle metadata, tenant placement policies, and tablet range-map
+    replacement for operator-controlled split/merge cutovers. Runtime metrics
+    for Raft lag, compaction debt, snapshot age, and object-store backlog still
+    need the underlying workers.
+
 ## Non-Goals
 
 - Do not make object storage the synchronous commit path for hot appends.
