@@ -10,6 +10,7 @@ dependencies = [
  "agentdb-meta",
  "agentdb-storage",
  "axum",
+ "base64 0.22.1",
  "reqwest",
  "serde",
  "serde_json",

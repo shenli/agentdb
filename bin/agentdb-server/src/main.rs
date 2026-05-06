@@ -125,6 +125,11 @@ struct ServeOpts {
     /// Optional MongoDB PLAIN auth password. Requires `--mongo-username`.
     #[arg(long)]
     mongo_password: Option<String>,
+
+    /// Shared secret for internal node-to-node APIs. Can also be set with
+    /// AGENTDB_INTERNAL_AUTH_TOKEN.
+    #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN")]
+    internal_auth_token: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -266,6 +271,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         });
+    if let Some(token) = config.internal_auth_token.clone() {
+        state = state.with_internal_auth_token(token);
+    }
     let route_location = config
         .route_region
         .clone()
@@ -335,6 +343,7 @@ struct ResolvedServeConfig {
     mongo_bind: Option<SocketAddr>,
     mongo_username: Option<String>,
     mongo_password: Option<String>,
+    internal_auth_token: Option<String>,
 }
 
 impl ResolvedServeConfig {
@@ -467,6 +476,11 @@ impl ResolvedServeConfig {
             .or(file.mongodb.password)
             .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
         validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let internal_auth_token = opts
+            .internal_auth_token
+            .or(file.server.internal_auth_token)
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -499,6 +513,7 @@ impl ResolvedServeConfig {
             mongo_bind: opts.mongo_bind.or(file.mongodb.bind),
             mongo_username,
             mongo_password,
+            internal_auth_token,
         })
     }
 
@@ -539,6 +554,11 @@ impl ResolvedServeConfig {
             .password
             .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
         validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let internal_auth_token = file
+            .server
+            .internal_auth_token
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -565,6 +585,7 @@ impl ResolvedServeConfig {
             mongo_bind: file.mongodb.bind,
             mongo_username,
             mongo_password,
+            internal_auth_token,
         })
     }
 }
@@ -592,6 +613,7 @@ struct DeploymentFileConfig {
 struct ServerFileConfig {
     bind: Option<SocketAddr>,
     dev: Option<bool>,
+    internal_auth_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -655,6 +677,21 @@ fn validate_mongo_auth(username: &Option<String>, password: &Option<String>) -> 
         (None, Some(_)) => anyhow::bail!(
             "mongodb password requires a username; set --mongo-username or AGENTDB_MONGODB_USERNAME"
         ),
+    }
+}
+
+fn validate_internal_auth_token(
+    deployment_mode: DeploymentMode,
+    token: &Option<String>,
+) -> anyhow::Result<()> {
+    match (deployment_mode, token.as_deref()) {
+        (_, Some(token)) if token.len() < 16 => {
+            anyhow::bail!("server.internal_auth_token must be at least 16 characters")
+        }
+        (DeploymentMode::Cluster, None) => anyhow::bail!(
+            "deployment.mode=cluster requires server.internal_auth_token or AGENTDB_INTERNAL_AUTH_TOKEN"
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -837,6 +874,14 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
             }
         );
     }
+    println!(
+        "  internal raft rpc: {}",
+        if config.internal_auth_token.is_some() {
+            "token auth enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
@@ -1070,12 +1115,14 @@ async fn load_raft_rs_node_configs(
         if replica.role == "log_only" {
             continue;
         }
-        configs.push(agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
-            tablet_id,
-            &replica.node_id,
-            &replica.role,
-            raft_engine_root,
-        )?);
+        configs.push(
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                tablet_id,
+                &replica.node_id,
+                &replica.role,
+                raft_engine_root,
+            )?,
+        );
     }
     if configs.is_empty() {
         anyhow::bail!("tablet {tablet_id} has no voter/learner replicas for raft-rs");
@@ -1378,6 +1425,7 @@ mod tests {
             mongo_bind: None,
             mongo_username: None,
             mongo_password: None,
+            internal_auth_token: None,
         }
     }
 
@@ -1606,6 +1654,52 @@ region = "us-west-2"
     }
 
     #[test]
+    fn cluster_mode_requires_internal_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+
+[routing]
+node_id = "node-a"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires server.internal_auth_token"));
+    }
+
+    #[test]
+    fn internal_auth_token_must_not_be_too_short() {
+        let mut opts = base_opts();
+        opts.internal_auth_token = Some("short".into());
+
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("server.internal_auth_token must be at least 16 characters"));
+    }
+
+    #[test]
     fn single_node_slatedb_s3_remains_valid() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agentdb.toml");
@@ -1787,7 +1881,9 @@ region = "us-west-2"
             .await
             .unwrap();
 
-        let configs = load_raft_rs_node_configs(&meta, 7, dir.path()).await.unwrap();
+        let configs = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].role, agentdb_storage::RaftRsNodeRole::Voter);

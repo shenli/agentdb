@@ -932,7 +932,10 @@ fn replay_raft_engine_to_storage(
     let snapshot_index = if let Some(bytes) = engine.get(raft_group_id, SNAPSHOT_KEY) {
         let snapshot = Snapshot::decode(bytes.as_slice()).map_err(map_prost_error)?;
         let index = snapshot.get_metadata().index;
-        storage.wl().apply_snapshot(snapshot).map_err(map_raft_error)?;
+        storage
+            .wl()
+            .apply_snapshot(snapshot)
+            .map_err(map_raft_error)?;
         index
     } else {
         0
@@ -1358,14 +1361,18 @@ mod tests {
         let transfer = group
             .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
             .unwrap();
-        let wrong_target = group.install_snapshot_transfer(2, transfer.clone()).unwrap_err();
+        let wrong_target = group
+            .install_snapshot_transfer(2, transfer.clone())
+            .unwrap_err();
         assert!(wrong_target.to_string().contains("targets node 3"));
 
         let wrong_tablet = RaftRsSnapshotTransfer {
             tablet_id: 8,
             ..transfer
         };
-        let err = group.install_snapshot_transfer(3, wrong_tablet).unwrap_err();
+        let err = group
+            .install_snapshot_transfer(3, wrong_tablet)
+            .unwrap_err();
         assert!(err.to_string().contains("targets tablet 8"));
     }
 
@@ -1458,7 +1465,9 @@ mod tests {
             .unwrap();
         let transport = RecordingRaftRsTransport::default();
 
-        group.send_snapshot_to(&transport, snapshot.clone()).unwrap();
+        group
+            .send_snapshot_to(&transport, snapshot.clone())
+            .unwrap();
 
         assert_eq!(transport.snapshots.lock().unwrap().as_slice(), &[snapshot]);
     }

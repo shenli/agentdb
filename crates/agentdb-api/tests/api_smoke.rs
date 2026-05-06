@@ -6,18 +6,46 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use agentdb_api::{
+    internal_raft_http::RaftRsHttpClient,
     routing_http::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_TABLET_ID,
     },
-    state::ProxyPolicy,
+    state::{ProxyPolicy, RaftRsIngress},
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
 use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
+use agentdb_storage::{RaftRsSnapshotTransfer, RaftRsWireMessage};
+use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
 use serde_json::json;
+
+#[derive(Default)]
+struct TestRaftIngress {
+    messages: Mutex<Vec<RaftRsWireMessage>>,
+    snapshots: Mutex<Vec<RaftRsSnapshotTransfer>>,
+}
+
+impl RaftRsIngress for TestRaftIngress {
+    fn step_wire_message(&self, message: RaftRsWireMessage) -> agentdb_storage::Result<()> {
+        self.messages.lock().unwrap().push(message);
+        Ok(())
+    }
+
+    fn install_snapshot_transfer(
+        &self,
+        _to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> agentdb_storage::Result<Vec<u8>> {
+        let payload = transfer.payload.clone();
+        self.snapshots.lock().unwrap().push(transfer);
+        Ok(payload)
+    }
+}
 
 #[tokio::test]
 async fn create_tenant_agent_session_append_fetch_round_trip() {
@@ -549,6 +577,146 @@ async fn admin_routing_status_reports_disabled_mode() {
     assert_eq!(body["mode"], "disabled");
     assert_eq!(body["local_node_id"], "single-node");
     assert!(body.get("snapshot").is_none());
+}
+
+#[tokio::test]
+async fn internal_raft_message_requires_token() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn internal_raft_message_dispatches_to_ingress() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["status"], "accepted");
+    let messages = ingress.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].tablet_id, 7);
+    assert_eq!(messages[0].from, 1);
+    assert_eq!(messages[0].to, 2);
+    assert_eq!(messages[0].payload, b"msg");
+}
+
+#[tokio::test]
+async fn internal_raft_snapshot_dispatches_to_ingress() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/internal/raft/snapshots", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "index": 42,
+            "term": 3,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"snapshot")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["status"], "accepted");
+    let snapshots = ingress.snapshots.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].tablet_id, 7);
+    assert_eq!(snapshots[0].from, 1);
+    assert_eq!(snapshots[0].to, 2);
+    assert_eq!(snapshots[0].index, 42);
+    assert_eq!(snapshots[0].term, 3);
+    assert_eq!(snapshots[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_raft_http_client_sends_message_and_snapshot() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let client = RaftRsHttpClient::new("secret");
+
+    client
+        .send_message(
+            &app.base,
+            &RaftRsWireMessage {
+                tablet_id: 7,
+                from: 1,
+                to: 2,
+                payload: b"msg".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .send_snapshot(
+            &app.base,
+            &RaftRsSnapshotTransfer {
+                tablet_id: 7,
+                from: 1,
+                to: 2,
+                index: 42,
+                term: 3,
+                payload: b"snapshot".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ingress.messages.lock().unwrap()[0].payload, b"msg");
+    assert_eq!(ingress.snapshots.lock().unwrap()[0].payload, b"snapshot");
 }
 
 #[tokio::test]

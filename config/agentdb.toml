@@ -11,6 +11,9 @@ mode = "single_node" # or "cluster"
 bind = "127.0.0.1:7878"
 # dev = true uses ephemeral in-memory state.
 dev = false
+# Required for cluster mode internal Raft RPCs. Prefer setting
+# AGENTDB_INTERNAL_AUTH_TOKEN in production instead of committing a secret.
+# internal_auth_token = "change-me-min-16-chars"
 
 [mongodb]
 # Optional MongoDB wire-protocol compatibility listener.
@@ -40,6 +43,7 @@ backend = "rocksdb" # or "slatedb"
 # - storage.content.backend = "object_store"
 # - storage.object_store.backend = "s3"
 # - routing.node_id must be set
+# - server.internal_auth_token or AGENTDB_INTERNAL_AUTH_TOKEN must be set
 
 # Shared object-store config. Required when:
 # - storage.kv.backend = "slatedb"

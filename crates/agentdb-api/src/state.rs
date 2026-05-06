@@ -10,8 +10,19 @@ use std::sync::{
 
 use agentdb_core::Runtime;
 use agentdb_meta::MetaStore;
+use agentdb_storage::{RaftRsSnapshotTransfer, RaftRsWireMessage};
 
 use crate::routing_http::RouteRuntime;
+
+pub trait RaftRsIngress: Send + Sync {
+    fn step_wire_message(&self, message: RaftRsWireMessage) -> agentdb_storage::Result<()>;
+
+    fn install_snapshot_transfer(
+        &self,
+        to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> agentdb_storage::Result<Vec<u8>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyPolicy {
@@ -160,6 +171,8 @@ pub struct AppState {
     pub runtime: Arc<Runtime>,
     pub meta: Option<MetaStore>,
     pub routing: RouteRuntime,
+    pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
+    pub internal_auth_token: Option<Arc<str>>,
     pub drain: DrainState,
     pub scheduler: Option<SchedulerStatus>,
     pub proxy: reqwest::Client,
@@ -172,6 +185,8 @@ impl AppState {
             runtime,
             meta: None,
             routing: RouteRuntime::disabled(),
+            raft_ingress: None,
+            internal_auth_token: None,
             drain: DrainState::new("single-node"),
             scheduler: None,
             proxy: reqwest::Client::new(),
@@ -187,6 +202,16 @@ impl AppState {
     pub fn with_routing(mut self, routing: RouteRuntime) -> Self {
         self.drain = self.drain.with_node_id(routing.local_node_id().to_string());
         self.routing = routing;
+        self
+    }
+
+    pub fn with_raft_ingress(mut self, ingress: Arc<dyn RaftRsIngress>) -> Self {
+        self.raft_ingress = Some(ingress);
+        self
+    }
+
+    pub fn with_internal_auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.internal_auth_token = Some(token.into());
         self
     }
 

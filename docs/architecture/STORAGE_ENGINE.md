@@ -942,9 +942,13 @@ single-session appends or record writes.
    unsent messages on transport failure. The adapter also supports online
    learner promotion and voter removal through `raft-rs` configuration changes.
    Server-side control-plane wiring can load `tablet_replicas` rows into stable
-   `RaftRsNodeConfig` values with per-tablet raft-engine directories. The
-   remaining production work is binding that transport boundary to authenticated
-   HTTP/gRPC internode RPC and background retry scheduling.
+   `RaftRsNodeConfig` values with per-tablet raft-engine directories. The HTTP
+   API exposes token-protected internal Raft message and snapshot ingress
+   endpoints, and server config wires the shared token from
+   `server.internal_auth_token` or `AGENTDB_INTERNAL_AUTH_TOKEN`.
+   `RaftRsHttpClient` can deliver wire messages and snapshots to those
+   endpoints. The remaining production work is a local tablet-group registry
+   and background retry scheduling around the transport.
 
 7. Add snapshot and catch-up support.
 

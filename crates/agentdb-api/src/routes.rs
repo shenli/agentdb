@@ -22,6 +22,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use agentdb_core::{
@@ -52,6 +53,7 @@ const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
+const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -63,6 +65,14 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(health_ready))
+        .route(
+            "/api/internal/raft/messages",
+            post(post_internal_raft_message),
+        )
+        .route(
+            "/api/internal/raft/snapshots",
+            post(post_internal_raft_snapshot),
+        )
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/scheduler", get(get_admin_scheduler))
@@ -498,6 +508,32 @@ struct ClusterReadinessResponse {
     reasons: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalRaftMessageBody {
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+    payload_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalRaftSnapshotBody {
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+    index: u64,
+    term: u64,
+    payload_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalRaftAccepted {
+    status: &'static str,
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+}
+
 async fn get_cluster_health(
     State(s): State<AppState>,
     Query(query): Query<ClusterAdminQuery>,
@@ -524,6 +560,146 @@ async fn get_cluster_readiness(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(readiness)).into_response()
+}
+
+async fn post_internal_raft_message(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftMessageBody>,
+) -> Response {
+    if let Err(response) = validate_internal_raft_request(&s, &headers) {
+        return response;
+    }
+    let Some(ingress) = s.raft_ingress.as_ref() else {
+        return internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INGRESS_UNAVAILABLE",
+            "raft ingress is not configured on this node",
+        );
+    };
+    let payload = match decode_base64(&body.payload_base64) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    match ingress.step_wire_message(agentdb_storage::RaftRsWireMessage {
+        tablet_id: body.tablet_id,
+        from: body.from,
+        to: body.to,
+        payload,
+    }) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(InternalRaftAccepted {
+                status: "accepted",
+                tablet_id: body.tablet_id,
+                from: body.from,
+                to: body.to,
+            }),
+        )
+            .into_response(),
+        Err(err) => internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "RAFT_MESSAGE_REJECTED",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn post_internal_raft_snapshot(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftSnapshotBody>,
+) -> Response {
+    if let Err(response) = validate_internal_raft_request(&s, &headers) {
+        return response;
+    }
+    let Some(ingress) = s.raft_ingress.as_ref() else {
+        return internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INGRESS_UNAVAILABLE",
+            "raft ingress is not configured on this node",
+        );
+    };
+    let payload = match decode_base64(&body.payload_base64) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    match ingress.install_snapshot_transfer(
+        body.to,
+        agentdb_storage::RaftRsSnapshotTransfer {
+            tablet_id: body.tablet_id,
+            from: body.from,
+            to: body.to,
+            index: body.index,
+            term: body.term,
+            payload,
+        },
+    ) {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(InternalRaftAccepted {
+                status: "accepted",
+                tablet_id: body.tablet_id,
+                from: body.from,
+                to: body.to,
+            }),
+        )
+            .into_response(),
+        Err(err) => internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "RAFT_SNAPSHOT_REJECTED",
+            err.to_string(),
+        ),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_internal_raft_request(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected) = state.internal_auth_token.as_ref() else {
+        return Err(internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INTERNAL_AUTH_UNCONFIGURED",
+            "internal raft RPC auth token is not configured on this node",
+        ));
+    };
+    let presented = headers
+        .get(INTERNAL_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if presented != Some(expected.as_ref()) {
+        return Err(internal_raft_error(
+            StatusCode::UNAUTHORIZED,
+            "RAFT_INTERNAL_AUTH_FAILED",
+            "invalid internal raft RPC token",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, Response> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|err| {
+            internal_raft_error(
+                StatusCode::BAD_REQUEST,
+                "RAFT_PAYLOAD_INVALID",
+                format!("invalid base64 raft payload: {err}"),
+            )
+        })
+}
+
+fn internal_raft_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message.into(),
+            "retryable": status.is_server_error(),
+        }
+    });
+    (status, Json(body)).into_response()
 }
 
 async fn get_admin_drain(State(s): State<AppState>) -> Json<DrainStatusResponse> {
