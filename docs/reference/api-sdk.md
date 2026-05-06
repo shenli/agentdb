@@ -321,7 +321,7 @@ Primary sync classes:
 ```text
 AgentDB
   health_ready()
-  workspace(external_key, *, tenant_id=None, policy=None)
+  workspace(external_key=None, *, tenant_id=None, policy=None)
   session(tenant_id, session_id=None, *, agent_id=None)
   session_by_id(tenant_id, session_id, *, agent_id=None)
 
@@ -363,9 +363,13 @@ Lower-level sync `Client` methods:
 
 ```text
 health_ready()
+user_info()
+list_tenants()
 create_tenant(external_key, policy=None)
 get_tenant(tenant_id)
+list_agents(tenant_id)
 create_agent(tenant_id, alias=None, config=None)
+list_sessions(tenant_id)
 create_session(tenant_id, agent_id, alias=None)
 session(tenant_id, session_id=None, *, agent_id=None)
 put_artifact(tenant_id, data, content_type=None, sha256=None)
@@ -401,7 +405,7 @@ Session-first surface:
 import { AgentDB } from "agentdb";
 
 const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
-const workspace = await db.workspace("acme");
+const workspace = await db.workspace();
 const agent = await workspace.agent("sales-agent");
 const session = await agent.session("support-ticket-42");
 
@@ -409,12 +413,18 @@ await session.appendUser("hello");
 const events = await session.replay({ limit: 100 });
 ```
 
+In authenticated deployments, `workspace()` resolves the workspace/tenant from
+user-info metadata. For local development against a server without `/api/me`,
+pass a workspace alias, such as `workspace("acme-dev")`.
+
 Primary classes:
 
 ```text
 AgentDB
   healthReady()
-  workspace(externalKey, opts?)
+  workspace(externalKey?, opts?)
+  session(sessionId, opts?)
+  sessionById(sessionId, { tenantId, agentId? })
 
 Workspace
   tenantId
@@ -453,8 +463,12 @@ Lower-level `Client` methods:
 
 ```text
 healthReady()
+userInfo()
+listTenants()
 createTenant(externalKey, policy?)
+listAgents(tenantId)
 createAgent(tenantId, opts?)
+listSessions(tenantId)
 createSession(tenantId, agentId, opts?)
 session(tenantId, sessionId?, opts?)
 putArtifact(tenantId, data, opts?)

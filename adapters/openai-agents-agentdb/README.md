@@ -13,18 +13,36 @@ This adapter stores every operation as an ordered AgentDB event. `pop_item` and
 `clear_session` are represented as tombstone events so conversation history stays
 auditable while the effective session view matches the SDK protocol.
 
-```python
-from agentdb import AsyncClient
-from openai_agents_agentdb import AgentDBSession
+Application code should not pass `tenant_id`. Tenant scope is resolved from the
+authenticated principal through AgentDB user-info metadata. For local/dev
+servers that do not expose `/api/me` yet, pass a `workspace` alias and the
+adapter will resolve or create the backing tenant internally.
 
-client = AsyncClient("http://127.0.0.1:7878")
-session = AgentDBSession(
-    client,
-    tenant_id="ten_...",
-    agent_id="agt_...",
-    session_id="ses_...",
+```python
+import os
+
+from agents import Agent, Runner
+from openai_agents_agentdb import AgentDBSessions
+
+sessions = AgentDBSessions(
+    api_key=os.environ["AGENTDB_API_KEY"],
+    agent="support-agent",
 )
 
-await session.add_items([{"role": "user", "content": "hello"}])
-items = await session.get_items()
+session = await sessions.session("ticket-42")
+
+agent = Agent(
+    name="Support agent",
+    instructions="Help the user with their support request.",
+)
+
+result = await Runner.run(agent, "What happened with my order?", session=session)
+print(result.final_output)
 ```
+
+`AgentDBSession` remains available as a low-level protocol implementation when
+you already have canonical AgentDB IDs. New integrations should prefer
+`AgentDBSessions` so tenant resolution stays an authentication concern.
+
+For local development against the OSS server, pass `workspace="dev"` because
+the local server may not expose hosted user-info yet.

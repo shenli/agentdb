@@ -86,6 +86,20 @@ class AsyncClient:
     async def get_tenant(self, tenant_id: TenantId) -> dict:
         return await self._request("GET", f"/api/tenants/{_quote(tenant_id)}")
 
+    async def user_info(self) -> dict:
+        """Return authenticated principal/workspace metadata.
+
+        Hosted deployments should expose this endpoint so application code can
+        derive the tenant scope from authentication instead of passing
+        `tenant_id` through normal agent code.
+        """
+
+        return await self._request("GET", "/api/me")
+
+    async def list_tenants(self) -> list:
+        data = await self._request("GET", "/api/tenants")
+        return data.get("tenants", [])
+
     async def create_agent(
         self, tenant_id: TenantId, *, alias: Optional[str] = None, config: Optional[dict] = None
     ) -> dict:
@@ -94,6 +108,10 @@ class AsyncClient:
             f"/api/tenants/{_quote(tenant_id)}/agents",
             json={"alias": alias, "config": config or {}},
         )
+
+    async def list_agents(self, tenant_id: TenantId) -> list:
+        data = await self._request("GET", f"/api/tenants/{_quote(tenant_id)}/agents")
+        return data.get("agents", [])
 
     async def create_session(
         self, tenant_id: TenantId, agent_id: AgentId, *, alias: Optional[str] = None
@@ -104,6 +122,10 @@ class AsyncClient:
             json={"alias": alias},
         )
         return AsyncSession(self, tenant_id, data["session_id"], data["agent_id"])
+
+    async def list_sessions(self, tenant_id: TenantId) -> list:
+        data = await self._request("GET", f"/api/tenants/{_quote(tenant_id)}/sessions")
+        return data.get("sessions", [])
 
     def session(
         self,
@@ -236,12 +258,16 @@ class AsyncClient:
         headers: Optional[dict] = None,
         stream: bool = False,
     ) -> httpx.Response:
+        hdrs = dict(headers or {})
+        token = await self._bearer_token()
+        if token is not None and "Authorization" not in hdrs:
+            hdrs["Authorization"] = f"Bearer {token}"
         kwargs: dict = {"timeout": httpx.Timeout(self.timeout, read=None) if stream else self.timeout}
         if params:
             kwargs["params"] = params
-        if headers:
-            kwargs["headers"] = dict(headers)
-        if self._auth is not None:
+        if hdrs:
+            kwargs["headers"] = hdrs
+        if self._auth is not None and "Authorization" not in hdrs:
             kwargs["auth"] = self._auth
         if json is not None:
             kwargs["json"] = json
@@ -250,7 +276,13 @@ class AsyncClient:
         return await self._http.request(method, path, **kwargs)
 
     async def _stream(self, method: str, path: str, **kwargs: Any) -> AsyncIterator[httpx.Response]:
-        if self._auth is not None:
+        headers = dict(kwargs.pop("headers", {}) or {})
+        token = await self._bearer_token()
+        if token is not None and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {token}"
+        if headers:
+            kwargs["headers"] = headers
+        if self._auth is not None and "Authorization" not in headers:
             kwargs["auth"] = self._auth
         async with self._http.stream(method, path, **kwargs) as resp:
             yield resp

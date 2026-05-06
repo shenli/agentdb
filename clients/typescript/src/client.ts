@@ -142,6 +142,14 @@ export interface ClientSubscribeOptions {
   limit?: number;
 }
 
+export interface UserInfo {
+  tenant_id?: string;
+  default_workspace?: string;
+  workspace?: Record<string, unknown>;
+  workspaces?: Record<string, unknown>[];
+  [key: string]: unknown;
+}
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RECORD_COMMIT_SEQ_HEADER = "x-agentdb-record-commit-seq";
 
@@ -161,9 +169,31 @@ export class AgentDB {
     opts: { tenantId?: TenantId; policy?: Record<string, unknown> } = {}
   ): Promise<Workspace> {
     if (opts.tenantId !== undefined) return new Workspace(this.client, opts.tenantId, { name });
+    const resolved = await this.resolveTenant(name);
+    if (resolved !== undefined) {
+      return new Workspace(this.client, resolved.tenantId, {
+        name: resolved.name ?? name,
+        data: resolved.data,
+      });
+    }
     const externalKey = name ?? "default";
+    for (const tenant of await this.client.listTenants()) {
+      if (tenant.external_key === externalKey) {
+        return new Workspace(this.client, String(tenant.tenant_id), { name: externalKey, data: tenant });
+      }
+    }
     const tenant = await this.client.createTenant(externalKey, opts.policy ?? {});
     return new Workspace(this.client, String(tenant.tenant_id), { name: externalKey, data: tenant });
+  }
+
+  async session(
+    sessionId: SessionId,
+    opts: { workspace?: string; tenantId?: TenantId; agentId?: AgentId } = {}
+  ): Promise<SessionHandle> {
+    if (opts.tenantId !== undefined) {
+      return new Workspace(this.client, opts.tenantId).sessionById(sessionId, { agentId: opts.agentId });
+    }
+    return (await this.workspace(opts.workspace)).sessionById(sessionId, { agentId: opts.agentId });
   }
 
   sessionById(
@@ -171,6 +201,21 @@ export class AgentDB {
     opts: { tenantId: TenantId; agentId?: AgentId }
   ): SessionHandle {
     return new Workspace(this.client, opts.tenantId).sessionById(sessionId, { agentId: opts.agentId });
+  }
+
+  private async resolveTenant(name?: string): Promise<{ tenantId: TenantId; name?: string; data: Record<string, unknown> } | undefined> {
+    let info: UserInfo | undefined;
+    try {
+      info = await this.client.userInfo();
+    } catch (err) {
+      if (!(err instanceof AgentDBError) || err.statusCode !== 404) throw err;
+      return undefined;
+    }
+    const resolved = tenantFromUserInfo(info, name);
+    if (resolved === undefined) {
+      throw new Error("authenticated user-info did not include an allowed workspace");
+    }
+    return resolved;
   }
 }
 
@@ -200,7 +245,21 @@ export class Workspace {
     opts: { agentId?: AgentId; config?: Record<string, unknown> } = {}
   ): Promise<AgentHandle> {
     if (opts.agentId !== undefined) return new AgentHandle(this, opts.agentId, { alias });
-    const data = await this.client.createAgent(this.id, { alias, config: opts.config });
+    if (alias !== undefined) {
+      const existing = await findAgentByAlias(this.client, this.id, alias);
+      if (existing !== undefined) {
+        return new AgentHandle(this, String(existing.agent_id), { alias, data: existing });
+      }
+    }
+    let data: Record<string, unknown>;
+    try {
+      data = await this.client.createAgent(this.id, { alias, config: opts.config });
+    } catch (err) {
+      if (alias === undefined || !(err instanceof AgentDBError) || err.statusCode !== 409) throw err;
+      const existing = await findAgentByAlias(this.client, this.id, alias);
+      if (existing === undefined) throw err;
+      data = existing;
+    }
     return new AgentHandle(this, String(data.agent_id), { alias, data });
   }
 
@@ -237,7 +296,21 @@ export class AgentHandle {
 
   async session(alias?: string, opts: { sessionId?: SessionId } = {}): Promise<SessionHandle> {
     if (opts.sessionId !== undefined) return this.sessionById(opts.sessionId);
-    const session = await this.workspaceClient().createSession(this.workspace.id, this.id, { alias });
+    if (alias !== undefined) {
+      const existing = await findSessionByAlias(this.workspaceClient(), this.workspace.id, alias);
+      if (existing !== undefined) {
+        return this.sessionById(String(existing.session_id));
+      }
+    }
+    let session: Session;
+    try {
+      session = await this.workspaceClient().createSession(this.workspace.id, this.id, { alias });
+    } catch (err) {
+      if (alias === undefined || !(err instanceof AgentDBError) || err.statusCode !== 409) throw err;
+      const existing = await findSessionByAlias(this.workspaceClient(), this.workspace.id, alias);
+      if (existing === undefined) throw err;
+      session = this.workspaceClient().session(this.workspace.id, String(existing.session_id), { agentId: this.id });
+    }
     return new SessionHandle(this.workspace, session, { agent: this });
   }
 
@@ -417,7 +490,7 @@ export class Client {
   }
 
   get authenticated(): boolean {
-    return this._auth !== undefined;
+    return this._auth !== undefined || this._token !== undefined || this._getToken !== undefined;
   }
 
   async healthReady(): Promise<boolean> {
@@ -432,6 +505,15 @@ export class Client {
     return await this._request("POST", "/api/tenants", { external_key: externalKey, policy });
   }
 
+  async userInfo(): Promise<UserInfo> {
+    return await this._request("GET", "/api/me") as UserInfo;
+  }
+
+  async listTenants(): Promise<Record<string, unknown>[]> {
+    const data = await this._request("GET", "/api/tenants");
+    return Array.isArray(data.tenants) ? data.tenants as Record<string, unknown>[] : [];
+  }
+
   async createAgent(
     tenantId: TenantId,
     opts: { alias?: string | null; config?: Record<string, unknown> } = {}
@@ -440,6 +522,11 @@ export class Client {
       alias: opts.alias ?? null,
       config: opts.config ?? {},
     });
+  }
+
+  async listAgents(tenantId: TenantId): Promise<Record<string, unknown>[]> {
+    const data = await this._request("GET", `/api/tenants/${enc(tenantId)}/agents`);
+    return Array.isArray(data.agents) ? data.agents as Record<string, unknown>[] : [];
   }
 
   async createSession(
@@ -453,6 +540,11 @@ export class Client {
       { alias: opts.alias ?? null }
     );
     return new Session(this, tenantId, String(data.session_id), { agentId: String(data.agent_id) });
+  }
+
+  async listSessions(tenantId: TenantId): Promise<Record<string, unknown>[]> {
+    const data = await this._request("GET", `/api/tenants/${enc(tenantId)}/sessions`);
+    return Array.isArray(data.sessions) ? data.sessions as Record<string, unknown>[] : [];
   }
 
   session(tenantId: TenantId, sessionId?: SessionId, opts: SessionOptions = {}): Session {
@@ -576,7 +668,7 @@ export class Client {
     headers: Record<string, string> = {},
     rawBody?: BodyInit
   ): Promise<Response> {
-    const hdrs = { ...headers, ...(await this._authHeaders()) };
+    const hdrs = { ...(await this._authHeaders()), ...headers };
     let body: BodyInit | undefined = rawBody;
     if (json !== undefined) {
       hdrs["Content-Type"] = "application/json";
@@ -592,15 +684,26 @@ export class Client {
   }
 
   async _fetchUrl(input: string | URL, init: RequestInit): Promise<Response> {
-    return await this._fetch(input, init);
+    return await this._fetch(input, {
+      ...init,
+      headers: { ...(await this._authHeaders()), ...headersRecord(init.headers) },
+    });
   }
 
   private async _authHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {};
-    if (this._auth) {
+    const token = await this._bearerToken();
+    if (token !== undefined) {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else if (this._auth) {
       headers["Authorization"] = `Basic ${Buffer.from(`${this._auth.user}:${this._auth.password}`).toString("base64")}`;
     }
     return headers;
+  }
+
+  private async _bearerToken(): Promise<string | undefined> {
+    if (this._getToken !== undefined) return await this._getToken();
+    return this._token;
   }
 
   private _captureRecordCommitSeq(tenantId: TenantId, resp: Response): void {
@@ -899,6 +1002,81 @@ function stringOrUndefined(value: unknown): string | undefined {
 function watchItemFromDict(d: unknown): WatchItem {
   const rec = d as Record<string, unknown>;
   return { cursor: String(rec.cursor), event: eventFromDict(rec.event) };
+}
+
+function tenantFromUserInfo(
+  info: UserInfo,
+  workspace?: string
+): { tenantId: TenantId; name?: string; data: Record<string, unknown> } | undefined {
+  if (workspace === undefined && typeof info.tenant_id === "string") {
+    return { tenantId: info.tenant_id, data: info as Record<string, unknown> };
+  }
+
+  const workspaces = Array.isArray(info.workspaces) ? info.workspaces : [];
+  const target = workspace ?? (typeof info.default_workspace === "string" ? info.default_workspace : undefined);
+  if (target === undefined && workspaces.length === 1) {
+    const only = workspaces[0]!;
+    const tenantId = workspaceTenantId(only);
+    if (tenantId !== undefined) return { tenantId, name: workspaceName(only), data: only };
+  }
+  if (target !== undefined) {
+    for (const item of workspaces) {
+      if (workspaceNames(item).has(target)) {
+        const tenantId = workspaceTenantId(item);
+        if (tenantId !== undefined) return { tenantId, name: workspaceName(item), data: item };
+      }
+    }
+  }
+
+  const current = info.workspace;
+  if (current !== undefined) {
+    if (workspace === undefined || workspaceNames(current).has(workspace)) {
+      const tenantId = workspaceTenantId(current);
+      if (tenantId !== undefined) return { tenantId, name: workspaceName(current), data: current };
+    }
+  }
+  return undefined;
+}
+
+function workspaceTenantId(workspace: Record<string, unknown>): string | undefined {
+  const value = workspace.tenant_id ?? workspace.id;
+  return typeof value === "string" ? value : undefined;
+}
+
+function workspaceName(workspace: Record<string, unknown>): string | undefined {
+  for (const key of ["name", "workspace", "external_key"] as const) {
+    if (typeof workspace[key] === "string") return workspace[key];
+  }
+  return undefined;
+}
+
+function workspaceNames(workspace: Record<string, unknown>): Set<string> {
+  const names = new Set<string>();
+  for (const key of ["name", "workspace", "external_key"] as const) {
+    if (typeof workspace[key] === "string") names.add(workspace[key]);
+  }
+  return names;
+}
+
+async function findAgentByAlias(client: Client, tenantId: TenantId, alias: string): Promise<Record<string, unknown> | undefined> {
+  return (await client.listAgents(tenantId)).find((agent) => agent.alias === alias);
+}
+
+async function findSessionByAlias(client: Client, tenantId: TenantId, alias: string): Promise<Record<string, unknown> | undefined> {
+  return (await client.listSessions(tenantId)).find((session) => session.alias === alias);
+}
+
+function headersRecord(headers: HeadersInit | undefined): Record<string, string> {
+  if (headers === undefined) return {};
+  if (Array.isArray(headers)) return Object.fromEntries(headers);
+  if (typeof (headers as Headers).forEach === "function") {
+    const out: Record<string, string> = {};
+    (headers as Headers).forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }
+  return { ...(headers as Record<string, string>) };
 }
 
 function enc(s: string): string {

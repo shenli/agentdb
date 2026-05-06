@@ -22,8 +22,13 @@ cargo run -p agentdb-server -- serve --dev
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
-const workspace = await db.workspace("acme");
+const db = new AgentDB({
+  baseUrl: "http://127.0.0.1:7878",
+  token: process.env.AGENTDB_API_KEY,
+});
+
+// Hosted deployments resolve the workspace/tenant from authentication.
+const workspace = await db.workspace();
 const agent = await workspace.agent("sales-agent");
 const session = await agent.session("ticket-42");
 
@@ -31,12 +36,21 @@ const result = await session.appendUser("hello", { fetchLastN: 5 });
 console.log(result.seq, result.recent.map((event) => event.payload));
 ```
 
+`tenantId` is infrastructure state. Normal application code should let
+authentication resolve the workspace/tenant, then use application-facing agent
+and session aliases. For local development against a server without `/api/me`,
+pass a workspace alias explicitly:
+
+```ts
+const workspace = await db.workspace("acme-dev");
+```
+
 `workspace("acme")`, `workspace.agent("sales-agent")`, and
 `agent.session("ticket-42")` use application-facing names/aliases. AgentDB still
 assigns canonical opaque IDs (`ten_*`, `agt_*`, `ses_*`) and exposes them on the
 returned handles as `.id`. Use `agent.sessionById(sessionId)` or
-`db.sessionById(sessionId, { tenantId, agentId })` when recovering from a
-persisted canonical session ID.
+`await db.session(sessionId, { agentId })` when recovering from a persisted
+canonical session ID without exposing `tenantId` to normal app code.
 
 ## Core Surface
 
@@ -72,14 +86,18 @@ LSI-like index; omit it for GSI-like global discovery.
 ## Harness Recovery
 
 AgentDB sessions are durable state outside the harness process. A restarted
-harness should keep the tenant, agent, session, and last-seen sequence IDs, then
-rebuild a session handle and continue from durable history:
+harness should keep the agent/session identity and last-seen sequence IDs, then
+rebuild a session handle and continue from durable history. Tenant/workspace
+scope should come from authentication:
 
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
-const session = db.sessionById(sessionId, { tenantId, agentId });
+const db = new AgentDB({
+  baseUrl: "http://127.0.0.1:7878",
+  token: process.env.AGENTDB_API_KEY,
+});
+const session = await db.session(sessionId, { agentId });
 
 const history = await session.replay({ fromSeq: 0, limit: 100 });
 const context = await session.context({
@@ -104,7 +122,7 @@ Concept mapping:
 | subscribe from sequence | `session.subscribe({ fromSeq })` |
 | fork session | `session.fork(...)` |
 | build context | `session.context(...)` |
-| tenant/session watch | `client.watch(...)` |
+| workspace/session watch | `workspace.watch(...)` |
 
 Use `fromSeq: lastSeenSeq + 1` when reconnecting a subscription to avoid
 replaying events the harness has already processed. Persisting the last handled

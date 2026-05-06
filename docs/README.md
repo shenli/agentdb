@@ -14,6 +14,8 @@ or implementation plans.
   optimized for, where it should win, and where it should not compete
 - [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - current crate
   boundaries, request flow, storage, routing, and operational model
+- [agentdb-messaging-house.md](agentdb-messaging-house.md)
+  - product positioning and value-prop messaging framework
 
 ## Run And Operate
 
