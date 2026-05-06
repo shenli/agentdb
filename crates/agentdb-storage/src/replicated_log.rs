@@ -41,6 +41,12 @@ pub trait ReplicatedLog: Send + Sync {
         after_index: u64,
         limit: usize,
     ) -> Result<Vec<LogEntry>>;
+
+    /// Delete committed log entries through `up_to_index`, inclusive.
+    ///
+    /// Callers should only compact after a snapshot covering `up_to_index` is
+    /// durable enough for recovery/catch-up.
+    fn compact(&self, tablet_id: i64, up_to_index: u64) -> Result<usize>;
 }
 
 #[derive(Clone)]
@@ -103,6 +109,29 @@ impl ReplicatedLog for SingleNodeReplicatedLog {
         entries.sort_by_key(|entry| entry.index);
         entries.truncate(limit);
         Ok(entries)
+    }
+
+    fn compact(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {
+        validate_tablet_id(tablet_id)?;
+        if up_to_index == 0 {
+            return Ok(0);
+        }
+        let prefix = log_prefix(tablet_id);
+        let mut ops = Vec::new();
+        for item in self.kv.scan_prefix(&prefix)? {
+            let (key, _) = item?;
+            let Some(index) = parse_log_index(&key, &prefix) else {
+                continue;
+            };
+            if index <= up_to_index {
+                ops.push(WriteOp::Delete { key });
+            }
+        }
+        let deleted = ops.len();
+        if deleted > 0 {
+            self.kv.write_batch(ops)?;
+        }
+        Ok(deleted)
     }
 }
 
@@ -191,5 +220,40 @@ mod tests {
         let entries = log.committed_entries(7, 0, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, b"seven");
+    }
+
+    #[test]
+    fn single_node_log_compacts_committed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let log = SingleNodeReplicatedLog::new(kv);
+
+        log.append(7, b"first".to_vec()).unwrap();
+        log.append(7, b"second".to_vec()).unwrap();
+        log.append(7, b"third".to_vec()).unwrap();
+
+        assert_eq!(log.compact(7, 2).unwrap(), 2);
+
+        let entries = log.committed_entries(7, 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 3);
+        assert_eq!(entries[0].command, b"third");
+    }
+
+    #[test]
+    fn single_node_log_compaction_is_scoped_by_tablet() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let log = SingleNodeReplicatedLog::new(kv);
+
+        log.append(7, b"seven".to_vec()).unwrap();
+        log.append(8, b"eight".to_vec()).unwrap();
+
+        assert_eq!(log.compact(7, 1).unwrap(), 1);
+
+        assert!(log.committed_entries(7, 0, 10).unwrap().is_empty());
+        let entries = log.committed_entries(8, 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, b"eight");
     }
 }

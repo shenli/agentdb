@@ -160,6 +160,16 @@ impl LoggedTabletStateMachine {
             .expect("tablet applied-index lock poisoned") = snapshot.applied_index;
         Ok(())
     }
+
+    pub fn compact_log_through(&self, up_to_index: u64) -> StorageResult<usize> {
+        if up_to_index > self.applied_index() {
+            return Err(agentdb_storage::Error::Other(format!(
+                "cannot compact through index {up_to_index}; applied index is {}",
+                self.applied_index()
+            )));
+        }
+        self.log.compact(self.tablet_id, up_to_index)
+    }
 }
 
 impl TabletStateMachine for LoggedTabletStateMachine {
@@ -475,5 +485,49 @@ mod tests {
         let err = machine.install_snapshot(&snapshot).unwrap_err();
 
         assert!(err.to_string().contains("does not match state machine"));
+    }
+
+    #[test]
+    fn compact_log_through_rejects_unapplied_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let machine = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+
+        let err = machine.compact_log_through(1).unwrap_err();
+
+        assert!(err.to_string().contains("cannot compact through index 1"));
+    }
+
+    #[test]
+    fn compact_log_through_removes_covered_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let log = Arc::new(SingleNodeReplicatedLog::new(kv.clone()));
+        let machine =
+            LoggedTabletStateMachine::new(7, log.clone(), TabletKvStore::new(kv, 7).unwrap())
+                .unwrap();
+
+        machine
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![TabletWriteOp::Put {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                }],
+            })
+            .unwrap();
+        machine
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![TabletWriteOp::Put {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec(),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(machine.compact_log_through(1).unwrap(), 1);
+
+        let entries = log.committed_entries(7, 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 2);
     }
 }
