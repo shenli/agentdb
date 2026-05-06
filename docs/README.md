@@ -14,6 +14,8 @@ or implementation plans.
   optimized for, where it should win, and where it should not compete
 - [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - current crate
   boundaries, request flow, storage, routing, and operational model
+- [architecture/STORAGE_ENGINE.md](architecture/STORAGE_ENGINE.md) - current
+  storage engine and replicated tablet/split-LSM improvement plan
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
 
