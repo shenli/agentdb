@@ -233,6 +233,14 @@ Persistent single-node RocksDB mode stores runtime metadata under
 `<data-dir>/runtime`. SlateDB mode stores runtime metadata under the fixed
 object-store prefix `agentdb/runtime`.
 
+SlateDB is currently an optional evaluation backend, not the target production
+commit path. It proves that the `KvStore` abstraction can run over object
+storage, but it is not a replication mechanism and does not replace a
+multi-node consensus protocol. The production direction for clustered hot
+writes is a replicated local log/tablet path that commits after quorum, with
+object-store upload happening asynchronously for sealed history, artifacts, and
+archives.
+
 Artifact content is separated from metadata through a `ContentBackend`. The
 server now supports:
 
@@ -244,6 +252,14 @@ Local mode stores content under the configured `content_dir`; if no content
 directory is configured, it uses `<data-dir>/content`. Object-store mode stores
 artifacts, sealed cold segments, and archive bundles under the fixed prefix
 `agentdb/content`.
+
+The hot session append path should not synchronously upload event history to
+object storage. Appends target the warm runtime store; lifecycle workers later
+seal cold segments or archive bundles and write those immutable objects through
+the content backend. Large artifact bytes are already out-of-line through
+`ContentBackend`; the current object-store content backend performs a
+synchronous object PUT for artifact uploads, which should remain separate from
+ordinary event append.
 
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.

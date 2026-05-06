@@ -52,6 +52,9 @@ The current product shape is intentionally narrow:
 - framework adapters should prove the runtime primitives, not reimplement them
 - compatibility layers and extra SDKs are secondary until the core experience is
   stable
+- object-store-backed runtime metadata is an optional evaluation path; the
+  production write architecture should not depend on synchronous object-store
+  writes for every append
 
 ## Active Interfaces
 
@@ -194,6 +197,13 @@ purge in a policy-controlled order.
 Runtime metadata is stored through the existing KV abstraction. Local persistent
 mode uses RocksDB. Artifact content uses a separate content backend so metadata
 and blob bytes can be placed, retained, and purged independently.
+
+SlateDB is allowed as an optional `KvStore` backend to validate the abstraction
+and evaluate object-store-backed runtime metadata. It should not be treated as
+the production answer for hot write durability or multi-node safety. A clustered
+AgentDB needs a replicated local log/tablet commit path, such as Raft-style
+quorum replication, before acknowledging writes; object storage belongs behind
+asynchronous sealing, archival, and artifact flows.
 
 ## SDKs And Adapters
 

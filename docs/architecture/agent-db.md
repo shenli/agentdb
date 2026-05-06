@@ -160,6 +160,13 @@ For AgentDB, this suggests a split:
 - Search should be scoped by the runtime model: tenant, agent, session,
   namespace, source refs, policy, and lifecycle. Search alone is not enough.
 
+This split also means object storage should not be the synchronous hot-write
+contract. SlateDB-on-object-storage is useful as an evaluation backend and a way
+to harden the storage abstraction, but it does not provide multi-node commit
+consensus. Production hot writes should commit to local durable state replicated
+across nodes; object storage should receive sealed segments, archive bundles,
+and large artifacts asynchronously after the write is already safe.
+
 ### Query Patterns Are Concentrated
 
 Agent runtime queries cluster into a small set:
