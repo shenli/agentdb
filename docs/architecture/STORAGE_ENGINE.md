@@ -246,7 +246,7 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
 | Runtime data | Persisted runtime state is stored through `TabletKvStore` under the primary runtime tablet namespace | Tablet-local applied state stores per routed tablet |
-| Replication | No hot-path multi-node consensus yet; `ReplicatedLog` has a durable single-node implementation | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
+| Replication | Leader-driven quorum commit exists behind `ReplicatedLog`; production election/transport still pending | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
 | Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
 | Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
@@ -899,9 +899,10 @@ single-session appends or record writes.
    with a single-node implementation that preserves current behavior, then add a
    Raft implementation using `raft-rs` and `raft-engine`.
 
-   Current implementation status: the `ReplicatedLog` trait and
-   `SingleNodeReplicatedLog` exist. Persisted runtime writes are routed through
-   a logged tablet state-machine wrapper in single-node mode.
+   Current implementation status: the `ReplicatedLog` trait,
+   `SingleNodeReplicatedLog`, and `RaftQuorumReplicatedLog` exist. Persisted
+   runtime writes can be routed through a logged tablet state-machine wrapper
+   backed either by single-node commit or by leader-driven quorum commit.
 
 5. Move append/write commands through the tablet state machine.
 
@@ -921,6 +922,15 @@ single-session appends or record writes.
    In clustered mode, acknowledge writes only after the Raft group reaches the
    commit index for the command and the local apply path has made it visible to
    the session read context.
+
+   Current implementation status: `RaftQuorumReplicatedLog` writes the leader's
+   local log entry, sends AppendEntries requests to voters, persists a commit
+   index only after majority acknowledgement, and exposes follower
+   AppendEntries handling. The runtime has a constructor that accepts a
+   replicated log, and tests verify runtime writes fail without quorum and
+   hydrate from a quorum follower after commit. Full raft-rs leader election,
+   persistent raft-engine log storage, membership changes, and production
+   network transport are still pending.
 
 7. Add snapshot and catch-up support.
 

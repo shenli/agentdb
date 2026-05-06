@@ -24,8 +24,8 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
-    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, TabletKvStore,
-    WriteOp,
+    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, ReplicatedLog,
+    TabletKvStore, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -519,17 +519,28 @@ struct RuntimeTabletKvStore {
 }
 
 impl RuntimeTabletKvStore {
-    fn single_node(
+    fn new(
         kv: Arc<dyn KvStore + Send + Sync>,
         tablet_id: i64,
+        state_machine: Arc<dyn TabletStateMachine>,
     ) -> agentdb_storage::Result<Self> {
-        let store = Arc::new(TabletKvStore::new(kv.clone(), tablet_id)?);
-        let state_machine = Arc::new(LoggedTabletStateMachine::single_node(kv, tablet_id)?);
+        let store = Arc::new(TabletKvStore::new(kv, tablet_id)?);
         state_machine.apply_committed()?;
         Ok(Self {
             store,
             state_machine,
         })
+    }
+
+    fn single_node(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        tablet_id: i64,
+    ) -> agentdb_storage::Result<Self> {
+        let state_machine = Arc::new(LoggedTabletStateMachine::single_node(
+            kv.clone(),
+            tablet_id,
+        )?);
+        Self::new(kv, tablet_id, state_machine)
     }
 }
 
@@ -917,6 +928,43 @@ impl Runtime {
         )
     }
 
+    pub fn with_kv_and_replicated_log(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        log: Arc<dyn ReplicatedLog + Send + Sync>,
+    ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_log(
+            kv,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            Arc::new(IdentityMetadataCryptoAdapter),
+            log,
+        )
+    }
+
+    pub fn with_kv_kms_content_metadata_and_replicated_log(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+        log: Arc<dyn ReplicatedLog + Send + Sync>,
+    ) -> Arc<Self> {
+        let tablet_store = TabletKvStore::new(kv.clone(), RUNTIME_PRIMARY_TABLET_ID)
+            .expect("open runtime tablet store");
+        let state_machine = Arc::new(
+            LoggedTabletStateMachine::new(RUNTIME_PRIMARY_TABLET_ID, log, tablet_store)
+                .expect("open runtime tablet state machine"),
+        );
+        let runtime_kv = Arc::new(
+            RuntimeTabletKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, state_machine)
+                .expect("open runtime tablet state"),
+        );
+        let persist = Persist::with_metadata_crypto(runtime_kv, metadata_crypto);
+        Self::from_persist(persist, content, kms, content_crypto)
+    }
+
     pub fn with_kv_kms_content_and_metadata_crypto(
         kv: Arc<dyn KvStore + Send + Sync>,
         content: Arc<dyn ContentBackend>,
@@ -929,7 +977,15 @@ impl Runtime {
                 .expect("open runtime tablet state"),
         );
         let persist = Persist::with_metadata_crypto(runtime_kv, metadata_crypto);
+        Self::from_persist(persist, content, kms, content_crypto)
+    }
 
+    fn from_persist(
+        persist: Persist,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+    ) -> Arc<Self> {
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {
             state.tenants.insert(t.tenant_id.as_str().to_string(), t);

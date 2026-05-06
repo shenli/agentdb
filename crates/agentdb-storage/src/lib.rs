@@ -32,7 +32,10 @@ pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
 };
-pub use replicated_log::{LogCommit, LogEntry, ReplicatedLog, SingleNodeReplicatedLog};
+pub use replicated_log::{
+    LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,
+    RaftLogTransport, RaftQuorumReplicatedLog, ReplicatedLog, SingleNodeReplicatedLog,
+};
 pub use rocks::RocksKvStore;
 pub use slate::SlateKvStore;
 pub use tablet_store::TabletKvStore;
