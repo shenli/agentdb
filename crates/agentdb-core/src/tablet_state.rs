@@ -54,6 +54,19 @@ pub struct TabletApplyResult {
     pub applied_index: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TabletStateSnapshot {
+    pub tablet_id: i64,
+    pub applied_index: u64,
+    pub entries: Vec<TabletSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TabletSnapshotEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 pub trait TabletStateMachine: Send + Sync {
     fn commit(&self, command: TabletCommand) -> StorageResult<TabletApplyResult>;
     fn apply_committed(&self) -> StorageResult<usize>;
@@ -94,6 +107,58 @@ impl LoggedTabletStateMachine {
 
     pub fn store(&self) -> &TabletKvStore {
         &self.store
+    }
+
+    pub fn export_snapshot(&self) -> StorageResult<TabletStateSnapshot> {
+        self.apply_committed()?;
+        let mut entries = Vec::new();
+        for item in self.store.scan_prefix(b"")? {
+            let (key, value) = item?;
+            if key.starts_with(RESERVED_KEY_PREFIX) {
+                continue;
+            }
+            entries.push(TabletSnapshotEntry { key, value });
+        }
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(TabletStateSnapshot {
+            tablet_id: self.tablet_id,
+            applied_index: self.applied_index(),
+            entries,
+        })
+    }
+
+    pub fn install_snapshot(&self, snapshot: &TabletStateSnapshot) -> StorageResult<()> {
+        if snapshot.tablet_id != self.tablet_id {
+            return Err(agentdb_storage::Error::Other(format!(
+                "snapshot tablet_id {} does not match state machine tablet_id {}",
+                snapshot.tablet_id, self.tablet_id
+            )));
+        }
+        for entry in &snapshot.entries {
+            validate_user_key(&entry.key)?;
+        }
+
+        let mut ops = Vec::new();
+        for item in self.store.scan_prefix(b"")? {
+            let (key, _) = item?;
+            ops.push(WriteOp::Delete { key });
+        }
+        for entry in &snapshot.entries {
+            ops.push(WriteOp::Put {
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+            });
+        }
+        ops.push(WriteOp::Put {
+            key: APPLIED_INDEX_KEY.to_vec(),
+            value: snapshot.applied_index.to_be_bytes().to_vec(),
+        });
+        self.store.write_batch(ops)?;
+        *self
+            .applied_index
+            .lock()
+            .expect("tablet applied-index lock poisoned") = snapshot.applied_index;
+        Ok(())
     }
 }
 
@@ -179,6 +244,10 @@ fn validate_write_op_key(op: &TabletWriteOp) -> StorageResult<()> {
     let key = match op {
         TabletWriteOp::Put { key, .. } | TabletWriteOp::Delete { key } => key,
     };
+    validate_user_key(key)
+}
+
+fn validate_user_key(key: &[u8]) -> StorageResult<()> {
     if key.starts_with(RESERVED_KEY_PREFIX) {
         return Err(agentdb_storage::Error::Other(
             "tablet command targets reserved keyspace".into(),
@@ -314,5 +383,97 @@ mod tests {
             .to_string()
             .contains("tablet command targets reserved keyspace"));
         assert_eq!(machine.applied_index(), 0);
+    }
+
+    #[test]
+    fn snapshot_exports_applied_state_without_internal_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let machine = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+        machine
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![
+                    TabletWriteOp::Put {
+                        key: b"b".to_vec(),
+                        value: b"2".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        let snapshot = machine.export_snapshot().unwrap();
+
+        assert_eq!(snapshot.tablet_id, 7);
+        assert_eq!(snapshot.applied_index, 1);
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                TabletSnapshotEntry {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                TabletSnapshotEntry {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_install_replaces_tablet_state_and_applied_index() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_kv = Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+        let source = LoggedTabletStateMachine::single_node(source_kv, 7).unwrap();
+        source
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![TabletWriteOp::Put {
+                    key: b"k".to_vec(),
+                    value: b"fresh".to_vec(),
+                }],
+            })
+            .unwrap();
+        let snapshot = source.export_snapshot().unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_kv = Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+        let target = LoggedTabletStateMachine::single_node(target_kv.clone(), 7).unwrap();
+        target.store().put(b"stale", b"old").unwrap();
+
+        target.install_snapshot(&snapshot).unwrap();
+
+        assert_eq!(target.applied_index(), snapshot.applied_index);
+        assert_eq!(
+            target.store().get(b"k").unwrap().as_deref(),
+            Some(&b"fresh"[..])
+        );
+        assert!(target.store().get(b"stale").unwrap().is_none());
+
+        let restarted = LoggedTabletStateMachine::single_node(target_kv.clone(), 7).unwrap();
+        assert_eq!(restarted.applied_index(), snapshot.applied_index);
+        assert_eq!(
+            restarted.store().get(b"k").unwrap().as_deref(),
+            Some(&b"fresh"[..])
+        );
+    }
+
+    #[test]
+    fn snapshot_install_rejects_wrong_tablet() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let machine = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+        let snapshot = TabletStateSnapshot {
+            tablet_id: 8,
+            applied_index: 1,
+            entries: vec![],
+        };
+
+        let err = machine.install_snapshot(&snapshot).unwrap_err();
+
+        assert!(err.to_string().contains("does not match state machine"));
     }
 }

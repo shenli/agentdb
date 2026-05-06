@@ -925,6 +925,12 @@ single-session appends or record writes.
    Snapshot tablet-local applied state, upload snapshots asynchronously, and use
    Raft log replay plus snapshots for follower catch-up and node replacement.
 
+   Current implementation status: `LoggedTabletStateMachine` can export a
+   deterministic tablet-local state snapshot with its applied index and install
+   a snapshot atomically into another tablet-local store. Snapshot persistence,
+   async upload, retention, and Raft follower catch-up orchestration are still
+   not wired.
+
 8. Add tablet split and rebalance.
 
    Split hot or large dedicated tablets by same-tenant virtual shard range.
