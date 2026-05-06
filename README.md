@@ -23,9 +23,18 @@ to rebuild session semantics on top of a generic database.
 - **Session-native runtime semantics** — tenant-scoped agents, sessions,
   ordered events, artifacts, records, skills, policy, replay, fork, subscribe,
   context, and lifecycle state
+- **Multi-tenant runtime architecture** — tenant boundaries are built into
+  routing, policy, quota, lifecycle, watch streams, storage layout, and future
+  placement decisions instead of being bolted on in application code
+- **DynamoDB-style record index behavior** — owner-local record searches with
+  read-after-write semantics when a `sharding_key` is known, plus async
+  eventually consistent global discovery when it is not
 - **Object-store based storage engine** — scale retained history and keep costs
   predictable by separating hot session metadata from cold events, large
   artifacts, and derived state
+- **Compatibility where it helps** — native HTTP/SDK APIs remain canonical,
+  while the optional MongoDB listener lets existing drivers and tools inspect
+  and write AgentDB runtime collections
 - **Operate and debug agent runs** — dashboard, watch streams, structured
   errors, runbooks, health checks, and deployment docs make runtime state
   inspectable
@@ -40,22 +49,32 @@ AgentDB, then reads it back to resume, replay, fork, inspect, or stream a run.
 ```text
                  AI agent platform
 
-        brain / harness              hands
-    model loop, planning,      tools, sandboxes, MCP,
-    context management         code execution, APIs
-             |                         |
-             | append/read/replay      | tool calls/results
-             v                         v
-      +---------------------------------------+
-      |                AgentDB                |
-      | durable sessions, events, artifacts,  |
-      | replay, fork, records, policy, watch  |
-      +---------------------------------------+
-             |                         |
-             v                         v
-    memory / knowledge          application data
-    vector DB, RAG,             Postgres/MySQL/etc.
-    summaries                   users, billing, CRM
+  tenant A / workspace A             tenant B / workspace B
+  support agents, sessions           research agents, sessions
+             |                                  |
+             | append/read/replay/search/watch |
+             v                                  v
+      +--------------------------------------------------+
+      |                    AgentDB                       |
+      | multi-tenant runtime boundary                    |
+      |                                                  |
+      |  tenants -> agents -> sessions -> events         |
+      |      |          |          |          |           |
+      |      |          |          +--> artifacts         |
+      |      |          |          +--> records           |
+      |      |          |                 |               |
+      |      |          |                 +--> local index |
+      |      |          |                 |    sharding_key|
+      |      |          |                 +--> global index|
+      |      |          |                      async/GSI   |
+      |      |          |                                  |
+      |      +--> policy, quota, lifecycle, storage       |
+      |      +--> watch/changefeed cursors                |
+      +--------------------------------------------------+
+             |                                  |
+             v                                  v
+   dashboards, supervisors,          tools, sandboxes, MCP,
+   evaluators, replay viewers        application systems
 ```
 
 This repository is a pre-release prototype. The supported developer surfaces
@@ -235,6 +254,11 @@ result = session.append({"role": "user", "text": "hello"}, fetch_last_n=5)
 print(result.seq, [event.payload for event in result.recent])
 ```
 
+In authenticated deployments, tenant scope is an authorization boundary derived
+from user-info metadata. Normal application code works with workspaces, agents,
+and sessions; local development can still pass `workspace("acme")` as an
+explicit alias.
+
 Async support is available through the optional extra:
 
 ```bash
@@ -256,8 +280,11 @@ Append an event and fetch recent session history:
 ```ts
 import { AgentDB } from "agentdb";
 
-const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878" });
-const workspace = await db.workspace("acme");
+const db = new AgentDB({
+  baseUrl: "http://127.0.0.1:7878",
+  token: process.env.AGENTDB_API_KEY,
+});
+const workspace = await db.workspace();
 const agent = await workspace.agent("sales-agent");
 const session = await agent.session("support-ticket-42");
 
@@ -267,6 +294,9 @@ const result = await session.append(
 );
 console.log(result.seq, result.recent.map((event) => event.payload));
 ```
+
+For local development against an unauthenticated server without `/api/me`, use
+`await db.workspace("acme")` to bind an explicit workspace alias.
 
 ## Workspace Layout
 
