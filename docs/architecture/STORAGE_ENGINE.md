@@ -938,9 +938,10 @@ single-session appends or record writes.
    returns. The older `RaftQuorumReplicatedLog` remains as a narrow
    legacy/in-process quorum harness. `RaftRsWireMessage` exposes encoded
    `raft-rs` messages for a production node-to-node transport and can step
-   messages delivered back into the local group. The remaining production work
-   is wiring that message surface into HTTP/gRPC internode RPC, online
-   membership changes, and snapshot transfer orchestration.
+   messages delivered back into the local group. The adapter also supports
+   online learner promotion and voter removal through `raft-rs` configuration
+   changes. The remaining production work is wiring the message surface into
+   HTTP/gRPC internode RPC and snapshot transfer orchestration.
 
 7. Add snapshot and catch-up support.
 

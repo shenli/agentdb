@@ -15,7 +15,9 @@ use std::{
 
 use prost::Message as ProstMessage;
 use raft::{
-    eraftpb::{Entry, EntryType, HardState, Message},
+    eraftpb::{
+        ConfChangeSingle, ConfChangeType, ConfChangeV2, Entry, EntryType, HardState, Message,
+    },
     raw_node::RawNode,
     storage::MemStorage,
     Config, StateRole,
@@ -259,6 +261,20 @@ impl RaftRsSharedGroup {
             .step_wire_message(message)
     }
 
+    pub fn promote_to_voter(&self, leader_id: u64, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .propose_membership_change(leader_id, node_id, ConfChangeType::AddNode)
+    }
+
+    pub fn remove_node(&self, leader_id: u64, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .propose_membership_change(leader_id, node_id, ConfChangeType::RemoveNode)
+    }
+
     fn append(&self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         self.inner
             .lock()
@@ -355,6 +371,23 @@ impl RaftRsGroup {
         self.node_mut(to)?
             .raw
             .step(raft_message)
+            .map_err(map_raft_error)?;
+        self.drive_until_idle()
+    }
+
+    fn propose_membership_change(
+        &mut self,
+        leader_id: u64,
+        node_id: u64,
+        change_type: ConfChangeType,
+    ) -> Result<()> {
+        if self.node(leader_id)?.raw.status().ss.raft_state != StateRole::Leader {
+            self.elect(leader_id)?;
+        }
+        let cc = conf_change(node_id, change_type);
+        self.node_mut(leader_id)?
+            .raw
+            .propose_conf_change(Vec::new(), cc)
             .map_err(map_raft_error)?;
         self.drive_until_idle()
     }
@@ -489,8 +522,19 @@ impl RaftRsGroup {
                     continue;
                 }
                 if let Some(node) = self.nodes.get_mut(&to) {
-                    node.raw.step(message).map_err(map_raft_error)?;
-                    progressed = true;
+                    match node.raw.step(message) {
+                        Ok(()) => {
+                            progressed = true;
+                        }
+                        Err(err) if err.to_string().contains("peer not found") => {
+                            tracing::debug!(
+                                node_id = to,
+                                ?err,
+                                "ignored message for removed raft peer"
+                            );
+                        }
+                        Err(err) => return Err(map_raft_error(err)),
+                    }
                 } else {
                     self.wire_messages
                         .push_back(RaftRsWireMessage::from_raft_message(
@@ -631,22 +675,26 @@ impl RaftRsNode {
     fn apply_committed(&mut self, entries: Vec<Entry>, tablet_id: i64) -> Result<()> {
         for entry in entries {
             self.last_applied_index = entry.index;
-            if entry.entry_type != EntryType::EntryNormal as i32 || entry.data.is_empty() {
+            if entry.entry_type == EntryType::EntryConfChangeV2 as i32 {
+                let cc = ConfChangeV2::decode(entry.data.as_slice()).map_err(map_prost_error)?;
+                self.raw.apply_conf_change(&cc).map_err(map_raft_error)?;
                 continue;
             }
-            if self
-                .committed
-                .iter()
-                .any(|committed| committed.index == entry.index)
-            {
-                continue;
+            if entry.entry_type == EntryType::EntryNormal as i32 && !entry.data.is_empty() {
+                if self
+                    .committed
+                    .iter()
+                    .any(|committed| committed.index == entry.index)
+                {
+                    continue;
+                }
+                self.committed.push(LogEntry {
+                    tablet_id,
+                    index: entry.index,
+                    term: entry.term,
+                    command: entry.data.to_vec(),
+                });
             }
-            self.committed.push(LogEntry {
-                tablet_id,
-                index: entry.index,
-                term: entry.term,
-                command: entry.data.to_vec(),
-            });
         }
         Ok(())
     }
@@ -748,6 +796,16 @@ fn replay_raft_engine_to_storage(
 
 fn raft_entry_key(index: u64) -> Vec<u8> {
     format!("entry/{index:020}").into_bytes()
+}
+
+fn conf_change(node_id: u64, change_type: ConfChangeType) -> ConfChangeV2 {
+    ConfChangeV2 {
+        changes: vec![ConfChangeSingle {
+            node_id,
+            change_type: change_type as i32,
+        }],
+        ..Default::default()
+    }
 }
 
 fn parse_raft_entry_key(key: &[u8]) -> Option<u64> {
@@ -989,5 +1047,53 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.command == b"wire-delivery"));
+    }
+
+    #[test]
+    fn raft_rs_log_promotes_learner_to_voter() {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            RaftRsNodeConfig {
+                node_id: 1,
+                role: RaftRsNodeRole::Voter,
+                raft_engine_dir: dir.path().join("n1"),
+            },
+            RaftRsNodeConfig {
+                node_id: 2,
+                role: RaftRsNodeRole::Voter,
+                raft_engine_dir: dir.path().join("n2"),
+            },
+            RaftRsNodeConfig {
+                node_id: 3,
+                role: RaftRsNodeRole::Learner,
+                raft_engine_dir: dir.path().join("n3"),
+            },
+        ];
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+
+        group.promote_to_voter(1, 3).unwrap();
+        group.mark_unavailable(2).unwrap();
+        let commit = logs[0].append(7, b"promoted-voter".to_vec()).unwrap();
+
+        assert!(commit.index > 0);
+        assert!(logs[2]
+            .committed_entries(7, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.command == b"promoted-voter"));
+    }
+
+    #[test]
+    fn raft_rs_log_removes_voter_from_quorum() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+
+        group.remove_node(1, 3).unwrap();
+        group.mark_unavailable(2).unwrap();
+        let err = logs[0].append(7, b"after-remove".to_vec()).unwrap_err();
+
+        assert!(err.to_string().contains("did not commit"));
     }
 }
