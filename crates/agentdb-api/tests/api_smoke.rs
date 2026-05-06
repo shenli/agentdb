@@ -1895,6 +1895,10 @@ fn tablet_with_epoch(id: i64, owner: Option<&str>, epoch: i64) -> Tablet {
         epoch,
         lease_expires_at_ms: i64::MAX,
         created_at_ms: 0,
+        placement_scope_id: "default".into(),
+        state: "serving".into(),
+        raft_group_id: None,
+        encryption_policy_version: 0,
         handoff_target_node_id: None,
     }
 }

@@ -109,6 +109,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/015_session_locator_notify.sql"),
         include_str!("../migrations/015_session_locator_notify.pg.sql"),
     ),
+    (
+        16,
+        "placement scopes, tablet lifecycle, and compressed shard ranges",
+        include_str!("../migrations/016_tablet_ranges.sql"),
+        include_str!("../migrations/016_tablet_ranges.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

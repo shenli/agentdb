@@ -22,6 +22,7 @@ use agentdb_meta::{
     routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
     session_locators::{self, SessionLocator},
     shards::{self, ShardRow},
+    tablet_ranges::{self, TabletRange},
     tablets::{self, Tablet},
     MetaStore,
 };
@@ -81,6 +82,7 @@ pub struct RouteSnapshot {
     pub request_location: Option<String>,
     pub policy: ResidencyPolicy,
     pub shards: Arc<[ShardRow]>,
+    pub tablet_ranges: Arc<[TabletRange]>,
     pub tablets: Arc<[Tablet]>,
     pub nodes: Arc<[Node]>,
     pub session_locators: Arc<[SessionLocator]>,
@@ -125,6 +127,7 @@ pub struct RouteSnapshotStatus {
     pub allowed_locations: Vec<String>,
     pub allow_cross_location: bool,
     pub shard_rows: usize,
+    pub tablet_range_count: usize,
     pub tablet_count: usize,
     pub node_count: usize,
     pub session_locator_count: usize,
@@ -271,6 +274,7 @@ impl RouteRuntime {
                     RouteRequest {
                         tenant_id,
                         routing_key: session_id,
+                        placement_scope_id: None,
                         session_locator,
                         request_location: snapshot.request_location.as_deref(),
                         local_node_id: Some(&self.local_node_id),
@@ -279,6 +283,7 @@ impl RouteRuntime {
                         policy: snapshot.policy.clone(),
                     },
                     &snapshot.shards,
+                    &snapshot.tablet_ranges,
                     &snapshot.tablets,
                     &snapshot.nodes,
                 );
@@ -421,6 +426,7 @@ impl RouteRuntime {
             RouteRequest {
                 tenant_id,
                 routing_key,
+                placement_scope_id: None,
                 session_locator,
                 request_location: snapshot.request_location.as_deref(),
                 local_node_id: Some(&self.local_node_id),
@@ -429,6 +435,7 @@ impl RouteRuntime {
                 policy: snapshot.policy.clone(),
             },
             &snapshot.shards,
+            &snapshot.tablet_ranges,
             &snapshot.tablets,
             &snapshot.nodes,
         );
@@ -505,6 +512,7 @@ impl RouteSnapshot {
             request_location: None,
             policy: ResidencyPolicy::default(),
             shards: Arc::from([]),
+            tablet_ranges: Arc::from([]),
             tablets: Arc::from([]),
             nodes: Arc::from([]),
             session_locators: Arc::from([]),
@@ -523,6 +531,7 @@ impl RouteSnapshot {
             request_location,
             policy,
             shards: Arc::from(shards::list_all(pool).await?),
+            tablet_ranges: Arc::from(tablet_ranges::list_all(pool).await?),
             tablets: Arc::from(tablets::list_all(pool).await?),
             nodes: Arc::from(nodes::list_all(pool).await?),
             session_locators: Arc::from(session_locators::list_all(pool).await?),
@@ -541,6 +550,11 @@ impl RouteSnapshot {
 
     pub fn with_shards(mut self, shards: Vec<ShardRow>) -> Self {
         self.shards = Arc::from(shards);
+        self
+    }
+
+    pub fn with_tablet_ranges(mut self, tablet_ranges: Vec<TabletRange>) -> Self {
+        self.tablet_ranges = Arc::from(tablet_ranges);
         self
     }
 
@@ -616,6 +630,7 @@ impl RouteSnapshot {
             allowed_locations: self.policy.allowed_locations.clone(),
             allow_cross_location: self.policy.allow_cross_location,
             shard_rows: self.shards.len(),
+            tablet_range_count: self.tablet_ranges.len(),
             tablet_count: self.tablets.len(),
             node_count: self.nodes.len(),
             session_locator_count: self.session_locators.len(),
@@ -927,6 +942,10 @@ mod tests {
             epoch: 3,
             lease_expires_at_ms,
             created_at_ms: 0,
+            placement_scope_id: "default".into(),
+            state: "serving".into(),
+            raft_group_id: None,
+            encryption_policy_version: 0,
             handoff_target_node_id: None,
         }
     }

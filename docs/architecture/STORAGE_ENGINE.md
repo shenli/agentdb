@@ -21,8 +21,10 @@ The target architecture is a replicated tablet store:
 - Free or low-SLA tenants may use shared pool tablets under an explicit
   placement policy.
 - Each tablet owns a small local LSM tree or equivalent applied-state store.
-- Large tenants are split across virtual tablets instead of growing one large
-  tree.
+- Large tenants are split across multiple physical tablets instead of growing one
+  large tablet-local tree.
+- Virtual shards are stable routing slots only; they are not independently
+  scheduled, replicated, compacted, snapshotted, or moved.
 - Object storage is used asynchronously for sealed history, artifacts,
   snapshots, and archives, not as the synchronous append path.
 - Local indexes live with the tablet; global indexes are async, partitioned
@@ -64,6 +66,17 @@ The target physical storage model should support two placement classes.
 Dedicated placement preserves a one-tenant-per-tablet boundary. Shared placement
 is a cost optimization for free or low-SLA tenants and must be governed by a
 separate policy.
+
+Today, the control-plane schema already has the early shape of this model:
+
+- `shards`: fixed virtual routing slots, currently seeded as 16,384 rows.
+- `tablets`: ownership rows with owner, lease, and epoch.
+- `session_locators`: session-to-shard/tablet metadata for stable session
+  routing.
+
+Those rows are control-plane routing metadata only. The current runtime still
+uses a single `KvStore` backend for data; tablets are not yet independent Raft
+groups or independent LSM instances.
 
 ## Current Write Path
 
@@ -136,8 +149,9 @@ AgentDB should instead bound the size and responsibility of each LSM tree.
 ## Target Architecture
 
 The target architecture splits the storage engine into replicated tablets. A
-tablet is the physical ownership unit for a range, hash bucket, or virtual
-bucket of AgentDB data.
+tablet is the physical ownership unit for one or more virtual shard ranges.
+Shards are stable logical routing slots inside a placement scope. They are not
+TiKV-style regions and must not become independently managed data chunks.
 
 Tablet placement is policy-controlled:
 
@@ -209,6 +223,125 @@ The likely Rust components are:
 database. AgentDB still owns tablet placement, routing, snapshots, transport,
 apply workers, log compaction policy, index maintenance, and recovery.
 
+## Current Vs Target State
+
+| Area | Current implementation | Target design |
+|---|---|---|
+| Routing slots | `shards` table with 16,384 fixed rows | Virtual shards remain stable routing slots |
+| Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
+| Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
+| Runtime data | One `KvStore` backend selected by server config | Tablet-local applied state stores |
+| Replication | No hot-path multi-node consensus yet | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
+| Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
+| Placement policy | Not yet a first-class tenant policy table | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
+| Encryption policy | Metadata/content crypto primitives exist, but tablet placement does not yet own key policy | Control plane stores key references and versions; raw keys stay in KMS |
+
+The implementation should evolve toward the target without adding a second
+managed chunk layer under tablets. If more routing granularity is needed, add
+more virtual shards or split tablet shard ranges; do not make shards carry Raft,
+LSM, snapshot, or lease state.
+
+## Terminology And Invariants
+
+Use these terms consistently:
+
+- **Placement scope**: the logical namespace whose virtual shards are mapped to
+  tablets. A dedicated paid tenant is one placement scope. A shared free-tier
+  pool is also one placement scope.
+- **Shard**: a stable virtual routing slot inside a placement scope. Shards do
+  not have owners, leases, Raft groups, local LSMs, compaction, snapshots,
+  heartbeats, or recovery state.
+- **Tablet**: the physical serving and placement unit. Tablets own shard ranges
+  and carry ownership, epoch, replication, local LSM state, snapshots, indexes,
+  compaction, and movement lifecycle.
+- **Split**: a control-plane operation that replaces one tablet's shard range
+  with two or more child tablet ranges.
+- **Merge**: a control-plane operation that replaces adjacent compatible tablet
+  ranges with one destination tablet.
+
+Hard invariants:
+
+- One shard is served by exactly one active tablet at a tablet-map epoch.
+- One active tablet owns one or more contiguous shard ranges in one placement
+  scope.
+- A dedicated tablet contains exactly one tenant's data.
+- A shared tablet may contain multiple free-tier tenants, but never paid,
+  enterprise, regulated, or tenant-key-isolated tenants.
+- Shards are never independently replicated or compacted.
+- Split and merge change tablet-map ownership; they do not change shard ids.
+- Object-store paths for sealed/cold data should remain stable across tablet
+  movement. Tablet ownership should move manifests and metadata, not rewrite
+  immutable object bytes on the synchronous path.
+
+## Target Control-Plane Records
+
+The current schema can evolve into these logical records. Names are illustrative;
+the important contract is ownership and versioning.
+
+```text
+tenant_policy
+  tenant_id
+  tier
+  placement_class: dedicated | shared
+  placement_scope_id
+  encryption_class: tenant | pool
+  retention_policy_id
+  quota_policy_id
+  key_policy_id
+  policy_version
+
+placement_scope
+  placement_scope_id
+  kind: dedicated_tenant | shared_pool
+  shard_count
+  hash_seed
+  state
+  epoch
+
+tablet
+  tablet_id
+  placement_scope_id
+  state: creating | serving | splitting | merging | draining | tombstoned
+  owner_node_id
+  raft_group_id
+  epoch
+  lease_expires_at_ms
+  encryption_policy_version
+  created_at_ms
+
+tablet_range
+  placement_scope_id
+  start_shard
+  end_shard
+  tablet_id
+  map_epoch
+
+tablet_replica
+  tablet_id
+  node_id
+  role: voter | learner | log_only
+  health
+  applied_index
+  match_index
+
+session_locator
+  tenant_id
+  session_id
+  placement_scope_id
+  shard_id
+  tablet_id
+  tablet_epoch
+```
+
+`tablet_range` is the production-scale form of today's `shards` table. The
+current `shards` table stores per-shard overrides for simplicity; the target
+should use compressed ranges so splitting a tablet updates a few rows instead of
+thousands.
+
+`session_locator` is a fast path for stable session routing. If it exists, it is
+authoritative. If absent, routing computes the shard from the tenant-internal
+routing key and the current tablet map.
+
 ## Split-LSM Design
 
 Each tablet should own its own applied-state store. That store can be an LSM,
@@ -263,6 +396,18 @@ tablet = tablet_map[shard]
 This lets one tenant spread across many tablets while keeping shards virtual.
 Shards are routing slots only; tablets remain the only physical management
 units with leases, Raft groups, LSM state, snapshots, and placement lifecycle.
+
+The tablet map should be represented logically as shard ranges, even if the
+prototype stores individual `shard_id -> tablet_id` overrides:
+
+```text
+placement_scope, start_shard, end_shard, tablet_id, epoch
+```
+
+At the current 16,384-shard scale, per-shard rows are acceptable operationally.
+The target design should prefer compressed ranges so split/merge changes create
+or update a small number of tablet-map records rather than producing excessive
+metadata cardinality.
 
 ### Data Layout Diagram
 
@@ -334,6 +479,117 @@ after split
   tablet A-3 owns shards 8192..16383
   tablet A-1 drains, then tombstones
 ```
+
+## Tablet Lifecycle
+
+Tablet lifecycle is a control-plane state machine. The state should be explicit
+so routing, operators, and background workers agree on whether a tablet can
+serve writes, accept catch-up traffic, or be garbage collected.
+
+```text
+creating
+  -> serving
+  -> splitting
+  -> draining
+  -> tombstoned
+
+serving
+  -> merging
+  -> draining
+  -> tombstoned
+
+serving
+  -> draining
+  -> serving on another node
+```
+
+State meanings:
+
+- `creating`: metadata, replica set, Raft group, and local state are being
+  initialized. The tablet is not routable for normal writes.
+- `serving`: the tablet owns its shard range and can serve reads/writes subject
+  to leader and epoch checks.
+- `splitting`: the tablet is still fenced as the parent while children are
+  created and caught up.
+- `merging`: source tablets are fenced while the destination tablet is created
+  and caught up.
+- `draining`: no new writes should be routed here; in-flight requests finish or
+  fail with stale epoch.
+- `tombstoned`: the tablet no longer owns shards. Local state can be deleted
+  after retention, snapshot, and audit requirements are satisfied.
+
+### Split Flow
+
+Split is used for sustained size, throughput, latency, compaction, or index-lag
+pressure. It should not fire for a transient burst or for a single hot key that
+cannot be divided.
+
+```text
+1. Select parent tablet P and split points from observed shard/key traffic.
+2. Mark P as splitting and bump tablet epoch.
+3. Create child tablets C1..Cn in creating state.
+4. Bootstrap child Raft groups and local applied-state stores.
+5. Snapshot or range-copy P's hot state into children by shard range.
+6. Replay P's committed log tail into children up to a cutover index.
+7. Publish tablet_range rows for children under a new map_epoch.
+8. Route new writes to children.
+9. Drain P and reject/refresh stale-epoch writes.
+10. Tombstone P after all manifests, snapshots, and audit windows are safe.
+```
+
+Split-point selection should use observed traffic, not only midpoint:
+
+```text
+inputs
+  shard write rate
+  shard read rate
+  data size
+  compaction debt
+  p99 latency
+  local-index lag
+  hot-key distribution
+```
+
+Do not split when the pressure is dominated by one indivisible key/session.
+That case needs hot-session handling, admission control, rate limits, or
+application-level key redesign.
+
+### Merge Flow
+
+Merge is lower priority than split. Its job is to reduce overhead when tablets
+are cold, tiny, or over-fragmented.
+
+```text
+1. Select adjacent tablets with compatible placement scope, placement class,
+   encryption policy, retention policy, and replica constraints.
+2. Mark source tablets S1..Sn as merging and bump epochs.
+3. Create destination tablet D in creating state.
+4. Snapshot or range-copy hot state from all sources into D.
+5. Replay committed log tails into D up to cutover indexes.
+6. Publish one tablet_range row for D under a new map_epoch.
+7. Route new writes to D.
+8. Drain source tablets.
+9. Tombstone sources after retention and verification.
+```
+
+Merge must never combine dedicated tablets from different tenants. Shared pool
+tablets can merge only within the same shared placement scope and encryption
+class.
+
+### Scale Guardrails
+
+The design intentionally avoids TiKV-style region explosion. Enforce these
+guardrails:
+
+- Minimum shard-range width per tablet.
+- Minimum tablet size before size-based split.
+- Sustained-load window before throughput-based split.
+- Cooldown between splits for the same placement scope.
+- Maximum active tablets per tenant and per shared pool.
+- Maximum active tablets per node.
+- Maximum concurrent split/merge/rebalance jobs per cluster.
+- Merge cold/small tablets when tablet count rises above policy.
+- Keep shard metadata compressed as ranges in the target control plane.
 
 ## Placement Classes
 
@@ -477,7 +733,7 @@ tenant_kek_id
 
 Dedicated tablet lifecycle must preserve the encryption boundary:
 
-- Creating a tablet chooses the tenant first, then the tablet bucket/range.
+- Creating a tablet chooses the tenant first, then the tablet shard range.
 - Splitting a tablet creates child tablets with the same `tenant_id`.
 - Merging tablets is allowed only when all source tablets have the same
   `tenant_id`.
@@ -547,6 +803,23 @@ quorum commit first
   -> garbage collect old local state after policy allows
 ```
 
+Split and merge must be tier-aware. They should move hot tablet state and
+control-plane ownership first, while preserving cold/archive object references
+through manifests. A split or merge should not synchronously copy sealed session
+segments, archive bundles, or artifact blobs unless a repair or repack policy
+explicitly requests it.
+
+```text
+split / merge
+  -> fence old tablet epoch
+  -> create destination tablet metadata
+  -> move or replay hot keys into destination tablet state
+  -> move manifest ownership
+  -> publish new tablet map epoch
+  -> route new writes to destination tablet
+  -> lazily rebuild local indexes / repack cold objects if needed
+```
+
 ## Consistency Model
 
 The target storage engine should provide:
@@ -564,13 +837,20 @@ future feature needs atomic multi-tablet behavior, it should be explicit and
 designed separately because it changes latency, failure modes, and operational
 complexity.
 
+Split and merge are control-plane operations, not ordinary request-path
+transactions. They should use epochs and fencing to move routing safely. A write
+arriving with an old tablet epoch should be rejected or forwarded after a fresh
+tablet-map lookup. The data path should not use two-phase commit for normal
+single-session appends or record writes.
+
 ## Implementation Plan
 
 1. Define placement-aware tablet identity and routing.
 
    Introduce stable physical tablet ids for both dedicated and shared placement.
-   Route by internal tenant scope, placement class, and shard key or virtual
-   bucket. Keep this internal to the server and SDK adapters.
+   Route by internal tenant scope, placement class, and virtual shard selected
+   from a tenant-internal routing key. Keep this internal to the server and SDK
+   adapters.
 
 2. Add control-plane policy and key metadata.
 
@@ -609,30 +889,41 @@ complexity.
 
 8. Add tablet split and rebalance.
 
-   Split hot or large dedicated tablets by same-tenant virtual bucket/range.
-   Split shared pool tablets by pool bucket/range and tenant distribution.
+   Split hot or large dedicated tablets by same-tenant virtual shard range.
+   Split shared pool tablets by pool shard range and tenant distribution.
    Rebalance tablets across nodes based on write rate, compaction debt, storage
    size, and read pressure. Never move paid or enterprise tenants into shared
    pool tablets.
 
-9. Add shared-to-dedicated promotion.
+9. Add compressed tablet-map ranges.
+
+   Move from per-shard override rows toward `tablet_range` records keyed by
+   placement scope and shard range. Keep compatibility reads for the current
+   `shards` table during migration.
+
+10. Add tablet lifecycle state.
+
+   Add explicit `creating`, `serving`, `splitting`, `merging`, `draining`, and
+   `tombstoned` states so split/merge/rebalance can be fenced and observable.
+
+11. Add shared-to-dedicated promotion.
 
    Support policy-driven promotion when a free tenant upgrades, becomes hot, or
    requires tenant-scoped encryption and lifecycle guarantees.
 
-10. Tune LSM compaction per workload.
+12. Tune LSM compaction per workload.
 
    Keep append-heavy session logs, mutable metadata, and read-heavy indexes in
    separate column families or stores when needed. Use tiered/universal
    compaction for append-heavy logs and leveled compaction for read-heavy
    indexes only where it pays off.
 
-11. Make object-store upload asynchronous.
+13. Make object-store upload asynchronous.
 
    Move sealed segments, snapshots, archive bundles, and large content objects
    through background workers with checksums, retry, and manifest updates.
 
-12. Expose operational signals.
+14. Expose operational signals.
 
     Add metrics and admin surfaces for tablet size, write rate, Raft lag,
     applied index, compaction debt, global-index lag, snapshot age, and
@@ -642,6 +933,8 @@ complexity.
 
 - Do not make object storage the synchronous commit path for hot appends.
 - Do not build one database-wide LSM tree.
+- Do not introduce a second physical chunk layer below tablets. Shards are
+  virtual routing slots, not independently managed regions.
 - Do not place paid, enterprise, regulated, or tenant-key-isolated tenants in
   shared pool tablets.
 - Do not allow a dedicated tablet, dedicated Raft group, dedicated local LSM,
@@ -656,12 +949,16 @@ complexity.
 
 ## Open Decisions
 
-- Dedicated tablet keying inside one tenant: hash bucket, range partition, or
-  hybrid virtual bucket layout.
-- Shared pool tablet keying across free tenants: pool hash bucket, tenant bucket,
-  or hybrid layout.
+- Dedicated tablet keying inside one tenant: hash-based virtual shards, range
+  partitioning, or a hybrid layout.
+- Shared pool tablet keying across free tenants: pool virtual shards,
+  tenant-aware shard distribution, or hybrid layout.
 - Applied-state backend: RocksDB per tablet, shared RocksDB with column families,
   SlateDB for selected paths, or another local LSM implementation.
+- Exact split thresholds and cooldowns for size, write rate, p99 latency,
+  compaction debt, index lag, and single-hot-key detection.
+- Exact merge thresholds for cold/small tablets and how aggressively to reduce
+  tablet count without hurting recovery time.
 - Snapshot format and snapshot cadence.
 - Compaction strategy by data type.
 - Global-index partitioning and repair strategy.
