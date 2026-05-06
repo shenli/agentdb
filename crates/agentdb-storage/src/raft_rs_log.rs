@@ -17,10 +17,11 @@ use prost::Message as ProstMessage;
 use raft::{
     eraftpb::{
         ConfChangeSingle, ConfChangeType, ConfChangeV2, Entry, EntryType, HardState, Message,
+        Snapshot,
     },
     raw_node::RawNode,
     storage::MemStorage,
-    Config, StateRole,
+    Config, StateRole, Storage,
 };
 use raft_engine::{Config as RaftEngineConfig, Engine as RaftEngine, LogBatch};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::{Error, LogCommit, LogEntry, ReplicatedLog, Result};
 
 const HARD_STATE_KEY: &[u8] = b"hard_state";
+const SNAPSHOT_KEY: &[u8] = b"snapshot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftRsNodeConfig {
@@ -120,6 +122,40 @@ impl RaftRsWireMessage {
     pub fn into_raft_message(self) -> Result<Message> {
         Message::decode(self.payload.as_slice()).map_err(map_prost_error)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftRsSnapshotTransfer {
+    pub tablet_id: i64,
+    pub from: u64,
+    pub to: u64,
+    pub index: u64,
+    pub term: u64,
+    pub payload: Vec<u8>,
+}
+
+impl RaftRsSnapshotTransfer {
+    fn from_snapshot(tablet_id: i64, from: u64, to: u64, snapshot: &Snapshot) -> Self {
+        let metadata = snapshot.get_metadata();
+        Self {
+            tablet_id,
+            from,
+            to,
+            index: metadata.index,
+            term: metadata.term,
+            payload: snapshot.encode_to_vec(),
+        }
+    }
+
+    fn into_snapshot(self) -> Result<Snapshot> {
+        Snapshot::decode(self.payload.as_slice()).map_err(map_prost_error)
+    }
+}
+
+pub trait RaftRsTransport: Send + Sync {
+    fn send_message(&self, message: RaftRsWireMessage) -> Result<()>;
+
+    fn send_snapshot(&self, snapshot: RaftRsSnapshotTransfer) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -261,6 +297,21 @@ impl RaftRsSharedGroup {
             .step_wire_message(message)
     }
 
+    pub fn flush_wire_messages_to(&self, transport: &dyn RaftRsTransport) -> Result<usize> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .flush_wire_messages_to(transport)
+    }
+
+    pub fn send_snapshot_to(
+        &self,
+        transport: &dyn RaftRsTransport,
+        snapshot: RaftRsSnapshotTransfer,
+    ) -> Result<()> {
+        transport.send_snapshot(snapshot)
+    }
+
     pub fn promote_to_voter(&self, leader_id: u64, node_id: u64) -> Result<()> {
         self.inner
             .lock()
@@ -273,6 +324,29 @@ impl RaftRsSharedGroup {
             .lock()
             .expect("raft-rs group lock poisoned")
             .propose_membership_change(leader_id, node_id, ConfChangeType::RemoveNode)
+    }
+
+    pub fn build_snapshot_transfer(
+        &self,
+        from: u64,
+        to: u64,
+        application_snapshot: Vec<u8>,
+    ) -> Result<RaftRsSnapshotTransfer> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .build_snapshot_transfer(from, to, application_snapshot)
+    }
+
+    pub fn install_snapshot_transfer(
+        &self,
+        to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> Result<Vec<u8>> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .install_snapshot_transfer(to, transfer)
     }
 
     fn append(&self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
@@ -355,6 +429,20 @@ impl RaftRsGroup {
         self.wire_messages.drain(..).collect()
     }
 
+    fn flush_wire_messages_to(&mut self, transport: &dyn RaftRsTransport) -> Result<usize> {
+        let mut sent = 0;
+        while let Some(message) = self.wire_messages.pop_front() {
+            match transport.send_message(message.clone()) {
+                Ok(()) => sent += 1,
+                Err(err) => {
+                    self.wire_messages.push_front(message);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(sent)
+    }
+
     fn step_wire_message(&mut self, message: RaftRsWireMessage) -> Result<()> {
         if message.tablet_id != self.tablet_id {
             return Err(Error::Other(format!(
@@ -390,6 +478,59 @@ impl RaftRsGroup {
             .propose_conf_change(Vec::new(), cc)
             .map_err(map_raft_error)?;
         self.drive_until_idle()
+    }
+
+    fn build_snapshot_transfer(
+        &self,
+        from: u64,
+        to: u64,
+        application_snapshot: Vec<u8>,
+    ) -> Result<RaftRsSnapshotTransfer> {
+        let node = self.node(from)?;
+        self.node(to)?;
+        let mut snapshot = node
+            .storage
+            .snapshot(node.last_applied_index, to)
+            .map_err(map_raft_error)?;
+        snapshot.set_data(application_snapshot.into());
+        Ok(RaftRsSnapshotTransfer::from_snapshot(
+            self.tablet_id,
+            from,
+            to,
+            &snapshot,
+        ))
+    }
+
+    fn install_snapshot_transfer(
+        &mut self,
+        to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> Result<Vec<u8>> {
+        if transfer.tablet_id != self.tablet_id {
+            return Err(Error::Other(format!(
+                "raft-rs snapshot targets tablet {}, local group is tablet {}",
+                transfer.tablet_id, self.tablet_id
+            )));
+        }
+        if transfer.to != to {
+            return Err(Error::Other(format!(
+                "raft-rs snapshot targets node {}, install requested for node {to}",
+                transfer.to
+            )));
+        }
+        self.node(transfer.from)?;
+        let node = self.node_mut(to)?;
+        let snapshot = transfer.into_snapshot()?;
+        let metadata = snapshot.get_metadata();
+        if metadata.index < node.last_applied_index {
+            return Err(Error::Other(format!(
+                "stale raft-rs snapshot at index {}; node {to} is already applied through {}",
+                metadata.index, node.last_applied_index
+            )));
+        }
+        let application_snapshot = snapshot.get_data().to_vec();
+        node.install_snapshot(snapshot)?;
+        Ok(application_snapshot)
     }
 
     fn elect(&mut self, node_id: u64) -> Result<()> {
@@ -730,6 +871,46 @@ impl RaftRsNode {
         }
         Ok(deleted)
     }
+
+    fn install_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
+        let index = snapshot.get_metadata().index;
+        self.storage
+            .wl()
+            .apply_snapshot(snapshot.clone())
+            .map_err(map_raft_error)?;
+        self.persist_snapshot(&snapshot)?;
+        self.last_applied_index = index;
+        self.committed.retain(|entry| entry.index > index);
+        self.compact_engine_entries(index)?;
+        Ok(())
+    }
+
+    fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        let hard_state = self
+            .storage
+            .initial_state()
+            .map_err(map_raft_error)?
+            .hard_state;
+        let mut batch = LogBatch::default();
+        batch
+            .put(
+                self.raft_group_id,
+                SNAPSHOT_KEY.to_vec(),
+                snapshot.encode_to_vec(),
+            )
+            .map_err(map_raft_engine_error)?;
+        batch
+            .put(
+                self.raft_group_id,
+                HARD_STATE_KEY.to_vec(),
+                hard_state.encode_to_vec(),
+            )
+            .map_err(map_raft_engine_error)?;
+        self.engine
+            .write(&mut batch, true)
+            .map(|_| ())
+            .map_err(map_raft_engine_error)
+    }
 }
 
 struct RaftEngineReplay {
@@ -748,6 +929,14 @@ fn replay_raft_engine_to_storage(
     raft_group_id: u64,
     storage: &MemStorage,
 ) -> Result<RaftEngineReplay> {
+    let snapshot_index = if let Some(bytes) = engine.get(raft_group_id, SNAPSHOT_KEY) {
+        let snapshot = Snapshot::decode(bytes.as_slice()).map_err(map_prost_error)?;
+        let index = snapshot.get_metadata().index;
+        storage.wl().apply_snapshot(snapshot).map_err(map_raft_error)?;
+        index
+    } else {
+        0
+    };
     let hard_state = if let Some(bytes) = engine.get(raft_group_id, HARD_STATE_KEY) {
         let hard_state = HardState::decode(bytes.as_slice()).map_err(map_prost_error)?;
         storage.wl().set_hardstate(hard_state.clone());
@@ -790,7 +979,7 @@ fn replay_raft_engine_to_storage(
     }
     Ok(RaftEngineReplay {
         committed_entries,
-        last_applied_index: hard_state.commit,
+        last_applied_index: hard_state.commit.max(snapshot_index),
     })
 }
 
@@ -848,6 +1037,41 @@ fn map_prost_error(err: prost::DecodeError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingRaftRsTransport {
+        messages: Mutex<Vec<RaftRsWireMessage>>,
+        snapshots: Mutex<Vec<RaftRsSnapshotTransfer>>,
+        fail_after: Mutex<Option<usize>>,
+    }
+
+    impl RecordingRaftRsTransport {
+        fn fail_after(count: usize) -> Self {
+            Self {
+                fail_after: Mutex::new(Some(count)),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl RaftRsTransport for RecordingRaftRsTransport {
+        fn send_message(&self, message: RaftRsWireMessage) -> Result<()> {
+            let mut fail_after = self.fail_after.lock().unwrap();
+            if let Some(remaining) = fail_after.as_mut() {
+                if *remaining == 0 {
+                    return Err(Error::Other("transport unavailable".into()));
+                }
+                *remaining -= 1;
+            }
+            self.messages.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn send_snapshot(&self, snapshot: RaftRsSnapshotTransfer) -> Result<()> {
+            self.snapshots.lock().unwrap().push(snapshot);
+            Ok(())
+        }
+    }
 
     fn configs(count: u64) -> (tempfile::TempDir, Vec<RaftRsNodeConfig>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1095,5 +1319,147 @@ mod tests {
         let err = logs[0].append(7, b"after-remove".to_vec()).unwrap_err();
 
         assert!(err.to_string().contains("did not commit"));
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_round_trips_payload_and_advances_target() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        let commit = logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+
+        let transfer = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+        assert_eq!(transfer.tablet_id, 7);
+        assert_eq!(transfer.from, 1);
+        assert_eq!(transfer.to, 3);
+        assert_eq!(transfer.index, commit.index);
+
+        let payload = group.install_snapshot_transfer(3, transfer).unwrap();
+
+        assert_eq!(payload, b"tablet-state-snapshot");
+        let status = group
+            .status()
+            .into_iter()
+            .find(|status| status.node_id == 3)
+            .unwrap();
+        assert_eq!(status.applied_index, commit.index);
+        assert!(logs[2].committed_entries(7, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_rejects_wrong_target_and_tablet() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+
+        let transfer = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+        let wrong_target = group.install_snapshot_transfer(2, transfer.clone()).unwrap_err();
+        assert!(wrong_target.to_string().contains("targets node 3"));
+
+        let wrong_tablet = RaftRsSnapshotTransfer {
+            tablet_id: 8,
+            ..transfer
+        };
+        let err = group.install_snapshot_transfer(3, wrong_tablet).unwrap_err();
+        assert!(err.to_string().contains("targets tablet 8"));
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_rejects_stale_snapshot() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        logs[0].append(7, b"first".to_vec()).unwrap();
+        let stale = group
+            .build_snapshot_transfer(1, 3, b"stale-snapshot".to_vec())
+            .unwrap();
+        logs[0].append(7, b"second".to_vec()).unwrap();
+        let fresh = group
+            .build_snapshot_transfer(1, 3, b"fresh-snapshot".to_vec())
+            .unwrap();
+        group.install_snapshot_transfer(3, fresh).unwrap();
+
+        let err = group.install_snapshot_transfer(3, stale).unwrap_err();
+
+        assert!(err.to_string().contains("stale raft-rs snapshot"));
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_persists_across_restart() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs.clone()).unwrap();
+        group.elect(1).unwrap();
+        let commit = logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+        let transfer = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+        group.install_snapshot_transfer(3, transfer).unwrap();
+        drop(logs);
+        drop(group);
+
+        let (_reopened_group, reopened_logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+
+        assert!(reopened_logs[2]
+            .committed_entries(7, 0, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(reopened_logs[2].compact(7, commit.index).unwrap(), 0);
+    }
+
+    #[test]
+    fn raft_rs_transport_flushes_wire_message_outbox() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(3).unwrap();
+        logs[0].append(7, b"wire-outbox".to_vec()).unwrap();
+        let transport = RecordingRaftRsTransport::default();
+
+        let sent = group.flush_wire_messages_to(&transport).unwrap();
+
+        assert!(sent > 0);
+        assert_eq!(group.take_wire_messages().len(), 0);
+        assert!(transport
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.to == 3));
+    }
+
+    #[test]
+    fn raft_rs_transport_keeps_unsent_wire_messages_on_failure() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(3).unwrap();
+        logs[0].append(7, b"wire-outbox".to_vec()).unwrap();
+        let transport = RecordingRaftRsTransport::fail_after(0);
+
+        let err = group.flush_wire_messages_to(&transport).unwrap_err();
+
+        assert!(err.to_string().contains("transport unavailable"));
+        assert!(!group.take_wire_messages().is_empty());
+    }
+
+    #[test]
+    fn raft_rs_transport_sends_snapshot_transfer() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+        let snapshot = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+        let transport = RecordingRaftRsTransport::default();
+
+        group.send_snapshot_to(&transport, snapshot.clone()).unwrap();
+
+        assert_eq!(transport.snapshots.lock().unwrap().as_slice(), &[snapshot]);
     }
 }

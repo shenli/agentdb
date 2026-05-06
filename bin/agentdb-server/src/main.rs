@@ -1059,6 +1059,30 @@ async fn load_route_snapshot(
     .await
 }
 
+async fn load_raft_rs_node_configs(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    raft_engine_root: &std::path::Path,
+) -> anyhow::Result<Vec<agentdb_storage::RaftRsNodeConfig>> {
+    let replicas = agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+    let mut configs = Vec::new();
+    for replica in replicas {
+        if replica.role == "log_only" {
+            continue;
+        }
+        configs.push(agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+            tablet_id,
+            &replica.node_id,
+            &replica.role,
+            raft_engine_root,
+        )?);
+    }
+    if configs.is_empty() {
+        anyhow::bail!("tablet {tablet_id} has no voter/learner replicas for raft-rs");
+    }
+    Ok(configs)
+}
+
 fn spawn_route_snapshot_refresher(
     meta: agentdb_meta::MetaStore,
     routing: agentdb_api::routing_http::RouteRuntime,
@@ -1334,7 +1358,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdb_meta::{nodes, tablets, MetaStore};
+    use agentdb_meta::{nodes, tablet_replicas, tablets, MetaStore};
 
     fn base_opts() -> ServeOpts {
         ServeOpts {
@@ -1351,6 +1375,9 @@ mod tests {
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
             route_proxy_max_response_bytes: None,
+            mongo_bind: None,
+            mongo_username: None,
+            mongo_password: None,
         }
     }
 
@@ -1744,5 +1771,45 @@ region = "us-west-2"
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
+    async fn raft_rs_node_configs_load_from_control_plane_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = load_raft_rs_node_configs(&meta, 7, dir.path()).await.unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].role, agentdb_storage::RaftRsNodeRole::Voter);
+        assert!(configs[0].raft_engine_dir.ends_with("tablet-7/node-a"));
+        assert_eq!(configs[1].role, agentdb_storage::RaftRsNodeRole::Learner);
+        assert!(configs[1].raft_engine_dir.ends_with("tablet-7/node-b"));
+    }
+
+    #[tokio::test]
+    async fn raft_rs_node_configs_require_raft_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let err = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("tablet 7 has no voter/learner replicas"));
     }
 }

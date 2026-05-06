@@ -246,7 +246,7 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
 | Runtime data | Persisted runtime state is stored through `TabletKvStore` under the primary runtime tablet namespace | Tablet-local applied state stores per routed tablet |
-| Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; production network transport still pending | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
+| Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; `RaftRsTransport` is the production message boundary, while external RPC wiring is still pending | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
 | Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
 | Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
@@ -937,11 +937,14 @@ single-session appends or record writes.
    unavailable follower, failure without quorum, and recovery after a follower
    returns. The older `RaftQuorumReplicatedLog` remains as a narrow
    legacy/in-process quorum harness. `RaftRsWireMessage` exposes encoded
-   `raft-rs` messages for a production node-to-node transport and can step
-   messages delivered back into the local group. The adapter also supports
-   online learner promotion and voter removal through `raft-rs` configuration
-   changes. The remaining production work is wiring the message surface into
-   HTTP/gRPC internode RPC and snapshot transfer orchestration.
+   `raft-rs` messages, `RaftRsTransport` defines the production transport
+   boundary, and the group can flush its wire-message outbox without losing
+   unsent messages on transport failure. The adapter also supports online
+   learner promotion and voter removal through `raft-rs` configuration changes.
+   Server-side control-plane wiring can load `tablet_replicas` rows into stable
+   `RaftRsNodeConfig` values with per-tablet raft-engine directories. The
+   remaining production work is binding that transport boundary to authenticated
+   HTTP/gRPC internode RPC and background retry scheduling.
 
 7. Add snapshot and catch-up support.
 
@@ -951,9 +954,15 @@ single-session appends or record writes.
    Current implementation status: `LoggedTabletStateMachine` can export a
    deterministic tablet-local state snapshot with its applied index and install
    a snapshot atomically into another tablet-local store. `ReplicatedLog` also
-   supports compacting log entries covered by a durable snapshot. Snapshot
-   persistence, async upload, retention policy, and Raft follower catch-up
-   orchestration are still not wired.
+   supports compacting log entries covered by a durable snapshot.
+   `RaftRsSnapshotTransfer` wraps a native `raft-rs` `Snapshot`: Raft metadata
+   carries the index, term, and configuration state, while the tablet-local
+   application snapshot is carried in the snapshot data field. Installing a
+   transfer applies the Raft snapshot to the target node, persists snapshot
+   metadata and HardState into `raft-engine`, rejects stale/wrong-target
+   transfers, removes covered committed entries, and survives restart. The
+   remaining production work is async object-store upload/download, snapshot
+   retention policy, and automated follower catch-up orchestration.
 
 8. Add tablet split and rebalance.
 
