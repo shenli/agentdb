@@ -5,7 +5,8 @@ use agentdb_core::runtime::Runtime;
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
-    RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RocksKvStore,
+    RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
+    RaftRsSharedGroup, RocksKvStore,
 };
 use tempfile::TempDir;
 
@@ -98,6 +99,41 @@ async fn runtime_persisted_writes_replicate_to_raft_quorum_followers() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "quorum-tenant");
+}
+
+#[tokio::test]
+async fn runtime_persisted_writes_replicate_with_raft_rs_quorum() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(1, raft_configs).unwrap();
+    group.elect(1).unwrap();
+
+    let leader_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let follower_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n2")).unwrap());
+
+    let leader_runtime = Runtime::with_kv_and_replicated_log(leader_kv, content(), logs[0].clone());
+    let tenant = leader_runtime
+        .create_tenant(NewTenant {
+            external_key: "raft-rs-tenant".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    let follower_runtime =
+        Runtime::with_kv_and_replicated_log(follower_kv, content(), logs[1].clone());
+    let hydrated = follower_runtime
+        .get_tenant(&tenant.tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(hydrated.external_key, "raft-rs-tenant");
 }
 
 #[tokio::test]

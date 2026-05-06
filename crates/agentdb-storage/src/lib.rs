@@ -11,6 +11,7 @@ pub mod keys;
 pub mod kms;
 pub mod kv;
 pub mod metadata_crypto;
+pub mod raft_rs_log;
 pub mod replicated_log;
 pub mod rocks;
 pub mod slate;
@@ -31,6 +32,9 @@ pub use kms::{
 pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
+};
+pub use raft_rs_log::{
+    RaftRsNodeConfig, RaftRsReplicaStatus, RaftRsReplicatedLog, RaftRsSharedGroup,
 };
 pub use replicated_log::{
     LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,
