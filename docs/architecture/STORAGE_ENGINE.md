@@ -933,10 +933,11 @@ single-session appends or record writes.
    control-plane `tablet_replicas` metadata. The storage layer also provides a
    deterministic mapping from control-plane string node IDs to Raft numeric node
    IDs and per-tablet raft-engine directories. Tests verify runtime hydration
-   from a follower after `raft-rs` quorum commit. The older
-   `RaftQuorumReplicatedLog` remains as a narrow legacy/in-process quorum
-   harness. Production network transport, online membership changes, and
-   snapshot transfer orchestration are still pending.
+   from a follower after `raft-rs` quorum commit, successful commit with one
+   unavailable follower, failure without quorum, and recovery after a follower
+   returns. The older `RaftQuorumReplicatedLog` remains as a narrow
+   legacy/in-process quorum harness. Production network transport, online
+   membership changes, and snapshot transfer orchestration are still pending.
 
 7. Add snapshot and catch-up support.
 

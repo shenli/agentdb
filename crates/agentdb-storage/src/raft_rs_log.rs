@@ -8,7 +8,7 @@
 //! same Ready/message processing loop.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -208,6 +208,20 @@ impl RaftRsSharedGroup {
             .status()
     }
 
+    pub fn mark_unavailable(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .mark_unavailable(node_id)
+    }
+
+    pub fn mark_available(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .mark_available(node_id)
+    }
+
     fn append(&self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         self.inner
             .lock()
@@ -239,6 +253,7 @@ impl RaftRsSharedGroup {
 struct RaftRsGroup {
     tablet_id: i64,
     nodes: BTreeMap<u64, RaftRsNode>,
+    unavailable_nodes: BTreeSet<u64>,
     messages: VecDeque<Message>,
 }
 
@@ -258,6 +273,7 @@ impl RaftRsGroup {
         let mut group = Self {
             tablet_id,
             nodes,
+            unavailable_nodes: BTreeSet::new(),
             messages: VecDeque::new(),
         };
         group.drive_until_idle()?;
@@ -266,6 +282,18 @@ impl RaftRsGroup {
 
     fn node_ids(&self) -> Vec<u64> {
         self.nodes.keys().copied().collect()
+    }
+
+    fn mark_unavailable(&mut self, node_id: u64) -> Result<()> {
+        self.node(node_id)?;
+        self.unavailable_nodes.insert(node_id);
+        Ok(())
+    }
+
+    fn mark_available(&mut self, node_id: u64) -> Result<()> {
+        self.node(node_id)?;
+        self.unavailable_nodes.remove(&node_id);
+        self.drive_until_idle()
     }
 
     fn elect(&mut self, node_id: u64) -> Result<()> {
@@ -292,6 +320,7 @@ impl RaftRsGroup {
         if self.node(node_id)?.raw.status().ss.raft_state != StateRole::Leader {
             self.elect(node_id)?;
         }
+        let previous_applied_index = self.node(node_id)?.last_applied_index;
         self.node_mut(node_id)?
             .raw
             .propose(Vec::new(), command)
@@ -299,22 +328,19 @@ impl RaftRsGroup {
         self.drive_until_idle()?;
 
         let leader = self.node(node_id)?;
-        let commit_index = leader.last_applied_index;
-        if commit_index == 0 {
+        let Some(committed) = leader
+            .committed
+            .iter()
+            .find(|entry| entry.index > previous_applied_index)
+        else {
             return Err(Error::Other(format!(
                 "raft-rs command did not commit for tablet {tablet_id}"
             )));
-        }
-        let term = leader
-            .committed
-            .iter()
-            .find(|entry| entry.index == commit_index)
-            .map(|entry| entry.term)
-            .unwrap_or_else(|| leader.raw.status().hs.term);
+        };
         Ok(LogCommit {
             tablet_id,
-            index: commit_index,
-            term,
+            index: committed.index,
+            term: committed.term,
         })
     }
 
@@ -382,10 +408,18 @@ impl RaftRsGroup {
             let mut progressed = false;
             let node_ids = self.node_ids();
             for node_id in node_ids {
+                if self.unavailable_nodes.contains(&node_id) {
+                    continue;
+                }
                 progressed |= self.process_ready(node_id)?;
             }
             while let Some(message) = self.messages.pop_front() {
                 let to = message.to;
+                if self.unavailable_nodes.contains(&message.from)
+                    || self.unavailable_nodes.contains(&to)
+                {
+                    continue;
+                }
                 if let Some(node) = self.nodes.get_mut(&to) {
                     node.raw.step(message).map_err(map_raft_error)?;
                     progressed = true;
@@ -803,5 +837,43 @@ mod tests {
         assert!(first.raft_engine_dir.ends_with("tablet-7/node-a.us-west"));
         assert_eq!(stable_raft_node_id("42").unwrap(), 42);
         assert!(stable_raft_node_id("").is_err());
+    }
+
+    #[test]
+    fn raft_rs_log_commits_with_one_unavailable_follower() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(3).unwrap();
+
+        let commit = logs[0].append(7, b"majority".to_vec()).unwrap();
+
+        assert!(commit.index > 0);
+        assert_eq!(
+            logs[1].committed_entries(7, 0, 10).unwrap()[0].command,
+            b"majority"
+        );
+        assert!(logs[2].committed_entries(7, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raft_rs_log_fails_without_quorum_and_recovers_after_follower_returns() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(2).unwrap();
+        group.mark_unavailable(3).unwrap();
+
+        let err = logs[0].append(7, b"no-quorum".to_vec()).unwrap_err();
+        assert!(err.to_string().contains("did not commit"));
+
+        group.mark_available(2).unwrap();
+        let commit = logs[0].append(7, b"quorum-restored".to_vec()).unwrap();
+
+        assert!(commit.index > 0);
+        let entries = logs[1].committed_entries(7, 0, 10).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.command == b"quorum-restored"));
     }
 }
