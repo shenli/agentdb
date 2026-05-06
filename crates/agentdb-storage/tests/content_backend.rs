@@ -5,12 +5,14 @@
 //! abstract trait via a dispatch helper. The local-fs-specific assertions
 //! (path layout, atomic rename, restart safety) live in their own tests.
 
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, LocalFsContentBackend,
     ObjectStoreContentBackend,
 };
+use async_trait::async_trait;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tempfile::TempDir;
@@ -249,6 +251,23 @@ async fn async_mirror_delete_removes_primary_and_mirror_in_background() {
     assert!(!mirror.head("ten_a", "art_x").await.unwrap());
 }
 
+#[tokio::test]
+async fn async_mirror_retries_transient_upload_failures() {
+    let primary = in_memory();
+    let mirror = Arc::new(FlakyContentBackend::new(1, 0));
+    let backend = AsyncMirrorContentBackend::new_with_retries(primary, mirror.clone(), 8, 3);
+
+    backend.put("ten_a", "art_x", b"retry me").await.unwrap();
+
+    wait_for_mirror(&backend, 1).await;
+    assert_eq!(mirror.get("ten_a", "art_x").await.unwrap(), b"retry me");
+    let stats = backend.stats();
+    assert_eq!(stats.queued, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.backlog, 0);
+}
+
 async fn wait_for_mirror(backend: &AsyncMirrorContentBackend, completed: u64) {
     for _ in 0..50 {
         let stats = backend.stats();
@@ -258,4 +277,68 @@ async fn wait_for_mirror(backend: &AsyncMirrorContentBackend, completed: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("async mirror did not complete: {:?}", backend.stats());
+}
+
+struct FlakyContentBackend {
+    inner: InMemoryContentBackend,
+    put_failures: Mutex<usize>,
+    delete_failures: Mutex<usize>,
+}
+
+impl FlakyContentBackend {
+    fn new(put_failures: usize, delete_failures: usize) -> Self {
+        Self {
+            inner: InMemoryContentBackend::default(),
+            put_failures: Mutex::new(put_failures),
+            delete_failures: Mutex::new(delete_failures),
+        }
+    }
+}
+
+#[async_trait]
+impl ContentBackend for FlakyContentBackend {
+    async fn put(
+        &self,
+        tenant_id: &str,
+        artifact_id: &str,
+        bytes: &[u8],
+    ) -> io::Result<agentdb_storage::PutResult> {
+        let should_fail = {
+            let mut failures = self.put_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(io::Error::other("transient put failure"));
+        }
+        self.inner.put(tenant_id, artifact_id, bytes).await
+    }
+
+    async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
+        self.inner.get(tenant_id, artifact_id).await
+    }
+
+    async fn head(&self, tenant_id: &str, artifact_id: &str) -> io::Result<bool> {
+        self.inner.head(tenant_id, artifact_id).await
+    }
+
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        let should_fail = {
+            let mut failures = self.delete_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(io::Error::other("transient delete failure"));
+        }
+        self.inner.delete(tenant_id, artifact_id).await
+    }
 }

@@ -967,9 +967,9 @@ single-session appends or record writes.
 
    Current implementation status: `AsyncMirrorContentBackend` can stage content
    in a primary backend and mirror it to another backend asynchronously, with
-   queued/completed/failed/backlog counters. Runtime configuration still needs
-   to wire local-durable primary plus object-store mirror for production
-   deployments.
+   bounded retry and queued/completed/failed/backlog counters. Runtime
+   configuration still needs to wire local-durable primary plus object-store
+   mirror for production deployments.
 
 14. Expose operational signals.
 

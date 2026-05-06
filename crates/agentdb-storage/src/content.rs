@@ -94,6 +94,7 @@ struct AsyncMirrorCounters {
     backlog: AtomicU64,
 }
 
+#[derive(Clone)]
 enum MirrorJob {
     Put {
         tenant_id: String,
@@ -125,26 +126,24 @@ impl AsyncMirrorContentBackend {
         mirror: Arc<dyn ContentBackend>,
         queue_capacity: usize,
     ) -> Self {
+        Self::new_with_retries(primary, mirror, queue_capacity, 3)
+    }
+
+    pub fn new_with_retries(
+        primary: Arc<dyn ContentBackend>,
+        mirror: Arc<dyn ContentBackend>,
+        queue_capacity: usize,
+        max_attempts: usize,
+    ) -> Self {
         let capacity = queue_capacity.max(1);
+        let max_attempts = max_attempts.max(1);
         let (sender, mut receiver) = mpsc::channel::<MirrorJob>(capacity);
         let counters = Arc::new(AsyncMirrorCounters::default());
         let worker_counters = counters.clone();
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
-                let result = match job {
-                    MirrorJob::Put {
-                        tenant_id,
-                        artifact_id,
-                        bytes,
-                    } => mirror
-                        .put(&tenant_id, &artifact_id, &bytes)
-                        .await
-                        .map(|_| ()),
-                    MirrorJob::Delete {
-                        tenant_id,
-                        artifact_id,
-                    } => mirror.delete(&tenant_id, &artifact_id).await,
-                };
+                let result =
+                    execute_mirror_job_with_retry(mirror.as_ref(), &job, max_attempts).await;
                 worker_counters.backlog.fetch_sub(1, Ordering::Relaxed);
                 match result {
                     Ok(()) => {
@@ -184,6 +183,47 @@ impl AsyncMirrorContentBackend {
             )));
         }
         Ok(())
+    }
+}
+
+async fn execute_mirror_job_with_retry(
+    mirror: &(dyn ContentBackend + Send + Sync),
+    job: &MirrorJob,
+    max_attempts: usize,
+) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match execute_mirror_job(mirror, job).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < max_attempts => {
+                tracing::warn!(
+                    ?err,
+                    attempt,
+                    max_attempts,
+                    "async content mirror job failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn execute_mirror_job(
+    mirror: &(dyn ContentBackend + Send + Sync),
+    job: &MirrorJob,
+) -> io::Result<()> {
+    match job {
+        MirrorJob::Put {
+            tenant_id,
+            artifact_id,
+            bytes,
+        } => mirror.put(tenant_id, artifact_id, bytes).await.map(|_| ()),
+        MirrorJob::Delete {
+            tenant_id,
+            artifact_id,
+        } => mirror.delete(tenant_id, artifact_id).await,
     }
 }
 
