@@ -270,6 +270,7 @@ impl RouteRuntime {
                 let decision = plan_route(
                     RouteRequest {
                         tenant_id,
+                        routing_key: session_id,
                         session_locator,
                         request_location: snapshot.request_location.as_deref(),
                         local_node_id: Some(&self.local_node_id),
@@ -333,6 +334,7 @@ impl RouteRuntime {
         self.guard_snapshot(
             snapshot,
             tenant_id,
+            None,
             session_locator,
             original_path_and_query,
             incoming_headers,
@@ -354,6 +356,7 @@ impl RouteRuntime {
         self.guard_snapshot(
             snapshot,
             tenant_id,
+            Some(session_id),
             session_locator,
             original_path_and_query,
             incoming_headers,
@@ -409,6 +412,7 @@ impl RouteRuntime {
         &self,
         snapshot: &RouteSnapshot,
         tenant_id: &str,
+        routing_key: Option<&str>,
         session_locator: Option<&SessionLocator>,
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
@@ -416,6 +420,7 @@ impl RouteRuntime {
         let decision = plan_route(
             RouteRequest {
                 tenant_id,
+                routing_key,
                 session_locator,
                 request_location: snapshot.request_location.as_deref(),
                 local_node_id: Some(&self.local_node_id),

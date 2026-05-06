@@ -150,6 +150,15 @@ pass `min_visible_record_commit_seq`, and SDKs propagate the latest sequence
 automatically, so same-client reads repair from committed base records when an
 async index is behind.
 
+Placement uses virtual shards and physical tablets. Shards are lightweight
+routing slots, not independently managed storage regions. A tablet owns one or
+more shard ranges and is the unit that should eventually carry ownership,
+replication, local LSM state, snapshots, compaction, and movement. Default shard
+selection must include a tenant-internal routing key, such as `session_id` for
+session-scoped requests or `sharding_key` for record/search requests, rather
+than hashing only `tenant_id`. This lets one tenant spread across multiple
+tablets without exposing placement to SDK callers.
+
 This is deliberately similar to DynamoDB's local/global secondary-index
 behavior: locality gives stronger read-after-write semantics, while global
 discovery is an asynchronous derived view. The base record write is the durable

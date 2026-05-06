@@ -37,6 +37,11 @@ impl Default for ResidencyPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteRequest<'a> {
     pub tenant_id: &'a str,
+    /// Tenant-internal key used for default shard selection when no session
+    /// locator exists. For session-scoped requests this should be the
+    /// `session_id`; for record/search requests this can be the caller's
+    /// sharding key. If absent, routing falls back to tenant-only hashing.
+    pub routing_key: Option<&'a str>,
     pub session_locator: Option<&'a SessionLocator>,
     pub request_location: Option<&'a str>,
     pub local_node_id: Option<&'a str>,
@@ -92,7 +97,9 @@ pub fn plan_route(
     let shard_id = request
         .session_locator
         .map(|locator| i64::from(locator.shard_id))
-        .unwrap_or_else(|| stable_shard(request.tenant_id, request.shard_count));
+        .unwrap_or_else(|| {
+            stable_shard(request.tenant_id, request.routing_key, request.shard_count)
+        });
     let tablet_id = request
         .session_locator
         .and_then(|locator| locator.tablet_id)
@@ -163,9 +170,17 @@ pub fn plan_route(
     }
 }
 
-pub fn stable_shard(tenant_id: &str, shard_count: i64) -> i64 {
+pub fn stable_shard(tenant_id: &str, routing_key: Option<&str>, shard_count: i64) -> i64 {
     assert!(shard_count > 0, "shard_count must be positive");
-    (fnv1a64(tenant_id.as_bytes()) % shard_count as u64) as i64
+    let mut bytes =
+        Vec::with_capacity(tenant_id.len() + 1 + routing_key.map(str::len).unwrap_or_default());
+    bytes.extend_from_slice(tenant_id.as_bytes());
+    if let Some(routing_key) = routing_key.filter(|key| !key.is_empty()) {
+        // Separator avoids ambiguous pairs such as ("ab", "c") and ("a", "bc").
+        bytes.push(0xff);
+        bytes.extend_from_slice(routing_key.as_bytes());
+    }
+    (fnv1a64(&bytes) % shard_count as u64) as i64
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -260,6 +275,7 @@ mod tests {
     fn local_route_uses_session_locator_tablet_before_shard_override() {
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 3, Some(99))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -292,6 +308,7 @@ mod tests {
     fn forward_route_uses_shard_override_when_no_locator_exists() {
         let request = RouteRequest {
             tenant_id: "tenant-a",
+            routing_key: Some("session-a"),
             session_locator: None,
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -299,7 +316,7 @@ mod tests {
             now_ms: 1_000,
             policy: ResidencyPolicy::default(),
         };
-        let shard_id = stable_shard("tenant-a", 16);
+        let shard_id = stable_shard("tenant-a", Some("session-a"), 16);
         let decision = plan_route(
             request,
             &[ShardRow {
@@ -317,9 +334,22 @@ mod tests {
     }
 
     #[test]
+    fn default_shard_uses_tenant_internal_routing_key() {
+        let tenant_only = stable_shard("tenant-a", None, 16_384);
+        let empty_key = stable_shard("tenant-a", Some(""), 16_384);
+        let session_a = stable_shard("tenant-a", Some("session-a"), 16_384);
+        let session_b = stable_shard("tenant-a", Some("session-b"), 16_384);
+
+        assert_eq!(tenant_only, empty_key);
+        assert_ne!(tenant_only, session_a);
+        assert_ne!(session_a, session_b);
+    }
+
+    #[test]
     fn expired_lease_is_unassigned_not_forwarded() {
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: None,
             local_node_id: Some("node-a"),
@@ -342,6 +372,7 @@ mod tests {
     fn residency_policy_rejects_owner_outside_allowed_locations() {
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
@@ -370,6 +401,7 @@ mod tests {
         owner.availability_zone = Some("us-west-2a".into());
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2"),
             local_node_id: Some("node-local"),
@@ -393,6 +425,7 @@ mod tests {
         owner.availability_zone = Some("us-west-2a".into());
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-local"),
@@ -413,6 +446,7 @@ mod tests {
     fn wrong_request_location_is_rejected_when_cross_location_is_disabled() {
         let request = RouteRequest {
             tenant_id: "ten_1",
+            routing_key: Some("ses_1"),
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
