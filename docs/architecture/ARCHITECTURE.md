@@ -241,6 +241,23 @@ writes is a replicated local log/tablet path that commits after quorum, with
 object-store upload happening asynchronously for sealed history, artifacts, and
 archives.
 
+Cluster routing distinguishes virtual shards from physical tablets. A shard is
+a stable routing slot; it has no Raft group, LSM, snapshot, lease, or independent
+lifecycle. A tablet is the physical serving and placement unit that owns one or
+more shard ranges. When no session locator exists yet, session-scoped routing
+selects the shard from `hash(tenant_id, session_id)`, not from `tenant_id` alone;
+record/search routing should use `hash(tenant_id, sharding_key)` when a
+`sharding_key` is present. This keeps split/merge at the tablet layer while
+allowing a single tenant to spread across tablets.
+
+```text
+tenant or shared pool
+  -> virtual shards: stable routing slots
+  -> tablet map: shard range -> tablet
+  -> tablet: Raft group + local LSM + local indexes + warm state
+  -> object storage: sealed segments + archives + artifacts + snapshots
+```
+
 Artifact content is separated from metadata through a `ContentBackend`. The
 server now supports:
 

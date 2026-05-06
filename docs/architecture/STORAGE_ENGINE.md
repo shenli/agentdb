@@ -250,6 +250,91 @@ policy. A paid tenant can map to one dedicated tablet when small and many
 dedicated tablets when hot or large. Free tenants can share pool tablets until
 policy, usage, or upgrade requires promotion to dedicated placement.
 
+Shard selection should use a tenant-internal routing key, not only the tenant
+identity. For session-scoped requests, the routing key is the `session_id`. For
+record/search requests, the routing key is the caller-provided `sharding_key`
+when present.
+
+```text
+shard = hash(tenant_id, session_id or sharding_key) % shard_count
+tablet = tablet_map[shard]
+```
+
+This lets one tenant spread across many tablets while keeping shards virtual.
+Shards are routing slots only; tablets remain the only physical management
+units with leases, Raft groups, LSM state, snapshots, and placement lifecycle.
+
+### Data Layout Diagram
+
+```text
+Control plane
+  tenant policy / placement class / encryption policy
+  tablet map: (placement scope, shard range) -> tablet_id
+  tablet epoch / owner / replica placement
+
+Dedicated paid tenant
+  tenant A
+    virtual shards: 0000..16383
+
+    tablet A-1 owns shards 0000..8191
+      Raft group A-1
+      local LSM/state A-1
+      local indexes A-1
+      warm session heads / records / manifests
+
+    tablet A-2 owns shards 8192..16383
+      Raft group A-2
+      local LSM/state A-2
+      local indexes A-2
+      warm session heads / records / manifests
+
+Shared free-tier pool
+  shared pool F
+    virtual shards: 0000..16383
+
+    tablet F-1 owns shards 0000..8191
+      tenants f1, f2, f3
+      Raft group F-1
+      local LSM/state F-1
+      pool/tablet encryption key
+
+    tablet F-2 owns shards 8192..16383
+      tenants f4, f5
+      Raft group F-2
+      local LSM/state F-2
+      pool/tablet encryption key
+
+Object storage
+  sealed session segments
+  archive bundles
+  artifact blobs
+  tablet snapshots
+  log/archive manifests
+```
+
+Request routing:
+
+```text
+tenant/session request
+  -> resolve placement policy
+  -> choose routing key: session_id or sharding_key
+  -> shard = hash(tenant_id, routing_key) % shard_count
+  -> tablet = tablet_map[placement_scope, shard]
+  -> route to tablet leader
+```
+
+Split changes tablet ownership, not shard identity:
+
+```text
+before split
+  tablet A-1 owns shards 0000..16383
+
+after split
+  tablet A-2 owns shards 0000..8191
+  tablet A-3 owns shards 8192..16383
+  tablet A-1 drains, then tombstones
+```
+
 ## Placement Classes
 
 Placement is a policy decision, not an SDK concept.
