@@ -963,6 +963,12 @@ single-session appends or record writes.
    Move sealed segments, snapshots, archive bundles, and large content objects
    through background workers with checksums, retry, and manifest updates.
 
+   Current implementation status: `AsyncMirrorContentBackend` can stage content
+   in a primary backend and mirror it to another backend asynchronously, with
+   queued/completed/failed/backlog counters. Runtime configuration still needs
+   to wire local-durable primary plus object-store mirror for production
+   deployments.
+
 14. Expose operational signals.
 
     Add metrics and admin surfaces for tablet size, write rate, Raft lag,

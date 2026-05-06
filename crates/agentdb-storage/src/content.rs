@@ -27,13 +27,17 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 
 /// Result of a successful put: the byte count written and the sha256 we
 /// computed while writing. Callers compare `sha256_hex` against any
@@ -70,6 +74,148 @@ pub trait ContentBackend: Send + Sync {
     /// Best-effort delete. Removing a missing blob is NOT an error — the
     /// V2.4 GC reaper relies on idempotent delete to clean up orphans.
     async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()>;
+}
+
+// ----- AsyncMirrorContentBackend ---------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsyncMirrorStats {
+    pub queued: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub backlog: u64,
+}
+
+#[derive(Default)]
+struct AsyncMirrorCounters {
+    queued: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    backlog: AtomicU64,
+}
+
+enum MirrorJob {
+    Put {
+        tenant_id: String,
+        artifact_id: String,
+        bytes: Vec<u8>,
+    },
+    Delete {
+        tenant_id: String,
+        artifact_id: String,
+    },
+}
+
+/// Stages content in a primary backend and mirrors to another backend
+/// asynchronously.
+///
+/// This is the storage primitive behind the "do not block hot writes on S3"
+/// design: configure the primary as local durable storage and the mirror as
+/// object storage. `put` returns after the primary write succeeds and the mirror
+/// job is queued.
+pub struct AsyncMirrorContentBackend {
+    primary: Arc<dyn ContentBackend>,
+    sender: mpsc::Sender<MirrorJob>,
+    counters: Arc<AsyncMirrorCounters>,
+}
+
+impl AsyncMirrorContentBackend {
+    pub fn new(
+        primary: Arc<dyn ContentBackend>,
+        mirror: Arc<dyn ContentBackend>,
+        queue_capacity: usize,
+    ) -> Self {
+        let capacity = queue_capacity.max(1);
+        let (sender, mut receiver) = mpsc::channel::<MirrorJob>(capacity);
+        let counters = Arc::new(AsyncMirrorCounters::default());
+        let worker_counters = counters.clone();
+        tokio::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                let result = match job {
+                    MirrorJob::Put {
+                        tenant_id,
+                        artifact_id,
+                        bytes,
+                    } => mirror
+                        .put(&tenant_id, &artifact_id, &bytes)
+                        .await
+                        .map(|_| ()),
+                    MirrorJob::Delete {
+                        tenant_id,
+                        artifact_id,
+                    } => mirror.delete(&tenant_id, &artifact_id).await,
+                };
+                worker_counters.backlog.fetch_sub(1, Ordering::Relaxed);
+                match result {
+                    Ok(()) => {
+                        worker_counters.completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        worker_counters.failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(?err, "async content mirror job failed");
+                    }
+                }
+            }
+        });
+        Self {
+            primary,
+            sender,
+            counters,
+        }
+    }
+
+    pub fn stats(&self) -> AsyncMirrorStats {
+        AsyncMirrorStats {
+            queued: self.counters.queued.load(Ordering::Relaxed),
+            completed: self.counters.completed.load(Ordering::Relaxed),
+            failed: self.counters.failed.load(Ordering::Relaxed),
+            backlog: self.counters.backlog.load(Ordering::Relaxed),
+        }
+    }
+
+    async fn enqueue(&self, job: MirrorJob) -> io::Result<()> {
+        self.counters.queued.fetch_add(1, Ordering::Relaxed);
+        self.counters.backlog.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = self.sender.send(job).await {
+            self.counters.backlog.fetch_sub(1, Ordering::Relaxed);
+            self.counters.failed.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other(format!(
+                "async content mirror queue closed: {err}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ContentBackend for AsyncMirrorContentBackend {
+    async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
+        let result = self.primary.put(tenant_id, artifact_id, bytes).await?;
+        self.enqueue(MirrorJob::Put {
+            tenant_id: tenant_id.into(),
+            artifact_id: artifact_id.into(),
+            bytes: bytes.to_vec(),
+        })
+        .await?;
+        Ok(result)
+    }
+
+    async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
+        self.primary.get(tenant_id, artifact_id).await
+    }
+
+    async fn head(&self, tenant_id: &str, artifact_id: &str) -> io::Result<bool> {
+        self.primary.head(tenant_id, artifact_id).await
+    }
+
+    async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        self.primary.delete(tenant_id, artifact_id).await?;
+        self.enqueue(MirrorJob::Delete {
+            tenant_id: tenant_id.into(),
+            artifact_id: artifact_id.into(),
+        })
+        .await
+    }
 }
 
 // ----- LocalFsContentBackend --------------------------------------------------
@@ -226,10 +372,7 @@ pub struct ObjectStoreContentBackend {
 }
 
 impl ObjectStoreContentBackend {
-    pub fn new(
-        store: std::sync::Arc<dyn ObjectStore>,
-        prefix: impl Into<String>,
-    ) -> Self {
+    pub fn new(store: std::sync::Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         let prefix = prefix.into().trim_matches('/').to_string();
         Self { store, prefix }
     }
@@ -254,7 +397,10 @@ impl ContentBackend for ObjectStoreContentBackend {
     async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
         let sha256_hex = sha256_hex(bytes);
         self.store
-            .put(&self.path_for(tenant_id, artifact_id), bytes.to_vec().into())
+            .put(
+                &self.path_for(tenant_id, artifact_id),
+                bytes.to_vec().into(),
+            )
             .await
             .map_err(|err| io::Error::other(format!("object store put failed: {err}")))?;
         Ok(PutResult {
@@ -282,9 +428,7 @@ impl ContentBackend for ObjectStoreContentBackend {
         match self.store.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(err) => Err(io::Error::other(format!(
-                "object store head failed: {err}"
-            ))),
+            Err(err) => Err(io::Error::other(format!("object store head failed: {err}"))),
         }
     }
 
