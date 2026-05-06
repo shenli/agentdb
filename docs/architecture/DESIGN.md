@@ -57,7 +57,11 @@ The current product shape is intentionally narrow:
 
 The primary developer interface is the SDK surface. The supported public
 protocol underneath it is the native HTTP API mounted under `/api/...`. Routes
-are tenant-scoped and use typed opaque IDs.
+are tenant-scoped and use typed opaque IDs because tenant is the isolation,
+policy, quota, lifecycle, storage, routing, and admin boundary. SDKs should
+treat tenant selection as an authentication and authorization concern, then let
+normal application code use workspace, agent, and session aliases rather than
+threading `tenant_id` through the agent loop.
 
 HTTP is the right canonical API for the current product shape: agent
 frameworks, SDKs, dashboards, examples, and local operators can use it without
@@ -99,6 +103,10 @@ debugging, and route-shape clarity.
 
 SDKs may let developers provide domain-friendly external names where that helps
 ergonomics, but the server-assigned opaque IDs remain the durable identifiers.
+Tenant IDs are the exception developers should usually not see: they are
+infrastructure identifiers for routing, policy, quota, storage, and admin
+surfaces. Hosted deployments should bind the current tenant/workspace from
+authentication and only expose tenant IDs as low-level escape hatches.
 
 ## Data Model
 
@@ -138,6 +146,12 @@ consistent. Record writes return a tenant-scoped commit sequence; callers can
 pass `min_visible_record_commit_seq`, and SDKs propagate the latest sequence
 automatically, so same-client reads repair from committed base records when an
 async index is behind.
+
+This is deliberately similar to DynamoDB's local/global secondary-index
+behavior: locality gives stronger read-after-write semantics, while global
+discovery is an asynchronous derived view. The base record write is the durable
+source of truth; index lag is repaired or observed rather than treated as a
+failed write.
 
 The canonical harness flow is:
 
@@ -187,6 +201,11 @@ Python and TypeScript are the maintained SDKs. They should make the common
 agent path feel natural: create or open a workspace, create or open an agent,
 create or open a session, append events, fetch context, store artifacts, search
 records, and subscribe to progress.
+
+The SDKs should keep tenant scope out of normal app code. Authenticated
+deployments should derive it from user-info metadata; local development can use
+explicit workspace aliases. Tenant-scoped `Client` methods remain available for
+tests, admin tooling, and low-level integrations.
 
 Framework adapters validate that the native primitives cover real persistence
 needs without recreating ordering, forking, idempotency, artifact, search, and

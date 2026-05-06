@@ -177,6 +177,14 @@ This concentration is a design opportunity. AgentDB does not need to be a
 general-purpose query optimizer to be useful. It needs to make the agent runtime
 paths reliable and ergonomic.
 
+Record search follows the same distinction agent applications usually make in
+practice. If the caller knows the owner or placement key, a local index can
+serve fast, read-after-write filtering for that scope. If the caller is doing
+tenant-wide or cross-owner discovery, a global index can update asynchronously
+and provide eventual consistency. AgentDB exposes this as explicit local/global
+record-index behavior rather than hiding the consistency tradeoff in adapter
+code.
+
 ### The Session Is The Natural Aggregation Unit
 
 Agent operations aggregate naturally by session:
@@ -222,8 +230,16 @@ AgentDB therefore needs:
 - operational paths that do not require per-tenant manual work
 
 The current implementation is single-node first, but the tenant model is
-deliberate. A future distributed implementation should extend the same concepts
-instead of inventing a second product surface.
+deliberate. Tenant boundaries are part of the architecture: routes, policies,
+quotas, lifecycle work, watch scopes, storage accounting, and future placement
+decisions all preserve tenant scope. A future distributed implementation should
+extend those concepts instead of inventing a second product surface.
+
+Tenant identity is infrastructure state. Authentication and user-info metadata
+should establish the tenant/workspace boundary, while normal application code
+talks in terms of workspaces, agents, and sessions. The server and low-level
+routes keep tenant IDs because they are the isolation, routing, policy, quota,
+storage, billing, and admin boundary.
 
 ### Self-Hosted Deployment Matters
 
@@ -362,6 +378,12 @@ policy metadata.
 MongoDB can back an implementation, especially early. But exposing a
 MongoDB-shaped product would optimize for document CRUD while the user is
 actually asking for session runtime semantics.
+
+AgentDB's MongoDB compatibility listener is intentionally narrower than that.
+It is useful as an adapter for existing MongoDB drivers, shell tooling, and AI
+coding agents that already know MongoDB collection helpers. The listener maps a
+small command subset onto AgentDB runtime methods; it does not make MongoDB CRUD
+the product model or create a second storage path.
 
 **Columnar analytics stores, such as ClickHouse.** ClickHouse is excellent for
 high-volume analytical ingestion, aggregation, dashboards, and log-style
