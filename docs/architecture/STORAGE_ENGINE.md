@@ -89,6 +89,9 @@ The storage crate now has two target-facing seams:
 - `ReplicatedLog`: a commit-before-apply boundary with a durable single-node
   implementation. This is not Raft yet; it is the interface the Raft-backed log
   should replace.
+- `LoggedTabletStateMachine`: a core-layer command application boundary that
+  serializes deterministic tablet commands through `ReplicatedLog` before
+  applying them to `TabletKvStore`.
 
 ## Current Write Path
 
@@ -903,6 +906,11 @@ single-session appends or record writes.
 
    Model appends, record writes, idempotency rows, local-index updates, and
    global-index outbox entries as deterministic commands applied after commit.
+
+   Current implementation status: `TabletCommand`, `TabletWriteOp`, and
+   `LoggedTabletStateMachine` exist and apply committed log entries to
+   tablet-local KV state. Runtime append/record paths still need to emit these
+   commands instead of calling `Persist` directly.
 
 6. Add quorum commit before acknowledgement.
 
