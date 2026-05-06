@@ -924,13 +924,14 @@ single-session appends or record writes.
    the session read context.
 
    Current implementation status: `RaftQuorumReplicatedLog` writes the leader's
-   local log entry, sends AppendEntries requests to voters, persists a commit
-   index only after majority acknowledgement, and exposes follower
-   AppendEntries handling. The runtime has a constructor that accepts a
-   replicated log, and tests verify runtime writes fail without quorum and
-   hydrate from a quorum follower after commit. Full raft-rs leader election,
-   persistent raft-engine log storage, membership changes, and production
-   network transport are still pending.
+   local log entry, sends AppendEntries requests to voters, backfills stale
+   followers by replaying the missing leader suffix, persists a commit index
+   only after majority acknowledgement, and exposes follower AppendEntries
+   handling. The runtime has a constructor that accepts a replicated log, and
+   tests verify runtime writes fail without quorum and hydrate from a quorum
+   follower after commit. Full raft-rs leader election, persistent raft-engine
+   log storage, membership changes, and production network transport are still
+   pending.
 
 7. Add snapshot and catch-up support.
 

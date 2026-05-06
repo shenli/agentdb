@@ -204,13 +204,6 @@ impl ReplicatedLog for RaftQuorumReplicatedLog {
     fn append(&self, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         validate_tablet_id(tablet_id)?;
         let prev_log_index = max_raft_index(self.kv.as_ref(), tablet_id)?;
-        let prev_log_term = if prev_log_index == 0 {
-            0
-        } else {
-            read_raft_record(self.kv.as_ref(), tablet_id, prev_log_index)?
-                .map(|record| record.term)
-                .unwrap_or(0)
-        };
         let index = prev_log_index + 1;
         let record = RaftLogRecord {
             index,
@@ -225,34 +218,15 @@ impl ReplicatedLog for RaftQuorumReplicatedLog {
             if voter == &self.local_node_id {
                 continue;
             }
-            let response = self.transport.append_entries(
-                voter,
-                RaftAppendEntriesRequest {
-                    tablet_id,
-                    term: self.term,
-                    leader_id: self.local_node_id.clone(),
-                    prev_log_index,
-                    prev_log_term,
-                    entry: Some(record.clone()),
-                    leader_commit,
-                },
-            );
-            match response {
-                Ok(response) if response.success && response.match_index >= index => {
+            match self.replicate_through(voter, tablet_id, index, leader_commit) {
+                Ok(()) => {
                     acknowledgements += 1;
-                }
-                Ok(response) => {
-                    tracing::warn!(
-                        target_node_id = %voter,
-                        ?response,
-                        "raft append_entries was not accepted"
-                    );
                 }
                 Err(err) => {
                     tracing::warn!(
                         target_node_id = %voter,
                         ?err,
-                        "raft append_entries failed"
+                        "raft follower replication failed"
                     );
                 }
             }
@@ -334,6 +308,72 @@ impl ReplicatedLog for RaftQuorumReplicatedLog {
             )));
         }
         compact_raft_log(self.kv.as_ref(), tablet_id, up_to_index)
+    }
+}
+
+impl RaftQuorumReplicatedLog {
+    fn replicate_through(
+        &self,
+        voter: &str,
+        tablet_id: i64,
+        target_index: u64,
+        leader_commit: u64,
+    ) -> Result<()> {
+        let mut next_index = target_index;
+        let max_attempts = target_index.saturating_mul(2).saturating_add(2);
+        for _ in 0..max_attempts {
+            let Some(record) = read_raft_record(self.kv.as_ref(), tablet_id, next_index)? else {
+                return Err(Error::Other(format!(
+                    "leader is missing raft log entry {next_index} for tablet {tablet_id}"
+                )));
+            };
+            let prev_log_index = next_index.saturating_sub(1);
+            let prev_log_term = if prev_log_index == 0 {
+                0
+            } else {
+                read_raft_record(self.kv.as_ref(), tablet_id, prev_log_index)?
+                    .map(|record| record.term)
+                    .ok_or_else(|| {
+                        Error::Other(format!(
+                            "leader is missing raft prev log entry {prev_log_index} for tablet {tablet_id}"
+                        ))
+                    })?
+            };
+            let response = self.transport.append_entries(
+                voter,
+                RaftAppendEntriesRequest {
+                    tablet_id,
+                    term: self.term,
+                    leader_id: self.local_node_id.clone(),
+                    prev_log_index,
+                    prev_log_term,
+                    entry: Some(record),
+                    leader_commit,
+                },
+            )?;
+            if response.term > self.term {
+                return Err(Error::Other(format!(
+                    "raft follower {voter} reports newer term {} than local term {}",
+                    response.term, self.term
+                )));
+            }
+            if response.success {
+                if response.match_index >= target_index {
+                    return Ok(());
+                }
+                next_index = response.match_index.saturating_add(1);
+            } else {
+                next_index = response.match_index.saturating_add(1).max(1);
+            }
+            if next_index > target_index {
+                return Err(Error::Other(format!(
+                    "raft follower {voter} advanced past target index {target_index}"
+                )));
+            }
+        }
+        Err(Error::Other(format!(
+            "raft follower {voter} did not catch up to tablet {tablet_id} index {target_index}"
+        )))
     }
 }
 
@@ -692,6 +732,10 @@ mod tests {
         fn block(&self, node_id: &str) {
             self.blocked.lock().unwrap().insert(node_id.into());
         }
+
+        fn unblock(&self, node_id: &str) {
+            self.blocked.lock().unwrap().remove(node_id);
+        }
     }
 
     impl RaftLogTransport for InMemoryRaftTransport {
@@ -787,6 +831,35 @@ mod tests {
 
         assert!(err.to_string().contains("raft quorum not reached"));
         assert!(leader.committed_entries(7, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raft_quorum_log_backfills_stale_follower_before_commit() {
+        let transport = Arc::new(InMemoryRaftTransport::default());
+        let voters = vec!["n1".into(), "n2".into(), "n3".into()];
+        let leader = raft_node("n1", voters.clone(), transport.clone());
+        let stale_follower = raft_node("n2", voters.clone(), transport.clone());
+        let other_follower = raft_node("n3", voters, transport.clone());
+        transport.insert("n1", leader.clone());
+        transport.insert("n2", stale_follower.clone());
+        transport.insert("n3", other_follower.clone());
+
+        transport.block("n2");
+        leader.append(7, b"first".to_vec()).unwrap();
+        assert!(stale_follower
+            .committed_entries(7, 0, 10)
+            .unwrap()
+            .is_empty());
+
+        transport.unblock("n2");
+        transport.block("n3");
+        let commit = leader.append(7, b"second".to_vec()).unwrap();
+
+        assert_eq!(commit.index, 2);
+        let entries = stale_follower.committed_entries(7, 0, 10).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, b"first");
+        assert_eq!(entries[1].command, b"second");
     }
 
     #[test]
