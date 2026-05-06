@@ -165,6 +165,15 @@ def test_idempotency_key_is_generated_for_mutations():
     assert any("Idempotency-Key" in h for h in headers)
 
 
+def test_bearer_token_is_sent_when_configured():
+    c = Client("http://x", token="tok_1")
+    calls, patched = capture(c)
+    with patched:
+        c.user_info()
+
+    assert calls[0][2]["headers"]["Authorization"] == "Bearer tok_1"
+
+
 def test_session_append_requires_agent_id():
     with pytest.raises(ValueError):
         Client("http://x").session("ten_1", "ses_1").append({"x": 1})

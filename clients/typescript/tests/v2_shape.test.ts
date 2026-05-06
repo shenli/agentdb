@@ -65,6 +65,13 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
       url: raw,
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
     });
+    if (raw.endsWith("/api/me")) {
+      return json({
+        principal_id: "usr_1",
+        default_workspace: "acme",
+        workspaces: [{ name: "acme", tenant_id: "ten_1", role: "writer" }],
+      });
+    }
     if (raw.endsWith("/api/tenants")) return json({ tenant_id: "ten_1" });
     if (raw.endsWith("/agents")) return json({ agent_id: "agt_1" });
     if (raw.endsWith("/sessions")) return json({ session_id: "ses_1", agent_id: "agt_1" });
@@ -144,6 +151,56 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   assert.equal(replayed[0]?.metadataKeyId, "tenant:ten_1:default");
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/agents/agt_1/sessions")));
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
+});
+
+test("friendly SDK can resolve workspace from auth user-info", async () => {
+  const calls: { url: string; body?: unknown }[] = [];
+  const mockFetch = async (url: string | URL, init?: RequestInit) => {
+    const raw = String(url);
+    calls.push({
+      url: raw,
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+    });
+    if (raw.endsWith("/api/me")) {
+      return json({
+        principal_id: "usr_1",
+        default_workspace: "prod",
+        workspaces: [{ name: "prod", tenant_id: "ten_prod", role: "writer" }],
+      });
+    }
+    if (raw.endsWith("/agents") && init?.method === "GET") return json({ agents: [] });
+    if (raw.endsWith("/agents")) return json({ agent_id: "agt_1" });
+    if (raw.endsWith("/sessions") && init?.method === "GET") return json({ sessions: [] });
+    if (raw.endsWith("/sessions")) return json({ session_id: "ses_1", agent_id: "agt_1" });
+    return json({});
+  };
+
+  const db = new AgentDB({ baseUrl: "http://x", token: "tok_1", fetch: mockFetch as typeof globalThis.fetch });
+  const workspace = await db.workspace();
+  const agent = await workspace.agent("support-agent");
+  const session = await agent.session("ticket-42");
+
+  assert.equal(workspace.id, "ten_prod");
+  assert.equal(agent.id, "agt_1");
+  assert.equal(session.id, "ses_1");
+  assert.ok(!calls.some((call) => call.url.endsWith("/api/tenants") && call.body !== undefined));
+});
+
+test("bearer token is sent when configured", async () => {
+  const authHeaders: string[] = [];
+  const mockFetch = async (_url: string | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    authHeaders.push(headers.get("authorization") ?? "");
+    return json({
+      principal_id: "usr_1",
+      tenant_id: "ten_1",
+    });
+  };
+
+  const c = new Client({ baseUrl: "http://x", token: "tok_1", fetch: mockFetch as typeof globalThis.fetch });
+  await c.userInfo();
+
+  assert.equal(authHeaders[0], "Bearer tok_1");
 });
 
 test("record search carries the last tenant commit sequence", async () => {

@@ -7,9 +7,9 @@
  *
  *   const db = new AgentDB({
  *     baseUrl: "http://127.0.0.1:7878",
- *     auth: { user: "alice", password: "hunter2" },
+ *     token: process.env.AGENTDB_API_KEY,
  *   });
- *   const workspace = await db.workspace("acme");
+ *   const workspace = await db.workspace();
  *   const agent = await workspace.agent("support-agent");
  *   const session = await agent.session("ticket-42");
  *   const result = await session.appendUser("hello", { fetchLastN: 5 });
@@ -75,6 +75,7 @@ export type {
   TenantId,
   AgentId,
   SessionId,
+  UserInfo,
   UserMessageOptions,
   EventId,
   ArtifactId,

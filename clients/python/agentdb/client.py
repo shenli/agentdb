@@ -587,6 +587,20 @@ class Client:
     def get_tenant(self, tenant_id: TenantId) -> dict:
         return self._request("GET", f"/api/tenants/{_quote(tenant_id)}")
 
+    def user_info(self) -> dict:
+        """Return authenticated principal/workspace metadata.
+
+        Hosted deployments should expose this endpoint so application code can
+        derive the tenant scope from authentication instead of passing
+        `tenant_id` through normal agent code.
+        """
+
+        return self._request("GET", "/api/me")
+
+    def list_tenants(self) -> list:
+        data = self._request("GET", "/api/tenants")
+        return data.get("tenants", [])
+
     def create_agent(
         self, tenant_id: TenantId, *, alias: Optional[str] = None, config: Optional[dict] = None
     ) -> dict:
@@ -595,6 +609,10 @@ class Client:
             f"/api/tenants/{_quote(tenant_id)}/agents",
             json={"alias": alias, "config": config or {}},
         )
+
+    def list_agents(self, tenant_id: TenantId) -> list:
+        data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/agents")
+        return data.get("agents", [])
 
     def create_session(
         self, tenant_id: TenantId, agent_id: AgentId, *, alias: Optional[str] = None
@@ -605,6 +623,10 @@ class Client:
             json={"alias": alias},
         )
         return Session(self, tenant_id, data["session_id"], data["agent_id"])
+
+    def list_sessions(self, tenant_id: TenantId) -> list:
+        data = self._request("GET", f"/api/tenants/{_quote(tenant_id)}/sessions")
+        return data.get("sessions", [])
 
     def session(
         self, tenant_id: TenantId, session_id: Optional[SessionId] = None, *, agent_id: Optional[AgentId] = None
@@ -766,6 +788,9 @@ class Client:
         stream: bool = False,
     ) -> requests.Response:
         hdrs = dict(headers or {})
+        token = self._bearer_token()
+        if token is not None and "Authorization" not in hdrs:
+            hdrs["Authorization"] = f"Bearer {token}"
         kwargs: dict = {"timeout": (self.timeout, None) if stream else self.timeout}
         if params:
             kwargs["params"] = params
