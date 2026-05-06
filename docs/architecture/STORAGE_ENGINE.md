@@ -930,7 +930,9 @@ single-session appends or record writes.
    after committed entries are visible through the `ReplicatedLog` interface.
    It rebuilds committed entries from `raft-engine` on restart, compacts
    persisted raft-entry messages, and accepts voter/learner peer roles matching
-   control-plane `tablet_replicas` metadata. Tests verify runtime hydration
+   control-plane `tablet_replicas` metadata. The storage layer also provides a
+   deterministic mapping from control-plane string node IDs to Raft numeric node
+   IDs and per-tablet raft-engine directories. Tests verify runtime hydration
    from a follower after `raft-rs` quorum commit. The older
    `RaftQuorumReplicatedLog` remains as a narrow legacy/in-process quorum
    harness. Production network transport, online membership changes, and

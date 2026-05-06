@@ -21,6 +21,7 @@ use raft::{
     Config, StateRole,
 };
 use raft_engine::{Config as RaftEngineConfig, Engine as RaftEngine, LogBatch};
+use sha2::{Digest, Sha256};
 
 use crate::{Error, LogCommit, LogEntry, ReplicatedLog, Result};
 
@@ -31,6 +32,26 @@ pub struct RaftRsNodeConfig {
     pub node_id: u64,
     pub role: RaftRsNodeRole,
     pub raft_engine_dir: PathBuf,
+}
+
+impl RaftRsNodeConfig {
+    pub fn from_control_plane_replica(
+        tablet_id: i64,
+        node_id: &str,
+        role: &str,
+        raft_engine_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        validate_raft_tablet_id(tablet_id)?;
+        let raft_node_id = stable_raft_node_id(node_id)?;
+        Ok(Self {
+            node_id: raft_node_id,
+            role: RaftRsNodeRole::from_replica_role(role)?,
+            raft_engine_dir: raft_engine_root
+                .as_ref()
+                .join(format!("tablet-{tablet_id}"))
+                .join(sanitize_path_component(node_id)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +70,21 @@ impl RaftRsNodeRole {
             ))),
         }
     }
+}
+
+pub fn stable_raft_node_id(node_id: &str) -> Result<u64> {
+    if node_id.trim().is_empty() {
+        return Err(Error::Other("raft-rs node_id cannot be empty".into()));
+    }
+    if let Ok(parsed) = node_id.parse::<u64>() {
+        if parsed != 0 {
+            return Ok(parsed);
+        }
+    }
+    let digest = Sha256::digest(node_id.as_bytes());
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest[..8]);
+    Ok(u64::from_be_bytes(raw).max(1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +647,19 @@ fn parse_raft_entry_key(key: &[u8]) -> Option<u64> {
     std::str::from_utf8(suffix).ok()?.parse().ok()
 }
 
+fn sanitize_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn validate_raft_tablet_id(tablet_id: i64) -> Result<()> {
     if tablet_id <= 0 {
         return Err(Error::Other("raft-rs tablet_id must be positive".into()));
@@ -736,5 +785,23 @@ mod tests {
 
         assert_eq!(logs.len(), 2);
         assert!(RaftRsNodeRole::from_replica_role("log_only").is_err());
+    }
+
+    #[test]
+    fn raft_rs_node_config_maps_control_plane_replica_stably() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first =
+            RaftRsNodeConfig::from_control_plane_replica(7, "node-a.us-west", "voter", dir.path())
+                .unwrap();
+        let second =
+            RaftRsNodeConfig::from_control_plane_replica(7, "node-a.us-west", "voter", dir.path())
+                .unwrap();
+
+        assert_eq!(first.node_id, second.node_id);
+        assert_eq!(first.role, RaftRsNodeRole::Voter);
+        assert!(first.raft_engine_dir.ends_with("tablet-7/node-a.us-west"));
+        assert_eq!(stable_raft_node_id("42").unwrap(), 42);
+        assert!(stable_raft_node_id("").is_err());
     }
 }
