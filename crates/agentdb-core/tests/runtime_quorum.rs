@@ -6,7 +6,7 @@ use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
-    RaftRsSharedGroup, RocksKvStore,
+    RaftRsNodeRole, RaftRsSharedGroup, RocksKvStore,
 };
 use tempfile::TempDir;
 
@@ -107,6 +107,7 @@ async fn runtime_persisted_writes_replicate_with_raft_rs_quorum() {
     let raft_configs: Vec<_> = (1..=3)
         .map(|node_id| RaftRsNodeConfig {
             node_id,
+            role: RaftRsNodeRole::Voter,
             raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
         })
         .collect();

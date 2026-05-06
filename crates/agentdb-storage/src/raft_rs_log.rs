@@ -29,7 +29,26 @@ const HARD_STATE_KEY: &[u8] = b"hard_state";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftRsNodeConfig {
     pub node_id: u64,
+    pub role: RaftRsNodeRole,
     pub raft_engine_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftRsNodeRole {
+    Voter,
+    Learner,
+}
+
+impl RaftRsNodeRole {
+    pub fn from_replica_role(role: &str) -> Result<Self> {
+        match role {
+            "voter" => Ok(Self::Voter),
+            "learner" => Ok(Self::Learner),
+            other => Err(Error::Other(format!(
+                "tablet replica role `{other}` cannot be used as a raft-rs peer"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,9 +122,25 @@ impl RaftRsSharedGroup {
                 )));
             }
         }
-        let voters: Vec<u64> = configs.iter().map(|config| config.node_id).collect();
+        let voters: Vec<u64> = configs
+            .iter()
+            .filter(|config| config.role == RaftRsNodeRole::Voter)
+            .map(|config| config.node_id)
+            .collect();
+        let learners: Vec<u64> = configs
+            .iter()
+            .filter(|config| config.role == RaftRsNodeRole::Learner)
+            .map(|config| config.node_id)
+            .collect();
+        if voters.is_empty() {
+            return Err(Error::Other(
+                "raft-rs group requires at least one voter".into(),
+            ));
+        }
         let group = Self {
-            inner: Arc::new(Mutex::new(RaftRsGroup::open(tablet_id, configs, voters)?)),
+            inner: Arc::new(Mutex::new(RaftRsGroup::open(
+                tablet_id, configs, voters, learners,
+            )?)),
         };
         let handles = group
             .inner
@@ -167,22 +202,25 @@ impl RaftRsSharedGroup {
 
 struct RaftRsGroup {
     tablet_id: i64,
-    raft_group_id: u64,
     nodes: BTreeMap<u64, RaftRsNode>,
     messages: VecDeque<Message>,
 }
 
 impl RaftRsGroup {
-    fn open(tablet_id: i64, configs: Vec<RaftRsNodeConfig>, voters: Vec<u64>) -> Result<Self> {
+    fn open(
+        tablet_id: i64,
+        configs: Vec<RaftRsNodeConfig>,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+    ) -> Result<Self> {
         let raft_group_id = tablet_id as u64;
         let mut nodes = BTreeMap::new();
         for config in configs {
-            let node = RaftRsNode::open(raft_group_id, &voters, config)?;
+            let node = RaftRsNode::open(raft_group_id, &voters, &learners, config)?;
             nodes.insert(node.node_id, node);
         }
         let mut group = Self {
             tablet_id,
-            raft_group_id,
             nodes,
             messages: VecDeque::new(),
         };
@@ -278,16 +316,12 @@ impl RaftRsGroup {
                 self.tablet_id
             )));
         }
-        let raft_group_id = self.raft_group_id;
         let node = self.node_mut(node_id)?;
-        let before = node.engine.first_index(raft_group_id).unwrap_or(1);
         node.storage
             .wl()
             .compact(up_to_index.saturating_add(1))
             .map_err(map_raft_error)?;
-        let deleted = node.engine.compact_to(raft_group_id, up_to_index + 1);
-        let after = node.engine.first_index(raft_group_id).unwrap_or(before);
-        Ok(deleted as usize + after.saturating_sub(before) as usize)
+        node.compact_engine_entries(up_to_index)
     }
 
     fn status(&self) -> Vec<RaftRsReplicaStatus> {
@@ -382,11 +416,16 @@ struct RaftRsNode {
 }
 
 impl RaftRsNode {
-    fn open(raft_group_id: u64, voters: &[u64], config: RaftRsNodeConfig) -> Result<Self> {
+    fn open(
+        raft_group_id: u64,
+        voters: &[u64],
+        learners: &[u64],
+        config: RaftRsNodeConfig,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&config.raft_engine_dir).map_err(Error::from)?;
         let engine = open_engine(&config.raft_engine_dir)?;
-        let storage = MemStorage::new_with_conf_state((voters.to_vec(), vec![]));
-        replay_raft_engine_to_storage(&engine, raft_group_id, &storage)?;
+        let storage = MemStorage::new_with_conf_state((voters.to_vec(), learners.to_vec()));
+        let replay = replay_raft_engine_to_storage(&engine, raft_group_id, &storage)?;
         let raft_config = Config {
             id: config.node_id,
             election_tick: 10,
@@ -406,8 +445,8 @@ impl RaftRsNode {
             raw,
             storage,
             engine,
-            committed: Vec::new(),
-            last_applied_index: 0,
+            committed: replay.committed_entries,
+            last_applied_index: replay.last_applied_index,
         })
     }
 
@@ -451,6 +490,13 @@ impl RaftRsNode {
             if entry.entry_type != EntryType::EntryNormal as i32 || entry.data.is_empty() {
                 continue;
             }
+            if self
+                .committed
+                .iter()
+                .any(|committed| committed.index == entry.index)
+            {
+                continue;
+            }
             self.committed.push(LogEntry {
                 tablet_id,
                 index: entry.index,
@@ -460,6 +506,43 @@ impl RaftRsNode {
         }
         Ok(())
     }
+
+    fn compact_engine_entries(&self, up_to_index: u64) -> Result<usize> {
+        if up_to_index == 0 {
+            return Ok(0);
+        }
+        let mut keys = Vec::new();
+        self.engine
+            .scan_raw_messages(
+                self.raft_group_id,
+                Some(b"entry/"),
+                Some(b"entry0"),
+                false,
+                |key, _| {
+                    if parse_raft_entry_key(key).is_some_and(|index| index <= up_to_index) {
+                        keys.push(key.to_vec());
+                    }
+                    true
+                },
+            )
+            .map_err(map_raft_engine_error)?;
+        let deleted = keys.len();
+        if deleted > 0 {
+            let mut batch = LogBatch::default();
+            for key in keys {
+                batch.delete(self.raft_group_id, key);
+            }
+            self.engine
+                .write(&mut batch, true)
+                .map_err(map_raft_engine_error)?;
+        }
+        Ok(deleted)
+    }
+}
+
+struct RaftEngineReplay {
+    committed_entries: Vec<LogEntry>,
+    last_applied_index: u64,
 }
 
 fn open_engine(path: &Path) -> Result<RaftEngine> {
@@ -472,12 +555,15 @@ fn replay_raft_engine_to_storage(
     engine: &RaftEngine,
     raft_group_id: u64,
     storage: &MemStorage,
-) -> Result<()> {
-    if let Some(bytes) = engine.get(raft_group_id, HARD_STATE_KEY) {
+) -> Result<RaftEngineReplay> {
+    let hard_state = if let Some(bytes) = engine.get(raft_group_id, HARD_STATE_KEY) {
         let hard_state = HardState::decode(bytes.as_slice()).map_err(map_prost_error)?;
-        storage.wl().set_hardstate(hard_state);
-    }
-    let mut entries = Vec::new();
+        storage.wl().set_hardstate(hard_state.clone());
+        hard_state
+    } else {
+        HardState::default()
+    };
+    let mut entries_by_index = BTreeMap::new();
     engine
         .scan_raw_messages(
             raft_group_id,
@@ -486,21 +572,43 @@ fn replay_raft_engine_to_storage(
             false,
             |_, raw| {
                 if let Ok(entry) = Entry::decode(raw) {
-                    entries.push(entry);
+                    entries_by_index.insert(entry.index, entry);
                 }
                 true
             },
         )
         .map_err(map_raft_engine_error)?;
-    entries.sort_by_key(|entry| entry.index);
+    let entries: Vec<_> = entries_by_index.into_values().collect();
     if !entries.is_empty() {
         storage.wl().append(&entries).map_err(map_raft_error)?;
     }
-    Ok(())
+    let mut committed_entries = Vec::new();
+    for entry in &entries {
+        if entry.index <= hard_state.commit
+            && entry.entry_type == EntryType::EntryNormal as i32
+            && !entry.data.is_empty()
+        {
+            committed_entries.push(LogEntry {
+                tablet_id: raft_group_id as i64,
+                index: entry.index,
+                term: entry.term,
+                command: entry.data.to_vec(),
+            });
+        }
+    }
+    Ok(RaftEngineReplay {
+        committed_entries,
+        last_applied_index: hard_state.commit,
+    })
 }
 
 fn raft_entry_key(index: u64) -> Vec<u8> {
     format!("entry/{index:020}").into_bytes()
+}
+
+fn parse_raft_entry_key(key: &[u8]) -> Option<u64> {
+    let suffix = key.strip_prefix(b"entry/")?;
+    std::str::from_utf8(suffix).ok()?.parse().ok()
 }
 
 fn validate_raft_tablet_id(tablet_id: i64) -> Result<()> {
@@ -531,6 +639,7 @@ mod tests {
         let configs = (1..=count)
             .map(|node_id| RaftRsNodeConfig {
                 node_id,
+                role: RaftRsNodeRole::Voter,
                 raft_engine_dir: dir.path().join(format!("n{node_id}")),
             })
             .collect();
@@ -575,5 +684,57 @@ mod tests {
             })
             .unwrap();
         assert!(persisted_entries > 0);
+    }
+
+    #[test]
+    fn raft_rs_log_rebuilds_committed_entries_after_restart() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs.clone()).unwrap();
+        group.elect(1).unwrap();
+        logs[0].append(7, b"before-restart".to_vec()).unwrap();
+        drop(logs);
+        drop(group);
+
+        let (_reopened_group, reopened_logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+
+        let entries = reopened_logs[1].committed_entries(7, 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, b"before-restart");
+    }
+
+    #[test]
+    fn raft_rs_log_compacts_persisted_engine_entries() {
+        let (_dir, configs) = configs(3);
+        let (_group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        logs[0].append(7, b"first".to_vec()).unwrap();
+        logs[0].append(7, b"second".to_vec()).unwrap();
+
+        let deleted = logs[0].compact(7, 1).unwrap();
+
+        assert!(deleted >= 1);
+        let entries = logs[0].committed_entries(7, 0, 10).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn raft_rs_log_accepts_control_plane_voter_and_learner_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            RaftRsNodeConfig {
+                node_id: 1,
+                role: RaftRsNodeRole::from_replica_role("voter").unwrap(),
+                raft_engine_dir: dir.path().join("n1"),
+            },
+            RaftRsNodeConfig {
+                node_id: 2,
+                role: RaftRsNodeRole::from_replica_role("learner").unwrap(),
+                raft_engine_dir: dir.path().join("n2"),
+            },
+        ];
+
+        let (_group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+
+        assert_eq!(logs.len(), 2);
+        assert!(RaftRsNodeRole::from_replica_role("log_only").is_err());
     }
 }

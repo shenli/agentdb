@@ -928,10 +928,13 @@ single-session appends or record writes.
    `raft-rs` `RawNode` instances, persists Ready entries and HardState to TiKV
    `raft-engine`, elects a leader through Raft, and acknowledges runtime writes
    after committed entries are visible through the `ReplicatedLog` interface.
-   Tests verify runtime hydration from a follower after `raft-rs` quorum commit.
-   The older `RaftQuorumReplicatedLog` remains as a narrow legacy/in-process
-   quorum harness. Production network transport, control-plane-driven
-   membership changes, and snapshot transfer orchestration are still pending.
+   It rebuilds committed entries from `raft-engine` on restart, compacts
+   persisted raft-entry messages, and accepts voter/learner peer roles matching
+   control-plane `tablet_replicas` metadata. Tests verify runtime hydration
+   from a follower after `raft-rs` quorum commit. The older
+   `RaftQuorumReplicatedLog` remains as a narrow legacy/in-process quorum
+   harness. Production network transport, online membership changes, and
+   snapshot transfer orchestration are still pending.
 
 7. Add snapshot and catch-up support.
 
