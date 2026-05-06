@@ -1,10 +1,16 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use base64::Engine as _;
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use agentdb_storage::{RaftRsSnapshotTransfer, RaftRsWireMessage};
+use agentdb_storage::{RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsWireMessage};
+
+use crate::raft_ingress::RaftRsGroupRegistry;
 
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
 
@@ -86,10 +92,118 @@ impl RaftRsHttpClient {
     }
 }
 
+#[derive(Clone)]
+pub struct RaftRsHttpOutbox {
+    client: RaftRsHttpClient,
+    peer_urls: Arc<RwLock<BTreeMap<u64, String>>>,
+}
+
+impl RaftRsHttpOutbox {
+    pub fn new(token: impl Into<Arc<str>>) -> Self {
+        Self {
+            client: RaftRsHttpClient::new(token),
+            peer_urls: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn with_client(client: RaftRsHttpClient) -> Self {
+        Self {
+            client,
+            peer_urls: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn set_peer_url(&self, node_id: u64, base_url: impl Into<String>) {
+        self.peer_urls
+            .write()
+            .expect("raft-rs HTTP peer map lock poisoned")
+            .insert(node_id, base_url.into());
+    }
+
+    pub fn remove_peer_url(&self, node_id: u64) -> Option<String> {
+        self.peer_urls
+            .write()
+            .expect("raft-rs HTTP peer map lock poisoned")
+            .remove(&node_id)
+    }
+
+    pub async fn flush_group_once(
+        &self,
+        group: &RaftRsSharedGroup,
+    ) -> Result<usize, RaftRsHttpError> {
+        let messages = group.take_wire_messages();
+        let mut sent = 0;
+        for (index, message) in messages.iter().cloned().enumerate() {
+            let Some(base_url) = self.peer_url(message.to) else {
+                group
+                    .restore_wire_messages(messages[index..].to_vec())
+                    .map_err(RaftRsHttpError::Storage)?;
+                return Err(RaftRsHttpError::MissingPeerUrl);
+            };
+            match self.client.send_message(&base_url, &message).await {
+                Ok(()) => sent += 1,
+                Err(err) => {
+                    group
+                        .restore_wire_messages(messages[index..].to_vec())
+                        .map_err(RaftRsHttpError::Storage)?;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    pub async fn flush_registry_once(
+        &self,
+        registry: &RaftRsGroupRegistry,
+    ) -> Result<usize, RaftRsHttpError> {
+        let mut sent = 0;
+        for (_, group) in registry.groups_snapshot() {
+            sent += self.flush_group_once(&group).await?;
+        }
+        Ok(sent)
+    }
+
+    pub async fn send_snapshot_to_peer(
+        &self,
+        snapshot: &RaftRsSnapshotTransfer,
+    ) -> Result<(), RaftRsHttpError> {
+        let base_url = self
+            .peer_url(snapshot.to)
+            .ok_or(RaftRsHttpError::MissingPeerUrl)?;
+        self.client.send_snapshot(&base_url, snapshot).await
+    }
+
+    fn peer_url(&self, node_id: u64) -> Option<String> {
+        self.peer_urls
+            .read()
+            .expect("raft-rs HTTP peer map lock poisoned")
+            .get(&node_id)
+            .cloned()
+    }
+}
+
+pub fn spawn_raft_rs_outbox_worker(
+    registry: Arc<RaftRsGroupRegistry>,
+    outbox: RaftRsHttpOutbox,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let interval = interval.max(Duration::from_millis(100));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let _ = outbox.flush_registry_once(&registry).await;
+        }
+    })
+}
+
 #[derive(Debug)]
 pub enum RaftRsHttpError {
     Request(reqwest::Error),
     Rejected { status: StatusCode, body: String },
+    MissingPeerUrl,
+    Storage(agentdb_storage::Error),
 }
 
 impl std::fmt::Display for RaftRsHttpError {
@@ -99,6 +213,8 @@ impl std::fmt::Display for RaftRsHttpError {
             Self::Rejected { status, body } => {
                 write!(f, "raft-rs HTTP request rejected with {status}: {body}")
             }
+            Self::MissingPeerUrl => write!(f, "raft-rs HTTP peer URL is not configured"),
+            Self::Storage(err) => write!(f, "raft-rs storage error: {err}"),
         }
     }
 }

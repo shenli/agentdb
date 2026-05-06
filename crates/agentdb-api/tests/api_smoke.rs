@@ -9,7 +9,8 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use agentdb_api::{
-    internal_raft_http::RaftRsHttpClient,
+    internal_raft_http::{RaftRsHttpClient, RaftRsHttpOutbox},
+    raft_ingress::RaftRsGroupRegistry,
     routing_http::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_TABLET_ID,
@@ -19,10 +20,14 @@ use agentdb_api::{
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
 use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
-use agentdb_storage::{RaftRsSnapshotTransfer, RaftRsWireMessage};
+use agentdb_storage::{
+    RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup,
+    RaftRsSnapshotTransfer, RaftRsWireMessage, ReplicatedLog,
+};
 use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
 use serde_json::json;
+use tempfile::TempDir;
 
 #[derive(Default)]
 struct TestRaftIngress {
@@ -45,6 +50,19 @@ impl RaftRsIngress for TestRaftIngress {
         self.snapshots.lock().unwrap().push(transfer);
         Ok(payload)
     }
+}
+
+fn test_raft_group() -> (TempDir, RaftRsSharedGroup, Vec<Arc<RaftRsReplicatedLog>>) {
+    let dir = TempDir::new().unwrap();
+    let configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+    (dir, group, logs)
 }
 
 #[tokio::test]
@@ -717,6 +735,72 @@ async fn internal_raft_http_client_sends_message_and_snapshot() {
 
     assert_eq!(ingress.messages.lock().unwrap()[0].payload, b"msg");
     assert_eq!(ingress.snapshots.lock().unwrap()[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_raft_registry_dispatches_message_to_group() {
+    let (_dir, group, logs) = test_raft_group();
+    group.elect(1).unwrap();
+    group.mark_unavailable(3).unwrap();
+    logs[0].append(7, b"registry-wire".to_vec()).unwrap();
+    group.mark_available(3).unwrap();
+
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group.clone()).unwrap();
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(registry)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let outbox = RaftRsHttpOutbox::new("secret");
+    outbox.set_peer_url(3, app.base.clone());
+
+    let sent = outbox.flush_group_once(&group).await.unwrap();
+
+    assert!(sent > 0);
+    assert!(logs[2]
+        .committed_entries(7, 0, 10)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.command == b"registry-wire"));
+}
+
+#[tokio::test]
+async fn internal_raft_registry_rejects_unregistered_tablet() {
+    let registry = RaftRsGroupRegistry::shared();
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(registry)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let client = RaftRsHttpClient::new("secret");
+
+    let err = client
+        .send_message(
+            &app.base,
+            &RaftRsWireMessage {
+                tablet_id: 404,
+                from: 1,
+                to: 2,
+                payload: b"missing".to_vec(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("not registered"));
+}
+
+#[tokio::test]
+async fn internal_raft_http_outbox_restores_messages_when_peer_missing() {
+    let (_dir, group, logs) = test_raft_group();
+    group.elect(1).unwrap();
+    group.mark_unavailable(3).unwrap();
+    logs[0].append(7, b"registry-wire".to_vec()).unwrap();
+    let outbox = RaftRsHttpOutbox::new("secret");
+
+    let err = outbox.flush_group_once(&group).await.unwrap_err();
+
+    assert!(err.to_string().contains("peer URL is not configured"));
+    assert!(!group.take_wire_messages().is_empty());
 }
 
 #[tokio::test]

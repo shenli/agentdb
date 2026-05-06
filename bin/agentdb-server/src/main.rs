@@ -272,7 +272,10 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             max_response_bytes: config.route_proxy_max_response_bytes,
         });
     if let Some(token) = config.internal_auth_token.clone() {
-        state = state.with_internal_auth_token(token);
+        let raft_registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        state = state
+            .with_internal_auth_token(token)
+            .with_raft_ingress(raft_registry);
     }
     let route_location = config
         .route_region

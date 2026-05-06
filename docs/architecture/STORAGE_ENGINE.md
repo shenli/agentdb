@@ -947,8 +947,11 @@ single-session appends or record writes.
    endpoints, and server config wires the shared token from
    `server.internal_auth_token` or `AGENTDB_INTERNAL_AUTH_TOKEN`.
    `RaftRsHttpClient` can deliver wire messages and snapshots to those
-   endpoints. The remaining production work is a local tablet-group registry
-   and background retry scheduling around the transport.
+   endpoints. `RaftRsGroupRegistry` maps local tablet ids to
+   `RaftRsSharedGroup` instances for ingress dispatch, and `RaftRsHttpOutbox`
+   plus `spawn_raft_rs_outbox_worker` provide retryable outbox draining. The
+   remaining production work is server-side tablet group bootstrap and
+   control-plane peer URL refresh.
 
 7. Add snapshot and catch-up support.
 

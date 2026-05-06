@@ -290,6 +290,13 @@ impl RaftRsSharedGroup {
             .take_wire_messages()
     }
 
+    pub fn restore_wire_messages(&self, messages: Vec<RaftRsWireMessage>) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .restore_wire_messages(messages)
+    }
+
     pub fn step_wire_message(&self, message: RaftRsWireMessage) -> Result<()> {
         self.inner
             .lock()
@@ -427,6 +434,21 @@ impl RaftRsGroup {
 
     fn take_wire_messages(&mut self) -> Vec<RaftRsWireMessage> {
         self.wire_messages.drain(..).collect()
+    }
+
+    fn restore_wire_messages(&mut self, messages: Vec<RaftRsWireMessage>) -> Result<()> {
+        for message in &messages {
+            if message.tablet_id != self.tablet_id {
+                return Err(Error::Other(format!(
+                    "raft-rs wire message targets tablet {}, local group is tablet {}",
+                    message.tablet_id, self.tablet_id
+                )));
+            }
+        }
+        for message in messages.into_iter().rev() {
+            self.wire_messages.push_front(message);
+        }
+        Ok(())
     }
 
     fn flush_wire_messages_to(&mut self, transport: &dyn RaftRsTransport) -> Result<usize> {
