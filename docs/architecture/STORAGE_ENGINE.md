@@ -73,10 +73,22 @@ Today, the control-plane schema already has the early shape of this model:
 - `tablets`: ownership rows with owner, lease, and epoch.
 - `session_locators`: session-to-shard/tablet metadata for stable session
   routing.
+- `placement_scopes`: shared-pool and dedicated placement namespaces.
+- `tablet_ranges`: compressed virtual-shard range to tablet map.
+- `tablet_replicas`: intended replica placement and catch-up metadata.
+- `tenant_policies`: tenant placement class, placement scope, encryption class,
+  key policy reference, and policy versions.
 
 Those rows are control-plane routing metadata only. The current runtime still
 uses a single `KvStore` backend for data; tablets are not yet independent Raft
 groups or independent LSM instances.
+
+The storage crate now has two target-facing seams:
+
+- `TabletKvStore`: a tablet-local namespace over the existing `KvStore`.
+- `ReplicatedLog`: a commit-before-apply boundary with a durable single-node
+  implementation. This is not Raft yet; it is the interface the Raft-backed log
+  should replace.
 
 ## Current Write Path
 
@@ -230,11 +242,11 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing slots | `shards` table with 16,384 fixed rows | Virtual shards remain stable routing slots |
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
-| Runtime data | One `KvStore` backend selected by server config | Tablet-local applied state stores |
-| Replication | No hot-path multi-node consensus yet | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
+| Runtime data | Runtime still uses one configured `KvStore`; `TabletKvStore` now provides a tablet-local namespace for new state-machine work | Tablet-local applied state stores |
+| Replication | No hot-path multi-node consensus yet; `ReplicatedLog` has a durable single-node implementation | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
 | Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
-| Placement policy | Not yet a first-class tenant policy table | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
-| Encryption policy | Metadata/content crypto primitives exist, but tablet placement does not yet own key policy | Control plane stores key references and versions; raw keys stay in KMS |
+| Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
+| Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
 
 The implementation should evolve toward the target without adding a second
 managed chunk layer under tablets. If more routing granularity is needed, add
@@ -852,6 +864,10 @@ single-session appends or record writes.
    from a tenant-internal routing key. Keep this internal to the server and SDK
    adapters.
 
+   Current implementation status: control-plane placement scopes, tablet ranges,
+   and routing-snapshot placement-scope resolution exist. Runtime policy
+   resolution still needs to be connected to all data paths.
+
 2. Add control-plane policy and key metadata.
 
    Store tenant policy, placement class, encryption class, key references, key
@@ -859,17 +875,29 @@ single-session appends or record writes.
    plane. Store references and wrapped-key metadata only; raw key material stays
    in KMS.
 
+   Current implementation status: `tenant_policies`, `placement_scopes`,
+   `tablet_ranges`, `tablet_replicas`, and tablet encryption policy version
+   metadata exist.
+
 3. Separate tablet-local runtime state.
 
    Stop treating the runtime KV store as one global write domain. Add a
    tablet-local storage interface so each tablet can own its own applied state,
    local indexes, and replay cursor.
 
+   Current implementation status: `TabletKvStore` provides a tablet-local
+   namespace over the existing KV backend. The runtime append/record paths still
+   need to move onto it.
+
 4. Add replicated log abstraction.
 
    Introduce a `ReplicatedLog` boundary before the applied state machine. Start
    with a single-node implementation that preserves current behavior, then add a
    Raft implementation using `raft-rs` and `raft-engine`.
+
+   Current implementation status: the `ReplicatedLog` trait and
+   `SingleNodeReplicatedLog` exist. The runtime state machine still needs to
+   issue deterministic commands through this boundary.
 
 5. Move append/write commands through the tablet state machine.
 

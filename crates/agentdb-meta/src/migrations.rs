@@ -115,6 +115,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/016_tablet_ranges.sql"),
         include_str!("../migrations/016_tablet_ranges.pg.sql"),
     ),
+    (
+        17,
+        "tenant placement and encryption policy metadata",
+        include_str!("../migrations/017_tenant_placement_policies.sql"),
+        include_str!("../migrations/017_tenant_placement_policies.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
