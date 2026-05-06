@@ -1,10 +1,9 @@
 //! Tablet state-machine boundary.
 //!
-//! Runtime append/record code still writes through `Persist` today. This module
-//! is the target seam: commands are serialized into a tablet log, committed, and
-//! then applied deterministically to tablet-local state. The current
-//! implementation works with `SingleNodeReplicatedLog`; replacing the log with
-//! Raft should not change command application semantics.
+//! Tablet write commands are serialized into a tablet log, committed, and then
+//! applied deterministically to tablet-local state. The current implementation
+//! works with `SingleNodeReplicatedLog`; replacing the log with Raft should not
+//! change command application semantics.
 
 use std::sync::{Arc, Mutex};
 

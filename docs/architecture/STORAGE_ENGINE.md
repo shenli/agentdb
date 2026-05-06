@@ -245,7 +245,7 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing slots | `shards` table with 16,384 fixed rows | Virtual shards remain stable routing slots |
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
-| Runtime data | Runtime still uses one configured `KvStore`; `TabletKvStore` now provides a tablet-local namespace for new state-machine work | Tablet-local applied state stores |
+| Runtime data | Persisted runtime state is stored through `TabletKvStore` under the primary runtime tablet namespace | Tablet-local applied state stores per routed tablet |
 | Replication | No hot-path multi-node consensus yet; `ReplicatedLog` has a durable single-node implementation | `raft-rs` consensus with durable local Raft logs, likely `raft-engine` |
 | Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
@@ -889,8 +889,9 @@ single-session appends or record writes.
    local indexes, and replay cursor.
 
    Current implementation status: `TabletKvStore` provides a tablet-local
-   namespace over the existing KV backend. The runtime append/record paths still
-   need to move onto it.
+   namespace over the existing KV backend and implements the `KvStore` trait.
+   The persisted runtime keyspace is now opened through the primary runtime
+   tablet instead of writing directly into the raw configured KV store.
 
 4. Add replicated log abstraction.
 
@@ -899,8 +900,8 @@ single-session appends or record writes.
    Raft implementation using `raft-rs` and `raft-engine`.
 
    Current implementation status: the `ReplicatedLog` trait and
-   `SingleNodeReplicatedLog` exist. The runtime state machine still needs to
-   issue deterministic commands through this boundary.
+   `SingleNodeReplicatedLog` exist. Persisted runtime writes are routed through
+   a logged tablet state-machine wrapper in single-node mode.
 
 5. Move append/write commands through the tablet state machine.
 
@@ -911,8 +912,9 @@ single-session appends or record writes.
    `LoggedTabletStateMachine` exist and apply committed log entries to
    tablet-local KV state. The applied index is persisted atomically with tablet
    state updates so recovery can resume from the last applied committed entry.
-   Runtime append/record paths still need to emit these commands instead of
-   calling `Persist` directly.
+   `Persist` still defines the logical write batches, but the configured
+   persisted runtime store commits those batches through `TabletCommand` before
+   applying them to tablet-local state.
 
 6. Add quorum commit before acknowledgement.
 

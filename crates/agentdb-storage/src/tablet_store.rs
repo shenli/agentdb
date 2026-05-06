@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::{Error, KvIter, KvStore, Result, WriteOp};
+use crate::{Error, KvIter, KvSnapshot, KvStore, Result, WriteOp};
 
 const TABLET_STATE_PREFIX: &[u8] = b"tablet_state/";
 
@@ -81,6 +81,100 @@ impl TabletKvStore {
         scoped.extend_from_slice(key);
         scoped
     }
+}
+
+impl KvStore for TabletKvStore {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Self::get(self, key)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        Self::put(self, key, value)
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        Self::delete(self, key)
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        Self::scan_prefix(self, prefix)
+    }
+
+    fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
+        Self::write_batch(self, ops)
+    }
+
+    fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
+        let snapshot = self.kv.snapshot()?;
+        Ok(Box::new(TabletKvSnapshot {
+            inner: snapshot,
+            prefix: self.prefix.clone(),
+        }))
+    }
+
+    fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>> {
+        let inner = self.kv.clone().snapshot_owned()?;
+        Ok(Arc::new(TabletKvOwnedSnapshot {
+            inner,
+            prefix: self.prefix.clone(),
+        }))
+    }
+}
+
+struct TabletKvSnapshot<'a> {
+    inner: Box<dyn KvSnapshot + 'a>,
+    prefix: Vec<u8>,
+}
+
+impl KvSnapshot for TabletKvSnapshot<'_> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get(&scoped_key(&self.prefix, key))
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let scoped_prefix = scoped_key(&self.prefix, prefix);
+        let tablet_prefix = self.prefix.clone();
+        let iter = self.inner.scan_prefix(&scoped_prefix)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|(key, value)| {
+                let logical = key
+                    .strip_prefix(tablet_prefix.as_slice())
+                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
+                (logical, value)
+            })
+        })))
+    }
+}
+
+struct TabletKvOwnedSnapshot {
+    inner: Arc<dyn KvSnapshot>,
+    prefix: Vec<u8>,
+}
+
+impl KvSnapshot for TabletKvOwnedSnapshot {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get(&scoped_key(&self.prefix, key))
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let scoped_prefix = scoped_key(&self.prefix, prefix);
+        let tablet_prefix = self.prefix.clone();
+        let iter = self.inner.scan_prefix(&scoped_prefix)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|(key, value)| {
+                let logical = key
+                    .strip_prefix(tablet_prefix.as_slice())
+                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
+                (logical, value)
+            })
+        })))
+    }
+}
+
+fn scoped_key(prefix: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut scoped = prefix.to_vec();
+    scoped.extend_from_slice(key);
+    scoped
 }
 
 fn tablet_prefix(tablet_id: i64) -> Vec<u8> {

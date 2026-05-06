@@ -24,7 +24,8 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
-    KmsError, KmsKeyResolver, KvStore, MetadataCryptoAdapter,
+    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, TabletKvStore,
+    WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -45,7 +46,12 @@ use crate::segment::{
 };
 use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
+use crate::tablet_state::{
+    LoggedTabletStateMachine, TabletCommand, TabletStateMachine, TabletWriteOp,
+};
 use crate::tenant::{NewTenant, Tenant};
+
+const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -506,6 +512,66 @@ pub struct Runtime {
     global_record_index: Arc<dyn GlobalRecordIndex>,
 }
 
+#[derive(Clone)]
+struct RuntimeTabletKvStore {
+    store: Arc<TabletKvStore>,
+    state_machine: Arc<dyn TabletStateMachine>,
+}
+
+impl RuntimeTabletKvStore {
+    fn single_node(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        tablet_id: i64,
+    ) -> agentdb_storage::Result<Self> {
+        let store = Arc::new(TabletKvStore::new(kv.clone(), tablet_id)?);
+        let state_machine = Arc::new(LoggedTabletStateMachine::single_node(kv, tablet_id)?);
+        state_machine.apply_committed()?;
+        Ok(Self {
+            store,
+            state_machine,
+        })
+    }
+}
+
+impl KvStore for RuntimeTabletKvStore {
+    fn get(&self, key: &[u8]) -> agentdb_storage::Result<Option<Vec<u8>>> {
+        self.store.get(key)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> agentdb_storage::Result<()> {
+        self.write_batch(vec![WriteOp::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }])
+    }
+
+    fn delete(&self, key: &[u8]) -> agentdb_storage::Result<()> {
+        self.write_batch(vec![WriteOp::Delete { key: key.to_vec() }])
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
+        self.store.scan_prefix(prefix)
+    }
+
+    fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.state_machine.commit(TabletCommand::WriteBatch {
+            ops: ops.into_iter().map(TabletWriteOp::from).collect(),
+        })?;
+        Ok(())
+    }
+
+    fn snapshot<'a>(&'a self) -> agentdb_storage::Result<Box<dyn KvSnapshot + 'a>> {
+        self.store.snapshot()
+    }
+
+    fn snapshot_owned(self: Arc<Self>) -> agentdb_storage::Result<Arc<dyn KvSnapshot>> {
+        self.store.clone().snapshot_owned()
+    }
+}
+
 impl Runtime {
     fn bump_lifecycle_counts(counts: &mut LifecycleCounts, lifecycle: Lifecycle) {
         match lifecycle {
@@ -858,7 +924,11 @@ impl Runtime {
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
     ) -> Arc<Self> {
-        let persist = Persist::with_metadata_crypto(kv, metadata_crypto);
+        let runtime_kv = Arc::new(
+            RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
+                .expect("open runtime tablet state"),
+        );
+        let persist = Persist::with_metadata_crypto(runtime_kv, metadata_crypto);
 
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {
