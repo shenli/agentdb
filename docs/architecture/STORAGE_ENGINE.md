@@ -936,8 +936,11 @@ single-session appends or record writes.
    from a follower after `raft-rs` quorum commit, successful commit with one
    unavailable follower, failure without quorum, and recovery after a follower
    returns. The older `RaftQuorumReplicatedLog` remains as a narrow
-   legacy/in-process quorum harness. Production network transport, online
-   membership changes, and snapshot transfer orchestration are still pending.
+   legacy/in-process quorum harness. `RaftRsWireMessage` exposes encoded
+   `raft-rs` messages for a production node-to-node transport and can step
+   messages delivered back into the local group. The remaining production work
+   is wiring that message surface into HTTP/gRPC internode RPC, online
+   membership changes, and snapshot transfer orchestration.
 
 7. Add snapshot and catch-up support.
 

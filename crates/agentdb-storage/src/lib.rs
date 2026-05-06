@@ -35,7 +35,7 @@ pub use metadata_crypto::{
 };
 pub use raft_rs_log::{
     stable_raft_node_id, RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicaStatus,
-    RaftRsReplicatedLog, RaftRsSharedGroup,
+    RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsWireMessage,
 };
 pub use replicated_log::{
     LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,

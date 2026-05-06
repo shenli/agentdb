@@ -97,6 +97,29 @@ pub struct RaftRsReplicaStatus {
     pub applied_index: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftRsWireMessage {
+    pub tablet_id: i64,
+    pub from: u64,
+    pub to: u64,
+    pub payload: Vec<u8>,
+}
+
+impl RaftRsWireMessage {
+    pub fn from_raft_message(tablet_id: i64, message: &Message) -> Self {
+        Self {
+            tablet_id,
+            from: message.from,
+            to: message.to,
+            payload: message.encode_to_vec(),
+        }
+    }
+
+    pub fn into_raft_message(self) -> Result<Message> {
+        Message::decode(self.payload.as_slice()).map_err(map_prost_error)
+    }
+}
+
 #[derive(Clone)]
 pub struct RaftRsReplicatedLog {
     group: RaftRsSharedGroup,
@@ -222,6 +245,20 @@ impl RaftRsSharedGroup {
             .mark_available(node_id)
     }
 
+    pub fn take_wire_messages(&self) -> Vec<RaftRsWireMessage> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .take_wire_messages()
+    }
+
+    pub fn step_wire_message(&self, message: RaftRsWireMessage) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .step_wire_message(message)
+    }
+
     fn append(&self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         self.inner
             .lock()
@@ -255,6 +292,7 @@ struct RaftRsGroup {
     nodes: BTreeMap<u64, RaftRsNode>,
     unavailable_nodes: BTreeSet<u64>,
     messages: VecDeque<Message>,
+    wire_messages: VecDeque<RaftRsWireMessage>,
 }
 
 impl RaftRsGroup {
@@ -275,6 +313,7 @@ impl RaftRsGroup {
             nodes,
             unavailable_nodes: BTreeSet::new(),
             messages: VecDeque::new(),
+            wire_messages: VecDeque::new(),
         };
         group.drive_until_idle()?;
         Ok(group)
@@ -293,6 +332,30 @@ impl RaftRsGroup {
     fn mark_available(&mut self, node_id: u64) -> Result<()> {
         self.node(node_id)?;
         self.unavailable_nodes.remove(&node_id);
+        self.drive_until_idle()
+    }
+
+    fn take_wire_messages(&mut self) -> Vec<RaftRsWireMessage> {
+        self.wire_messages.drain(..).collect()
+    }
+
+    fn step_wire_message(&mut self, message: RaftRsWireMessage) -> Result<()> {
+        if message.tablet_id != self.tablet_id {
+            return Err(Error::Other(format!(
+                "raft-rs wire message targets tablet {}, local group is tablet {}",
+                message.tablet_id, self.tablet_id
+            )));
+        }
+        if self.unavailable_nodes.contains(&message.to) {
+            self.wire_messages.push_back(message);
+            return Ok(());
+        }
+        let to = message.to;
+        let raft_message = message.into_raft_message()?;
+        self.node_mut(to)?
+            .raw
+            .step(raft_message)
+            .map_err(map_raft_error)?;
         self.drive_until_idle()
     }
 
@@ -418,11 +481,22 @@ impl RaftRsGroup {
                 if self.unavailable_nodes.contains(&message.from)
                     || self.unavailable_nodes.contains(&to)
                 {
+                    self.wire_messages
+                        .push_back(RaftRsWireMessage::from_raft_message(
+                            self.tablet_id,
+                            &message,
+                        ));
                     continue;
                 }
                 if let Some(node) = self.nodes.get_mut(&to) {
                     node.raw.step(message).map_err(map_raft_error)?;
                     progressed = true;
+                } else {
+                    self.wire_messages
+                        .push_back(RaftRsWireMessage::from_raft_message(
+                            self.tablet_id,
+                            &message,
+                        ));
                 }
             }
             if !progressed {
@@ -875,5 +949,45 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.command == b"quorum-restored"));
+    }
+
+    #[test]
+    fn raft_rs_log_exposes_wire_messages_for_unavailable_nodes() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(3).unwrap();
+
+        logs[0].append(7, b"wire".to_vec()).unwrap();
+        let messages = group.take_wire_messages();
+
+        assert!(messages.iter().any(|message| {
+            message.tablet_id == 7
+                && message.from == 1
+                && message.to == 3
+                && !message.payload.is_empty()
+        }));
+    }
+
+    #[test]
+    fn raft_rs_log_steps_wire_message_after_node_returns() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(3).unwrap();
+        logs[0].append(7, b"wire-delivery".to_vec()).unwrap();
+        let messages = group.take_wire_messages();
+
+        group.mark_available(3).unwrap();
+        for message in messages {
+            if message.to == 3 {
+                group.step_wire_message(message).unwrap();
+            }
+        }
+
+        let entries = logs[2].committed_entries(7, 0, 10).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.command == b"wire-delivery"));
     }
 }
