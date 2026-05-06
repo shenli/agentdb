@@ -931,6 +931,10 @@ single-session appends or record writes.
    size, and read pressure. Never move paid or enterprise tenants into shared
    pool tablets.
 
+   Current implementation status: `tablet_ranges::replace_ranges` can
+   atomically publish split/merge tablet-map cutovers with exact coverage
+   validation. It does not yet copy/replay hot state or coordinate Raft groups.
+
 9. Add compressed tablet-map ranges.
 
    Move from per-shard override rows toward `tablet_range` records keyed by
