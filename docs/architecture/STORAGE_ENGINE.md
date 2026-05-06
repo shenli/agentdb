@@ -909,8 +909,10 @@ single-session appends or record writes.
 
    Current implementation status: `TabletCommand`, `TabletWriteOp`, and
    `LoggedTabletStateMachine` exist and apply committed log entries to
-   tablet-local KV state. Runtime append/record paths still need to emit these
-   commands instead of calling `Persist` directly.
+   tablet-local KV state. The applied index is persisted atomically with tablet
+   state updates so recovery can resume from the last applied committed entry.
+   Runtime append/record paths still need to emit these commands instead of
+   calling `Persist` directly.
 
 6. Add quorum commit before acknowledgement.
 

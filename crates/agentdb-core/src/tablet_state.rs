@@ -13,6 +13,9 @@ use agentdb_storage::{
     TabletKvStore, WriteOp,
 };
 
+const APPLIED_INDEX_KEY: &[u8] = b"\0agentdb/tablet/applied_index";
+const RESERVED_KEY_PREFIX: &[u8] = b"\0agentdb/";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TabletCommand {
@@ -80,11 +83,12 @@ impl LoggedTabletStateMachine {
                 "tablet_id must be non-negative".into(),
             ));
         }
+        let applied_index = load_applied_index(&store)?;
         Ok(Self {
             tablet_id,
             log,
             store,
-            applied_index: Mutex::new(0),
+            applied_index: Mutex::new(applied_index),
         })
     }
 
@@ -125,7 +129,7 @@ impl TabletStateMachine for LoggedTabletStateMachine {
                     entry.index
                 ))
             })?;
-            apply_command(&self.store, command)?;
+            apply_command(&self.store, command, entry.index)?;
             *applied_index = entry.index;
             applied += 1;
         }
@@ -140,12 +144,47 @@ impl TabletStateMachine for LoggedTabletStateMachine {
     }
 }
 
-fn apply_command(store: &TabletKvStore, command: TabletCommand) -> StorageResult<()> {
+fn load_applied_index(store: &TabletKvStore) -> StorageResult<u64> {
+    let Some(bytes) = store.get(APPLIED_INDEX_KEY)? else {
+        return Ok(0);
+    };
+    let raw: [u8; 8] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| agentdb_storage::Error::Other("invalid tablet applied index".into()))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn apply_command(
+    store: &TabletKvStore,
+    command: TabletCommand,
+    applied_index: u64,
+) -> StorageResult<()> {
     match command {
         TabletCommand::WriteBatch { ops } => {
-            store.write_batch(ops.into_iter().map(WriteOp::from).collect())
+            for op in &ops {
+                validate_write_op_key(op)?;
+            }
+            let mut write_ops: Vec<WriteOp> = ops.into_iter().map(WriteOp::from).collect();
+            write_ops.push(WriteOp::Put {
+                key: APPLIED_INDEX_KEY.to_vec(),
+                value: applied_index.to_be_bytes().to_vec(),
+            });
+            store.write_batch(write_ops)
         }
     }
+}
+
+fn validate_write_op_key(op: &TabletWriteOp) -> StorageResult<()> {
+    let key = match op {
+        TabletWriteOp::Put { key, .. } | TabletWriteOp::Delete { key } => key,
+    };
+    if key.starts_with(RESERVED_KEY_PREFIX) {
+        return Err(agentdb_storage::Error::Other(
+            "tablet command targets reserved keyspace".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,5 +268,51 @@ mod tests {
             Some(&b"v"[..])
         );
         assert_eq!(machine.applied_index(), 1);
+    }
+
+    #[test]
+    fn applied_index_is_loaded_from_tablet_store_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let log = Arc::new(SingleNodeReplicatedLog::new(kv.clone()));
+        let store = TabletKvStore::new(kv.clone(), 7).unwrap();
+        let command = TabletCommand::WriteBatch {
+            ops: vec![TabletWriteOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        };
+        log.append(7, serde_json::to_vec(&command).unwrap())
+            .unwrap();
+
+        let first = LoggedTabletStateMachine::new(7, log.clone(), store).unwrap();
+        assert_eq!(first.apply_committed().unwrap(), 1);
+        assert_eq!(first.applied_index(), 1);
+
+        let restarted =
+            LoggedTabletStateMachine::new(7, log, TabletKvStore::new(kv, 7).unwrap()).unwrap();
+        assert_eq!(restarted.applied_index(), 1);
+        assert_eq!(restarted.apply_committed().unwrap(), 0);
+    }
+
+    #[test]
+    fn command_cannot_write_internal_tablet_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let machine = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+
+        let err = machine
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![TabletWriteOp::Put {
+                    key: APPLIED_INDEX_KEY.to_vec(),
+                    value: 99_u64.to_be_bytes().to_vec(),
+                }],
+            })
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("tablet command targets reserved keyspace"));
+        assert_eq!(machine.applied_index(), 0);
     }
 }
