@@ -9,6 +9,7 @@
 //! in `crate::errors`.
 
 use std::{
+    collections::BTreeMap,
     fs,
     future::Future,
     path::{Path as FsPath, PathBuf},
@@ -526,14 +527,19 @@ struct ContentMirrorStatusResponse {
 #[derive(Debug, Serialize)]
 struct RaftStatusResponse {
     enabled: bool,
+    control_plane_enabled: bool,
     tablet_count: usize,
+    configured_replica_count: usize,
+    unhealthy_replica_count: usize,
     tablets: Vec<RaftTabletStatus>,
 }
 
 #[derive(Debug, Serialize)]
 struct RaftTabletStatus {
     tablet_id: i64,
+    local_group_open: bool,
     replicas: Vec<RaftReplicaStatus>,
+    configured_replicas: Vec<RaftConfiguredReplicaStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -544,6 +550,23 @@ struct RaftReplicaStatus {
     term: u64,
     commit_index: u64,
     applied_index: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftConfiguredReplicaStatus {
+    node_id: String,
+    raft_node_id: Option<u64>,
+    role: String,
+    health: String,
+    applied_index: i64,
+    match_index: i64,
+    updated_at_ms: i64,
+    local_runtime: bool,
+    runtime_role: Option<String>,
+    runtime_leader_id: Option<u64>,
+    runtime_term: Option<u64>,
+    runtime_commit_index: Option<u64>,
+    runtime_applied_index: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1634,20 +1657,25 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
     })
 }
 
-async fn get_raft_status(State(s): State<AppState>) -> Json<RaftStatusResponse> {
+async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusResponse>, ApiError> {
+    let configured_by_tablet = load_configured_raft_replicas(s.meta.as_ref()).await?;
     let Some(registry) = s.raft_registry.as_ref() else {
-        return Json(RaftStatusResponse {
+        let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
+        let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
+        return Ok(Json(RaftStatusResponse {
             enabled: false,
+            control_plane_enabled: s.meta.is_some(),
             tablet_count: 0,
+            configured_replica_count,
+            unhealthy_replica_count,
             tablets: Vec::new(),
-        });
+        }));
     };
     let tablets: Vec<_> = registry
         .groups_snapshot()
         .into_iter()
-        .map(|(tablet_id, group)| RaftTabletStatus {
-            tablet_id,
-            replicas: group
+        .map(|(tablet_id, group)| {
+            let runtime_replicas: Vec<_> = group
                 .status()
                 .into_iter()
                 .map(|status| RaftReplicaStatus {
@@ -1658,14 +1686,90 @@ async fn get_raft_status(State(s): State<AppState>) -> Json<RaftStatusResponse> 
                     commit_index: status.commit_index,
                     applied_index: status.applied_index,
                 })
-                .collect(),
+                .collect();
+            let configured = configured_by_tablet
+                .get(&tablet_id)
+                .map(|replicas| configured_raft_replica_statuses(replicas, &runtime_replicas))
+                .unwrap_or_default();
+            RaftTabletStatus {
+                tablet_id,
+                local_group_open: true,
+                replicas: runtime_replicas,
+                configured_replicas: configured,
+            }
         })
         .collect();
-    Json(RaftStatusResponse {
+    let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
+    let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
+    Ok(Json(RaftStatusResponse {
         enabled: true,
+        control_plane_enabled: s.meta.is_some(),
         tablet_count: tablets.len(),
+        configured_replica_count,
+        unhealthy_replica_count,
         tablets,
-    })
+    }))
+}
+
+async fn load_configured_raft_replicas(
+    meta: Option<&agentdb_meta::MetaStore>,
+) -> Result<BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>, ApiError> {
+    let Some(meta) = meta else {
+        return Ok(BTreeMap::new());
+    };
+    let mut by_tablet: BTreeMap<i64, Vec<tablet_replicas::TabletReplica>> = BTreeMap::new();
+    for replica in tablet_replicas::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+    {
+        by_tablet
+            .entry(replica.tablet_id)
+            .or_default()
+            .push(replica);
+    }
+    Ok(by_tablet)
+}
+
+fn count_unhealthy_configured_replicas(
+    configured_by_tablet: &BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>,
+) -> usize {
+    configured_by_tablet
+        .values()
+        .flatten()
+        .filter(|replica| replica.health != "healthy")
+        .count()
+}
+
+fn configured_raft_replica_statuses(
+    replicas: &[tablet_replicas::TabletReplica],
+    runtime_replicas: &[RaftReplicaStatus],
+) -> Vec<RaftConfiguredReplicaStatus> {
+    replicas
+        .iter()
+        .map(|replica| {
+            let raft_node_id = agentdb_storage::stable_raft_node_id(&replica.node_id).ok();
+            let runtime = raft_node_id.and_then(|node_id| {
+                runtime_replicas
+                    .iter()
+                    .find(|status| status.node_id == node_id)
+            });
+            RaftConfiguredReplicaStatus {
+                node_id: replica.node_id.clone(),
+                raft_node_id,
+                role: replica.role.clone(),
+                health: replica.health.clone(),
+                applied_index: replica.applied_index,
+                match_index: replica.match_index,
+                updated_at_ms: replica.updated_at_ms,
+                local_runtime: runtime.is_some(),
+                runtime_role: runtime.map(|status| status.role.clone()),
+                runtime_leader_id: runtime.map(|status| status.leader_id),
+                runtime_term: runtime.map(|status| status.term),
+                runtime_commit_index: runtime.map(|status| status.commit_index),
+                runtime_applied_index: runtime.map(|status| status.applied_index),
+            }
+        })
+        .collect()
 }
 
 fn build_cluster_health(
