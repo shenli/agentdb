@@ -127,6 +127,13 @@ impl RaftRsHttpOutbox {
             .remove(&node_id)
     }
 
+    pub fn replace_peer_urls(&self, peer_urls: BTreeMap<u64, String>) {
+        *self
+            .peer_urls
+            .write()
+            .expect("raft-rs HTTP peer map lock poisoned") = peer_urls;
+    }
+
     pub async fn flush_group_once(
         &self,
         group: &RaftRsSharedGroup,

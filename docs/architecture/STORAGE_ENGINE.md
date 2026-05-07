@@ -949,9 +949,13 @@ single-session appends or record writes.
    `RaftRsHttpClient` can deliver wire messages and snapshots to those
    endpoints. `RaftRsGroupRegistry` maps local tablet ids to
    `RaftRsSharedGroup` instances for ingress dispatch, and `RaftRsHttpOutbox`
-   plus `spawn_raft_rs_outbox_worker` provide retryable outbox draining. The
-   remaining production work is server-side tablet group bootstrap and
-   control-plane peer URL refresh.
+   plus `spawn_raft_rs_outbox_worker` provide retryable outbox draining. Server
+   startup now bootstraps local `raft-rs` tablet groups from
+   `tablet_replicas`, opens only the local node's raft-engine state while
+   retaining the full voter/learner ConfState, loads peer URLs from `nodes`,
+   and refreshes those URLs periodically and on control-plane change hints. The
+   remaining production work is making the runtime hot write path route tablet
+   writes through these registered local Raft logs.
 
 7. Add snapshot and catch-up support.
 

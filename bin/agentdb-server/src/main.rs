@@ -5,6 +5,7 @@
 //! `--in-memory` to get the ephemeral backend (useful for smoke tests and
 //! local dev).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -271,11 +273,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         });
+    let mut raft_registry = None;
     if let Some(token) = config.internal_auth_token.clone() {
-        let raft_registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         state = state
             .with_internal_auth_token(token)
-            .with_raft_ingress(raft_registry);
+            .with_raft_ingress(registry.clone());
+        raft_registry = Some(registry);
     }
     let route_location = config
         .route_region
@@ -304,6 +308,43 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             state.drain.clone(),
             ClusterWorkerConfig::from_env(),
         );
+        if let Some(registry) = raft_registry.clone() {
+            let raft_engine_root = config.data_dir.join("raft-engine");
+            let tablet_ids =
+                bootstrap_raft_rs_registry(&meta, node_id, &raft_engine_root, registry.clone())
+                    .await?;
+            if !tablet_ids.is_empty() {
+                let internal_auth_token = config
+                    .internal_auth_token
+                    .clone()
+                    .expect("raft registry requires internal auth token");
+                let outbox =
+                    agentdb_api::internal_raft_http::RaftRsHttpOutbox::new(internal_auth_token);
+                refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await?;
+                spawn_raft_rs_peer_url_refresher(
+                    meta.clone(),
+                    tablet_ids.clone(),
+                    outbox.clone(),
+                    config.route_refresh_interval_ms,
+                );
+                let raft_outbox_interval_ms = env_u64(
+                    "AGENTDB_RAFT_OUTBOX_INTERVAL_MS",
+                    DEFAULT_RAFT_OUTBOX_INTERVAL_MS,
+                )
+                .max(100);
+                agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
+                    registry,
+                    outbox,
+                    Duration::from_millis(raft_outbox_interval_ms),
+                );
+                tracing::info!(
+                    node_id,
+                    tablet_count = tablet_ids.len(),
+                    outbox_interval_ms = raft_outbox_interval_ms,
+                    "bootstrapped raft-rs tablet groups"
+                );
+            }
+        }
         state = state
             .with_meta(meta.clone())
             .with_scheduler(scheduler_status)
@@ -1133,6 +1174,123 @@ async fn load_raft_rs_node_configs(
     Ok(configs)
 }
 
+async fn bootstrap_raft_rs_registry(
+    meta: &agentdb_meta::MetaStore,
+    local_node_id: &str,
+    raft_engine_root: &std::path::Path,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+) -> anyhow::Result<Vec<i64>> {
+    let local_raft_node_id = agentdb_storage::stable_raft_node_id(local_node_id)?;
+    let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_all(meta.pool())
+        .await?
+        .into_iter()
+        .filter(|replica| {
+            replica.node_id == local_node_id && matches!(replica.role.as_str(), "voter" | "learner")
+        })
+        .map(|replica| replica.tablet_id)
+        .collect();
+    let mut bootstrapped = Vec::new();
+    for tablet_id in local_tablet_ids {
+        let configs = load_raft_rs_node_configs(meta, tablet_id, raft_engine_root).await?;
+        let (group, _local_log) =
+            agentdb_storage::RaftRsSharedGroup::open_local(tablet_id, configs, local_raft_node_id)?;
+        registry.register(tablet_id, group)?;
+        bootstrapped.push(tablet_id);
+    }
+    Ok(bootstrapped)
+}
+
+async fn load_raft_rs_peer_urls(
+    meta: &agentdb_meta::MetaStore,
+    tablet_ids: impl IntoIterator<Item = i64>,
+) -> anyhow::Result<BTreeMap<u64, String>> {
+    let mut peer_urls = BTreeMap::new();
+    for tablet_id in tablet_ids {
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                continue;
+            }
+            let node = agentdb_meta::nodes::get(meta.pool(), &replica.node_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tablet {tablet_id} raft replica {} has no node metadata",
+                        replica.node_id
+                    )
+                })?;
+            if node.address.trim().is_empty() {
+                anyhow::bail!(
+                    "tablet {tablet_id} raft replica {} has an empty node address",
+                    replica.node_id
+                );
+            }
+            let raft_node_id = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
+            peer_urls.insert(raft_node_id, node.address);
+        }
+    }
+    Ok(peer_urls)
+}
+
+async fn refresh_raft_rs_peer_urls(
+    meta: &agentdb_meta::MetaStore,
+    tablet_ids: &[i64],
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<()> {
+    let peer_urls = load_raft_rs_peer_urls(meta, tablet_ids.iter().copied()).await?;
+    outbox.replace_peer_urls(peer_urls);
+    Ok(())
+}
+
+fn spawn_raft_rs_peer_url_refresher(
+    meta: agentdb_meta::MetaStore,
+    tablet_ids: Vec<i64>,
+    outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    refresh_interval_ms: u64,
+) {
+    let refresh_interval_ms = refresh_interval_ms.max(100);
+    let mut changes = agentdb_meta::change_notifier::subscribe(
+        &meta,
+        &[
+            agentdb_meta::change_notifier::Channel::Nodes,
+            agentdb_meta::change_notifier::Channel::Tablets,
+        ],
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await {
+                        tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
+                    }
+                }
+                change = changes.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs peer metadata change received");
+                            if let Err(error) = refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await {
+                                tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
+                            }
+                        }
+                        None => {
+                            tracing::warn!("raft-rs peer metadata change stream closed; continuing with periodic refresh");
+                            changes = agentdb_meta::change_notifier::subscribe(
+                                &meta,
+                                &[
+                                    agentdb_meta::change_notifier::Channel::Nodes,
+                                    agentdb_meta::change_notifier::Channel::Tablets,
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn spawn_route_snapshot_refresher(
     meta: agentdb_meta::MetaStore,
     routing: agentdb_api::routing_http::RouteRuntime,
@@ -1910,5 +2068,128 @@ region = "us-west-2"
         assert!(err
             .to_string()
             .contains("tablet 7 has no voter/learner replicas"));
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_bootstrap_registers_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let tablet_ids = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(tablet_ids, vec![7]);
+        assert_eq!(registry.tablet_count(), 1);
+        let groups = registry.groups_snapshot();
+        assert_eq!(groups[0].1.status().len(), 1);
+        assert_eq!(
+            groups[0].1.status()[0].node_id,
+            agentdb_storage::stable_raft_node_id("node-a").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_bootstrap_skips_log_only_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let tablet_ids = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert!(tablet_ids.is_empty());
+        assert_eq!(registry.tablet_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_rs_peer_urls_load_from_control_plane_nodes() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let peer_urls = load_raft_rs_peer_urls(&meta, [7]).await.unwrap();
+
+        assert_eq!(
+            peer_urls.get(&agentdb_storage::stable_raft_node_id("node-a").unwrap()),
+            Some(&"http://127.0.0.1:18080".to_string())
+        );
+        assert_eq!(
+            peer_urls.get(&agentdb_storage::stable_raft_node_id("node-b").unwrap()),
+            Some(&"http://127.0.0.1:18081".to_string())
+        );
+        assert!(!peer_urls.contains_key(&agentdb_storage::stable_raft_node_id("node-c").unwrap()));
     }
 }

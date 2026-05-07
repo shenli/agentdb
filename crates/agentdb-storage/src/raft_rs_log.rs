@@ -190,6 +190,47 @@ impl ReplicatedLog for RaftRsReplicatedLog {
     }
 }
 
+fn prepare_raft_rs_configs(
+    tablet_id: i64,
+    configs: impl IntoIterator<Item = RaftRsNodeConfig>,
+) -> Result<(Vec<RaftRsNodeConfig>, Vec<u64>, Vec<u64>)> {
+    validate_raft_tablet_id(tablet_id)?;
+    let configs: Vec<_> = configs.into_iter().collect();
+    if configs.is_empty() {
+        return Err(Error::Other(
+            "raft-rs group requires at least one node".into(),
+        ));
+    }
+    let mut seen = BTreeMap::new();
+    for config in &configs {
+        if config.node_id == 0 {
+            return Err(Error::Other("raft-rs node id must be positive".into()));
+        }
+        if seen.insert(config.node_id, ()).is_some() {
+            return Err(Error::Other(format!(
+                "duplicate raft-rs node id {}",
+                config.node_id
+            )));
+        }
+    }
+    let voters: Vec<u64> = configs
+        .iter()
+        .filter(|config| config.role == RaftRsNodeRole::Voter)
+        .map(|config| config.node_id)
+        .collect();
+    let learners: Vec<u64> = configs
+        .iter()
+        .filter(|config| config.role == RaftRsNodeRole::Learner)
+        .map(|config| config.node_id)
+        .collect();
+    if voters.is_empty() {
+        return Err(Error::Other(
+            "raft-rs group requires at least one voter".into(),
+        ));
+    }
+    Ok((configs, voters, learners))
+}
+
 #[derive(Clone)]
 pub struct RaftRsSharedGroup {
     inner: Arc<Mutex<RaftRsGroup>>,
@@ -200,45 +241,8 @@ impl RaftRsSharedGroup {
         tablet_id: i64,
         configs: impl IntoIterator<Item = RaftRsNodeConfig>,
     ) -> Result<(Self, Vec<Arc<RaftRsReplicatedLog>>)> {
-        validate_raft_tablet_id(tablet_id)?;
-        let configs: Vec<_> = configs.into_iter().collect();
-        if configs.is_empty() {
-            return Err(Error::Other(
-                "raft-rs group requires at least one node".into(),
-            ));
-        }
-        let mut seen = BTreeMap::new();
-        for config in &configs {
-            if config.node_id == 0 {
-                return Err(Error::Other("raft-rs node id must be positive".into()));
-            }
-            if seen.insert(config.node_id, ()).is_some() {
-                return Err(Error::Other(format!(
-                    "duplicate raft-rs node id {}",
-                    config.node_id
-                )));
-            }
-        }
-        let voters: Vec<u64> = configs
-            .iter()
-            .filter(|config| config.role == RaftRsNodeRole::Voter)
-            .map(|config| config.node_id)
-            .collect();
-        let learners: Vec<u64> = configs
-            .iter()
-            .filter(|config| config.role == RaftRsNodeRole::Learner)
-            .map(|config| config.node_id)
-            .collect();
-        if voters.is_empty() {
-            return Err(Error::Other(
-                "raft-rs group requires at least one voter".into(),
-            ));
-        }
-        let group = Self {
-            inner: Arc::new(Mutex::new(RaftRsGroup::open(
-                tablet_id, configs, voters, learners,
-            )?)),
-        };
+        let (configs, voters, learners) = prepare_raft_rs_configs(tablet_id, configs)?;
+        let group = Self::open_with_local_configs(tablet_id, configs, voters, learners)?;
         let handles = group
             .inner
             .lock()
@@ -253,6 +257,52 @@ impl RaftRsSharedGroup {
             })
             .collect();
         Ok((group, handles))
+    }
+
+    pub fn open_local(
+        tablet_id: i64,
+        configs: impl IntoIterator<Item = RaftRsNodeConfig>,
+        local_node_id: u64,
+    ) -> Result<(Self, Arc<RaftRsReplicatedLog>)> {
+        if local_node_id == 0 {
+            return Err(Error::Other(
+                "raft-rs local node id must be positive".into(),
+            ));
+        }
+        let (configs, voters, learners) = prepare_raft_rs_configs(tablet_id, configs)?;
+        let Some(local_config) = configs
+            .into_iter()
+            .find(|config| config.node_id == local_node_id)
+        else {
+            return Err(Error::Other(format!(
+                "raft-rs local node {local_node_id} is not a replica of tablet {tablet_id}"
+            )));
+        };
+        let group = Self::open_with_local_configs(tablet_id, vec![local_config], voters, learners)?;
+        let handle = Arc::new(RaftRsReplicatedLog {
+            group: group.clone(),
+            node_id: local_node_id,
+        });
+        Ok((group, handle))
+    }
+
+    fn open_with_local_configs(
+        tablet_id: i64,
+        configs: Vec<RaftRsNodeConfig>,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+    ) -> Result<Self> {
+        validate_raft_tablet_id(tablet_id)?;
+        if configs.is_empty() {
+            return Err(Error::Other(
+                "raft-rs group requires at least one node".into(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(Mutex::new(RaftRsGroup::open(
+                tablet_id, configs, voters, learners,
+            )?)),
+        })
     }
 
     pub fn elect(&self, node_id: u64) -> Result<()> {
@@ -1492,5 +1542,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(transport.snapshots.lock().unwrap().as_slice(), &[snapshot]);
+    }
+
+    #[test]
+    fn raft_rs_open_local_hosts_only_local_node_with_full_conf_state() {
+        let (_dir, configs) = configs(3);
+        let (group, local_log) = RaftRsSharedGroup::open_local(7, configs, 2).unwrap();
+
+        assert_eq!(local_log.node_id(), 2);
+        assert_eq!(group.status().len(), 1);
+        assert_eq!(group.status()[0].node_id, 2);
+
+        let err = group.elect(2).unwrap_err();
+        assert!(err.to_string().contains("did not become leader"));
+        let outbound = group.take_wire_messages();
+        assert!(
+            outbound.iter().any(|message| message.to == 1)
+                && outbound.iter().any(|message| message.to == 3)
+        );
     }
 }
