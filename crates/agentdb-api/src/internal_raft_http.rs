@@ -181,6 +181,16 @@ impl RaftRsHttpOutbox {
         self.client.send_snapshot(&base_url, snapshot).await
     }
 
+    pub async fn send_message_to_peer(
+        &self,
+        message: &RaftRsWireMessage,
+    ) -> Result<(), RaftRsHttpError> {
+        let base_url = self
+            .peer_url(message.to)
+            .ok_or(RaftRsHttpError::MissingPeerUrl)?;
+        self.client.send_message(&base_url, message).await
+    }
+
     fn peer_url(&self, node_id: u64) -> Option<String> {
         self.peer_urls
             .read()

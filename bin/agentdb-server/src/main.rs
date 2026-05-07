@@ -370,7 +370,8 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         outbox.clone(),
                         config.route_refresh_interval_ms,
                     );
-                    agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
+                    spawn_raft_rs_message_outbox_worker(
+                        startup.meta.clone(),
                         registry.clone(),
                         outbox.clone(),
                         Duration::from_millis(raft_outbox_interval_ms),
@@ -1515,6 +1516,67 @@ fn spawn_raft_rs_peer_url_refresher(
     });
 }
 
+fn spawn_raft_rs_message_outbox_worker(
+    meta: agentdb_meta::MetaStore,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    interval: Duration,
+) {
+    let interval = interval.max(Duration::from_millis(100));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = run_raft_rs_message_outbox_tick(&meta, &registry, &outbox).await {
+                tracing::warn!(?error, "failed to run raft-rs message outbox tick");
+            }
+        }
+    });
+}
+
+async fn run_raft_rs_message_outbox_tick(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<usize> {
+    let mut sent = 0usize;
+    for (tablet_id, group) in registry.groups_snapshot() {
+        match flush_raft_rs_group_messages_with_health(meta, tablet_id, &group, outbox).await {
+            Ok(group_sent) => sent += group_sent,
+            Err(error) => {
+                tracing::warn!(tablet_id, ?error, "failed to flush raft-rs group messages");
+            }
+        }
+    }
+    Ok(sent)
+}
+
+async fn flush_raft_rs_group_messages_with_health(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    group: &agentdb_storage::RaftRsSharedGroup,
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<usize> {
+    let messages = group.take_wire_messages();
+    let mut sent = 0usize;
+    for (index, message) in messages.iter().cloned().enumerate() {
+        match outbox.send_message_to_peer(&message).await {
+            Ok(()) => {
+                set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "healthy")
+                    .await?;
+                sent += 1;
+            }
+            Err(error) => {
+                set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "unreachable")
+                    .await?;
+                group.restore_wire_messages(messages[index..].to_vec())?;
+                return Err(anyhow::anyhow!(error));
+            }
+        }
+    }
+    Ok(sent)
+}
+
 fn spawn_raft_rs_snapshot_worker(
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
@@ -1682,6 +1744,48 @@ async fn update_raft_replica_progress_health(
     agentdb_meta::tablet_replicas::set_health(meta.pool(), tablet_id, node_id, health, now_ms)
         .await?;
     Ok(())
+}
+
+async fn set_raft_replica_health_by_raft_node_id(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    raft_node_id: u64,
+    health: &str,
+) -> anyhow::Result<bool> {
+    let Some(node_id) = resolve_raft_replica_node_id(meta, tablet_id, raft_node_id).await? else {
+        tracing::debug!(
+            tablet_id,
+            raft_node_id,
+            health,
+            "skipping raft replica health update; control-plane node not found"
+        );
+        return Ok(false);
+    };
+    let updated = agentdb_meta::tablet_replicas::set_health(
+        meta.pool(),
+        tablet_id,
+        &node_id,
+        health,
+        now_ms_i64(),
+    )
+    .await?;
+    Ok(updated)
+}
+
+async fn resolve_raft_replica_node_id(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    raft_node_id: u64,
+) -> agentdb_meta::MetaResult<Option<String>> {
+    for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
+        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&replica.node_id) else {
+            continue;
+        };
+        if candidate == raft_node_id {
+            return Ok(Some(replica.node_id));
+        }
+    }
+    Ok(None)
 }
 
 fn spawn_raft_rs_registry_refresher(
@@ -2725,6 +2829,49 @@ region = "us-west-2"
         assert_eq!(local.health, "healthy");
         assert!(local.applied_index > 0);
         assert!(local.match_index > 0);
+        let remote = replicas
+            .iter()
+            .find(|replica| replica.node_id == "node-b")
+            .unwrap();
+        assert_eq!(remote.health, "unreachable");
+    }
+
+    #[tokio::test]
+    async fn raft_rs_message_outbox_marks_unreachable_and_restores_messages() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let raft_configs = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap();
+        let node_a = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let node_b = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _log) =
+            agentdb_storage::RaftRsSharedGroup::open_local(7, raft_configs, node_a).unwrap();
+        group
+            .restore_wire_messages(vec![agentdb_storage::RaftRsWireMessage {
+                tablet_id: 7,
+                from: node_a,
+                to: node_b,
+                payload: b"pending-message".to_vec(),
+            }])
+            .unwrap();
+        let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
+
+        let err = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("peer URL is not configured"));
+        assert_eq!(group.take_wire_messages().len(), 1);
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
         let remote = replicas
             .iter()
             .find(|replica| replica.node_id == "node-b")
