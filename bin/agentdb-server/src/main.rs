@@ -31,6 +31,7 @@ const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
+const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
@@ -199,17 +200,34 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
     let route_startup =
         prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
-    let primary_raft_log = route_startup
-        .as_ref()
-        .and_then(|startup| {
-            startup.raft_bootstrap.as_ref().and_then(|bootstrap| {
-                bootstrap
-                    .local_logs
-                    .get(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID)
-            })
+    let runtime_raft_logs: Option<
+        BTreeMap<i64, Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>>,
+    > = route_startup.as_ref().and_then(|startup| {
+        startup.raft_bootstrap.as_ref().and_then(|bootstrap| {
+            if bootstrap.local_logs.is_empty() {
+                None
+            } else {
+                Some(
+                    bootstrap
+                        .local_logs
+                        .iter()
+                        .map(|(tablet_id, log)| {
+                            (
+                                *tablet_id,
+                                log.clone()
+                                    as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                            )
+                        })
+                        .collect(),
+                )
+            }
         })
-        .map(|log| -> Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync> { log.clone() });
-    if matches!(config.deployment_mode, DeploymentMode::Cluster) && primary_raft_log.is_none() {
+    });
+    if matches!(config.deployment_mode, DeploymentMode::Cluster)
+        && !runtime_raft_logs
+            .as_ref()
+            .is_some_and(|logs| logs.contains_key(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID))
+    {
         anyhow::bail!(
             "deployment.mode=cluster requires local node {} to be a voter or learner for runtime primary tablet {}",
             config.route_node_id.as_deref().unwrap_or("<missing-node-id>"),
@@ -243,13 +261,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         };
 
         let (content, content_mirror) = build_content_backend(&config)?;
-        if let Some(log) = primary_raft_log {
+        if let Some(logs) = runtime_raft_logs {
             tracing::info!(
-                tablet_id = agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
-                "opened runtime with raft-rs replicated primary tablet log"
+                tablet_count = logs.len(),
+                "opened runtime with raft-rs replicated tablet logs"
             );
             (
-                agentdb_core::Runtime::with_kv_and_replicated_log(kv, content, log),
+                agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs),
                 content_mirror,
             )
         } else {
@@ -289,11 +307,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
     }
 
-    let mut state =
-        agentdb_api::AppState::new(runtime).with_proxy_policy(agentdb_api::state::ProxyPolicy {
+    let mut state = agentdb_api::AppState::new(runtime.clone()).with_proxy_policy(
+        agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
-        });
+        },
+    );
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror);
     }
@@ -350,9 +369,21 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         config.route_refresh_interval_ms,
                     );
                     agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
-                        registry,
-                        outbox,
+                        registry.clone(),
+                        outbox.clone(),
                         Duration::from_millis(raft_outbox_interval_ms),
+                    );
+                    let raft_snapshot_interval_ms = env_u64(
+                        "AGENTDB_RAFT_SNAPSHOT_INTERVAL_MS",
+                        DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS,
+                    )
+                    .max(1_000);
+                    spawn_raft_rs_snapshot_worker(
+                        startup.meta.clone(),
+                        registry,
+                        runtime.clone(),
+                        outbox,
+                        Duration::from_millis(raft_snapshot_interval_ms),
                     );
                 }
                 tracing::info!(
@@ -1435,6 +1466,79 @@ fn spawn_raft_rs_peer_url_refresher(
             }
         }
     });
+}
+
+fn spawn_raft_rs_snapshot_worker(
+    meta: agentdb_meta::MetaStore,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    runtime: Arc<agentdb_core::Runtime>,
+    outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                run_raft_rs_snapshot_tick(&meta, &registry, runtime.clone(), &outbox).await
+            {
+                tracing::warn!(?error, "failed to run raft-rs snapshot tick");
+            }
+        }
+    });
+}
+
+async fn run_raft_rs_snapshot_tick(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    runtime: Arc<agentdb_core::Runtime>,
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<usize> {
+    let mut sent = 0usize;
+    for (tablet_id, group) in registry.groups_snapshot() {
+        let Some(local_status) = group.status().into_iter().next() else {
+            continue;
+        };
+        let application_snapshot = match runtime.export_tablet_snapshot_payload(tablet_id) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id,
+                    message = %error.message,
+                    "skipping raft-rs snapshot because runtime state export failed"
+                );
+                continue;
+            }
+        };
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                continue;
+            }
+            let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
+            if to == local_status.node_id {
+                continue;
+            }
+            let transfer = group.build_snapshot_transfer(
+                local_status.node_id,
+                to,
+                application_snapshot.clone(),
+            )?;
+            if let Err(error) = outbox.send_snapshot_to_peer(&transfer).await {
+                tracing::warn!(
+                    tablet_id,
+                    from = local_status.node_id,
+                    to,
+                    ?error,
+                    "failed to enqueue raft-rs snapshot to peer"
+                );
+                continue;
+            }
+            sent += 1;
+        }
+    }
+    Ok(sent)
 }
 
 fn spawn_raft_rs_registry_refresher(

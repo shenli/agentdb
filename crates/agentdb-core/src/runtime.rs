@@ -11,9 +11,11 @@
 //! together. With KV this is implemented via `KvStore::write_batch`; with
 //! in-memory it's the state mutex.
 
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::future::Future;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use agentdb_index::doc_id::DocId;
@@ -47,11 +49,15 @@ use crate::segment::{
 use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
-    LoggedTabletStateMachine, TabletCommand, TabletStateMachine, TabletWriteOp,
+    LoggedTabletStateMachine, TabletCommand, TabletStateMachine, TabletStateSnapshot, TabletWriteOp,
 };
 use crate::tenant::{NewTenant, Tenant};
 
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
+
+tokio::task_local! {
+    static CURRENT_RUNTIME_TABLET_ID: i64;
+}
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
@@ -510,6 +516,7 @@ pub struct Runtime {
     /// guards the `&mut self` requirement of the trait surface.
     vector_index: StdMutex<HnswVectorIndex>,
     global_record_index: Arc<dyn GlobalRecordIndex>,
+    tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
 }
 
 #[derive(Clone)]
@@ -541,6 +548,17 @@ impl RuntimeTabletKvStore {
             tablet_id,
         )?);
         Self::new(kv, tablet_id, state_machine)
+    }
+
+    fn logged(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        tablet_id: i64,
+        log: Arc<dyn ReplicatedLog + Send + Sync>,
+    ) -> agentdb_storage::Result<(Self, Arc<LoggedTabletStateMachine>)> {
+        let tablet_store = TabletKvStore::new(kv.clone(), tablet_id)?;
+        let state_machine = Arc::new(LoggedTabletStateMachine::new(tablet_id, log, tablet_store)?);
+        let kv_store = Self::new(kv, tablet_id, state_machine.clone())?;
+        Ok((kv_store, state_machine))
     }
 }
 
@@ -581,6 +599,237 @@ impl KvStore for RuntimeTabletKvStore {
     fn snapshot_owned(self: Arc<Self>) -> agentdb_storage::Result<Arc<dyn KvSnapshot>> {
         self.store.clone().snapshot_owned()
     }
+}
+
+struct RuntimeTabletHandle {
+    kv_store: Arc<RuntimeTabletKvStore>,
+    state_machine: Arc<LoggedTabletStateMachine>,
+}
+
+struct RuntimeTabletRouterKvStore {
+    default_tablet_id: i64,
+    tablets: RwLock<BTreeMap<i64, RuntimeTabletHandle>>,
+}
+
+impl RuntimeTabletRouterKvStore {
+    fn new(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        default_tablet_id: i64,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> agentdb_storage::Result<Self> {
+        if logs.is_empty() {
+            return Err(agentdb_storage::Error::Other(
+                "runtime tablet router requires at least one tablet log".into(),
+            ));
+        }
+        if !logs.contains_key(&default_tablet_id) {
+            return Err(agentdb_storage::Error::Other(format!(
+                "runtime tablet router default tablet {default_tablet_id} is not registered"
+            )));
+        }
+        let mut tablets = BTreeMap::new();
+        for (tablet_id, log) in logs {
+            let (kv_store, state_machine) =
+                RuntimeTabletKvStore::logged(kv.clone(), tablet_id, log)?;
+            tablets.insert(
+                tablet_id,
+                RuntimeTabletHandle {
+                    kv_store: Arc::new(kv_store),
+                    state_machine,
+                },
+            );
+        }
+        Ok(Self {
+            default_tablet_id,
+            tablets: RwLock::new(tablets),
+        })
+    }
+
+    fn current_tablet_id() -> Option<i64> {
+        CURRENT_RUNTIME_TABLET_ID
+            .try_with(|tablet_id| *tablet_id)
+            .ok()
+    }
+
+    fn resolve_tablet_id(&self) -> agentdb_storage::Result<Option<i64>> {
+        let Some(tablet_id) = Self::current_tablet_id() else {
+            return Ok(None);
+        };
+        if self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned")
+            .contains_key(&tablet_id)
+        {
+            Ok(Some(tablet_id))
+        } else {
+            Err(agentdb_storage::Error::Other(format!(
+                "runtime tablet {tablet_id} is not registered on this node"
+            )))
+        }
+    }
+
+    fn with_handle<T>(
+        &self,
+        tablet_id: i64,
+        f: impl FnOnce(&RuntimeTabletHandle) -> agentdb_storage::Result<T>,
+    ) -> agentdb_storage::Result<T> {
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let handle = tablets.get(&tablet_id).ok_or_else(|| {
+            agentdb_storage::Error::Other(format!(
+                "runtime tablet {tablet_id} is not registered on this node"
+            ))
+        })?;
+        f(handle)
+    }
+
+    fn export_snapshot_payload(&self, tablet_id: i64) -> agentdb_storage::Result<Vec<u8>> {
+        self.with_handle(tablet_id, |handle| {
+            let snapshot = handle.state_machine.export_snapshot()?;
+            serde_json::to_vec(&snapshot).map_err(|err| {
+                agentdb_storage::Error::Other(format!(
+                    "encode tablet {tablet_id} runtime snapshot: {err}"
+                ))
+            })
+        })
+    }
+
+    fn install_snapshot_payload(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> agentdb_storage::Result<()> {
+        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|err| {
+            agentdb_storage::Error::Other(format!(
+                "decode tablet {tablet_id} runtime snapshot: {err}"
+            ))
+        })?;
+        self.with_handle(tablet_id, |handle| {
+            handle.state_machine.install_snapshot(&snapshot)
+        })
+    }
+
+    fn compact_log_through(
+        &self,
+        tablet_id: i64,
+        up_to_index: u64,
+    ) -> agentdb_storage::Result<usize> {
+        self.with_handle(tablet_id, |handle| {
+            handle.state_machine.compact_log_through(up_to_index)
+        })
+    }
+}
+
+impl KvStore for RuntimeTabletRouterKvStore {
+    fn get(&self, key: &[u8]) -> agentdb_storage::Result<Option<Vec<u8>>> {
+        if let Some(tablet_id) = self.resolve_tablet_id()? {
+            return self.with_handle(tablet_id, |handle| handle.kv_store.get(key));
+        }
+
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        for handle in tablets.values() {
+            if let Some(value) = handle.kv_store.get(key)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> agentdb_storage::Result<()> {
+        self.write_batch(vec![WriteOp::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }])
+    }
+
+    fn delete(&self, key: &[u8]) -> agentdb_storage::Result<()> {
+        self.write_batch(vec![WriteOp::Delete { key: key.to_vec() }])
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
+        if let Some(tablet_id) = self.resolve_tablet_id()? {
+            return self.with_handle(tablet_id, |handle| handle.kv_store.scan_prefix(prefix));
+        }
+
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut rows = BTreeMap::new();
+        for handle in tablets.values() {
+            for item in handle.kv_store.scan_prefix(prefix)? {
+                let (key, value) = item?;
+                rows.entry(key).or_insert(value);
+            }
+        }
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
+    fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let tablet_id = self.resolve_tablet_id()?.unwrap_or(self.default_tablet_id);
+        self.with_handle(tablet_id, |handle| handle.kv_store.write_batch(ops))
+    }
+
+    fn snapshot<'a>(&'a self) -> agentdb_storage::Result<Box<dyn KvSnapshot + 'a>> {
+        Ok(Box::new(RuntimeTabletRouterSnapshot {
+            rows: collect_kv_rows(self, b"")?,
+        }))
+    }
+
+    fn snapshot_owned(self: Arc<Self>) -> agentdb_storage::Result<Arc<dyn KvSnapshot>> {
+        Ok(Arc::new(RuntimeTabletRouterSnapshot {
+            rows: collect_kv_rows(self.as_ref(), b"")?,
+        }))
+    }
+
+    fn checkpoint(&self, out_dir: &std::path::Path) -> agentdb_storage::Result<()> {
+        let _ = out_dir;
+        Err(agentdb_storage::Error::Other(
+            "checkpoint is not supported by the runtime tablet router".into(),
+        ))
+    }
+}
+
+struct RuntimeTabletRouterSnapshot {
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl KvSnapshot for RuntimeTabletRouterSnapshot {
+    fn get(&self, key: &[u8]) -> agentdb_storage::Result<Option<Vec<u8>>> {
+        Ok(self.rows.get(key).cloned())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
+        let prefix = prefix.to_vec();
+        let rows: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect();
+        Ok(Box::new(rows.into_iter()))
+    }
+}
+
+fn collect_kv_rows(
+    kv: &dyn KvStore,
+    prefix: &[u8],
+) -> agentdb_storage::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut rows = BTreeMap::new();
+    for item in kv.scan_prefix(prefix)? {
+        let (key, value) = item?;
+        rows.insert(key, value);
+    }
+    Ok(rows)
 }
 
 impl Runtime {
@@ -843,6 +1092,7 @@ impl Runtime {
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
             global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
+            tablet_router: None,
         })
     }
 
@@ -857,6 +1107,7 @@ impl Runtime {
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
             global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
+            tablet_router: None,
         })
     }
 
@@ -874,6 +1125,7 @@ impl Runtime {
             text_index: StdMutex::new(InMemoryInverted::new()),
             vector_index: StdMutex::new(HnswVectorIndex::new()),
             global_record_index: Arc::new(InMemoryGlobalRecordIndex::default()),
+            tablet_router: None,
         })
     }
 
@@ -933,13 +1185,29 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> Arc<Self> {
-        Self::with_kv_kms_content_metadata_and_replicated_log(
+        let logs = BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]);
+        Self::with_kv_kms_content_metadata_and_replicated_logs(
             kv,
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
-            log,
+            logs,
+        )
+    }
+
+    pub fn with_kv_and_replicated_logs(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_logs(
+            kv,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            Arc::new(IdentityMetadataCryptoAdapter),
+            logs,
         )
     }
 
@@ -951,18 +1219,37 @@ impl Runtime {
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> Arc<Self> {
-        let tablet_store = TabletKvStore::new(kv.clone(), RUNTIME_PRIMARY_TABLET_ID)
-            .expect("open runtime tablet store");
-        let state_machine = Arc::new(
-            LoggedTabletStateMachine::new(RUNTIME_PRIMARY_TABLET_ID, log, tablet_store)
-                .expect("open runtime tablet state machine"),
+        let logs = BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]);
+        Self::with_kv_kms_content_metadata_and_replicated_logs(
+            kv,
+            content,
+            kms,
+            content_crypto,
+            metadata_crypto,
+            logs,
+        )
+    }
+
+    pub fn with_kv_kms_content_metadata_and_replicated_logs(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+                .expect("open runtime tablet router"),
         );
-        let runtime_kv = Arc::new(
-            RuntimeTabletKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, state_machine)
-                .expect("open runtime tablet state"),
-        );
-        let persist = Persist::with_metadata_crypto(runtime_kv, metadata_crypto);
-        Self::from_persist(persist, content, kms, content_crypto)
+        let persist = Persist::with_metadata_crypto(tablet_router.clone(), metadata_crypto);
+        Self::from_persist_with_tablet_router(
+            persist,
+            content,
+            kms,
+            content_crypto,
+            Some(tablet_router),
+        )
     }
 
     pub fn with_kv_kms_content_and_metadata_crypto(
@@ -977,14 +1264,15 @@ impl Runtime {
                 .expect("open runtime tablet state"),
         );
         let persist = Persist::with_metadata_crypto(runtime_kv, metadata_crypto);
-        Self::from_persist(persist, content, kms, content_crypto)
+        Self::from_persist_with_tablet_router(persist, content, kms, content_crypto, None)
     }
 
-    fn from_persist(
+    fn from_persist_with_tablet_router(
         persist: Persist,
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
         content_crypto: Arc<dyn ContentCryptoAdapter>,
+        tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
     ) -> Arc<Self> {
         let mut state = State::default();
         for t in persist.scan_all_tenants().expect("hydrate tenants") {
@@ -1135,7 +1423,47 @@ impl Runtime {
             text_index: StdMutex::new(text_idx),
             vector_index: StdMutex::new(vector_idx),
             global_record_index,
+            tablet_router,
         })
+    }
+
+    pub async fn with_tablet_context<F, T>(&self, tablet_id: i64, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future).await
+    }
+
+    pub fn export_tablet_snapshot_payload(&self, tablet_id: i64) -> Result<Vec<u8>> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "runtime tablet snapshots require a replicated tablet router",
+            ));
+        };
+        router.export_snapshot_payload(tablet_id).map_err(internal)
+    }
+
+    pub fn install_tablet_snapshot_payload(&self, tablet_id: i64, payload: &[u8]) -> Result<bool> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(false);
+        };
+        router
+            .install_snapshot_payload(tablet_id, payload)
+            .map_err(internal)?;
+        Ok(true)
+    }
+
+    pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "runtime tablet log compaction requires a replicated tablet router",
+            ));
+        };
+        router
+            .compact_log_through(tablet_id, up_to_index)
+            .map_err(internal)
     }
 
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {

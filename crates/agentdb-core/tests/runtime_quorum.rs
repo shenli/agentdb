@@ -7,7 +7,7 @@ use agentdb_core::RUNTIME_PRIMARY_TABLET_ID;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
-    RaftRsNodeRole, RaftRsSharedGroup, RocksKvStore,
+    RaftRsNodeRole, RaftRsSharedGroup, ReplicatedLog, RocksKvStore, SingleNodeReplicatedLog,
 };
 use tempfile::TempDir;
 
@@ -217,4 +217,64 @@ async fn runtime_persisted_write_fails_without_raft_quorum() {
         .unwrap_err();
 
     assert!(err.message.contains("raft quorum not reached"));
+}
+
+#[tokio::test]
+async fn runtime_tablet_context_routes_writes_and_snapshots_by_tablet() {
+    let source_dir = TempDir::new().unwrap();
+    let source_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+    let source_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_runtime = Runtime::with_kv_and_replicated_logs(
+        source_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, source_primary_log),
+            (7, source_tablet_log),
+        ]),
+    );
+
+    let create_runtime = source_runtime.clone();
+    let tenant = source_runtime
+        .with_tablet_context(7, async move {
+            create_runtime
+                .create_tenant(NewTenant {
+                    external_key: "tablet-seven-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    let payload = source_runtime.export_tablet_snapshot_payload(7).unwrap();
+
+    let target_dir = TempDir::new().unwrap();
+    let target_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+    let target_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_logs = BTreeMap::from([
+        (RUNTIME_PRIMARY_TABLET_ID, target_primary_log),
+        (7, target_tablet_log),
+    ]);
+    let target_runtime =
+        Runtime::with_kv_and_replicated_logs(target_kv.clone(), content(), target_logs.clone());
+    assert!(target_runtime
+        .install_tablet_snapshot_payload(7, &payload)
+        .unwrap());
+
+    let restarted_runtime = Runtime::with_kv_and_replicated_logs(target_kv, content(), target_logs);
+    let read_runtime = restarted_runtime.clone();
+    let hydrated = restarted_runtime
+        .with_tablet_context(7, async move {
+            read_runtime.get_tenant(&tenant.tenant_id).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(hydrated.external_key, "tablet-seven-tenant");
 }
