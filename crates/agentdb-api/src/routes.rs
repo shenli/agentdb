@@ -130,7 +130,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/admin/raft", get(get_raft_status))
         .route("/api/admin/indexes/records", get(get_record_index_status))
+        .route("/api/admin/content-mirror", get(get_content_mirror_status))
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -506,6 +508,38 @@ struct ClusterReadinessResponse {
     ready: bool,
     stale_threshold_ms: i64,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContentMirrorStatusResponse {
+    enabled: bool,
+    queued: u64,
+    completed: u64,
+    failed: u64,
+    backlog: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftStatusResponse {
+    enabled: bool,
+    tablet_count: usize,
+    tablets: Vec<RaftTabletStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftTabletStatus {
+    tablet_id: i64,
+    replicas: Vec<RaftReplicaStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftReplicaStatus {
+    node_id: u64,
+    role: String,
+    leader_id: u64,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1453,6 +1487,60 @@ async fn get_fleet_storage_summary(
     State(s): State<AppState>,
 ) -> Json<agentdb_core::FleetStorageSummary> {
     Json(s.runtime.fleet_storage_summary().await)
+}
+
+async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMirrorStatusResponse> {
+    let Some(mirror) = s.content_mirror.as_ref() else {
+        return Json(ContentMirrorStatusResponse {
+            enabled: false,
+            queued: 0,
+            completed: 0,
+            failed: 0,
+            backlog: 0,
+        });
+    };
+    let stats = mirror.stats();
+    Json(ContentMirrorStatusResponse {
+        enabled: true,
+        queued: stats.queued,
+        completed: stats.completed,
+        failed: stats.failed,
+        backlog: stats.backlog,
+    })
+}
+
+async fn get_raft_status(State(s): State<AppState>) -> Json<RaftStatusResponse> {
+    let Some(registry) = s.raft_registry.as_ref() else {
+        return Json(RaftStatusResponse {
+            enabled: false,
+            tablet_count: 0,
+            tablets: Vec::new(),
+        });
+    };
+    let tablets: Vec<_> = registry
+        .groups_snapshot()
+        .into_iter()
+        .map(|(tablet_id, group)| RaftTabletStatus {
+            tablet_id,
+            replicas: group
+                .status()
+                .into_iter()
+                .map(|status| RaftReplicaStatus {
+                    node_id: status.node_id,
+                    role: status.role,
+                    leader_id: status.leader_id,
+                    term: status.term,
+                    commit_index: status.commit_index,
+                    applied_index: status.applied_index,
+                })
+                .collect(),
+        })
+        .collect();
+    Json(RaftStatusResponse {
+        enabled: true,
+        tablet_count: tablets.len(),
+        tablets,
+    })
 }
 
 fn build_cluster_health(

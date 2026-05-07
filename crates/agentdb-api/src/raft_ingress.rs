@@ -50,6 +50,15 @@ impl RaftRsGroupRegistry {
             .len()
     }
 
+    pub fn tablet_ids(&self) -> Vec<i64> {
+        self.groups
+            .read()
+            .expect("raft-rs registry lock poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn groups_snapshot(&self) -> Vec<(i64, RaftRsSharedGroup)> {
         self.groups
             .read()

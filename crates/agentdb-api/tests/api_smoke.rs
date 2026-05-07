@@ -21,8 +21,9 @@ use agentdb_api::{
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
 use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
 use agentdb_storage::{
-    RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup,
-    RaftRsSnapshotTransfer, RaftRsWireMessage, ReplicatedLog,
+    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
+    RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
+    RaftRsWireMessage, ReplicatedLog,
 };
 use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
@@ -595,6 +596,109 @@ async fn admin_routing_status_reports_disabled_mode() {
     assert_eq!(body["mode"], "disabled");
     assert_eq!(body["local_node_id"], "single-node");
     assert!(body.get("snapshot").is_none());
+}
+
+#[tokio::test]
+async fn admin_content_mirror_reports_disabled_mode() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/content-mirror", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["backlog"], 0);
+}
+
+#[tokio::test]
+async fn admin_content_mirror_reports_async_backlog_stats() {
+    let primary = Arc::new(InMemoryContentBackend::default());
+    let mirror = Arc::new(InMemoryContentBackend::default());
+    let content_mirror = Arc::new(AsyncMirrorContentBackend::new(primary, mirror, 8));
+    content_mirror
+        .put("ten_a", "art_x", b"bytes")
+        .await
+        .unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_content_mirror(content_mirror.clone());
+    let app = spawn_app_with_state(state).await;
+
+    for _ in 0..100 {
+        if content_mirror.stats().completed >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/content-mirror", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["queued"], 1);
+    assert_eq!(body["completed"], 1);
+    assert_eq!(body["failed"], 0);
+    assert_eq!(body["backlog"], 0);
+}
+
+#[tokio::test]
+async fn admin_raft_status_reports_disabled_mode() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["tablet_count"], 0);
+}
+
+#[tokio::test]
+async fn admin_raft_status_reports_registered_tablets() {
+    let (_dir, group, _logs) = test_raft_group();
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group).unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_raft_registry(registry);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["tablet_count"], 1);
+    assert_eq!(body["tablets"][0]["tablet_id"], 7);
+    assert_eq!(body["tablets"][0]["replicas"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]

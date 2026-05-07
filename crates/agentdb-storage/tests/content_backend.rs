@@ -268,6 +268,20 @@ async fn async_mirror_retries_transient_upload_failures() {
     assert_eq!(stats.backlog, 0);
 }
 
+#[tokio::test]
+async fn async_mirror_reads_through_from_mirror_and_backfills_primary() {
+    let primary = in_memory();
+    let mirror = in_memory();
+    mirror.put("ten_a", "art_x", b"from mirror").await.unwrap();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror, 8);
+
+    let bytes = backend.get("ten_a", "art_x").await.unwrap();
+
+    assert_eq!(bytes, b"from mirror");
+    assert_eq!(primary.get("ten_a", "art_x").await.unwrap(), b"from mirror");
+    assert!(backend.head("ten_a", "art_x").await.unwrap());
+}
+
 async fn wait_for_mirror(backend: &AsyncMirrorContentBackend, completed: u64) {
     for _ in 0..50 {
         let stats = backend.stats();

@@ -246,7 +246,7 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
 | Runtime data | Persisted runtime state is stored through `TabletKvStore` under the primary runtime tablet namespace | Tablet-local applied state stores per routed tablet |
-| Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; `RaftRsTransport` is the production message boundary, while external RPC wiring is still pending | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
+| Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; token-protected internal HTTP Raft message/snapshot RPC and retrying outbox workers are wired | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
 | Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
 | Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
@@ -953,7 +953,8 @@ single-session appends or record writes.
    startup now bootstraps local `raft-rs` tablet groups from
    `tablet_replicas`, opens only the local node's raft-engine state while
    retaining the full voter/learner ConfState, loads peer URLs from `nodes`,
-   and refreshes those URLs periodically and on control-plane change hints.
+   refreshes those URLs periodically and on control-plane change hints, and
+   periodically re-syncs the local registry as `tablet_replicas` changes.
    Cluster-mode server startup injects the local `raft-rs` log for the current
    runtime primary tablet into `Runtime::with_kv_and_replicated_log`, so the
    hot metadata/event write path acknowledges only after Raft commit. The local
@@ -1023,9 +1024,11 @@ single-session appends or record writes.
 
    Current implementation status: `AsyncMirrorContentBackend` can stage content
    in a primary backend and mirror it to another backend asynchronously, with
-   bounded retry and queued/completed/failed/backlog counters. Runtime
-   configuration still needs to wire local-durable primary plus object-store
-   mirror for production deployments.
+   bounded retry and queued/completed/failed/backlog counters. It also reads
+   through from the mirror and backfills the local primary when local content is
+   missing. Cluster-mode server configuration now wires LocalFs as the durable
+   synchronous primary and object storage as the async mirror, so hot writes do
+   not wait for S3/object-store upload.
 
 14. Expose operational signals.
 
@@ -1036,8 +1039,10 @@ single-session appends or record writes.
     Current implementation status: admin surfaces expose tablet placement and
     lifecycle metadata, tenant placement policies, and tablet range-map
     replacement for operator-controlled split/merge cutovers. Runtime metrics
-    for Raft lag, compaction debt, snapshot age, and object-store backlog still
-    need the underlying workers.
+    for object-store mirror backlog are exposed through
+    `/api/admin/content-mirror`; live local Raft tablet/replica commit and
+    applied indexes are exposed through `/api/admin/raft`. Compaction debt and
+    snapshot age still need the underlying workers.
 
 ## Non-Goals
 

@@ -116,6 +116,7 @@ enum MirrorJob {
 /// job is queued.
 pub struct AsyncMirrorContentBackend {
     primary: Arc<dyn ContentBackend>,
+    mirror: Arc<dyn ContentBackend>,
     sender: mpsc::Sender<MirrorJob>,
     counters: Arc<AsyncMirrorCounters>,
 }
@@ -140,10 +141,11 @@ impl AsyncMirrorContentBackend {
         let (sender, mut receiver) = mpsc::channel::<MirrorJob>(capacity);
         let counters = Arc::new(AsyncMirrorCounters::default());
         let worker_counters = counters.clone();
+        let worker_mirror = mirror.clone();
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
                 let result =
-                    execute_mirror_job_with_retry(mirror.as_ref(), &job, max_attempts).await;
+                    execute_mirror_job_with_retry(worker_mirror.as_ref(), &job, max_attempts).await;
                 worker_counters.backlog.fetch_sub(1, Ordering::Relaxed);
                 match result {
                     Ok(()) => {
@@ -158,6 +160,7 @@ impl AsyncMirrorContentBackend {
         });
         Self {
             primary,
+            mirror,
             sender,
             counters,
         }
@@ -241,11 +244,29 @@ impl ContentBackend for AsyncMirrorContentBackend {
     }
 
     async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
-        self.primary.get(tenant_id, artifact_id).await
+        match self.primary.get(tenant_id, artifact_id).await {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let bytes = self.mirror.get(tenant_id, artifact_id).await?;
+                if let Err(backfill_err) = self.primary.put(tenant_id, artifact_id, &bytes).await {
+                    tracing::warn!(
+                        ?backfill_err,
+                        tenant_id,
+                        artifact_id,
+                        "async content mirror read-through backfill failed"
+                    );
+                }
+                Ok(bytes)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn head(&self, tenant_id: &str, artifact_id: &str) -> io::Result<bool> {
-        self.primary.head(tenant_id, artifact_id).await
+        if self.primary.head(tenant_id, artifact_id).await? {
+            return Ok(true);
+        }
+        self.mirror.head(tenant_id, artifact_id).await
     }
 
     async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {

@@ -10,8 +10,9 @@ use std::sync::{
 
 use agentdb_core::Runtime;
 use agentdb_meta::MetaStore;
-use agentdb_storage::{RaftRsSnapshotTransfer, RaftRsWireMessage};
+use agentdb_storage::{AsyncMirrorContentBackend, RaftRsSnapshotTransfer, RaftRsWireMessage};
 
+use crate::raft_ingress::RaftRsGroupRegistry;
 use crate::routing_http::RouteRuntime;
 
 pub trait RaftRsIngress: Send + Sync {
@@ -172,9 +173,11 @@ pub struct AppState {
     pub meta: Option<MetaStore>,
     pub routing: RouteRuntime,
     pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
+    pub raft_registry: Option<Arc<RaftRsGroupRegistry>>,
     pub internal_auth_token: Option<Arc<str>>,
     pub drain: DrainState,
     pub scheduler: Option<SchedulerStatus>,
+    pub content_mirror: Option<Arc<AsyncMirrorContentBackend>>,
     pub proxy: reqwest::Client,
     pub proxy_policy: ProxyPolicy,
 }
@@ -186,9 +189,11 @@ impl AppState {
             meta: None,
             routing: RouteRuntime::disabled(),
             raft_ingress: None,
+            raft_registry: None,
             internal_auth_token: None,
             drain: DrainState::new("single-node"),
             scheduler: None,
+            content_mirror: None,
             proxy: reqwest::Client::new(),
             proxy_policy: ProxyPolicy::default(),
         }
@@ -210,6 +215,12 @@ impl AppState {
         self
     }
 
+    pub fn with_raft_registry(mut self, registry: Arc<RaftRsGroupRegistry>) -> Self {
+        self.raft_ingress = Some(registry.clone());
+        self.raft_registry = Some(registry);
+        self
+    }
+
     pub fn with_internal_auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
         self.internal_auth_token = Some(token.into());
         self
@@ -217,6 +228,11 @@ impl AppState {
 
     pub fn with_scheduler(mut self, scheduler: SchedulerStatus) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_content_mirror(mut self, content_mirror: Arc<AsyncMirrorContentBackend>) -> Self {
+        self.content_mirror = Some(content_mirror);
         self
     }
 

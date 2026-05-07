@@ -31,6 +31,7 @@ const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
+const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -215,9 +216,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             agentdb_core::RUNTIME_PRIMARY_TABLET_ID
         );
     }
-    let runtime = if config.in_memory {
+    let (runtime, content_mirror) = if config.in_memory {
         tracing::info!("using in-memory runtime (state lost on shutdown)");
-        agentdb_core::Runtime::in_memory()
+        (agentdb_core::Runtime::in_memory(), None)
     } else {
         let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = match config.kv_backend {
             KvBackendKind::RocksDb => {
@@ -241,35 +242,18 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             }
         };
 
-        let content: Arc<dyn agentdb_storage::ContentBackend> = match config.content_backend {
-            ContentBackendKind::LocalFs => {
-                let content_dir = config.content_dir.clone();
-                std::fs::create_dir_all(&content_dir)?;
-                tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
-                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir))
-            }
-            ContentBackendKind::ObjectStore => {
-                let object_store = build_object_store(
-                    config
-                        .object_store
-                        .as_ref()
-                        .expect("object-store content backend requires object store config"),
-                )?;
-                tracing::info!(prefix = %OBJECT_STORE_CONTENT_PREFIX, "opened object-store artifact content backend");
-                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
-                    object_store,
-                    OBJECT_STORE_CONTENT_PREFIX,
-                ))
-            }
-        };
+        let (content, content_mirror) = build_content_backend(&config)?;
         if let Some(log) = primary_raft_log {
             tracing::info!(
                 tablet_id = agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
                 "opened runtime with raft-rs replicated primary tablet log"
             );
-            agentdb_core::Runtime::with_kv_and_replicated_log(kv, content, log)
+            (
+                agentdb_core::Runtime::with_kv_and_replicated_log(kv, content, log),
+                content_mirror,
+            )
         } else {
-            agentdb_core::Runtime::with_kv(kv, content)
+            (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
         }
     };
 
@@ -310,10 +294,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         });
+    if let Some(content_mirror) = content_mirror {
+        state = state.with_content_mirror(content_mirror);
+    }
     if let Some(token) = config.internal_auth_token.clone() {
         state = state.with_internal_auth_token(token);
         if let Some(registry) = raft_registry.clone() {
-            state = state.with_raft_ingress(registry);
+            state = state.with_raft_registry(registry);
         }
     }
     if let Some(startup) = route_startup {
@@ -342,19 +329,26 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     .expect("raft registry requires internal auth token");
                 let outbox =
                     agentdb_api::internal_raft_http::RaftRsHttpOutbox::new(internal_auth_token);
-                refresh_raft_rs_peer_urls(&startup.meta, &bootstrap.tablet_ids, &outbox).await?;
-                spawn_raft_rs_peer_url_refresher(
-                    startup.meta.clone(),
-                    bootstrap.tablet_ids.clone(),
-                    outbox.clone(),
-                    config.route_refresh_interval_ms,
-                );
                 let raft_outbox_interval_ms = env_u64(
                     "AGENTDB_RAFT_OUTBOX_INTERVAL_MS",
                     DEFAULT_RAFT_OUTBOX_INTERVAL_MS,
                 )
                 .max(100);
                 if let Some(registry) = raft_registry.clone() {
+                    refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
+                    spawn_raft_rs_registry_refresher(
+                        startup.meta.clone(),
+                        startup.node_id.clone(),
+                        config.data_dir.join("raft-engine"),
+                        registry.clone(),
+                        config.route_refresh_interval_ms,
+                    );
+                    spawn_raft_rs_peer_url_refresher(
+                        startup.meta.clone(),
+                        registry.clone(),
+                        outbox.clone(),
+                        config.route_refresh_interval_ms,
+                    );
                     agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
                         registry,
                         outbox,
@@ -364,6 +358,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 tracing::info!(
                     node_id = %startup.node_id,
                     tablet_count = bootstrap.tablet_ids.len(),
+                    bootstrapped_tablet_count = bootstrap.bootstrapped_tablet_ids.len(),
                     outbox_interval_ms = raft_outbox_interval_ms,
                     "bootstrapped raft-rs tablet groups"
                 );
@@ -424,6 +419,7 @@ struct RouteStartup {
 
 struct RaftRsRegistryBootstrap {
     tablet_ids: Vec<i64>,
+    bootstrapped_tablet_ids: Vec<i64>,
     local_logs: BTreeMap<i64, Arc<agentdb_storage::RaftRsReplicatedLog>>,
 }
 
@@ -857,6 +853,77 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
+fn build_content_backend(
+    config: &ResolvedServeConfig,
+) -> anyhow::Result<(
+    Arc<dyn agentdb_storage::ContentBackend>,
+    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
+)> {
+    match config.content_backend {
+        ContentBackendKind::LocalFs => {
+            let content_dir = config.content_dir.clone();
+            std::fs::create_dir_all(&content_dir)?;
+            tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
+            Ok((
+                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir)),
+                None,
+            ))
+        }
+        ContentBackendKind::ObjectStore
+            if matches!(config.deployment_mode, DeploymentMode::Cluster) =>
+        {
+            let content_dir = config.content_dir.clone();
+            std::fs::create_dir_all(&content_dir)?;
+            let primary: Arc<dyn agentdb_storage::ContentBackend> =
+                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
+            let object_store = build_object_store(
+                config
+                    .object_store
+                    .as_ref()
+                    .expect("object-store content backend requires object store config"),
+            )?;
+            let mirror: Arc<dyn agentdb_storage::ContentBackend> =
+                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
+                    object_store,
+                    OBJECT_STORE_CONTENT_PREFIX,
+                ));
+            let queue_capacity = env_usize(
+                "AGENTDB_CONTENT_MIRROR_QUEUE_CAPACITY",
+                DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
+            )
+            .max(1);
+            let backend = Arc::new(agentdb_storage::AsyncMirrorContentBackend::new(
+                primary,
+                mirror,
+                queue_capacity,
+            ));
+            tracing::info!(
+                primary_path = %content_dir.display(),
+                mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
+                queue_capacity,
+                "opened async mirrored artifact content backend"
+            );
+            Ok((backend.clone(), Some(backend)))
+        }
+        ContentBackendKind::ObjectStore => {
+            let object_store = build_object_store(
+                config
+                    .object_store
+                    .as_ref()
+                    .expect("object-store content backend requires object store config"),
+            )?;
+            tracing::info!(prefix = %OBJECT_STORE_CONTENT_PREFIX, "opened object-store artifact content backend");
+            Ok((
+                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
+                    object_store,
+                    OBJECT_STORE_CONTENT_PREFIX,
+                )),
+                None,
+            ))
+        }
+    }
+}
+
 fn validate_storage_backend_config(
     deployment_mode: DeploymentMode,
     kv_backend: KvBackendKind,
@@ -1199,7 +1266,7 @@ async fn prepare_route_startup(
     let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
     let raft_bootstrap = if let Some(registry) = raft_registry {
         let raft_engine_root = config.data_dir.join("raft-engine");
-        Some(bootstrap_raft_rs_registry(&meta, node_id, &raft_engine_root, registry).await?)
+        Some(sync_raft_rs_registry(&meta, node_id, &raft_engine_root, registry).await?)
     } else {
         None
     };
@@ -1238,7 +1305,7 @@ async fn load_raft_rs_node_configs(
     Ok(configs)
 }
 
-async fn bootstrap_raft_rs_registry(
+async fn sync_raft_rs_registry(
     meta: &agentdb_meta::MetaStore,
     local_node_id: &str,
     raft_engine_root: &std::path::Path,
@@ -1255,7 +1322,16 @@ async fn bootstrap_raft_rs_registry(
         .collect();
     let mut bootstrapped = Vec::new();
     let mut local_logs = BTreeMap::new();
-    for tablet_id in local_tablet_ids {
+    for tablet_id in registry.tablet_ids() {
+        if !local_tablet_ids.contains(&tablet_id) {
+            registry.unregister(tablet_id);
+        }
+    }
+    let registered: BTreeSet<_> = registry.tablet_ids().into_iter().collect();
+    for tablet_id in local_tablet_ids.iter().copied() {
+        if registered.contains(&tablet_id) {
+            continue;
+        }
         let configs = load_raft_rs_node_configs(meta, tablet_id, raft_engine_root).await?;
         let (group, local_log) =
             agentdb_storage::RaftRsSharedGroup::open_local(tablet_id, configs, local_raft_node_id)?;
@@ -1264,7 +1340,8 @@ async fn bootstrap_raft_rs_registry(
         local_logs.insert(tablet_id, local_log);
     }
     Ok(RaftRsRegistryBootstrap {
-        tablet_ids: bootstrapped,
+        tablet_ids: local_tablet_ids.into_iter().collect(),
+        bootstrapped_tablet_ids: bootstrapped,
         local_logs,
     })
 }
@@ -1304,17 +1381,17 @@ async fn load_raft_rs_peer_urls(
 
 async fn refresh_raft_rs_peer_urls(
     meta: &agentdb_meta::MetaStore,
-    tablet_ids: &[i64],
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
 ) -> anyhow::Result<()> {
-    let peer_urls = load_raft_rs_peer_urls(meta, tablet_ids.iter().copied()).await?;
+    let peer_urls = load_raft_rs_peer_urls(meta, registry.tablet_ids()).await?;
     outbox.replace_peer_urls(peer_urls);
     Ok(())
 }
 
 fn spawn_raft_rs_peer_url_refresher(
     meta: agentdb_meta::MetaStore,
-    tablet_ids: Vec<i64>,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     refresh_interval_ms: u64,
 ) {
@@ -1331,7 +1408,7 @@ fn spawn_raft_rs_peer_url_refresher(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(error) = refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await {
+                    if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
                         tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
                     }
                 }
@@ -1339,7 +1416,7 @@ fn spawn_raft_rs_peer_url_refresher(
                     match change {
                         Some(change) => {
                             tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs peer metadata change received");
-                            if let Err(error) = refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await {
+                            if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
                                 tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
                             }
                         }
@@ -1351,6 +1428,49 @@ fn spawn_raft_rs_peer_url_refresher(
                                     agentdb_meta::change_notifier::Channel::Nodes,
                                     agentdb_meta::change_notifier::Channel::Tablets,
                                 ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_raft_rs_registry_refresher(
+    meta: agentdb_meta::MetaStore,
+    local_node_id: String,
+    raft_engine_root: PathBuf,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    refresh_interval_ms: u64,
+) {
+    let refresh_interval_ms = refresh_interval_ms.max(100);
+    let mut changes = agentdb_meta::change_notifier::subscribe(
+        &meta,
+        &[agentdb_meta::change_notifier::Channel::Tablets],
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                        tracing::warn!(?error, "failed to sync raft-rs registry");
+                    }
+                }
+                change = changes.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs replica metadata change received");
+                            if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                                tracing::warn!(?error, "failed to sync raft-rs registry");
+                            }
+                        }
+                        None => {
+                            tracing::warn!("raft-rs registry metadata change stream closed; continuing with periodic refresh");
+                            changes = agentdb_meta::change_notifier::subscribe(
+                                &meta,
+                                &[agentdb_meta::change_notifier::Channel::Tablets],
                             );
                         }
                     }
@@ -2178,11 +2298,12 @@ region = "us-west-2"
             .unwrap();
 
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        let bootstrap = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
             .await
             .unwrap();
 
         assert_eq!(bootstrap.tablet_ids, vec![7]);
+        assert_eq!(bootstrap.bootstrapped_tablet_ids, vec![7]);
         assert!(bootstrap.local_logs.contains_key(&7));
         assert_eq!(registry.tablet_count(), 1);
         let groups = registry.groups_snapshot();
@@ -2205,13 +2326,41 @@ region = "us-west-2"
             .unwrap();
 
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        let bootstrap = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
             .await
             .unwrap();
 
         assert!(bootstrap.tablet_ids.is_empty());
+        assert!(bootstrap.bootstrapped_tablet_ids.is_empty());
         assert!(bootstrap.local_logs.is_empty());
         assert_eq!(registry.tablet_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_sync_unregisters_removed_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+        assert_eq!(registry.tablet_ids(), vec![7]);
+
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 200)
+            .await
+            .unwrap();
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert!(bootstrap.tablet_ids.is_empty());
+        assert!(registry.tablet_ids().is_empty());
     }
 
     #[tokio::test]
@@ -2262,5 +2411,39 @@ region = "us-west-2"
             Some(&"http://127.0.0.1:18081".to_string())
         );
         assert!(!peer_urls.contains_key(&agentdb_storage::stable_raft_node_id("node-c").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cluster_object_store_content_uses_async_local_primary_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ResolvedServeConfig::from_serve_opts(base_opts()).unwrap();
+        config.deployment_mode = DeploymentMode::Cluster;
+        config.content_backend = ContentBackendKind::ObjectStore;
+        config.content_dir = dir.path().join("content-primary");
+        config.object_store = Some(ResolvedObjectStoreConfig {
+            backend: ObjectStoreBackendKind::LocalFs,
+            local_root: Some(dir.path().join("content-mirror")),
+            bucket: None,
+            region: None,
+            endpoint: None,
+            allow_http: false,
+        });
+
+        let (content, mirror) = build_content_backend(&config).unwrap();
+        content.put("ten_a", "art_x", b"hello").await.unwrap();
+
+        let mirror = mirror.expect("cluster object-store content should be mirrored");
+        for _ in 0..100 {
+            if mirror.stats().completed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stats = mirror.stats();
+        assert_eq!(stats.queued, 1);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.backlog, 0);
+        assert_eq!(content.get("ten_a", "art_x").await.unwrap(), b"hello");
     }
 }
