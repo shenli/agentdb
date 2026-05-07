@@ -199,6 +199,10 @@ enum TabletsCommand {
         placement_scope_id: Option<String>,
         #[arg(long)]
         map_epoch: i64,
+        #[arg(long)]
+        min_applied_index: Option<i64>,
+        #[arg(long)]
+        allow_unready: bool,
     },
     /// Prepare a fenced tablet merge workflow.
     PrepareMerge {
@@ -217,6 +221,17 @@ enum TabletsCommand {
         placement_scope_id: Option<String>,
         #[arg(long)]
         map_epoch: i64,
+        #[arg(long)]
+        min_applied_index: Option<i64>,
+        #[arg(long)]
+        allow_unready: bool,
+    },
+    /// List split/merge state movement work.
+    Movements {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
     },
     /// Run the rebalance policy.
     Rebalance {
@@ -626,13 +641,17 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             child_ranges,
             placement_scope_id,
             map_epoch,
+            min_applied_index,
+            allow_unready,
         } => {
             api.post(
                 &format!("/api/admin/tablets/{tablet_id}/split/complete"),
                 json!({
                     "placement_scope_id": placement_scope_id,
                     "child_ranges": parse_tablet_ranges(&child_ranges)?,
-                    "map_epoch": map_epoch
+                    "map_epoch": map_epoch,
+                    "min_applied_index": min_applied_index,
+                    "require_ready": !allow_unready
                 }),
             )
             .await
@@ -657,6 +676,8 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             destination_tablet_id,
             placement_scope_id,
             map_epoch,
+            min_applied_index,
+            allow_unready,
         } => {
             api.post(
                 "/api/admin/tablets/merge/complete",
@@ -664,9 +685,21 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
                     "placement_scope_id": placement_scope_id,
                     "source_tablet_ids": source_tablet_ids,
                     "destination_tablet_id": destination_tablet_id,
-                    "map_epoch": map_epoch
+                    "map_epoch": map_epoch,
+                    "min_applied_index": min_applied_index,
+                    "require_ready": !allow_unready
                 }),
             )
+            .await
+        }
+        TabletsCommand::Movements { status, limit } => {
+            api.get(&format!(
+                "/api/admin/tablet-movements{}",
+                query_pairs(&[
+                    ("status", status.map(|value| value.to_string())),
+                    ("limit", limit.map(|value| value.to_string()))
+                ])
+            ))
             .await
         }
         TabletsCommand::Rebalance {
@@ -711,6 +744,18 @@ fn query_opt<T: ToString>(name: &str, value: Option<T>) -> String {
     value
         .map(|value| format!("?{name}={}", value.to_string()))
         .unwrap_or_default()
+}
+
+fn query_pairs(pairs: &[(&str, Option<String>)]) -> String {
+    let values = pairs
+        .iter()
+        .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", values.join("&"))
+    }
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -854,14 +899,20 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "status",
         "action",
         "changed",
+        "movement_id",
+        "movement_type",
         "placement_scope_id",
         "owner_node_id",
         "source_node_id",
         "target_node_id",
+        "source_tablet_id",
+        "destination_tablet_id",
         "source_tablet_ids",
         "destination_tablet_ids",
         "new_owner_node_id",
         "required_applied_index",
+        "start_shard",
+        "end_shard",
         "raft_membership_changed",
         "retired_source",
         "from_raft_node_id",
@@ -985,5 +1036,17 @@ mod tests {
         assert_eq!(ranges[0]["end_shard"], 49);
         assert_eq!(ranges[0]["tablet_id"], 8);
         assert!(parse_tablet_ranges(&["0:49".into()]).is_err());
+    }
+
+    #[test]
+    fn builds_query_pairs() {
+        assert_eq!(
+            query_pairs(&[
+                ("status", Some("pending".into())),
+                ("limit", Some("10".into()))
+            ]),
+            "?status=pending&limit=10"
+        );
+        assert_eq!(query_pairs(&[("status", None)]), "");
     }
 }

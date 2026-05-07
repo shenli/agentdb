@@ -2104,10 +2104,13 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
     )
     .await
     .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
+        .await
+        .unwrap();
     agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
         .await
         .unwrap();
-    let state = AppState::new(runtime).with_meta(meta);
+    let state = AppState::new(runtime).with_meta(meta.clone());
     let app = spawn_app_with_state(state).await;
 
     let response = app
@@ -2136,6 +2139,52 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap()
         .iter()
         .any(|tablet| tablet["tablet_id"] == 8 && tablet["state"] == "creating"));
+    assert_eq!(split_prepare["required_applied_index"], 12);
+    assert_eq!(split_prepare["destinations_ready"], false);
+    assert!(split_prepare["replicas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|replica| replica["tablet_id"] == 8 && replica["role"] == "voter"));
+    assert!(split_prepare["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| {
+            movement["movement_id"] == "split:7:8"
+                && movement["status"] == "pending"
+                && movement["required_applied_index"] == 12
+        }));
+
+    let rejected = app
+        .client
+        .post(format!("{}/api/admin/tablets/7/split/complete", app.base))
+        .json(&json!({
+            "child_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ],
+            "map_epoch": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    for tablet_id in [8, 9] {
+        tablet_replicas::upsert(
+            meta.pool(),
+            tablet_id,
+            "node-a",
+            "voter",
+            "healthy",
+            12,
+            12,
+            200,
+        )
+        .await
+        .unwrap();
+    }
 
     let split_complete: serde_json::Value = app
         .client
@@ -2156,6 +2205,12 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .await
         .unwrap();
     assert_eq!(split_complete["action"], "complete_split");
+    assert_eq!(split_complete["destinations_ready"], true);
+    assert!(split_complete["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|movement| movement["status"] == "completed"));
     assert!(split_complete["tablets"]
         .as_array()
         .unwrap()
@@ -2177,11 +2232,24 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
     let merge_prepare: serde_json::Value = response.json().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "{merge_prepare}");
     assert_eq!(merge_prepare["action"], "prepare_merge");
+    assert_eq!(merge_prepare["required_applied_index"], 12);
+    assert_eq!(merge_prepare["destinations_ready"], false);
+    assert!(
+        merge_prepare["movements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|movement| movement["movement_id"] == "merge:8:10"
+                && movement["status"] == "pending")
+    );
     assert!(merge_prepare["tablets"]
         .as_array()
         .unwrap()
         .iter()
         .any(|tablet| tablet["tablet_id"] == 10 && tablet["state"] == "creating"));
+    tablet_replicas::upsert(meta.pool(), 10, "node-a", "voter", "healthy", 12, 12, 300)
+        .await
+        .unwrap();
 
     let merge_complete: serde_json::Value = app
         .client
@@ -2200,6 +2268,12 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .await
         .unwrap();
     assert_eq!(merge_complete["action"], "complete_merge");
+    assert_eq!(merge_complete["destinations_ready"], true);
+    assert!(merge_complete["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|movement| movement["status"] == "completed"));
     assert_eq!(merge_complete["ranges"].as_array().unwrap().len(), 1);
     assert_eq!(merge_complete["ranges"][0]["tablet_id"], 10);
     assert!(merge_complete["tablets"]
@@ -2212,6 +2286,31 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap()
         .iter()
         .any(|tablet| tablet["tablet_id"] == 8 && tablet["state"] == "tombstoned"));
+
+    let movements: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/admin/tablet-movements?status=completed",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(movements
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| movement["movement_id"] == "split:7:8"));
+    assert!(movements
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| movement["movement_id"] == "merge:8:10"));
 }
 
 #[tokio::test]
