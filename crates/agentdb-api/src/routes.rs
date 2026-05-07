@@ -36,7 +36,9 @@ use agentdb_core::{
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
-use agentdb_meta::{nodes, tablet_ranges, tablet_rebalance, tablets, tenant_policies};
+use agentdb_meta::{
+    nodes, tablet_ranges, tablet_rebalance, tablet_replicas, tablets, tenant_policies,
+};
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
@@ -623,16 +625,35 @@ async fn post_internal_raft_message(
         to: body.to,
         payload,
     }) {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(InternalRaftAccepted {
-                status: "accepted",
-                tablet_id: body.tablet_id,
-                from: body.from,
-                to: body.to,
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            if let Some(registry) = s.raft_registry.as_ref() {
+                if let Ok(statuses) = registry.status_for(body.tablet_id) {
+                    if let Some(status) = statuses
+                        .into_iter()
+                        .find(|status| status.node_id == body.to)
+                    {
+                        record_local_raft_replica_progress(
+                            &s,
+                            body.tablet_id,
+                            body.to,
+                            status.applied_index,
+                            status.commit_index,
+                        )
+                        .await;
+                    }
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(InternalRaftAccepted {
+                    status: "accepted",
+                    tablet_id: body.tablet_id,
+                    from: body.from,
+                    to: body.to,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => internal_raft_error(
             StatusCode::BAD_REQUEST,
             "RAFT_MESSAGE_REJECTED",
@@ -691,6 +712,8 @@ async fn post_internal_raft_snapshot(
                     }
                 }
             }
+            record_local_raft_replica_progress(&s, body.tablet_id, body.to, body.index, body.index)
+                .await;
             (
                 StatusCode::ACCEPTED,
                 Json(InternalRaftAccepted {
@@ -742,6 +765,85 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, Response> {
                 format!("invalid base64 raft payload: {err}"),
             )
         })
+}
+
+async fn record_local_raft_replica_progress(
+    state: &AppState,
+    tablet_id: i64,
+    raft_node_id: u64,
+    applied_index: u64,
+    match_index: u64,
+) {
+    let Some(meta) = state.meta.as_ref() else {
+        return;
+    };
+    let local_node_id = match resolve_control_plane_node_id(meta, tablet_id, raft_node_id).await {
+        Ok(Some(node_id)) => node_id,
+        Ok(None) => {
+            tracing::debug!(
+                tablet_id,
+                raft_node_id,
+                "skipping raft replica progress update; control-plane node not found"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                tablet_id,
+                raft_node_id,
+                ?error,
+                "failed to resolve raft replica control-plane node"
+            );
+            return;
+        }
+    };
+    let now_ms = now_ms_i64();
+    let applied = applied_index.min(i64::MAX as u64) as i64;
+    let matched = match_index.min(i64::MAX as u64) as i64;
+    if let Err(error) = tablet_replicas::set_progress(
+        meta.pool(),
+        tablet_id,
+        &local_node_id,
+        applied,
+        matched,
+        now_ms,
+    )
+    .await
+    {
+        tracing::warn!(
+            tablet_id,
+            node_id = %local_node_id,
+            ?error,
+            "failed to update raft replica progress"
+        );
+        return;
+    }
+    if let Err(error) =
+        tablet_replicas::set_health(meta.pool(), tablet_id, &local_node_id, "healthy", now_ms).await
+    {
+        tracing::warn!(
+            tablet_id,
+            node_id = %local_node_id,
+            ?error,
+            "failed to update raft replica health"
+        );
+    }
+}
+
+async fn resolve_control_plane_node_id(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    raft_node_id: u64,
+) -> agentdb_meta::MetaResult<Option<String>> {
+    for replica in tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
+        let Ok(candidate) = agentdb_storage::stable_raft_node_id(&replica.node_id) else {
+            continue;
+        };
+        if candidate == raft_node_id {
+            return Ok(Some(replica.node_id));
+        }
+    }
+    Ok(None)
 }
 
 fn internal_raft_error(
