@@ -185,11 +185,40 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
+    if !config.in_memory {
+        std::fs::create_dir_all(&config.data_dir)?;
+    }
+    let route_location = config
+        .route_region
+        .clone()
+        .or(config.route_location.clone());
+    let raft_registry = config
+        .internal_auth_token
+        .as_ref()
+        .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
+    let route_startup =
+        prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
+    let primary_raft_log = route_startup
+        .as_ref()
+        .and_then(|startup| {
+            startup.raft_bootstrap.as_ref().and_then(|bootstrap| {
+                bootstrap
+                    .local_logs
+                    .get(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID)
+            })
+        })
+        .map(|log| -> Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync> { log.clone() });
+    if matches!(config.deployment_mode, DeploymentMode::Cluster) && primary_raft_log.is_none() {
+        anyhow::bail!(
+            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime primary tablet {}",
+            config.route_node_id.as_deref().unwrap_or("<missing-node-id>"),
+            agentdb_core::RUNTIME_PRIMARY_TABLET_ID
+        );
+    }
     let runtime = if config.in_memory {
         tracing::info!("using in-memory runtime (state lost on shutdown)");
         agentdb_core::Runtime::in_memory()
     } else {
-        std::fs::create_dir_all(&config.data_dir)?;
         let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = match config.kv_backend {
             KvBackendKind::RocksDb => {
                 let kv_path = config.data_dir.join("runtime");
@@ -233,7 +262,15 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 ))
             }
         };
-        agentdb_core::Runtime::with_kv(kv, content)
+        if let Some(log) = primary_raft_log {
+            tracing::info!(
+                tablet_id = agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
+                "opened runtime with raft-rs replicated primary tablet log"
+            );
+            agentdb_core::Runtime::with_kv_and_replicated_log(kv, content, log)
+        } else {
+            agentdb_core::Runtime::with_kv(kv, content)
+        }
     };
 
     let record_index_worker_interval_ms = env_u64(
@@ -273,57 +310,42 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         });
-    let mut raft_registry = None;
     if let Some(token) = config.internal_auth_token.clone() {
-        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        state = state
-            .with_internal_auth_token(token)
-            .with_raft_ingress(registry.clone());
-        raft_registry = Some(registry);
+        state = state.with_internal_auth_token(token);
+        if let Some(registry) = raft_registry.clone() {
+            state = state.with_raft_ingress(registry);
+        }
     }
-    let route_location = config
-        .route_region
-        .clone()
-        .or(config.route_location.clone());
-    if let Some(node_id) = config.route_node_id.as_deref() {
-        let meta = agentdb_meta::MetaStore::open_from_env().await?;
-        let scheduler_status = agentdb_api::state::SchedulerStatus::new();
-        let snapshot =
-            load_route_snapshot(&meta, config.route_shard_count, route_location.clone()).await?;
-        let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
+    if let Some(startup) = route_startup {
         spawn_route_snapshot_refresher(
-            meta.clone(),
-            routing.clone(),
+            startup.meta.clone(),
+            startup.routing.clone(),
             config.route_shard_count,
             route_location.clone(),
             config.route_refresh_interval_ms,
         );
         let node_address = format!("http://{}", config.bind);
         spawn_cluster_workers(
-            meta.clone(),
-            node_id.to_string(),
+            startup.meta.clone(),
+            startup.node_id.clone(),
             node_address,
             config.route_region.clone(),
-            scheduler_status.clone(),
+            startup.scheduler_status.clone(),
             state.drain.clone(),
             ClusterWorkerConfig::from_env(),
         );
-        if let Some(registry) = raft_registry.clone() {
-            let raft_engine_root = config.data_dir.join("raft-engine");
-            let tablet_ids =
-                bootstrap_raft_rs_registry(&meta, node_id, &raft_engine_root, registry.clone())
-                    .await?;
-            if !tablet_ids.is_empty() {
+        if let Some(bootstrap) = startup.raft_bootstrap {
+            if !bootstrap.tablet_ids.is_empty() {
                 let internal_auth_token = config
                     .internal_auth_token
                     .clone()
                     .expect("raft registry requires internal auth token");
                 let outbox =
                     agentdb_api::internal_raft_http::RaftRsHttpOutbox::new(internal_auth_token);
-                refresh_raft_rs_peer_urls(&meta, &tablet_ids, &outbox).await?;
+                refresh_raft_rs_peer_urls(&startup.meta, &bootstrap.tablet_ids, &outbox).await?;
                 spawn_raft_rs_peer_url_refresher(
-                    meta.clone(),
-                    tablet_ids.clone(),
+                    startup.meta.clone(),
+                    bootstrap.tablet_ids.clone(),
                     outbox.clone(),
                     config.route_refresh_interval_ms,
                 );
@@ -332,25 +354,27 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     DEFAULT_RAFT_OUTBOX_INTERVAL_MS,
                 )
                 .max(100);
-                agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
-                    registry,
-                    outbox,
-                    Duration::from_millis(raft_outbox_interval_ms),
-                );
+                if let Some(registry) = raft_registry.clone() {
+                    agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
+                        registry,
+                        outbox,
+                        Duration::from_millis(raft_outbox_interval_ms),
+                    );
+                }
                 tracing::info!(
-                    node_id,
-                    tablet_count = tablet_ids.len(),
+                    node_id = %startup.node_id,
+                    tablet_count = bootstrap.tablet_ids.len(),
                     outbox_interval_ms = raft_outbox_interval_ms,
                     "bootstrapped raft-rs tablet groups"
                 );
             }
         }
         state = state
-            .with_meta(meta.clone())
-            .with_scheduler(scheduler_status)
-            .with_routing(routing);
+            .with_meta(startup.meta.clone())
+            .with_scheduler(startup.scheduler_status)
+            .with_routing(startup.routing);
         tracing::info!(
-            node_id,
+            node_id = %startup.node_id,
             shard_count = config.route_shard_count,
             location = ?route_location,
             refresh_interval_ms = config.route_refresh_interval_ms,
@@ -388,6 +412,19 @@ struct ResolvedServeConfig {
     mongo_username: Option<String>,
     mongo_password: Option<String>,
     internal_auth_token: Option<String>,
+}
+
+struct RouteStartup {
+    node_id: String,
+    meta: agentdb_meta::MetaStore,
+    scheduler_status: agentdb_api::state::SchedulerStatus,
+    routing: agentdb_api::routing_http::RouteRuntime,
+    raft_bootstrap: Option<RaftRsRegistryBootstrap>,
+}
+
+struct RaftRsRegistryBootstrap {
+    tablet_ids: Vec<i64>,
+    local_logs: BTreeMap<i64, Arc<agentdb_storage::RaftRsReplicatedLog>>,
 }
 
 impl ResolvedServeConfig {
@@ -1148,6 +1185,33 @@ async fn load_route_snapshot(
     .await
 }
 
+async fn prepare_route_startup(
+    config: &ResolvedServeConfig,
+    route_location: Option<String>,
+    raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
+) -> anyhow::Result<Option<RouteStartup>> {
+    let Some(node_id) = config.route_node_id.as_deref() else {
+        return Ok(None);
+    };
+    let meta = agentdb_meta::MetaStore::open_from_env().await?;
+    let scheduler_status = agentdb_api::state::SchedulerStatus::new();
+    let snapshot = load_route_snapshot(&meta, config.route_shard_count, route_location).await?;
+    let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
+    let raft_bootstrap = if let Some(registry) = raft_registry {
+        let raft_engine_root = config.data_dir.join("raft-engine");
+        Some(bootstrap_raft_rs_registry(&meta, node_id, &raft_engine_root, registry).await?)
+    } else {
+        None
+    };
+    Ok(Some(RouteStartup {
+        node_id: node_id.to_string(),
+        meta,
+        scheduler_status,
+        routing,
+        raft_bootstrap,
+    }))
+}
+
 async fn load_raft_rs_node_configs(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
@@ -1179,7 +1243,7 @@ async fn bootstrap_raft_rs_registry(
     local_node_id: &str,
     raft_engine_root: &std::path::Path,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
-) -> anyhow::Result<Vec<i64>> {
+) -> anyhow::Result<RaftRsRegistryBootstrap> {
     let local_raft_node_id = agentdb_storage::stable_raft_node_id(local_node_id)?;
     let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_all(meta.pool())
         .await?
@@ -1190,14 +1254,19 @@ async fn bootstrap_raft_rs_registry(
         .map(|replica| replica.tablet_id)
         .collect();
     let mut bootstrapped = Vec::new();
+    let mut local_logs = BTreeMap::new();
     for tablet_id in local_tablet_ids {
         let configs = load_raft_rs_node_configs(meta, tablet_id, raft_engine_root).await?;
-        let (group, _local_log) =
+        let (group, local_log) =
             agentdb_storage::RaftRsSharedGroup::open_local(tablet_id, configs, local_raft_node_id)?;
         registry.register(tablet_id, group)?;
         bootstrapped.push(tablet_id);
+        local_logs.insert(tablet_id, local_log);
     }
-    Ok(bootstrapped)
+    Ok(RaftRsRegistryBootstrap {
+        tablet_ids: bootstrapped,
+        local_logs,
+    })
 }
 
 async fn load_raft_rs_peer_urls(
@@ -2109,11 +2178,12 @@ region = "us-west-2"
             .unwrap();
 
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        let tablet_ids = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+        let bootstrap = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
             .await
             .unwrap();
 
-        assert_eq!(tablet_ids, vec![7]);
+        assert_eq!(bootstrap.tablet_ids, vec![7]);
+        assert!(bootstrap.local_logs.contains_key(&7));
         assert_eq!(registry.tablet_count(), 1);
         let groups = registry.groups_snapshot();
         assert_eq!(groups[0].1.status().len(), 1);
@@ -2135,11 +2205,12 @@ region = "us-west-2"
             .unwrap();
 
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        let tablet_ids = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+        let bootstrap = bootstrap_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
             .await
             .unwrap();
 
-        assert!(tablet_ids.is_empty());
+        assert!(bootstrap.tablet_ids.is_empty());
+        assert!(bootstrap.local_logs.is_empty());
         assert_eq!(registry.tablet_count(), 0);
     }
 

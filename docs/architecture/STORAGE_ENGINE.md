@@ -953,9 +953,15 @@ single-session appends or record writes.
    startup now bootstraps local `raft-rs` tablet groups from
    `tablet_replicas`, opens only the local node's raft-engine state while
    retaining the full voter/learner ConfState, loads peer URLs from `nodes`,
-   and refreshes those URLs periodically and on control-plane change hints. The
-   remaining production work is making the runtime hot write path route tablet
-   writes through these registered local Raft logs.
+   and refreshes those URLs periodically and on control-plane change hints.
+   Cluster-mode server startup injects the local `raft-rs` log for the current
+   runtime primary tablet into `Runtime::with_kv_and_replicated_log`, so the
+   hot metadata/event write path acknowledges only after Raft commit. The local
+   Raft append path now releases its group lock while waiting for peer
+   responses, allowing the HTTP outbox and ingress workers to complete
+   multi-node election and quorum commit. The remaining production work is
+   tabletizing the runtime state model so each route-owned tablet has its own
+   state machine instead of the current primary-tablet runtime log.
 
 7. Add snapshot and catch-up support.
 

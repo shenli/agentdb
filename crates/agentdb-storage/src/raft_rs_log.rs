@@ -11,6 +11,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use prost::Message as ProstMessage;
@@ -30,6 +32,8 @@ use crate::{Error, LogCommit, LogEntry, ReplicatedLog, Result};
 
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
+const APPEND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const APPEND_WAIT_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftRsNodeConfig {
@@ -407,10 +411,66 @@ impl RaftRsSharedGroup {
     }
 
     fn append(&self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
-        self.inner
-            .lock()
-            .expect("raft-rs group lock poisoned")
-            .append(node_id, tablet_id, command)
+        {
+            let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+            if group.node_count() > 1 {
+                return group.append(node_id, tablet_id, command);
+            }
+        }
+        let started_at = Instant::now();
+        let mut campaign_started = false;
+        let mut proposed_after = None;
+        loop {
+            let maybe_commit = {
+                let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
+                group.validate_append_target(node_id, tablet_id)?;
+                if proposed_after.is_none() {
+                    if !group.is_leader(node_id)? {
+                        if !campaign_started {
+                            group
+                                .node_mut(node_id)?
+                                .raw
+                                .campaign()
+                                .map_err(map_raft_error)?;
+                            campaign_started = true;
+                        }
+                        group.drive_until_idle()?;
+                        None
+                    } else {
+                        let previous_applied_index = group.node(node_id)?.last_applied_index;
+                        group
+                            .node_mut(node_id)?
+                            .raw
+                            .propose(Vec::new(), command.clone())
+                            .map_err(map_raft_error)?;
+                        proposed_after = Some(previous_applied_index);
+                        group.drive_until_idle()?;
+                        group.find_committed_after(node_id, tablet_id, previous_applied_index)?
+                    }
+                } else {
+                    group.drive_until_idle()?;
+                    group.find_committed_after(
+                        node_id,
+                        tablet_id,
+                        proposed_after.expect("proposal index set"),
+                    )?
+                }
+            };
+            if let Some(commit) = maybe_commit {
+                return Ok(commit);
+            }
+            if started_at.elapsed() >= APPEND_WAIT_TIMEOUT {
+                let reason = if proposed_after.is_some() {
+                    "command did not commit"
+                } else {
+                    "node did not become leader"
+                };
+                return Err(Error::Other(format!(
+                    "raft-rs {reason} for tablet {tablet_id} before timeout"
+                )));
+            }
+            thread::sleep(APPEND_WAIT_POLL);
+        }
     }
 
     fn committed_entries(
@@ -470,6 +530,10 @@ impl RaftRsGroup {
         self.nodes.keys().copied().collect()
     }
 
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn mark_unavailable(&mut self, node_id: u64) -> Result<()> {
         self.node(node_id)?;
         self.unavailable_nodes.insert(node_id);
@@ -480,6 +544,39 @@ impl RaftRsGroup {
         self.node(node_id)?;
         self.unavailable_nodes.remove(&node_id);
         self.drive_until_idle()
+    }
+
+    fn validate_append_target(&self, node_id: u64, tablet_id: i64) -> Result<()> {
+        if tablet_id != self.tablet_id {
+            return Err(Error::Other(format!(
+                "raft-rs log opened for tablet {}, got tablet {tablet_id}",
+                self.tablet_id
+            )));
+        }
+        self.node(node_id)?;
+        Ok(())
+    }
+
+    fn is_leader(&self, node_id: u64) -> Result<bool> {
+        Ok(self.node(node_id)?.raw.status().ss.raft_state == StateRole::Leader)
+    }
+
+    fn find_committed_after(
+        &self,
+        node_id: u64,
+        tablet_id: i64,
+        previous_applied_index: u64,
+    ) -> Result<Option<LogCommit>> {
+        Ok(self
+            .node(node_id)?
+            .committed
+            .iter()
+            .find(|entry| entry.index > previous_applied_index)
+            .map(|entry| LogCommit {
+                tablet_id,
+                index: entry.index,
+                term: entry.term,
+            }))
     }
 
     fn take_wire_messages(&mut self) -> Vec<RaftRsWireMessage> {
@@ -620,12 +717,7 @@ impl RaftRsGroup {
     }
 
     fn append(&mut self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
-        if tablet_id != self.tablet_id {
-            return Err(Error::Other(format!(
-                "raft-rs log opened for tablet {}, got tablet {tablet_id}",
-                self.tablet_id
-            )));
-        }
+        self.validate_append_target(node_id, tablet_id)?;
         if self.node(node_id)?.raw.status().ss.raft_state != StateRole::Leader {
             self.elect(node_id)?;
         }
@@ -636,21 +728,14 @@ impl RaftRsGroup {
             .map_err(map_raft_error)?;
         self.drive_until_idle()?;
 
-        let leader = self.node(node_id)?;
-        let Some(committed) = leader
-            .committed
-            .iter()
-            .find(|entry| entry.index > previous_applied_index)
+        let Some(committed) =
+            self.find_committed_after(node_id, tablet_id, previous_applied_index)?
         else {
             return Err(Error::Other(format!(
                 "raft-rs command did not commit for tablet {tablet_id}"
             )));
         };
-        Ok(LogCommit {
-            tablet_id,
-            index: committed.index,
-            term: committed.term,
-        })
+        Ok(committed)
     }
 
     fn committed_entries(
@@ -1560,5 +1645,64 @@ mod tests {
             outbound.iter().any(|message| message.to == 1)
                 && outbound.iter().any(|message| message.to == 3)
         );
+    }
+
+    #[test]
+    fn raft_rs_open_local_commits_through_delivered_wire_messages() {
+        let (_dir, configs) = configs(3);
+        let (group_1, log_1) = RaftRsSharedGroup::open_local(7, configs.clone(), 1).unwrap();
+        let (group_2, log_2) = RaftRsSharedGroup::open_local(7, configs.clone(), 2).unwrap();
+        let (group_3, log_3) = RaftRsSharedGroup::open_local(7, configs, 3).unwrap();
+        let groups = BTreeMap::from([(1, group_1.clone()), (2, group_2), (3, group_3)]);
+
+        let append = std::thread::spawn(move || log_1.append(7, b"network-quorum".to_vec()));
+        for _ in 0..1_000 {
+            let mut messages = Vec::new();
+            for group in groups.values() {
+                messages.extend(group.take_wire_messages());
+            }
+            for message in messages {
+                groups
+                    .get(&message.to)
+                    .expect("target raft group")
+                    .step_wire_message(message)
+                    .unwrap();
+            }
+            if append.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let commit = append.join().unwrap().unwrap();
+        assert!(commit.index > 0);
+        for _ in 0..10 {
+            let mut messages = Vec::new();
+            for group in groups.values() {
+                messages.extend(group.take_wire_messages());
+            }
+            if messages.is_empty() {
+                break;
+            }
+            for message in messages {
+                groups
+                    .get(&message.to)
+                    .expect("target raft group")
+                    .step_wire_message(message)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            log_2.committed_entries(7, 0, 10).unwrap()[0].command,
+            b"network-quorum"
+        );
+        assert_eq!(
+            log_3.committed_entries(7, 0, 10).unwrap()[0].command,
+            b"network-quorum"
+        );
+        assert!(group_1
+            .status()
+            .iter()
+            .any(|status| status.node_id == 1 && status.role == "Leader"));
     }
 }

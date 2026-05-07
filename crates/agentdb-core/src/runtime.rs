@@ -51,7 +51,7 @@ use crate::tablet_state::{
 };
 use crate::tenant::{NewTenant, Tenant};
 
-const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
+pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct AppendRequest {

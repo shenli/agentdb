@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use agentdb_core::runtime::Runtime;
 use agentdb_core::tenant::NewTenant;
+use agentdb_core::RUNTIME_PRIMARY_TABLET_ID;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
@@ -135,6 +136,65 @@ async fn runtime_persisted_writes_replicate_with_raft_rs_quorum() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "raft-rs-tenant");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group_1, log_1) =
+        RaftRsSharedGroup::open_local(RUNTIME_PRIMARY_TABLET_ID, raft_configs.clone(), 1).unwrap();
+    let (group_2, log_2) =
+        RaftRsSharedGroup::open_local(RUNTIME_PRIMARY_TABLET_ID, raft_configs.clone(), 2).unwrap();
+    let (group_3, _log_3) =
+        RaftRsSharedGroup::open_local(RUNTIME_PRIMARY_TABLET_ID, raft_configs, 3).unwrap();
+    let groups = BTreeMap::from([(1, group_1), (2, group_2), (3, group_3)]);
+
+    let leader_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let follower_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n2")).unwrap());
+    let leader_runtime = Runtime::with_kv_and_replicated_log(leader_kv, content(), log_1);
+
+    let create = tokio::spawn(async move {
+        leader_runtime
+            .create_tenant(NewTenant {
+                external_key: "raft-rs-network-tenant".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+    });
+    for _ in 0..1_000 {
+        let mut messages = Vec::new();
+        for group in groups.values() {
+            messages.extend(group.take_wire_messages());
+        }
+        for message in messages {
+            groups
+                .get(&message.to)
+                .expect("target raft group")
+                .step_wire_message(message)
+                .unwrap();
+        }
+        if create.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let tenant = create.await.unwrap().unwrap();
+
+    let follower_runtime = Runtime::with_kv_and_replicated_log(follower_kv, content(), log_2);
+    let hydrated = follower_runtime
+        .get_tenant(&tenant.tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(hydrated.external_key, "raft-rs-network-tenant");
 }
 
 #[tokio::test]
