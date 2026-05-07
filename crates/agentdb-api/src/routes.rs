@@ -38,7 +38,8 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    nodes, tablet_ranges, tablet_rebalance, tablet_replicas, tablets, tenant_policies,
+    nodes, session_locators, tablet_ranges, tablet_rebalance, tablet_replicas, tablets,
+    tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -50,7 +51,8 @@ use crate::dto::{
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::routing_http::{
-    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_ROUTE_REASON, HDR_TABLET_ID,
+    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_FORWARDED_BY,
+    HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -2094,6 +2096,8 @@ async fn delete_agent(
 async fn create_session(
     State(s): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Response, ApiError> {
     reject_if_draining(&s)?;
@@ -2107,19 +2111,51 @@ async fn create_session(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
-    let sess = s
-        .runtime
-        .create_session(NewSession {
-            tenant_id: tid.clone(),
-            agent_id: aid,
-            alias: body.alias,
-        })
-        .await?;
+    let preallocated_session_id =
+        forwarded_preallocated_session_id(&headers)?.unwrap_or_else(|| Id::new(IdKind::Session));
+    let forward_body = serde_json::to_vec(&body).expect("create-session body must serialize");
+    let mut extra_forward_headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(preallocated_session_id.as_str()) {
+        extra_forward_headers.insert(HDR_PREALLOCATED_SESSION_ID, value);
+    }
+    let route_headers = match guard_routing_key_request(
+        &s,
+        &tid,
+        Some(preallocated_session_id.as_str()),
+        &original_uri,
+        &headers,
+        Method::POST,
+        Some(forward_body),
+        extra_forward_headers,
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let runtime = s.runtime.clone();
+    let create_tid = tid.clone();
+    let sess = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .create_session_with_id(
+                NewSession {
+                    tenant_id: create_tid,
+                    agent_id: aid,
+                    alias: body.alias,
+                },
+                preallocated_session_id,
+            )
+            .await
+    })
+    .await?;
+    record_session_locator(&s, &tid, &sess.session_id, &route_headers).await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
-    Ok(json_with_backpressure(
-        StatusCode::CREATED,
-        Json(sess),
-        backpressure,
+    Ok(with_headers(
+        json_with_backpressure(StatusCode::CREATED, Json(sess), backpressure),
+        route_headers,
     ))
 }
 
@@ -2901,6 +2937,89 @@ fn route_tablet_id(headers: &HeaderMap) -> Option<i64> {
         .get(HDR_TABLET_ID)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn route_shard_id(headers: &HeaderMap) -> Option<i32> {
+    headers
+        .get(HDR_SHARD_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i32>().ok())
+}
+
+fn forwarded_preallocated_session_id(headers: &HeaderMap) -> Result<Option<Id>, ApiError> {
+    if !headers.contains_key(HDR_FORWARDED_BY) {
+        return Ok(None);
+    }
+    let Some(raw) = headers
+        .get(HDR_PREALLOCATED_SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(parse_id_or(
+        raw,
+        IdKind::Session,
+        ErrorCode::SessionNotFound,
+    )?))
+}
+
+async fn record_session_locator(
+    state: &AppState,
+    tenant_id: &Id,
+    session_id: &Id,
+    route_headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    let (Some(tablet_id), Some(shard_id)) = (
+        route_tablet_id(route_headers),
+        route_shard_id(route_headers),
+    ) else {
+        return Ok(());
+    };
+    let tenant = tenants::get_or_create(meta.pool(), tenant_id.as_str(), now_ms_i64())
+        .await
+        .map_err(internal_error)?;
+    session_locators::upsert(
+        meta.pool(),
+        session_id.as_str(),
+        tenant.internal_id,
+        tenant_id.as_str(),
+        Some(tablet_id),
+        shard_id,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(())
+}
+
+async fn guard_routing_key_request(
+    state: &AppState,
+    tenant_id: &Id,
+    routing_key: Option<&str>,
+    original_uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    method: Method,
+    body: Option<Vec<u8>>,
+    extra_forward_headers: HeaderMap,
+) -> Result<HeaderMap, Response> {
+    let path_and_query = original_uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_else(|| original_uri.path());
+    match state
+        .routing
+        .guard_routing_key(tenant_id.as_str(), routing_key, path_and_query, headers)
+    {
+        RouteGuardOutcome::ServeLocal(headers) => Ok(headers),
+        RouteGuardOutcome::Forward(mut forward) => {
+            forward.headers.extend(extra_forward_headers);
+            Err(execute_forward(state, forward, method, body).await)
+        }
+        RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
+    }
 }
 
 async fn guard_session_request(

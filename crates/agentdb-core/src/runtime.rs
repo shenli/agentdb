@@ -2316,6 +2316,18 @@ impl Runtime {
     }
 
     pub async fn create_session(&self, req: NewSession) -> Result<Session> {
+        self.create_session_inner(req, None).await
+    }
+
+    pub async fn create_session_with_id(&self, req: NewSession, session_id: Id) -> Result<Session> {
+        self.create_session_inner(req, Some(session_id)).await
+    }
+
+    async fn create_session_inner(
+        &self,
+        req: NewSession,
+        session_id: Option<Id>,
+    ) -> Result<Session> {
         let sess = {
             let mut s = self.state.lock().await;
             let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
@@ -2368,7 +2380,16 @@ impl Runtime {
                     }
                 }
             }
-            let sess = Session::create(req);
+            let sess = match session_id {
+                Some(session_id) => Session::create_with_id(req, session_id),
+                None => Session::create(req),
+            };
+            if s.sessions.contains_key(sess.session_id.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!("session id collision: {}", sess.session_id),
+                ));
+            }
             s.sessions
                 .insert(sess.session_id.as_str().to_string(), sess.clone());
             if let Some(alias) = sess.alias.as_deref() {
