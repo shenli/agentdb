@@ -2090,6 +2090,131 @@ async fn admin_tablet_ranges_replace_round_trip() {
 }
 
 #[tokio::test]
+async fn admin_tablet_split_merge_lifecycle_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        7,
+        "default",
+        "serving",
+        Some("raft/7"),
+        0,
+        100,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .post(format!("{}/api/admin/tablets/7/split/prepare", app.base))
+        .json(&json!({
+            "child_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let split_prepare: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{split_prepare}");
+    assert_eq!(split_prepare["action"], "prepare_split");
+    assert!(split_prepare["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 7 && tablet["state"] == "splitting"));
+    assert!(split_prepare["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 8 && tablet["state"] == "creating"));
+
+    let split_complete: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/7/split/complete", app.base))
+        .json(&json!({
+            "child_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ],
+            "map_epoch": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(split_complete["action"], "complete_split");
+    assert!(split_complete["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 7 && tablet["state"] == "tombstoned"));
+    assert_eq!(split_complete["ranges"].as_array().unwrap().len(), 2);
+
+    let response = app
+        .client
+        .post(format!("{}/api/admin/tablets/merge/prepare", app.base))
+        .json(&json!({
+            "source_tablet_ids": [8, 9],
+            "destination_tablet_id": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let merge_prepare: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{merge_prepare}");
+    assert_eq!(merge_prepare["action"], "prepare_merge");
+    assert!(merge_prepare["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 10 && tablet["state"] == "creating"));
+
+    let merge_complete: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/merge/complete", app.base))
+        .json(&json!({
+            "source_tablet_ids": [8, 9],
+            "destination_tablet_id": 10,
+            "map_epoch": 3
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(merge_complete["action"], "complete_merge");
+    assert_eq!(merge_complete["ranges"].as_array().unwrap().len(), 1);
+    assert_eq!(merge_complete["ranges"][0]["tablet_id"], 10);
+    assert!(merge_complete["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 10 && tablet["state"] == "serving"));
+    assert!(merge_complete["tablets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tablet| tablet["tablet_id"] == 8 && tablet["state"] == "tombstoned"));
+}
+
+#[tokio::test]
 async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();

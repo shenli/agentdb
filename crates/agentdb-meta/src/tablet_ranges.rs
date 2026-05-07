@@ -247,6 +247,13 @@ pub async fn replace_ranges(
     Ok(())
 }
 
+pub fn validate_replacement_plan(
+    old_ranges: &[RangeBounds],
+    new_ranges: &[ReplacementRange],
+) -> MetaResult<()> {
+    validate_replacement(old_ranges, new_ranges)
+}
+
 pub fn range_override(
     ranges: &[TabletRange],
     placement_scope_id: Option<&str>,

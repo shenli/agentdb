@@ -182,6 +182,42 @@ enum TabletsCommand {
         #[arg(long)]
         retire_source: bool,
     },
+    /// Prepare a fenced tablet split workflow.
+    PrepareSplit {
+        tablet_id: i64,
+        #[arg(long = "child-range", required = true)]
+        child_ranges: Vec<String>,
+        #[arg(long)]
+        placement_scope_id: Option<String>,
+    },
+    /// Complete a prepared tablet split and publish range cutover.
+    CompleteSplit {
+        tablet_id: i64,
+        #[arg(long = "child-range", required = true)]
+        child_ranges: Vec<String>,
+        #[arg(long)]
+        placement_scope_id: Option<String>,
+        #[arg(long)]
+        map_epoch: i64,
+    },
+    /// Prepare a fenced tablet merge workflow.
+    PrepareMerge {
+        #[arg(long = "source-tablet-id", required = true)]
+        source_tablet_ids: Vec<i64>,
+        destination_tablet_id: i64,
+        #[arg(long)]
+        placement_scope_id: Option<String>,
+    },
+    /// Complete a prepared tablet merge and publish range cutover.
+    CompleteMerge {
+        #[arg(long = "source-tablet-id", required = true)]
+        source_tablet_ids: Vec<i64>,
+        destination_tablet_id: i64,
+        #[arg(long)]
+        placement_scope_id: Option<String>,
+        #[arg(long)]
+        map_epoch: i64,
+    },
     /// Run the rebalance policy.
     Rebalance {
         #[arg(long)]
@@ -571,6 +607,68 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             )
             .await
         }
+        TabletsCommand::PrepareSplit {
+            tablet_id,
+            child_ranges,
+            placement_scope_id,
+        } => {
+            api.post(
+                &format!("/api/admin/tablets/{tablet_id}/split/prepare"),
+                json!({
+                    "placement_scope_id": placement_scope_id,
+                    "child_ranges": parse_tablet_ranges(&child_ranges)?
+                }),
+            )
+            .await
+        }
+        TabletsCommand::CompleteSplit {
+            tablet_id,
+            child_ranges,
+            placement_scope_id,
+            map_epoch,
+        } => {
+            api.post(
+                &format!("/api/admin/tablets/{tablet_id}/split/complete"),
+                json!({
+                    "placement_scope_id": placement_scope_id,
+                    "child_ranges": parse_tablet_ranges(&child_ranges)?,
+                    "map_epoch": map_epoch
+                }),
+            )
+            .await
+        }
+        TabletsCommand::PrepareMerge {
+            source_tablet_ids,
+            destination_tablet_id,
+            placement_scope_id,
+        } => {
+            api.post(
+                "/api/admin/tablets/merge/prepare",
+                json!({
+                    "placement_scope_id": placement_scope_id,
+                    "source_tablet_ids": source_tablet_ids,
+                    "destination_tablet_id": destination_tablet_id
+                }),
+            )
+            .await
+        }
+        TabletsCommand::CompleteMerge {
+            source_tablet_ids,
+            destination_tablet_id,
+            placement_scope_id,
+            map_epoch,
+        } => {
+            api.post(
+                "/api/admin/tablets/merge/complete",
+                json!({
+                    "placement_scope_id": placement_scope_id,
+                    "source_tablet_ids": source_tablet_ids,
+                    "destination_tablet_id": destination_tablet_id,
+                    "map_epoch": map_epoch
+                }),
+            )
+            .await
+        }
         TabletsCommand::Rebalance {
             dry_run,
             stale_threshold_ms,
@@ -587,6 +685,26 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             .await
         }
     }
+}
+
+fn parse_tablet_ranges(values: &[String]) -> Result<Vec<Value>> {
+    values
+        .iter()
+        .map(|value| {
+            let parts = value.split(':').collect::<Vec<_>>();
+            if parts.len() != 3 {
+                anyhow::bail!("tablet range must be formatted as start:end:tablet_id");
+            }
+            let start_shard = parts[0].parse::<i64>()?;
+            let end_shard = parts[1].parse::<i64>()?;
+            let tablet_id = parts[2].parse::<i64>()?;
+            Ok(json!({
+                "start_shard": start_shard,
+                "end_shard": end_shard,
+                "tablet_id": tablet_id
+            }))
+        })
+        .collect()
 }
 
 fn query_opt<T: ToString>(name: &str, value: Option<T>) -> String {
@@ -736,9 +854,12 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "status",
         "action",
         "changed",
+        "placement_scope_id",
         "owner_node_id",
         "source_node_id",
         "target_node_id",
+        "source_tablet_ids",
+        "destination_tablet_ids",
         "new_owner_node_id",
         "required_applied_index",
         "raft_membership_changed",
@@ -855,5 +976,14 @@ mod tests {
         assert!(rendered.contains("status=ok"));
         assert!(rendered.contains("ready=true"));
         assert!(rendered.contains("leader=node-a"));
+    }
+
+    #[test]
+    fn parses_tablet_range_triples() {
+        let ranges = parse_tablet_ranges(&["0:49:8".into(), "50:99:9".into()]).unwrap();
+        assert_eq!(ranges[0]["start_shard"], 0);
+        assert_eq!(ranges[0]["end_shard"], 49);
+        assert_eq!(ranges[0]["tablet_id"], 8);
+        assert!(parse_tablet_ranges(&["0:49".into()]).is_err());
     }
 }

@@ -106,6 +106,22 @@ pub fn routes() -> Router<AppState> {
             post(replace_admin_tablet_ranges),
         )
         .route(
+            "/api/admin/tablets/:tablet_id/split/prepare",
+            post(prepare_admin_tablet_split),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/split/complete",
+            post(complete_admin_tablet_split),
+        )
+        .route(
+            "/api/admin/tablets/merge/prepare",
+            post(prepare_admin_tablet_merge),
+        )
+        .route(
+            "/api/admin/tablets/merge/complete",
+            post(complete_admin_tablet_merge),
+        )
+        .route(
             "/api/admin/tenant-policies",
             get(get_admin_tenant_policies).post(upsert_admin_tenant_policy),
         )
@@ -439,6 +455,34 @@ struct ReplaceTabletRangesBody {
 struct ReplaceTabletRangesResponse {
     placement_scope_id: String,
     changed: bool,
+    ranges: Vec<tablet_ranges::TabletRange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SplitTabletBody {
+    placement_scope_id: Option<String>,
+    child_ranges: Vec<tablet_ranges::ReplacementRange>,
+    map_epoch: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeTabletsBody {
+    placement_scope_id: Option<String>,
+    source_tablet_ids: Vec<i64>,
+    destination_tablet_id: i64,
+    map_epoch: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletRangeLifecycleResponse {
+    action: &'static str,
+    changed: bool,
+    placement_scope_id: String,
+    source_tablet_ids: Vec<i64>,
+    destination_tablet_ids: Vec<i64>,
+    old_ranges: Vec<tablet_ranges::RangeBounds>,
+    new_ranges: Vec<tablet_ranges::ReplacementRange>,
+    tablets: Vec<AdminTabletView>,
     ranges: Vec<tablet_ranges::TabletRange>,
 }
 
@@ -1510,6 +1554,81 @@ async fn get_tablet_replica(
         .find(|replica| replica.node_id == node_id))
 }
 
+async fn scoped_ranges_for_tablet(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    placement_scope_id: &str,
+) -> Result<Vec<tablet_ranges::TabletRange>, ApiError> {
+    Ok(tablet_ranges::list_by_tablet(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == placement_scope_id)
+        .collect())
+}
+
+fn range_bounds(ranges: &[tablet_ranges::TabletRange]) -> Vec<tablet_ranges::RangeBounds> {
+    ranges
+        .iter()
+        .map(|range| tablet_ranges::RangeBounds {
+            start_shard: range.start_shard,
+            end_shard: range.end_shard,
+        })
+        .collect()
+}
+
+fn union_replacement_range(
+    ranges: &[tablet_ranges::TabletRange],
+    tablet_id: i64,
+) -> Result<tablet_ranges::ReplacementRange, ApiError> {
+    let start_shard = ranges
+        .iter()
+        .map(|range| range.start_shard)
+        .min()
+        .ok_or_else(|| {
+            invalid_admin_request("range lifecycle requires at least one source range")
+        })?;
+    let end_shard = ranges
+        .iter()
+        .map(|range| range.end_shard)
+        .max()
+        .expect("source range start existed above");
+    Ok(tablet_ranges::ReplacementRange {
+        start_shard,
+        end_shard,
+        tablet_id,
+    })
+}
+
+async fn create_lifecycle_tablet_if_missing(
+    meta: &agentdb_meta::MetaStore,
+    source: &tablets::Tablet,
+    tablet_id: i64,
+    state: &str,
+    now_ms: i64,
+) -> Result<bool, ApiError> {
+    if tablets::get(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    let raft_group_id = format!("raft/{tablet_id}");
+    tablets::create_with_placement(
+        meta.pool(),
+        tablet_id,
+        &source.placement_scope_id,
+        state,
+        Some(&raft_group_id),
+        source.encryption_policy_version,
+        now_ms,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(true)
+}
+
 async fn get_admin_tablets(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
@@ -1603,6 +1722,351 @@ async fn replace_admin_tablet_ranges(
     Ok(Json(ReplaceTabletRangesResponse {
         placement_scope_id: body.placement_scope_id,
         changed: true,
+        ranges,
+    }))
+}
+
+async fn prepare_admin_tablet_split(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<SplitTabletBody>,
+) -> Result<Json<AdminTabletRangeLifecycleResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let source = get_tablet_or_404(meta, tablet_id).await?;
+    if body.child_ranges.len() < 2 {
+        return Err(invalid_admin_request(
+            "split prepare requires at least two child ranges",
+        ));
+    }
+    if body
+        .child_ranges
+        .iter()
+        .any(|range| range.tablet_id == tablet_id)
+    {
+        return Err(invalid_admin_request(
+            "split child tablet ids must be different from the parent",
+        ));
+    }
+    let placement_scope_id = body
+        .placement_scope_id
+        .unwrap_or_else(|| source.placement_scope_id.clone());
+    let old_ranges = scoped_ranges_for_tablet(meta, tablet_id, &placement_scope_id).await?;
+    if old_ranges.is_empty() {
+        return Err(invalid_admin_request(format!(
+            "tablet {tablet_id} has no ranges in placement scope {placement_scope_id}"
+        )));
+    }
+    let old_bounds = range_bounds(&old_ranges);
+    tablet_ranges::validate_replacement_plan(&old_bounds, &body.child_ranges)
+        .map_err(|err| invalid_admin_request(err.to_string()))?;
+    let now_ms = now_ms_i64();
+    let mut changed = tablets::set_state(meta.pool(), tablet_id, "splitting")
+        .await
+        .map_err(internal_error)?;
+    for child in &body.child_ranges {
+        changed |=
+            create_lifecycle_tablet_if_missing(meta, &source, child.tablet_id, "creating", now_ms)
+                .await?;
+    }
+    let tablets = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|tablet| {
+            tablet.tablet_id == tablet_id
+                || body
+                    .child_ranges
+                    .iter()
+                    .any(|child| child.tablet_id == tablet.tablet_id)
+        })
+        .map(tablet_view)
+        .collect();
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == placement_scope_id)
+        .collect();
+    Ok(Json(AdminTabletRangeLifecycleResponse {
+        action: "prepare_split",
+        changed,
+        placement_scope_id,
+        source_tablet_ids: vec![tablet_id],
+        destination_tablet_ids: body
+            .child_ranges
+            .iter()
+            .map(|range| range.tablet_id)
+            .collect(),
+        old_ranges: old_bounds,
+        new_ranges: body.child_ranges,
+        tablets,
+        ranges,
+    }))
+}
+
+async fn complete_admin_tablet_split(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<SplitTabletBody>,
+) -> Result<Json<AdminTabletRangeLifecycleResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let source = get_tablet_or_404(meta, tablet_id).await?;
+    if body.child_ranges.len() < 2 {
+        return Err(invalid_admin_request(
+            "split completion requires at least two child ranges",
+        ));
+    }
+    if source.state != "splitting" {
+        return Err(invalid_admin_request(
+            "split completion requires parent tablet state `splitting`",
+        ));
+    }
+    let map_epoch = body
+        .map_epoch
+        .ok_or_else(|| invalid_admin_request("split completion requires map_epoch"))?;
+    let placement_scope_id = body
+        .placement_scope_id
+        .unwrap_or_else(|| source.placement_scope_id.clone());
+    let old_ranges = scoped_ranges_for_tablet(meta, tablet_id, &placement_scope_id).await?;
+    if old_ranges.is_empty() {
+        return Err(invalid_admin_request(format!(
+            "tablet {tablet_id} has no ranges in placement scope {placement_scope_id}"
+        )));
+    }
+    for child in &body.child_ranges {
+        let child_tablet = get_tablet_or_404(meta, child.tablet_id).await?;
+        if child_tablet.state != "creating" && child_tablet.state != "serving" {
+            return Err(invalid_admin_request(
+                "split child tablets must be in `creating` or `serving` state",
+            ));
+        }
+    }
+    let old_bounds = range_bounds(&old_ranges);
+    tablet_ranges::replace_ranges(
+        meta.pool(),
+        &placement_scope_id,
+        &old_bounds,
+        &body.child_ranges,
+        map_epoch,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    for child in &body.child_ranges {
+        tablets::set_state(meta.pool(), child.tablet_id, "serving")
+            .await
+            .map_err(internal_error)?;
+    }
+    tablets::set_state(meta.pool(), tablet_id, "tombstoned")
+        .await
+        .map_err(internal_error)?;
+    let tablets = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|tablet| {
+            tablet.tablet_id == tablet_id
+                || body
+                    .child_ranges
+                    .iter()
+                    .any(|child| child.tablet_id == tablet.tablet_id)
+        })
+        .map(tablet_view)
+        .collect();
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == placement_scope_id)
+        .collect();
+    Ok(Json(AdminTabletRangeLifecycleResponse {
+        action: "complete_split",
+        changed: true,
+        placement_scope_id,
+        source_tablet_ids: vec![tablet_id],
+        destination_tablet_ids: body
+            .child_ranges
+            .iter()
+            .map(|range| range.tablet_id)
+            .collect(),
+        old_ranges: old_bounds,
+        new_ranges: body.child_ranges,
+        tablets,
+        ranges,
+    }))
+}
+
+async fn prepare_admin_tablet_merge(
+    State(s): State<AppState>,
+    Json(body): Json<MergeTabletsBody>,
+) -> Result<Json<AdminTabletRangeLifecycleResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    if body.source_tablet_ids.len() < 2 {
+        return Err(invalid_admin_request(
+            "merge prepare requires at least two source tablets",
+        ));
+    }
+    if body.source_tablet_ids.contains(&body.destination_tablet_id) {
+        return Err(invalid_admin_request(
+            "merge destination tablet id must be different from sources",
+        ));
+    }
+    let first_source = get_tablet_or_404(meta, body.source_tablet_ids[0]).await?;
+    let placement_scope_id = body
+        .placement_scope_id
+        .unwrap_or_else(|| first_source.placement_scope_id.clone());
+    let mut old_ranges = Vec::new();
+    for source_id in &body.source_tablet_ids {
+        let source = get_tablet_or_404(meta, *source_id).await?;
+        if source.placement_scope_id != first_source.placement_scope_id {
+            return Err(invalid_admin_request(
+                "merge sources must have the same placement scope",
+            ));
+        }
+        old_ranges.extend(scoped_ranges_for_tablet(meta, *source_id, &placement_scope_id).await?);
+    }
+    if old_ranges.is_empty() {
+        return Err(invalid_admin_request(
+            "merge sources have no ranges in the requested placement scope",
+        ));
+    }
+    let old_bounds = range_bounds(&old_ranges);
+    let new_range = union_replacement_range(&old_ranges, body.destination_tablet_id)?;
+    tablet_ranges::validate_replacement_plan(&old_bounds, &[new_range])
+        .map_err(|err| invalid_admin_request(err.to_string()))?;
+    let now_ms = now_ms_i64();
+    let mut changed = create_lifecycle_tablet_if_missing(
+        meta,
+        &first_source,
+        body.destination_tablet_id,
+        "creating",
+        now_ms,
+    )
+    .await?;
+    for source_id in &body.source_tablet_ids {
+        changed |= tablets::set_state(meta.pool(), *source_id, "merging")
+            .await
+            .map_err(internal_error)?;
+    }
+    let tablets = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|tablet| {
+            body.source_tablet_ids.contains(&tablet.tablet_id)
+                || tablet.tablet_id == body.destination_tablet_id
+        })
+        .map(tablet_view)
+        .collect();
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == placement_scope_id)
+        .collect();
+    Ok(Json(AdminTabletRangeLifecycleResponse {
+        action: "prepare_merge",
+        changed,
+        placement_scope_id,
+        source_tablet_ids: body.source_tablet_ids,
+        destination_tablet_ids: vec![body.destination_tablet_id],
+        old_ranges: old_bounds,
+        new_ranges: vec![new_range],
+        tablets,
+        ranges,
+    }))
+}
+
+async fn complete_admin_tablet_merge(
+    State(s): State<AppState>,
+    Json(body): Json<MergeTabletsBody>,
+) -> Result<Json<AdminTabletRangeLifecycleResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    if body.source_tablet_ids.len() < 2 {
+        return Err(invalid_admin_request(
+            "merge completion requires at least two source tablets",
+        ));
+    }
+    if body.source_tablet_ids.contains(&body.destination_tablet_id) {
+        return Err(invalid_admin_request(
+            "merge destination tablet id must be different from sources",
+        ));
+    }
+    let map_epoch = body
+        .map_epoch
+        .ok_or_else(|| invalid_admin_request("merge completion requires map_epoch"))?;
+    let first_source = get_tablet_or_404(meta, body.source_tablet_ids[0]).await?;
+    let destination = get_tablet_or_404(meta, body.destination_tablet_id).await?;
+    if destination.state != "creating" && destination.state != "serving" {
+        return Err(invalid_admin_request(
+            "merge destination tablet must be in `creating` or `serving` state",
+        ));
+    }
+    let placement_scope_id = body
+        .placement_scope_id
+        .unwrap_or_else(|| first_source.placement_scope_id.clone());
+    let mut old_ranges = Vec::new();
+    for source_id in &body.source_tablet_ids {
+        let source = get_tablet_or_404(meta, *source_id).await?;
+        if source.state != "merging" {
+            return Err(invalid_admin_request(
+                "merge completion requires every source tablet state `merging`",
+            ));
+        }
+        old_ranges.extend(scoped_ranges_for_tablet(meta, *source_id, &placement_scope_id).await?);
+    }
+    if old_ranges.is_empty() {
+        return Err(invalid_admin_request(
+            "merge sources have no ranges in the requested placement scope",
+        ));
+    }
+    let old_bounds = range_bounds(&old_ranges);
+    let new_range = union_replacement_range(&old_ranges, body.destination_tablet_id)?;
+    tablet_ranges::validate_replacement_plan(&old_bounds, &[new_range])
+        .map_err(|err| invalid_admin_request(err.to_string()))?;
+    tablet_ranges::replace_ranges(
+        meta.pool(),
+        &placement_scope_id,
+        &old_bounds,
+        &[new_range],
+        map_epoch,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    tablets::set_state(meta.pool(), body.destination_tablet_id, "serving")
+        .await
+        .map_err(internal_error)?;
+    for source_id in &body.source_tablet_ids {
+        tablets::set_state(meta.pool(), *source_id, "tombstoned")
+            .await
+            .map_err(internal_error)?;
+    }
+    let tablets = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|tablet| {
+            body.source_tablet_ids.contains(&tablet.tablet_id)
+                || tablet.tablet_id == body.destination_tablet_id
+        })
+        .map(tablet_view)
+        .collect();
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == placement_scope_id)
+        .collect();
+    Ok(Json(AdminTabletRangeLifecycleResponse {
+        action: "complete_merge",
+        changed: true,
+        placement_scope_id,
+        source_tablet_ids: body.source_tablet_ids,
+        destination_tablet_ids: vec![body.destination_tablet_id],
+        old_ranges: old_bounds,
+        new_ranges: vec![new_range],
+        tablets,
         ranges,
     }))
 }

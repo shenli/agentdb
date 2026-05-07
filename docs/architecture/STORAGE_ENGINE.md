@@ -541,15 +541,15 @@ cannot be divided.
 
 ```text
 1. Select parent tablet P and split points from observed shard/key traffic.
-2. Mark P as splitting and bump tablet epoch.
-3. Create child tablets C1..Cn in creating state.
+2. Prepare split: mark P as splitting and bump tablet epoch.
+3. Prepare split: create child tablets C1..Cn in creating state.
 4. Bootstrap child Raft groups and local applied-state stores.
 5. Snapshot or range-copy P's hot state into children by shard range.
 6. Replay P's committed log tail into children up to a cutover index.
-7. Publish tablet_range rows for children under a new map_epoch.
-8. Route new writes to children.
+7. Complete split: publish tablet_range rows for children under a new map_epoch.
+8. Complete split: mark children serving so new writes route to children.
 9. Drain P and reject/refresh stale-epoch writes.
-10. Tombstone P after all manifests, snapshots, and audit windows are safe.
+10. Complete split: tombstone P after routing cutover.
 ```
 
 Split-point selection should use observed traffic, not only midpoint:
@@ -577,14 +577,14 @@ are cold, tiny, or over-fragmented.
 ```text
 1. Select adjacent tablets with compatible placement scope, placement class,
    encryption policy, retention policy, and replica constraints.
-2. Mark source tablets S1..Sn as merging and bump epochs.
-3. Create destination tablet D in creating state.
+2. Prepare merge: mark source tablets S1..Sn as merging and bump epochs.
+3. Prepare merge: create destination tablet D in creating state.
 4. Snapshot or range-copy hot state from all sources into D.
 5. Replay committed log tails into D up to cutover indexes.
-6. Publish one tablet_range row for D under a new map_epoch.
-7. Route new writes to D.
+6. Complete merge: publish one tablet_range row for D under a new map_epoch.
+7. Complete merge: mark D serving so new writes route to D.
 8. Drain source tablets.
-9. Tombstone sources after retention and verification.
+9. Complete merge: tombstone sources after routing cutover.
 ```
 
 Merge must never combine dedicated tablets from different tenants. Shared pool
@@ -1035,8 +1035,10 @@ single-session appends or record writes.
    validation. Rebalance assigns unowned tablets with owner voter metadata and
    prepares owned-tablet movement by creating learner replica intent for the
    target, and completes prepared replacements once the target is healthy and
-   caught up. It does not yet copy/replay hot split state or coordinate
-   split-created Raft groups.
+   caught up. Admin split/merge lifecycle endpoints and `agentdbctl tablets`
+   commands can now prepare fenced source/destination tablet metadata and
+   complete atomic range-map cutovers. They do not yet copy/replay hot split
+   state or coordinate split-created Raft groups.
 
 9. Add compressed tablet-map ranges.
 
