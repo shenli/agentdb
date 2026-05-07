@@ -607,6 +607,7 @@ struct RuntimeTabletHandle {
 }
 
 struct RuntimeTabletRouterKvStore {
+    kv: Arc<dyn KvStore + Send + Sync>,
     default_tablet_id: i64,
     tablets: RwLock<BTreeMap<i64, RuntimeTabletHandle>>,
 }
@@ -640,9 +641,51 @@ impl RuntimeTabletRouterKvStore {
             );
         }
         Ok(Self {
+            kv,
             default_tablet_id,
             tablets: RwLock::new(tablets),
         })
+    }
+
+    fn register(
+        &self,
+        tablet_id: i64,
+        log: Arc<dyn ReplicatedLog + Send + Sync>,
+    ) -> agentdb_storage::Result<bool> {
+        let mut tablets = self
+            .tablets
+            .write()
+            .expect("runtime tablet router lock poisoned");
+        if tablets.contains_key(&tablet_id) {
+            return Ok(false);
+        }
+        let (kv_store, state_machine) =
+            RuntimeTabletKvStore::logged(self.kv.clone(), tablet_id, log)?;
+        tablets.insert(
+            tablet_id,
+            RuntimeTabletHandle {
+                kv_store: Arc::new(kv_store),
+                state_machine,
+            },
+        );
+        Ok(true)
+    }
+
+    fn unregister(&self, tablet_id: i64) -> bool {
+        self.tablets
+            .write()
+            .expect("runtime tablet router lock poisoned")
+            .remove(&tablet_id)
+            .is_some()
+    }
+
+    fn tablet_ids(&self) -> BTreeSet<i64> {
+        self.tablets
+            .read()
+            .expect("runtime tablet router lock poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 
     fn current_tablet_id() -> Option<i64> {
@@ -830,6 +873,154 @@ fn collect_kv_rows(
         rows.insert(key, value);
     }
     Ok(rows)
+}
+
+struct RuntimeHydration {
+    state: State,
+    idempotency_records: Vec<(String, IdempotencyRecord)>,
+    text_index: InMemoryInverted,
+    vector_index: HnswVectorIndex,
+    global_record_index: Arc<dyn GlobalRecordIndex>,
+}
+
+fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
+    let mut state = State::default();
+    for t in persist.scan_all_tenants().expect("hydrate tenants") {
+        state.tenants.insert(t.tenant_id.as_str().to_string(), t);
+    }
+    for a in persist.scan_all_agents().expect("hydrate agents") {
+        state.agents.insert(a.agent_id.as_str().to_string(), a);
+    }
+    for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
+        // Reconcile next_seq against persisted events.
+        let max_seq = persist
+            .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
+            .expect("hydrate session events");
+        if let Some(m) = max_seq {
+            if s.next_seq <= m {
+                s.next_seq = m + 1;
+            }
+        }
+        state.sessions.insert(s.session_id.as_str().to_string(), s);
+    }
+    for art in persist.scan_all_artifacts().expect("hydrate artifacts") {
+        state
+            .artifacts
+            .insert(art.artifact_id.as_str().to_string(), art);
+    }
+    // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
+    // runtime keeps enforcing the same constraints. We scan the alias prefixes
+    // directly rather than walking records; alias rows are the source of truth.
+    for (external_key, tenant_id) in persist
+        .scan_all_tenant_aliases()
+        .expect("hydrate tenant aliases")
+    {
+        state.tenant_aliases.insert(external_key, tenant_id);
+    }
+    for ((tenant, alias), agent_id) in persist
+        .scan_all_agent_aliases()
+        .expect("hydrate agent aliases")
+    {
+        state
+            .agent_aliases
+            .insert(scoped_alias_key(&tenant, &alias), agent_id);
+    }
+    for ((tenant, alias), session_id) in persist
+        .scan_all_session_aliases()
+        .expect("hydrate session aliases")
+    {
+        state
+            .session_aliases
+            .insert(scoped_alias_key(&tenant, &alias), session_id);
+    }
+    for skill in persist.scan_all_skills().expect("hydrate skills") {
+        if skill.deleted_at_ms.is_none() {
+            state
+                .skills
+                .insert(skill.skill_id.as_str().to_string(), skill);
+        }
+    }
+    for ((tenant, name, version), skill_id) in persist
+        .scan_all_skill_uniques()
+        .expect("hydrate skill uniqueness")
+    {
+        state
+            .skill_uniques
+            .insert(skill_unique_state_key(&tenant, &name, &version), skill_id);
+    }
+    for binding in persist
+        .scan_all_agent_skill_bindings()
+        .expect("hydrate agent skill bindings")
+    {
+        if binding.deleted_at_ms.is_none() {
+            state.agent_skill_bindings.insert(
+                (
+                    binding.agent_id.as_str().to_string(),
+                    binding.skill_id.as_str().to_string(),
+                ),
+                binding,
+            );
+        }
+    }
+
+    let idempotency_records = persist
+        .scan_all_idempotency()
+        .expect("hydrate idempotency records");
+    let mut hydrated_record_commit_seq: BTreeMap<String, u64> = persist
+        .scan_all_record_commit_seqs()
+        .expect("hydrate record commit sequences")
+        .into_iter()
+        .collect();
+    if let Some(max_commit_seq) = hydrated_record_commit_seq.values().copied().max() {
+        state.next_record_commit_seq = max_commit_seq;
+        state.local_record_index_watermark = max_commit_seq;
+    }
+
+    // Build the V2.2 text + vector indexes from scratch and replay every live
+    // record into them. DocIds are minted fresh per run; the reverse maps are
+    // rebuilt alongside, trading brief warm-up cost for no persisted doc ids.
+    let mut text_index = InMemoryInverted::new();
+    let mut vector_index = HnswVectorIndex::new();
+    let global_record_index: Arc<dyn GlobalRecordIndex> =
+        Arc::new(InMemoryGlobalRecordIndex::default());
+    for r in persist.scan_all_records().expect("hydrate records") {
+        if r.deleted_at_ms.is_some() || r.is_expired() {
+            continue;
+        }
+        let doc_id = mint_doc_id(&mut state.next_doc_seq);
+        index_record_into(&mut text_index, &mut vector_index, &r, doc_id);
+        state
+            .doc_to_record
+            .insert(doc_id, r.record_id.as_str().to_string());
+        state
+            .record_to_doc
+            .insert(r.record_id.as_str().to_string(), doc_id);
+        let commit_seq = hydrated_record_commit_seq
+            .remove(r.record_id.as_str())
+            .unwrap_or_else(|| next_record_commit_seq(&mut state));
+        state
+            .record_commit_seq
+            .insert(r.record_id.as_str().to_string(), commit_seq);
+        state.local_record_index_watermark = state.local_record_index_watermark.max(commit_seq);
+        state.next_record_commit_seq = state.next_record_commit_seq.max(commit_seq);
+        global_record_index
+            .apply(global_index_mutation_for_record(
+                &r,
+                commit_seq,
+                GlobalIndexMutationOp::Upsert,
+            ))
+            .expect("hydrate global record index");
+        state.global_record_index_watermark = state.global_record_index_watermark.max(commit_seq);
+        state.records.insert(r.record_id.as_str().to_string(), r);
+    }
+
+    RuntimeHydration {
+        state,
+        idempotency_records,
+        text_index,
+        vector_index,
+        global_record_index,
+    }
 }
 
 impl Runtime {
@@ -1274,155 +1465,20 @@ impl Runtime {
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
     ) -> Arc<Self> {
-        let mut state = State::default();
-        for t in persist.scan_all_tenants().expect("hydrate tenants") {
-            state.tenants.insert(t.tenant_id.as_str().to_string(), t);
-        }
-        for a in persist.scan_all_agents().expect("hydrate agents") {
-            state.agents.insert(a.agent_id.as_str().to_string(), a);
-        }
-        for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
-            // Reconcile next_seq against persisted events.
-            let max_seq = persist
-                .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
-                .expect("hydrate session events");
-            if let Some(m) = max_seq {
-                if s.next_seq <= m {
-                    s.next_seq = m + 1;
-                }
-            }
-            state.sessions.insert(s.session_id.as_str().to_string(), s);
-        }
-        for art in persist.scan_all_artifacts().expect("hydrate artifacts") {
-            state
-                .artifacts
-                .insert(art.artifact_id.as_str().to_string(), art);
-        }
-        // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
-        // runtime keeps enforcing the same constraints. We scan the alias
-        // prefixes directly rather than walking the records; alias rows are
-        // the source of truth for "this name is taken".
-        for (external_key, tenant_id) in persist
-            .scan_all_tenant_aliases()
-            .expect("hydrate tenant aliases")
-        {
-            state.tenant_aliases.insert(external_key, tenant_id);
-        }
-        for ((tenant, alias), agent_id) in persist
-            .scan_all_agent_aliases()
-            .expect("hydrate agent aliases")
-        {
-            state
-                .agent_aliases
-                .insert(scoped_alias_key(&tenant, &alias), agent_id);
-        }
-        for ((tenant, alias), session_id) in persist
-            .scan_all_session_aliases()
-            .expect("hydrate session aliases")
-        {
-            state
-                .session_aliases
-                .insert(scoped_alias_key(&tenant, &alias), session_id);
-        }
-        for skill in persist.scan_all_skills().expect("hydrate skills") {
-            if skill.deleted_at_ms.is_none() {
-                state
-                    .skills
-                    .insert(skill.skill_id.as_str().to_string(), skill);
-            }
-        }
-        for ((tenant, name, version), skill_id) in persist
-            .scan_all_skill_uniques()
-            .expect("hydrate skill uniqueness")
-        {
-            state
-                .skill_uniques
-                .insert(skill_unique_state_key(&tenant, &name, &version), skill_id);
-        }
-        for binding in persist
-            .scan_all_agent_skill_bindings()
-            .expect("hydrate agent skill bindings")
-        {
-            if binding.deleted_at_ms.is_none() {
-                state.agent_skill_bindings.insert(
-                    (
-                        binding.agent_id.as_str().to_string(),
-                        binding.skill_id.as_str().to_string(),
-                    ),
-                    binding,
-                );
-            }
-        }
-
+        let hydration = hydrate_runtime_from_persist(&persist);
         let idem = IdempotencyStore::default();
-        idem.extend(
-            persist
-                .scan_all_idempotency()
-                .expect("hydrate idempotency records"),
-        );
-        let mut hydrated_record_commit_seq: BTreeMap<String, u64> = persist
-            .scan_all_record_commit_seqs()
-            .expect("hydrate record commit sequences")
-            .into_iter()
-            .collect();
-        if let Some(max_commit_seq) = hydrated_record_commit_seq.values().copied().max() {
-            state.next_record_commit_seq = max_commit_seq;
-            state.local_record_index_watermark = max_commit_seq;
-        }
-
-        // Build the V2.2 text + vector indexes from scratch and replay
-        // every live record into them. DocIds are minted fresh per run
-        // (see `mint_doc_id`); the reverse map (`doc_to_record`) is
-        // rebuilt alongside, so a restart trades a brief warm-up cost
-        // for not having to persist the doc-id assignment.
-        let mut text_idx = InMemoryInverted::new();
-        let mut vector_idx = HnswVectorIndex::new();
-        let global_record_index: Arc<dyn GlobalRecordIndex> =
-            Arc::new(InMemoryGlobalRecordIndex::default());
-        for r in persist.scan_all_records().expect("hydrate records") {
-            if r.deleted_at_ms.is_some() || r.is_expired() {
-                // GC will reap these; skip them at hydration time so
-                // they don't leak into the indexes.
-                continue;
-            }
-            let doc_id = mint_doc_id(&mut state.next_doc_seq);
-            index_record_into(&mut text_idx, &mut vector_idx, &r, doc_id);
-            state
-                .doc_to_record
-                .insert(doc_id, r.record_id.as_str().to_string());
-            state
-                .record_to_doc
-                .insert(r.record_id.as_str().to_string(), doc_id);
-            let commit_seq = hydrated_record_commit_seq
-                .remove(r.record_id.as_str())
-                .unwrap_or_else(|| next_record_commit_seq(&mut state));
-            state
-                .record_commit_seq
-                .insert(r.record_id.as_str().to_string(), commit_seq);
-            state.local_record_index_watermark = state.local_record_index_watermark.max(commit_seq);
-            state.next_record_commit_seq = state.next_record_commit_seq.max(commit_seq);
-            global_record_index
-                .apply(global_index_mutation_for_record(
-                    &r,
-                    commit_seq,
-                    GlobalIndexMutationOp::Upsert,
-                ))
-                .expect("hydrate global record index");
-            state.global_record_index_watermark =
-                state.global_record_index_watermark.max(commit_seq);
-            state.records.insert(r.record_id.as_str().to_string(), r);
-        }
+        idem.extend(hydration.idempotency_records);
 
         Arc::new(Self {
-            state: Mutex::new(state),
+            state: Mutex::new(hydration.state),
             idem,
             persist: Some(persist),
             content,
             content_crypto,
             kms,
-            text_index: StdMutex::new(text_idx),
-            vector_index: StdMutex::new(vector_idx),
-            global_record_index,
+            text_index: StdMutex::new(hydration.text_index),
+            vector_index: StdMutex::new(hydration.vector_index),
+            global_record_index: hydration.global_record_index,
             tablet_router,
         })
     }
@@ -1454,6 +1510,46 @@ impl Runtime {
         Ok(true)
     }
 
+    pub async fn install_tablet_snapshot_payload_and_rehydrate(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        if !self.install_tablet_snapshot_payload(tablet_id, payload)? {
+            return Ok(false);
+        }
+        self.rehydrate_from_persist().await?;
+        Ok(true)
+    }
+
+    pub fn register_replicated_tablet(
+        &self,
+        tablet_id: i64,
+        log: Arc<dyn ReplicatedLog + Send + Sync>,
+    ) -> Result<bool> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "runtime tablet registration requires a replicated tablet router",
+            ));
+        };
+        router.register(tablet_id, log).map_err(internal)
+    }
+
+    pub fn unregister_replicated_tablet(&self, tablet_id: i64) -> Result<bool> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(false);
+        };
+        Ok(router.unregister(tablet_id))
+    }
+
+    pub fn registered_tablet_ids(&self) -> BTreeSet<i64> {
+        self.tablet_router
+            .as_ref()
+            .map(|router| router.tablet_ids())
+            .unwrap_or_else(|| BTreeSet::from([RUNTIME_PRIMARY_TABLET_ID]))
+    }
+
     pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {
         let Some(router) = self.tablet_router.as_ref() else {
             return Err(Error::new(
@@ -1464,6 +1560,39 @@ impl Runtime {
         router
             .compact_log_through(tablet_id, up_to_index)
             .map_err(internal)
+    }
+
+    async fn rehydrate_from_persist(&self) -> Result<()> {
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        let hydration = hydrate_runtime_from_persist(persist);
+        self.idem.replace(hydration.idempotency_records);
+        {
+            let mut state = self.state.lock().await;
+            *state = hydration.state;
+        }
+        *self.text_index.lock().expect("text index lock poisoned") = hydration.text_index;
+        *self
+            .vector_index
+            .lock()
+            .expect("vector index lock poisoned") = hydration.vector_index;
+        self.global_record_index.reset()?;
+        let state = self.state.lock().await;
+        for record in state.records.values() {
+            let commit_seq = state
+                .record_commit_seq
+                .get(record.record_id.as_str())
+                .copied()
+                .unwrap_or(0);
+            self.global_record_index
+                .apply(global_index_mutation_for_record(
+                    record,
+                    commit_seq,
+                    GlobalIndexMutationOp::Upsert,
+                ))?;
+        }
+        Ok(())
     }
 
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {

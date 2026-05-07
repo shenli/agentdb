@@ -265,8 +265,19 @@ async fn runtime_tablet_context_routes_writes_and_snapshots_by_tablet() {
     let target_runtime =
         Runtime::with_kv_and_replicated_logs(target_kv.clone(), content(), target_logs.clone());
     assert!(target_runtime
-        .install_tablet_snapshot_payload(7, &payload)
+        .install_tablet_snapshot_payload_and_rehydrate(7, &payload)
+        .await
         .unwrap());
+
+    let live_read_runtime = target_runtime.clone();
+    let live_tenant_id = tenant.tenant_id.clone();
+    let live_hydrated = target_runtime
+        .with_tablet_context(7, async move {
+            live_read_runtime.get_tenant(&live_tenant_id).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(live_hydrated.external_key, "tablet-seven-tenant");
 
     let restarted_runtime = Runtime::with_kv_and_replicated_logs(target_kv, content(), target_logs);
     let read_runtime = restarted_runtime.clone();
@@ -277,4 +288,47 @@ async fn runtime_tablet_context_routes_writes_and_snapshots_by_tablet() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "tablet-seven-tenant");
+}
+
+#[tokio::test]
+async fn runtime_can_register_new_replicated_tablets_after_startup() {
+    let dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+    let primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(kv.clone()));
+    let runtime = Runtime::with_kv_and_replicated_logs(
+        kv.clone(),
+        content(),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, primary_log)]),
+    );
+    assert!(!runtime.registered_tablet_ids().contains(&7));
+
+    let tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(kv));
+    assert!(runtime.register_replicated_tablet(7, tablet_log).unwrap());
+    assert!(runtime.registered_tablet_ids().contains(&7));
+
+    let create_runtime = runtime.clone();
+    let tenant = runtime
+        .with_tablet_context(7, async move {
+            create_runtime
+                .create_tenant(NewTenant {
+                    external_key: "late-tablet".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    let read_runtime = runtime.clone();
+    let hydrated = runtime
+        .with_tablet_context(7, async move {
+            read_runtime.get_tenant(&tenant.tenant_id).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(hydrated.external_key, "late-tablet");
+
+    assert!(runtime.unregister_replicated_tablet(7).unwrap());
+    assert!(!runtime.registered_tablet_ids().contains(&7));
 }
