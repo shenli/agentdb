@@ -92,6 +92,12 @@ And a very small amount of direct metadata admin:
   for source-owner handoff acknowledgement
 - `agentdbctl tablets cancel-handoff <tablet_id>` for retracting a handoff
   signal
+- `agentdbctl tablets prepare-replacement <tablet_id> <target_node_id>` to
+  register a replacement target as a learner and mark it as the handoff target
+- `agentdbctl tablets complete-replacement <tablet_id> <target_node_id>` to
+  promote a healthy, caught-up replacement target to owner; use
+  `--min-applied-index` when source replica progress is unavailable and
+  `--retire-source` when the old owner should be removed from replica metadata
 - `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
   for assigning unowned tablets, moving tablets away from fresh draining nodes,
   and evening out fresh `alive` node load

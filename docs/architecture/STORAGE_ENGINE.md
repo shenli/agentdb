@@ -999,9 +999,20 @@ single-session appends or record writes.
    metadata deleted. The server also runs a restore worker that finds the
    newest retained object-store snapshot for the local node, downloads and
    verifies the bytes, installs the Raft snapshot into the local group, and
-   applies the embedded tablet-state snapshot to runtime state. Remaining
-   production work is coordinating this restore path with automated tablet
-   replacement workflows.
+   applies the embedded tablet-state snapshot to runtime state. Operators can
+   now drive replacement as a fenced workflow:
+   `POST /api/admin/tablets/:tablet_id/replacement/prepare` or
+   `agentdbctl tablets prepare-replacement` registers the target node as a
+   learner and marks it as the tablet handoff target; snapshot restore and
+   catch-up then advance the target replica's applied index; finally
+   `POST /api/admin/tablets/:tablet_id/replacement/complete` or
+   `agentdbctl tablets complete-replacement` requires the target to be healthy
+   and caught up before promoting it to owner. If the API node has the local
+   Raft group registered, completion also proposes the `raft-rs` membership
+   promotion, and `--retire-source` removes the old node from Raft and
+   `tablet_replicas`. Remaining production work is automating when this
+   operator workflow should run and integrating it with split/merge placement
+   policy.
 
 8. Add tablet split and rebalance.
 

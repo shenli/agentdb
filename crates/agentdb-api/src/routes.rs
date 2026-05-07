@@ -137,6 +137,14 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/tablets/:tablet_id/handoff/cancel",
             post(cancel_admin_tablet_handoff),
         )
+        .route(
+            "/api/admin/tablets/:tablet_id/replacement/prepare",
+            post(prepare_admin_tablet_replacement),
+        )
+        .route(
+            "/api/admin/tablets/:tablet_id/replacement/complete",
+            post(complete_admin_tablet_replacement),
+        )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/admin/raft", get(get_raft_status))
@@ -380,6 +388,17 @@ struct AdminTabletView {
     handoff_target_node_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminTabletReplicaView {
+    tablet_id: i64,
+    node_id: String,
+    role: String,
+    health: String,
+    applied_index: i64,
+    match_index: i64,
+    updated_at_ms: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateTabletBody {
     tablet_id: i64,
@@ -438,6 +457,22 @@ struct CompleteHandoffBody {
     expected_source_node_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PrepareTabletReplacementBody {
+    target_node_id: String,
+    source_node_id: Option<String>,
+    stale_threshold_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteTabletReplacementBody {
+    target_node_id: String,
+    source_node_id: Option<String>,
+    min_applied_index: Option<i64>,
+    require_healthy: Option<bool>,
+    retire_source: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 struct AdminTabletMutationResponse {
     action: &'static str,
@@ -451,6 +486,32 @@ struct AdminTabletHandoffCompleteResponse {
     changed: bool,
     new_owner_node_id: Option<String>,
     tablet: AdminTabletView,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletReplacementPrepareResponse {
+    action: &'static str,
+    changed: bool,
+    source_node_id: Option<String>,
+    target_node_id: String,
+    tablet: AdminTabletView,
+    source_replica: Option<AdminTabletReplicaView>,
+    target_replica: AdminTabletReplicaView,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletReplacementCompleteResponse {
+    action: &'static str,
+    changed: bool,
+    new_owner_node_id: Option<String>,
+    source_node_id: Option<String>,
+    target_node_id: String,
+    required_applied_index: i64,
+    raft_membership_changed: bool,
+    retired_source: bool,
+    tablet: AdminTabletView,
+    source_replica: Option<AdminTabletReplicaView>,
+    target_replica: AdminTabletReplicaView,
 }
 
 #[derive(Debug, Serialize)]
@@ -1391,6 +1452,18 @@ fn tablet_view(tablet: tablets::Tablet) -> AdminTabletView {
     }
 }
 
+fn tablet_replica_view(replica: tablet_replicas::TabletReplica) -> AdminTabletReplicaView {
+    AdminTabletReplicaView {
+        tablet_id: replica.tablet_id,
+        node_id: replica.node_id,
+        role: replica.role,
+        health: replica.health,
+        applied_index: replica.applied_index,
+        match_index: replica.match_index,
+        updated_at_ms: replica.updated_at_ms,
+    }
+}
+
 async fn get_tablet_or_404(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
@@ -1423,6 +1496,18 @@ async fn require_assignable_node(
         )));
     }
     Ok(node)
+}
+
+async fn get_tablet_replica(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    node_id: &str,
+) -> Result<Option<tablet_replicas::TabletReplica>, ApiError> {
+    Ok(tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .find(|replica| replica.node_id == node_id))
 }
 
 async fn get_admin_tablets(
@@ -1663,6 +1748,250 @@ async fn cancel_admin_tablet_handoff(
         action: "cancel_handoff",
         changed,
         tablet: tablet_view(tablet),
+    }))
+}
+
+async fn prepare_admin_tablet_replacement(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<PrepareTabletReplacementBody>,
+) -> Result<Json<AdminTabletReplacementPrepareResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    if tablet.owner_node_id.as_deref() == Some(body.target_node_id.as_str()) {
+        return Err(invalid_admin_request(
+            "replacement target must be different from the current owner",
+        ));
+    }
+    let source_node_id = body.source_node_id.or(tablet.owner_node_id.clone());
+    if source_node_id.is_none() {
+        return Err(invalid_admin_request(
+            "tablet replacement requires a current owner or explicit source_node_id",
+        ));
+    }
+    if let Some(source_node_id) = source_node_id.as_ref() {
+        if tablet.owner_node_id.as_ref() != Some(source_node_id) {
+            return Err(invalid_admin_request(format!(
+                "source node {source_node_id} must match the current tablet owner"
+            )));
+        }
+    }
+    let now_ms = now_ms_i64();
+    let stale_threshold_ms = body.stale_threshold_ms.unwrap_or(15_000);
+    let _ = require_assignable_node(meta, &body.target_node_id, now_ms, stale_threshold_ms).await?;
+    let existing_target = get_tablet_replica(meta, tablet_id, &body.target_node_id).await?;
+    let target_applied = existing_target
+        .as_ref()
+        .map(|replica| replica.applied_index)
+        .unwrap_or(0);
+    let target_match = existing_target
+        .as_ref()
+        .map(|replica| replica.match_index)
+        .unwrap_or(0);
+    let target_health = existing_target
+        .as_ref()
+        .map(|replica| replica.health.as_str())
+        .unwrap_or("lagging");
+    tablet_replicas::upsert(
+        meta.pool(),
+        tablet_id,
+        &body.target_node_id,
+        "learner",
+        target_health,
+        target_applied,
+        target_match,
+        now_ms,
+    )
+    .await
+    .map_err(internal_error)?;
+    let handoff_changed = tablets::mark_for_handoff(meta.pool(), tablet_id, &body.target_node_id)
+        .await
+        .map_err(internal_error)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
+        get_tablet_replica(meta, tablet_id, source_node_id).await?
+    } else {
+        None
+    };
+    let target_replica = get_tablet_replica(meta, tablet_id, &body.target_node_id)
+        .await?
+        .expect("target replica upserted above");
+    Ok(Json(AdminTabletReplacementPrepareResponse {
+        action: "prepare_replacement",
+        changed: handoff_changed
+            || existing_target
+                .as_ref()
+                .map(|replica| replica.role != "learner")
+                .unwrap_or(true),
+        source_node_id,
+        target_node_id: body.target_node_id,
+        tablet: tablet_view(tablet),
+        source_replica: source_replica.map(tablet_replica_view),
+        target_replica: tablet_replica_view(target_replica),
+    }))
+}
+
+async fn complete_admin_tablet_replacement(
+    State(s): State<AppState>,
+    Path(tablet_id): Path<i64>,
+    Json(body): Json<CompleteTabletReplacementBody>,
+) -> Result<Json<AdminTabletReplacementCompleteResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    if tablet.owner_node_id.as_deref() == Some(body.target_node_id.as_str()) {
+        return Err(invalid_admin_request(
+            "replacement target already owns the tablet",
+        ));
+    }
+    let source_node_id = body.source_node_id.or(tablet.owner_node_id.clone());
+    if source_node_id.is_none() {
+        return Err(invalid_admin_request(
+            "tablet replacement requires a current owner or explicit source_node_id",
+        ));
+    }
+    if let Some(source_node_id) = source_node_id.as_ref() {
+        if tablet.owner_node_id.as_ref() != Some(source_node_id) {
+            return Err(invalid_admin_request(format!(
+                "source node {source_node_id} must match the current tablet owner"
+            )));
+        }
+    }
+    if tablet.handoff_target_node_id.as_deref() != Some(body.target_node_id.as_str()) {
+        return Err(invalid_admin_request(
+            "replacement must be prepared before it can be completed",
+        ));
+    }
+    let target_replica = get_tablet_replica(meta, tablet_id, &body.target_node_id)
+        .await?
+        .ok_or_else(|| {
+            invalid_admin_request(format!(
+                "target replica {} does not exist for tablet {tablet_id}",
+                body.target_node_id
+            ))
+        })?;
+    if body.require_healthy.unwrap_or(true) && target_replica.health != "healthy" {
+        return Err(invalid_admin_request(format!(
+            "target replica {} is {}; wait for catch-up or set require_healthy=false",
+            body.target_node_id, target_replica.health
+        )));
+    }
+    let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
+        get_tablet_replica(meta, tablet_id, source_node_id).await?
+    } else {
+        None
+    };
+    let required_applied_index = if let Some(min_applied_index) = body.min_applied_index {
+        min_applied_index
+    } else if let Some(source_replica) = source_replica.as_ref() {
+        source_replica.applied_index
+    } else {
+        return Err(invalid_admin_request(
+            "min_applied_index is required when source replica progress is unavailable",
+        ));
+    };
+    if required_applied_index < 0 {
+        return Err(invalid_admin_request(
+            "min_applied_index must be non-negative",
+        ));
+    }
+    if target_replica.applied_index < required_applied_index {
+        return Err(invalid_admin_request(format!(
+            "target replica {} applied_index {} is below required_applied_index {}",
+            body.target_node_id, target_replica.applied_index, required_applied_index
+        )));
+    }
+
+    let retire_source = body.retire_source.unwrap_or(false);
+    let mut raft_membership_changed = false;
+    if let Some(registry) = s.raft_registry.as_ref() {
+        if let Ok(statuses) = registry.status_for(tablet_id) {
+            let leader_id = statuses
+                .iter()
+                .find(|status| status.role == "Leader")
+                .map(|status| status.node_id)
+                .or_else(|| {
+                    statuses
+                        .iter()
+                        .find(|status| status.leader_id != 0)
+                        .map(|status| status.leader_id)
+                })
+                .ok_or_else(|| invalid_admin_request("tablet raft group has no known leader"))?;
+            let target_raft_node_id = agentdb_storage::stable_raft_node_id(&body.target_node_id)
+                .map_err(internal_error)?;
+            registry
+                .promote_to_voter(tablet_id, leader_id, target_raft_node_id)
+                .map_err(internal_error)?;
+            raft_membership_changed = true;
+            if retire_source {
+                if let Some(source_node_id) = source_node_id.as_ref() {
+                    let source_raft_node_id = agentdb_storage::stable_raft_node_id(source_node_id)
+                        .map_err(internal_error)?;
+                    registry
+                        .remove_node(tablet_id, leader_id, source_raft_node_id)
+                        .map_err(internal_error)?;
+                }
+            }
+        } else if retire_source {
+            if let Some(source_node_id) = source_node_id.as_ref() {
+                registry
+                    .status_for(tablet_id)
+                    .map_err(|err| {
+                        invalid_admin_request(format!(
+                            "cannot retire source {source_node_id}; tablet raft group is not registered on this API node: {err}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let now_ms = now_ms_i64();
+    tablet_replicas::upsert(
+        meta.pool(),
+        tablet_id,
+        &body.target_node_id,
+        "voter",
+        &target_replica.health,
+        target_replica.applied_index,
+        target_replica.match_index,
+        now_ms,
+    )
+    .await
+    .map_err(internal_error)?;
+    if retire_source {
+        if let Some(source_node_id) = source_node_id.as_ref() {
+            let _ = tablet_replicas::delete(meta.pool(), tablet_id, source_node_id)
+                .await
+                .map_err(internal_error)?;
+        }
+    }
+    let expected_source = source_node_id.clone().ok_or_else(|| {
+        invalid_admin_request("source_node_id is required to complete tablet replacement")
+    })?;
+    let new_owner = tablets::complete_handoff(meta.pool(), tablet_id, &expected_source)
+        .await
+        .map_err(internal_error)?;
+    let changed = new_owner.is_some();
+    let tablet = get_tablet_or_404(meta, tablet_id).await?;
+    let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
+        get_tablet_replica(meta, tablet_id, source_node_id).await?
+    } else {
+        None
+    };
+    let target_replica = get_tablet_replica(meta, tablet_id, &body.target_node_id)
+        .await?
+        .expect("target replica upserted above");
+    Ok(Json(AdminTabletReplacementCompleteResponse {
+        action: "complete_replacement",
+        changed,
+        new_owner_node_id: new_owner,
+        source_node_id,
+        target_node_id: body.target_node_id,
+        required_applied_index,
+        raft_membership_changed,
+        retired_source: retire_source,
+        tablet: tablet_view(tablet),
+        source_replica: source_replica.map(tablet_replica_view),
+        target_replica: tablet_replica_view(target_replica),
     }))
 }
 
