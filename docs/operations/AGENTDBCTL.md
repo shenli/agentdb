@@ -68,6 +68,8 @@ Raft catch-up:
 agentdbctl raft status
 agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b --dry-run
 agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b --min-lag 128
+agentdbctl raft snapshots --tablet-id 7
+agentdbctl raft prune-snapshots --dry-run
 ```
 
 Backup and restore validation:

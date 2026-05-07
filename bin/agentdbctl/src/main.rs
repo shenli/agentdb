@@ -175,6 +175,20 @@ enum TabletsCommand {
 enum RaftCommand {
     /// Show local Raft groups and configured replica progress.
     Status,
+    /// List retained Raft snapshot metadata.
+    Snapshots {
+        #[arg(long)]
+        tablet_id: Option<i64>,
+        #[arg(long)]
+        include_deleted: bool,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Mark expired retained snapshot metadata deleted.
+    PruneSnapshots {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Trigger snapshot catch-up for lagging replicas.
     CatchUp {
         #[arg(long)]
@@ -366,6 +380,35 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
 async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
     match command {
         RaftCommand::Status => api.get("/api/admin/raft").await,
+        RaftCommand::Snapshots {
+            tablet_id,
+            include_deleted,
+            limit,
+        } => {
+            let mut path = "/api/admin/raft/snapshots".to_string();
+            let mut params = Vec::new();
+            if let Some(tablet_id) = tablet_id {
+                params.push(format!("tablet_id={tablet_id}"));
+            }
+            if include_deleted {
+                params.push("include_deleted=true".to_string());
+            }
+            if let Some(limit) = limit {
+                params.push(format!("limit={limit}"));
+            }
+            if !params.is_empty() {
+                path.push('?');
+                path.push_str(&params.join("&"));
+            }
+            api.get(&path).await
+        }
+        RaftCommand::PruneSnapshots { dry_run } => {
+            api.post(
+                "/api/admin/raft/snapshots/prune",
+                json!({ "dry_run": dry_run }),
+            )
+            .await
+        }
         RaftCommand::CatchUp {
             tablet_id,
             target_node_id,
@@ -642,6 +685,11 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "to_raft_node_id",
         "lag",
         "snapshot_index",
+        "snapshot_id",
+        "target_raft_node_id",
+        "size_bytes",
+        "age_ms",
+        "expired",
         "handoff_target_node_id",
         "is_stale",
         "ready",

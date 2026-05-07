@@ -100,6 +100,12 @@ And a very small amount of direct metadata admin:
 - `agentdbctl raft catch-up --dry-run` for previewing snapshot catch-up
   candidates, and `agentdbctl raft catch-up` for manually sending snapshots to
   lagging voter/learner replicas
+- `agentdbctl raft snapshots` for retained snapshot metadata, including age,
+  expiry, size, checksum, source node, target node, and storage URI when a
+  retained object exists
+- `agentdbctl raft prune-snapshots --dry-run` and
+  `agentdbctl raft prune-snapshots` for retention cleanup of expired retained
+  snapshot metadata
 - `agentdbctl backup create ...` for an online backup manifest and optional
   metadata snapshot
 - `agentdbctl restore validate <manifest-path>` for backup manifest validation;

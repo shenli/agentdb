@@ -986,8 +986,14 @@ single-session appends or record writes.
    after successful delivery. Operators can also inspect catch-up readiness
    through `GET /api/admin/raft` and trigger a dry-run or real catch-up pass
    with `POST /api/admin/raft/catch-up` or `agentdbctl raft catch-up`.
-   Remaining production work is async object-store upload/download for large
-   retained snapshots and an explicit snapshot-retention policy.
+   Successful snapshot sends are cataloged in `tablet_snapshots` with source
+   and target node ids, Raft index/term, size, checksum, optional storage URI,
+   and `expires_at_ms`. `GET /api/admin/raft/snapshots` and
+   `agentdbctl raft snapshots` expose retained snapshot age and expiry state;
+   `POST /api/admin/raft/snapshots/prune` and
+   `agentdbctl raft prune-snapshots` mark expired snapshot metadata deleted.
+   Remaining production work is uploading large retained snapshots to shared
+   object storage and deleting those objects during retention pruning.
 
 8. Add tablet split and rebalance.
 
@@ -1049,10 +1055,11 @@ single-session appends or record writes.
     for object-store mirror backlog are exposed through
     `/api/admin/content-mirror`; live local Raft tablet/replica commit and
     applied indexes, configured-replica lag, and catch-up-required flags are
-    exposed through `/api/admin/raft`. `POST /api/admin/raft/catch-up` and
+    exposed through `/api/admin/raft`. Retained snapshot age, expiry, size,
+    checksum, source, and target are exposed through
+    `/api/admin/raft/snapshots`. `POST /api/admin/raft/catch-up` and
     `agentdbctl raft catch-up` provide an operator-triggered catch-up path for
-    lagging replicas. Compaction debt and retained snapshot age still need the
-    underlying workers.
+    lagging replicas. Compaction debt still needs the underlying worker.
 
 ## Non-Goals
 

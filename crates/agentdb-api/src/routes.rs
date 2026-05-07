@@ -38,8 +38,8 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    nodes, session_locators, tablet_ranges, tablet_rebalance, tablet_replicas, tablets,
-    tenant_policies, tenants,
+    nodes, session_locators, tablet_ranges, tablet_rebalance, tablet_replicas, tablet_snapshots,
+    tablets, tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -62,6 +62,7 @@ const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
+const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -140,6 +141,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/admin/raft", get(get_raft_status))
         .route("/api/admin/raft/catch-up", post(post_raft_catch_up))
+        .route("/api/admin/raft/snapshots", get(get_raft_snapshots))
+        .route(
+            "/api/admin/raft/snapshots/prune",
+            post(post_raft_snapshot_prune),
+        )
         .route("/api/admin/indexes/records", get(get_record_index_status))
         .route("/api/admin/content-mirror", get(get_content_mirror_status))
         .route("/api/admin/backups", post(create_admin_backup))
@@ -277,6 +283,18 @@ fn now_ms_i64() -> i64 {
 
 fn raft_index_to_i64(index: u64) -> Result<i64, ApiError> {
     i64::try_from(index).map_err(|_| internal_error(format!("raft index {index} exceeds i64::MAX")))
+}
+
+fn raft_snapshot_id(tablet_id: i64, from: u64, to: u64, index: u64) -> String {
+    format!("tablet-{tablet_id}-from-{from}-to-{to}-idx-{index}")
+}
+
+fn snapshot_expires_at(now_ms: i64, retention_ms: Option<i64>) -> Result<Option<i64>, ApiError> {
+    let retention_ms = retention_ms.unwrap_or(DEFAULT_RAFT_SNAPSHOT_RETENTION_MS);
+    if retention_ms < 0 {
+        return Err(invalid_admin_request("retention_ms must be non-negative"));
+    }
+    Ok(now_ms.checked_add(retention_ms))
 }
 
 fn drain_status_response(s: &AppState) -> DrainStatusResponse {
@@ -570,6 +588,10 @@ struct RaftConfiguredReplicaStatus {
     match_index: i64,
     replication_lag: u64,
     catch_up_required: bool,
+    last_snapshot_index: Option<i64>,
+    last_snapshot_age_ms: Option<i64>,
+    last_snapshot_status: Option<String>,
+    last_snapshot_expires_at_ms: Option<i64>,
     updated_at_ms: i64,
     local_runtime: bool,
     runtime_role: Option<String>,
@@ -584,6 +606,7 @@ struct RaftCatchUpBody {
     tablet_id: Option<i64>,
     target_node_id: Option<String>,
     min_lag: Option<u64>,
+    retention_ms: Option<i64>,
     dry_run: Option<bool>,
 }
 
@@ -615,6 +638,51 @@ struct RaftCatchUpFailure {
     node_id: String,
     to_raft_node_id: Option<u64>,
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RaftSnapshotsQuery {
+    tablet_id: Option<i64>,
+    include_deleted: Option<bool>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftSnapshotsResponse {
+    snapshots: Vec<RaftSnapshotView>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftSnapshotView {
+    snapshot_id: String,
+    tablet_id: i64,
+    source_node_id: String,
+    source_raft_node_id: i64,
+    target_node_id: String,
+    target_raft_node_id: i64,
+    snapshot_index: i64,
+    snapshot_term: i64,
+    size_bytes: i64,
+    sha256_hex: String,
+    storage_uri: Option<String>,
+    status: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    expires_at_ms: Option<i64>,
+    age_ms: i64,
+    expired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RaftSnapshotPruneBody {
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftSnapshotPruneResponse {
+    dry_run: bool,
+    expired_snapshot_count: i64,
+    deleted_snapshot_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1707,6 +1775,7 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
 
 async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusResponse>, ApiError> {
     let configured_by_tablet = load_configured_raft_replicas(s.meta.as_ref()).await?;
+    let latest_snapshots = load_latest_raft_snapshots(s.meta.as_ref()).await?;
     let Some(registry) = s.raft_registry.as_ref() else {
         let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
         let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
@@ -1737,7 +1806,14 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
                 .collect();
             let configured = configured_by_tablet
                 .get(&tablet_id)
-                .map(|replicas| configured_raft_replica_statuses(replicas, &runtime_replicas))
+                .map(|replicas| {
+                    configured_raft_replica_statuses(
+                        replicas,
+                        &runtime_replicas,
+                        &latest_snapshots,
+                        now_ms_i64(),
+                    )
+                })
                 .unwrap_or_default();
             RaftTabletStatus {
                 tablet_id,
@@ -1775,6 +1851,8 @@ async fn post_raft_catch_up(
     let configured_by_tablet = load_configured_raft_replicas(Some(meta)).await?;
     let dry_run = body.dry_run.unwrap_or(false);
     let min_lag = body.min_lag.unwrap_or(1);
+    let now_ms = now_ms_i64();
+    let expires_at_ms = snapshot_expires_at(now_ms, body.retention_ms)?;
     let mut response = RaftCatchUpResponse {
         dry_run,
         tablet_count: 0,
@@ -1813,6 +1891,8 @@ async fn post_raft_catch_up(
             response.skipped += 1;
             continue;
         };
+        let source_node_id = raft_node_label(replicas, source_status.node_id)
+            .unwrap_or_else(|| source_status.node_id.to_string());
         let mut application_snapshot: Option<Vec<u8>> = None;
         let mut compact_through = 0u64;
         for replica in replicas {
@@ -1932,6 +2012,26 @@ async fn post_raft_catch_up(
             {
                 Ok(()) => {
                     let index = raft_index_to_i64(transfer.index)?;
+                    tablet_snapshots::record(
+                        meta.pool(),
+                        &raft_snapshot_id(tablet_id, transfer.from, transfer.to, transfer.index),
+                        tablet_id,
+                        &source_node_id,
+                        raft_index_to_i64(transfer.from)?,
+                        &replica.node_id,
+                        raft_index_to_i64(transfer.to)?,
+                        index,
+                        raft_index_to_i64(transfer.term)?,
+                        i64::try_from(transfer.payload.len())
+                            .map_err(|_| internal_error("snapshot payload exceeds i64::MAX"))?,
+                        &agentdb_storage::sha256_hex(&transfer.payload),
+                        None,
+                        "available",
+                        now_ms_i64(),
+                        expires_at_ms,
+                    )
+                    .await
+                    .map_err(internal_error)?;
                     tablet_replicas::set_progress(
                         meta.pool(),
                         tablet_id,
@@ -1998,6 +2098,46 @@ async fn post_raft_catch_up(
     Ok(Json(response))
 }
 
+async fn get_raft_snapshots(
+    State(s): State<AppState>,
+    Query(query): Query<RaftSnapshotsQuery>,
+) -> Result<Json<RaftSnapshotsResponse>, ApiError> {
+    if query.tablet_id.is_some_and(|tablet_id| tablet_id <= 0) {
+        return Err(invalid_admin_request("tablet_id must be positive"));
+    }
+    let meta = meta_required(&s)?;
+    let now_ms = now_ms_i64();
+    let snapshots = tablet_snapshots::list_recent(
+        meta.pool(),
+        query.tablet_id,
+        query.include_deleted.unwrap_or(false),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    .map_err(internal_error)?
+    .into_iter()
+    .map(|snapshot| raft_snapshot_view(snapshot, now_ms))
+    .collect();
+    Ok(Json(RaftSnapshotsResponse { snapshots }))
+}
+
+async fn post_raft_snapshot_prune(
+    State(s): State<AppState>,
+    Json(body): Json<RaftSnapshotPruneBody>,
+) -> Result<Json<RaftSnapshotPruneResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let dry_run = body.dry_run.unwrap_or(false);
+    let expired_snapshot_count =
+        tablet_snapshots::mark_expired_deleted(meta.pool(), now_ms_i64(), dry_run)
+            .await
+            .map_err(internal_error)?;
+    Ok(Json(RaftSnapshotPruneResponse {
+        dry_run,
+        expired_snapshot_count,
+        deleted_snapshot_count: if dry_run { 0 } else { expired_snapshot_count },
+    }))
+}
+
 async fn load_configured_raft_replicas(
     meta: Option<&agentdb_meta::MetaStore>,
 ) -> Result<BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>, ApiError> {
@@ -2044,6 +2184,67 @@ async fn load_raft_peer_urls(
     Ok(peer_urls)
 }
 
+async fn load_latest_raft_snapshots(
+    meta: Option<&agentdb_meta::MetaStore>,
+) -> Result<BTreeMap<(i64, String), tablet_snapshots::TabletSnapshot>, ApiError> {
+    let Some(meta) = meta else {
+        return Ok(BTreeMap::new());
+    };
+    let mut latest = BTreeMap::new();
+    for snapshot in tablet_snapshots::latest_available_by_tablet(meta.pool())
+        .await
+        .map_err(internal_error)?
+    {
+        let key = (snapshot.tablet_id, snapshot.target_node_id.clone());
+        let replace = latest
+            .get(&key)
+            .map(|existing: &tablet_snapshots::TabletSnapshot| {
+                snapshot.snapshot_index > existing.snapshot_index
+            })
+            .unwrap_or(true);
+        if replace {
+            latest.insert(key, snapshot);
+        }
+    }
+    Ok(latest)
+}
+
+fn raft_node_label(
+    replicas: &[tablet_replicas::TabletReplica],
+    raft_node_id: u64,
+) -> Option<String> {
+    replicas.iter().find_map(|replica| {
+        let candidate = agentdb_storage::stable_raft_node_id(&replica.node_id).ok()?;
+        (candidate == raft_node_id).then(|| replica.node_id.clone())
+    })
+}
+
+fn raft_snapshot_view(snapshot: tablet_snapshots::TabletSnapshot, now_ms: i64) -> RaftSnapshotView {
+    let expired = snapshot
+        .expires_at_ms
+        .map(|expires_at_ms| expires_at_ms <= now_ms)
+        .unwrap_or(false);
+    RaftSnapshotView {
+        snapshot_id: snapshot.snapshot_id,
+        tablet_id: snapshot.tablet_id,
+        source_node_id: snapshot.source_node_id,
+        source_raft_node_id: snapshot.source_raft_node_id,
+        target_node_id: snapshot.target_node_id,
+        target_raft_node_id: snapshot.target_raft_node_id,
+        snapshot_index: snapshot.snapshot_index,
+        snapshot_term: snapshot.snapshot_term,
+        size_bytes: snapshot.size_bytes,
+        sha256_hex: snapshot.sha256_hex,
+        storage_uri: snapshot.storage_uri,
+        status: snapshot.status,
+        created_at_ms: snapshot.created_at_ms,
+        updated_at_ms: snapshot.updated_at_ms,
+        expires_at_ms: snapshot.expires_at_ms,
+        age_ms: now_ms.saturating_sub(snapshot.created_at_ms),
+        expired,
+    }
+}
+
 fn count_unhealthy_configured_replicas(
     configured_by_tablet: &BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>,
 ) -> usize {
@@ -2057,6 +2258,8 @@ fn count_unhealthy_configured_replicas(
 fn configured_raft_replica_statuses(
     replicas: &[tablet_replicas::TabletReplica],
     runtime_replicas: &[RaftReplicaStatus],
+    latest_snapshots: &BTreeMap<(i64, String), tablet_snapshots::TabletSnapshot>,
+    now_ms: i64,
 ) -> Vec<RaftConfiguredReplicaStatus> {
     let source_applied_index = runtime_replicas
         .iter()
@@ -2076,6 +2279,8 @@ fn configured_raft_replica_statuses(
                 .map(|status| status.applied_index)
                 .unwrap_or_else(|| replica.applied_index.max(0) as u64);
             let replication_lag = source_applied_index.saturating_sub(replica_applied_index);
+            let latest_snapshot =
+                latest_snapshots.get(&(replica.tablet_id, replica.node_id.clone()));
             RaftConfiguredReplicaStatus {
                 node_id: replica.node_id.clone(),
                 raft_node_id,
@@ -2085,6 +2290,12 @@ fn configured_raft_replica_statuses(
                 match_index: replica.match_index,
                 replication_lag,
                 catch_up_required: replication_lag > 0 || replica.health == "lagging",
+                last_snapshot_index: latest_snapshot.map(|snapshot| snapshot.snapshot_index),
+                last_snapshot_age_ms: latest_snapshot
+                    .map(|snapshot| now_ms.saturating_sub(snapshot.created_at_ms)),
+                last_snapshot_status: latest_snapshot.map(|snapshot| snapshot.status.clone()),
+                last_snapshot_expires_at_ms: latest_snapshot
+                    .and_then(|snapshot| snapshot.expires_at_ms),
                 updated_at_ms: replica.updated_at_ms,
                 local_runtime: runtime.is_some(),
                 runtime_role: runtime.map(|status| status.role.clone()),
