@@ -105,7 +105,8 @@ And a very small amount of direct metadata admin:
   retained object exists
 - `agentdbctl raft prune-snapshots --dry-run` and
   `agentdbctl raft prune-snapshots` for retention cleanup of expired retained
-  snapshot metadata
+  metadata-only snapshots; object-backed retained snapshots are deleted by the
+  server prune worker before their metadata is marked deleted
 - `agentdbctl backup create ...` for an online backup manifest and optional
   metadata snapshot
 - `agentdbctl restore validate <manifest-path>` for backup manifest validation;

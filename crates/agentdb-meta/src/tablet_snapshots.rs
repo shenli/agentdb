@@ -203,11 +203,51 @@ pub async fn latest_available_by_tablet(pool: &AnyPool) -> MetaResult<Vec<Tablet
     Ok(rows.into_iter().map(into_snapshot).collect())
 }
 
+pub async fn list_expired(
+    pool: &AnyPool,
+    now_ms: i64,
+    limit: i64,
+) -> MetaResult<Vec<TabletSnapshot>> {
+    let limit = limit.clamp(1, 1_000);
+    let rows: Vec<TabletSnapshotRow> = sqlx::query_as(
+        "SELECT snapshot_id, tablet_id, source_node_id, source_raft_node_id,
+                target_node_id, target_raft_node_id, snapshot_index, snapshot_term,
+                size_bytes, sha256_hex, storage_uri, status, created_at_ms,
+                updated_at_ms, expires_at_ms
+           FROM tablet_snapshots
+          WHERE status != 'deleted'
+            AND expires_at_ms IS NOT NULL
+            AND expires_at_ms <= ?
+          ORDER BY expires_at_ms ASC, created_at_ms ASC
+          LIMIT ?",
+    )
+    .bind(now_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(into_snapshot).collect())
+}
+
+pub async fn count_expired(pool: &AnyPool, now_ms: i64) -> MetaResult<i64> {
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)
+           FROM tablet_snapshots
+          WHERE status != 'deleted'
+            AND expires_at_ms IS NOT NULL
+            AND expires_at_ms <= ?",
+    )
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
+    Ok(count.0)
+}
+
 pub async fn mark_expired_deleted(pool: &AnyPool, now_ms: i64, dry_run: bool) -> MetaResult<i64> {
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)
            FROM tablet_snapshots
           WHERE status != 'deleted'
+            AND storage_uri IS NULL
             AND expires_at_ms IS NOT NULL
             AND expires_at_ms <= ?",
     )
@@ -221,6 +261,7 @@ pub async fn mark_expired_deleted(pool: &AnyPool, now_ms: i64, dry_run: bool) ->
         "UPDATE tablet_snapshots
             SET status = 'deleted', updated_at_ms = ?
           WHERE status != 'deleted'
+            AND storage_uri IS NULL
             AND expires_at_ms IS NOT NULL
             AND expires_at_ms <= ?",
     )
@@ -229,6 +270,25 @@ pub async fn mark_expired_deleted(pool: &AnyPool, now_ms: i64, dry_run: bool) ->
     .execute(pool)
     .await?;
     Ok(count.0)
+}
+
+pub async fn mark_deleted(pool: &AnyPool, snapshot_id: &str, now_ms: i64) -> MetaResult<bool> {
+    if snapshot_id.is_empty() {
+        return Err(MetaError::InvalidInput(
+            "snapshot_id must not be empty".into(),
+        ));
+    }
+    let rows = sqlx::query(
+        "UPDATE tablet_snapshots
+            SET status = 'deleted', updated_at_ms = ?
+          WHERE snapshot_id = ?",
+    )
+    .bind(now_ms)
+    .bind(snapshot_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 fn validate(
@@ -322,7 +382,7 @@ mod tests {
             3,
             128,
             "abcd",
-            Some("object://snap-1"),
+            None,
             "available",
             1_000,
             Some(1_500),
@@ -347,5 +407,39 @@ mod tests {
             list_recent(&pool, None, true, 10).await.unwrap()[0].status,
             "deleted"
         );
+    }
+
+    #[tokio::test]
+    async fn object_backed_snapshots_require_explicit_delete() {
+        let pool = crate::test_pool_sqlite_memory().await;
+        record(
+            &pool,
+            "snap-object",
+            7,
+            "node-a",
+            1,
+            "node-b",
+            2,
+            42,
+            3,
+            128,
+            "abcd",
+            Some("object://snap-object"),
+            "available",
+            1_000,
+            Some(1_500),
+        )
+        .await
+        .unwrap();
+
+        let expired = list_expired(&pool, 1_600, 10).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(mark_expired_deleted(&pool, 1_600, false).await.unwrap(), 0);
+        assert_eq!(list_recent(&pool, None, false, 10).await.unwrap().len(), 1);
+        assert!(mark_deleted(&pool, "snap-object", 1_700).await.unwrap());
+        assert!(list_recent(&pool, None, false, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
