@@ -60,6 +60,9 @@ agentdbctl tablets rebalance --dry-run
 agentdbctl tablets rebalance --max-movements 10
 agentdbctl tablets handoff 7 node-b
 agentdbctl tablets complete-handoff 7 node-a
+agentdbctl tablets prepare-replacement 7 node-b --source-node-id node-a
+agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b
+agentdbctl tablets complete-replacement 7 node-b --source-node-id node-a --min-applied-index 1024 --retire-source
 ```
 
 Raft catch-up:

@@ -73,6 +73,15 @@ impl RaftRsGroupRegistry {
         Ok(self.group_for(tablet_id)?.status())
     }
 
+    pub fn promote_to_voter(&self, tablet_id: i64, leader_id: u64, node_id: u64) -> Result<()> {
+        self.group_for(tablet_id)?
+            .promote_to_voter(leader_id, node_id)
+    }
+
+    pub fn remove_node(&self, tablet_id: i64, leader_id: u64, node_id: u64) -> Result<()> {
+        self.group_for(tablet_id)?.remove_node(leader_id, node_id)
+    }
+
     pub fn build_snapshot_transfer(
         &self,
         tablet_id: i64,

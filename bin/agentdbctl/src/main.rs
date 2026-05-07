@@ -160,6 +160,28 @@ enum TabletsCommand {
     },
     /// Cancel a pending handoff signal.
     CancelHandoff { tablet_id: i64 },
+    /// Prepare a replacement owner as a learner and handoff target.
+    PrepareReplacement {
+        tablet_id: i64,
+        target_node_id: String,
+        #[arg(long)]
+        source_node_id: Option<String>,
+        #[arg(long)]
+        stale_threshold_ms: Option<i64>,
+    },
+    /// Promote a caught-up replacement target to owner.
+    CompleteReplacement {
+        tablet_id: i64,
+        target_node_id: String,
+        #[arg(long)]
+        source_node_id: Option<String>,
+        #[arg(long)]
+        min_applied_index: Option<i64>,
+        #[arg(long)]
+        allow_lagging: bool,
+        #[arg(long)]
+        retire_source: bool,
+    },
     /// Run the rebalance policy.
     Rebalance {
         #[arg(long)]
@@ -513,6 +535,42 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             )
             .await
         }
+        TabletsCommand::PrepareReplacement {
+            tablet_id,
+            target_node_id,
+            source_node_id,
+            stale_threshold_ms,
+        } => {
+            api.post(
+                &format!("/api/admin/tablets/{tablet_id}/replacement/prepare"),
+                json!({
+                    "target_node_id": target_node_id,
+                    "source_node_id": source_node_id,
+                    "stale_threshold_ms": stale_threshold_ms
+                }),
+            )
+            .await
+        }
+        TabletsCommand::CompleteReplacement {
+            tablet_id,
+            target_node_id,
+            source_node_id,
+            min_applied_index,
+            allow_lagging,
+            retire_source,
+        } => {
+            api.post(
+                &format!("/api/admin/tablets/{tablet_id}/replacement/complete"),
+                json!({
+                    "target_node_id": target_node_id,
+                    "source_node_id": source_node_id,
+                    "min_applied_index": min_applied_index,
+                    "require_healthy": !allow_lagging,
+                    "retire_source": retire_source
+                }),
+            )
+            .await
+        }
         TabletsCommand::Rebalance {
             dry_run,
             stale_threshold_ms,
@@ -681,6 +739,10 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "owner_node_id",
         "source_node_id",
         "target_node_id",
+        "new_owner_node_id",
+        "required_applied_index",
+        "raft_membership_changed",
+        "retired_source",
         "from_raft_node_id",
         "to_raft_node_id",
         "lag",

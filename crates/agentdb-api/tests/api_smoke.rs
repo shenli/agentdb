@@ -1801,6 +1801,115 @@ async fn admin_tablet_ownership_mutations_round_trip() {
 }
 
 #[tokio::test]
+async fn admin_tablet_replacement_requires_caught_up_target() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2a"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-b",
+        "http://127.0.0.1:18081",
+        None,
+        "alive",
+        i64::MAX,
+        Some("us-west-2b"),
+        Some("us-west-2"),
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablets::get_or_create(meta.pool(), 9, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assume_ownership(meta.pool(), 9, 0, "node-a", 500)
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta.clone());
+    let app = spawn_app_with_state(state).await;
+
+    let prepared: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/admin/tablets/9/replacement/prepare",
+            app.base
+        ))
+        .json(&json!({"target_node_id": "node-b"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prepared["changed"], true);
+    assert_eq!(prepared["source_node_id"], "node-a");
+    assert_eq!(prepared["target_replica"]["role"], "learner");
+    assert_eq!(prepared["target_replica"]["health"], "lagging");
+    assert_eq!(prepared["tablet"]["handoff_target_node_id"], "node-b");
+
+    let rejected = app
+        .client
+        .post(format!(
+            "{}/api/admin/tablets/9/replacement/complete",
+            app.base
+        ))
+        .json(&json!({"target_node_id": "node-b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    tablet_replicas::upsert(meta.pool(), 9, "node-b", "learner", "healthy", 42, 42, 200)
+        .await
+        .unwrap();
+
+    let completed: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/admin/tablets/9/replacement/complete",
+            app.base
+        ))
+        .json(&json!({
+            "target_node_id": "node-b",
+            "min_applied_index": 42,
+            "retire_source": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed["changed"], true);
+    assert_eq!(completed["new_owner_node_id"], "node-b");
+    assert_eq!(completed["required_applied_index"], 42);
+    assert_eq!(completed["retired_source"], true);
+    assert_eq!(completed["tablet"]["owner_node_id"], "node-b");
+    assert_eq!(
+        completed["tablet"]["handoff_target_node_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(completed["target_replica"]["role"], "voter");
+    assert_eq!(completed["source_replica"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn admin_tablet_create_accepts_placement_metadata() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
