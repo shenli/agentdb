@@ -655,8 +655,12 @@ impl RaftRsGroup {
         to: u64,
         application_snapshot: Vec<u8>,
     ) -> Result<RaftRsSnapshotTransfer> {
+        if to == 0 {
+            return Err(Error::Other(
+                "raft-rs snapshot target must be positive".into(),
+            ));
+        }
         let node = self.node(from)?;
-        self.node(to)?;
         let mut snapshot = node
             .storage
             .snapshot(node.last_applied_index, to)
@@ -1645,6 +1649,27 @@ mod tests {
             outbound.iter().any(|message| message.to == 1)
                 && outbound.iter().any(|message| message.to == 3)
         );
+    }
+
+    #[test]
+    fn raft_rs_open_local_builds_snapshot_for_remote_peer() {
+        let (_dir, configs) = configs(2);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs.clone()).unwrap();
+        group.elect(1).unwrap();
+        let commit = logs[0].append(7, b"snapshot-source".to_vec()).unwrap();
+        drop(group);
+        drop(logs);
+
+        let (local_group, _local_log) = RaftRsSharedGroup::open_local(7, configs, 1).unwrap();
+        let transfer = local_group
+            .build_snapshot_transfer(1, 2, b"application-state".to_vec())
+            .unwrap();
+
+        assert_eq!(transfer.tablet_id, 7);
+        assert_eq!(transfer.from, 1);
+        assert_eq!(transfer.to, 2);
+        assert_eq!(transfer.index, commit.index);
+        assert!(!transfer.payload.is_empty());
     }
 
     #[test]

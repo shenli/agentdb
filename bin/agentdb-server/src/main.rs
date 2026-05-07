@@ -1557,13 +1557,13 @@ async fn run_raft_rs_snapshot_tick(
             }
             let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
             if to == local_status.node_id {
-                let _ = agentdb_meta::tablet_replicas::set_progress(
-                    meta.pool(),
+                update_raft_replica_progress_health(
+                    meta,
                     tablet_id,
                     &replica.node_id,
-                    local_status.applied_index.min(i64::MAX as u64) as i64,
-                    local_status.commit_index.min(i64::MAX as u64) as i64,
-                    now_ms_i64(),
+                    local_status.applied_index,
+                    local_status.commit_index,
+                    "healthy",
                 )
                 .await?;
                 continue;
@@ -1573,7 +1573,17 @@ async fn run_raft_rs_snapshot_tick(
             if lag < min_lag && replica.health != "lagging" {
                 continue;
             }
-            target_nodes.push(to);
+            if replica.health != "lagging" {
+                agentdb_meta::tablet_replicas::set_health(
+                    meta.pool(),
+                    tablet_id,
+                    &replica.node_id,
+                    "lagging",
+                    now_ms_i64(),
+                )
+                .await?;
+            }
+            target_nodes.push((to, replica.node_id));
         }
         if target_nodes.is_empty() {
             continue;
@@ -1590,13 +1600,21 @@ async fn run_raft_rs_snapshot_tick(
             }
         };
         let mut compact_through = 0u64;
-        for to in target_nodes {
+        for (to, node_id) in target_nodes {
             let transfer = group.build_snapshot_transfer(
                 local_status.node_id,
                 to,
                 application_snapshot.clone(),
             )?;
             if let Err(error) = outbox.send_snapshot_to_peer(&transfer).await {
+                agentdb_meta::tablet_replicas::set_health(
+                    meta.pool(),
+                    tablet_id,
+                    &node_id,
+                    "unreachable",
+                    now_ms_i64(),
+                )
+                .await?;
                 tracing::warn!(
                     tablet_id,
                     from = local_status.node_id,
@@ -1606,6 +1624,15 @@ async fn run_raft_rs_snapshot_tick(
                 );
                 continue;
             }
+            update_raft_replica_progress_health(
+                meta,
+                tablet_id,
+                &node_id,
+                transfer.index,
+                transfer.index,
+                "healthy",
+            )
+            .await?;
             compact_through = compact_through.max(transfer.index);
             sent += 1;
         }
@@ -1632,6 +1659,29 @@ async fn run_raft_rs_snapshot_tick(
         }
     }
     Ok(sent)
+}
+
+async fn update_raft_replica_progress_health(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    node_id: &str,
+    applied_index: u64,
+    match_index: u64,
+    health: &str,
+) -> anyhow::Result<()> {
+    let now_ms = now_ms_i64();
+    agentdb_meta::tablet_replicas::set_progress(
+        meta.pool(),
+        tablet_id,
+        node_id,
+        applied_index.min(i64::MAX as u64) as i64,
+        match_index.min(i64::MAX as u64) as i64,
+        now_ms,
+    )
+    .await?;
+    agentdb_meta::tablet_replicas::set_health(meta.pool(), tablet_id, node_id, health, now_ms)
+        .await?;
+    Ok(())
 }
 
 fn spawn_raft_rs_registry_refresher(
@@ -2609,6 +2659,77 @@ region = "us-west-2"
             Some(&"http://127.0.0.1:18081".to_string())
         );
         assert!(!peer_urls.contains_key(&agentdb_storage::stable_raft_node_id("node-c").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn raft_rs_snapshot_tick_marks_progress_and_unreachable_peers() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "unknown", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let raft_configs = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap();
+        let local_node_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, tablet_log) =
+            agentdb_storage::RaftRsSharedGroup::open_local(7, raft_configs, local_node_id).unwrap();
+        group.elect(local_node_id).unwrap();
+
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
+            Arc::new(agentdb_storage::RocksKvStore::open(dir.path().join("runtime")).unwrap());
+        let primary_log: Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync> =
+            Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv.clone()));
+        let runtime = agentdb_core::Runtime::with_kv_and_replicated_logs(
+            kv,
+            Arc::new(agentdb_storage::InMemoryContentBackend::default()),
+            BTreeMap::from([
+                (agentdb_core::RUNTIME_PRIMARY_TABLET_ID, primary_log),
+                (
+                    7,
+                    tablet_log as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                ),
+            ]),
+        );
+        let create_runtime = runtime.clone();
+        runtime
+            .with_tablet_context(7, async move {
+                create_runtime
+                    .create_tenant(agentdb_core::NewTenant {
+                        external_key: "snapshot-progress".into(),
+                        policy: serde_json::json!({}),
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+        let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
+        let sent = run_raft_rs_snapshot_tick(&meta, &registry, runtime, &outbox, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(sent, 0);
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        let local = replicas
+            .iter()
+            .find(|replica| replica.node_id == "node-a")
+            .unwrap();
+        assert_eq!(local.health, "healthy");
+        assert!(local.applied_index > 0);
+        assert!(local.match_index > 0);
+        let remote = replicas
+            .iter()
+            .find(|replica| replica.node_id == "node-b")
+            .unwrap();
+        assert_eq!(remote.health, "unreachable");
     }
 
     #[tokio::test]
