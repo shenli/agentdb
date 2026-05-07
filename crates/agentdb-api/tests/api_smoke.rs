@@ -2131,7 +2131,7 @@ async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
         action["action"] == "assign" && action["tablet_id"] == 5 && action["reason"] == "unowned"
     }));
     assert!(dry_run["actions"].as_array().unwrap().iter().any(|action| {
-        action["action"] == "handoff"
+        action["action"] == "prepare_replacement"
             && action["source_node_id"] == "node-c"
             && action["reason"] == "source_draining"
     }));
@@ -2168,6 +2168,18 @@ async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
     assert!(rows.iter().any(|row| {
         row["handoff_target_node_id"] == "node-a" || row["handoff_target_node_id"] == "node-b"
     }));
+    let raft: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(raft["configured_replica_count"].as_u64().unwrap() >= 2);
 }
 
 #[tokio::test]

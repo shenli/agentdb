@@ -99,8 +99,8 @@ And a very small amount of direct metadata admin:
   `--min-applied-index` when source replica progress is unavailable and
   `--retire-source` when the old owner should be removed from replica metadata
 - `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
-  for assigning unowned tablets, moving tablets away from fresh draining nodes,
-  and evening out fresh `alive` node load
+  for assigning unowned tablets, preparing replacement learners for tablets on
+  fresh draining nodes, and evening out fresh `alive` node load
 - `agentdbctl raft status` for local Raft group status, configured replica
   progress, replication lag, and catch-up-needed visibility
 - `agentdbctl raft catch-up --dry-run` for previewing snapshot catch-up

@@ -2943,6 +2943,67 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_tick_prepares_replacement_for_draining_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            10_000,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "draining",
+            10_000,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 20_000)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
+        };
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+            .await
+            .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.handoff_target_node_id.as_deref(), Some("node-a"));
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-b" && replica.role == "voter"));
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-a" && replica.role == "learner"));
+        assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
     async fn raft_rs_node_configs_load_from_control_plane_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();

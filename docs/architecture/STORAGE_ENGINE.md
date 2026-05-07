@@ -1010,9 +1010,12 @@ single-session appends or record writes.
    and caught up before promoting it to owner. If the API node has the local
    Raft group registered, completion also proposes the `raft-rs` membership
    promotion, and `--retire-source` removes the old node from Raft and
-   `tablet_replicas`. Remaining production work is automating when this
-   operator workflow should run and integrating it with split/merge placement
-   policy.
+   `tablet_replicas`. Rebalance now uses the same replacement intent for owned
+   tablet movement: it seeds the source as a voter, the target as a learner, and
+   marks the target as the handoff destination so catch-up workers have explicit
+   control-plane work to converge. Remaining production work is completing
+   ready replacements automatically and integrating the workflow with
+   split/merge placement policy.
 
 8. Add tablet split and rebalance.
 
@@ -1024,7 +1027,10 @@ single-session appends or record writes.
 
    Current implementation status: `tablet_ranges::replace_ranges` can
    atomically publish split/merge tablet-map cutovers with exact coverage
-   validation. It does not yet copy/replay hot state or coordinate Raft groups.
+   validation. Rebalance assigns unowned tablets with owner voter metadata and
+   prepares owned-tablet movement by creating learner replica intent for the
+   target. It does not yet copy/replay hot split state or coordinate
+   split-created Raft groups.
 
 9. Add compressed tablet-map ranges.
 

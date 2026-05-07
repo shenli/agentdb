@@ -65,6 +65,11 @@ agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b
 agentdbctl tablets complete-replacement 7 node-b --source-node-id node-a --min-applied-index 1024 --retire-source
 ```
 
+`rebalance` assigns unowned tablets directly. For owned tablets, it prepares a
+replacement intent by marking the target as a learner and handoff destination;
+use `raft catch-up` and `complete-replacement` to finish promotion after the
+target is healthy and caught up.
+
 Raft catch-up:
 
 ```bash

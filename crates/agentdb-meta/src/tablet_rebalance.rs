@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 
-use crate::{nodes, tablets, MetaResult};
+use crate::{nodes, tablet_replicas, tablets, MetaResult};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RebalanceRequest {
@@ -133,7 +133,21 @@ pub async fn run(
         let changed = if request.dry_run {
             true
         } else {
-            tablets::assign_to(pool, tablet.tablet_id, &target).await?
+            let assigned = tablets::assign_to(pool, tablet.tablet_id, &target).await?;
+            if assigned {
+                tablet_replicas::upsert(
+                    pool,
+                    tablet.tablet_id,
+                    &target,
+                    "voter",
+                    "healthy",
+                    0,
+                    0,
+                    now_ms,
+                )
+                .await?;
+            }
+            assigned
         };
         if changed {
             *counts_after.entry(target.clone()).or_insert(0) += 1;
@@ -165,16 +179,20 @@ pub async fn run(
         if source.as_deref() == Some(target.as_str()) {
             continue;
         }
-        let changed = if request.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(pool, tablet.tablet_id, &target).await?
-        };
+        let changed = prepare_replacement_intent(
+            pool,
+            tablet.tablet_id,
+            source.as_deref(),
+            &target,
+            request.dry_run,
+            now_ms,
+        )
+        .await?;
         if changed {
             *counts_after.entry(target.clone()).or_insert(0) += 1;
         }
         actions.push(RebalanceAction {
-            action: "handoff",
+            action: "prepare_replacement",
             tablet_id: tablet.tablet_id,
             source_node_id: source,
             target_node_id: Some(target),
@@ -212,17 +230,21 @@ pub async fn run(
             break;
         };
         let tablet = balance_candidates.remove(candidate_index);
-        let changed = if request.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(pool, tablet.tablet_id, &target).await?
-        };
+        let changed = prepare_replacement_intent(
+            pool,
+            tablet.tablet_id,
+            Some(&source),
+            &target,
+            request.dry_run,
+            now_ms,
+        )
+        .await?;
         if changed {
             *counts_after.entry(source.clone()).or_insert(0) -= 1;
             *counts_after.entry(target.clone()).or_insert(0) += 1;
         }
         actions.push(RebalanceAction {
-            action: "handoff",
+            action: "prepare_replacement",
             tablet_id: tablet.tablet_id,
             source_node_id: Some(source),
             target_node_id: Some(target),
@@ -258,6 +280,76 @@ pub async fn run(
         actions,
         skipped,
     })
+}
+
+async fn prepare_replacement_intent(
+    pool: &AnyPool,
+    tablet_id: i64,
+    source_node_id: Option<&str>,
+    target_node_id: &str,
+    dry_run: bool,
+    now_ms: i64,
+) -> MetaResult<bool> {
+    if dry_run {
+        return Ok(true);
+    }
+    let replicas = tablet_replicas::list_by_tablet(pool, tablet_id).await?;
+    let source_replica =
+        source_node_id.and_then(|source| replicas.iter().find(|replica| replica.node_id == source));
+    let mut changed = false;
+    if let Some(source_node_id) = source_node_id {
+        if source_replica
+            .map(|replica| replica.role != "voter")
+            .unwrap_or(true)
+        {
+            tablet_replicas::upsert(
+                pool,
+                tablet_id,
+                source_node_id,
+                "voter",
+                source_replica
+                    .map(|replica| replica.health.as_str())
+                    .unwrap_or("healthy"),
+                source_replica
+                    .map(|replica| replica.applied_index)
+                    .unwrap_or(0),
+                source_replica
+                    .map(|replica| replica.match_index)
+                    .unwrap_or(0),
+                now_ms,
+            )
+            .await?;
+            changed = true;
+        }
+    }
+    let target_replica = replicas
+        .iter()
+        .find(|replica| replica.node_id == target_node_id);
+    if target_replica
+        .map(|replica| replica.role != "learner")
+        .unwrap_or(true)
+    {
+        tablet_replicas::upsert(
+            pool,
+            tablet_id,
+            target_node_id,
+            "learner",
+            target_replica
+                .map(|replica| replica.health.as_str())
+                .unwrap_or("lagging"),
+            target_replica
+                .map(|replica| replica.applied_index)
+                .unwrap_or(0),
+            target_replica
+                .map(|replica| replica.match_index)
+                .unwrap_or(0),
+            now_ms,
+        )
+        .await?;
+        changed = true;
+    }
+    let handoff_changed = tablets::mark_for_handoff(pool, tablet_id, target_node_id).await?;
+    Ok(changed || handoff_changed)
 }
 
 fn owner_counts(tablets: &[tablets::Tablet]) -> HashMap<String, usize> {
@@ -342,8 +434,19 @@ mod tests {
         assert!(report
             .actions
             .iter()
-            .any(|action| action.action == "handoff"
+            .any(|action| action.action == "prepare_replacement"
                 && action.source_node_id.as_deref() == Some("node-c")));
         assert!(report.changed_count() >= 2);
+        let replicas = tablet_replicas::list_by_tablet(&p, 3).await.unwrap();
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-c" && replica.role == "voter"));
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id != "node-c" && replica.role == "learner"));
+        let assigned_replicas = tablet_replicas::list_by_tablet(&p, 4).await.unwrap();
+        assert!(assigned_replicas
+            .iter()
+            .any(|replica| replica.role == "voter" && replica.health == "healthy"));
     }
 }
