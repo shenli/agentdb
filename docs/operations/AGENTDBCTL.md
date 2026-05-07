@@ -43,6 +43,7 @@ Cluster status:
 agentdbctl status
 agentdbctl nodes list
 agentdbctl tablets list
+agentdbctl raft status
 ```
 
 Drain and undrain a node:
@@ -59,6 +60,14 @@ agentdbctl tablets rebalance --dry-run
 agentdbctl tablets rebalance --max-movements 10
 agentdbctl tablets handoff 7 node-b
 agentdbctl tablets complete-handoff 7 node-a
+```
+
+Raft catch-up:
+
+```bash
+agentdbctl raft status
+agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b --dry-run
+agentdbctl raft catch-up --tablet-id 7 --target-node-id node-b --min-lag 128
 ```
 
 Backup and restore validation:

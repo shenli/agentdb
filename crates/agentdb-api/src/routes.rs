@@ -9,7 +9,7 @@
 //! in `crate::errors`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     future::Future,
     path::{Path as FsPath, PathBuf},
@@ -50,6 +50,7 @@ use crate::dto::{
     TransitionSessionLifecycleBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
+use crate::internal_raft_http::RaftRsHttpOutbox;
 use crate::routing_http::{
     route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_FORWARDED_BY,
     HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_ID,
@@ -138,6 +139,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
         .route("/api/admin/raft", get(get_raft_status))
+        .route("/api/admin/raft/catch-up", post(post_raft_catch_up))
         .route("/api/admin/indexes/records", get(get_record_index_status))
         .route("/api/admin/content-mirror", get(get_content_mirror_status))
         .route("/api/admin/backups", post(create_admin_backup))
@@ -271,6 +273,10 @@ fn now_ms_i64() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn raft_index_to_i64(index: u64) -> Result<i64, ApiError> {
+    i64::try_from(index).map_err(|_| internal_error(format!("raft index {index} exceeds i64::MAX")))
 }
 
 fn drain_status_response(s: &AppState) -> DrainStatusResponse {
@@ -562,6 +568,8 @@ struct RaftConfiguredReplicaStatus {
     health: String,
     applied_index: i64,
     match_index: i64,
+    replication_lag: u64,
+    catch_up_required: bool,
     updated_at_ms: i64,
     local_runtime: bool,
     runtime_role: Option<String>,
@@ -569,6 +577,44 @@ struct RaftConfiguredReplicaStatus {
     runtime_term: Option<u64>,
     runtime_commit_index: Option<u64>,
     runtime_applied_index: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RaftCatchUpBody {
+    tablet_id: Option<i64>,
+    target_node_id: Option<String>,
+    min_lag: Option<u64>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftCatchUpResponse {
+    dry_run: bool,
+    tablet_count: usize,
+    attempted: usize,
+    sent: usize,
+    skipped: usize,
+    failures: Vec<RaftCatchUpFailure>,
+    actions: Vec<RaftCatchUpAction>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftCatchUpAction {
+    tablet_id: i64,
+    node_id: String,
+    from_raft_node_id: u64,
+    to_raft_node_id: u64,
+    lag: u64,
+    snapshot_index: Option<u64>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftCatchUpFailure {
+    tablet_id: i64,
+    node_id: String,
+    to_raft_node_id: Option<u64>,
+    error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1713,6 +1759,245 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
     }))
 }
 
+async fn post_raft_catch_up(
+    State(s): State<AppState>,
+    Json(body): Json<RaftCatchUpBody>,
+) -> Result<Json<RaftCatchUpResponse>, ApiError> {
+    if body.tablet_id.is_some_and(|tablet_id| tablet_id <= 0) {
+        return Err(invalid_admin_request("tablet_id must be positive"));
+    }
+    let meta = meta_required(&s)?;
+    let Some(registry) = s.raft_registry.as_ref() else {
+        return Err(invalid_admin_request(
+            "raft registry is not configured on this node",
+        ));
+    };
+    let configured_by_tablet = load_configured_raft_replicas(Some(meta)).await?;
+    let dry_run = body.dry_run.unwrap_or(false);
+    let min_lag = body.min_lag.unwrap_or(1);
+    let mut response = RaftCatchUpResponse {
+        dry_run,
+        tablet_count: 0,
+        attempted: 0,
+        sent: 0,
+        skipped: 0,
+        failures: Vec::new(),
+        actions: Vec::new(),
+    };
+
+    let outbox = if dry_run {
+        None
+    } else {
+        let token = s.internal_auth_token.clone().ok_or_else(|| {
+            invalid_admin_request("internal auth token is required for raft catch-up")
+        })?;
+        let outbox = RaftRsHttpOutbox::new(token);
+        outbox.replace_peer_urls(load_raft_peer_urls(meta, &configured_by_tablet).await?);
+        Some(outbox)
+    };
+
+    for (tablet_id, group) in registry.groups_snapshot() {
+        if body
+            .tablet_id
+            .is_some_and(|requested| requested != tablet_id)
+        {
+            continue;
+        }
+        response.tablet_count += 1;
+        let statuses = group.status();
+        let Some(source_status) = statuses.iter().max_by_key(|status| status.applied_index) else {
+            response.skipped += 1;
+            continue;
+        };
+        let Some(replicas) = configured_by_tablet.get(&tablet_id) else {
+            response.skipped += 1;
+            continue;
+        };
+        let mut application_snapshot: Option<Vec<u8>> = None;
+        let mut compact_through = 0u64;
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                response.skipped += 1;
+                continue;
+            }
+            if body
+                .target_node_id
+                .as_ref()
+                .is_some_and(|target| target != &replica.node_id)
+            {
+                continue;
+            }
+            let to = match agentdb_storage::stable_raft_node_id(&replica.node_id) {
+                Ok(to) => to,
+                Err(err) => {
+                    response.failures.push(RaftCatchUpFailure {
+                        tablet_id,
+                        node_id: replica.node_id.clone(),
+                        to_raft_node_id: None,
+                        error: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if to == source_status.node_id {
+                if !dry_run {
+                    let index = raft_index_to_i64(source_status.applied_index)?;
+                    tablet_replicas::set_progress(
+                        meta.pool(),
+                        tablet_id,
+                        &replica.node_id,
+                        index,
+                        index,
+                        now_ms_i64(),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    tablet_replicas::set_health(
+                        meta.pool(),
+                        tablet_id,
+                        &replica.node_id,
+                        "healthy",
+                        now_ms_i64(),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                }
+                response.skipped += 1;
+                continue;
+            }
+            let peer_applied = replica.applied_index.max(0) as u64;
+            let lag = source_status.applied_index.saturating_sub(peer_applied);
+            if lag < min_lag && replica.health != "lagging" {
+                response.skipped += 1;
+                continue;
+            }
+            response.attempted += 1;
+            if dry_run {
+                response.actions.push(RaftCatchUpAction {
+                    tablet_id,
+                    node_id: replica.node_id.clone(),
+                    from_raft_node_id: source_status.node_id,
+                    to_raft_node_id: to,
+                    lag,
+                    snapshot_index: Some(source_status.applied_index),
+                    status: "would_send".into(),
+                });
+                continue;
+            }
+            let snapshot = match application_snapshot.as_ref() {
+                Some(snapshot) => snapshot.clone(),
+                None => match s.runtime.export_tablet_snapshot_payload(tablet_id) {
+                    Ok(snapshot) => {
+                        application_snapshot = Some(snapshot.clone());
+                        snapshot
+                    }
+                    Err(err) => {
+                        response.failures.push(RaftCatchUpFailure {
+                            tablet_id,
+                            node_id: replica.node_id.clone(),
+                            to_raft_node_id: Some(to),
+                            error: err.message,
+                        });
+                        continue;
+                    }
+                },
+            };
+            let transfer = match group.build_snapshot_transfer(source_status.node_id, to, snapshot)
+            {
+                Ok(transfer) => transfer,
+                Err(err) => {
+                    response.failures.push(RaftCatchUpFailure {
+                        tablet_id,
+                        node_id: replica.node_id.clone(),
+                        to_raft_node_id: Some(to),
+                        error: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+            tablet_replicas::set_health(
+                meta.pool(),
+                tablet_id,
+                &replica.node_id,
+                "lagging",
+                now_ms_i64(),
+            )
+            .await
+            .map_err(internal_error)?;
+            match outbox
+                .as_ref()
+                .unwrap()
+                .send_snapshot_to_peer(&transfer)
+                .await
+            {
+                Ok(()) => {
+                    let index = raft_index_to_i64(transfer.index)?;
+                    tablet_replicas::set_progress(
+                        meta.pool(),
+                        tablet_id,
+                        &replica.node_id,
+                        index,
+                        index,
+                        now_ms_i64(),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    tablet_replicas::set_health(
+                        meta.pool(),
+                        tablet_id,
+                        &replica.node_id,
+                        "healthy",
+                        now_ms_i64(),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    compact_through = compact_through.max(transfer.index);
+                    response.sent += 1;
+                    response.actions.push(RaftCatchUpAction {
+                        tablet_id,
+                        node_id: replica.node_id.clone(),
+                        from_raft_node_id: source_status.node_id,
+                        to_raft_node_id: to,
+                        lag,
+                        snapshot_index: Some(transfer.index),
+                        status: "sent".into(),
+                    });
+                }
+                Err(err) => {
+                    tablet_replicas::set_health(
+                        meta.pool(),
+                        tablet_id,
+                        &replica.node_id,
+                        "unreachable",
+                        now_ms_i64(),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    response.failures.push(RaftCatchUpFailure {
+                        tablet_id,
+                        node_id: replica.node_id.clone(),
+                        to_raft_node_id: Some(to),
+                        error: err.to_string(),
+                    });
+                }
+            }
+        }
+        if compact_through > 0 {
+            let _ = s
+                .runtime
+                .compact_tablet_log_through(tablet_id, compact_through);
+        }
+    }
+
+    if body.tablet_id.is_some() && response.tablet_count == 0 {
+        return Err(invalid_admin_request(
+            "requested tablet has no local raft group",
+        ));
+    }
+
+    Ok(Json(response))
+}
+
 async fn load_configured_raft_replicas(
     meta: Option<&agentdb_meta::MetaStore>,
 ) -> Result<BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>, ApiError> {
@@ -1732,6 +2017,33 @@ async fn load_configured_raft_replicas(
     Ok(by_tablet)
 }
 
+async fn load_raft_peer_urls(
+    meta: &agentdb_meta::MetaStore,
+    configured_by_tablet: &BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>,
+) -> Result<BTreeMap<u64, String>, ApiError> {
+    let needed_node_ids: BTreeSet<_> = configured_by_tablet
+        .values()
+        .flatten()
+        .map(|replica| replica.node_id.as_str())
+        .collect();
+    let nodes_by_id: BTreeMap<_, _> = nodes::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|node| needed_node_ids.contains(node.node_id.as_str()))
+        .map(|node| (node.node_id.clone(), node))
+        .collect();
+    let mut peer_urls = BTreeMap::new();
+    for replica in configured_by_tablet.values().flatten() {
+        let raft_node_id =
+            agentdb_storage::stable_raft_node_id(&replica.node_id).map_err(internal_error)?;
+        if let Some(node) = nodes_by_id.get(&replica.node_id) {
+            peer_urls.insert(raft_node_id, node.address.clone());
+        }
+    }
+    Ok(peer_urls)
+}
+
 fn count_unhealthy_configured_replicas(
     configured_by_tablet: &BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>,
 ) -> usize {
@@ -1746,6 +2058,11 @@ fn configured_raft_replica_statuses(
     replicas: &[tablet_replicas::TabletReplica],
     runtime_replicas: &[RaftReplicaStatus],
 ) -> Vec<RaftConfiguredReplicaStatus> {
+    let source_applied_index = runtime_replicas
+        .iter()
+        .map(|status| status.applied_index)
+        .max()
+        .unwrap_or(0);
     replicas
         .iter()
         .map(|replica| {
@@ -1755,6 +2072,10 @@ fn configured_raft_replica_statuses(
                     .iter()
                     .find(|status| status.node_id == node_id)
             });
+            let replica_applied_index = runtime
+                .map(|status| status.applied_index)
+                .unwrap_or_else(|| replica.applied_index.max(0) as u64);
+            let replication_lag = source_applied_index.saturating_sub(replica_applied_index);
             RaftConfiguredReplicaStatus {
                 node_id: replica.node_id.clone(),
                 raft_node_id,
@@ -1762,6 +2083,8 @@ fn configured_raft_replica_statuses(
                 health: replica.health.clone(),
                 applied_index: replica.applied_index,
                 match_index: replica.match_index,
+                replication_lag,
+                catch_up_required: replication_lag > 0 || replica.health == "lagging",
                 updated_at_ms: replica.updated_at_ms,
                 local_runtime: runtime.is_some(),
                 runtime_role: runtime.map(|status| status.role.clone()),

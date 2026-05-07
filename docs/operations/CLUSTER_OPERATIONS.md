@@ -340,11 +340,14 @@ A usable cluster mode should expose at least:
 
 - `agentdbctl nodes list`
 - `agentdbctl tablets list`
+- `agentdbctl raft status`
+- `agentdbctl raft catch-up --dry-run`
 - `agentdbctl status`
 - node drain status
 - node staleness
 - ownership epoch / lease visibility
 - routing snapshot status
+- Raft replica lag and snapshot catch-up status
 
 Future cluster mode likely also needs:
 

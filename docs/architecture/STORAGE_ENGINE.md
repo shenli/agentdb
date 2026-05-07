@@ -978,9 +978,16 @@ single-session appends or record writes.
    application snapshot is carried in the snapshot data field. Installing a
    transfer applies the Raft snapshot to the target node, persists snapshot
    metadata and HardState into `raft-engine`, rejects stale/wrong-target
-   transfers, removes covered committed entries, and survives restart. The
-   remaining production work is async object-store upload/download, snapshot
-   retention policy, and automated follower catch-up orchestration.
+   transfers, removes covered committed entries, and survives restart. Server
+   cluster mode runs a periodic catch-up worker that detects lagging
+   voter/learner rows in `tablet_replicas`, exports the tablet-local runtime
+   snapshot, sends it through the token-protected internal snapshot RPC, marks
+   failed peers `unreachable`, and compacts covered local runtime log entries
+   after successful delivery. Operators can also inspect catch-up readiness
+   through `GET /api/admin/raft` and trigger a dry-run or real catch-up pass
+   with `POST /api/admin/raft/catch-up` or `agentdbctl raft catch-up`.
+   Remaining production work is async object-store upload/download for large
+   retained snapshots and an explicit snapshot-retention policy.
 
 8. Add tablet split and rebalance.
 
@@ -1041,8 +1048,11 @@ single-session appends or record writes.
     replacement for operator-controlled split/merge cutovers. Runtime metrics
     for object-store mirror backlog are exposed through
     `/api/admin/content-mirror`; live local Raft tablet/replica commit and
-    applied indexes are exposed through `/api/admin/raft`. Compaction debt and
-    snapshot age still need the underlying workers.
+    applied indexes, configured-replica lag, and catch-up-required flags are
+    exposed through `/api/admin/raft`. `POST /api/admin/raft/catch-up` and
+    `agentdbctl raft catch-up` provide an operator-triggered catch-up path for
+    lagging replicas. Compaction debt and retained snapshot age still need the
+    underlying workers.
 
 ## Non-Goals
 
@@ -1060,7 +1070,8 @@ single-session appends or record writes.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
 - Do not claim clustered production safety until quorum replication, snapshots,
-  catch-up, and operational recovery are implemented.
+  catch-up, split/merge movement, retained snapshot policy, and operational
+  recovery are implemented end to end.
 
 ## Open Decisions
 
