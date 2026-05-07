@@ -84,6 +84,15 @@ impl RaftRsGroupRegistry {
             .build_snapshot_transfer(from, to, application_snapshot)
     }
 
+    pub fn install_snapshot_transfer(
+        &self,
+        to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> Result<Vec<u8>> {
+        self.group_for(transfer.tablet_id)?
+            .install_snapshot_transfer(to, transfer)
+    }
+
     fn group_for(&self, tablet_id: i64) -> Result<RaftRsSharedGroup> {
         self.groups
             .read()

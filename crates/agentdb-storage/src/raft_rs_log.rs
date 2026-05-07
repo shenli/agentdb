@@ -691,7 +691,6 @@ impl RaftRsGroup {
                 transfer.to
             )));
         }
-        self.node(transfer.from)?;
         let node = self.node_mut(to)?;
         let snapshot = transfer.into_snapshot()?;
         let metadata = snapshot.get_metadata();
@@ -1670,6 +1669,25 @@ mod tests {
         assert_eq!(transfer.to, 2);
         assert_eq!(transfer.index, commit.index);
         assert!(!transfer.payload.is_empty());
+    }
+
+    #[test]
+    fn raft_rs_open_local_installs_snapshot_from_remote_source() {
+        let (_dir, configs) = configs(2);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs.clone()).unwrap();
+        group.elect(1).unwrap();
+        let commit = logs[0].append(7, b"snapshot-source".to_vec()).unwrap();
+        let transfer = group
+            .build_snapshot_transfer(1, 2, b"application-state".to_vec())
+            .unwrap();
+        drop(group);
+        drop(logs);
+
+        let (target_group, _target_log) = RaftRsSharedGroup::open_local(7, configs, 2).unwrap();
+        let payload = target_group.install_snapshot_transfer(2, transfer).unwrap();
+
+        assert_eq!(payload, b"application-state");
+        assert_eq!(target_group.status()[0].applied_index, commit.index);
     }
 
     #[test]

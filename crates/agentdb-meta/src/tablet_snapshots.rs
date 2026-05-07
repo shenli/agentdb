@@ -203,6 +203,32 @@ pub async fn latest_available_by_tablet(pool: &AnyPool) -> MetaResult<Vec<Tablet
     Ok(rows.into_iter().map(into_snapshot).collect())
 }
 
+pub async fn latest_available_for_target(
+    pool: &AnyPool,
+    target_node_id: &str,
+) -> MetaResult<Vec<TabletSnapshot>> {
+    let rows: Vec<TabletSnapshotRow> = sqlx::query_as(
+        "SELECT snapshot_id, tablet_id, source_node_id, source_raft_node_id,
+                target_node_id, target_raft_node_id, snapshot_index, snapshot_term,
+                size_bytes, sha256_hex, storage_uri, status, created_at_ms,
+                updated_at_ms, expires_at_ms
+           FROM tablet_snapshots
+          WHERE status = 'available' AND target_node_id = ?
+          ORDER BY tablet_id, snapshot_index DESC",
+    )
+    .bind(target_node_id)
+    .fetch_all(pool)
+    .await?;
+    let mut latest = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for snapshot in rows.into_iter().map(into_snapshot) {
+        if seen.insert(snapshot.tablet_id) {
+            latest.push(snapshot);
+        }
+    }
+    Ok(latest)
+}
+
 pub async fn list_expired(
     pool: &AnyPool,
     now_ms: i64,
@@ -441,5 +467,55 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_available_for_target_keeps_highest_index_per_tablet() {
+        let pool = crate::test_pool_sqlite_memory().await;
+        for (snapshot_id, index) in [("snap-old", 10), ("snap-new", 20)] {
+            record(
+                &pool,
+                snapshot_id,
+                7,
+                "node-a",
+                1,
+                "node-b",
+                2,
+                index,
+                3,
+                128,
+                "abcd",
+                Some("object://snap"),
+                "available",
+                index,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        record(
+            &pool,
+            "snap-other-target",
+            7,
+            "node-a",
+            1,
+            "node-c",
+            3,
+            30,
+            3,
+            128,
+            "abcd",
+            Some("object://snap"),
+            "available",
+            30,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let snapshots = latest_available_for_target(&pool, "node-b").await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].snapshot_id, "snap-new");
+        assert_eq!(snapshots[0].snapshot_index, 20);
     }
 }
