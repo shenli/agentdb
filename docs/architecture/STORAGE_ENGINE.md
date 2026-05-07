@@ -991,9 +991,14 @@ single-session appends or record writes.
    and `expires_at_ms`. `GET /api/admin/raft/snapshots` and
    `agentdbctl raft snapshots` expose retained snapshot age and expiry state;
    `POST /api/admin/raft/snapshots/prune` and
-   `agentdbctl raft prune-snapshots` mark expired snapshot metadata deleted.
-   Remaining production work is uploading large retained snapshots to shared
-   object storage and deleting those objects during retention pruning.
+   `agentdbctl raft prune-snapshots` mark expired metadata-only snapshot rows
+   deleted. When the server has shared object storage configured, the
+   background snapshot worker uploads retained snapshot bytes under
+   `agentdb/raft-snapshots/...`, stores the resulting `storage_uri`, and runs a
+   retention prune worker that deletes expired objects before marking their
+   metadata deleted. Remaining production work is using retained object-store
+   snapshots for node replacement/bootstrap instead of only point-to-point
+   catch-up.
 
 8. Add tablet split and rebalance.
 
@@ -1057,9 +1062,11 @@ single-session appends or record writes.
     applied indexes, configured-replica lag, and catch-up-required flags are
     exposed through `/api/admin/raft`. Retained snapshot age, expiry, size,
     checksum, source, and target are exposed through
-    `/api/admin/raft/snapshots`. `POST /api/admin/raft/catch-up` and
-    `agentdbctl raft catch-up` provide an operator-triggered catch-up path for
-    lagging replicas. Compaction debt still needs the underlying worker.
+    `/api/admin/raft/snapshots`. Retained snapshot object deletion is handled
+    by the server prune worker when shared object storage is configured.
+    `POST /api/admin/raft/catch-up` and `agentdbctl raft catch-up` provide an
+    operator-triggered catch-up path for lagging replicas. Compaction debt
+    still needs the underlying worker.
 
 ## Non-Goals
 

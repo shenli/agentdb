@@ -2127,14 +2127,18 @@ async fn post_raft_snapshot_prune(
 ) -> Result<Json<RaftSnapshotPruneResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let dry_run = body.dry_run.unwrap_or(false);
-    let expired_snapshot_count =
-        tablet_snapshots::mark_expired_deleted(meta.pool(), now_ms_i64(), dry_run)
+    let now_ms = now_ms_i64();
+    let expired_snapshot_count = tablet_snapshots::count_expired(meta.pool(), now_ms)
+        .await
+        .map_err(internal_error)?;
+    let deleted_snapshot_count =
+        tablet_snapshots::mark_expired_deleted(meta.pool(), now_ms, dry_run)
             .await
             .map_err(internal_error)?;
     Ok(Json(RaftSnapshotPruneResponse {
         dry_run,
         expired_snapshot_count,
-        deleted_snapshot_count: if dry_run { 0 } else { expired_snapshot_count },
+        deleted_snapshot_count: if dry_run { 0 } else { deleted_snapshot_count },
     }))
 }
 

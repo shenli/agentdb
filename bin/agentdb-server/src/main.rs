@@ -15,6 +15,7 @@ use axum::routing::get;
 use clap::Parser;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde::Deserialize;
 
@@ -22,6 +23,7 @@ const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
 const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
+const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
 const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
@@ -34,6 +36,8 @@ const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_RAFT_SNAPSHOT_MIN_LAG: u64 = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_RAFT_SNAPSHOT_PRUNE_INTERVAL_MS: u64 = 5 * 60_000;
+const DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH: i64 = 256;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
@@ -357,6 +361,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .max(100);
                 if let Some(registry) = raft_registry.clone() {
                     refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
+                    let raft_snapshot_store = match config.object_store.as_ref() {
+                        Some(object_store_config) => Some(Arc::new(RaftSnapshotObjectStore::new(
+                            build_object_store(object_store_config)?,
+                            RAFT_SNAPSHOT_OBJECT_PREFIX,
+                        ))),
+                        None => None,
+                    };
                     spawn_raft_rs_registry_refresher(
                         startup.meta.clone(),
                         startup.node_id.clone(),
@@ -400,7 +411,26 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         Duration::from_millis(raft_snapshot_interval_ms),
                         raft_snapshot_min_lag,
                         raft_snapshot_retention_ms,
+                        raft_snapshot_store.clone(),
                     );
+                    if let Some(snapshot_store) = raft_snapshot_store {
+                        let prune_interval_ms = env_u64(
+                            "AGENTDB_RAFT_SNAPSHOT_PRUNE_INTERVAL_MS",
+                            DEFAULT_RAFT_SNAPSHOT_PRUNE_INTERVAL_MS,
+                        )
+                        .max(1_000);
+                        let prune_batch = env_i64(
+                            "AGENTDB_RAFT_SNAPSHOT_PRUNE_BATCH",
+                            DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH,
+                        )
+                        .max(1);
+                        spawn_raft_snapshot_prune_worker(
+                            startup.meta.clone(),
+                            snapshot_store,
+                            Duration::from_millis(prune_interval_ms),
+                            prune_batch,
+                        );
+                    }
                 }
                 tracing::info!(
                     node_id = %startup.node_id,
@@ -897,6 +927,64 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
             }
             Ok(Arc::new(builder.build()?))
         }
+    }
+}
+
+#[derive(Clone)]
+struct RaftSnapshotObjectStore {
+    store: Arc<dyn ObjectStore>,
+    prefix: String,
+}
+
+impl RaftSnapshotObjectStore {
+    fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into().trim_matches('/').to_string(),
+        }
+    }
+
+    async fn put_transfer(
+        &self,
+        transfer: &agentdb_storage::RaftRsSnapshotTransfer,
+    ) -> anyhow::Result<String> {
+        let path = self.path_for(
+            transfer.tablet_id,
+            transfer.from,
+            transfer.to,
+            transfer.index,
+        );
+        self.store
+            .put(&path, transfer.payload.clone().into())
+            .await
+            .map_err(|error| anyhow::anyhow!("raft snapshot object upload failed: {error}"))?;
+        Ok(format!("object://{path}"))
+    }
+
+    async fn delete_uri(&self, uri: &str) -> anyhow::Result<()> {
+        let Some(path) = uri.strip_prefix("object://") else {
+            anyhow::bail!("unsupported raft snapshot storage URI: {uri}");
+        };
+        let path = ObjectPath::from(path.to_string());
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "raft snapshot object delete failed for {uri}: {error}"
+            )),
+        }
+    }
+
+    fn path_for(&self, tablet_id: i64, from: u64, to: u64, index: u64) -> ObjectPath {
+        let mut path = String::new();
+        if !self.prefix.is_empty() {
+            path.push_str(&self.prefix);
+            path.push('/');
+        }
+        path.push_str(&format!(
+            "tablet-{tablet_id}/from-{from}/to-{to}/idx-{index}.snapshot"
+        ));
+        ObjectPath::from(path)
     }
 }
 
@@ -1592,6 +1680,7 @@ fn spawn_raft_rs_snapshot_worker(
     interval: Duration,
     min_lag: u64,
     retention_ms: i64,
+    snapshot_store: Option<Arc<RaftSnapshotObjectStore>>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
@@ -1604,6 +1693,7 @@ fn spawn_raft_rs_snapshot_worker(
                 &outbox,
                 min_lag,
                 retention_ms,
+                snapshot_store.clone(),
             )
             .await
             {
@@ -1620,6 +1710,7 @@ async fn run_raft_rs_snapshot_tick(
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     min_lag: u64,
     retention_ms: i64,
+    snapshot_store: Option<Arc<RaftSnapshotObjectStore>>,
 ) -> anyhow::Result<usize> {
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
@@ -1715,6 +1806,23 @@ async fn run_raft_rs_snapshot_tick(
             .await?;
             let now_ms = now_ms_i64();
             let expires_at_ms = now_ms.checked_add(retention_ms);
+            let storage_uri = match snapshot_store.as_ref() {
+                Some(snapshot_store) => match snapshot_store.put_transfer(&transfer).await {
+                    Ok(uri) => Some(uri),
+                    Err(error) => {
+                        tracing::warn!(
+                            tablet_id,
+                            from = transfer.from,
+                            to = transfer.to,
+                            index = transfer.index,
+                            ?error,
+                            "failed to upload retained raft snapshot object"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             agentdb_meta::tablet_snapshots::record(
                 meta.pool(),
                 &raft_snapshot_id(tablet_id, transfer.from, transfer.to, transfer.index),
@@ -1727,7 +1835,7 @@ async fn run_raft_rs_snapshot_tick(
                 transfer.term.min(i64::MAX as u64) as i64,
                 transfer.payload.len().min(i64::MAX as usize) as i64,
                 &agentdb_storage::sha256_hex(&transfer.payload),
-                None,
+                storage_uri.as_deref(),
                 "available",
                 now_ms,
                 expires_at_ms,
@@ -1759,6 +1867,59 @@ async fn run_raft_rs_snapshot_tick(
         }
     }
     Ok(sent)
+}
+
+fn spawn_raft_snapshot_prune_worker(
+    meta: agentdb_meta::MetaStore,
+    snapshot_store: Arc<RaftSnapshotObjectStore>,
+    interval: Duration,
+    batch_size: i64,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                run_raft_snapshot_prune_tick(&meta, Some(snapshot_store.clone()), batch_size).await
+            {
+                tracing::warn!(?error, "failed to run raft snapshot prune tick");
+            }
+        }
+    });
+}
+
+async fn run_raft_snapshot_prune_tick(
+    meta: &agentdb_meta::MetaStore,
+    snapshot_store: Option<Arc<RaftSnapshotObjectStore>>,
+    batch_size: i64,
+) -> anyhow::Result<usize> {
+    let now_ms = now_ms_i64();
+    let expired =
+        agentdb_meta::tablet_snapshots::list_expired(meta.pool(), now_ms, batch_size).await?;
+    let mut deleted = 0usize;
+    for snapshot in expired {
+        if let Some(uri) = snapshot.storage_uri.as_deref() {
+            let Some(snapshot_store) = snapshot_store.as_ref() else {
+                tracing::warn!(
+                    snapshot_id = %snapshot.snapshot_id,
+                    storage_uri = %uri,
+                    "retained raft snapshot object is expired but no object store is configured"
+                );
+                continue;
+            };
+            snapshot_store.delete_uri(uri).await?;
+        }
+        if agentdb_meta::tablet_snapshots::mark_deleted(
+            meta.pool(),
+            &snapshot.snapshot_id,
+            now_ms_i64(),
+        )
+        .await?
+        {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 async fn update_raft_replica_progress_health(
@@ -2873,6 +3034,7 @@ region = "us-west-2"
             &outbox,
             1,
             DEFAULT_RAFT_SNAPSHOT_RETENTION_MS,
+            None,
         )
         .await
         .unwrap();
@@ -2893,6 +3055,89 @@ region = "us-west-2"
             .find(|replica| replica.node_id == "node-b")
             .unwrap();
         assert_eq!(remote.health, "unreachable");
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_object_store_puts_and_deletes_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let snapshot_store =
+            RaftSnapshotObjectStore::new(object_store.clone(), RAFT_SNAPSHOT_OBJECT_PREFIX);
+        let transfer = agentdb_storage::RaftRsSnapshotTransfer {
+            tablet_id: 7,
+            from: 1,
+            to: 2,
+            index: 42,
+            term: 3,
+            payload: b"retained-snapshot".to_vec(),
+        };
+
+        let uri = snapshot_store.put_transfer(&transfer).await.unwrap();
+        let path = uri.strip_prefix("object://").unwrap();
+        let result = object_store.get(&ObjectPath::from(path)).await.unwrap();
+        assert_eq!(result.bytes().await.unwrap().as_ref(), b"retained-snapshot");
+
+        snapshot_store.delete_uri(&uri).await.unwrap();
+        assert!(matches!(
+            object_store.head(&ObjectPath::from(path)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_prune_deletes_object_before_metadata() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let snapshot_store = Arc::new(RaftSnapshotObjectStore::new(
+            object_store.clone(),
+            RAFT_SNAPSHOT_OBJECT_PREFIX,
+        ));
+        let transfer = agentdb_storage::RaftRsSnapshotTransfer {
+            tablet_id: 7,
+            from: 1,
+            to: 2,
+            index: 42,
+            term: 3,
+            payload: b"expired-snapshot".to_vec(),
+        };
+        let uri = snapshot_store.put_transfer(&transfer).await.unwrap();
+        let path = uri.strip_prefix("object://").unwrap().to_string();
+        agentdb_meta::tablet_snapshots::record(
+            meta.pool(),
+            "snap-expired-object",
+            7,
+            "node-a",
+            1,
+            "node-b",
+            2,
+            42,
+            3,
+            transfer.payload.len() as i64,
+            &agentdb_storage::sha256_hex(&transfer.payload),
+            Some(&uri),
+            "available",
+            1_000,
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        let deleted = run_raft_snapshot_prune_tick(&meta, Some(snapshot_store), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(matches!(
+            object_store.head(&ObjectPath::from(path)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        let snapshots = agentdb_meta::tablet_snapshots::list_recent(meta.pool(), None, true, 10)
+            .await
+            .unwrap();
+        assert_eq!(snapshots[0].status, "deleted");
     }
 
     #[tokio::test]
