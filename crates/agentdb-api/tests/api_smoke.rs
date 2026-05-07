@@ -962,6 +962,53 @@ async fn admin_raft_status_joins_control_plane_replica_metadata() {
 }
 
 #[tokio::test]
+async fn admin_raft_catch_up_dry_run_reports_snapshot_candidates() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 2, 2, 100)
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 0, 0, 100)
+        .await
+        .unwrap();
+    let (_dir, group, logs) = test_raft_group();
+    group.elect(1).unwrap();
+    logs[0].append(7, b"catch-up-source".to_vec()).unwrap();
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group).unwrap();
+    let state = AppState::new(Runtime::in_memory())
+        .with_meta(meta)
+        .with_raft_registry(registry);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/raft/catch-up", app.base))
+        .json(&json!({
+            "tablet_id": 7,
+            "target_node_id": "2",
+            "dry_run": true,
+            "min_lag": 1
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["tablet_count"], 1);
+    assert_eq!(body["attempted"], 1);
+    assert_eq!(body["sent"], 0);
+    assert_eq!(body["actions"][0]["tablet_id"], 7);
+    assert_eq!(body["actions"][0]["node_id"], "2");
+    assert_eq!(body["actions"][0]["to_raft_node_id"], 2);
+    assert_eq!(body["actions"][0]["status"], "would_send");
+}
+
+#[tokio::test]
 async fn internal_raft_message_requires_token() {
     let ingress = Arc::new(TestRaftIngress::default());
     let state = AppState::new(Runtime::in_memory())

@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         command: TabletsCommand,
     },
+    /// Raft replica visibility and catch-up operations.
+    Raft {
+        #[command(subcommand)]
+        command: RaftCommand,
+    },
     /// Local drain operations.
     Drain {
         #[command(subcommand)]
@@ -163,6 +168,23 @@ enum TabletsCommand {
         stale_threshold_ms: Option<i64>,
         #[arg(long)]
         max_movements: Option<usize>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RaftCommand {
+    /// Show local Raft groups and configured replica progress.
+    Status,
+    /// Trigger snapshot catch-up for lagging replicas.
+    CatchUp {
+        #[arg(long)]
+        tablet_id: Option<i64>,
+        #[arg(long)]
+        target_node_id: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        min_lag: u64,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -291,6 +313,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
         }
         Command::Nodes { command } => nodes(api, command).await,
         Command::Tablets { command } => tablets(api, command).await,
+        Command::Raft { command } => raft(api, command).await,
         Command::Drain { command } => match command {
             DrainCommand::Status => api.get("/api/admin/drain").await,
             DrainCommand::Start => api.post("/api/admin/drain", json!({})).await,
@@ -337,6 +360,29 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 api.post(&path, body).await
             }
         },
+    }
+}
+
+async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
+    match command {
+        RaftCommand::Status => api.get("/api/admin/raft").await,
+        RaftCommand::CatchUp {
+            tablet_id,
+            target_node_id,
+            min_lag,
+            dry_run,
+        } => {
+            api.post(
+                "/api/admin/raft/catch-up",
+                json!({
+                    "tablet_id": tablet_id,
+                    "target_node_id": target_node_id,
+                    "min_lag": min_lag,
+                    "dry_run": dry_run
+                }),
+            )
+            .await
+        }
     }
 }
 
@@ -592,6 +638,10 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "owner_node_id",
         "source_node_id",
         "target_node_id",
+        "from_raft_node_id",
+        "to_raft_node_id",
+        "lag",
+        "snapshot_index",
         "handoff_target_node_id",
         "is_stale",
         "ready",

@@ -68,6 +68,7 @@ The repository now has cluster-facing visibility endpoints:
 - `GET /api/admin/tablets`
 - `GET /api/admin/routing`
 - `GET /api/admin/routing/decision`
+- `GET /api/admin/raft`
 - `GET /api/admin/cluster/health`
 - `GET /api/admin/cluster/readiness`
 
@@ -94,6 +95,11 @@ And a very small amount of direct metadata admin:
 - `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
   for assigning unowned tablets, moving tablets away from fresh draining nodes,
   and evening out fresh `alive` node load
+- `agentdbctl raft status` for local Raft group status, configured replica
+  progress, replication lag, and catch-up-needed visibility
+- `agentdbctl raft catch-up --dry-run` for previewing snapshot catch-up
+  candidates, and `agentdbctl raft catch-up` for manually sending snapshots to
+  lagging voter/learner replicas
 - `agentdbctl backup create ...` for an online backup manifest and optional
   metadata snapshot
 - `agentdbctl restore validate <manifest-path>` for backup manifest validation;

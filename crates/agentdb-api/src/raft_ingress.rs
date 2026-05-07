@@ -73,6 +73,17 @@ impl RaftRsGroupRegistry {
         Ok(self.group_for(tablet_id)?.status())
     }
 
+    pub fn build_snapshot_transfer(
+        &self,
+        tablet_id: i64,
+        from: u64,
+        to: u64,
+        application_snapshot: Vec<u8>,
+    ) -> Result<RaftRsSnapshotTransfer> {
+        self.group_for(tablet_id)?
+            .build_snapshot_transfer(from, to, application_snapshot)
+    }
+
     fn group_for(&self, tablet_id: i64) -> Result<RaftRsSharedGroup> {
         self.groups
             .read()
