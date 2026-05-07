@@ -1043,9 +1043,13 @@ single-session appends or record writes.
    commands can now prepare fenced source/destination tablet metadata, seed
    destination replica intent from source replica placement, and complete atomic
    range-map cutovers only after destination replicas are healthy and caught up
-   to the source applied index. They do not yet perform the copy/replay itself
-   or actively bootstrap split-created Raft groups; those workers must update
-   `tablet_replicas` progress before cutover succeeds.
+   to the source applied index. Prepare also writes `tablet_movements` rows,
+   giving Raft/state-copy workers an explicit source-to-destination work queue
+   with shard range and required applied index. Complete marks those movement
+   rows `completed`. The system does not yet perform the copy/replay itself or
+   actively bootstrap split-created Raft groups; those workers must process
+   `tablet_movements` and update `tablet_replicas` progress before cutover
+   succeeds.
 
 9. Add compressed tablet-map ranges.
 

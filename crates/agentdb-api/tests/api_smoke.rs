@@ -2146,6 +2146,15 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap()
         .iter()
         .any(|replica| replica["tablet_id"] == 8 && replica["role"] == "voter"));
+    assert!(split_prepare["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| {
+            movement["movement_id"] == "split:7:8"
+                && movement["status"] == "pending"
+                && movement["required_applied_index"] == 12
+        }));
 
     let rejected = app
         .client
@@ -2197,6 +2206,11 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap();
     assert_eq!(split_complete["action"], "complete_split");
     assert_eq!(split_complete["destinations_ready"], true);
+    assert!(split_complete["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|movement| movement["status"] == "completed"));
     assert!(split_complete["tablets"]
         .as_array()
         .unwrap()
@@ -2220,6 +2234,14 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
     assert_eq!(merge_prepare["action"], "prepare_merge");
     assert_eq!(merge_prepare["required_applied_index"], 12);
     assert_eq!(merge_prepare["destinations_ready"], false);
+    assert!(
+        merge_prepare["movements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|movement| movement["movement_id"] == "merge:8:10"
+                && movement["status"] == "pending")
+    );
     assert!(merge_prepare["tablets"]
         .as_array()
         .unwrap()
@@ -2247,6 +2269,11 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap();
     assert_eq!(merge_complete["action"], "complete_merge");
     assert_eq!(merge_complete["destinations_ready"], true);
+    assert!(merge_complete["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|movement| movement["status"] == "completed"));
     assert_eq!(merge_complete["ranges"].as_array().unwrap().len(), 1);
     assert_eq!(merge_complete["ranges"][0]["tablet_id"], 10);
     assert!(merge_complete["tablets"]
@@ -2259,6 +2286,31 @@ async fn admin_tablet_split_merge_lifecycle_round_trip() {
         .unwrap()
         .iter()
         .any(|tablet| tablet["tablet_id"] == 8 && tablet["state"] == "tombstoned"));
+
+    let movements: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/admin/tablet-movements?status=completed",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(movements
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| movement["movement_id"] == "split:7:8"));
+    assert!(movements
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|movement| movement["movement_id"] == "merge:8:10"));
 }
 
 #[tokio::test]

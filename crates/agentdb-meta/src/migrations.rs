@@ -127,6 +127,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/018_tablet_snapshots.sql"),
         include_str!("../migrations/018_tablet_snapshots.pg.sql"),
     ),
+    (
+        19,
+        "tablet split/merge state movement queue",
+        include_str!("../migrations/019_tablet_movements.sql"),
+        include_str!("../migrations/019_tablet_movements.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
@@ -293,6 +299,7 @@ mod tests {
             "scheduler_leader",
             "session_overrides",
             "shards",
+            "tablet_movements",
             "tablets",
             "tenants",
             "users",

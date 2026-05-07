@@ -38,8 +38,8 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    nodes, session_locators, tablet_ranges, tablet_rebalance, tablet_replicas, tablet_snapshots,
-    tablets, tenant_policies, tenants,
+    nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance, tablet_replicas,
+    tablet_snapshots, tablets, tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -104,6 +104,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/admin/tablet-ranges/replace",
             post(replace_admin_tablet_ranges),
+        )
+        .route(
+            "/api/admin/tablet-movements",
+            get(get_admin_tablet_movements),
         )
         .route(
             "/api/admin/tablets/:tablet_id/split/prepare",
@@ -459,6 +463,12 @@ struct ReplaceTabletRangesResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct TabletMovementsQuery {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SplitTabletBody {
     placement_scope_id: Option<String>,
     child_ranges: Vec<tablet_ranges::ReplacementRange>,
@@ -490,6 +500,7 @@ struct AdminTabletRangeLifecycleResponse {
     new_ranges: Vec<tablet_ranges::ReplacementRange>,
     tablets: Vec<AdminTabletView>,
     replicas: Vec<AdminTabletReplicaView>,
+    movements: Vec<tablet_movements::TabletMovement>,
     ranges: Vec<tablet_ranges::TabletRange>,
 }
 
@@ -1764,6 +1775,30 @@ async fn lifecycle_replicas(
     Ok(replicas)
 }
 
+fn split_movement_id(source_tablet_id: i64, destination_tablet_id: i64) -> String {
+    format!("split:{source_tablet_id}:{destination_tablet_id}")
+}
+
+fn merge_movement_id(source_tablet_id: i64, destination_tablet_id: i64) -> String {
+    format!("merge:{source_tablet_id}:{destination_tablet_id}")
+}
+
+async fn movement_rows(
+    meta: &agentdb_meta::MetaStore,
+    movement_ids: &[String],
+) -> Result<Vec<tablet_movements::TabletMovement>, ApiError> {
+    let mut rows = Vec::new();
+    for movement_id in movement_ids {
+        if let Some(row) = tablet_movements::get(meta.pool(), movement_id)
+            .await
+            .map_err(internal_error)?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
 async fn get_admin_tablets(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
@@ -1830,6 +1865,21 @@ async fn get_admin_tablet_ranges(
     let rows = tablet_ranges::list_all(meta.pool())
         .await
         .map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn get_admin_tablet_movements(
+    State(s): State<AppState>,
+    Query(query): Query<TabletMovementsQuery>,
+) -> Result<Json<Vec<tablet_movements::TabletMovement>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = tablet_movements::list_recent(
+        meta.pool(),
+        query.status.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await
+    .map_err(|err| invalid_admin_request(err.to_string()))?;
     Ok(Json(rows))
 }
 
@@ -1915,6 +1965,25 @@ async fn prepare_admin_tablet_split(
     let destinations_ready =
         ensure_destinations_ready(meta, &destination_tablet_ids, required_applied_index, false)
             .await?;
+    let mut movement_ids = Vec::new();
+    for child in &body.child_ranges {
+        let movement_id = split_movement_id(tablet_id, child.tablet_id);
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            &movement_id,
+            "split",
+            tablet_id,
+            child.tablet_id,
+            &placement_scope_id,
+            child.start_shard,
+            child.end_shard,
+            required_applied_index,
+            now_ms,
+        )
+        .await
+        .map_err(internal_error)?;
+        movement_ids.push(movement_id);
+    }
     let tablets = tablets::list_all(meta.pool())
         .await
         .map_err(internal_error)?
@@ -1946,6 +2015,7 @@ async fn prepare_admin_tablet_split(
         new_ranges: body.child_ranges,
         tablets,
         replicas: lifecycle_replicas(meta, &destination_tablet_ids).await?,
+        movements: movement_rows(meta, &movement_ids).await?,
         ranges,
     }))
 }
@@ -2008,16 +2078,25 @@ async fn complete_admin_tablet_split(
         body.require_ready.unwrap_or(true),
     )
     .await?;
+    let now_ms = now_ms_i64();
     tablet_ranges::replace_ranges(
         meta.pool(),
         &placement_scope_id,
         &old_bounds,
         &body.child_ranges,
         map_epoch,
-        now_ms_i64(),
+        now_ms,
     )
     .await
     .map_err(internal_error)?;
+    let mut movement_ids = Vec::new();
+    for child in &body.child_ranges {
+        let movement_id = split_movement_id(tablet_id, child.tablet_id);
+        let _ = tablet_movements::mark_completed(meta.pool(), &movement_id, now_ms)
+            .await
+            .map_err(internal_error)?;
+        movement_ids.push(movement_id);
+    }
     for child in &body.child_ranges {
         tablets::set_state(meta.pool(), child.tablet_id, "serving")
             .await
@@ -2057,6 +2136,7 @@ async fn complete_admin_tablet_split(
         new_ranges: body.child_ranges,
         tablets,
         replicas: lifecycle_replicas(meta, &destination_tablet_ids).await?,
+        movements: movement_rows(meta, &movement_ids).await?,
         ranges,
     }))
 }
@@ -2128,6 +2208,27 @@ async fn prepare_admin_tablet_merge(
         false,
     )
     .await?;
+    let mut movement_ids = Vec::new();
+    for source_id in &body.source_tablet_ids {
+        let source_ranges = scoped_ranges_for_tablet(meta, *source_id, &placement_scope_id).await?;
+        let source_range = union_replacement_range(&source_ranges, body.destination_tablet_id)?;
+        let movement_id = merge_movement_id(*source_id, body.destination_tablet_id);
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            &movement_id,
+            "merge",
+            *source_id,
+            body.destination_tablet_id,
+            &placement_scope_id,
+            source_range.start_shard,
+            source_range.end_shard,
+            required_applied_index,
+            now_ms,
+        )
+        .await
+        .map_err(internal_error)?;
+        movement_ids.push(movement_id);
+    }
     let tablets = tablets::list_all(meta.pool())
         .await
         .map_err(internal_error)?
@@ -2156,6 +2257,7 @@ async fn prepare_admin_tablet_merge(
         new_ranges: vec![new_range],
         tablets,
         replicas: lifecycle_replicas(meta, &[body.destination_tablet_id]).await?,
+        movements: movement_rows(meta, &movement_ids).await?,
         ranges,
     }))
 }
@@ -2222,16 +2324,25 @@ async fn complete_admin_tablet_merge(
         body.require_ready.unwrap_or(true),
     )
     .await?;
+    let now_ms = now_ms_i64();
     tablet_ranges::replace_ranges(
         meta.pool(),
         &placement_scope_id,
         &old_bounds,
         &[new_range],
         map_epoch,
-        now_ms_i64(),
+        now_ms,
     )
     .await
     .map_err(internal_error)?;
+    let mut movement_ids = Vec::new();
+    for source_id in &body.source_tablet_ids {
+        let movement_id = merge_movement_id(*source_id, body.destination_tablet_id);
+        let _ = tablet_movements::mark_completed(meta.pool(), &movement_id, now_ms)
+            .await
+            .map_err(internal_error)?;
+        movement_ids.push(movement_id);
+    }
     tablets::set_state(meta.pool(), body.destination_tablet_id, "serving")
         .await
         .map_err(internal_error)?;
@@ -2268,6 +2379,7 @@ async fn complete_admin_tablet_merge(
         new_ranges: vec![new_range],
         tablets,
         replicas: lifecycle_replicas(meta, &[body.destination_tablet_id]).await?,
+        movements: movement_rows(meta, &movement_ids).await?,
         ranges,
     }))
 }

@@ -30,6 +30,7 @@ pub mod scram;
 pub mod session_locators;
 pub mod session_overrides;
 pub mod shards;
+pub mod tablet_movements;
 pub mod tablet_ranges;
 pub mod tablet_rebalance;
 pub mod tablet_replicas;
