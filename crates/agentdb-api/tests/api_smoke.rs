@@ -13,13 +13,13 @@ use agentdb_api::{
     raft_ingress::RaftRsGroupRegistry,
     routing_http::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
-        HDR_TABLET_ID,
+        HDR_SHARD_ID, HDR_TABLET_ID,
     },
     state::{ProxyPolicy, RaftRsIngress},
     AppState,
 };
-use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
-use agentdb_meta::{nodes::Node, tablet_replicas, tablets::Tablet, MetaStore};
+use agentdb_core::{runtime::FetchRequest, Id, IdKind, NewAgent, NewSession, NewTenant, Runtime};
+use agentdb_meta::{nodes::Node, session_locators, tablet_replicas, tablets::Tablet, MetaStore};
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
     RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
@@ -575,6 +575,86 @@ async fn session_handlers_add_local_route_headers_when_snapshot_owner_is_local()
     assert_eq!(r.headers()[HDR_ROUTE_ACTION].to_str().unwrap(), "local");
     assert_eq!(r.headers()[HDR_OWNER_NODE].to_str().unwrap(), "node-a");
     assert_eq!(r.headers()[HDR_TABLET_ID].to_str().unwrap(), "0");
+}
+
+#[tokio::test]
+async fn create_session_routes_to_owner_and_records_session_locator() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let owner_snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-b"))])
+        .with_nodes(vec![node("node-b", "http://127.0.0.1:18081")]);
+    let owner = spawn_app_with_state(
+        AppState::new(runtime.clone())
+            .with_meta(meta.clone())
+            .with_routing(RouteRuntime::snapshot("node-b", owner_snapshot)),
+    )
+    .await;
+    let local_snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-b"))])
+        .with_nodes(vec![
+            node("node-a", "http://127.0.0.1:18080"),
+            node("node-b", &owner.base),
+        ]);
+    let local = spawn_app_with_state(
+        AppState::new(runtime)
+            .with_meta(meta.clone())
+            .with_routing(RouteRuntime::snapshot("node-a", local_snapshot)),
+    )
+    .await;
+
+    let t: serde_json::Value = local
+        .client
+        .post(format!("{}/api/tenants", local.base))
+        .json(&json!({"external_key": "routed-create", "policy": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = t["tenant_id"].as_str().unwrap().to_string();
+    let a: serde_json::Value = local
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", local.base))
+        .json(&json!({"alias": "agent", "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = a["agent_id"].as_str().unwrap().to_string();
+
+    let response = local
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            local.base
+        ))
+        .json(&json!({"alias": null}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(response.headers().get(HDR_ROUTE_ACTION).unwrap(), "local");
+    assert_eq!(response.headers().get(HDR_TABLET_ID).unwrap(), "0");
+    assert_eq!(response.headers().get(HDR_SHARD_ID).unwrap(), "0");
+    let session: serde_json::Value = response.json().await.unwrap();
+    let sid = session["session_id"].as_str().unwrap();
+
+    let locator = session_locators::get(meta.pool(), sid)
+        .await
+        .unwrap()
+        .expect("session locator");
+    assert_eq!(locator.tenant_external_id.as_deref(), Some(tid.as_str()));
+    assert_eq!(locator.tablet_id, Some(0));
+    assert_eq!(locator.shard_id, 0);
 }
 
 #[tokio::test]
@@ -2322,51 +2402,37 @@ async fn append_to_unknown_session_returns_404() {
 }
 
 async fn bootstrap_session(app: &TestApp) -> (String, String, String) {
-    let t: serde_json::Value = app
-        .client
-        .post(format!("{}/api/tenants", app.base))
-        .json(&json!({"external_key": "test", "policy": {}}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    let tenant = app
+        .runtime
+        .create_tenant(NewTenant {
+            external_key: "test".into(),
+            policy: serde_json::json!({}),
+        })
         .await
         .unwrap();
-    let tid = t["tenant_id"].as_str().unwrap().to_string();
-
-    let a: serde_json::Value = app
-        .client
-        .post(format!("{}/api/tenants/{tid}/agents", app.base))
-        .json(&json!({"alias": null, "config": {}}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    let agent = app
+        .runtime
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
         .await
         .unwrap();
-    let aid = a["agent_id"].as_str().unwrap().to_string();
-
-    let s: serde_json::Value = app
-        .client
-        .post(format!(
-            "{}/api/tenants/{tid}/agents/{aid}/sessions",
-            app.base
-        ))
-        .json(&json!({"alias": null}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    let session = app
+        .runtime
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
         .await
         .unwrap();
-    let sid = s["session_id"].as_str().unwrap().to_string();
-    (tid, aid, sid)
+    (
+        tenant.tenant_id.as_str().to_string(),
+        agent.agent_id.as_str().to_string(),
+        session.session_id.as_str().to_string(),
+    )
 }
 
 async fn spawn_routed_app(owner_node_id: &str) -> TestApp {

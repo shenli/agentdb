@@ -62,9 +62,13 @@ pub struct NewSession {
 
 impl Session {
     pub fn create(req: NewSession) -> Self {
+        Self::create_with_id(req, Id::new(IdKind::Session))
+    }
+
+    pub fn create_with_id(req: NewSession, session_id: Id) -> Self {
         let now = crate::now_ms();
         Self {
-            session_id: Id::new(IdKind::Session),
+            session_id,
             tenant_id: req.tenant_id,
             agent_id: req.agent_id,
             alias: req.alias,

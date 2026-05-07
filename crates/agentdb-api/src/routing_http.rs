@@ -32,10 +32,12 @@ pub const HDR_ROUTE_ACTION: &str = "x-agentdb-route-action";
 pub const HDR_OWNER_NODE: &str = "x-agentdb-owner-node";
 pub const HDR_OWNER_ADDRESS: &str = "x-agentdb-owner-address";
 pub const HDR_TABLET_ID: &str = "x-agentdb-tablet-id";
+pub const HDR_SHARD_ID: &str = "x-agentdb-shard-id";
 pub const HDR_TABLET_EPOCH: &str = "x-agentdb-tablet-epoch";
 pub const HDR_ROUTE_REASON: &str = "x-agentdb-route-reason";
 pub const HDR_FORWARDED_BY: &str = "x-agentdb-forwarded-by";
 pub const HDR_FORWARDED_FOR: &str = "x-agentdb-forwarded-for";
+pub const HDR_PREALLOCATED_SESSION_ID: &str = "x-agentdb-preallocated-session-id";
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -371,6 +373,27 @@ impl RouteRuntime {
             tenant_id,
             Some(session_id),
             session_locator,
+            original_path_and_query,
+            incoming_headers,
+        )
+    }
+
+    pub fn guard_routing_key(
+        &self,
+        tenant_id: &str,
+        routing_key: Option<&str>,
+        original_path_and_query: &str,
+        incoming_headers: &HeaderMap,
+    ) -> RouteGuardOutcome {
+        let mode = self.mode.read().expect("route runtime lock poisoned");
+        let RouteRuntimeMode::Snapshot(snapshot) = &*mode else {
+            return self.guard(original_path_and_query, incoming_headers);
+        };
+        self.guard_snapshot(
+            snapshot,
+            tenant_id,
+            routing_key,
+            None,
             original_path_and_query,
             incoming_headers,
         )
@@ -768,6 +791,7 @@ fn route_target(decision: &RouteDecision, action: &'static str) -> RouteTarget {
     insert_header(&mut headers, HDR_OWNER_NODE, &owner_node_id);
     insert_header(&mut headers, HDR_OWNER_ADDRESS, &owner_address);
     insert_header(&mut headers, HDR_TABLET_ID, &decision.tablet_id.to_string());
+    insert_header(&mut headers, HDR_SHARD_ID, &decision.shard_id.to_string());
     insert_header(&mut headers, HDR_TABLET_EPOCH, &epoch.to_string());
     RouteTarget {
         tablet_id: decision.tablet_id,
