@@ -702,6 +702,53 @@ async fn admin_raft_status_reports_registered_tablets() {
 }
 
 #[tokio::test]
+async fn admin_raft_status_joins_control_plane_replica_metadata() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 11, 12, 100)
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 3, 4, 100)
+        .await
+        .unwrap();
+    let (_dir, group, _logs) = test_raft_group();
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group).unwrap();
+    let state = AppState::new(Runtime::in_memory())
+        .with_meta(meta)
+        .with_raft_registry(registry);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["control_plane_enabled"], true);
+    assert_eq!(body["configured_replica_count"], 2);
+    assert_eq!(body["unhealthy_replica_count"], 1);
+    let configured = body["tablets"][0]["configured_replicas"]
+        .as_array()
+        .unwrap();
+    assert_eq!(configured.len(), 2);
+    assert_eq!(configured[0]["node_id"], "1");
+    assert_eq!(configured[0]["raft_node_id"], 1);
+    assert_eq!(configured[0]["health"], "healthy");
+    assert_eq!(configured[0]["local_runtime"], true);
+    assert_eq!(configured[0]["runtime_commit_index"], 0);
+    assert_eq!(configured[1]["node_id"], "2");
+    assert_eq!(configured[1]["role"], "learner");
+    assert_eq!(configured[1]["health"], "lagging");
+}
+
+#[tokio::test]
 async fn internal_raft_message_requires_token() {
     let ingress = Arc::new(TestRaftIngress::default());
     let state = AppState::new(Runtime::in_memory())
