@@ -76,14 +76,15 @@ Split/merge lifecycle:
 
 ```bash
 agentdbctl tablets prepare-split 7 --child-range 0:49:8 --child-range 50:99:9
-agentdbctl tablets complete-split 7 --child-range 0:49:8 --child-range 50:99:9 --map-epoch 2
+agentdbctl tablets complete-split 7 --child-range 0:49:8 --child-range 50:99:9 --map-epoch 2 --min-applied-index 1024
 agentdbctl tablets prepare-merge --source-tablet-id 8 --source-tablet-id 9 10
-agentdbctl tablets complete-merge --source-tablet-id 8 --source-tablet-id 9 10 --map-epoch 3
+agentdbctl tablets complete-merge --source-tablet-id 8 --source-tablet-id 9 10 --map-epoch 3 --min-applied-index 1024
 ```
 
 Prepare only fences metadata and creates destination tablets. Complete publishes
-the range-map cutover and lifecycle states after external state copy/replay is
-safe.
+the range-map cutover and lifecycle states after destination replicas are
+healthy and caught up to the source applied index. Use `--allow-unready` only
+for emergency/manual recovery after separately proving state safety.
 
 Raft catch-up:
 

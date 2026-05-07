@@ -546,10 +546,12 @@ cannot be divided.
 4. Bootstrap child Raft groups and local applied-state stores.
 5. Snapshot or range-copy P's hot state into children by shard range.
 6. Replay P's committed log tail into children up to a cutover index.
-7. Complete split: publish tablet_range rows for children under a new map_epoch.
-8. Complete split: mark children serving so new writes route to children.
-9. Drain P and reject/refresh stale-epoch writes.
-10. Complete split: tombstone P after routing cutover.
+7. Complete split: verify every child destination replica is healthy and caught
+   up to the parent source applied index.
+8. Complete split: publish tablet_range rows for children under a new map_epoch.
+9. Complete split: mark children serving so new writes route to children.
+10. Drain P and reject/refresh stale-epoch writes.
+11. Complete split: tombstone P after routing cutover.
 ```
 
 Split-point selection should use observed traffic, not only midpoint:
@@ -581,10 +583,12 @@ are cold, tiny, or over-fragmented.
 3. Prepare merge: create destination tablet D in creating state.
 4. Snapshot or range-copy hot state from all sources into D.
 5. Replay committed log tails into D up to cutover indexes.
-6. Complete merge: publish one tablet_range row for D under a new map_epoch.
-7. Complete merge: mark D serving so new writes route to D.
-8. Drain source tablets.
-9. Complete merge: tombstone sources after routing cutover.
+6. Complete merge: verify every destination replica is healthy and caught up to
+   the maximum source applied index.
+7. Complete merge: publish one tablet_range row for D under a new map_epoch.
+8. Complete merge: mark D serving so new writes route to D.
+9. Drain source tablets.
+10. Complete merge: tombstone sources after routing cutover.
 ```
 
 Merge must never combine dedicated tablets from different tenants. Shared pool
@@ -1036,9 +1040,12 @@ single-session appends or record writes.
    prepares owned-tablet movement by creating learner replica intent for the
    target, and completes prepared replacements once the target is healthy and
    caught up. Admin split/merge lifecycle endpoints and `agentdbctl tablets`
-   commands can now prepare fenced source/destination tablet metadata and
-   complete atomic range-map cutovers. They do not yet copy/replay hot split
-   state or coordinate split-created Raft groups.
+   commands can now prepare fenced source/destination tablet metadata, seed
+   destination replica intent from source replica placement, and complete atomic
+   range-map cutovers only after destination replicas are healthy and caught up
+   to the source applied index. They do not yet perform the copy/replay itself
+   or actively bootstrap split-created Raft groups; those workers must update
+   `tablet_replicas` progress before cutover succeeds.
 
 9. Add compressed tablet-map ranges.
 

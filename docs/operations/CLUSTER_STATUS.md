@@ -100,10 +100,10 @@ And a very small amount of direct metadata admin:
   `--retire-source` when the old owner should be removed from replica metadata
 - `agentdbctl tablets prepare-split` / `complete-split` to fence a parent
   tablet, create child tablet metadata, and publish the child range-map cutover
-  after state copy/replay is safe
+  after destination replicas are healthy and caught up
 - `agentdbctl tablets prepare-merge` / `complete-merge` to fence source
   tablets, create destination tablet metadata, and publish the merged range-map
-  cutover after state copy/replay is safe
+  cutover after destination replicas are healthy and caught up
 - `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
   for assigning unowned tablets, preparing replacement learners for tablets on
   fresh draining nodes, completing prepared replacements once their targets are

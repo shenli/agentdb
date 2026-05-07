@@ -463,6 +463,8 @@ struct SplitTabletBody {
     placement_scope_id: Option<String>,
     child_ranges: Vec<tablet_ranges::ReplacementRange>,
     map_epoch: Option<i64>,
+    min_applied_index: Option<i64>,
+    require_ready: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +473,8 @@ struct MergeTabletsBody {
     source_tablet_ids: Vec<i64>,
     destination_tablet_id: i64,
     map_epoch: Option<i64>,
+    min_applied_index: Option<i64>,
+    require_ready: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -480,9 +484,12 @@ struct AdminTabletRangeLifecycleResponse {
     placement_scope_id: String,
     source_tablet_ids: Vec<i64>,
     destination_tablet_ids: Vec<i64>,
+    required_applied_index: i64,
+    destinations_ready: bool,
     old_ranges: Vec<tablet_ranges::RangeBounds>,
     new_ranges: Vec<tablet_ranges::ReplacementRange>,
     tablets: Vec<AdminTabletView>,
+    replicas: Vec<AdminTabletReplicaView>,
     ranges: Vec<tablet_ranges::TabletRange>,
 }
 
@@ -1629,6 +1636,134 @@ async fn create_lifecycle_tablet_if_missing(
     Ok(true)
 }
 
+async fn source_applied_index(
+    meta: &agentdb_meta::MetaStore,
+    source_tablet_ids: &[i64],
+) -> Result<i64, ApiError> {
+    let mut max_index = 0;
+    for tablet_id in source_tablet_ids {
+        for replica in tablet_replicas::list_by_tablet(meta.pool(), *tablet_id)
+            .await
+            .map_err(internal_error)?
+        {
+            if replica.role != "log_only" {
+                max_index = max_index.max(replica.applied_index);
+            }
+        }
+    }
+    Ok(max_index)
+}
+
+async fn seed_destination_replicas_from_sources(
+    meta: &agentdb_meta::MetaStore,
+    source_tablet_ids: &[i64],
+    destination_tablet_ids: &[i64],
+    now_ms: i64,
+) -> Result<bool, ApiError> {
+    let mut by_node = BTreeMap::<String, (String, i64, i64)>::new();
+    for source_id in source_tablet_ids {
+        for replica in tablet_replicas::list_by_tablet(meta.pool(), *source_id)
+            .await
+            .map_err(internal_error)?
+        {
+            let priority = replica_role_priority(&replica.role);
+            by_node
+                .entry(replica.node_id)
+                .and_modify(|existing| {
+                    if priority > existing.1 {
+                        *existing = (replica.role.clone(), priority, replica.applied_index);
+                    } else {
+                        existing.2 = existing.2.max(replica.applied_index);
+                    }
+                })
+                .or_insert((replica.role, priority, replica.applied_index));
+        }
+    }
+    let mut changed = false;
+    for destination_id in destination_tablet_ids {
+        let existing = tablet_replicas::list_by_tablet(meta.pool(), *destination_id)
+            .await
+            .map_err(internal_error)?;
+        for (node_id, (role, _, _)) in &by_node {
+            if existing.iter().any(|replica| replica.node_id == *node_id) {
+                continue;
+            }
+            tablet_replicas::upsert(
+                meta.pool(),
+                *destination_id,
+                node_id,
+                role,
+                "lagging",
+                0,
+                0,
+                now_ms,
+            )
+            .await
+            .map_err(internal_error)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn replica_role_priority(role: &str) -> i64 {
+    match role {
+        "voter" => 3,
+        "learner" => 2,
+        "log_only" => 1,
+        _ => 0,
+    }
+}
+
+async fn ensure_destinations_ready(
+    meta: &agentdb_meta::MetaStore,
+    destination_tablet_ids: &[i64],
+    required_applied_index: i64,
+    require_ready: bool,
+) -> Result<bool, ApiError> {
+    let mut all_ready = true;
+    for destination_id in destination_tablet_ids {
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), *destination_id)
+            .await
+            .map_err(internal_error)?;
+        let serving_replicas: Vec<_> = replicas
+            .iter()
+            .filter(|replica| replica.role != "log_only")
+            .collect();
+        if serving_replicas.is_empty() {
+            all_ready = false;
+        }
+        for replica in serving_replicas {
+            if replica.health != "healthy" || replica.applied_index < required_applied_index {
+                all_ready = false;
+            }
+        }
+    }
+    if require_ready && !all_ready {
+        return Err(invalid_admin_request(format!(
+            "destination tablets are not ready for cutover at applied_index {required_applied_index}"
+        )));
+    }
+    Ok(all_ready)
+}
+
+async fn lifecycle_replicas(
+    meta: &agentdb_meta::MetaStore,
+    tablet_ids: &[i64],
+) -> Result<Vec<AdminTabletReplicaView>, ApiError> {
+    let mut replicas = Vec::new();
+    for tablet_id in tablet_ids {
+        replicas.extend(
+            tablet_replicas::list_by_tablet(meta.pool(), *tablet_id)
+                .await
+                .map_err(internal_error)?
+                .into_iter()
+                .map(tablet_replica_view),
+        );
+    }
+    Ok(replicas)
+}
+
 async fn get_admin_tablets(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<AdminTabletView>>, ApiError> {
@@ -1763,11 +1898,23 @@ async fn prepare_admin_tablet_split(
     let mut changed = tablets::set_state(meta.pool(), tablet_id, "splitting")
         .await
         .map_err(internal_error)?;
+    let destination_tablet_ids: Vec<_> = body
+        .child_ranges
+        .iter()
+        .map(|range| range.tablet_id)
+        .collect();
     for child in &body.child_ranges {
         changed |=
             create_lifecycle_tablet_if_missing(meta, &source, child.tablet_id, "creating", now_ms)
                 .await?;
     }
+    changed |=
+        seed_destination_replicas_from_sources(meta, &[tablet_id], &destination_tablet_ids, now_ms)
+            .await?;
+    let required_applied_index = source_applied_index(meta, &[tablet_id]).await?;
+    let destinations_ready =
+        ensure_destinations_ready(meta, &destination_tablet_ids, required_applied_index, false)
+            .await?;
     let tablets = tablets::list_all(meta.pool())
         .await
         .map_err(internal_error)?
@@ -1792,14 +1939,13 @@ async fn prepare_admin_tablet_split(
         changed,
         placement_scope_id,
         source_tablet_ids: vec![tablet_id],
-        destination_tablet_ids: body
-            .child_ranges
-            .iter()
-            .map(|range| range.tablet_id)
-            .collect(),
+        destination_tablet_ids: destination_tablet_ids.clone(),
+        required_applied_index,
+        destinations_ready,
         old_ranges: old_bounds,
         new_ranges: body.child_ranges,
         tablets,
+        replicas: lifecycle_replicas(meta, &destination_tablet_ids).await?,
         ranges,
     }))
 }
@@ -1824,6 +1970,11 @@ async fn complete_admin_tablet_split(
     let map_epoch = body
         .map_epoch
         .ok_or_else(|| invalid_admin_request("split completion requires map_epoch"))?;
+    let destination_tablet_ids: Vec<_> = body
+        .child_ranges
+        .iter()
+        .map(|range| range.tablet_id)
+        .collect();
     let placement_scope_id = body
         .placement_scope_id
         .unwrap_or_else(|| source.placement_scope_id.clone());
@@ -1842,6 +1993,21 @@ async fn complete_admin_tablet_split(
         }
     }
     let old_bounds = range_bounds(&old_ranges);
+    let required_applied_index = body
+        .min_applied_index
+        .unwrap_or(source_applied_index(meta, &[tablet_id]).await?);
+    if required_applied_index < 0 {
+        return Err(invalid_admin_request(
+            "min_applied_index must be non-negative",
+        ));
+    }
+    let destinations_ready = ensure_destinations_ready(
+        meta,
+        &destination_tablet_ids,
+        required_applied_index,
+        body.require_ready.unwrap_or(true),
+    )
+    .await?;
     tablet_ranges::replace_ranges(
         meta.pool(),
         &placement_scope_id,
@@ -1884,14 +2050,13 @@ async fn complete_admin_tablet_split(
         changed: true,
         placement_scope_id,
         source_tablet_ids: vec![tablet_id],
-        destination_tablet_ids: body
-            .child_ranges
-            .iter()
-            .map(|range| range.tablet_id)
-            .collect(),
+        destination_tablet_ids: destination_tablet_ids.clone(),
+        required_applied_index,
+        destinations_ready,
         old_ranges: old_bounds,
         new_ranges: body.child_ranges,
         tablets,
+        replicas: lifecycle_replicas(meta, &destination_tablet_ids).await?,
         ranges,
     }))
 }
@@ -1948,6 +2113,21 @@ async fn prepare_admin_tablet_merge(
             .await
             .map_err(internal_error)?;
     }
+    changed |= seed_destination_replicas_from_sources(
+        meta,
+        &body.source_tablet_ids,
+        &[body.destination_tablet_id],
+        now_ms,
+    )
+    .await?;
+    let required_applied_index = source_applied_index(meta, &body.source_tablet_ids).await?;
+    let destinations_ready = ensure_destinations_ready(
+        meta,
+        &[body.destination_tablet_id],
+        required_applied_index,
+        false,
+    )
+    .await?;
     let tablets = tablets::list_all(meta.pool())
         .await
         .map_err(internal_error)?
@@ -1970,9 +2150,12 @@ async fn prepare_admin_tablet_merge(
         placement_scope_id,
         source_tablet_ids: body.source_tablet_ids,
         destination_tablet_ids: vec![body.destination_tablet_id],
+        required_applied_index,
+        destinations_ready,
         old_ranges: old_bounds,
         new_ranges: vec![new_range],
         tablets,
+        replicas: lifecycle_replicas(meta, &[body.destination_tablet_id]).await?,
         ranges,
     }))
 }
@@ -2024,6 +2207,21 @@ async fn complete_admin_tablet_merge(
     let new_range = union_replacement_range(&old_ranges, body.destination_tablet_id)?;
     tablet_ranges::validate_replacement_plan(&old_bounds, &[new_range])
         .map_err(|err| invalid_admin_request(err.to_string()))?;
+    let required_applied_index = body
+        .min_applied_index
+        .unwrap_or(source_applied_index(meta, &body.source_tablet_ids).await?);
+    if required_applied_index < 0 {
+        return Err(invalid_admin_request(
+            "min_applied_index must be non-negative",
+        ));
+    }
+    let destinations_ready = ensure_destinations_ready(
+        meta,
+        &[body.destination_tablet_id],
+        required_applied_index,
+        body.require_ready.unwrap_or(true),
+    )
+    .await?;
     tablet_ranges::replace_ranges(
         meta.pool(),
         &placement_scope_id,
@@ -2064,9 +2262,12 @@ async fn complete_admin_tablet_merge(
         placement_scope_id,
         source_tablet_ids: body.source_tablet_ids,
         destination_tablet_ids: vec![body.destination_tablet_id],
+        required_applied_index,
+        destinations_ready,
         old_ranges: old_bounds,
         new_ranges: vec![new_range],
         tablets,
+        replicas: lifecycle_replicas(meta, &[body.destination_tablet_id]).await?,
         ranges,
     }))
 }

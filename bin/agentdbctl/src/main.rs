@@ -199,6 +199,10 @@ enum TabletsCommand {
         placement_scope_id: Option<String>,
         #[arg(long)]
         map_epoch: i64,
+        #[arg(long)]
+        min_applied_index: Option<i64>,
+        #[arg(long)]
+        allow_unready: bool,
     },
     /// Prepare a fenced tablet merge workflow.
     PrepareMerge {
@@ -217,6 +221,10 @@ enum TabletsCommand {
         placement_scope_id: Option<String>,
         #[arg(long)]
         map_epoch: i64,
+        #[arg(long)]
+        min_applied_index: Option<i64>,
+        #[arg(long)]
+        allow_unready: bool,
     },
     /// Run the rebalance policy.
     Rebalance {
@@ -626,13 +634,17 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             child_ranges,
             placement_scope_id,
             map_epoch,
+            min_applied_index,
+            allow_unready,
         } => {
             api.post(
                 &format!("/api/admin/tablets/{tablet_id}/split/complete"),
                 json!({
                     "placement_scope_id": placement_scope_id,
                     "child_ranges": parse_tablet_ranges(&child_ranges)?,
-                    "map_epoch": map_epoch
+                    "map_epoch": map_epoch,
+                    "min_applied_index": min_applied_index,
+                    "require_ready": !allow_unready
                 }),
             )
             .await
@@ -657,6 +669,8 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
             destination_tablet_id,
             placement_scope_id,
             map_epoch,
+            min_applied_index,
+            allow_unready,
         } => {
             api.post(
                 "/api/admin/tablets/merge/complete",
@@ -664,7 +678,9 @@ async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
                     "placement_scope_id": placement_scope_id,
                     "source_tablet_ids": source_tablet_ids,
                     "destination_tablet_id": destination_tablet_id,
-                    "map_epoch": map_epoch
+                    "map_epoch": map_epoch,
+                    "min_applied_index": min_applied_index,
+                    "require_ready": !allow_unready
                 }),
             )
             .await
