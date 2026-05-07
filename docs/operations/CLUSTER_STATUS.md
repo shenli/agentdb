@@ -100,9 +100,11 @@ And a very small amount of direct metadata admin:
   `--retire-source` when the old owner should be removed from replica metadata
 - `agentdbctl tablets rebalance --dry-run` and `agentdbctl tablets rebalance`
   for assigning unowned tablets, preparing replacement learners for tablets on
-  fresh draining nodes, and evening out fresh `alive` node load
+  fresh draining nodes, completing prepared replacements once their targets are
+  healthy and caught up, and evening out fresh `alive` node load
 - `agentdbctl raft status` for local Raft group status, configured replica
-  progress, replication lag, and catch-up-needed visibility
+  progress, replication lag, catch-up-needed visibility, and configured-only
+  tablets that have not opened a local Raft group on the queried API node
 - `agentdbctl raft catch-up --dry-run` for previewing snapshot catch-up
   candidates, and `agentdbctl raft catch-up` for manually sending snapshots to
   lagging voter/learner replicas

@@ -1013,9 +1013,14 @@ single-session appends or record writes.
    `tablet_replicas`. Rebalance now uses the same replacement intent for owned
    tablet movement: it seeds the source as a voter, the target as a learner, and
    marks the target as the handoff destination so catch-up workers have explicit
-   control-plane work to converge. Remaining production work is completing
-   ready replacements automatically and integrating the workflow with
-   split/merge placement policy.
+   control-plane work to converge. Later rebalance passes complete prepared
+   replacements once the target replica is healthy and its applied index has
+   caught up to the source. `GET /api/admin/raft` includes configured-only
+   tablets even when the local API node has not opened a Raft group, so
+   replacement learner intent is visible before local runtime bootstrap.
+   Remaining production work is integrating the workflow with split/merge
+   placement policy and proposing Raft membership changes from the scheduler
+   path.
 
 8. Add tablet split and rebalance.
 
@@ -1029,7 +1034,8 @@ single-session appends or record writes.
    atomically publish split/merge tablet-map cutovers with exact coverage
    validation. Rebalance assigns unowned tablets with owner voter metadata and
    prepares owned-tablet movement by creating learner replica intent for the
-   target. It does not yet copy/replay hot split state or coordinate
+   target, and completes prepared replacements once the target is healthy and
+   caught up. It does not yet copy/replay hot split state or coordinate
    split-created Raft groups.
 
 9. Add compressed tablet-map ranges.

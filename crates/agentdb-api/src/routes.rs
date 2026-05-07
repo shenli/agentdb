@@ -2105,22 +2105,31 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
 async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusResponse>, ApiError> {
     let configured_by_tablet = load_configured_raft_replicas(s.meta.as_ref()).await?;
     let latest_snapshots = load_latest_raft_snapshots(s.meta.as_ref()).await?;
+    let now_ms = now_ms_i64();
     let Some(registry) = s.raft_registry.as_ref() else {
         let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
         let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
+        let tablets = configured_only_raft_tablet_statuses(
+            &configured_by_tablet,
+            &latest_snapshots,
+            now_ms,
+            &BTreeSet::new(),
+        );
         return Ok(Json(RaftStatusResponse {
             enabled: false,
             control_plane_enabled: s.meta.is_some(),
-            tablet_count: 0,
+            tablet_count: tablets.len(),
             configured_replica_count,
             unhealthy_replica_count,
-            tablets: Vec::new(),
+            tablets,
         }));
     };
-    let tablets: Vec<_> = registry
+    let mut open_tablet_ids = BTreeSet::new();
+    let mut tablets: Vec<_> = registry
         .groups_snapshot()
         .into_iter()
         .map(|(tablet_id, group)| {
+            open_tablet_ids.insert(tablet_id);
             let runtime_replicas: Vec<_> = group
                 .status()
                 .into_iter()
@@ -2152,6 +2161,12 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
             }
         })
         .collect();
+    tablets.extend(configured_only_raft_tablet_statuses(
+        &configured_by_tablet,
+        &latest_snapshots,
+        now_ms,
+        &open_tablet_ids,
+    ));
     let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
     let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
     Ok(Json(RaftStatusResponse {
@@ -2162,6 +2177,29 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
         unhealthy_replica_count,
         tablets,
     }))
+}
+
+fn configured_only_raft_tablet_statuses(
+    configured_by_tablet: &BTreeMap<i64, Vec<tablet_replicas::TabletReplica>>,
+    latest_snapshots: &BTreeMap<(i64, String), tablet_snapshots::TabletSnapshot>,
+    now_ms: i64,
+    open_tablet_ids: &BTreeSet<i64>,
+) -> Vec<RaftTabletStatus> {
+    configured_by_tablet
+        .iter()
+        .filter(|(tablet_id, _)| !open_tablet_ids.contains(tablet_id))
+        .map(|(tablet_id, replicas)| RaftTabletStatus {
+            tablet_id: *tablet_id,
+            local_group_open: false,
+            replicas: Vec::new(),
+            configured_replicas: configured_raft_replica_statuses(
+                replicas,
+                &[],
+                latest_snapshots,
+                now_ms,
+            ),
+        })
+        .collect()
 }
 
 async fn post_raft_catch_up(
