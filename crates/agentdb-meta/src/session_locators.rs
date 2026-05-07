@@ -147,6 +147,22 @@ pub async fn delete(pool: &AnyPool, session_id: &str) -> MetaResult<bool> {
     Ok(rows > 0)
 }
 
+/// Drop every locator for an external tenant id.
+///
+/// Used when a tenant is deleted so routing snapshots do not retain stale
+/// session placement rows after the runtime objects have been removed.
+pub async fn delete_by_tenant_external(
+    pool: &AnyPool,
+    tenant_external_id: &str,
+) -> MetaResult<u64> {
+    let rows = sqlx::query("DELETE FROM session_locators WHERE tenant_external_id = ?")
+        .bind(tenant_external_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows)
+}
+
 /// Cursor-style listing keyed on the **external** tenant id.
 /// Auth-bound and cross-cluster stable; the variant the wire
 /// find handler uses for multi-tablet fanout (M26 Phase 3).
@@ -345,6 +361,22 @@ mod tests {
         assert!(get(&p, "s-1").await.unwrap().is_none());
         // Idempotent second delete.
         assert!(!delete(&p, "s-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_by_tenant_external_removes_only_that_tenant() {
+        let p = pool().await;
+        upsert(&p, "s-a", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-b", 1, "t-1", Some(0), 0, 0).await.unwrap();
+        upsert(&p, "s-other", 2, "t-2", Some(0), 0, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(delete_by_tenant_external(&p, "t-1").await.unwrap(), 2);
+        assert!(get(&p, "s-a").await.unwrap().is_none());
+        assert!(get(&p, "s-b").await.unwrap().is_none());
+        assert!(get(&p, "s-other").await.unwrap().is_some());
+        assert_eq!(delete_by_tenant_external(&p, "t-1").await.unwrap(), 0);
     }
 
     #[tokio::test]

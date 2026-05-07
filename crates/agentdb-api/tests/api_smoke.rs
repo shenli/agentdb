@@ -658,6 +658,139 @@ async fn create_session_routes_to_owner_and_records_session_locator() {
 }
 
 #[tokio::test]
+async fn session_locator_lifecycle_tracks_fork_delete_and_tenant_delete() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-a"))])
+        .with_nodes(vec![node("node-a", "http://127.0.0.1:18080")]);
+    let app = spawn_app_with_state(
+        AppState::new(runtime)
+            .with_meta(meta.clone())
+            .with_routing(RouteRuntime::snapshot("node-a", snapshot)),
+    )
+    .await;
+
+    let t: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({"external_key": "locator-lifecycle", "policy": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = t["tenant_id"].as_str().unwrap().to_string();
+    let a: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({"alias": "agent", "config": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = a["agent_id"].as_str().unwrap().to_string();
+    let s: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
+        .json(&json!({"alias": null}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sid = s["session_id"].as_str().unwrap().to_string();
+    assert!(session_locators::get(meta.pool(), &sid)
+        .await
+        .unwrap()
+        .is_some());
+
+    app.client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/events",
+            app.base
+        ))
+        .json(&json!({
+            "agent_id": aid,
+            "kind": "x",
+            "payload": {"i": 1},
+            "artifact_refs": [],
+            "source_refs": []
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let child: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{sid}/fork",
+            app.base
+        ))
+        .json(&json!({"at_seq": 0, "alias": null}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child_sid = child["session_id"].as_str().unwrap().to_string();
+    let child_locator = session_locators::get(meta.pool(), &child_sid)
+        .await
+        .unwrap()
+        .expect("forked session locator");
+    assert_eq!(child_locator.tablet_id, Some(0));
+    assert_eq!(
+        child_locator.tenant_external_id.as_deref(),
+        Some(tid.as_str())
+    );
+
+    app.client
+        .delete(format!("{}/api/tenants/{tid}/sessions/{sid}", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(session_locators::get(meta.pool(), &sid)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(session_locators::get(meta.pool(), &child_sid)
+        .await
+        .unwrap()
+        .is_some());
+
+    app.client
+        .delete(format!("{}/api/tenants/{tid}", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert!(session_locators::get(meta.pool(), &child_sid)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn admin_routing_status_reports_disabled_mode() {
     let app = spawn_app().await;
 
