@@ -72,6 +72,19 @@ healthy and caught up. Use `raft catch-up` to accelerate convergence and
 `complete-replacement` when you need explicit operator-controlled promotion or
 source retirement.
 
+Split/merge lifecycle:
+
+```bash
+agentdbctl tablets prepare-split 7 --child-range 0:49:8 --child-range 50:99:9
+agentdbctl tablets complete-split 7 --child-range 0:49:8 --child-range 50:99:9 --map-epoch 2
+agentdbctl tablets prepare-merge --source-tablet-id 8 --source-tablet-id 9 10
+agentdbctl tablets complete-merge --source-tablet-id 8 --source-tablet-id 9 10 --map-epoch 3
+```
+
+Prepare only fences metadata and creates destination tablets. Complete publishes
+the range-map cutover and lifecycle states after external state copy/replay is
+safe.
+
 Raft catch-up:
 
 ```bash
