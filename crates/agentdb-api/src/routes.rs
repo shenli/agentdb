@@ -2010,6 +2010,7 @@ async fn delete_tenant(
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
     s.runtime.delete_tenant(&tid).await?;
+    delete_tenant_session_locators(&s, &tid).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2225,10 +2226,13 @@ async fn delete_session(
         return Ok(response);
     }
     let runtime = s.runtime.clone();
+    let delete_tid = tid.clone();
+    let delete_sid = sid.clone();
     with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime.delete_session(&tid, &sid).await
+        runtime.delete_session(&delete_tid, &delete_sid).await
     })
     .await?;
+    delete_session_locator(&s, &sid).await?;
     Ok(with_headers(
         StatusCode::NO_CONTENT.into_response(),
         route_headers,
@@ -2602,17 +2606,20 @@ async fn fork_session(
         return Ok(response);
     }
     let runtime = s.runtime.clone();
+    let fork_tid = tid.clone();
+    let fork_sid = sid.clone();
     let child = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         runtime
             .fork_session(ForkSessionRequest {
-                tenant_id: tid,
-                session_id: sid,
+                tenant_id: fork_tid,
+                session_id: fork_sid,
                 at_seq: body.at_seq,
                 alias: body.alias,
             })
             .await
     })
     .await?;
+    record_session_locator(&s, &tid, &child.session_id, &route_headers).await?;
     Ok(with_headers(
         (StatusCode::CREATED, Json(child)).into_response(),
         route_headers,
@@ -2992,6 +2999,26 @@ async fn record_session_locator(
     )
     .await
     .map_err(internal_error)?;
+    Ok(())
+}
+
+async fn delete_session_locator(state: &AppState, session_id: &Id) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    session_locators::delete(meta.pool(), session_id.as_str())
+        .await
+        .map_err(internal_error)?;
+    Ok(())
+}
+
+async fn delete_tenant_session_locators(state: &AppState, tenant_id: &Id) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    session_locators::delete_by_tenant_external(meta.pool(), tenant_id.as_str())
+        .await
+        .map_err(internal_error)?;
     Ok(())
 }
 
