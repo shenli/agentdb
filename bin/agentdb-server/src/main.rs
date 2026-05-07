@@ -5,6 +5,7 @@
 //! `--in-memory` to get the ephemeral backend (useful for smoke tests and
 //! local dev).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,9 @@ const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
+const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
+const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
@@ -125,6 +129,11 @@ struct ServeOpts {
     /// Optional MongoDB PLAIN auth password. Requires `--mongo-username`.
     #[arg(long)]
     mongo_password: Option<String>,
+
+    /// Shared secret for internal node-to-node APIs. Can also be set with
+    /// AGENTDB_INTERNAL_AUTH_TOKEN.
+    #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN")]
+    internal_auth_token: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -178,11 +187,57 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
-    let runtime = if config.in_memory {
-        tracing::info!("using in-memory runtime (state lost on shutdown)");
-        agentdb_core::Runtime::in_memory()
-    } else {
+    if !config.in_memory {
         std::fs::create_dir_all(&config.data_dir)?;
+    }
+    let route_location = config
+        .route_region
+        .clone()
+        .or(config.route_location.clone());
+    let raft_registry = config
+        .internal_auth_token
+        .as_ref()
+        .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
+    let route_startup =
+        prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
+    let runtime_raft_logs: Option<
+        BTreeMap<i64, Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>>,
+    > = route_startup.as_ref().and_then(|startup| {
+        startup.raft_bootstrap.as_ref().and_then(|bootstrap| {
+            if bootstrap.local_logs.is_empty() {
+                None
+            } else {
+                Some(
+                    bootstrap
+                        .local_logs
+                        .iter()
+                        .map(|(tablet_id, log)| {
+                            (
+                                *tablet_id,
+                                log.clone()
+                                    as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                            )
+                        })
+                        .collect(),
+                )
+            }
+        })
+    });
+    if matches!(config.deployment_mode, DeploymentMode::Cluster)
+        && !runtime_raft_logs
+            .as_ref()
+            .is_some_and(|logs| logs.contains_key(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID))
+    {
+        anyhow::bail!(
+            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime primary tablet {}",
+            config.route_node_id.as_deref().unwrap_or("<missing-node-id>"),
+            agentdb_core::RUNTIME_PRIMARY_TABLET_ID
+        );
+    }
+    let (runtime, content_mirror) = if config.in_memory {
+        tracing::info!("using in-memory runtime (state lost on shutdown)");
+        (agentdb_core::Runtime::in_memory(), None)
+    } else {
         let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> = match config.kv_backend {
             KvBackendKind::RocksDb => {
                 let kv_path = config.data_dir.join("runtime");
@@ -205,28 +260,19 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             }
         };
 
-        let content: Arc<dyn agentdb_storage::ContentBackend> = match config.content_backend {
-            ContentBackendKind::LocalFs => {
-                let content_dir = config.content_dir.clone();
-                std::fs::create_dir_all(&content_dir)?;
-                tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
-                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir))
-            }
-            ContentBackendKind::ObjectStore => {
-                let object_store = build_object_store(
-                    config
-                        .object_store
-                        .as_ref()
-                        .expect("object-store content backend requires object store config"),
-                )?;
-                tracing::info!(prefix = %OBJECT_STORE_CONTENT_PREFIX, "opened object-store artifact content backend");
-                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
-                    object_store,
-                    OBJECT_STORE_CONTENT_PREFIX,
-                ))
-            }
-        };
-        agentdb_core::Runtime::with_kv(kv, content)
+        let (content, content_mirror) = build_content_backend(&config)?;
+        if let Some(logs) = runtime_raft_logs {
+            tracing::info!(
+                tablet_count = logs.len(),
+                "opened runtime with raft-rs replicated tablet logs"
+            );
+            (
+                agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs),
+                content_mirror,
+            )
+        } else {
+            (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
+        }
     };
 
     let record_index_worker_interval_ms = env_u64(
@@ -261,44 +307,100 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
     }
 
-    let mut state =
-        agentdb_api::AppState::new(runtime).with_proxy_policy(agentdb_api::state::ProxyPolicy {
+    let mut state = agentdb_api::AppState::new(runtime.clone()).with_proxy_policy(
+        agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
-        });
-    let route_location = config
-        .route_region
-        .clone()
-        .or(config.route_location.clone());
-    if let Some(node_id) = config.route_node_id.as_deref() {
-        let meta = agentdb_meta::MetaStore::open_from_env().await?;
-        let scheduler_status = agentdb_api::state::SchedulerStatus::new();
-        let snapshot =
-            load_route_snapshot(&meta, config.route_shard_count, route_location.clone()).await?;
-        let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
+        },
+    );
+    if let Some(content_mirror) = content_mirror {
+        state = state.with_content_mirror(content_mirror);
+    }
+    if let Some(token) = config.internal_auth_token.clone() {
+        state = state.with_internal_auth_token(token);
+        if let Some(registry) = raft_registry.clone() {
+            state = state.with_raft_registry(registry);
+        }
+    }
+    if let Some(startup) = route_startup {
         spawn_route_snapshot_refresher(
-            meta.clone(),
-            routing.clone(),
+            startup.meta.clone(),
+            startup.routing.clone(),
             config.route_shard_count,
             route_location.clone(),
             config.route_refresh_interval_ms,
         );
         let node_address = format!("http://{}", config.bind);
         spawn_cluster_workers(
-            meta.clone(),
-            node_id.to_string(),
+            startup.meta.clone(),
+            startup.node_id.clone(),
             node_address,
             config.route_region.clone(),
-            scheduler_status.clone(),
+            startup.scheduler_status.clone(),
             state.drain.clone(),
             ClusterWorkerConfig::from_env(),
         );
+        if let Some(bootstrap) = startup.raft_bootstrap {
+            if !bootstrap.tablet_ids.is_empty() {
+                let internal_auth_token = config
+                    .internal_auth_token
+                    .clone()
+                    .expect("raft registry requires internal auth token");
+                let outbox =
+                    agentdb_api::internal_raft_http::RaftRsHttpOutbox::new(internal_auth_token);
+                let raft_outbox_interval_ms = env_u64(
+                    "AGENTDB_RAFT_OUTBOX_INTERVAL_MS",
+                    DEFAULT_RAFT_OUTBOX_INTERVAL_MS,
+                )
+                .max(100);
+                if let Some(registry) = raft_registry.clone() {
+                    refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
+                    spawn_raft_rs_registry_refresher(
+                        startup.meta.clone(),
+                        startup.node_id.clone(),
+                        config.data_dir.join("raft-engine"),
+                        registry.clone(),
+                        config.route_refresh_interval_ms,
+                    );
+                    spawn_raft_rs_peer_url_refresher(
+                        startup.meta.clone(),
+                        registry.clone(),
+                        outbox.clone(),
+                        config.route_refresh_interval_ms,
+                    );
+                    agentdb_api::internal_raft_http::spawn_raft_rs_outbox_worker(
+                        registry.clone(),
+                        outbox.clone(),
+                        Duration::from_millis(raft_outbox_interval_ms),
+                    );
+                    let raft_snapshot_interval_ms = env_u64(
+                        "AGENTDB_RAFT_SNAPSHOT_INTERVAL_MS",
+                        DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS,
+                    )
+                    .max(1_000);
+                    spawn_raft_rs_snapshot_worker(
+                        startup.meta.clone(),
+                        registry,
+                        runtime.clone(),
+                        outbox,
+                        Duration::from_millis(raft_snapshot_interval_ms),
+                    );
+                }
+                tracing::info!(
+                    node_id = %startup.node_id,
+                    tablet_count = bootstrap.tablet_ids.len(),
+                    bootstrapped_tablet_count = bootstrap.bootstrapped_tablet_ids.len(),
+                    outbox_interval_ms = raft_outbox_interval_ms,
+                    "bootstrapped raft-rs tablet groups"
+                );
+            }
+        }
         state = state
-            .with_meta(meta.clone())
-            .with_scheduler(scheduler_status)
-            .with_routing(routing);
+            .with_meta(startup.meta.clone())
+            .with_scheduler(startup.scheduler_status)
+            .with_routing(startup.routing);
         tracing::info!(
-            node_id,
+            node_id = %startup.node_id,
             shard_count = config.route_shard_count,
             location = ?route_location,
             refresh_interval_ms = config.route_refresh_interval_ms,
@@ -335,6 +437,21 @@ struct ResolvedServeConfig {
     mongo_bind: Option<SocketAddr>,
     mongo_username: Option<String>,
     mongo_password: Option<String>,
+    internal_auth_token: Option<String>,
+}
+
+struct RouteStartup {
+    node_id: String,
+    meta: agentdb_meta::MetaStore,
+    scheduler_status: agentdb_api::state::SchedulerStatus,
+    routing: agentdb_api::routing_http::RouteRuntime,
+    raft_bootstrap: Option<RaftRsRegistryBootstrap>,
+}
+
+struct RaftRsRegistryBootstrap {
+    tablet_ids: Vec<i64>,
+    bootstrapped_tablet_ids: Vec<i64>,
+    local_logs: BTreeMap<i64, Arc<agentdb_storage::RaftRsReplicatedLog>>,
 }
 
 impl ResolvedServeConfig {
@@ -467,6 +584,11 @@ impl ResolvedServeConfig {
             .or(file.mongodb.password)
             .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
         validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let internal_auth_token = opts
+            .internal_auth_token
+            .or(file.server.internal_auth_token)
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -499,6 +621,7 @@ impl ResolvedServeConfig {
             mongo_bind: opts.mongo_bind.or(file.mongodb.bind),
             mongo_username,
             mongo_password,
+            internal_auth_token,
         })
     }
 
@@ -539,6 +662,11 @@ impl ResolvedServeConfig {
             .password
             .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
         validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let internal_auth_token = file
+            .server
+            .internal_auth_token
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -565,6 +693,7 @@ impl ResolvedServeConfig {
             mongo_bind: file.mongodb.bind,
             mongo_username,
             mongo_password,
+            internal_auth_token,
         })
     }
 }
@@ -592,6 +721,7 @@ struct DeploymentFileConfig {
 struct ServerFileConfig {
     bind: Option<SocketAddr>,
     dev: Option<bool>,
+    internal_auth_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -655,6 +785,21 @@ fn validate_mongo_auth(username: &Option<String>, password: &Option<String>) -> 
         (None, Some(_)) => anyhow::bail!(
             "mongodb password requires a username; set --mongo-username or AGENTDB_MONGODB_USERNAME"
         ),
+    }
+}
+
+fn validate_internal_auth_token(
+    deployment_mode: DeploymentMode,
+    token: &Option<String>,
+) -> anyhow::Result<()> {
+    match (deployment_mode, token.as_deref()) {
+        (_, Some(token)) if token.len() < 16 => {
+            anyhow::bail!("server.internal_auth_token must be at least 16 characters")
+        }
+        (DeploymentMode::Cluster, None) => anyhow::bail!(
+            "deployment.mode=cluster requires server.internal_auth_token or AGENTDB_INTERNAL_AUTH_TOKEN"
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -735,6 +880,77 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
                 builder = builder.with_allow_http(true);
             }
             Ok(Arc::new(builder.build()?))
+        }
+    }
+}
+
+fn build_content_backend(
+    config: &ResolvedServeConfig,
+) -> anyhow::Result<(
+    Arc<dyn agentdb_storage::ContentBackend>,
+    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
+)> {
+    match config.content_backend {
+        ContentBackendKind::LocalFs => {
+            let content_dir = config.content_dir.clone();
+            std::fs::create_dir_all(&content_dir)?;
+            tracing::info!(path = %content_dir.display(), "opened LocalFs artifact content backend");
+            Ok((
+                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir)),
+                None,
+            ))
+        }
+        ContentBackendKind::ObjectStore
+            if matches!(config.deployment_mode, DeploymentMode::Cluster) =>
+        {
+            let content_dir = config.content_dir.clone();
+            std::fs::create_dir_all(&content_dir)?;
+            let primary: Arc<dyn agentdb_storage::ContentBackend> =
+                Arc::new(agentdb_storage::LocalFsContentBackend::new(&content_dir));
+            let object_store = build_object_store(
+                config
+                    .object_store
+                    .as_ref()
+                    .expect("object-store content backend requires object store config"),
+            )?;
+            let mirror: Arc<dyn agentdb_storage::ContentBackend> =
+                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
+                    object_store,
+                    OBJECT_STORE_CONTENT_PREFIX,
+                ));
+            let queue_capacity = env_usize(
+                "AGENTDB_CONTENT_MIRROR_QUEUE_CAPACITY",
+                DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
+            )
+            .max(1);
+            let backend = Arc::new(agentdb_storage::AsyncMirrorContentBackend::new(
+                primary,
+                mirror,
+                queue_capacity,
+            ));
+            tracing::info!(
+                primary_path = %content_dir.display(),
+                mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
+                queue_capacity,
+                "opened async mirrored artifact content backend"
+            );
+            Ok((backend.clone(), Some(backend)))
+        }
+        ContentBackendKind::ObjectStore => {
+            let object_store = build_object_store(
+                config
+                    .object_store
+                    .as_ref()
+                    .expect("object-store content backend requires object store config"),
+            )?;
+            tracing::info!(prefix = %OBJECT_STORE_CONTENT_PREFIX, "opened object-store artifact content backend");
+            Ok((
+                Arc::new(agentdb_storage::ObjectStoreContentBackend::new(
+                    object_store,
+                    OBJECT_STORE_CONTENT_PREFIX,
+                )),
+                None,
+            ))
         }
     }
 }
@@ -837,6 +1053,14 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
             }
         );
     }
+    println!(
+        "  internal raft rpc: {}",
+        if config.internal_auth_token.is_some() {
+            "token auth enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
@@ -1057,6 +1281,307 @@ async fn load_route_snapshot(
         agentdb_meta::routing::ResidencyPolicy::default(),
     )
     .await
+}
+
+async fn prepare_route_startup(
+    config: &ResolvedServeConfig,
+    route_location: Option<String>,
+    raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
+) -> anyhow::Result<Option<RouteStartup>> {
+    let Some(node_id) = config.route_node_id.as_deref() else {
+        return Ok(None);
+    };
+    let meta = agentdb_meta::MetaStore::open_from_env().await?;
+    let scheduler_status = agentdb_api::state::SchedulerStatus::new();
+    let snapshot = load_route_snapshot(&meta, config.route_shard_count, route_location).await?;
+    let routing = agentdb_api::routing_http::RouteRuntime::snapshot(node_id, snapshot);
+    let raft_bootstrap = if let Some(registry) = raft_registry {
+        let raft_engine_root = config.data_dir.join("raft-engine");
+        Some(sync_raft_rs_registry(&meta, node_id, &raft_engine_root, registry).await?)
+    } else {
+        None
+    };
+    Ok(Some(RouteStartup {
+        node_id: node_id.to_string(),
+        meta,
+        scheduler_status,
+        routing,
+        raft_bootstrap,
+    }))
+}
+
+async fn load_raft_rs_node_configs(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    raft_engine_root: &std::path::Path,
+) -> anyhow::Result<Vec<agentdb_storage::RaftRsNodeConfig>> {
+    let replicas = agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+    let mut configs = Vec::new();
+    for replica in replicas {
+        if replica.role == "log_only" {
+            continue;
+        }
+        configs.push(
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                tablet_id,
+                &replica.node_id,
+                &replica.role,
+                raft_engine_root,
+            )?,
+        );
+    }
+    if configs.is_empty() {
+        anyhow::bail!("tablet {tablet_id} has no voter/learner replicas for raft-rs");
+    }
+    Ok(configs)
+}
+
+async fn sync_raft_rs_registry(
+    meta: &agentdb_meta::MetaStore,
+    local_node_id: &str,
+    raft_engine_root: &std::path::Path,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+) -> anyhow::Result<RaftRsRegistryBootstrap> {
+    let local_raft_node_id = agentdb_storage::stable_raft_node_id(local_node_id)?;
+    let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_all(meta.pool())
+        .await?
+        .into_iter()
+        .filter(|replica| {
+            replica.node_id == local_node_id && matches!(replica.role.as_str(), "voter" | "learner")
+        })
+        .map(|replica| replica.tablet_id)
+        .collect();
+    let mut bootstrapped = Vec::new();
+    let mut local_logs = BTreeMap::new();
+    for tablet_id in registry.tablet_ids() {
+        if !local_tablet_ids.contains(&tablet_id) {
+            registry.unregister(tablet_id);
+        }
+    }
+    let registered: BTreeSet<_> = registry.tablet_ids().into_iter().collect();
+    for tablet_id in local_tablet_ids.iter().copied() {
+        if registered.contains(&tablet_id) {
+            continue;
+        }
+        let configs = load_raft_rs_node_configs(meta, tablet_id, raft_engine_root).await?;
+        let (group, local_log) =
+            agentdb_storage::RaftRsSharedGroup::open_local(tablet_id, configs, local_raft_node_id)?;
+        registry.register(tablet_id, group)?;
+        bootstrapped.push(tablet_id);
+        local_logs.insert(tablet_id, local_log);
+    }
+    Ok(RaftRsRegistryBootstrap {
+        tablet_ids: local_tablet_ids.into_iter().collect(),
+        bootstrapped_tablet_ids: bootstrapped,
+        local_logs,
+    })
+}
+
+async fn load_raft_rs_peer_urls(
+    meta: &agentdb_meta::MetaStore,
+    tablet_ids: impl IntoIterator<Item = i64>,
+) -> anyhow::Result<BTreeMap<u64, String>> {
+    let mut peer_urls = BTreeMap::new();
+    for tablet_id in tablet_ids {
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                continue;
+            }
+            let node = agentdb_meta::nodes::get(meta.pool(), &replica.node_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tablet {tablet_id} raft replica {} has no node metadata",
+                        replica.node_id
+                    )
+                })?;
+            if node.address.trim().is_empty() {
+                anyhow::bail!(
+                    "tablet {tablet_id} raft replica {} has an empty node address",
+                    replica.node_id
+                );
+            }
+            let raft_node_id = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
+            peer_urls.insert(raft_node_id, node.address);
+        }
+    }
+    Ok(peer_urls)
+}
+
+async fn refresh_raft_rs_peer_urls(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<()> {
+    let peer_urls = load_raft_rs_peer_urls(meta, registry.tablet_ids()).await?;
+    outbox.replace_peer_urls(peer_urls);
+    Ok(())
+}
+
+fn spawn_raft_rs_peer_url_refresher(
+    meta: agentdb_meta::MetaStore,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    refresh_interval_ms: u64,
+) {
+    let refresh_interval_ms = refresh_interval_ms.max(100);
+    let mut changes = agentdb_meta::change_notifier::subscribe(
+        &meta,
+        &[
+            agentdb_meta::change_notifier::Channel::Nodes,
+            agentdb_meta::change_notifier::Channel::Tablets,
+        ],
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
+                        tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
+                    }
+                }
+                change = changes.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs peer metadata change received");
+                            if let Err(error) = refresh_raft_rs_peer_urls(&meta, &registry, &outbox).await {
+                                tracing::warn!(?error, "failed to refresh raft-rs peer URLs");
+                            }
+                        }
+                        None => {
+                            tracing::warn!("raft-rs peer metadata change stream closed; continuing with periodic refresh");
+                            changes = agentdb_meta::change_notifier::subscribe(
+                                &meta,
+                                &[
+                                    agentdb_meta::change_notifier::Channel::Nodes,
+                                    agentdb_meta::change_notifier::Channel::Tablets,
+                                ],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_raft_rs_snapshot_worker(
+    meta: agentdb_meta::MetaStore,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    runtime: Arc<agentdb_core::Runtime>,
+    outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                run_raft_rs_snapshot_tick(&meta, &registry, runtime.clone(), &outbox).await
+            {
+                tracing::warn!(?error, "failed to run raft-rs snapshot tick");
+            }
+        }
+    });
+}
+
+async fn run_raft_rs_snapshot_tick(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    runtime: Arc<agentdb_core::Runtime>,
+    outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+) -> anyhow::Result<usize> {
+    let mut sent = 0usize;
+    for (tablet_id, group) in registry.groups_snapshot() {
+        let Some(local_status) = group.status().into_iter().next() else {
+            continue;
+        };
+        let application_snapshot = match runtime.export_tablet_snapshot_payload(tablet_id) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id,
+                    message = %error.message,
+                    "skipping raft-rs snapshot because runtime state export failed"
+                );
+                continue;
+            }
+        };
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                continue;
+            }
+            let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
+            if to == local_status.node_id {
+                continue;
+            }
+            let transfer = group.build_snapshot_transfer(
+                local_status.node_id,
+                to,
+                application_snapshot.clone(),
+            )?;
+            if let Err(error) = outbox.send_snapshot_to_peer(&transfer).await {
+                tracing::warn!(
+                    tablet_id,
+                    from = local_status.node_id,
+                    to,
+                    ?error,
+                    "failed to enqueue raft-rs snapshot to peer"
+                );
+                continue;
+            }
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
+fn spawn_raft_rs_registry_refresher(
+    meta: agentdb_meta::MetaStore,
+    local_node_id: String,
+    raft_engine_root: PathBuf,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    refresh_interval_ms: u64,
+) {
+    let refresh_interval_ms = refresh_interval_ms.max(100);
+    let mut changes = agentdb_meta::change_notifier::subscribe(
+        &meta,
+        &[agentdb_meta::change_notifier::Channel::Tablets],
+    );
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(refresh_interval_ms));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                        tracing::warn!(?error, "failed to sync raft-rs registry");
+                    }
+                }
+                change = changes.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs replica metadata change received");
+                            if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                                tracing::warn!(?error, "failed to sync raft-rs registry");
+                            }
+                        }
+                        None => {
+                            tracing::warn!("raft-rs registry metadata change stream closed; continuing with periodic refresh");
+                            changes = agentdb_meta::change_notifier::subscribe(
+                                &meta,
+                                &[agentdb_meta::change_notifier::Channel::Tablets],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn spawn_route_snapshot_refresher(
@@ -1334,7 +1859,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdb_meta::{nodes, tablets, MetaStore};
+    use agentdb_meta::{nodes, tablet_replicas, tablets, MetaStore};
 
     fn base_opts() -> ServeOpts {
         ServeOpts {
@@ -1351,6 +1876,10 @@ mod tests {
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
             route_proxy_max_response_bytes: None,
+            mongo_bind: None,
+            mongo_username: None,
+            mongo_password: None,
+            internal_auth_token: None,
         }
     }
 
@@ -1579,6 +2108,52 @@ region = "us-west-2"
     }
 
     #[test]
+    fn cluster_mode_requires_internal_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[deployment]
+mode = "cluster"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "agentdb-test"
+region = "us-west-2"
+
+[routing]
+node_id = "node-a"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("deployment.mode=cluster requires server.internal_auth_token"));
+    }
+
+    #[test]
+    fn internal_auth_token_must_not_be_too_short() {
+        let mut opts = base_opts();
+        opts.internal_auth_token = Some("short".into());
+
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("server.internal_auth_token must be at least 16 characters"));
+    }
+
+    #[test]
     fn single_node_slatedb_s3_remains_valid() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agentdb.toml");
@@ -1744,5 +2319,235 @@ region = "us-west-2"
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
+    async fn raft_rs_node_configs_load_from_control_plane_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "lagging", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].role, agentdb_storage::RaftRsNodeRole::Voter);
+        assert!(configs[0].raft_engine_dir.ends_with("tablet-7/node-a"));
+        assert_eq!(configs[1].role, agentdb_storage::RaftRsNodeRole::Learner);
+        assert!(configs[1].raft_engine_dir.ends_with("tablet-7/node-b"));
+    }
+
+    #[tokio::test]
+    async fn raft_rs_node_configs_require_raft_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let err = load_raft_rs_node_configs(&meta, 7, dir.path())
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("tablet 7 has no voter/learner replicas"));
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_bootstrap_registers_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(bootstrap.tablet_ids, vec![7]);
+        assert_eq!(bootstrap.bootstrapped_tablet_ids, vec![7]);
+        assert!(bootstrap.local_logs.contains_key(&7));
+        assert_eq!(registry.tablet_count(), 1);
+        let groups = registry.groups_snapshot();
+        assert_eq!(groups[0].1.status().len(), 1);
+        assert_eq!(
+            groups[0].1.status()[0].node_id,
+            agentdb_storage::stable_raft_node_id("node-a").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_bootstrap_skips_log_only_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert!(bootstrap.tablet_ids.is_empty());
+        assert!(bootstrap.bootstrapped_tablet_ids.is_empty());
+        assert!(bootstrap.local_logs.is_empty());
+        assert_eq!(registry.tablet_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_sync_unregisters_removed_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+        assert_eq!(registry.tablet_ids(), vec![7]);
+
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "log_only", "healthy", 0, 0, 200)
+            .await
+            .unwrap();
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert!(bootstrap.tablet_ids.is_empty());
+        assert!(registry.tablet_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn raft_rs_peer_urls_load_from_control_plane_nodes() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "log_only", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let peer_urls = load_raft_rs_peer_urls(&meta, [7]).await.unwrap();
+
+        assert_eq!(
+            peer_urls.get(&agentdb_storage::stable_raft_node_id("node-a").unwrap()),
+            Some(&"http://127.0.0.1:18080".to_string())
+        );
+        assert_eq!(
+            peer_urls.get(&agentdb_storage::stable_raft_node_id("node-b").unwrap()),
+            Some(&"http://127.0.0.1:18081".to_string())
+        );
+        assert!(!peer_urls.contains_key(&agentdb_storage::stable_raft_node_id("node-c").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cluster_object_store_content_uses_async_local_primary_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ResolvedServeConfig::from_serve_opts(base_opts()).unwrap();
+        config.deployment_mode = DeploymentMode::Cluster;
+        config.content_backend = ContentBackendKind::ObjectStore;
+        config.content_dir = dir.path().join("content-primary");
+        config.object_store = Some(ResolvedObjectStoreConfig {
+            backend: ObjectStoreBackendKind::LocalFs,
+            local_root: Some(dir.path().join("content-mirror")),
+            bucket: None,
+            region: None,
+            endpoint: None,
+            allow_http: false,
+        });
+
+        let (content, mirror) = build_content_backend(&config).unwrap();
+        content.put("ten_a", "art_x", b"hello").await.unwrap();
+
+        let mirror = mirror.expect("cluster object-store content should be mirrored");
+        for _ in 0..100 {
+            if mirror.stats().completed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stats = mirror.stats();
+        assert_eq!(stats.queued, 1);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.backlog, 0);
+        assert_eq!(content.get("ten_a", "art_x").await.unwrap(), b"hello");
     }
 }

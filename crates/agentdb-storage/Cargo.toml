@@ -14,6 +14,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 tracing = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+protobuf = { workspace = true }
+prost = { workspace = true }
+raft = { workspace = true }
+raft-engine = { workspace = true }
+slog = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

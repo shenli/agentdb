@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 
-use agentdb_storage::Error as StorageError;
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
@@ -32,6 +31,7 @@ use agentdb_storage::keys::{
     record_index_outbox_key, record_key, session_alias_key, session_record_key,
     session_segment_key, skill_record_key, skill_unique_key, tenant_alias_key, tenant_record_key,
 };
+use agentdb_storage::Error as StorageError;
 use agentdb_storage::{
     KeyResolution, KvStore, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
     Result as KvResult, WriteOp,
@@ -380,6 +380,15 @@ impl Persist {
         session: &Session,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
+        self.write_ops(self.append_batch_ops(event, session, idem)?)
+    }
+
+    pub(crate) fn append_batch_ops(
+        &self,
+        event: &EventEnvelope,
+        session: &Session,
+        idem: Option<(&str, &IdempotencyRecord)>,
+    ) -> KvResult<Vec<WriteOp>> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(4);
         let ek = event_key(
             event.tenant_id.as_str(),
@@ -422,7 +431,7 @@ impl Persist {
                 value: serde_json::to_vec(rec).expect("idempotency record serializes"),
             });
         }
-        self.kv.write_batch(ops)
+        Ok(ops)
     }
 
     /// Resolve an `event_id` to its `(session_id, seq)` location via the
@@ -653,6 +662,14 @@ impl Persist {
         r: &SearchableRecord,
         commit_seq: Option<u64>,
     ) -> KvResult<()> {
+        self.write_ops(self.put_record_with_commit_seq_ops(r, commit_seq)?)
+    }
+
+    pub(crate) fn put_record_with_commit_seq_ops(
+        &self,
+        r: &SearchableRecord,
+        commit_seq: Option<u64>,
+    ) -> KvResult<Vec<WriteOp>> {
         let ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
@@ -694,6 +711,10 @@ impl Persist {
             ]
         }))
         .collect();
+        Ok(ops)
+    }
+
+    pub(crate) fn write_ops(&self, ops: Vec<WriteOp>) -> KvResult<()> {
         self.kv.write_batch(ops)
     }
 

@@ -6,18 +6,65 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use agentdb_api::{
+    internal_raft_http::{RaftRsHttpClient, RaftRsHttpOutbox},
+    raft_ingress::RaftRsGroupRegistry,
     routing_http::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_TABLET_ID,
     },
-    state::ProxyPolicy,
+    state::{ProxyPolicy, RaftRsIngress},
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
 use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
+use agentdb_storage::{
+    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
+    RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
+    RaftRsWireMessage, ReplicatedLog,
+};
+use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
 use serde_json::json;
+use tempfile::TempDir;
+
+#[derive(Default)]
+struct TestRaftIngress {
+    messages: Mutex<Vec<RaftRsWireMessage>>,
+    snapshots: Mutex<Vec<RaftRsSnapshotTransfer>>,
+}
+
+impl RaftRsIngress for TestRaftIngress {
+    fn step_wire_message(&self, message: RaftRsWireMessage) -> agentdb_storage::Result<()> {
+        self.messages.lock().unwrap().push(message);
+        Ok(())
+    }
+
+    fn install_snapshot_transfer(
+        &self,
+        _to: u64,
+        transfer: RaftRsSnapshotTransfer,
+    ) -> agentdb_storage::Result<Vec<u8>> {
+        let payload = transfer.payload.clone();
+        self.snapshots.lock().unwrap().push(transfer);
+        Ok(payload)
+    }
+}
+
+fn test_raft_group() -> (TempDir, RaftRsSharedGroup, Vec<Arc<RaftRsReplicatedLog>>) {
+    let dir = TempDir::new().unwrap();
+    let configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+    (dir, group, logs)
+}
 
 #[tokio::test]
 async fn create_tenant_agent_session_append_fetch_round_trip() {
@@ -552,6 +599,315 @@ async fn admin_routing_status_reports_disabled_mode() {
 }
 
 #[tokio::test]
+async fn admin_content_mirror_reports_disabled_mode() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/content-mirror", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["backlog"], 0);
+}
+
+#[tokio::test]
+async fn admin_content_mirror_reports_async_backlog_stats() {
+    let primary = Arc::new(InMemoryContentBackend::default());
+    let mirror = Arc::new(InMemoryContentBackend::default());
+    let content_mirror = Arc::new(AsyncMirrorContentBackend::new(primary, mirror, 8));
+    content_mirror
+        .put("ten_a", "art_x", b"bytes")
+        .await
+        .unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_content_mirror(content_mirror.clone());
+    let app = spawn_app_with_state(state).await;
+
+    for _ in 0..100 {
+        if content_mirror.stats().completed >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/content-mirror", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["queued"], 1);
+    assert_eq!(body["completed"], 1);
+    assert_eq!(body["failed"], 0);
+    assert_eq!(body["backlog"], 0);
+}
+
+#[tokio::test]
+async fn admin_raft_status_reports_disabled_mode() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["tablet_count"], 0);
+}
+
+#[tokio::test]
+async fn admin_raft_status_reports_registered_tablets() {
+    let (_dir, group, _logs) = test_raft_group();
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group).unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_raft_registry(registry);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["tablet_count"], 1);
+    assert_eq!(body["tablets"][0]["tablet_id"], 7);
+    assert_eq!(body["tablets"][0]["replicas"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn internal_raft_message_requires_token() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn internal_raft_message_dispatches_to_ingress() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["status"], "accepted");
+    let messages = ingress.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].tablet_id, 7);
+    assert_eq!(messages[0].from, 1);
+    assert_eq!(messages[0].to, 2);
+    assert_eq!(messages[0].payload, b"msg");
+}
+
+#[tokio::test]
+async fn internal_raft_snapshot_dispatches_to_ingress() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/internal/raft/snapshots", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "index": 42,
+            "term": 3,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"snapshot")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["status"], "accepted");
+    let snapshots = ingress.snapshots.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].tablet_id, 7);
+    assert_eq!(snapshots[0].from, 1);
+    assert_eq!(snapshots[0].to, 2);
+    assert_eq!(snapshots[0].index, 42);
+    assert_eq!(snapshots[0].term, 3);
+    assert_eq!(snapshots[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_raft_http_client_sends_message_and_snapshot() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let client = RaftRsHttpClient::new("secret");
+
+    client
+        .send_message(
+            &app.base,
+            &RaftRsWireMessage {
+                tablet_id: 7,
+                from: 1,
+                to: 2,
+                payload: b"msg".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .send_snapshot(
+            &app.base,
+            &RaftRsSnapshotTransfer {
+                tablet_id: 7,
+                from: 1,
+                to: 2,
+                index: 42,
+                term: 3,
+                payload: b"snapshot".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ingress.messages.lock().unwrap()[0].payload, b"msg");
+    assert_eq!(ingress.snapshots.lock().unwrap()[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_raft_registry_dispatches_message_to_group() {
+    let (_dir, group, logs) = test_raft_group();
+    group.elect(1).unwrap();
+    group.mark_unavailable(3).unwrap();
+    logs[0].append(7, b"registry-wire".to_vec()).unwrap();
+    group.mark_available(3).unwrap();
+
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group.clone()).unwrap();
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(registry)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let outbox = RaftRsHttpOutbox::new("secret");
+    outbox.set_peer_url(3, app.base.clone());
+
+    let sent = outbox.flush_group_once(&group).await.unwrap();
+
+    assert!(sent > 0);
+    assert!(logs[2]
+        .committed_entries(7, 0, 10)
+        .unwrap()
+        .iter()
+        .any(|entry| entry.command == b"registry-wire"));
+}
+
+#[tokio::test]
+async fn internal_raft_registry_rejects_unregistered_tablet() {
+    let registry = RaftRsGroupRegistry::shared();
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(registry)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let client = RaftRsHttpClient::new("secret");
+
+    let err = client
+        .send_message(
+            &app.base,
+            &RaftRsWireMessage {
+                tablet_id: 404,
+                from: 1,
+                to: 2,
+                payload: b"missing".to_vec(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("not registered"));
+}
+
+#[tokio::test]
+async fn internal_raft_http_outbox_restores_messages_when_peer_missing() {
+    let (_dir, group, logs) = test_raft_group();
+    group.elect(1).unwrap();
+    group.mark_unavailable(3).unwrap();
+    logs[0].append(7, b"registry-wire".to_vec()).unwrap();
+    let outbox = RaftRsHttpOutbox::new("secret");
+
+    let err = outbox.flush_group_once(&group).await.unwrap_err();
+
+    assert!(err.to_string().contains("peer URL is not configured"));
+    assert!(!group.take_wire_messages().is_empty());
+}
+
+#[tokio::test]
 async fn admin_routing_status_reports_snapshot_metadata() {
     let app = spawn_routed_app("node-a").await;
 
@@ -843,6 +1199,9 @@ async fn admin_tablets_returns_rows() {
     assert_eq!(rows[0]["tablet_id"], 7);
     assert_eq!(rows[0]["owner_node_id"], "node-a");
     assert_eq!(rows[0]["handoff_target_node_id"], "node-b");
+    assert_eq!(rows[0]["placement_scope_id"], "default");
+    assert_eq!(rows[0]["state"], "serving");
+    assert_eq!(rows[0]["encryption_policy_version"], 0);
 }
 
 #[tokio::test]
@@ -891,6 +1250,7 @@ async fn admin_tablet_ownership_mutations_round_trip() {
     assert_eq!(created["action"], "create");
     assert_eq!(created["changed"], true);
     assert_eq!(created["tablet"]["tablet_id"], 9);
+    assert_eq!(created["tablet"]["placement_scope_id"], "default");
 
     let assigned: serde_json::Value = app
         .client
@@ -962,6 +1322,149 @@ async fn admin_tablet_ownership_mutations_round_trip() {
         serde_json::Value::Null
     );
     assert_eq!(relinquished["tablet"]["epoch"], 2);
+}
+
+#[tokio::test]
+async fn admin_tablet_create_accepts_placement_metadata() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/create", app.base))
+        .json(&json!({
+            "tablet_id": 11,
+            "placement_scope_id": "tenant/acme",
+            "state": "creating",
+            "raft_group_id": "raft/11",
+            "encryption_policy_version": 3
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(created["changed"], true);
+    assert_eq!(created["tablet"]["tablet_id"], 11);
+    assert_eq!(created["tablet"]["placement_scope_id"], "tenant/acme");
+    assert_eq!(created["tablet"]["state"], "creating");
+    assert_eq!(created["tablet"]["raft_group_id"], "raft/11");
+    assert_eq!(created["tablet"]["encryption_policy_version"], 3);
+}
+
+#[tokio::test]
+async fn admin_tenant_policies_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let policy: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tenant-policies", app.base))
+        .json(&json!({
+            "tenant_id": "ten_acme",
+            "placement_class": "dedicated",
+            "placement_scope_id": "tenant/acme",
+            "encryption_class": "tenant",
+            "key_policy_id": "key/acme",
+            "encryption_policy_version": 2,
+            "policy_version": 5
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(policy["tenant_id"], "ten_acme");
+    assert_eq!(policy["placement_scope_id"], "tenant/acme");
+    assert_eq!(policy["key_policy_id"], "key/acme");
+    assert_eq!(policy["policy_version"], 5);
+
+    let rows: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tenant-policies", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    let deleted: serde_json::Value = app
+        .client
+        .delete(format!("{}/api/admin/tenant-policies/ten_acme", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(deleted["removed"], true);
+}
+
+#[tokio::test]
+async fn admin_tablet_ranges_replace_round_trip() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let replaced: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablet-ranges/replace", app.base))
+        .json(&json!({
+            "placement_scope_id": "default",
+            "old_ranges": [{"start_shard": 0, "end_shard": 99}],
+            "new_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ],
+            "map_epoch": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["changed"], true);
+    assert_eq!(replaced["ranges"].as_array().unwrap().len(), 2);
+
+    let rows: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tablet-ranges", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row["tablet_id"] == 8));
+    assert!(rows.iter().any(|row| row["tablet_id"] == 9));
 }
 
 #[tokio::test]
@@ -1895,6 +2398,10 @@ fn tablet_with_epoch(id: i64, owner: Option<&str>, epoch: i64) -> Tablet {
         epoch,
         lease_expires_at_ms: i64::MAX,
         created_at_ms: 0,
+        placement_scope_id: "default".into(),
+        state: "serving".into(),
+        raft_group_id: None,
+        encryption_policy_version: 0,
         handoff_target_node_id: None,
     }
 }

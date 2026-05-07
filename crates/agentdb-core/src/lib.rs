@@ -32,6 +32,7 @@ pub mod runtime;
 pub mod segment;
 pub mod session;
 pub mod skill;
+pub mod tablet_state;
 pub mod tenant;
 
 pub use agent::{Agent, NewAgent};
@@ -49,12 +50,14 @@ pub use runtime::{
     ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
     LifecycleSweepReport, PolicyWorkerReport, RecordIndexStats, ReplayResponse, Runtime,
     SessionStorageSummary, TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
+    RUNTIME_PRIMARY_TABLET_ID,
 };
-pub use segment::{
-    SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
-};
+pub use segment::{SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile};
 pub use session::{Lifecycle, NewSession, Session};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
+pub use tablet_state::{
+    LoggedTabletStateMachine, TabletApplyResult, TabletCommand, TabletStateMachine, TabletWriteOp,
+};
 pub use tenant::{NewTenant, Tenant};
 
 pub(crate) fn now_ms() -> u64 {

@@ -9,9 +9,11 @@ use agentdb_core::tenant::NewTenant;
 use agentdb_storage::keys::{artifact_record_key, event_key};
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentBackend, InMemoryContentBackend, KvStore, MetadataCryptoAdapter,
-    MetadataCryptoContext, RocksKvStore,
+    MetadataCryptoContext, RocksKvStore, TabletKvStore,
 };
 use tempfile::TempDir;
+
+const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
 
 fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
     Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
@@ -118,7 +120,8 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
         .await
         .unwrap();
 
-        let artifact_raw = kv
+        let tablet = TabletKvStore::new(kv.clone(), RUNTIME_PRIMARY_TABLET_ID).unwrap();
+        let artifact_raw = tablet
             .get(
                 artifact_record_key(tenant.tenant_id.as_str(), artifact.artifact_id.as_str())
                     .as_bytes(),
@@ -129,7 +132,7 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
         assert!(!artifact_raw.starts_with(b"{"));
         assert!(artifact.metadata_key_id.as_deref().is_some());
 
-        let event_raw = kv
+        let event_raw = tablet
             .get(event_key(tenant.tenant_id.as_str(), session.session_id.as_str(), 0).as_bytes())
             .unwrap()
             .unwrap();

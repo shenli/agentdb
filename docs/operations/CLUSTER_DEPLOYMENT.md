@@ -92,6 +92,7 @@ Each node should have:
 
 - a stable `node_id`
 - a routable internal address
+- a shared internal auth token for node-to-node Raft RPCs
 - region / availability-zone metadata
 - local fast storage for hot working set
 
@@ -260,6 +261,8 @@ Each node should have:
 - rebalance movement cap (`AGENTDB_REBALANCE_MAX_MOVEMENTS`; `0` disables
   automatic movement)
 - routing refresh intervals
+- internal Raft RPC token (`server.internal_auth_token` or
+  `AGENTDB_INTERNAL_AUTH_TOKEN`)
 
 ### Node-local settings
 

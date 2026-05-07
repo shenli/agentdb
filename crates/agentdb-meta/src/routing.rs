@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use crate::nodes::Node;
 use crate::session_locators::SessionLocator;
 use crate::shards::ShardRow;
+use crate::tablet_ranges::{range_override, TabletRange};
 use crate::tablets::Tablet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,10 @@ pub struct RouteRequest<'a> {
     /// `session_id`; for record/search requests this can be the caller's
     /// sharding key. If absent, routing falls back to tenant-only hashing.
     pub routing_key: Option<&'a str>,
+    /// Placement scope whose tablet map should be used. `None` keeps the
+    /// compatibility default scope until tenant policy resolution is wired into
+    /// the routing caller.
+    pub placement_scope_id: Option<&'a str>,
     pub session_locator: Option<&'a SessionLocator>,
     pub request_location: Option<&'a str>,
     pub local_node_id: Option<&'a str>,
@@ -89,6 +94,7 @@ pub enum RouteReason {
 pub fn plan_route(
     request: RouteRequest<'_>,
     shards: &[ShardRow],
+    tablet_ranges: &[TabletRange],
     tablets: &[Tablet],
     nodes: &[Node],
 ) -> RouteDecision {
@@ -103,6 +109,7 @@ pub fn plan_route(
     let tablet_id = request
         .session_locator
         .and_then(|locator| locator.tablet_id)
+        .or_else(|| range_override(tablet_ranges, request.placement_scope_id, shard_id))
         .or_else(|| shard_override(shards, shard_id))
         .unwrap_or(shard_id);
 
@@ -256,6 +263,10 @@ mod tests {
             epoch: 7,
             lease_expires_at_ms,
             created_at_ms: 0,
+            placement_scope_id: "default".into(),
+            state: "serving".into(),
+            raft_group_id: None,
+            encryption_policy_version: 0,
             handoff_target_node_id: None,
         }
     }
@@ -276,6 +287,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 3, Some(99))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -290,6 +302,7 @@ mod tests {
                 tablet_id: Some(3),
                 updated_at_ms: 0,
             }],
+            &[],
             &[tablet(99, Some("node-a"), 2_000)],
             &[node("node-a", "us-west-2a")],
         );
@@ -309,6 +322,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "tenant-a",
             routing_key: Some("session-a"),
+            placement_scope_id: None,
             session_locator: None,
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -324,6 +338,7 @@ mod tests {
                 tablet_id: Some(42),
                 updated_at_ms: 0,
             }],
+            &[],
             &[tablet(42, Some("node-b"), 2_000)],
             &[node("node-b", "us-west-2a")],
         );
@@ -331,6 +346,85 @@ mod tests {
         assert_eq!(decision.action, RouteAction::Forward);
         assert_eq!(decision.tablet_id, 42);
         assert_eq!(decision.owner_node_id.as_deref(), Some("node-b"));
+    }
+
+    #[test]
+    fn route_uses_tablet_range_before_shard_override() {
+        let request = RouteRequest {
+            tenant_id: "tenant-a",
+            routing_key: Some("session-a"),
+            placement_scope_id: None,
+            session_locator: None,
+            request_location: Some("us-west-2a"),
+            local_node_id: Some("node-a"),
+            shard_count: 16,
+            now_ms: 1_000,
+            policy: ResidencyPolicy::default(),
+        };
+        let shard_id = stable_shard("tenant-a", Some("session-a"), 16);
+        let decision = plan_route(
+            request,
+            &[ShardRow {
+                shard_id,
+                tablet_id: Some(1),
+                updated_at_ms: 0,
+            }],
+            &[TabletRange {
+                placement_scope_id: "default".into(),
+                start_shard: 0,
+                end_shard: 15,
+                tablet_id: 42,
+                map_epoch: 1,
+                updated_at_ms: 0,
+            }],
+            &[tablet(42, Some("node-b"), 2_000)],
+            &[node("node-b", "us-west-2a")],
+        );
+
+        assert_eq!(decision.action, RouteAction::Forward);
+        assert_eq!(decision.tablet_id, 42);
+    }
+
+    #[test]
+    fn route_uses_requested_placement_scope_for_tablet_ranges() {
+        let request = RouteRequest {
+            tenant_id: "tenant-a",
+            routing_key: Some("session-a"),
+            placement_scope_id: Some("tenant/acme"),
+            session_locator: None,
+            request_location: Some("us-west-2a"),
+            local_node_id: Some("node-a"),
+            shard_count: 16,
+            now_ms: 1_000,
+            policy: ResidencyPolicy::default(),
+        };
+        let decision = plan_route(
+            request,
+            &[],
+            &[
+                TabletRange {
+                    placement_scope_id: "default".into(),
+                    start_shard: 0,
+                    end_shard: 15,
+                    tablet_id: 1,
+                    map_epoch: 1,
+                    updated_at_ms: 0,
+                },
+                TabletRange {
+                    placement_scope_id: "tenant/acme".into(),
+                    start_shard: 0,
+                    end_shard: 15,
+                    tablet_id: 42,
+                    map_epoch: 1,
+                    updated_at_ms: 0,
+                },
+            ],
+            &[tablet(42, Some("node-b"), 2_000)],
+            &[node("node-b", "us-west-2a")],
+        );
+
+        assert_eq!(decision.action, RouteAction::Forward);
+        assert_eq!(decision.tablet_id, 42);
     }
 
     #[test]
@@ -350,6 +444,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: None,
             local_node_id: Some("node-a"),
@@ -359,6 +454,7 @@ mod tests {
         };
         let decision = plan_route(
             request,
+            &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
             &[node("node-a", "us-west-2a")],
@@ -373,6 +469,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
@@ -385,6 +482,7 @@ mod tests {
         };
         let decision = plan_route(
             request,
+            &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
             &[node("node-a", "us-west-2a")],
@@ -402,6 +500,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2"),
             local_node_id: Some("node-local"),
@@ -412,7 +511,13 @@ mod tests {
                 allow_cross_location: false,
             },
         };
-        let decision = plan_route(request, &[], &[tablet(1, Some("node-a"), 2_000)], &[owner]);
+        let decision = plan_route(
+            request,
+            &[],
+            &[],
+            &[tablet(1, Some("node-a"), 2_000)],
+            &[owner],
+        );
 
         assert_eq!(decision.action, RouteAction::Forward);
         assert_eq!(decision.owner_location.as_deref(), Some("us-west-2"));
@@ -426,6 +531,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-local"),
@@ -436,7 +542,13 @@ mod tests {
                 allow_cross_location: false,
             },
         };
-        let decision = plan_route(request, &[], &[tablet(1, Some("node-a"), 2_000)], &[owner]);
+        let decision = plan_route(
+            request,
+            &[],
+            &[],
+            &[tablet(1, Some("node-a"), 2_000)],
+            &[owner],
+        );
 
         assert_eq!(decision.action, RouteAction::Forward);
         assert_eq!(decision.owner_location.as_deref(), Some("us-west-2a"));
@@ -447,6 +559,7 @@ mod tests {
         let request = RouteRequest {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
+            placement_scope_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
@@ -459,6 +572,7 @@ mod tests {
         };
         let decision = plan_route(
             request,
+            &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
             &[node("node-a", "us-west-2a")],

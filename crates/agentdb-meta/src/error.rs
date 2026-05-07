@@ -16,6 +16,9 @@ pub enum MetaError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// Data on disk failed an integrity check — e.g. a base64
     /// column didn't decode, or a stored hash was the wrong
     /// length. Should never happen absent DB tampering.

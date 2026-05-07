@@ -22,7 +22,9 @@ use agentdb_meta::{
     routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
     session_locators::{self, SessionLocator},
     shards::{self, ShardRow},
+    tablet_ranges::{self, TabletRange},
     tablets::{self, Tablet},
+    tenant_policies::{self, TenantPolicy},
     MetaStore,
 };
 
@@ -81,9 +83,11 @@ pub struct RouteSnapshot {
     pub request_location: Option<String>,
     pub policy: ResidencyPolicy,
     pub shards: Arc<[ShardRow]>,
+    pub tablet_ranges: Arc<[TabletRange]>,
     pub tablets: Arc<[Tablet]>,
     pub nodes: Arc<[Node]>,
     pub session_locators: Arc<[SessionLocator]>,
+    pub tenant_policies: Arc<[TenantPolicy]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,9 +129,11 @@ pub struct RouteSnapshotStatus {
     pub allowed_locations: Vec<String>,
     pub allow_cross_location: bool,
     pub shard_rows: usize,
+    pub tablet_range_count: usize,
     pub tablet_count: usize,
     pub node_count: usize,
     pub session_locator_count: usize,
+    pub tenant_policy_count: usize,
     pub nodes: Vec<RouteNodeStatus>,
     pub tablets: Vec<RouteTabletStatus>,
 }
@@ -163,6 +169,7 @@ pub struct RouteDecisionDryRun {
     pub local_node_id: String,
     pub tenant_id: String,
     pub session_id: Option<String>,
+    pub placement_scope_id: Option<String>,
     pub session_locator_found: bool,
     pub action: &'static str,
     pub shard_id: Option<i64>,
@@ -244,6 +251,7 @@ impl RouteRuntime {
                 local_node_id: self.local_node_id.to_string(),
                 tenant_id: tenant_id.to_string(),
                 session_id: session_id.map(str::to_string),
+                placement_scope_id: None,
                 session_locator_found: false,
                 action: "local",
                 shard_id: None,
@@ -261,16 +269,19 @@ impl RouteRuntime {
                 &self.local_node_id,
                 tenant_id,
                 session_id,
+                None,
                 false,
                 decision,
             ),
             RouteRuntimeMode::Snapshot(snapshot) => {
                 let session_locator =
                     session_id.and_then(|sid| snapshot.session_locator(tenant_id, sid));
+                let placement_scope_id = snapshot.placement_scope_id(tenant_id);
                 let decision = plan_route(
                     RouteRequest {
                         tenant_id,
                         routing_key: session_id,
+                        placement_scope_id: Some(placement_scope_id),
                         session_locator,
                         request_location: snapshot.request_location.as_deref(),
                         local_node_id: Some(&self.local_node_id),
@@ -279,6 +290,7 @@ impl RouteRuntime {
                         policy: snapshot.policy.clone(),
                     },
                     &snapshot.shards,
+                    &snapshot.tablet_ranges,
                     &snapshot.tablets,
                     &snapshot.nodes,
                 );
@@ -287,6 +299,7 @@ impl RouteRuntime {
                     &self.local_node_id,
                     tenant_id,
                     session_id,
+                    Some(placement_scope_id),
                     session_locator.is_some(),
                     &decision,
                 )
@@ -417,10 +430,12 @@ impl RouteRuntime {
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
     ) -> RouteGuardOutcome {
+        let placement_scope_id = snapshot.placement_scope_id(tenant_id);
         let decision = plan_route(
             RouteRequest {
                 tenant_id,
                 routing_key,
+                placement_scope_id: Some(placement_scope_id),
                 session_locator,
                 request_location: snapshot.request_location.as_deref(),
                 local_node_id: Some(&self.local_node_id),
@@ -429,6 +444,7 @@ impl RouteRuntime {
                 policy: snapshot.policy.clone(),
             },
             &snapshot.shards,
+            &snapshot.tablet_ranges,
             &snapshot.tablets,
             &snapshot.nodes,
         );
@@ -455,6 +471,7 @@ fn dry_run_from_decision(
     local_node_id: &str,
     tenant_id: &str,
     session_id: Option<&str>,
+    placement_scope_id: Option<&str>,
     session_locator_found: bool,
     decision: &RouteDecision,
 ) -> RouteDecisionDryRun {
@@ -471,6 +488,7 @@ fn dry_run_from_decision(
         local_node_id: local_node_id.to_string(),
         tenant_id: tenant_id.to_string(),
         session_id: session_id.map(str::to_string),
+        placement_scope_id: placement_scope_id.map(str::to_string),
         session_locator_found,
         action,
         shard_id: Some(decision.shard_id),
@@ -505,9 +523,11 @@ impl RouteSnapshot {
             request_location: None,
             policy: ResidencyPolicy::default(),
             shards: Arc::from([]),
+            tablet_ranges: Arc::from([]),
             tablets: Arc::from([]),
             nodes: Arc::from([]),
             session_locators: Arc::from([]),
+            tenant_policies: Arc::from([]),
         }
     }
 
@@ -523,9 +543,11 @@ impl RouteSnapshot {
             request_location,
             policy,
             shards: Arc::from(shards::list_all(pool).await?),
+            tablet_ranges: Arc::from(tablet_ranges::list_all(pool).await?),
             tablets: Arc::from(tablets::list_all(pool).await?),
             nodes: Arc::from(nodes::list_all(pool).await?),
             session_locators: Arc::from(session_locators::list_all(pool).await?),
+            tenant_policies: Arc::from(tenant_policies::list_all(pool).await?),
         })
     }
 
@@ -544,6 +566,11 @@ impl RouteSnapshot {
         self
     }
 
+    pub fn with_tablet_ranges(mut self, tablet_ranges: Vec<TabletRange>) -> Self {
+        self.tablet_ranges = Arc::from(tablet_ranges);
+        self
+    }
+
     pub fn with_tablets(mut self, tablets: Vec<Tablet>) -> Self {
         self.tablets = Arc::from(tablets);
         self
@@ -559,6 +586,11 @@ impl RouteSnapshot {
         self
     }
 
+    pub fn with_tenant_policies(mut self, tenant_policies: Vec<TenantPolicy>) -> Self {
+        self.tenant_policies = Arc::from(tenant_policies);
+        self
+    }
+
     fn session_locator(&self, tenant_id: &str, session_id: &str) -> Option<&SessionLocator> {
         self.session_locators.iter().find(|locator| {
             locator.session_id == session_id
@@ -567,6 +599,14 @@ impl RouteSnapshot {
                     .as_deref()
                     .map_or(true, |locator_tenant| locator_tenant == tenant_id)
         })
+    }
+
+    fn placement_scope_id(&self, tenant_id: &str) -> &str {
+        self.tenant_policies
+            .iter()
+            .find(|policy| policy.tenant_id == tenant_id)
+            .map(|policy| policy.placement_scope_id.as_str())
+            .unwrap_or(agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID)
     }
 
     fn describe(&self, local_node_id: &str) -> RouteSnapshotStatus {
@@ -616,9 +656,11 @@ impl RouteSnapshot {
             allowed_locations: self.policy.allowed_locations.clone(),
             allow_cross_location: self.policy.allow_cross_location,
             shard_rows: self.shards.len(),
+            tablet_range_count: self.tablet_ranges.len(),
             tablet_count: self.tablets.len(),
             node_count: self.nodes.len(),
             session_locator_count: self.session_locators.len(),
+            tenant_policy_count: self.tenant_policies.len(),
             nodes,
             tablets,
         }
@@ -927,6 +969,10 @@ mod tests {
             epoch: 3,
             lease_expires_at_ms,
             created_at_ms: 0,
+            placement_scope_id: "default".into(),
+            state: "serving".into(),
+            raft_group_id: None,
+            encryption_policy_version: 0,
             handoff_target_node_id: None,
         }
     }
@@ -939,6 +985,19 @@ mod tests {
             tablet_id,
             shard_id,
             created_at_ms: 0,
+        }
+    }
+
+    fn tenant_policy(tenant_id: &str, placement_scope_id: &str) -> TenantPolicy {
+        TenantPolicy {
+            tenant_id: tenant_id.into(),
+            placement_class: "dedicated".into(),
+            placement_scope_id: placement_scope_id.into(),
+            encryption_class: "tenant".into(),
+            key_policy_id: None,
+            encryption_policy_version: 1,
+            policy_version: 1,
+            updated_at_ms: 100,
         }
     }
 
@@ -1232,6 +1291,44 @@ mod tests {
     }
 
     #[test]
+    fn route_runtime_snapshot_uses_tenant_policy_placement_scope() {
+        let snapshot = RouteSnapshot::new(1)
+            .with_tenant_policies(vec![tenant_policy("ten_1", "tenant/acme")])
+            .with_tablet_ranges(vec![
+                TabletRange {
+                    placement_scope_id: "default".into(),
+                    start_shard: 0,
+                    end_shard: 0,
+                    tablet_id: 1,
+                    map_epoch: 1,
+                    updated_at_ms: 10,
+                },
+                TabletRange {
+                    placement_scope_id: "tenant/acme".into(),
+                    start_shard: 0,
+                    end_shard: 0,
+                    tablet_id: 42,
+                    map_epoch: 1,
+                    updated_at_ms: 10,
+                },
+            ])
+            .with_tablets(vec![tablet(42, Some("node-a"), i64::MAX)])
+            .with_nodes(vec![node("node-a", "us-west-2a")]);
+        let runtime = RouteRuntime::snapshot("node-a", snapshot);
+
+        let outcome = runtime.guard_session("ten_1", None, "/api/test", &HeaderMap::new());
+
+        let RouteGuardOutcome::ServeLocal(headers) = outcome else {
+            panic!("expected local");
+        };
+        assert_eq!(headers[HDR_TABLET_ID].to_str().unwrap(), "42");
+
+        let dry_run = runtime.dry_run_decision("ten_1", Some("ses_1"));
+        assert_eq!(dry_run.placement_scope_id.as_deref(), Some("tenant/acme"));
+        assert_eq!(dry_run.tablet_id, Some(42));
+    }
+
+    #[test]
     fn route_runtime_snapshot_guard_session_id_uses_locator() {
         let snapshot = RouteSnapshot::new(1)
             .with_tablets(vec![
@@ -1285,6 +1382,19 @@ mod tests {
         agentdb_meta::session_locators::upsert(pool, "ses_1", 1, "ten_1", Some(7), 0, 100)
             .await
             .unwrap();
+        agentdb_meta::tenant_policies::upsert(
+            pool,
+            "ten_1",
+            "dedicated",
+            "tenant/ten_1",
+            "tenant",
+            Some("key/ten_1"),
+            1,
+            2,
+            100,
+        )
+        .await
+        .unwrap();
 
         let snapshot =
             RouteSnapshot::load_from_meta(&store, 1, Some("us-west-2".into()), Default::default())
@@ -1296,6 +1406,8 @@ mod tests {
         assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(snapshot.session_locators.len(), 1);
         assert_eq!(snapshot.session_locators[0].session_id, "ses_1");
+        assert_eq!(snapshot.tenant_policies.len(), 1);
+        assert_eq!(snapshot.placement_scope_id("ten_1"), "tenant/ten_1");
     }
 
     #[test]

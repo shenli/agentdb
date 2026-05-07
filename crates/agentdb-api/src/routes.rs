@@ -10,7 +10,9 @@
 
 use std::{
     fs,
+    future::Future,
     path::{Path as FsPath, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +24,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use agentdb_core::{
@@ -33,7 +36,7 @@ use agentdb_core::{
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
-use agentdb_meta::{nodes, tablet_rebalance, tablets};
+use agentdb_meta::{nodes, tablet_ranges, tablet_rebalance, tablets, tenant_policies};
 
 use crate::dto::{
     AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
@@ -44,7 +47,7 @@ use crate::dto::{
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::routing_http::{
-    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_ROUTE_REASON,
+    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_ROUTE_REASON, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -52,6 +55,7 @@ const IDEMPOTENCY_HEADER: &str = "Idempotency-Key";
 const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
+const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -63,6 +67,14 @@ const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(health_ready))
+        .route(
+            "/api/internal/raft/messages",
+            post(post_internal_raft_message),
+        )
+        .route(
+            "/api/internal/raft/snapshots",
+            post(post_internal_raft_snapshot),
+        )
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/scheduler", get(get_admin_scheduler))
@@ -81,6 +93,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/tablets", get(get_admin_tablets))
         .route("/api/admin/tablets/create", post(create_admin_tablet))
+        .route("/api/admin/tablet-ranges", get(get_admin_tablet_ranges))
+        .route(
+            "/api/admin/tablet-ranges/replace",
+            post(replace_admin_tablet_ranges),
+        )
+        .route(
+            "/api/admin/tenant-policies",
+            get(get_admin_tenant_policies).post(upsert_admin_tenant_policy),
+        )
+        .route(
+            "/api/admin/tenant-policies/:tenant_id",
+            delete(delete_admin_tenant_policy),
+        )
         .route(
             "/api/admin/tablets/rebalance",
             post(rebalance_admin_tablets),
@@ -107,7 +132,9 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/routing", get(get_routing_status))
         .route("/api/admin/routing/decision", get(get_routing_decision))
+        .route("/api/admin/raft", get(get_raft_status))
         .route("/api/admin/indexes/records", get(get_record_index_status))
+        .route("/api/admin/content-mirror", get(get_content_mirror_status))
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -317,12 +344,54 @@ struct AdminTabletView {
     epoch: i64,
     lease_expires_at_ms: i64,
     created_at_ms: i64,
+    placement_scope_id: String,
+    state: String,
+    raft_group_id: Option<String>,
+    encryption_policy_version: i64,
     handoff_target_node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateTabletBody {
     tablet_id: i64,
+    placement_scope_id: Option<String>,
+    state: Option<String>,
+    raft_group_id: Option<String>,
+    encryption_policy_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertTenantPolicyBody {
+    tenant_id: String,
+    placement_class: String,
+    placement_scope_id: String,
+    encryption_class: String,
+    key_policy_id: Option<String>,
+    #[serde(default)]
+    encryption_policy_version: i64,
+    #[serde(default)]
+    policy_version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteTenantPolicyResponse {
+    tenant_id: String,
+    removed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceTabletRangesBody {
+    placement_scope_id: String,
+    old_ranges: Vec<tablet_ranges::RangeBounds>,
+    new_ranges: Vec<tablet_ranges::ReplacementRange>,
+    map_epoch: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplaceTabletRangesResponse {
+    placement_scope_id: String,
+    changed: bool,
+    ranges: Vec<tablet_ranges::TabletRange>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,6 +512,64 @@ struct ClusterReadinessResponse {
     reasons: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ContentMirrorStatusResponse {
+    enabled: bool,
+    queued: u64,
+    completed: u64,
+    failed: u64,
+    backlog: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftStatusResponse {
+    enabled: bool,
+    tablet_count: usize,
+    tablets: Vec<RaftTabletStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftTabletStatus {
+    tablet_id: i64,
+    replicas: Vec<RaftReplicaStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftReplicaStatus {
+    node_id: u64,
+    role: String,
+    leader_id: u64,
+    term: u64,
+    commit_index: u64,
+    applied_index: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalRaftMessageBody {
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+    payload_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalRaftSnapshotBody {
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+    index: u64,
+    term: u64,
+    payload_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalRaftAccepted {
+    status: &'static str,
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+}
+
 async fn get_cluster_health(
     State(s): State<AppState>,
     Query(query): Query<ClusterAdminQuery>,
@@ -469,6 +596,163 @@ async fn get_cluster_readiness(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(readiness)).into_response()
+}
+
+async fn post_internal_raft_message(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftMessageBody>,
+) -> Response {
+    if let Err(response) = validate_internal_raft_request(&s, &headers) {
+        return response;
+    }
+    let Some(ingress) = s.raft_ingress.as_ref() else {
+        return internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INGRESS_UNAVAILABLE",
+            "raft ingress is not configured on this node",
+        );
+    };
+    let payload = match decode_base64(&body.payload_base64) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    match ingress.step_wire_message(agentdb_storage::RaftRsWireMessage {
+        tablet_id: body.tablet_id,
+        from: body.from,
+        to: body.to,
+        payload,
+    }) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(InternalRaftAccepted {
+                status: "accepted",
+                tablet_id: body.tablet_id,
+                from: body.from,
+                to: body.to,
+            }),
+        )
+            .into_response(),
+        Err(err) => internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "RAFT_MESSAGE_REJECTED",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn post_internal_raft_snapshot(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InternalRaftSnapshotBody>,
+) -> Response {
+    if let Err(response) = validate_internal_raft_request(&s, &headers) {
+        return response;
+    }
+    let Some(ingress) = s.raft_ingress.as_ref() else {
+        return internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INGRESS_UNAVAILABLE",
+            "raft ingress is not configured on this node",
+        );
+    };
+    let payload = match decode_base64(&body.payload_base64) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    match ingress.install_snapshot_transfer(
+        body.to,
+        agentdb_storage::RaftRsSnapshotTransfer {
+            tablet_id: body.tablet_id,
+            from: body.from,
+            to: body.to,
+            index: body.index,
+            term: body.term,
+            payload,
+        },
+    ) {
+        Ok(application_snapshot_payload) => {
+            if !application_snapshot_payload.is_empty() {
+                match s
+                    .runtime
+                    .install_tablet_snapshot_payload(body.tablet_id, &application_snapshot_payload)
+                {
+                    Ok(_) => {}
+                    Err(err) => {
+                        return internal_raft_error(
+                            StatusCode::BAD_REQUEST,
+                            "RAFT_SNAPSHOT_STATE_REJECTED",
+                            err.message,
+                        )
+                    }
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(InternalRaftAccepted {
+                    status: "accepted",
+                    tablet_id: body.tablet_id,
+                    from: body.from,
+                    to: body.to,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "RAFT_SNAPSHOT_REJECTED",
+            err.to_string(),
+        ),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_internal_raft_request(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected) = state.internal_auth_token.as_ref() else {
+        return Err(internal_raft_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RAFT_INTERNAL_AUTH_UNCONFIGURED",
+            "internal raft RPC auth token is not configured on this node",
+        ));
+    };
+    let presented = headers
+        .get(INTERNAL_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if presented != Some(expected.as_ref()) {
+        return Err(internal_raft_error(
+            StatusCode::UNAUTHORIZED,
+            "RAFT_INTERNAL_AUTH_FAILED",
+            "invalid internal raft RPC token",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, Response> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|err| {
+            internal_raft_error(
+                StatusCode::BAD_REQUEST,
+                "RAFT_PAYLOAD_INVALID",
+                format!("invalid base64 raft payload: {err}"),
+            )
+        })
+}
+
+fn internal_raft_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message.into(),
+            "retryable": status.is_server_error(),
+        }
+    });
+    (status, Json(body)).into_response()
 }
 
 async fn get_admin_drain(State(s): State<AppState>) -> Json<DrainStatusResponse> {
@@ -854,6 +1138,10 @@ fn tablet_view(tablet: tablets::Tablet) -> AdminTabletView {
         epoch: tablet.epoch,
         lease_expires_at_ms: tablet.lease_expires_at_ms,
         created_at_ms: tablet.created_at_ms,
+        placement_scope_id: tablet.placement_scope_id,
+        state: tablet.state,
+        raft_group_id: tablet.raft_group_id,
+        encryption_policy_version: tablet.encryption_policy_version,
         handoff_target_node_id: tablet.handoff_target_node_id,
     }
 }
@@ -917,14 +1205,122 @@ async fn create_admin_tablet(
         .await
         .map_err(internal_error)?
         .is_some();
-    let tablet = tablets::get_or_create(meta.pool(), body.tablet_id, now_ms_i64())
+    let now_ms = now_ms_i64();
+    let tablet = if existed {
+        tablets::get(meta.pool(), body.tablet_id)
+            .await
+            .map_err(internal_error)?
+            .expect("tablet existed above")
+    } else if body.placement_scope_id.is_some()
+        || body.state.is_some()
+        || body.raft_group_id.is_some()
+        || body.encryption_policy_version.is_some()
+    {
+        tablets::create_with_placement(
+            meta.pool(),
+            body.tablet_id,
+            body.placement_scope_id.as_deref().unwrap_or("default"),
+            body.state.as_deref().unwrap_or("serving"),
+            body.raft_group_id.as_deref(),
+            body.encryption_policy_version.unwrap_or(0),
+            now_ms,
+        )
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+    } else {
+        tablets::get_or_create(meta.pool(), body.tablet_id, now_ms)
+            .await
+            .map_err(internal_error)?
+    };
     Ok(Json(AdminTabletMutationResponse {
         action: "create",
         changed: !existed,
         tablet: tablet_view(tablet),
     }))
+}
+
+async fn get_admin_tablet_ranges(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<tablet_ranges::TabletRange>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn replace_admin_tablet_ranges(
+    State(s): State<AppState>,
+    Json(body): Json<ReplaceTabletRangesBody>,
+) -> Result<Json<ReplaceTabletRangesResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    tablet_ranges::replace_ranges(
+        meta.pool(),
+        &body.placement_scope_id,
+        &body.old_ranges,
+        &body.new_ranges,
+        body.map_epoch,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let ranges = tablet_ranges::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|range| range.placement_scope_id == body.placement_scope_id)
+        .collect();
+    Ok(Json(ReplaceTabletRangesResponse {
+        placement_scope_id: body.placement_scope_id,
+        changed: true,
+        ranges,
+    }))
+}
+
+async fn get_admin_tenant_policies(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<tenant_policies::TenantPolicy>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = tenant_policies::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn upsert_admin_tenant_policy(
+    State(s): State<AppState>,
+    Json(body): Json<UpsertTenantPolicyBody>,
+) -> Result<Json<tenant_policies::TenantPolicy>, ApiError> {
+    let meta = meta_required(&s)?;
+    tenant_policies::upsert(
+        meta.pool(),
+        &body.tenant_id,
+        &body.placement_class,
+        &body.placement_scope_id,
+        &body.encryption_class,
+        body.key_policy_id.as_deref(),
+        body.encryption_policy_version,
+        body.policy_version,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let policy = tenant_policies::get(meta.pool(), &body.tenant_id)
+        .await
+        .map_err(internal_error)?
+        .expect("tenant policy upserted above");
+    Ok(Json(policy))
+}
+
+async fn delete_admin_tenant_policy(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<DeleteTenantPolicyResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    let removed = tenant_policies::delete(meta.pool(), &tenant_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(DeleteTenantPolicyResponse { tenant_id, removed }))
 }
 
 async fn assign_admin_tablet(
@@ -1110,6 +1506,60 @@ async fn get_fleet_storage_summary(
     State(s): State<AppState>,
 ) -> Json<agentdb_core::FleetStorageSummary> {
     Json(s.runtime.fleet_storage_summary().await)
+}
+
+async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMirrorStatusResponse> {
+    let Some(mirror) = s.content_mirror.as_ref() else {
+        return Json(ContentMirrorStatusResponse {
+            enabled: false,
+            queued: 0,
+            completed: 0,
+            failed: 0,
+            backlog: 0,
+        });
+    };
+    let stats = mirror.stats();
+    Json(ContentMirrorStatusResponse {
+        enabled: true,
+        queued: stats.queued,
+        completed: stats.completed,
+        failed: stats.failed,
+        backlog: stats.backlog,
+    })
+}
+
+async fn get_raft_status(State(s): State<AppState>) -> Json<RaftStatusResponse> {
+    let Some(registry) = s.raft_registry.as_ref() else {
+        return Json(RaftStatusResponse {
+            enabled: false,
+            tablet_count: 0,
+            tablets: Vec::new(),
+        });
+    };
+    let tablets: Vec<_> = registry
+        .groups_snapshot()
+        .into_iter()
+        .map(|(tablet_id, group)| RaftTabletStatus {
+            tablet_id,
+            replicas: group
+                .status()
+                .into_iter()
+                .map(|status| RaftReplicaStatus {
+                    node_id: status.node_id,
+                    role: status.role,
+                    leader_id: status.leader_id,
+                    term: status.term,
+                    commit_index: status.commit_index,
+                    applied_index: status.applied_index,
+                })
+                .collect(),
+        })
+        .collect();
+    Json(RaftStatusResponse {
+        enabled: true,
+        tablet_count: tablets.len(),
+        tablets,
+    })
 }
 
 fn build_cluster_health(
@@ -1486,10 +1936,12 @@ async fn get_session(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
-    Ok(with_headers(
-        Json(s.runtime.get_session(&tid, &sid).await?).into_response(),
-        route_headers,
-    ))
+    let runtime = s.runtime.clone();
+    let session = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.get_session(&tid, &sid).await
+    })
+    .await?;
+    Ok(with_headers(Json(session).into_response(), route_headers))
 }
 
 async fn delete_session(
@@ -1526,7 +1978,11 @@ async fn delete_session(
     if let Err(response) = validate_forwarded_mutation(&s, &headers) {
         return Ok(response);
     }
-    s.runtime.delete_session(&tid, &sid).await?;
+    let runtime = s.runtime.clone();
+    with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.delete_session(&tid, &sid).await
+    })
+    .await?;
     Ok(with_headers(
         StatusCode::NO_CONTENT.into_response(),
         route_headers,
@@ -1556,10 +2012,12 @@ async fn get_session_storage(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
-    Ok(with_headers(
-        Json(s.runtime.get_session_storage(&tid, &sid).await?).into_response(),
-        route_headers,
-    ))
+    let runtime = s.runtime.clone();
+    let storage = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.get_session_storage(&tid, &sid).await
+    })
+    .await?;
+    Ok(with_headers(Json(storage).into_response(), route_headers))
 }
 
 async fn get_tenant_storage_summary(
@@ -1622,15 +2080,14 @@ async fn transition_session_lifecycle(
             )))
         }
     };
-    Ok(with_headers(
-        Json(
-            s.runtime
-                .transition_session_lifecycle(&tid, &sid, target)
-                .await?,
-        )
-        .into_response(),
-        route_headers,
-    ))
+    let runtime = s.runtime.clone();
+    let session = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .transition_session_lifecycle(&tid, &sid, target)
+            .await
+    })
+    .await?;
+    Ok(with_headers(Json(session).into_response(), route_headers))
 }
 
 async fn restore_session_storage(
@@ -1679,15 +2136,14 @@ async fn restore_session_storage(
             )))
         }
     };
-    Ok(with_headers(
-        Json(
-            s.runtime
-                .restore_session_from_archive(&tid, &sid, target)
-                .await?,
-        )
-        .into_response(),
-        route_headers,
-    ))
+    let runtime = s.runtime.clone();
+    let session = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .restore_session_from_archive(&tid, &sid, target)
+            .await
+    })
+    .await?;
+    Ok(with_headers(Json(session).into_response(), route_headers))
 }
 
 async fn append_event(
@@ -1733,19 +2189,24 @@ async fn append_event(
     }
     let idem_key = idempotency_key(&headers);
 
-    let resp = s
-        .runtime
-        .append(AppendRequest {
-            tenant_id: tid.clone(),
-            agent_id: aid,
-            session_id: sid.clone(),
-            kind: body.kind,
-            payload: body.payload,
-            artifact_refs: body.artifact_refs,
-            source_refs: body.source_refs,
-            idempotency_key: idem_key,
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let append_tid = tid.clone();
+    let append_sid = sid.clone();
+    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append(AppendRequest {
+                tenant_id: append_tid,
+                agent_id: aid,
+                session_id: append_sid,
+                kind: body.kind,
+                payload: body.payload,
+                artifact_refs: body.artifact_refs,
+                source_refs: body.source_refs,
+                idempotency_key: idem_key,
+            })
+            .await
+    })
+    .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
     Ok(with_headers(
@@ -1797,23 +2258,28 @@ async fn append_and_fetch(
     }
     let idem_key = idempotency_key(&headers);
 
-    let resp = s
-        .runtime
-        .append_and_fetch(
-            AppendRequest {
-                tenant_id: tid.clone(),
-                agent_id: aid,
-                session_id: sid.clone(),
-                kind: body.kind,
-                payload: body.payload,
-                artifact_refs: body.artifact_refs,
-                source_refs: body.source_refs,
-                idempotency_key: idem_key,
-            },
-            body.last,
-            body.max_bytes,
-        )
-        .await?;
+    let runtime = s.runtime.clone();
+    let append_tid = tid.clone();
+    let append_sid = sid.clone();
+    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_and_fetch(
+                AppendRequest {
+                    tenant_id: append_tid,
+                    agent_id: aid,
+                    session_id: append_sid,
+                    kind: body.kind,
+                    payload: body.payload,
+                    artifact_refs: body.artifact_refs,
+                    source_refs: body.source_refs,
+                    idempotency_key: idem_key,
+                },
+                body.last,
+                body.max_bytes,
+            )
+            .await
+    })
+    .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
     Ok(with_headers(
@@ -1846,15 +2312,18 @@ async fn fetch_events(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
-    let events = s
-        .runtime
-        .fetch_from_seq(FetchRequest {
-            tenant_id: tid,
-            session_id: sid,
-            from_seq: q.from_seq,
-            limit: q.limit,
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tid,
+                session_id: sid,
+                from_seq: q.from_seq,
+                limit: q.limit,
+            })
+            .await
+    })
+    .await?;
     Ok(with_headers(Json(events).into_response(), route_headers))
 }
 
@@ -1886,15 +2355,18 @@ async fn fork_session(
     if let Err(response) = validate_forwarded_mutation(&s, &headers) {
         return Ok(response);
     }
-    let child = s
-        .runtime
-        .fork_session(ForkSessionRequest {
-            tenant_id: tid,
-            session_id: sid,
-            at_seq: body.at_seq,
-            alias: body.alias,
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let child = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .fork_session(ForkSessionRequest {
+                tenant_id: tid,
+                session_id: sid,
+                at_seq: body.at_seq,
+                alias: body.alias,
+            })
+            .await
+    })
+    .await?;
     Ok(with_headers(
         (StatusCode::CREATED, Json(child)).into_response(),
         route_headers,
@@ -1917,7 +2389,13 @@ async fn replay_session(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
-    let mut replay = s.runtime.replay_session(&tid, &sid).await?;
+    let runtime = s.runtime.clone();
+    let replay_tid = tid.clone();
+    let replay_sid = sid.clone();
+    let mut replay = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.replay_session(&replay_tid, &replay_sid).await
+    })
+    .await?;
     if let Some(from_seq) = q.from_seq {
         replay
             .events
@@ -1943,15 +2421,18 @@ async fn subscribe_session(
             Ok(headers) => headers,
             Err(response) => return Ok(response),
         };
-    let events = s
-        .runtime
-        .fetch_from_seq(FetchRequest {
-            tenant_id: tid,
-            session_id: sid,
-            from_seq: q.from_seq,
-            limit: q.limit.clamp(1, 1000),
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tid,
+                session_id: sid,
+                from_seq: q.from_seq,
+                limit: q.limit.clamp(1, 1000),
+            })
+            .await
+    })
+    .await?;
     Ok(with_headers(
         sse_response(events.into_iter().map(|event| ("event", event))),
         route_headers,
@@ -1985,17 +2466,20 @@ async fn build_context(
     let record_query = body
         .record_query
         .map(|q| search_body_to_request(tid.clone(), q));
-    let context = s
-        .runtime
-        .build_context(ContextRequest {
-            tenant_id: tid,
-            session_id: sid,
-            max_events: body.max_events.clamp(0, 1000),
-            max_bytes: body.max_bytes,
-            include: parse_context_includes(&body.include),
-            record_query,
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let context = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .build_context(ContextRequest {
+                tenant_id: tid,
+                session_id: sid,
+                max_events: body.max_events.clamp(0, 1000),
+                max_bytes: body.max_bytes,
+                include: parse_context_includes(&body.include),
+                record_query,
+            })
+            .await
+    })
+    .await?;
     Ok(with_headers(Json(context).into_response(), route_headers))
 }
 
@@ -2185,6 +2669,28 @@ fn json_with_backpressure<T: serde::Serialize>(
         }
     }
     resp
+}
+
+async fn with_route_tablet_context<F, T>(
+    runtime: Arc<agentdb_core::runtime::Runtime>,
+    headers: &HeaderMap,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    if let Some(tablet_id) = route_tablet_id(headers) {
+        runtime.with_tablet_context(tablet_id, future).await
+    } else {
+        future.await
+    }
+}
+
+fn route_tablet_id(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get(HDR_TABLET_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
 }
 
 async fn guard_session_request(

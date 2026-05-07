@@ -9,12 +9,20 @@ use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
-/// (tablet_id, owner_node_id, epoch, lease_expires_at_ms,
-/// created_at_ms, handoff_target_node_id) — the on-disk shape
-/// of every `tablets` SELECT in this module. Aliased so the
-/// `query_as` annotations don't have to spell the tuple six
-/// times (once per call site).
-type TabletRow = (i64, Option<String>, i64, i64, i64, Option<String>);
+/// On-disk shape of every `tablets` SELECT in this module. Aliased so the
+/// `query_as` annotations don't have to spell the tuple at every call site.
+type TabletRow = (
+    i64,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tablet {
@@ -23,6 +31,10 @@ pub struct Tablet {
     pub epoch: i64,
     pub lease_expires_at_ms: i64,
     pub created_at_ms: i64,
+    pub placement_scope_id: String,
+    pub state: String,
+    pub raft_group_id: Option<String>,
+    pub encryption_policy_version: i64,
     /// Set by the leader when it wants the current owner to
     /// hand the tablet off cooperatively. Owner reads this
     /// in its TabletReconciler, drains its in-process box,
@@ -51,24 +63,54 @@ pub async fn get_or_create(pool: &AnyPool, tablet_id: i64, now_ms: i64) -> MetaR
         .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after insert-or-ignore")))
 }
 
+pub async fn create_with_placement(
+    pool: &AnyPool,
+    tablet_id: i64,
+    placement_scope_id: &str,
+    state: &str,
+    raft_group_id: Option<&str>,
+    encryption_policy_version: i64,
+    now_ms: i64,
+) -> MetaResult<Tablet> {
+    validate_state(state)?;
+    if encryption_policy_version < 0 {
+        return Err(MetaError::InvalidInput(
+            "encryption_policy_version must be non-negative".into(),
+        ));
+    }
+    if get(pool, tablet_id).await?.is_some() {
+        return Err(MetaError::Conflict(format!("tablet {tablet_id} exists")));
+    }
+    sqlx::query(
+        "INSERT INTO tablets
+            (tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
+             placement_scope_id, state, raft_group_id, encryption_policy_version)
+         VALUES (?, NULL, 0, 0, ?, ?, ?, ?, ?)",
+    )
+    .bind(tablet_id)
+    .bind(now_ms)
+    .bind(placement_scope_id)
+    .bind(state)
+    .bind(raft_group_id)
+    .bind(encryption_policy_version)
+    .execute(pool)
+    .await?;
+    get(pool, tablet_id)
+        .await?
+        .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after create")))
+}
+
 pub async fn get(pool: &AnyPool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
     let row: Option<TabletRow> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
+                handoff_target_node_id, placement_scope_id, state, raft_group_id,
+                encryption_policy_version
          FROM tablets WHERE tablet_id = ?",
     )
     .bind(tablet_id)
     .fetch_optional(pool)
     .await?;
-    Ok(
-        row.map(|(id, owner, epoch, lease, created, handoff)| Tablet {
-            tablet_id: id,
-            owner_node_id: owner,
-            epoch,
-            lease_expires_at_ms: lease,
-            created_at_ms: created,
-            handoff_target_node_id: handoff,
-        }),
-    )
+    Ok(row.map(into_tablet))
 }
 
 /// Atomically claim or renew ownership. Bumps `epoch` and sets
@@ -233,23 +275,15 @@ pub async fn assign_to(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaRes
 /// (see `agentdb_core::tablet_reconciler`).
 pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tablet>> {
     let rows: Vec<TabletRow> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
+                handoff_target_node_id, placement_scope_id, state, raft_group_id,
+                encryption_policy_version
            FROM tablets WHERE owner_node_id = ? ORDER BY tablet_id",
     )
     .bind(node_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, owner, epoch, lease, created, handoff)| Tablet {
-            tablet_id: id,
-            owner_node_id: owner,
-            epoch,
-            lease_expires_at_ms: lease,
-            created_at_ms: created,
-            handoff_target_node_id: handoff,
-        })
-        .collect())
+    Ok(rows.into_iter().map(into_tablet).collect())
 }
 
 /// Every tablet row, ordered by `tablet_id`. Point-in-time snapshot —
@@ -258,22 +292,62 @@ pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tabl
 /// needs a cluster-wide view of which tablets exist.
 pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Tablet>> {
     let rows: Vec<TabletRow> = sqlx::query_as(
-        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms, handoff_target_node_id
+        "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
+                handoff_target_node_id, placement_scope_id, state, raft_group_id,
+                encryption_policy_version
            FROM tablets ORDER BY tablet_id",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, owner, epoch, lease, created, handoff)| Tablet {
-            tablet_id: id,
-            owner_node_id: owner,
-            epoch,
-            lease_expires_at_ms: lease,
-            created_at_ms: created,
-            handoff_target_node_id: handoff,
-        })
-        .collect())
+    Ok(rows.into_iter().map(into_tablet).collect())
+}
+
+pub async fn set_state(pool: &AnyPool, tablet_id: i64, state: &str) -> MetaResult<bool> {
+    validate_state(state)?;
+    let rows = sqlx::query("UPDATE tablets SET state = ?, epoch = epoch + 1 WHERE tablet_id = ?")
+        .bind(state)
+        .bind(tablet_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows > 0)
+}
+
+pub async fn set_raft_group(
+    pool: &AnyPool,
+    tablet_id: i64,
+    raft_group_id: Option<&str>,
+) -> MetaResult<bool> {
+    let rows = sqlx::query("UPDATE tablets SET raft_group_id = ? WHERE tablet_id = ?")
+        .bind(raft_group_id)
+        .bind(tablet_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows > 0)
+}
+
+pub async fn set_encryption_policy_version(
+    pool: &AnyPool,
+    tablet_id: i64,
+    encryption_policy_version: i64,
+) -> MetaResult<bool> {
+    if encryption_policy_version < 0 {
+        return Err(MetaError::InvalidInput(
+            "encryption_policy_version must be non-negative".into(),
+        ));
+    }
+    let rows = sqlx::query(
+        "UPDATE tablets
+            SET encryption_policy_version = ?, epoch = epoch + 1
+          WHERE tablet_id = ?",
+    )
+    .bind(encryption_policy_version)
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 /// Mark a still-owned tablet for cooperative handoff to
@@ -384,6 +458,43 @@ pub async fn cancel_handoff(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> 
     Ok(rows > 0)
 }
 
+fn validate_state(state: &str) -> MetaResult<()> {
+    match state {
+        "creating" | "serving" | "splitting" | "merging" | "draining" | "tombstoned" => Ok(()),
+        other => Err(MetaError::InvalidInput(format!(
+            "invalid tablet state `{other}`"
+        ))),
+    }
+}
+
+fn into_tablet(
+    (
+        tablet_id,
+        owner_node_id,
+        epoch,
+        lease_expires_at_ms,
+        created_at_ms,
+        handoff_target_node_id,
+        placement_scope_id,
+        state,
+        raft_group_id,
+        encryption_policy_version,
+    ): TabletRow,
+) -> Tablet {
+    Tablet {
+        tablet_id,
+        owner_node_id,
+        epoch,
+        lease_expires_at_ms,
+        created_at_ms,
+        placement_scope_id,
+        state,
+        raft_group_id,
+        encryption_policy_version,
+        handoff_target_node_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +510,10 @@ mod tests {
         assert_eq!(t.tablet_id, 7);
         assert_eq!(t.epoch, 0);
         assert_eq!(t.owner_node_id, None);
+        assert_eq!(t.placement_scope_id, "default");
+        assert_eq!(t.state, "serving");
+        assert_eq!(t.raft_group_id, None);
+        assert_eq!(t.encryption_policy_version, 0);
         let back = get(&p, 7).await.unwrap().unwrap();
         assert_eq!(back, t);
     }
@@ -409,6 +524,67 @@ mod tests {
         let a = get_or_create(&p, 7, 100).await.unwrap();
         let b = get_or_create(&p, 7, 200).await.unwrap();
         assert_eq!(a, b, "second get_or_create returns the original row");
+    }
+
+    #[tokio::test]
+    async fn create_with_placement_sets_target_metadata() {
+        let p = pool().await;
+        let t = create_with_placement(&p, 7, "tenant/acme", "creating", Some("raft/7"), 3, 100)
+            .await
+            .unwrap();
+        assert_eq!(t.tablet_id, 7);
+        assert_eq!(t.placement_scope_id, "tenant/acme");
+        assert_eq!(t.state, "creating");
+        assert_eq!(t.raft_group_id.as_deref(), Some("raft/7"));
+        assert_eq!(t.encryption_policy_version, 3);
+    }
+
+    #[tokio::test]
+    async fn create_with_placement_rejects_existing_tablet() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        let err = create_with_placement(&p, 7, "tenant/acme", "creating", None, 0, 100)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetaError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn set_state_bumps_epoch() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assert!(set_state(&p, 7, "splitting").await.unwrap());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.state, "splitting");
+        assert_eq!(t.epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn set_state_rejects_unknown_state() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        let err = set_state(&p, 7, "half-split").await.unwrap_err();
+        assert!(matches!(err, MetaError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn set_raft_group_updates_metadata_without_epoch_bump() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assert!(set_raft_group(&p, 7, Some("raft/7")).await.unwrap());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.raft_group_id.as_deref(), Some("raft/7"));
+        assert_eq!(t.epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn set_encryption_policy_version_bumps_epoch() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assert!(set_encryption_policy_version(&p, 7, 5).await.unwrap());
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.encryption_policy_version, 5);
+        assert_eq!(t.epoch, 1);
     }
 
     #[tokio::test]

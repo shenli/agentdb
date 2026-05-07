@@ -6,7 +6,7 @@
 <div align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-local-0f766e" alt="Docs"></a>
-  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-single--node%20today-7c3aed" alt="Deployment"></a>
+  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-self--hosted%20today%20%2B%20cluster%20target-7c3aed" alt="Deployment"></a>
 </div>
 
 <br>

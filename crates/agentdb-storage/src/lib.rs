@@ -11,12 +11,15 @@ pub mod keys;
 pub mod kms;
 pub mod kv;
 pub mod metadata_crypto;
+pub mod raft_rs_log;
+pub mod replicated_log;
 pub mod rocks;
 pub mod slate;
+pub mod tablet_store;
 
 pub use content::{
-    sha256_hex, ContentBackend, InMemoryContentBackend, LocalFsContentBackend,
-    ObjectStoreContentBackend, PutResult,
+    sha256_hex, AsyncMirrorContentBackend, AsyncMirrorStats, ContentBackend,
+    InMemoryContentBackend, LocalFsContentBackend, ObjectStoreContentBackend, PutResult,
 };
 pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,
@@ -30,5 +33,15 @@ pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
 };
+pub use raft_rs_log::{
+    stable_raft_node_id, RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicaStatus,
+    RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsTransport,
+    RaftRsWireMessage,
+};
+pub use replicated_log::{
+    LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,
+    RaftLogTransport, RaftQuorumReplicatedLog, ReplicatedLog, SingleNodeReplicatedLog,
+};
 pub use rocks::RocksKvStore;
 pub use slate::SlateKvStore;
+pub use tablet_store::TabletKvStore;
