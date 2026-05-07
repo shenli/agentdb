@@ -19,7 +19,9 @@ use agentdb_api::{
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, NewAgent, NewSession, NewTenant, Runtime};
-use agentdb_meta::{nodes::Node, session_locators, tablet_replicas, tablets::Tablet, MetaStore};
+use agentdb_meta::{
+    nodes::Node, session_locators, tablet_replicas, tablet_snapshots, tablets::Tablet, MetaStore,
+};
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
     RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
@@ -1006,6 +1008,133 @@ async fn admin_raft_catch_up_dry_run_reports_snapshot_candidates() {
     assert_eq!(body["actions"][0]["node_id"], "2");
     assert_eq!(body["actions"][0]["to_raft_node_id"], 2);
     assert_eq!(body["actions"][0]["status"], "would_send");
+}
+
+#[tokio::test]
+async fn admin_raft_status_reports_latest_snapshot_metadata() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 5, 5, 100)
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "healthy", 4, 4, 100)
+        .await
+        .unwrap();
+    tablet_snapshots::record(
+        meta.pool(),
+        "snap-7-2",
+        7,
+        "1",
+        1,
+        "2",
+        2,
+        4,
+        1,
+        256,
+        "abcd",
+        None,
+        "available",
+        1_000,
+        Some(i64::MAX),
+    )
+    .await
+    .unwrap();
+    let (_dir, group, _logs) = test_raft_group();
+    let registry = RaftRsGroupRegistry::shared();
+    registry.register(7, group).unwrap();
+    let state = AppState::new(Runtime::in_memory())
+        .with_meta(meta)
+        .with_raft_registry(registry);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let configured = body["tablets"][0]["configured_replicas"]
+        .as_array()
+        .unwrap();
+    let replica = configured
+        .iter()
+        .find(|replica| replica["node_id"] == "2")
+        .unwrap();
+    assert_eq!(replica["last_snapshot_index"], 4);
+    assert_eq!(replica["last_snapshot_status"], "available");
+}
+
+#[tokio::test]
+async fn admin_raft_snapshots_list_and_prune_expired_metadata() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_snapshots::record(
+        meta.pool(),
+        "snap-expired",
+        7,
+        "1",
+        1,
+        "2",
+        2,
+        4,
+        1,
+        256,
+        "abcd",
+        None,
+        "available",
+        1_000,
+        Some(1),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft/snapshots?tablet_id=7", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(body["snapshots"][0]["snapshot_id"], "snap-expired");
+    assert_eq!(body["snapshots"][0]["expired"], true);
+
+    let prune: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/raft/snapshots/prune", app.base))
+        .json(&json!({"dry_run": false}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prune["deleted_snapshot_count"], 1);
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft/snapshots?tablet_id=7", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body["snapshots"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -33,6 +33,7 @@ const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_RAFT_SNAPSHOT_MIN_LAG: u64 = 1_024;
+const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
@@ -386,6 +387,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         DEFAULT_RAFT_SNAPSHOT_MIN_LAG,
                     )
                     .max(1);
+                    let raft_snapshot_retention_ms = env_i64(
+                        "AGENTDB_RAFT_SNAPSHOT_RETENTION_MS",
+                        DEFAULT_RAFT_SNAPSHOT_RETENTION_MS,
+                    )
+                    .max(0);
                     spawn_raft_rs_snapshot_worker(
                         startup.meta.clone(),
                         registry,
@@ -393,6 +399,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         outbox,
                         Duration::from_millis(raft_snapshot_interval_ms),
                         raft_snapshot_min_lag,
+                        raft_snapshot_retention_ms,
                     );
                 }
                 tracing::info!(
@@ -1584,13 +1591,21 @@ fn spawn_raft_rs_snapshot_worker(
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     interval: Duration,
     min_lag: u64,
+    retention_ms: i64,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         loop {
             interval.tick().await;
-            if let Err(error) =
-                run_raft_rs_snapshot_tick(&meta, &registry, runtime.clone(), &outbox, min_lag).await
+            if let Err(error) = run_raft_rs_snapshot_tick(
+                &meta,
+                &registry,
+                runtime.clone(),
+                &outbox,
+                min_lag,
+                retention_ms,
+            )
+            .await
             {
                 tracing::warn!(?error, "failed to run raft-rs snapshot tick");
             }
@@ -1604,6 +1619,7 @@ async fn run_raft_rs_snapshot_tick(
     runtime: Arc<agentdb_core::Runtime>,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     min_lag: u64,
+    retention_ms: i64,
 ) -> anyhow::Result<usize> {
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
@@ -1612,6 +1628,8 @@ async fn run_raft_rs_snapshot_tick(
         };
         let replicas =
             agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let source_node_id = raft_node_label(&replicas, local_status.node_id)
+            .unwrap_or_else(|| local_status.node_id.to_string());
         let mut target_nodes = Vec::new();
         for replica in replicas {
             if !matches!(replica.role.as_str(), "voter" | "learner") {
@@ -1695,6 +1713,26 @@ async fn run_raft_rs_snapshot_tick(
                 "healthy",
             )
             .await?;
+            let now_ms = now_ms_i64();
+            let expires_at_ms = now_ms.checked_add(retention_ms);
+            agentdb_meta::tablet_snapshots::record(
+                meta.pool(),
+                &raft_snapshot_id(tablet_id, transfer.from, transfer.to, transfer.index),
+                tablet_id,
+                &source_node_id,
+                transfer.from.min(i64::MAX as u64) as i64,
+                &node_id,
+                transfer.to.min(i64::MAX as u64) as i64,
+                transfer.index.min(i64::MAX as u64) as i64,
+                transfer.term.min(i64::MAX as u64) as i64,
+                transfer.payload.len().min(i64::MAX as usize) as i64,
+                &agentdb_storage::sha256_hex(&transfer.payload),
+                None,
+                "available",
+                now_ms,
+                expires_at_ms,
+            )
+            .await?;
             compact_through = compact_through.max(transfer.index);
             sent += 1;
         }
@@ -1744,6 +1782,20 @@ async fn update_raft_replica_progress_health(
     agentdb_meta::tablet_replicas::set_health(meta.pool(), tablet_id, node_id, health, now_ms)
         .await?;
     Ok(())
+}
+
+fn raft_snapshot_id(tablet_id: i64, from: u64, to: u64, index: u64) -> String {
+    format!("tablet-{tablet_id}-from-{from}-to-{to}-idx-{index}")
+}
+
+fn raft_node_label(
+    replicas: &[agentdb_meta::tablet_replicas::TabletReplica],
+    raft_node_id: u64,
+) -> Option<String> {
+    replicas.iter().find_map(|replica| {
+        let candidate = agentdb_storage::stable_raft_node_id(&replica.node_id).ok()?;
+        (candidate == raft_node_id).then(|| replica.node_id.clone())
+    })
 }
 
 async fn set_raft_replica_health_by_raft_node_id(
@@ -2814,9 +2866,16 @@ region = "us-west-2"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
-        let sent = run_raft_rs_snapshot_tick(&meta, &registry, runtime, &outbox, 1)
-            .await
-            .unwrap();
+        let sent = run_raft_rs_snapshot_tick(
+            &meta,
+            &registry,
+            runtime,
+            &outbox,
+            1,
+            DEFAULT_RAFT_SNAPSHOT_RETENTION_MS,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(sent, 0);
         let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
