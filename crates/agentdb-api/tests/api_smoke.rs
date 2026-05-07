@@ -19,7 +19,7 @@ use agentdb_api::{
     AppState,
 };
 use agentdb_core::{runtime::FetchRequest, Id, IdKind, Runtime};
-use agentdb_meta::{nodes::Node, tablets::Tablet, MetaStore};
+use agentdb_meta::{nodes::Node, tablet_replicas, tablets::Tablet, MetaStore};
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
     RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
@@ -799,6 +799,46 @@ async fn internal_raft_snapshot_dispatches_to_ingress() {
     assert_eq!(snapshots[0].index, 42);
     assert_eq!(snapshots[0].term, 3);
     assert_eq!(snapshots[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_raft_snapshot_updates_replica_progress() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 1, 1, 100)
+        .await
+        .unwrap();
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_meta(meta.clone())
+        .with_raft_ingress(ingress)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    app.client
+        .post(format!("{}/api/internal/raft/snapshots", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "index": 42,
+            "term": 3,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"snapshot")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let replica = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(replica.node_id, "2");
+    assert_eq!(replica.applied_index, 42);
+    assert_eq!(replica.match_index, 42);
+    assert_eq!(replica.health, "healthy");
 }
 
 #[tokio::test]

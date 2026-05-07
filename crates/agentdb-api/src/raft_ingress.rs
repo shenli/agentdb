@@ -4,7 +4,8 @@ use std::{
 };
 
 use agentdb_storage::{
-    Error as StorageError, RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsWireMessage, Result,
+    Error as StorageError, RaftRsReplicaStatus, RaftRsSharedGroup, RaftRsSnapshotTransfer,
+    RaftRsWireMessage, Result,
 };
 
 use crate::state::RaftRsIngress;
@@ -66,6 +67,10 @@ impl RaftRsGroupRegistry {
             .iter()
             .map(|(tablet_id, group)| (*tablet_id, group.clone()))
             .collect()
+    }
+
+    pub fn status_for(&self, tablet_id: i64) -> Result<Vec<RaftRsReplicaStatus>> {
+        Ok(self.group_for(tablet_id)?.status())
     }
 
     fn group_for(&self, tablet_id: i64) -> Result<RaftRsSharedGroup> {
