@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 
-use crate::{nodes, tablets, MetaResult};
+use crate::{nodes, tablet_replicas, tablets, MetaResult};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RebalanceRequest {
@@ -122,6 +122,31 @@ pub async fn run(
 
     for tablet in tablets
         .iter()
+        .filter(|tablet| tablet.owner_node_id.is_some() && tablet.handoff_target_node_id.is_some())
+    {
+        if actions.len() >= request.max_movements {
+            break;
+        }
+        let step = complete_ready_replacement_intent(pool, tablet, request.dry_run, now_ms).await?;
+        if let Some(skipped_action) = step.skipped {
+            skipped.push(skipped_action);
+        }
+        let Some(action) = step.action else {
+            continue;
+        };
+        if action.changed {
+            if let Some((source, target)) = &step.ownership_move {
+                if let Some(count) = counts_after.get_mut(source) {
+                    *count = count.saturating_sub(1);
+                }
+                *counts_after.entry(target.clone()).or_insert(0) += 1;
+            }
+        }
+        actions.push(action);
+    }
+
+    for tablet in tablets
+        .iter()
         .filter(|tablet| tablet.owner_node_id.is_none())
     {
         if actions.len() >= request.max_movements {
@@ -133,7 +158,21 @@ pub async fn run(
         let changed = if request.dry_run {
             true
         } else {
-            tablets::assign_to(pool, tablet.tablet_id, &target).await?
+            let assigned = tablets::assign_to(pool, tablet.tablet_id, &target).await?;
+            if assigned {
+                tablet_replicas::upsert(
+                    pool,
+                    tablet.tablet_id,
+                    &target,
+                    "voter",
+                    "healthy",
+                    0,
+                    0,
+                    now_ms,
+                )
+                .await?;
+            }
+            assigned
         };
         if changed {
             *counts_after.entry(target.clone()).or_insert(0) += 1;
@@ -165,16 +204,20 @@ pub async fn run(
         if source.as_deref() == Some(target.as_str()) {
             continue;
         }
-        let changed = if request.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(pool, tablet.tablet_id, &target).await?
-        };
+        let changed = prepare_replacement_intent(
+            pool,
+            tablet.tablet_id,
+            source.as_deref(),
+            &target,
+            request.dry_run,
+            now_ms,
+        )
+        .await?;
         if changed {
             *counts_after.entry(target.clone()).or_insert(0) += 1;
         }
         actions.push(RebalanceAction {
-            action: "handoff",
+            action: "prepare_replacement",
             tablet_id: tablet.tablet_id,
             source_node_id: source,
             target_node_id: Some(target),
@@ -212,17 +255,21 @@ pub async fn run(
             break;
         };
         let tablet = balance_candidates.remove(candidate_index);
-        let changed = if request.dry_run {
-            true
-        } else {
-            tablets::mark_for_handoff(pool, tablet.tablet_id, &target).await?
-        };
+        let changed = prepare_replacement_intent(
+            pool,
+            tablet.tablet_id,
+            Some(&source),
+            &target,
+            request.dry_run,
+            now_ms,
+        )
+        .await?;
         if changed {
             *counts_after.entry(source.clone()).or_insert(0) -= 1;
             *counts_after.entry(target.clone()).or_insert(0) += 1;
         }
         actions.push(RebalanceAction {
-            action: "handoff",
+            action: "prepare_replacement",
             tablet_id: tablet.tablet_id,
             source_node_id: Some(source),
             target_node_id: Some(target),
@@ -258,6 +305,186 @@ pub async fn run(
         actions,
         skipped,
     })
+}
+
+struct RebalanceStep {
+    action: Option<RebalanceAction>,
+    skipped: Option<RebalanceAction>,
+    ownership_move: Option<(String, String)>,
+}
+
+async fn complete_ready_replacement_intent(
+    pool: &AnyPool,
+    tablet: &tablets::Tablet,
+    dry_run: bool,
+    now_ms: i64,
+) -> MetaResult<RebalanceStep> {
+    let Some(source_node_id) = tablet.owner_node_id.as_ref() else {
+        return Ok(RebalanceStep {
+            action: None,
+            skipped: None,
+            ownership_move: None,
+        });
+    };
+    let Some(target_node_id) = tablet.handoff_target_node_id.as_ref() else {
+        return Ok(RebalanceStep {
+            action: None,
+            skipped: None,
+            ownership_move: None,
+        });
+    };
+    let replicas = tablet_replicas::list_by_tablet(pool, tablet.tablet_id).await?;
+    let source_replica = replicas
+        .iter()
+        .find(|replica| replica.node_id == *source_node_id);
+    let Some(target_replica) = replicas
+        .iter()
+        .find(|replica| replica.node_id == *target_node_id)
+    else {
+        return Ok(RebalanceStep {
+            action: None,
+            skipped: Some(RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: tablet.tablet_id,
+                source_node_id: Some(source_node_id.clone()),
+                target_node_id: Some(target_node_id.clone()),
+                changed: false,
+                reason: "target_replica_missing",
+            }),
+            ownership_move: None,
+        });
+    };
+    let required_applied_index = source_replica
+        .map(|replica| replica.applied_index)
+        .unwrap_or(target_replica.applied_index);
+    if target_replica.health != "healthy" {
+        return Ok(RebalanceStep {
+            action: None,
+            skipped: Some(RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: tablet.tablet_id,
+                source_node_id: Some(source_node_id.clone()),
+                target_node_id: Some(target_node_id.clone()),
+                changed: false,
+                reason: "target_not_healthy",
+            }),
+            ownership_move: None,
+        });
+    }
+    if target_replica.applied_index < required_applied_index {
+        return Ok(RebalanceStep {
+            action: None,
+            skipped: Some(RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: tablet.tablet_id,
+                source_node_id: Some(source_node_id.clone()),
+                target_node_id: Some(target_node_id.clone()),
+                changed: false,
+                reason: "target_lagging",
+            }),
+            ownership_move: None,
+        });
+    }
+    let changed = if dry_run {
+        true
+    } else {
+        tablet_replicas::upsert(
+            pool,
+            tablet.tablet_id,
+            target_node_id,
+            "voter",
+            &target_replica.health,
+            target_replica.applied_index,
+            target_replica.match_index,
+            now_ms,
+        )
+        .await?;
+        tablets::complete_handoff(pool, tablet.tablet_id, source_node_id)
+            .await?
+            .is_some()
+    };
+    Ok(RebalanceStep {
+        action: Some(RebalanceAction {
+            action: "complete_replacement",
+            tablet_id: tablet.tablet_id,
+            source_node_id: Some(source_node_id.clone()),
+            target_node_id: Some(target_node_id.clone()),
+            changed,
+            reason: "target_caught_up",
+        }),
+        skipped: None,
+        ownership_move: changed.then(|| (source_node_id.clone(), target_node_id.clone())),
+    })
+}
+
+async fn prepare_replacement_intent(
+    pool: &AnyPool,
+    tablet_id: i64,
+    source_node_id: Option<&str>,
+    target_node_id: &str,
+    dry_run: bool,
+    now_ms: i64,
+) -> MetaResult<bool> {
+    if dry_run {
+        return Ok(true);
+    }
+    let replicas = tablet_replicas::list_by_tablet(pool, tablet_id).await?;
+    let source_replica =
+        source_node_id.and_then(|source| replicas.iter().find(|replica| replica.node_id == source));
+    let mut changed = false;
+    if let Some(source_node_id) = source_node_id {
+        if source_replica
+            .map(|replica| replica.role != "voter")
+            .unwrap_or(true)
+        {
+            tablet_replicas::upsert(
+                pool,
+                tablet_id,
+                source_node_id,
+                "voter",
+                source_replica
+                    .map(|replica| replica.health.as_str())
+                    .unwrap_or("healthy"),
+                source_replica
+                    .map(|replica| replica.applied_index)
+                    .unwrap_or(0),
+                source_replica
+                    .map(|replica| replica.match_index)
+                    .unwrap_or(0),
+                now_ms,
+            )
+            .await?;
+            changed = true;
+        }
+    }
+    let target_replica = replicas
+        .iter()
+        .find(|replica| replica.node_id == target_node_id);
+    if target_replica
+        .map(|replica| replica.role != "learner")
+        .unwrap_or(true)
+    {
+        tablet_replicas::upsert(
+            pool,
+            tablet_id,
+            target_node_id,
+            "learner",
+            target_replica
+                .map(|replica| replica.health.as_str())
+                .unwrap_or("lagging"),
+            target_replica
+                .map(|replica| replica.applied_index)
+                .unwrap_or(0),
+            target_replica
+                .map(|replica| replica.match_index)
+                .unwrap_or(0),
+            now_ms,
+        )
+        .await?;
+        changed = true;
+    }
+    let handoff_changed = tablets::mark_for_handoff(pool, tablet_id, target_node_id).await?;
+    Ok(changed || handoff_changed)
 }
 
 fn owner_counts(tablets: &[tablets::Tablet]) -> HashMap<String, usize> {
@@ -342,8 +569,80 @@ mod tests {
         assert!(report
             .actions
             .iter()
-            .any(|action| action.action == "handoff"
+            .any(|action| action.action == "prepare_replacement"
                 && action.source_node_id.as_deref() == Some("node-c")));
         assert!(report.changed_count() >= 2);
+        let replicas = tablet_replicas::list_by_tablet(&p, 3).await.unwrap();
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-c" && replica.role == "voter"));
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id != "node-c" && replica.role == "learner"));
+        let assigned_replicas = tablet_replicas::list_by_tablet(&p, 4).await.unwrap();
+        assert!(assigned_replicas
+            .iter()
+            .any(|replica| replica.role == "voter" && replica.health == "healthy"));
+    }
+
+    #[tokio::test]
+    async fn completes_ready_replacements_and_skips_lagging_targets() {
+        let p = pool().await;
+        nodes::upsert(&p, "node-a", "a", None, "alive", 1_000, None, None)
+            .await
+            .unwrap();
+        nodes::upsert(&p, "node-b", "b", None, "alive", 1_000, None, None)
+            .await
+            .unwrap();
+        for id in 7..=8 {
+            tablets::get_or_create(&p, id, 100).await.unwrap();
+            tablets::assign_to(&p, id, "node-a").await.unwrap();
+            tablets::mark_for_handoff(&p, id, "node-b").await.unwrap();
+            tablet_replicas::upsert(&p, id, "node-a", "voter", "healthy", 10, 10, 100)
+                .await
+                .unwrap();
+        }
+        tablet_replicas::upsert(&p, 7, "node-b", "learner", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(&p, 8, "node-b", "learner", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+
+        let report = run(
+            &p,
+            RebalanceRequest {
+                dry_run: false,
+                stale_threshold_ms: 15_000,
+                max_movements: 8,
+            },
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.action == "complete_replacement"
+                && action.tablet_id == 7
+                && action.reason == "target_caught_up"
+        }));
+        assert!(report.skipped.iter().any(|action| {
+            action.action == "complete_replacement"
+                && action.tablet_id == 8
+                && action.reason == "target_lagging"
+        }));
+        let completed = tablets::get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(completed.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(completed.handoff_target_node_id, None);
+        let target = tablet_replicas::list_by_tablet(&p, 7)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|replica| replica.node_id == "node-b")
+            .unwrap();
+        assert_eq!(target.role, "voter");
+        let lagging = tablets::get(&p, 8).await.unwrap().unwrap();
+        assert_eq!(lagging.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(lagging.handoff_target_node_id.as_deref(), Some("node-b"));
     }
 }

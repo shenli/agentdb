@@ -964,6 +964,43 @@ async fn admin_raft_status_joins_control_plane_replica_metadata() {
 }
 
 #[tokio::test]
+async fn admin_raft_status_reports_configured_only_replicas() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 17, "node-b", "learner", "lagging", 3, 4, 100)
+        .await
+        .unwrap();
+    let state = AppState::new(Runtime::in_memory()).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["control_plane_enabled"], true);
+    assert_eq!(body["tablet_count"], 1);
+    assert_eq!(body["configured_replica_count"], 1);
+    assert_eq!(body["tablets"][0]["tablet_id"], 17);
+    assert_eq!(body["tablets"][0]["local_group_open"], false);
+    assert_eq!(
+        body["tablets"][0]["configured_replicas"][0]["node_id"],
+        "node-b"
+    );
+    assert_eq!(
+        body["tablets"][0]["configured_replicas"][0]["catch_up_required"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn admin_raft_catch_up_dry_run_reports_snapshot_candidates() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
     tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 2, 2, 100)
@@ -2131,7 +2168,7 @@ async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
         action["action"] == "assign" && action["tablet_id"] == 5 && action["reason"] == "unowned"
     }));
     assert!(dry_run["actions"].as_array().unwrap().iter().any(|action| {
-        action["action"] == "handoff"
+        action["action"] == "prepare_replacement"
             && action["source_node_id"] == "node-c"
             && action["reason"] == "source_draining"
     }));
@@ -2167,6 +2204,26 @@ async fn admin_tablet_rebalance_assigns_unowned_and_moves_load() {
         && (row["owner_node_id"] == "node-a" || row["owner_node_id"] == "node-b")));
     assert!(rows.iter().any(|row| {
         row["handoff_target_node_id"] == "node-a" || row["handoff_target_node_id"] == "node-b"
+    }));
+    let raft: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/raft", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(raft["configured_replica_count"].as_u64().unwrap() >= 2);
+    assert!(raft["tablets"].as_array().unwrap().iter().any(|tablet| {
+        tablet["local_group_open"] == false
+            && tablet["configured_replicas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|replica| replica["role"] == "learner" && replica["catch_up_required"] == true)
     }));
 }
 
