@@ -58,6 +58,9 @@ pub trait GlobalRecordIndex: Send + Sync {
     fn apply(&self, mutation: GlobalIndexMutation) -> Result<()>;
     fn search(&self, query: GlobalIndexQuery) -> Result<GlobalIndexSearchResult>;
     fn watermark(&self, tenant_id: &str) -> Result<u64>;
+    fn reset(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +109,12 @@ struct GlobalIndexEntry {
 }
 
 impl GlobalRecordIndex for InMemoryGlobalRecordIndex {
+    fn reset(&self) -> Result<()> {
+        *self.inner.lock().expect("global record index lock") =
+            InMemoryGlobalRecordIndexState::default();
+        Ok(())
+    }
+
     fn apply(&self, mutation: GlobalIndexMutation) -> Result<()> {
         let mut inner = self.inner.lock().expect("global record index lock");
         let tenant_watermark = inner

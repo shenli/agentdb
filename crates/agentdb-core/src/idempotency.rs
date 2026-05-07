@@ -54,6 +54,18 @@ impl IdempotencyStore {
             g.insert(k, v);
         }
     }
+
+    /// Replace all in-memory idempotency records during runtime rehydration.
+    pub fn replace<I>(&self, records: I)
+    where
+        I: IntoIterator<Item = (String, IdempotencyRecord)>,
+    {
+        let mut g = self.inner.lock().unwrap();
+        g.clear();
+        for (k, v) in records {
+            g.insert(k, v);
+        }
+    }
 }
 
 /// Hash the full append-request shape for idempotency-conflict detection.

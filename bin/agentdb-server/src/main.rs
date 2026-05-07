@@ -32,6 +32,7 @@ const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
+const DEFAULT_RAFT_SNAPSHOT_MIN_LAG: u64 = 1_024;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser, Debug)]
@@ -360,6 +361,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         startup.node_id.clone(),
                         config.data_dir.join("raft-engine"),
                         registry.clone(),
+                        runtime.clone(),
                         config.route_refresh_interval_ms,
                     );
                     spawn_raft_rs_peer_url_refresher(
@@ -378,12 +380,18 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS,
                     )
                     .max(1_000);
+                    let raft_snapshot_min_lag = env_u64(
+                        "AGENTDB_RAFT_SNAPSHOT_MIN_LAG",
+                        DEFAULT_RAFT_SNAPSHOT_MIN_LAG,
+                    )
+                    .max(1);
                     spawn_raft_rs_snapshot_worker(
                         startup.meta.clone(),
                         registry,
                         runtime.clone(),
                         outbox,
                         Duration::from_millis(raft_snapshot_interval_ms),
+                        raft_snapshot_min_lag,
                     );
                 }
                 tracing::info!(
@@ -1377,6 +1385,45 @@ async fn sync_raft_rs_registry(
     })
 }
 
+async fn sync_raft_rs_registry_and_runtime(
+    meta: &agentdb_meta::MetaStore,
+    local_node_id: &str,
+    raft_engine_root: &std::path::Path,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    runtime: Arc<agentdb_core::Runtime>,
+) -> anyhow::Result<RaftRsRegistryBootstrap> {
+    let bootstrap = sync_raft_rs_registry(meta, local_node_id, raft_engine_root, registry).await?;
+    for (tablet_id, log) in &bootstrap.local_logs {
+        let registered = runtime
+            .register_replicated_tablet(
+                *tablet_id,
+                log.clone() as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+            )
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        if registered {
+            tracing::info!(
+                tablet_id,
+                "registered runtime raft tablet after metadata sync"
+            );
+        }
+    }
+    let expected: BTreeSet<_> = bootstrap.tablet_ids.iter().copied().collect();
+    for tablet_id in runtime.registered_tablet_ids() {
+        if !expected.contains(&tablet_id) {
+            if runtime
+                .unregister_replicated_tablet(tablet_id)
+                .map_err(|error| anyhow::anyhow!(error.message))?
+            {
+                tracing::info!(
+                    tablet_id,
+                    "unregistered runtime raft tablet after metadata sync"
+                );
+            }
+        }
+    }
+    Ok(bootstrap)
+}
+
 async fn load_raft_rs_peer_urls(
     meta: &agentdb_meta::MetaStore,
     tablet_ids: impl IntoIterator<Item = i64>,
@@ -1474,13 +1521,14 @@ fn spawn_raft_rs_snapshot_worker(
     runtime: Arc<agentdb_core::Runtime>,
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     interval: Duration,
+    min_lag: u64,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         loop {
             interval.tick().await;
             if let Err(error) =
-                run_raft_rs_snapshot_tick(&meta, &registry, runtime.clone(), &outbox).await
+                run_raft_rs_snapshot_tick(&meta, &registry, runtime.clone(), &outbox, min_lag).await
             {
                 tracing::warn!(?error, "failed to run raft-rs snapshot tick");
             }
@@ -1493,12 +1541,43 @@ async fn run_raft_rs_snapshot_tick(
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     runtime: Arc<agentdb_core::Runtime>,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    min_lag: u64,
 ) -> anyhow::Result<usize> {
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
         let Some(local_status) = group.status().into_iter().next() else {
             continue;
         };
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let mut target_nodes = Vec::new();
+        for replica in replicas {
+            if !matches!(replica.role.as_str(), "voter" | "learner") {
+                continue;
+            }
+            let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
+            if to == local_status.node_id {
+                let _ = agentdb_meta::tablet_replicas::set_progress(
+                    meta.pool(),
+                    tablet_id,
+                    &replica.node_id,
+                    local_status.applied_index.min(i64::MAX as u64) as i64,
+                    local_status.commit_index.min(i64::MAX as u64) as i64,
+                    now_ms_i64(),
+                )
+                .await?;
+                continue;
+            }
+            let peer_applied = replica.applied_index.max(0) as u64;
+            let lag = local_status.applied_index.saturating_sub(peer_applied);
+            if lag < min_lag && replica.health != "lagging" {
+                continue;
+            }
+            target_nodes.push(to);
+        }
+        if target_nodes.is_empty() {
+            continue;
+        }
         let application_snapshot = match runtime.export_tablet_snapshot_payload(tablet_id) {
             Ok(payload) => payload,
             Err(error) => {
@@ -1510,16 +1589,8 @@ async fn run_raft_rs_snapshot_tick(
                 continue;
             }
         };
-        let replicas =
-            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
-        for replica in replicas {
-            if !matches!(replica.role.as_str(), "voter" | "learner") {
-                continue;
-            }
-            let to = agentdb_storage::stable_raft_node_id(&replica.node_id)?;
-            if to == local_status.node_id {
-                continue;
-            }
+        let mut compact_through = 0u64;
+        for to in target_nodes {
             let transfer = group.build_snapshot_transfer(
                 local_status.node_id,
                 to,
@@ -1535,7 +1606,29 @@ async fn run_raft_rs_snapshot_tick(
                 );
                 continue;
             }
+            compact_through = compact_through.max(transfer.index);
             sent += 1;
+        }
+        if compact_through > 0 {
+            match runtime.compact_tablet_log_through(tablet_id, compact_through) {
+                Ok(compacted) if compacted > 0 => {
+                    tracing::debug!(
+                        tablet_id,
+                        compacted,
+                        compact_through,
+                        "compacted runtime tablet log after snapshot send"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        tablet_id,
+                        compact_through,
+                        message = %error.message,
+                        "failed to compact runtime tablet log after snapshot send"
+                    );
+                }
+            }
         }
     }
     Ok(sent)
@@ -1546,6 +1639,7 @@ fn spawn_raft_rs_registry_refresher(
     local_node_id: String,
     raft_engine_root: PathBuf,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    runtime: Arc<agentdb_core::Runtime>,
     refresh_interval_ms: u64,
 ) {
     let refresh_interval_ms = refresh_interval_ms.max(100);
@@ -1558,7 +1652,7 @@ fn spawn_raft_rs_registry_refresher(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                    if let Err(error) = sync_raft_rs_registry_and_runtime(&meta, &local_node_id, &raft_engine_root, registry.clone(), runtime.clone()).await {
                         tracing::warn!(?error, "failed to sync raft-rs registry");
                     }
                 }
@@ -1566,7 +1660,7 @@ fn spawn_raft_rs_registry_refresher(
                     match change {
                         Some(change) => {
                             tracing::debug!(channel = ?change.channel, payload = %change.payload, "raft-rs replica metadata change received");
-                            if let Err(error) = sync_raft_rs_registry(&meta, &local_node_id, &raft_engine_root, registry.clone()).await {
+                            if let Err(error) = sync_raft_rs_registry_and_runtime(&meta, &local_node_id, &raft_engine_root, registry.clone(), runtime.clone()).await {
                                 tracing::warn!(?error, "failed to sync raft-rs registry");
                             }
                         }

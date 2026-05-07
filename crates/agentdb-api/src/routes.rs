@@ -675,7 +675,11 @@ async fn post_internal_raft_snapshot(
             if !application_snapshot_payload.is_empty() {
                 match s
                     .runtime
-                    .install_tablet_snapshot_payload(body.tablet_id, &application_snapshot_payload)
+                    .install_tablet_snapshot_payload_and_rehydrate(
+                        body.tablet_id,
+                        &application_snapshot_payload,
+                    )
+                    .await
                 {
                     Ok(_) => {}
                     Err(err) => {
