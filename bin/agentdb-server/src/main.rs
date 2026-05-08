@@ -3633,6 +3633,40 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_rebalance_membership_change_skips_unregistered_group() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+
+        let changed = apply_scheduler_rebalance_raft_membership_changes(
+            &meta,
+            &registry,
+            &[agentdb_meta::tablet_rebalance::RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: 7,
+                source_node_id: Some("node-b".into()),
+                target_node_id: Some("node-a".into()),
+                changed: true,
+                reason: "target_caught_up",
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(changed, 0);
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        assert!(replicas.iter().any(|replica| replica.node_id == "node-b"));
+        assert!(replicas.iter().any(|replica| replica.node_id == "node-a"));
+    }
+
+    #[tokio::test]
     async fn tablet_movement_tick_completes_ready_destinations() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         tablet_movements::upsert_pending(
