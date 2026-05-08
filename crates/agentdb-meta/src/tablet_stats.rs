@@ -13,7 +13,7 @@ use crate::error::{MetaError, MetaResult};
 
 type TabletStatsRow = (i64, String, i64, i64, i64, i64, i64, i64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabletStats {
     pub tablet_id: i64,
     pub node_id: String,
@@ -25,7 +25,7 @@ pub struct TabletStats {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabletStatsAggregate {
     pub tablet_id: i64,
     pub replica_count: i64,

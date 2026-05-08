@@ -34,6 +34,7 @@ const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS: usize = 4;
+const DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
@@ -571,6 +572,7 @@ struct ClusterWorkerConfig {
     tablet_lifecycle_split_max_storage_bytes: i64,
     tablet_lifecycle_merge_max_storage_bytes: i64,
     tablet_lifecycle_max_actions: usize,
+    tablet_lifecycle_cooldown_ms: i64,
 }
 
 impl ClusterWorkerConfig {
@@ -642,6 +644,11 @@ impl ClusterWorkerConfig {
                 DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS,
             )
             .max(1),
+            tablet_lifecycle_cooldown_ms: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS",
+                DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
+            )
+            .max(0),
         }
     }
 }
@@ -2965,13 +2972,23 @@ async fn run_tablet_lifecycle_policy_tick(
         .into_iter()
         .map(|stats| (stats.tablet_id, stats))
         .collect();
-    let open_movements =
-        agentdb_meta::tablet_movements::list_open(meta.pool(), config.tablet_movement_batch_size)
-            .await?;
+    let recent_movements =
+        agentdb_meta::tablet_movements::list_recent(meta.pool(), None, 1_000).await?;
     let mut busy_tablet_ids = BTreeSet::new();
-    for movement in open_movements {
-        busy_tablet_ids.insert(movement.source_tablet_id);
-        busy_tablet_ids.insert(movement.destination_tablet_id);
+    let mut cooldown_tablet_ids = BTreeSet::new();
+    let cooldown_after_ms = now_ms.saturating_sub(config.tablet_lifecycle_cooldown_ms);
+    for movement in recent_movements {
+        if movement.status == "pending" {
+            busy_tablet_ids.insert(movement.source_tablet_id);
+            busy_tablet_ids.insert(movement.destination_tablet_id);
+        }
+        if config.tablet_lifecycle_cooldown_ms > 0
+            && movement.status == "completed"
+            && movement.updated_at_ms >= cooldown_after_ms
+        {
+            cooldown_tablet_ids.insert(movement.source_tablet_id);
+            cooldown_tablet_ids.insert(movement.destination_tablet_id);
+        }
     }
 
     let tablet_by_id: BTreeMap<_, _> = tablets
@@ -2992,6 +3009,7 @@ async fn run_tablet_lifecycle_policy_tick(
             .iter()
             .filter(|tablet| tablet.state == "serving")
             .filter(|tablet| !busy_tablet_ids.contains(&tablet.tablet_id))
+            .filter(|tablet| !cooldown_tablet_ids.contains(&tablet.tablet_id))
             .cloned()
             .collect();
         split_candidates.sort_by_key(|tablet| tablet.tablet_id);
@@ -3075,6 +3093,8 @@ async fn run_tablet_lifecycle_policy_tick(
                 || left.tablet_id == right.tablet_id
                 || busy_tablet_ids.contains(&left.tablet_id)
                 || busy_tablet_ids.contains(&right.tablet_id)
+                || cooldown_tablet_ids.contains(&left.tablet_id)
+                || cooldown_tablet_ids.contains(&right.tablet_id)
             {
                 continue;
             }
@@ -4040,6 +4060,7 @@ mod tests {
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         }
     }
 
@@ -4416,6 +4437,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4463,6 +4485,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status, None)
             .await
@@ -4511,6 +4534,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4571,6 +4595,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4650,6 +4675,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4835,6 +4861,52 @@ region = "us-west-2"
         assert!(movements
             .iter()
             .all(|movement| movement.movement_type == "merge"));
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_respects_recent_completed_movement_cooldown() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 8, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 99, 8, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 12, 12, 100)
+            .await
+            .unwrap();
+        tablet_stats::upsert(meta.pool(), 8, "node-a", 10, 100, 1_500, 1_600, 12, 200)
+            .await
+            .unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "split:7:8",
+            "split",
+            7,
+            8,
+            "default",
+            0,
+            99,
+            12,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_movements::mark_completed(meta.pool(), "split:7:8", 1_500)
+            .await
+            .unwrap();
+
+        let mut config = lifecycle_config(0, 0);
+        config.tablet_lifecycle_split_max_storage_bytes = 1_000;
+        config.tablet_lifecycle_cooldown_ms = 1_000;
+        let report = run_tablet_lifecycle_policy_tick(&meta, 2_000, &config)
+            .await
+            .unwrap();
+        assert_eq!(report.prepared_split_count, 0);
+
+        config.tablet_lifecycle_cooldown_ms = 100;
+        let report = run_tablet_lifecycle_policy_tick(&meta, 2_000, &config)
+            .await
+            .unwrap();
+        assert_eq!(report.prepared_split_count, 1);
     }
 
     #[tokio::test]

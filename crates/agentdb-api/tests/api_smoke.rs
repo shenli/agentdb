@@ -1852,6 +1852,39 @@ async fn admin_tablets_returns_rows() {
 }
 
 #[tokio::test]
+async fn admin_tablet_stats_returns_rows_and_aggregates() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablet_stats::upsert(meta.pool(), 7, "node-a", 10, 100, 1_000, 1_100, 12, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablet_stats::upsert(meta.pool(), 7, "node-b", 8, 80, 900, 980, 11, 110)
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tablet-stats?tablet_id=7", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["stats"].as_array().unwrap().len(), 2);
+    assert_eq!(body["aggregates"].as_array().unwrap().len(), 1);
+    assert_eq!(body["aggregates"][0]["tablet_id"], 7);
+    assert_eq!(body["aggregates"][0]["replica_count"], 2);
+    assert_eq!(body["aggregates"][0]["storage_bytes"], 1_100);
+    assert_eq!(body["aggregates"][0]["applied_index"], 12);
+}
+
+#[tokio::test]
 async fn admin_tablet_ownership_mutations_round_trip() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();

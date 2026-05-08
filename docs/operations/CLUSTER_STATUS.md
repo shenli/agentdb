@@ -74,6 +74,7 @@ The repository now has cluster-facing visibility endpoints:
 - `GET /api/admin/drain`
 - `GET /api/admin/nodes`
 - `GET /api/admin/tablets`
+- `GET /api/admin/tablet-stats`
 - `GET /api/admin/routing`
 - `GET /api/admin/routing/decision`
 - `GET /api/admin/raft`
@@ -172,6 +173,9 @@ when metadata-backed cluster mode is enabled:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`,
   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`, and
   `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`
+- lifecycle cooldown (`AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`, default 10
+  minutes) so recently completed split/merge rows do not trigger immediate
+  follow-on movement or oscillation
 - tombstoned-tablet replica cleanup so split/merge source Raft groups stop
   being reopened after cutover
 
