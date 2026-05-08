@@ -1109,11 +1109,19 @@ single-session appends or record writes.
    same registry sync path used at startup. After cutover, the scheduler deletes
    replica metadata for tombstoned source tablets; registry sync ignores any
    remaining tombstoned replicas and unregisters local runtime Raft groups. The
-   scheduler also has an opt-in policy pass for preparing lifecycle work:
-   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS` prepares a two-way split for a
-   serving tablet whose contiguous shard span exceeds the threshold, and
-   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS` prepares a merge for adjacent
-   serving tablets whose individual spans are at or below the threshold.
+   scheduler also has an opt-in policy pass for preparing lifecycle work. Each
+   node publishes best-effort `tablet_stats` rows for its local tablet replicas
+   on the heartbeat loop: key count, key bytes, value bytes, total storage
+   bytes, applied index, and update time. The scheduler aggregates those rows by
+   tablet using the max replica-observed values, then uses them with the
+   existing shard-span thresholds. `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`, and
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES` can prepare a two-way
+   split for a serving tablet whose shard span, key count, or storage bytes
+   exceed the configured threshold. `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`,
+   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS`, and
+   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES` can prepare a merge for
+   adjacent serving tablets that are each under the configured limits.
    `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds the number of prepared
    lifecycle groups per scheduler tick. The policy pass only prepares metadata
    and movement rows; existing snapshot copy, catch-up, and cutover checks still
@@ -1163,12 +1171,13 @@ single-session appends or record writes.
 
     Current implementation status: admin surfaces expose tablet placement and
     lifecycle metadata, tenant placement policies, and tablet range-map
-    replacement for operator-controlled split/merge cutovers. Runtime metrics
-    for object-store mirror backlog are exposed through
-    `/api/admin/content-mirror`; live local Raft tablet/replica commit and
-    applied indexes, configured-replica lag, and catch-up-required flags are
-    exposed through `/api/admin/raft`. Retained snapshot age, expiry, size,
-    checksum, source, and target are exposed through
+    replacement for operator-controlled split/merge cutovers. Nodes publish
+    per-tablet key/byte/applied-index stats to the control plane for lifecycle
+    policy decisions. Runtime metrics for object-store mirror backlog are
+    exposed through `/api/admin/content-mirror`; live local Raft
+    tablet/replica commit and applied indexes, configured-replica lag, and
+    catch-up-required flags are exposed through `/api/admin/raft`. Retained
+    snapshot age, expiry, size, checksum, source, and target are exposed through
     `/api/admin/raft/snapshots`. Retained snapshot object deletion is handled
     by the server prune worker when shared object storage is configured, and
     retained object snapshots are consumed by the server restore worker for
@@ -1192,8 +1201,8 @@ single-session appends or record writes.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
 - Do not claim full autonomous production operation until lifecycle policies
-  are driven by real tablet size/write-rate/compaction-debt metrics and
-  failure-injection validation is implemented end to end.
+  also include write-rate/compaction-debt metrics, cooldowns, and
+  failure-injection validation end to end.
 
 ## Open Decisions
 

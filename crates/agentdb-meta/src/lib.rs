@@ -35,6 +35,7 @@ pub mod tablet_ranges;
 pub mod tablet_rebalance;
 pub mod tablet_replicas;
 pub mod tablet_snapshots;
+pub mod tablet_stats;
 pub mod tablets;
 pub mod tenant_policies;
 pub mod tenant_quotas;

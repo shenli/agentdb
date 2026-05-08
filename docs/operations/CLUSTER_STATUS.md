@@ -161,9 +161,16 @@ when metadata-backed cluster mode is enabled:
 - automatic split/merge movement convergence that marks copied movement rows
   completed and publishes the prepared range-map cutover once the whole group
   is ready
-- opt-in tablet lifecycle preparation based on shard-span thresholds:
+- local tablet storage stats publication on the heartbeat loop: key count, key
+  bytes, value bytes, storage bytes, applied index, and update time
+- opt-in tablet lifecycle preparation based on shard-span and tablet-stat
+  thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
-  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`, and
+  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`,
+  `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`,
+  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS`,
+  `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`,
+  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`, and
   `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`
 - tombstoned-tablet replica cleanup so split/merge source Raft groups stop
   being reopened after cutover

@@ -67,6 +67,16 @@ pub struct TabletSnapshotEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletStorageStats {
+    pub tablet_id: i64,
+    pub key_count: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+    pub storage_bytes: u64,
+    pub applied_index: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TabletSnapshotShardFilter {
     pub target_tablet_id: i64,
     pub start_shard: i64,
@@ -150,6 +160,7 @@ pub trait TabletStateMachine: Send + Sync {
     fn commit(&self, command: TabletCommand) -> StorageResult<TabletApplyResult>;
     fn apply_committed(&self) -> StorageResult<usize>;
     fn applied_index(&self) -> u64;
+    fn storage_stats(&self) -> StorageResult<TabletStorageStats>;
 }
 
 pub struct LoggedTabletStateMachine {
@@ -295,6 +306,30 @@ impl LoggedTabletStateMachine {
         }
         self.log.compact(self.tablet_id, up_to_index)
     }
+
+    pub fn storage_stats(&self) -> StorageResult<TabletStorageStats> {
+        self.apply_committed()?;
+        let mut key_count = 0u64;
+        let mut key_bytes = 0u64;
+        let mut value_bytes = 0u64;
+        for item in self.store.scan_prefix(b"")? {
+            let (key, value) = item?;
+            if key.starts_with(RESERVED_KEY_PREFIX) {
+                continue;
+            }
+            key_count = key_count.saturating_add(1);
+            key_bytes = key_bytes.saturating_add(key.len() as u64);
+            value_bytes = value_bytes.saturating_add(value.len() as u64);
+        }
+        Ok(TabletStorageStats {
+            tablet_id: self.tablet_id,
+            key_count,
+            key_bytes,
+            value_bytes,
+            storage_bytes: key_bytes.saturating_add(value_bytes),
+            applied_index: self.applied_index(),
+        })
+    }
 }
 
 impl TabletStateMachine for LoggedTabletStateMachine {
@@ -341,6 +376,10 @@ impl TabletStateMachine for LoggedTabletStateMachine {
             .applied_index
             .lock()
             .expect("tablet applied-index lock poisoned")
+    }
+
+    fn storage_stats(&self) -> StorageResult<TabletStorageStats> {
+        LoggedTabletStateMachine::storage_stats(self)
     }
 }
 
@@ -579,6 +618,36 @@ mod tests {
             machine.store().get(b"record/r1").unwrap().as_deref(),
             Some(&b"v2"[..])
         );
+    }
+
+    #[test]
+    fn storage_stats_reports_user_key_bytes_and_applied_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let machine = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+
+        machine
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![
+                    TabletWriteOp::Put {
+                        key: b"k1".to_vec(),
+                        value: b"value-one".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"k2".to_vec(),
+                        value: b"value-two".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        let stats = machine.storage_stats().unwrap();
+        assert_eq!(stats.tablet_id, 7);
+        assert_eq!(stats.key_count, 2);
+        assert_eq!(stats.key_bytes, 4);
+        assert_eq!(stats.value_bytes, 18);
+        assert_eq!(stats.storage_bytes, 22);
+        assert_eq!(stats.applied_index, 1);
     }
 
     #[test]
