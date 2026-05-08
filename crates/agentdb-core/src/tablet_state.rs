@@ -104,6 +104,9 @@ impl TabletSnapshotShardFilter {
     fn contains_key(&self, key: &[u8], value: &[u8]) -> StorageResult<bool> {
         self.validate()?;
         let placement = classify_snapshot_entry(key, value)?;
+        if placement.routing_key.is_none() {
+            return Ok(true);
+        }
         let shard = stable_shard(
             &placement.tenant_id,
             placement.routing_key.as_deref(),
@@ -753,6 +756,10 @@ mod tests {
             .commit(TabletCommand::WriteBatch {
                 ops: vec![
                     TabletWriteOp::Put {
+                        key: b"record/tenant/tenant-a".to_vec(),
+                        value: b"tenant-global".to_vec(),
+                    },
+                    TabletWriteOp::Put {
                         key: format!("record/session/tenant-a/{session_a}").into_bytes(),
                         value: b"session-a".to_vec(),
                     },
@@ -790,6 +797,7 @@ mod tests {
             vec![
                 format!("event/tenant-a/{session_a}/00000000000000000001"),
                 format!("record/session/tenant-a/{session_a}"),
+                "record/tenant/tenant-a".to_string(),
             ]
         );
     }
