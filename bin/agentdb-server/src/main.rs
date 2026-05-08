@@ -2527,6 +2527,19 @@ async fn run_cluster_scheduler_tick(
                 "scheduler completed ready tablet movement rows"
             );
         }
+        let cutover_count = complete_ready_tablet_movement_cutovers(
+            meta,
+            now_ms,
+            config.tablet_movement_batch_size,
+        )
+        .await?;
+        if cutover_count > 0 {
+            tracing::info!(
+                node_id = %node_id,
+                cutover_count,
+                "scheduler completed ready tablet movement cutovers"
+            );
+        }
     }
     Ok(())
 }
@@ -2746,6 +2759,256 @@ async fn run_tablet_movement_tick(
         }
     }
     Ok(completed)
+}
+
+async fn complete_ready_tablet_movement_cutovers(
+    meta: &agentdb_meta::MetaStore,
+    now_ms: i64,
+    batch_size: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let movements = agentdb_meta::tablet_movements::list_open(meta.pool(), batch_size).await?;
+    let mut split_groups =
+        BTreeMap::<(String, i64), Vec<agentdb_meta::tablet_movements::TabletMovement>>::new();
+    let mut merge_groups =
+        BTreeMap::<(String, i64), Vec<agentdb_meta::tablet_movements::TabletMovement>>::new();
+    for movement in movements {
+        match movement.movement_type.as_str() {
+            "split" => split_groups
+                .entry((
+                    movement.placement_scope_id.clone(),
+                    movement.source_tablet_id,
+                ))
+                .or_default()
+                .push(movement),
+            "merge" => merge_groups
+                .entry((
+                    movement.placement_scope_id.clone(),
+                    movement.destination_tablet_id,
+                ))
+                .or_default()
+                .push(movement),
+            _ => {}
+        }
+    }
+
+    let mut cutovers = 0usize;
+    for ((placement_scope_id, source_tablet_id), _) in split_groups {
+        cutovers +=
+            complete_ready_split_cutover(meta, &placement_scope_id, source_tablet_id, now_ms)
+                .await?;
+    }
+    for ((placement_scope_id, destination_tablet_id), _) in merge_groups {
+        cutovers +=
+            complete_ready_merge_cutover(meta, &placement_scope_id, destination_tablet_id, now_ms)
+                .await?;
+    }
+    Ok(cutovers)
+}
+
+async fn complete_ready_split_cutover(
+    meta: &agentdb_meta::MetaStore,
+    placement_scope_id: &str,
+    source_tablet_id: i64,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let movements = agentdb_meta::tablet_movements::list_open_split_group(
+        meta.pool(),
+        placement_scope_id,
+        source_tablet_id,
+    )
+    .await?;
+    if movements.is_empty()
+        || movements
+            .iter()
+            .any(|movement| movement.status != "completed")
+    {
+        return Ok(0);
+    }
+    let Some(source) = agentdb_meta::tablets::get(meta.pool(), source_tablet_id).await? else {
+        return Ok(0);
+    };
+    if source.state != "splitting" {
+        return Ok(0);
+    }
+    for movement in &movements {
+        if !tablet_movement_destination_ready(meta, movement).await? {
+            return Ok(0);
+        }
+        let Some(destination) =
+            agentdb_meta::tablets::get(meta.pool(), movement.destination_tablet_id).await?
+        else {
+            return Ok(0);
+        };
+        if destination.state != "creating" && destination.state != "serving" {
+            return Ok(0);
+        }
+    }
+
+    let old_ranges = scoped_tablet_ranges(meta, source_tablet_id, placement_scope_id).await?;
+    if old_ranges.is_empty() {
+        return Ok(0);
+    }
+    let old_bounds = range_bounds_from_ranges(&old_ranges);
+    let mut new_ranges: Vec<_> = movements
+        .iter()
+        .map(|movement| agentdb_meta::tablet_ranges::ReplacementRange {
+            start_shard: movement.start_shard,
+            end_shard: movement.end_shard,
+            tablet_id: movement.destination_tablet_id,
+        })
+        .collect();
+    new_ranges.sort_by_key(|range| (range.start_shard, range.end_shard, range.tablet_id));
+    if let Err(error) =
+        agentdb_meta::tablet_ranges::validate_replacement_plan(&old_bounds, &new_ranges)
+    {
+        tracing::debug!(
+            source_tablet_id,
+            placement_scope_id,
+            error = %error,
+            "split movement group is not ready for cutover"
+        );
+        return Ok(0);
+    }
+    let next_epoch = next_range_map_epoch(&old_ranges);
+    agentdb_meta::tablet_ranges::replace_ranges(
+        meta.pool(),
+        placement_scope_id,
+        &old_bounds,
+        &new_ranges,
+        next_epoch,
+        now_ms,
+    )
+    .await?;
+    for movement in &movements {
+        agentdb_meta::tablets::set_state(meta.pool(), movement.destination_tablet_id, "serving")
+            .await?;
+    }
+    agentdb_meta::tablets::set_state(meta.pool(), source_tablet_id, "tombstoned").await?;
+    Ok(1)
+}
+
+async fn complete_ready_merge_cutover(
+    meta: &agentdb_meta::MetaStore,
+    placement_scope_id: &str,
+    destination_tablet_id: i64,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let movements = agentdb_meta::tablet_movements::list_open_merge_group(
+        meta.pool(),
+        placement_scope_id,
+        destination_tablet_id,
+    )
+    .await?;
+    if movements.len() < 2
+        || movements
+            .iter()
+            .any(|movement| movement.status != "completed")
+    {
+        return Ok(0);
+    }
+    let Some(destination) = agentdb_meta::tablets::get(meta.pool(), destination_tablet_id).await?
+    else {
+        return Ok(0);
+    };
+    if destination.state != "creating" && destination.state != "serving" {
+        return Ok(0);
+    }
+    let mut old_ranges = Vec::new();
+    for movement in &movements {
+        if !tablet_movement_destination_ready(meta, movement).await? {
+            return Ok(0);
+        }
+        let Some(source) =
+            agentdb_meta::tablets::get(meta.pool(), movement.source_tablet_id).await?
+        else {
+            return Ok(0);
+        };
+        if source.state != "merging" {
+            return Ok(0);
+        }
+        let source_ranges =
+            scoped_tablet_ranges(meta, movement.source_tablet_id, placement_scope_id).await?;
+        if source_ranges.is_empty() {
+            return Ok(0);
+        }
+        old_ranges.extend(source_ranges);
+    }
+    let old_bounds = range_bounds_from_ranges(&old_ranges);
+    let Some(start_shard) = old_ranges.iter().map(|range| range.start_shard).min() else {
+        return Ok(0);
+    };
+    let end_shard = old_ranges
+        .iter()
+        .map(|range| range.end_shard)
+        .max()
+        .expect("old range start existed above");
+    let new_ranges = vec![agentdb_meta::tablet_ranges::ReplacementRange {
+        start_shard,
+        end_shard,
+        tablet_id: destination_tablet_id,
+    }];
+    if let Err(error) =
+        agentdb_meta::tablet_ranges::validate_replacement_plan(&old_bounds, &new_ranges)
+    {
+        tracing::debug!(
+            destination_tablet_id,
+            placement_scope_id,
+            error = %error,
+            "merge movement group is not ready for cutover"
+        );
+        return Ok(0);
+    }
+    let next_epoch = next_range_map_epoch(&old_ranges);
+    agentdb_meta::tablet_ranges::replace_ranges(
+        meta.pool(),
+        placement_scope_id,
+        &old_bounds,
+        &new_ranges,
+        next_epoch,
+        now_ms,
+    )
+    .await?;
+    agentdb_meta::tablets::set_state(meta.pool(), destination_tablet_id, "serving").await?;
+    for movement in &movements {
+        agentdb_meta::tablets::set_state(meta.pool(), movement.source_tablet_id, "tombstoned")
+            .await?;
+    }
+    Ok(1)
+}
+
+async fn scoped_tablet_ranges(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    placement_scope_id: &str,
+) -> agentdb_meta::MetaResult<Vec<agentdb_meta::tablet_ranges::TabletRange>> {
+    Ok(
+        agentdb_meta::tablet_ranges::list_by_tablet(meta.pool(), tablet_id)
+            .await?
+            .into_iter()
+            .filter(|range| range.placement_scope_id == placement_scope_id)
+            .collect(),
+    )
+}
+
+fn range_bounds_from_ranges(
+    ranges: &[agentdb_meta::tablet_ranges::TabletRange],
+) -> Vec<agentdb_meta::tablet_ranges::RangeBounds> {
+    ranges
+        .iter()
+        .map(|range| agentdb_meta::tablet_ranges::RangeBounds {
+            start_shard: range.start_shard,
+            end_shard: range.end_shard,
+        })
+        .collect()
+}
+
+fn next_range_map_epoch(ranges: &[agentdb_meta::tablet_ranges::TabletRange]) -> i64 {
+    ranges
+        .iter()
+        .map(|range| range.map_epoch)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 async fn run_local_tablet_movement_executor_tick(
@@ -3056,7 +3319,9 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdb_meta::{nodes, tablet_movements, tablet_replicas, tablets, MetaStore};
+    use agentdb_meta::{
+        nodes, tablet_movements, tablet_ranges, tablet_replicas, tablets, MetaStore,
+    };
     use agentdb_storage::ReplicatedLog;
 
     fn base_opts() -> ServeOpts {
@@ -3872,6 +4137,187 @@ region = "us-west-2"
             .unwrap();
         assert_eq!(movement.status, "pending");
         assert_eq!(movement.completed_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn tablet_movement_cutover_completes_ready_split_group() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let scope = agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
+        tablets::create_with_placement(meta.pool(), 7, scope, "splitting", Some("raft/7"), 0, 100)
+            .await
+            .unwrap();
+        tablets::create_with_placement(meta.pool(), 8, scope, "creating", Some("raft/8"), 0, 100)
+            .await
+            .unwrap();
+        tablets::create_with_placement(meta.pool(), 9, scope, "creating", Some("raft/9"), 0, 100)
+            .await
+            .unwrap();
+        tablet_ranges::upsert(meta.pool(), scope, 0, 99, 7, 1, 100)
+            .await
+            .unwrap();
+        for tablet_id in [8, 9] {
+            tablet_replicas::upsert(
+                meta.pool(),
+                tablet_id,
+                "node-a",
+                "voter",
+                "healthy",
+                42,
+                42,
+                150,
+            )
+            .await
+            .unwrap();
+        }
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "split:7:8",
+            "split",
+            7,
+            8,
+            scope,
+            0,
+            49,
+            42,
+            200,
+        )
+        .await
+        .unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "split:7:9",
+            "split",
+            7,
+            9,
+            scope,
+            50,
+            99,
+            42,
+            200,
+        )
+        .await
+        .unwrap();
+        tablet_movements::mark_completed(meta.pool(), "split:7:8", 300)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            complete_ready_tablet_movement_cutovers(&meta, 400, 64)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 7).await.unwrap().unwrap().state,
+            "splitting"
+        );
+
+        tablet_movements::mark_completed(meta.pool(), "split:7:9", 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete_ready_tablet_movement_cutovers(&meta, 600, 64)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 7).await.unwrap().unwrap().state,
+            "tombstoned"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 8).await.unwrap().unwrap().state,
+            "serving"
+        );
+        let ranges = tablet_ranges::list_all(meta.pool()).await.unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].tablet_id, 8);
+        assert_eq!(ranges[0].map_epoch, 2);
+        assert_eq!(ranges[1].tablet_id, 9);
+        assert_eq!(ranges[1].map_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn tablet_movement_cutover_completes_ready_merge_group() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let scope = agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
+        tablets::create_with_placement(meta.pool(), 7, scope, "merging", Some("raft/7"), 0, 100)
+            .await
+            .unwrap();
+        tablets::create_with_placement(meta.pool(), 8, scope, "merging", Some("raft/8"), 0, 100)
+            .await
+            .unwrap();
+        tablets::create_with_placement(meta.pool(), 9, scope, "creating", Some("raft/9"), 0, 100)
+            .await
+            .unwrap();
+        tablet_ranges::upsert(meta.pool(), scope, 0, 49, 7, 3, 100)
+            .await
+            .unwrap();
+        tablet_ranges::upsert(meta.pool(), scope, 50, 99, 8, 3, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 150)
+            .await
+            .unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "merge:7:9",
+            "merge",
+            7,
+            9,
+            scope,
+            0,
+            49,
+            42,
+            200,
+        )
+        .await
+        .unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "merge:8:9",
+            "merge",
+            8,
+            9,
+            scope,
+            50,
+            99,
+            42,
+            200,
+        )
+        .await
+        .unwrap();
+        tablet_movements::mark_completed(meta.pool(), "merge:7:9", 300)
+            .await
+            .unwrap();
+        tablet_movements::mark_completed(meta.pool(), "merge:8:9", 300)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            complete_ready_tablet_movement_cutovers(&meta, 400, 64)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 7).await.unwrap().unwrap().state,
+            "tombstoned"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 8).await.unwrap().unwrap().state,
+            "tombstoned"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 9).await.unwrap().unwrap().state,
+            "serving"
+        );
+        let ranges = tablet_ranges::list_all(meta.pool()).await.unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].tablet_id, 9);
+        assert_eq!(ranges[0].start_shard, 0);
+        assert_eq!(ranges[0].end_shard, 99);
+        assert_eq!(ranges[0].map_epoch, 4);
     }
 
     #[tokio::test]

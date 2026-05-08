@@ -1053,28 +1053,28 @@ single-session appends or record writes.
    to the source applied index. Prepare also writes `tablet_movements` rows,
    giving Raft/state-copy workers an explicit source-to-destination work queue
    with shard range and required applied index. The scheduler leader now scans
-   pending movement rows (`AGENTDB_TABLET_MOVEMENT_BATCH_SIZE`, default `64`)
-   and marks them `completed` after every destination serving replica is healthy
-   and has `applied_index >= required_applied_index`. Complete also marks rows
-   completed as part of the explicit cutover path. Runtime tablet snapshots now
-   have the primitives required by those workers: a source tablet can export a
-   shard-range-filtered snapshot already retargeted to a split child tablet.
-   Routing-key rows such as sessions, events, and append idempotency records
-   are filtered by virtual shard; tenant-global metadata without a routing key
-   is included in every child snapshot so validation data is present wherever a
-   routed session may land. A merge destination can install source snapshots
-   non-destructively so multiple source tablets can be combined. The active
-   copy/replay executor is wired into cluster workers: when a node hosts the
-   destination replica for a pending movement, it either exports a local source
-   snapshot from a healthy caught-up local source, or fetches one from a
-   healthy caught-up remote source replica over the authenticated internal
-   movement snapshot endpoint, installs it into the destination tablet, and
-   updates that node's destination `tablet_replicas` progress and health.
-   `tablet_replicas` changes emit the tablet metadata notification used by
-   cluster workers, so split/merge-created destination replicas are opened as
-   local `raft-rs` runtime groups by the same registry sync path used at
-   startup. The scheduler leader still owns final movement completion once
-   every destination serving replica is ready.
+   movement rows (`AGENTDB_TABLET_MOVEMENT_BATCH_SIZE`, default `64`), marks
+   them `completed` after every destination serving replica is healthy and has
+   `applied_index >= required_applied_index`, and publishes the split/merge
+   range-map cutover once every movement in the prepared lifecycle group is
+   completed. Explicit complete calls still provide operator-controlled cutover
+   and recovery. Runtime tablet snapshots now have the primitives required by
+   those workers: a source tablet can export a shard-range-filtered snapshot
+   already retargeted to a split child tablet. Routing-key rows such as
+   sessions, events, and append idempotency records are filtered by virtual
+   shard; tenant-global metadata without a routing key is included in every
+   child snapshot so validation data is present wherever a routed session may
+   land. A merge destination can install source snapshots non-destructively so
+   multiple source tablets can be combined. The active copy/replay executor is
+   wired into cluster workers: when a node hosts the destination replica for a
+   pending movement, it either exports a local source snapshot from a healthy
+   caught-up local source, or fetches one from a healthy caught-up remote source
+   replica over the authenticated internal movement snapshot endpoint, installs
+   it into the destination tablet, and updates that node's destination
+   `tablet_replicas` progress and health. `tablet_replicas` changes emit the
+   tablet metadata notification used by cluster workers, so split/merge-created
+   destination replicas are opened as local `raft-rs` runtime groups by the
+   same registry sync path used at startup.
 
 9. Add compressed tablet-map ranges.
 
