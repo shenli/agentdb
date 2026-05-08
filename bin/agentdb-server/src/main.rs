@@ -35,6 +35,7 @@ const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
+const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_RAFT_SNAPSHOT_MIN_LAG: u64 = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -143,6 +144,11 @@ struct ServeOpts {
     /// AGENTDB_INTERNAL_AUTH_TOKEN.
     #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN")]
     internal_auth_token: Option<String>,
+
+    /// Previous internal node-to-node API token accepted during rotation. Can
+    /// also be set with AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN.
+    #[arg(long, env = "AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN")]
+    internal_auth_previous_token: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -327,6 +333,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
     if let Some(token) = config.internal_auth_token.clone() {
         state = state.with_internal_auth_token(token);
+        if let Some(previous_token) = config.internal_auth_previous_token.clone() {
+            state = state.with_internal_auth_previous_token(previous_token);
+        }
         if let Some(registry) = raft_registry.clone() {
             state = state.with_raft_registry(registry);
         }
@@ -368,6 +377,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     DEFAULT_RAFT_OUTBOX_INTERVAL_MS,
                 )
                 .max(100);
+                let raft_outbox_max_messages_per_tick = env_usize(
+                    "AGENTDB_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK",
+                    DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK,
+                )
+                .max(1);
                 if let Some(registry) = raft_registry.clone() {
                     refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
                     let raft_snapshot_store = match config.object_store.as_ref() {
@@ -396,6 +410,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         registry.clone(),
                         outbox.clone(),
                         Duration::from_millis(raft_outbox_interval_ms),
+                        raft_outbox_max_messages_per_tick,
                     );
                     let raft_snapshot_interval_ms = env_u64(
                         "AGENTDB_RAFT_SNAPSHOT_INTERVAL_MS",
@@ -459,6 +474,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     tablet_count = bootstrap.tablet_ids.len(),
                     bootstrapped_tablet_count = bootstrap.bootstrapped_tablet_ids.len(),
                     outbox_interval_ms = raft_outbox_interval_ms,
+                    outbox_max_messages_per_tick = raft_outbox_max_messages_per_tick,
                     "bootstrapped raft-rs tablet groups"
                 );
             }
@@ -506,6 +522,7 @@ struct ResolvedServeConfig {
     mongo_username: Option<String>,
     mongo_password: Option<String>,
     internal_auth_token: Option<String>,
+    internal_auth_previous_token: Option<String>,
 }
 
 struct RouteStartup {
@@ -668,7 +685,12 @@ impl ResolvedServeConfig {
             .internal_auth_token
             .or(file.server.internal_auth_token)
             .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        let internal_auth_previous_token = opts
+            .internal_auth_previous_token
+            .or(file.server.internal_auth_previous_token)
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN").ok());
         validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
+        validate_previous_internal_auth_token(&internal_auth_token, &internal_auth_previous_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -702,6 +724,7 @@ impl ResolvedServeConfig {
             mongo_username,
             mongo_password,
             internal_auth_token,
+            internal_auth_previous_token,
         })
     }
 
@@ -746,7 +769,12 @@ impl ResolvedServeConfig {
             .server
             .internal_auth_token
             .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_TOKEN").ok());
+        let internal_auth_previous_token = file
+            .server
+            .internal_auth_previous_token
+            .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN").ok());
         validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
+        validate_previous_internal_auth_token(&internal_auth_token, &internal_auth_previous_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -774,6 +802,7 @@ impl ResolvedServeConfig {
             mongo_username,
             mongo_password,
             internal_auth_token,
+            internal_auth_previous_token,
         })
     }
 }
@@ -802,6 +831,7 @@ struct ServerFileConfig {
     bind: Option<SocketAddr>,
     dev: Option<bool>,
     internal_auth_token: Option<String>,
+    internal_auth_previous_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -881,6 +911,22 @@ fn validate_internal_auth_token(
         ),
         _ => Ok(()),
     }
+}
+
+fn validate_previous_internal_auth_token(
+    current: &Option<String>,
+    previous: &Option<String>,
+) -> anyhow::Result<()> {
+    let Some(previous) = previous.as_deref() else {
+        return Ok(());
+    };
+    if previous.len() < 16 {
+        anyhow::bail!("server.internal_auth_previous_token must be at least 16 characters");
+    }
+    if current.as_deref() == Some(previous) {
+        anyhow::bail!("server.internal_auth_previous_token must differ from current token");
+    }
+    Ok(())
 }
 
 fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
@@ -1706,13 +1752,18 @@ fn spawn_raft_rs_message_outbox_worker(
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     outbox: agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     interval: Duration,
+    max_messages_per_tick: usize,
 ) {
     let interval = interval.max(Duration::from_millis(100));
+    let max_messages_per_tick = max_messages_per_tick.max(1);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(error) = run_raft_rs_message_outbox_tick(&meta, &registry, &outbox).await {
+            if let Err(error) =
+                run_raft_rs_message_outbox_tick(&meta, &registry, &outbox, max_messages_per_tick)
+                    .await
+            {
                 tracing::warn!(?error, "failed to run raft-rs message outbox tick");
             }
         }
@@ -1723,10 +1774,23 @@ async fn run_raft_rs_message_outbox_tick(
     meta: &agentdb_meta::MetaStore,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    max_messages_per_tick: usize,
 ) -> anyhow::Result<usize> {
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
-        match flush_raft_rs_group_messages_with_health(meta, tablet_id, &group, outbox).await {
+        if sent >= max_messages_per_tick {
+            break;
+        }
+        let remaining_budget = max_messages_per_tick - sent;
+        match flush_raft_rs_group_messages_with_health(
+            meta,
+            tablet_id,
+            &group,
+            outbox,
+            remaining_budget,
+        )
+        .await
+        {
             Ok(group_sent) => sent += group_sent,
             Err(error) => {
                 tracing::warn!(tablet_id, ?error, "failed to flush raft-rs group messages");
@@ -1741,10 +1805,15 @@ async fn flush_raft_rs_group_messages_with_health(
     tablet_id: i64,
     group: &agentdb_storage::RaftRsSharedGroup,
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
+    max_messages: usize,
 ) -> anyhow::Result<usize> {
     let messages = group.take_wire_messages();
+    let send_limit = messages.len().min(max_messages.max(1));
+    if messages.len() > send_limit {
+        group.restore_wire_messages(messages[send_limit..].to_vec())?;
+    }
     let mut sent = 0usize;
-    for (index, message) in messages.iter().cloned().enumerate() {
+    for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
                 set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "healthy")
@@ -1754,7 +1823,7 @@ async fn flush_raft_rs_group_messages_with_health(
             Err(error) => {
                 set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "unreachable")
                     .await?;
-                group.restore_wire_messages(messages[index..].to_vec())?;
+                group.restore_wire_messages(messages[index..send_limit].to_vec())?;
                 return Err(anyhow::anyhow!(error));
             }
         }
@@ -3375,6 +3444,7 @@ mod tests {
             mongo_username: None,
             mongo_password: None,
             internal_auth_token: None,
+            internal_auth_previous_token: None,
         }
     }
 
@@ -3646,6 +3716,19 @@ node_id = "node-a"
         assert!(err
             .to_string()
             .contains("server.internal_auth_token must be at least 16 characters"));
+    }
+
+    #[test]
+    fn previous_internal_auth_token_must_be_distinct_for_rotation() {
+        let mut opts = base_opts();
+        opts.internal_auth_token = Some("current-token-123".into());
+        opts.internal_auth_previous_token = Some("current-token-123".into());
+
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("server.internal_auth_previous_token must differ"));
     }
 
     #[test]
@@ -5065,7 +5148,7 @@ region = "us-west-2"
             .unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
 
-        let err = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox)
+        let err = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
             .await
             .unwrap_err();
 

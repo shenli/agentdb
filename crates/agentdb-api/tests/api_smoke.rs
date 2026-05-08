@@ -1241,6 +1241,68 @@ async fn internal_raft_message_dispatches_to_ingress() {
 }
 
 #[tokio::test]
+async fn internal_raft_message_accepts_previous_token_during_rotation() {
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_raft_ingress(ingress.clone())
+        .with_internal_auth_token("current-secret")
+        .with_internal_auth_previous_token("previous-secret");
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .header("X-AgentDB-Internal-Token", "previous-secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(ingress.messages.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn internal_raft_message_rejects_unconfigured_peer_when_meta_is_enabled() {
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 1, 1, 100)
+        .await
+        .unwrap();
+    let ingress = Arc::new(TestRaftIngress::default());
+    let state = AppState::new(Runtime::in_memory())
+        .with_meta(meta)
+        .with_raft_ingress(ingress)
+        .with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .post(format!("{}/api/internal/raft/messages", app.base))
+        .header("X-AgentDB-Internal-Token", "secret")
+        .json(&json!({
+            "tablet_id": 7,
+            "from": 1,
+            "to": 2,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"msg")
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn internal_raft_snapshot_dispatches_to_ingress() {
     let ingress = Arc::new(TestRaftIngress::default());
     let state = AppState::new(Runtime::in_memory())
@@ -1283,6 +1345,9 @@ async fn internal_raft_snapshot_dispatches_to_ingress() {
 #[tokio::test]
 async fn internal_raft_snapshot_updates_replica_progress() {
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "1", "voter", "healthy", 42, 42, 100)
+        .await
+        .unwrap();
     tablet_replicas::upsert(meta.pool(), 7, "2", "learner", "lagging", 1, 1, 100)
         .await
         .unwrap();
@@ -1313,7 +1378,9 @@ async fn internal_raft_snapshot_updates_replica_progress() {
     let replica = tablet_replicas::list_by_tablet(meta.pool(), 7)
         .await
         .unwrap()
-        .remove(0);
+        .into_iter()
+        .find(|replica| replica.node_id == "2")
+        .unwrap();
     assert_eq!(replica.node_id, "2");
     assert_eq!(replica.applied_index, 42);
     assert_eq!(replica.match_index, 42);

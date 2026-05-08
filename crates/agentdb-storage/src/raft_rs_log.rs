@@ -103,6 +103,8 @@ pub struct RaftRsReplicaStatus {
     pub term: u64,
     pub commit_index: u64,
     pub applied_index: u64,
+    pub pending_conf_change: bool,
+    pub outbound_message_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +325,13 @@ impl RaftRsSharedGroup {
             .status()
     }
 
+    pub fn pending_wire_message_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .pending_wire_message_count()
+    }
+
     pub fn mark_unavailable(&self, node_id: u64) -> Result<()> {
         self.inner
             .lock()
@@ -500,6 +509,7 @@ struct RaftRsGroup {
     unavailable_nodes: BTreeSet<u64>,
     messages: VecDeque<Message>,
     wire_messages: VecDeque<RaftRsWireMessage>,
+    pending_conf_change: bool,
 }
 
 impl RaftRsGroup {
@@ -521,6 +531,7 @@ impl RaftRsGroup {
             unavailable_nodes: BTreeSet::new(),
             messages: VecDeque::new(),
             wire_messages: VecDeque::new(),
+            pending_conf_change: false,
         };
         group.drive_until_idle()?;
         Ok(group)
@@ -583,6 +594,10 @@ impl RaftRsGroup {
         self.wire_messages.drain(..).collect()
     }
 
+    fn pending_wire_message_count(&self) -> usize {
+        self.wire_messages.len()
+    }
+
     fn restore_wire_messages(&mut self, messages: Vec<RaftRsWireMessage>) -> Result<()> {
         for message in &messages {
             if message.tablet_id != self.tablet_id {
@@ -638,6 +653,12 @@ impl RaftRsGroup {
         node_id: u64,
         change_type: ConfChangeType,
     ) -> Result<()> {
+        if self.pending_conf_change {
+            return Err(Error::Other(format!(
+                "raft-rs tablet {} already has a pending membership change",
+                self.tablet_id
+            )));
+        }
         if self.node(leader_id)?.raw.status().ss.raft_state != StateRole::Leader {
             self.elect(leader_id)?;
         }
@@ -646,6 +667,7 @@ impl RaftRsGroup {
             .raw
             .propose_conf_change(Vec::new(), cc)
             .map_err(map_raft_error)?;
+        self.pending_conf_change = true;
         self.drive_until_idle()
     }
 
@@ -795,6 +817,8 @@ impl RaftRsGroup {
                     term: status.hs.term,
                     commit_index: status.hs.commit,
                     applied_index: node.last_applied_index,
+                    pending_conf_change: self.pending_conf_change,
+                    outbound_message_count: self.wire_messages.len(),
                 }
             })
             .collect()
@@ -873,10 +897,14 @@ impl RaftRsGroup {
 
         let mut outbound = ready.take_messages();
         outbound.extend(ready.take_persisted_messages());
-        node.apply_committed(ready.take_committed_entries(), tablet_id)?;
+        let mut applied_conf_change =
+            node.apply_committed(ready.take_committed_entries(), tablet_id)?;
         let mut light = node.raw.advance(ready);
         outbound.extend(light.take_messages());
-        node.apply_committed(light.take_committed_entries(), tablet_id)?;
+        applied_conf_change |= node.apply_committed(light.take_committed_entries(), tablet_id)?;
+        if applied_conf_change {
+            self.pending_conf_change = false;
+        }
         self.messages.extend(outbound);
         Ok(true)
     }
@@ -973,12 +1001,14 @@ impl RaftRsNode {
             .map_err(map_raft_engine_error)
     }
 
-    fn apply_committed(&mut self, entries: Vec<Entry>, tablet_id: i64) -> Result<()> {
+    fn apply_committed(&mut self, entries: Vec<Entry>, tablet_id: i64) -> Result<bool> {
+        let mut applied_conf_change = false;
         for entry in entries {
             self.last_applied_index = entry.index;
             if entry.entry_type == EntryType::EntryConfChangeV2 as i32 {
                 let cc = ConfChangeV2::decode(entry.data.as_slice()).map_err(map_prost_error)?;
                 self.raw.apply_conf_change(&cc).map_err(map_raft_error)?;
+                applied_conf_change = true;
                 continue;
             }
             if entry.entry_type == EntryType::EntryNormal as i32 && !entry.data.is_empty() {
@@ -997,7 +1027,7 @@ impl RaftRsNode {
                 });
             }
         }
-        Ok(())
+        Ok(applied_conf_change)
     }
 
     fn compact_engine_entries(&self, up_to_index: u64) -> Result<usize> {
@@ -1469,6 +1499,42 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.command == b"promoted-voter"));
+    }
+
+    #[test]
+    fn raft_rs_membership_changes_are_serialized_until_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            RaftRsNodeConfig {
+                node_id: 1,
+                role: RaftRsNodeRole::Voter,
+                raft_engine_dir: dir.path().join("n1"),
+            },
+            RaftRsNodeConfig {
+                node_id: 2,
+                role: RaftRsNodeRole::Voter,
+                raft_engine_dir: dir.path().join("n2"),
+            },
+            RaftRsNodeConfig {
+                node_id: 3,
+                role: RaftRsNodeRole::Learner,
+                raft_engine_dir: dir.path().join("n3"),
+            },
+        ];
+        let (group, _logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        group.mark_unavailable(2).unwrap();
+        group.mark_unavailable(3).unwrap();
+
+        group.promote_to_voter(1, 3).unwrap();
+        let err = group.remove_node(1, 2).unwrap_err();
+
+        assert!(err.to_string().contains("pending membership change"));
+        assert!(group
+            .status()
+            .iter()
+            .all(|status| status.pending_conf_change));
+        assert!(group.pending_wire_message_count() > 0);
     }
 
     #[test]

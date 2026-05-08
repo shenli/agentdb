@@ -175,6 +175,7 @@ pub struct AppState {
     pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
     pub raft_registry: Option<Arc<RaftRsGroupRegistry>>,
     pub internal_auth_token: Option<Arc<str>>,
+    pub internal_auth_previous_token: Option<Arc<str>>,
     pub drain: DrainState,
     pub scheduler: Option<SchedulerStatus>,
     pub content_mirror: Option<Arc<AsyncMirrorContentBackend>>,
@@ -191,6 +192,7 @@ impl AppState {
             raft_ingress: None,
             raft_registry: None,
             internal_auth_token: None,
+            internal_auth_previous_token: None,
             drain: DrainState::new("single-node"),
             scheduler: None,
             content_mirror: None,
@@ -223,6 +225,11 @@ impl AppState {
 
     pub fn with_internal_auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
         self.internal_auth_token = Some(token.into());
+        self
+    }
+
+    pub fn with_internal_auth_previous_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.internal_auth_previous_token = Some(token.into());
         self
     }
 
