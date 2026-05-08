@@ -106,6 +106,15 @@ scheduler cleanup pass. The explicit `complete-*` commands remain for
 operator-controlled cutover or recovery. Use `--allow-unready` only for
 emergency/manual recovery after separately proving state safety.
 
+Automatic preparation is opt-in. Set
+`AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS` to prepare a two-way split for a
+serving tablet whose contiguous shard span exceeds the threshold. Set
+`AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS` to prepare a merge for adjacent
+serving tablets whose individual spans are at or below the threshold.
+`AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds prepared lifecycle groups per
+scheduler tick. These knobs only enqueue the same movement rows as the manual
+commands; existing copy/catch-up/cutover safety checks still gate completion.
+
 Raft catch-up:
 
 ```bash

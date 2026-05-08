@@ -260,6 +260,11 @@ Each node should have:
 - heartbeat timing
 - rebalance movement cap (`AGENTDB_REBALANCE_MAX_MOVEMENTS`; `0` disables
   automatic movement)
+- tablet lifecycle thresholds:
+  `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
+  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`, and
+  `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`; split/merge preparation is disabled
+  unless the split or merge threshold is set above `0`
 - routing refresh intervals
 - internal Raft RPC token (`server.internal_auth_token` or
   `AGENTDB_INTERNAL_AUTH_TOKEN`)
