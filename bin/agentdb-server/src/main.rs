@@ -33,6 +33,7 @@ const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS: usize = 4;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
@@ -563,6 +564,9 @@ struct ClusterWorkerConfig {
     rebalance_max_movements: usize,
     tablet_movement_batch_size: i64,
     tablet_movement_executor_interval_ms: u64,
+    tablet_lifecycle_split_max_shards: i64,
+    tablet_lifecycle_merge_max_shards: i64,
+    tablet_lifecycle_max_actions: usize,
 }
 
 impl ClusterWorkerConfig {
@@ -605,6 +609,21 @@ impl ClusterWorkerConfig {
                 DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS,
             )
             .max(1_000),
+            tablet_lifecycle_split_max_shards: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS",
+                0,
+            )
+            .max(0),
+            tablet_lifecycle_merge_max_shards: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS",
+                0,
+            )
+            .max(0),
+            tablet_lifecycle_max_actions: env_usize(
+                "AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS",
+                DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS,
+            )
+            .max(1),
         }
     }
 }
@@ -2597,6 +2616,16 @@ async fn run_cluster_scheduler_tick(
         }
     }
     if config.tablet_movement_batch_size > 0 {
+        let lifecycle_report = run_tablet_lifecycle_policy_tick(meta, now_ms, &config).await?;
+        if lifecycle_report.prepared_split_count > 0 || lifecycle_report.prepared_merge_count > 0 {
+            tracing::info!(
+                node_id = %node_id,
+                prepared_split_count = lifecycle_report.prepared_split_count,
+                prepared_merge_count = lifecycle_report.prepared_merge_count,
+                skipped_count = lifecycle_report.skipped_count,
+                "scheduler prepared tablet lifecycle movements"
+            );
+        }
         let completed_count =
             run_tablet_movement_tick(meta, now_ms, config.tablet_movement_batch_size).await?;
         if completed_count > 0 {
@@ -2824,6 +2853,391 @@ fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus
                 .find(|status| status.leader_id != 0)
                 .map(|status| status.leader_id)
         })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TabletLifecyclePolicyReport {
+    prepared_split_count: usize,
+    prepared_merge_count: usize,
+    skipped_count: usize,
+}
+
+async fn run_tablet_lifecycle_policy_tick(
+    meta: &agentdb_meta::MetaStore,
+    now_ms: i64,
+    config: &ClusterWorkerConfig,
+) -> agentdb_meta::MetaResult<TabletLifecyclePolicyReport> {
+    if config.tablet_lifecycle_split_max_shards == 0
+        && config.tablet_lifecycle_merge_max_shards == 0
+    {
+        return Ok(TabletLifecyclePolicyReport::default());
+    }
+
+    let tablets = agentdb_meta::tablets::list_all(meta.pool()).await?;
+    let ranges = agentdb_meta::tablet_ranges::list_all(meta.pool()).await?;
+    let open_movements =
+        agentdb_meta::tablet_movements::list_open(meta.pool(), config.tablet_movement_batch_size)
+            .await?;
+    let mut busy_tablet_ids = BTreeSet::new();
+    for movement in open_movements {
+        busy_tablet_ids.insert(movement.source_tablet_id);
+        busy_tablet_ids.insert(movement.destination_tablet_id);
+    }
+
+    let tablet_by_id: BTreeMap<_, _> = tablets
+        .iter()
+        .map(|tablet| (tablet.tablet_id, tablet.clone()))
+        .collect();
+    let mut next_tablet_id = tablets
+        .iter()
+        .map(|tablet| tablet.tablet_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    let mut report = TabletLifecyclePolicyReport::default();
+
+    if config.tablet_lifecycle_split_max_shards > 0 {
+        let mut split_candidates: Vec<_> = tablets
+            .iter()
+            .filter(|tablet| tablet.state == "serving")
+            .filter(|tablet| !busy_tablet_ids.contains(&tablet.tablet_id))
+            .cloned()
+            .collect();
+        split_candidates.sort_by_key(|tablet| tablet.tablet_id);
+        for tablet in split_candidates {
+            if report.prepared_split_count + report.prepared_merge_count
+                >= config.tablet_lifecycle_max_actions
+            {
+                break;
+            }
+            let scoped_ranges: Vec<_> = ranges
+                .iter()
+                .filter(|range| {
+                    range.tablet_id == tablet.tablet_id
+                        && range.placement_scope_id == tablet.placement_scope_id
+                })
+                .cloned()
+                .collect();
+            let Some((start_shard, end_shard)) = contiguous_range_span(&scoped_ranges) else {
+                report.skipped_count += 1;
+                continue;
+            };
+            let shard_count = shard_count(start_shard, end_shard);
+            if shard_count <= config.tablet_lifecycle_split_max_shards || shard_count < 2 {
+                continue;
+            }
+            if lifecycle_source_applied_index(meta, &[tablet.tablet_id])
+                .await?
+                .is_none()
+            {
+                report.skipped_count += 1;
+                continue;
+            }
+            let left_id = next_tablet_id;
+            let right_id = next_tablet_id.saturating_add(1);
+            next_tablet_id = next_tablet_id.saturating_add(2);
+            let split_at = start_shard + (end_shard - start_shard) / 2;
+            let child_ranges = [
+                agentdb_meta::tablet_ranges::ReplacementRange {
+                    start_shard,
+                    end_shard: split_at,
+                    tablet_id: left_id,
+                },
+                agentdb_meta::tablet_ranges::ReplacementRange {
+                    start_shard: split_at + 1,
+                    end_shard,
+                    tablet_id: right_id,
+                },
+            ];
+            prepare_lifecycle_split(meta, &tablet, &child_ranges, now_ms).await?;
+            busy_tablet_ids.insert(tablet.tablet_id);
+            busy_tablet_ids.insert(left_id);
+            busy_tablet_ids.insert(right_id);
+            report.prepared_split_count += 1;
+        }
+    }
+
+    if config.tablet_lifecycle_merge_max_shards > 0
+        && report.prepared_split_count + report.prepared_merge_count
+            < config.tablet_lifecycle_max_actions
+    {
+        let mut merge_ranges = ranges.clone();
+        merge_ranges.sort_by_key(|range| {
+            (
+                range.placement_scope_id.clone(),
+                range.start_shard,
+                range.end_shard,
+                range.tablet_id,
+            )
+        });
+        for pair in merge_ranges.windows(2) {
+            if report.prepared_split_count + report.prepared_merge_count
+                >= config.tablet_lifecycle_max_actions
+            {
+                break;
+            }
+            let left = &pair[0];
+            let right = &pair[1];
+            if left.placement_scope_id != right.placement_scope_id
+                || left.end_shard + 1 != right.start_shard
+                || left.tablet_id == right.tablet_id
+                || busy_tablet_ids.contains(&left.tablet_id)
+                || busy_tablet_ids.contains(&right.tablet_id)
+            {
+                continue;
+            }
+            if shard_count(left.start_shard, left.end_shard)
+                > config.tablet_lifecycle_merge_max_shards
+                || shard_count(right.start_shard, right.end_shard)
+                    > config.tablet_lifecycle_merge_max_shards
+            {
+                continue;
+            }
+            let Some(left_tablet) = tablet_by_id.get(&left.tablet_id) else {
+                report.skipped_count += 1;
+                continue;
+            };
+            let Some(right_tablet) = tablet_by_id.get(&right.tablet_id) else {
+                report.skipped_count += 1;
+                continue;
+            };
+            if left_tablet.state != "serving"
+                || right_tablet.state != "serving"
+                || left_tablet.placement_scope_id != right_tablet.placement_scope_id
+                || left_tablet.encryption_policy_version != right_tablet.encryption_policy_version
+                || left_tablet.placement_scope_id != left.placement_scope_id
+            {
+                report.skipped_count += 1;
+                continue;
+            }
+            if lifecycle_source_applied_index(meta, &[left.tablet_id, right.tablet_id])
+                .await?
+                .is_none()
+            {
+                report.skipped_count += 1;
+                continue;
+            }
+            let destination_tablet_id = next_tablet_id;
+            next_tablet_id = next_tablet_id.saturating_add(1);
+            prepare_lifecycle_merge(
+                meta,
+                left_tablet,
+                right_tablet,
+                destination_tablet_id,
+                now_ms,
+            )
+            .await?;
+            busy_tablet_ids.insert(left.tablet_id);
+            busy_tablet_ids.insert(right.tablet_id);
+            busy_tablet_ids.insert(destination_tablet_id);
+            report.prepared_merge_count += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+async fn prepare_lifecycle_split(
+    meta: &agentdb_meta::MetaStore,
+    source: &agentdb_meta::tablets::Tablet,
+    child_ranges: &[agentdb_meta::tablet_ranges::ReplacementRange; 2],
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<()> {
+    let required_applied_index = lifecycle_source_applied_index(meta, &[source.tablet_id])
+        .await?
+        .unwrap_or(0);
+    for child in child_ranges {
+        let raft_group_id = format!("raft/{}", child.tablet_id);
+        agentdb_meta::tablets::create_with_placement(
+            meta.pool(),
+            child.tablet_id,
+            &source.placement_scope_id,
+            "creating",
+            Some(&raft_group_id),
+            source.encryption_policy_version,
+            now_ms,
+        )
+        .await?;
+    }
+    seed_lifecycle_destination_replicas(
+        meta,
+        &[source.tablet_id],
+        &child_ranges
+            .iter()
+            .map(|range| range.tablet_id)
+            .collect::<Vec<_>>(),
+        now_ms,
+    )
+    .await?;
+    agentdb_meta::tablets::set_state(meta.pool(), source.tablet_id, "splitting").await?;
+    for child in child_ranges {
+        let movement_id = format!("split:{}:{}", source.tablet_id, child.tablet_id);
+        agentdb_meta::tablet_movements::upsert_pending(
+            meta.pool(),
+            &movement_id,
+            "split",
+            source.tablet_id,
+            child.tablet_id,
+            &source.placement_scope_id,
+            child.start_shard,
+            child.end_shard,
+            required_applied_index,
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn prepare_lifecycle_merge(
+    meta: &agentdb_meta::MetaStore,
+    left: &agentdb_meta::tablets::Tablet,
+    right: &agentdb_meta::tablets::Tablet,
+    destination_tablet_id: i64,
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<()> {
+    let source_ids = [left.tablet_id, right.tablet_id];
+    let required_applied_index = lifecycle_source_applied_index(meta, &source_ids)
+        .await?
+        .unwrap_or(0);
+    let raft_group_id = format!("raft/{destination_tablet_id}");
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        destination_tablet_id,
+        &left.placement_scope_id,
+        "creating",
+        Some(&raft_group_id),
+        left.encryption_policy_version,
+        now_ms,
+    )
+    .await?;
+    seed_lifecycle_destination_replicas(meta, &source_ids, &[destination_tablet_id], now_ms)
+        .await?;
+    for source_id in source_ids {
+        agentdb_meta::tablets::set_state(meta.pool(), source_id, "merging").await?;
+        let ranges = scoped_tablet_ranges(meta, source_id, &left.placement_scope_id).await?;
+        let Some((start_shard, end_shard)) = contiguous_range_span(&ranges) else {
+            return Err(agentdb_meta::MetaError::InvalidInput(format!(
+                "tablet {source_id} ranges are not contiguous for merge"
+            )));
+        };
+        let movement_id = format!("merge:{source_id}:{destination_tablet_id}");
+        agentdb_meta::tablet_movements::upsert_pending(
+            meta.pool(),
+            &movement_id,
+            "merge",
+            source_id,
+            destination_tablet_id,
+            &left.placement_scope_id,
+            start_shard,
+            end_shard,
+            required_applied_index,
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn lifecycle_source_applied_index(
+    meta: &agentdb_meta::MetaStore,
+    source_tablet_ids: &[i64],
+) -> agentdb_meta::MetaResult<Option<i64>> {
+    let mut max_index = 0;
+    let mut found = false;
+    for tablet_id in source_tablet_ids {
+        for replica in
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), *tablet_id).await?
+        {
+            if replica.role == "log_only" {
+                continue;
+            }
+            found = true;
+            max_index = max_index.max(replica.applied_index);
+        }
+    }
+    Ok(found.then_some(max_index))
+}
+
+async fn seed_lifecycle_destination_replicas(
+    meta: &agentdb_meta::MetaStore,
+    source_tablet_ids: &[i64],
+    destination_tablet_ids: &[i64],
+    now_ms: i64,
+) -> agentdb_meta::MetaResult<()> {
+    let mut by_node = BTreeMap::<String, (String, i64, i64, i64)>::new();
+    for source_id in source_tablet_ids {
+        for replica in
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), *source_id).await?
+        {
+            let priority = lifecycle_replica_role_priority(&replica.role);
+            if priority == 0 {
+                continue;
+            }
+            by_node
+                .entry(replica.node_id)
+                .and_modify(|existing| {
+                    if priority > existing.1 {
+                        existing.0 = replica.role.clone();
+                        existing.1 = priority;
+                    }
+                    existing.2 = existing.2.max(replica.applied_index);
+                    existing.3 = existing.3.max(replica.match_index);
+                })
+                .or_insert((
+                    replica.role,
+                    priority,
+                    replica.applied_index,
+                    replica.match_index,
+                ));
+        }
+    }
+    for destination_id in destination_tablet_ids {
+        for (node_id, (role, _, applied_index, match_index)) in &by_node {
+            agentdb_meta::tablet_replicas::upsert(
+                meta.pool(),
+                *destination_id,
+                node_id,
+                role,
+                "lagging",
+                *applied_index,
+                *match_index,
+                now_ms,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_replica_role_priority(role: &str) -> i64 {
+    match role {
+        "voter" => 3,
+        "learner" => 2,
+        "log_only" => 1,
+        _ => 0,
+    }
+}
+
+fn contiguous_range_span(
+    ranges: &[agentdb_meta::tablet_ranges::TabletRange],
+) -> Option<(i64, i64)> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| (range.start_shard, range.end_shard));
+    for pair in sorted.windows(2) {
+        if pair[0].end_shard + 1 != pair[1].start_shard {
+            return None;
+        }
+    }
+    Some((sorted[0].start_shard, sorted[sorted.len() - 1].end_shard))
+}
+
+fn shard_count(start_shard: i64, end_shard: i64) -> i64 {
+    end_shard.saturating_sub(start_shard).saturating_add(1)
 }
 
 async fn run_tablet_movement_tick(
@@ -3448,6 +3862,23 @@ mod tests {
         }
     }
 
+    fn lifecycle_config(split_max_shards: i64, merge_max_shards: i64) -> ClusterWorkerConfig {
+        ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 0,
+            tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: split_max_shards,
+            tablet_lifecycle_merge_max_shards: merge_max_shards,
+            tablet_lifecycle_max_actions: 4,
+        }
+    }
+
     #[test]
     fn default_single_node_config_matches_public_quickstarts() {
         let config = ResolvedServeConfig::from_serve_opts(base_opts()).unwrap();
@@ -3814,6 +4245,9 @@ region = "us-west-2"
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -3854,6 +4288,9 @@ region = "us-west-2"
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status, None)
             .await
@@ -3895,6 +4332,9 @@ region = "us-west-2"
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -3948,6 +4388,9 @@ region = "us-west-2"
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4020,6 +4463,9 @@ region = "us-west-2"
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
@@ -4035,6 +4481,106 @@ region = "us-west-2"
             .iter()
             .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_prepares_oversized_range_split() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
+            .await
+            .unwrap();
+
+        let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &lifecycle_config(50, 0))
+            .await
+            .unwrap();
+
+        assert_eq!(report.prepared_split_count, 1);
+        assert_eq!(report.prepared_merge_count, 0);
+        assert_eq!(
+            tablets::get(meta.pool(), 7).await.unwrap().unwrap().state,
+            "splitting"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 8).await.unwrap().unwrap().state,
+            "creating"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 9).await.unwrap().unwrap().state,
+            "creating"
+        );
+        let movements = tablet_movements::list_pending(meta.pool(), 10)
+            .await
+            .unwrap();
+        assert_eq!(movements.len(), 2);
+        assert!(movements.iter().any(|movement| {
+            movement.movement_id == "split:7:8"
+                && movement.start_shard == 0
+                && movement.end_shard == 49
+                && movement.required_applied_index == 12
+        }));
+        assert!(movements.iter().any(|movement| {
+            movement.movement_id == "split:7:9"
+                && movement.start_shard == 50
+                && movement.end_shard == 99
+                && movement.required_applied_index == 12
+        }));
+        let destination_replicas = tablet_replicas::list_by_tablet(meta.pool(), 8)
+            .await
+            .unwrap();
+        assert!(destination_replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-a" && replica.health == "lagging"));
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_prepares_adjacent_small_range_merge() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::get_or_create(meta.pool(), 8, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 9, 7, 1, 100)
+            .await
+            .unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 10, 19, 8, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+
+        let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &lifecycle_config(0, 10))
+            .await
+            .unwrap();
+
+        assert_eq!(report.prepared_split_count, 0);
+        assert_eq!(report.prepared_merge_count, 1);
+        assert_eq!(
+            tablets::get(meta.pool(), 7).await.unwrap().unwrap().state,
+            "merging"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 8).await.unwrap().unwrap().state,
+            "merging"
+        );
+        assert_eq!(
+            tablets::get(meta.pool(), 9).await.unwrap().unwrap().state,
+            "creating"
+        );
+        let movements = tablet_movements::list_pending(meta.pool(), 10)
+            .await
+            .unwrap();
+        assert_eq!(movements.len(), 2);
+        assert!(movements.iter().all(|movement| {
+            movement.movement_type == "merge"
+                && movement.destination_tablet_id == 9
+                && movement.required_applied_index == 9
+        }));
     }
 
     #[tokio::test]

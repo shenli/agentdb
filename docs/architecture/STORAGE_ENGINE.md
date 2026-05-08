@@ -1108,7 +1108,16 @@ single-session appends or record writes.
    destination replicas are opened as local `raft-rs` runtime groups by the
    same registry sync path used at startup. After cutover, the scheduler deletes
    replica metadata for tombstoned source tablets; registry sync ignores any
-   remaining tombstoned replicas and unregisters local runtime Raft groups.
+   remaining tombstoned replicas and unregisters local runtime Raft groups. The
+   scheduler also has an opt-in policy pass for preparing lifecycle work:
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS` prepares a two-way split for a
+   serving tablet whose contiguous shard span exceeds the threshold, and
+   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS` prepares a merge for adjacent
+   serving tablets whose individual spans are at or below the threshold.
+   `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds the number of prepared
+   lifecycle groups per scheduler tick. The policy pass only prepares metadata
+   and movement rows; existing snapshot copy, catch-up, and cutover checks still
+   decide when the range map can change.
 
 9. Add compressed tablet-map ranges.
 
@@ -1182,9 +1191,9 @@ single-session appends or record writes.
   concepts.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
-- Do not claim full autonomous production operation until policy-driven
-  split/merge scheduling, compaction-debt automation, and failure-injection
-  validation are implemented end to end.
+- Do not claim full autonomous production operation until lifecycle policies
+  are driven by real tablet size/write-rate/compaction-debt metrics and
+  failure-injection validation is implemented end to end.
 
 ## Open Decisions
 
