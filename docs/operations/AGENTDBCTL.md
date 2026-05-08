@@ -88,11 +88,14 @@ intent, and enqueues `tablet_movements` state-copy work. Complete publishes the
 range-map cutover and lifecycle states after destination replicas are healthy
 and caught up to the source applied index, then marks movements completed. The
 local tablet movement executor copies state for pending rows when this node
-hosts a destination replica; it uses a local source replica when available and
-otherwise fetches the filtered source snapshot from a remote source replica over
-the internal authenticated movement endpoint. The scheduler leader also scans
-pending movement rows and auto-completes them once all destination serving
-replicas report healthy and caught up, so operators can use
+hosts a destination replica; it uses a healthy caught-up local source replica
+when available and otherwise fetches the filtered source snapshot from a
+healthy caught-up remote source replica over the internal authenticated movement
+endpoint. Tablet replica metadata changes notify cluster workers, so new
+split/merge destination replicas are opened as local Raft runtime groups by the
+registry sync loop. The scheduler leader also scans pending movement rows and
+auto-completes them once all destination serving replicas report healthy and
+caught up, so operators can use
 `agentdbctl tablets movements --status pending` as the open-work view. Use
 `--allow-unready` only for emergency/manual recovery after separately proving
 state safety.

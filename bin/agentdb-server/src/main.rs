@@ -2542,14 +2542,23 @@ async fn run_local_tablet_movement_executor_tick(
             continue;
         }
         let source_is_local = registered_tablets.contains(&movement.source_tablet_id)
-            && local_serving_replica(meta, movement.source_tablet_id, node_id)
-                .await?
-                .is_some();
+            && local_source_replica_ready(
+                meta,
+                movement.source_tablet_id,
+                node_id,
+                movement.required_applied_index,
+            )
+            .await?;
         if !source_is_local
             && (movement_snapshot_client.is_none()
-                || source_replica_url(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .is_none())
+                || source_replica_url(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
+                .is_none())
         {
             continue;
         }
@@ -2602,9 +2611,13 @@ async fn run_local_tablet_movement_executor_tick(
                 continue;
             };
             let payload = if registered_tablets.contains(&movement.source_tablet_id)
-                && local_serving_replica(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .is_some()
+                && local_source_replica_ready(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
             {
                 runtime
                     .export_tablet_snapshot_payload_for_shard_range(
@@ -2618,14 +2631,19 @@ async fn run_local_tablet_movement_executor_tick(
             } else {
                 let client = movement_snapshot_client
                     .ok_or_else(|| anyhow::anyhow!("tablet movement snapshot client is missing"))?;
-                let base_url = source_replica_url(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no remote source replica URL for tablet {}",
-                            movement.source_tablet_id
-                        )
-                    })?;
+                let base_url = source_replica_url(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no healthy caught-up remote source replica URL for tablet {}",
+                        movement.source_tablet_id
+                    )
+                })?;
                 client
                     .export_tablet_movement_snapshot(
                         &base_url,
@@ -2710,13 +2728,30 @@ async fn local_serving_replica(
     )
 }
 
+async fn local_source_replica_ready(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    node_id: &str,
+    required_applied_index: i64,
+) -> agentdb_meta::MetaResult<bool> {
+    Ok(local_serving_replica(meta, tablet_id, node_id)
+        .await?
+        .is_some_and(|replica| {
+            replica.health == "healthy" && replica.applied_index >= required_applied_index
+        }))
+}
+
 async fn source_replica_url(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     local_node_id: &str,
+    required_applied_index: i64,
 ) -> anyhow::Result<Option<String>> {
     for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
         if replica.node_id == local_node_id || replica.role == "log_only" {
+            continue;
+        }
+        if replica.health != "healthy" || replica.applied_index < required_applied_index {
             continue;
         }
         let Some(node) = agentdb_meta::nodes::get(meta.pool(), &replica.node_id).await? else {
@@ -3572,6 +3607,52 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn tablet_movement_source_selection_requires_healthy_caught_up_replica() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-c",
+            "http://127.0.0.1:18082",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+
+        assert!(!local_source_replica_ready(&meta, 7, "node-a", 10)
+            .await
+            .unwrap());
+        assert_eq!(
+            source_replica_url(&meta, 7, "node-a", 10).await.unwrap(),
+            Some("http://127.0.0.1:18082".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn raft_rs_node_configs_load_from_control_plane_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3715,6 +3796,61 @@ region = "us-west-2"
 
         assert!(bootstrap.tablet_ids.is_empty());
         assert!(registry.tablet_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_sync_bootstraps_split_destination_runtime_tablet() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
+            Arc::new(agentdb_storage::RocksKvStore::open(dir.path().join("runtime")).unwrap());
+        let raft_engine_root = dir.path().join("raft-engine");
+        let runtime = agentdb_core::Runtime::with_kv_and_replicated_logs(
+            kv.clone(),
+            Arc::new(agentdb_storage::InMemoryContentBackend::default()),
+            BTreeMap::from([(
+                agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
+                Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv))
+                    as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+            )]),
+        );
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        sync_raft_rs_registry_and_runtime(
+            &meta,
+            "node-a",
+            &raft_engine_root,
+            registry.clone(),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.registered_tablet_ids().contains(&7));
+
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 200)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 200)
+            .await
+            .unwrap();
+        let bootstrap = sync_raft_rs_registry_and_runtime(
+            &meta,
+            "node-a",
+            &raft_engine_root,
+            registry.clone(),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bootstrap.bootstrapped_tablet_ids, vec![8]);
+        assert!(registry.tablet_ids().contains(&8));
+        assert!(runtime.registered_tablet_ids().contains(&8));
     }
 
     #[tokio::test]

@@ -10,13 +10,13 @@
 //! 1. Migrations apply cleanly against a fresh DB.
 //! 2. A re-open is idempotent (no duplicate schema rows).
 //! 3. Core CRUD paths round-trip (admin_tokens, nodes).
-//! 4. LISTEN/NOTIFY: a write to `nodes` fires a
-//!    `agentdb_nodes_changed` event on the subscriber.
+//! 4. LISTEN/NOTIFY: writes to `nodes` and tablet replicas fire
+//!    their expected change events.
 
 use std::time::Duration;
 
 use agentdb_meta::change_notifier::{subscribe, Channel};
-use agentdb_meta::{admin_tokens, nodes, session_locators, tenants, MetaStore};
+use agentdb_meta::{admin_tokens, nodes, session_locators, tablet_replicas, tenants, MetaStore};
 
 fn pg_url() -> Option<String> {
     std::env::var("AGENTDB_TEST_PG_URL").ok()
@@ -32,10 +32,12 @@ async fn cleanup_schema(url: &str) {
         "DROP TRIGGER IF EXISTS trg_agentdb_shards_notify ON shards",
         "DROP TRIGGER IF EXISTS trg_agentdb_nodes_notify ON nodes",
         "DROP TRIGGER IF EXISTS trg_agentdb_tablets_notify ON tablets",
+        "DROP TRIGGER IF EXISTS trg_agentdb_tablet_replicas_notify ON tablet_replicas",
         "DROP TRIGGER IF EXISTS trg_agentdb_session_locators_notify ON session_locators",
         "DROP FUNCTION IF EXISTS agentdb_notify_shards()",
         "DROP FUNCTION IF EXISTS agentdb_notify_nodes()",
         "DROP FUNCTION IF EXISTS agentdb_notify_tablets()",
+        "DROP FUNCTION IF EXISTS agentdb_notify_tablet_replicas()",
         "DROP FUNCTION IF EXISTS agentdb_notify_session_locators()",
         "DROP TABLE IF EXISTS tenant_quotas CASCADE",
         "DROP TABLE IF EXISTS admin_audit CASCADE",
@@ -47,6 +49,7 @@ async fn cleanup_schema(url: &str) {
         "DROP TABLE IF EXISTS session_overrides CASCADE",
         "DROP TABLE IF EXISTS shards CASCADE",
         "DROP TABLE IF EXISTS tablet_movements CASCADE",
+        "DROP TABLE IF EXISTS tablet_replicas CASCADE",
         "DROP TABLE IF EXISTS tablets CASCADE",
         "DROP TABLE IF EXISTS tenants CASCADE",
         "DROP TABLE IF EXISTS scheduler_leader CASCADE",
@@ -211,6 +214,39 @@ async fn pg_listen_notify_delivers_a_session_locator_change() {
         .expect("sender closed");
     assert_eq!(evt.channel, Channel::SessionLocators);
     assert_eq!(evt.payload, "pg-session-notify-test");
+
+    cleanup_schema(&url).await;
+}
+
+#[tokio::test]
+async fn pg_listen_notify_delivers_a_tablet_replica_change() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    cleanup_schema(&url).await;
+    let store = MetaStore::open_postgres(&url).await.unwrap();
+    let mut rx = subscribe(&store, &[Channel::Tablets]);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    tablet_replicas::upsert(
+        store.pool(),
+        7,
+        "pg-replica-notify-test",
+        "learner",
+        "lagging",
+        0,
+        0,
+        10,
+    )
+    .await
+    .unwrap();
+
+    let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("no NOTIFY delivered within 3s")
+        .expect("sender closed");
+    assert_eq!(evt.channel, Channel::Tablets);
+    assert_eq!(evt.payload, "7");
 
     cleanup_schema(&url).await;
 }

@@ -133,6 +133,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/019_tablet_movements.sql"),
         include_str!("../migrations/019_tablet_movements.pg.sql"),
     ),
+    (
+        20,
+        "tablet replica change notifications",
+        include_str!("../migrations/020_tablet_replica_notify.sql"),
+        include_str!("../migrations/020_tablet_replica_notify.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
