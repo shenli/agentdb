@@ -150,6 +150,9 @@ when metadata-backed cluster mode is enabled:
   draining owners through cooperative handoff, promote completed replacement
   targets in Raft when possible, retry `draining` source retirement, and even
   out fresh `alive` node load
+- automatic split/merge movement convergence that marks copied movement rows
+  completed and publishes the prepared range-map cutover once the whole group
+  is ready
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.

@@ -113,6 +113,68 @@ pub async fn list_pending(pool: &AnyPool, limit: i64) -> MetaResult<Vec<TabletMo
     list_recent(pool, Some("pending"), limit).await
 }
 
+pub async fn list_open(pool: &AnyPool, limit: i64) -> MetaResult<Vec<TabletMovement>> {
+    let rows: Vec<TabletMovementRow> = sqlx::query_as(
+        "SELECT movement_id, movement_type, source_tablet_id, destination_tablet_id,
+                placement_scope_id, start_shard, end_shard, required_applied_index,
+                status, created_at_ms, updated_at_ms, completed_at_ms
+           FROM tablet_movements
+          WHERE status IN ('pending', 'completed')
+          ORDER BY updated_at_ms DESC, movement_id
+          LIMIT ?",
+    )
+    .bind(limit.clamp(1, 1_000))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(into_movement).collect())
+}
+
+pub async fn list_open_split_group(
+    pool: &AnyPool,
+    placement_scope_id: &str,
+    source_tablet_id: i64,
+) -> MetaResult<Vec<TabletMovement>> {
+    let rows: Vec<TabletMovementRow> = sqlx::query_as(
+        "SELECT movement_id, movement_type, source_tablet_id, destination_tablet_id,
+                placement_scope_id, start_shard, end_shard, required_applied_index,
+                status, created_at_ms, updated_at_ms, completed_at_ms
+           FROM tablet_movements
+          WHERE status IN ('pending', 'completed')
+            AND movement_type = 'split'
+            AND placement_scope_id = ?
+            AND source_tablet_id = ?
+          ORDER BY start_shard, end_shard, destination_tablet_id, movement_id",
+    )
+    .bind(placement_scope_id)
+    .bind(source_tablet_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(into_movement).collect())
+}
+
+pub async fn list_open_merge_group(
+    pool: &AnyPool,
+    placement_scope_id: &str,
+    destination_tablet_id: i64,
+) -> MetaResult<Vec<TabletMovement>> {
+    let rows: Vec<TabletMovementRow> = sqlx::query_as(
+        "SELECT movement_id, movement_type, source_tablet_id, destination_tablet_id,
+                placement_scope_id, start_shard, end_shard, required_applied_index,
+                status, created_at_ms, updated_at_ms, completed_at_ms
+           FROM tablet_movements
+          WHERE status IN ('pending', 'completed')
+            AND movement_type = 'merge'
+            AND placement_scope_id = ?
+            AND destination_tablet_id = ?
+          ORDER BY start_shard, end_shard, source_tablet_id, movement_id",
+    )
+    .bind(placement_scope_id)
+    .bind(destination_tablet_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(into_movement).collect())
+}
+
 pub async fn get(pool: &AnyPool, movement_id: &str) -> MetaResult<Option<TabletMovement>> {
     let row: Option<TabletMovementRow> = sqlx::query_as(
         "SELECT movement_id, movement_type, source_tablet_id, destination_tablet_id,
@@ -277,6 +339,20 @@ mod tests {
         let rows = list_recent(&p, Some("completed"), 10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].completed_at_ms, Some(300));
+
+        let rows = list_open(&p, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].movement_id, "split:7:8");
+        let rows = list_open_split_group(&p, "default", 7).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].movement_id, "split:7:8");
+
+        upsert_pending(&p, "merge:7:9", "merge", 7, 9, "default", 0, 49, 13, 400)
+            .await
+            .unwrap();
+        let rows = list_open_merge_group(&p, "default", 9).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].movement_id, "merge:7:9");
     }
 
     #[tokio::test]
