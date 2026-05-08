@@ -1021,9 +1021,10 @@ single-session appends or record writes.
    replacements once the target replica is healthy and its applied index has
    caught up to the source; when the scheduler node has the local Raft group
    registered, it also proposes the learner-to-voter membership promotion for
-   the completed target. `GET /api/admin/raft` includes configured-only tablets
-   even when the local API node has not opened a Raft group, so replacement
-   learner intent is visible before local runtime bootstrap. Remaining
+   the completed target, removes the old source from Raft, and deletes the
+   retired source replica row. `GET /api/admin/raft` includes configured-only
+   tablets even when the local API node has not opened a Raft group, so
+   replacement learner intent is visible before local runtime bootstrap. Remaining
    production work is tabletizing the runtime state model so every route-owned
    tablet has its own state machine instead of the current primary-tablet
    runtime log.

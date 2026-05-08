@@ -2491,8 +2491,12 @@ async fn run_cluster_scheduler_tick(
         let changed_count = report.changed_count();
         if changed_count > 0 {
             if let Some(registry) = raft_registry {
-                let membership_changes =
-                    apply_scheduler_rebalance_raft_membership_changes(registry, &report.actions);
+                let membership_changes = apply_scheduler_rebalance_raft_membership_changes(
+                    meta,
+                    registry,
+                    &report.actions,
+                )
+                .await?;
                 if membership_changes > 0 {
                     tracing::info!(
                         node_id = %node_id,
@@ -2524,10 +2528,11 @@ async fn run_cluster_scheduler_tick(
     Ok(())
 }
 
-fn apply_scheduler_rebalance_raft_membership_changes(
+async fn apply_scheduler_rebalance_raft_membership_changes(
+    meta: &agentdb_meta::MetaStore,
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     actions: &[agentdb_meta::tablet_rebalance::RebalanceAction],
-) -> usize {
+) -> agentdb_meta::MetaResult<usize> {
     let mut changed = 0usize;
     for action in actions {
         if action.action != "complete_replacement" || !action.changed {
@@ -2566,8 +2571,52 @@ fn apply_scheduler_rebalance_raft_membership_changes(
                 continue;
             }
         };
+        let source_raft_node_id = match action
+            .source_node_id
+            .as_deref()
+            .map(agentdb_storage::stable_raft_node_id)
+            .transpose()
+        {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    source_node_id = action.source_node_id.as_deref(),
+                    error = %error,
+                    "skipping scheduler raft source retirement; source node id is invalid"
+                );
+                None
+            }
+        };
         match registry.promote_to_voter(action.tablet_id, leader_id, target_raft_node_id) {
-            Ok(()) => changed += 1,
+            Ok(()) => {
+                changed += 1;
+                if let Some(source_raft_node_id) = source_raft_node_id {
+                    match registry.remove_node(action.tablet_id, leader_id, source_raft_node_id) {
+                        Ok(()) => {
+                            if let Some(source_node_id) = action.source_node_id.as_deref() {
+                                let deleted = agentdb_meta::tablet_replicas::delete(
+                                    meta.pool(),
+                                    action.tablet_id,
+                                    source_node_id,
+                                )
+                                .await?;
+                                if deleted {
+                                    changed += 1;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                tablet_id = action.tablet_id,
+                                source_node_id = action.source_node_id.as_deref(),
+                                error = %error,
+                                "scheduler failed to retire replacement source from raft"
+                            );
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     tablet_id = action.tablet_id,
@@ -2578,7 +2627,7 @@ fn apply_scheduler_rebalance_raft_membership_changes(
             }
         }
     }
-    changed
+    Ok(changed)
 }
 
 fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
@@ -3525,8 +3574,9 @@ region = "us-west-2"
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
     }
 
-    #[test]
-    fn scheduler_rebalance_membership_change_promotes_completed_target() {
+    #[tokio::test]
+    async fn scheduler_rebalance_membership_change_promotes_target_and_retires_source() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let configs = vec![
             agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
@@ -3550,8 +3600,15 @@ region = "us-west-2"
         group.elect(leader_id).expect("elect source leader");
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
 
         let changed = apply_scheduler_rebalance_raft_membership_changes(
+            &meta,
             &registry,
             &[agentdb_meta::tablet_rebalance::RebalanceAction {
                 action: "complete_replacement",
@@ -3561,9 +3618,18 @@ region = "us-west-2"
                 changed: true,
                 reason: "target_caught_up",
             }],
-        );
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(changed, 1);
+        assert_eq!(changed, 2);
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
     }
 
     #[tokio::test]
