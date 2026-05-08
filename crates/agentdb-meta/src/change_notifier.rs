@@ -1,8 +1,8 @@
 //! Unified change-notification stream across dialects.
 //!
 //! Postgres delivers changes via `LISTEN/NOTIFY` triggers set
-//! up by migrations 009 and 015 on `shards`, `nodes`, `tablets`,
-//! and `session_locators`.
+//! up by migrations 009, 015, and 020 on `shards`, `nodes`,
+//! `tablets`, `tablet_replicas`, and `session_locators`.
 //! SQLite has no such primitive, so the SQLite variant
 //! returns a stream that never yields — consumers fall back
 //! to their existing periodic refresh loops.
@@ -16,7 +16,9 @@
 //! cache to refetch.
 //!
 //! `Channel` is a namespaced string (`shards`, `nodes`,
-//! `tablets`, `session_locators`).
+//! `tablets`, `session_locators`). Tablet replica changes share
+//! the tablets channel because consumers refresh tablet-scoped
+//! placement and Raft metadata together.
 
 use std::time::Duration;
 

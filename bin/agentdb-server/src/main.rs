@@ -348,6 +348,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .internal_auth_token
                 .clone()
                 .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
+            raft_registry.clone(),
             node_address,
             config.route_region.clone(),
             startup.scheduler_status.clone(),
@@ -2278,6 +2279,7 @@ fn spawn_cluster_workers(
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
     movement_snapshot_client: Option<agentdb_api::internal_raft_http::RaftRsHttpClient>,
+    raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
     node_address: String,
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
@@ -2363,8 +2365,15 @@ fn spawn_cluster_workers(
         loop {
             interval.tick().await;
             let now_ms = now_ms_i64();
-            if let Err(error) =
-                run_cluster_scheduler_tick(&meta, &node_id, now_ms, config, &scheduler_status).await
+            if let Err(error) = run_cluster_scheduler_tick(
+                &meta,
+                &node_id,
+                now_ms,
+                config,
+                &scheduler_status,
+                raft_registry.as_deref(),
+            )
+            .await
             {
                 tracing::warn!(node_id = %node_id, error = %error, "cluster scheduler tick failed");
             }
@@ -2399,6 +2408,7 @@ async fn run_cluster_scheduler_tick(
     now_ms: i64,
     config: ClusterWorkerConfig,
     status: &agentdb_api::state::SchedulerStatus,
+    raft_registry: Option<&agentdb_api::raft_ingress::RaftRsGroupRegistry>,
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
@@ -2480,6 +2490,21 @@ async fn run_cluster_scheduler_tick(
         .await?;
         let changed_count = report.changed_count();
         if changed_count > 0 {
+            if let Some(registry) = raft_registry {
+                let membership_changes = apply_scheduler_rebalance_raft_membership_changes(
+                    meta,
+                    registry,
+                    &report.actions,
+                )
+                .await?;
+                if membership_changes > 0 {
+                    tracing::info!(
+                        node_id = %node_id,
+                        membership_changes,
+                        "scheduler proposed raft membership changes for completed replacements"
+                    );
+                }
+            }
             status.add_tablet_reassignments(changed_count as u64);
             tracing::info!(
                 node_id = %node_id,
@@ -2501,6 +2526,121 @@ async fn run_cluster_scheduler_tick(
         }
     }
     Ok(())
+}
+
+async fn apply_scheduler_rebalance_raft_membership_changes(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    actions: &[agentdb_meta::tablet_rebalance::RebalanceAction],
+) -> agentdb_meta::MetaResult<usize> {
+    let mut changed = 0usize;
+    for action in actions {
+        if action.action != "complete_replacement" || !action.changed {
+            continue;
+        }
+        let Some(target_node_id) = action.target_node_id.as_deref() else {
+            continue;
+        };
+        let statuses = match registry.status_for(action.tablet_id) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                tracing::debug!(
+                    tablet_id = action.tablet_id,
+                    error = %error,
+                    "skipping scheduler raft membership change; local group is not registered"
+                );
+                continue;
+            }
+        };
+        let Some(leader_id) = raft_leader_id_from_statuses(&statuses) else {
+            tracing::warn!(
+                tablet_id = action.tablet_id,
+                "skipping scheduler raft membership change; no known leader"
+            );
+            continue;
+        };
+        let target_raft_node_id = match agentdb_storage::stable_raft_node_id(target_node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    target_node_id,
+                    error = %error,
+                    "skipping scheduler raft membership change; target node id is invalid"
+                );
+                continue;
+            }
+        };
+        let source_raft_node_id = match action
+            .source_node_id
+            .as_deref()
+            .map(agentdb_storage::stable_raft_node_id)
+            .transpose()
+        {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    source_node_id = action.source_node_id.as_deref(),
+                    error = %error,
+                    "skipping scheduler raft source retirement; source node id is invalid"
+                );
+                None
+            }
+        };
+        match registry.promote_to_voter(action.tablet_id, leader_id, target_raft_node_id) {
+            Ok(()) => {
+                changed += 1;
+                if let Some(source_raft_node_id) = source_raft_node_id {
+                    match registry.remove_node(action.tablet_id, leader_id, source_raft_node_id) {
+                        Ok(()) => {
+                            if let Some(source_node_id) = action.source_node_id.as_deref() {
+                                let deleted = agentdb_meta::tablet_replicas::delete(
+                                    meta.pool(),
+                                    action.tablet_id,
+                                    source_node_id,
+                                )
+                                .await?;
+                                if deleted {
+                                    changed += 1;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                tablet_id = action.tablet_id,
+                                source_node_id = action.source_node_id.as_deref(),
+                                error = %error,
+                                "scheduler failed to retire replacement source from raft"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    target_node_id,
+                    error = %error,
+                    "scheduler failed to promote replacement target in raft"
+                );
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
+    statuses
+        .iter()
+        .find(|status| status.role == "Leader")
+        .map(|status| status.node_id)
+        .or_else(|| {
+            statuses
+                .iter()
+                .find(|status| status.leader_id != 0)
+                .map(|status| status.leader_id)
+        })
 }
 
 async fn run_tablet_movement_tick(
@@ -2542,14 +2682,23 @@ async fn run_local_tablet_movement_executor_tick(
             continue;
         }
         let source_is_local = registered_tablets.contains(&movement.source_tablet_id)
-            && local_serving_replica(meta, movement.source_tablet_id, node_id)
-                .await?
-                .is_some();
+            && local_source_replica_ready(
+                meta,
+                movement.source_tablet_id,
+                node_id,
+                movement.required_applied_index,
+            )
+            .await?;
         if !source_is_local
             && (movement_snapshot_client.is_none()
-                || source_replica_url(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .is_none())
+                || source_replica_url(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
+                .is_none())
         {
             continue;
         }
@@ -2602,9 +2751,13 @@ async fn run_local_tablet_movement_executor_tick(
                 continue;
             };
             let payload = if registered_tablets.contains(&movement.source_tablet_id)
-                && local_serving_replica(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .is_some()
+                && local_source_replica_ready(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
             {
                 runtime
                     .export_tablet_snapshot_payload_for_shard_range(
@@ -2618,14 +2771,19 @@ async fn run_local_tablet_movement_executor_tick(
             } else {
                 let client = movement_snapshot_client
                     .ok_or_else(|| anyhow::anyhow!("tablet movement snapshot client is missing"))?;
-                let base_url = source_replica_url(meta, movement.source_tablet_id, node_id)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no remote source replica URL for tablet {}",
-                            movement.source_tablet_id
-                        )
-                    })?;
+                let base_url = source_replica_url(
+                    meta,
+                    movement.source_tablet_id,
+                    node_id,
+                    movement.required_applied_index,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no healthy caught-up remote source replica URL for tablet {}",
+                        movement.source_tablet_id
+                    )
+                })?;
                 client
                     .export_tablet_movement_snapshot(
                         &base_url,
@@ -2710,13 +2868,30 @@ async fn local_serving_replica(
     )
 }
 
+async fn local_source_replica_ready(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    node_id: &str,
+    required_applied_index: i64,
+) -> agentdb_meta::MetaResult<bool> {
+    Ok(local_serving_replica(meta, tablet_id, node_id)
+        .await?
+        .is_some_and(|replica| {
+            replica.health == "healthy" && replica.applied_index >= required_applied_index
+        }))
+}
+
 async fn source_replica_url(
     meta: &agentdb_meta::MetaStore,
     tablet_id: i64,
     local_node_id: &str,
+    required_applied_index: i64,
 ) -> anyhow::Result<Option<String>> {
     for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
         if replica.node_id == local_node_id || replica.role == "log_only" {
+            continue;
+        }
+        if replica.health != "healthy" || replica.applied_index < required_applied_index {
             continue;
         }
         let Some(node) = agentdb_meta::nodes::get(meta.pool(), &replica.node_id).await? else {
@@ -3177,7 +3352,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3217,7 +3392,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3258,7 +3433,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3311,7 +3486,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3383,7 +3558,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3397,6 +3572,64 @@ region = "us-west-2"
             .iter()
             .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_rebalance_membership_change_promotes_target_and_retires_source() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "learner",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(7, configs, leader_id)
+            .expect("open local raft group");
+        group.elect(leader_id).expect("elect source leader");
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+
+        let changed = apply_scheduler_rebalance_raft_membership_changes(
+            &meta,
+            &registry,
+            &[agentdb_meta::tablet_rebalance::RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: 7,
+                source_node_id: Some("node-b".into()),
+                target_node_id: Some("node-a".into()),
+                changed: true,
+                reason: "target_caught_up",
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(changed, 2);
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+        assert!(replicas
+            .iter()
+            .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
     }
 
     #[tokio::test]
@@ -3572,6 +3805,52 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn tablet_movement_source_selection_requires_healthy_caught_up_replica() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-c",
+            "http://127.0.0.1:18082",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-c", "voter", "healthy", 10, 10, 100)
+            .await
+            .unwrap();
+
+        assert!(!local_source_replica_ready(&meta, 7, "node-a", 10)
+            .await
+            .unwrap());
+        assert_eq!(
+            source_replica_url(&meta, 7, "node-a", 10).await.unwrap(),
+            Some("http://127.0.0.1:18082".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn raft_rs_node_configs_load_from_control_plane_replicas() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3715,6 +3994,61 @@ region = "us-west-2"
 
         assert!(bootstrap.tablet_ids.is_empty());
         assert!(registry.tablet_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_sync_bootstraps_split_destination_runtime_tablet() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
+            Arc::new(agentdb_storage::RocksKvStore::open(dir.path().join("runtime")).unwrap());
+        let raft_engine_root = dir.path().join("raft-engine");
+        let runtime = agentdb_core::Runtime::with_kv_and_replicated_logs(
+            kv.clone(),
+            Arc::new(agentdb_storage::InMemoryContentBackend::default()),
+            BTreeMap::from([(
+                agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
+                Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv))
+                    as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+            )]),
+        );
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        sync_raft_rs_registry_and_runtime(
+            &meta,
+            "node-a",
+            &raft_engine_root,
+            registry.clone(),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.registered_tablet_ids().contains(&7));
+
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 200)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-b", "voter", "healthy", 0, 0, 200)
+            .await
+            .unwrap();
+        let bootstrap = sync_raft_rs_registry_and_runtime(
+            &meta,
+            "node-a",
+            &raft_engine_root,
+            registry.clone(),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bootstrap.bootstrapped_tablet_ids, vec![8]);
+        assert!(registry.tablet_ids().contains(&8));
+        assert!(runtime.registered_tablet_ids().contains(&8));
     }
 
     #[tokio::test]

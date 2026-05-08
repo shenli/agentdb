@@ -68,9 +68,11 @@ agentdbctl tablets complete-replacement 7 node-b --source-node-id node-a --min-a
 `rebalance` assigns unowned tablets directly. For owned tablets, it prepares a
 replacement intent by marking the target as a learner and handoff destination;
 the next rebalance pass can complete the ownership handoff after the target is
-healthy and caught up. Use `raft catch-up` to accelerate convergence and
-`complete-replacement` when you need explicit operator-controlled promotion or
-source retirement.
+healthy and caught up. When the scheduler node has the local Raft group
+registered, automatic completion also promotes the target to voter, removes the
+source from Raft, and deletes the retired source replica row. Use `raft
+catch-up` to accelerate convergence and `complete-replacement` when you need
+explicit operator-controlled promotion or source retirement.
 
 Split/merge lifecycle:
 
@@ -88,11 +90,14 @@ intent, and enqueues `tablet_movements` state-copy work. Complete publishes the
 range-map cutover and lifecycle states after destination replicas are healthy
 and caught up to the source applied index, then marks movements completed. The
 local tablet movement executor copies state for pending rows when this node
-hosts a destination replica; it uses a local source replica when available and
-otherwise fetches the filtered source snapshot from a remote source replica over
-the internal authenticated movement endpoint. The scheduler leader also scans
-pending movement rows and auto-completes them once all destination serving
-replicas report healthy and caught up, so operators can use
+hosts a destination replica; it uses a healthy caught-up local source replica
+when available and otherwise fetches the filtered source snapshot from a
+healthy caught-up remote source replica over the internal authenticated movement
+endpoint. Tablet replica metadata changes notify cluster workers, so new
+split/merge destination replicas are opened as local Raft runtime groups by the
+registry sync loop. The scheduler leader also scans pending movement rows and
+auto-completes them once all destination serving replicas report healthy and
+caught up, so operators can use
 `agentdbctl tablets movements --status pending` as the open-work view. Use
 `--allow-unready` only for emergency/manual recovery after separately proving
 state safety.
