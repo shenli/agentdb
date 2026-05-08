@@ -1123,9 +1123,14 @@ single-session appends or record writes.
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES` can prepare a merge for
    adjacent serving tablets that are each under the configured limits.
    `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds the number of prepared
-   lifecycle groups per scheduler tick. The policy pass only prepares metadata
-   and movement rows; existing snapshot copy, catch-up, and cutover checks still
-   decide when the range map can change.
+   lifecycle groups per scheduler tick. `AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`
+   suppresses follow-on automatic split/merge work for tablets involved in
+   recently completed movements, which prevents immediate oscillation and fixes
+   the older behavior where completed movement rows could keep destination
+   tablets busy forever. Operators can inspect raw and aggregate stats through
+   `GET /api/admin/tablet-stats` or `agentdbctl tablets stats`. The policy pass
+   only prepares metadata and movement rows; existing snapshot copy, catch-up,
+   and cutover checks still decide when the range map can change.
 
 9. Add compressed tablet-map ranges.
 
@@ -1173,8 +1178,9 @@ single-session appends or record writes.
     lifecycle metadata, tenant placement policies, and tablet range-map
     replacement for operator-controlled split/merge cutovers. Nodes publish
     per-tablet key/byte/applied-index stats to the control plane for lifecycle
-    policy decisions. Runtime metrics for object-store mirror backlog are
-    exposed through `/api/admin/content-mirror`; live local Raft
+    policy decisions, and `GET /api/admin/tablet-stats` exposes raw per-node
+    rows plus aggregate max values. Runtime metrics for object-store mirror
+    backlog are exposed through `/api/admin/content-mirror`; live local Raft
     tablet/replica commit and applied indexes, configured-replica lag, and
     catch-up-required flags are exposed through `/api/admin/raft`. Retained
     snapshot age, expiry, size, checksum, source, and target are exposed through
@@ -1201,8 +1207,8 @@ single-session appends or record writes.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
 - Do not claim full autonomous production operation until lifecycle policies
-  also include write-rate/compaction-debt metrics, cooldowns, and
-  failure-injection validation end to end.
+  also include write-rate/compaction-debt metrics and failure-injection
+  validation end to end.
 
 ## Open Decisions
 

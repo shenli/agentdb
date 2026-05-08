@@ -139,6 +139,7 @@ POST /api/admin/nodes
 DELETE /api/admin/nodes/{node_id}
 POST /api/admin/nodes/{node_id}/maintenance
 GET  /api/admin/tablets
+GET  /api/admin/tablet-stats[?tablet_id={tablet_id}]
 POST /api/admin/tablets/create
 POST /api/admin/tablets/rebalance
 POST /api/admin/tablets/{tablet_id}/assign
@@ -168,6 +169,34 @@ node back to `alive` clears the local drain flag; setting it to `draining` or
 Tablet admin request bodies:
 
 ```json
+GET /api/admin/tablet-stats?tablet_id=7
+{
+  "stats": [
+    {
+      "tablet_id": 7,
+      "node_id": "node-a",
+      "key_count": 1000,
+      "key_bytes": 64000,
+      "value_bytes": 1048576,
+      "storage_bytes": 1112576,
+      "applied_index": 42,
+      "updated_at_ms": 1713900000000
+    }
+  ],
+  "aggregates": [
+    {
+      "tablet_id": 7,
+      "replica_count": 1,
+      "key_count": 1000,
+      "key_bytes": 64000,
+      "value_bytes": 1048576,
+      "storage_bytes": 1112576,
+      "applied_index": 42,
+      "updated_at_ms": 1713900000000
+    }
+  ]
+}
+
 POST /api/admin/tablets/create
 { "tablet_id": 0 }
 

@@ -39,7 +39,7 @@ use agentdb_core::{
 };
 use agentdb_meta::{
     nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance, tablet_replicas,
-    tablet_snapshots, tablets, tenant_policies, tenants,
+    tablet_snapshots, tablet_stats, tablets, tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -115,6 +115,7 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/tablet-movements",
             get(get_admin_tablet_movements),
         )
+        .route("/api/admin/tablet-stats", get(get_admin_tablet_stats))
         .route(
             "/api/admin/tablets/:tablet_id/split/prepare",
             post(prepare_admin_tablet_split),
@@ -472,6 +473,17 @@ struct ReplaceTabletRangesResponse {
 struct TabletMovementsQuery {
     status: Option<String>,
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TabletStatsQuery {
+    tablet_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminTabletStatsResponse {
+    stats: Vec<tablet_stats::TabletStats>,
+    aggregates: Vec<tablet_stats::TabletStatsAggregate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2050,6 +2062,38 @@ async fn get_admin_tablet_movements(
     .await
     .map_err(|err| invalid_admin_request(err.to_string()))?;
     Ok(Json(rows))
+}
+
+async fn get_admin_tablet_stats(
+    State(s): State<AppState>,
+    Query(query): Query<TabletStatsQuery>,
+) -> Result<Json<AdminTabletStatsResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    if let Some(tablet_id) = query.tablet_id {
+        if tablet_id < 0 {
+            return Err(invalid_admin_request("tablet_id must be non-negative"));
+        }
+    }
+    let stats = if let Some(tablet_id) = query.tablet_id {
+        tablet_stats::list_by_tablet(meta.pool(), tablet_id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        tablet_stats::list_all(meta.pool())
+            .await
+            .map_err(internal_error)?
+    };
+    let aggregates = tablet_stats::list_aggregates(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter(|aggregate| {
+            query
+                .tablet_id
+                .is_none_or(|tablet_id| aggregate.tablet_id == tablet_id)
+        })
+        .collect();
+    Ok(Json(AdminTabletStatsResponse { stats, aggregates }))
 }
 
 async fn replace_admin_tablet_ranges(

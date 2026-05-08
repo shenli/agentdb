@@ -119,8 +119,17 @@ serving tablets whose individual spans are at or below the threshold.
 when those caps are configured, tablets without stats are skipped rather than
 merged blindly.
 `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds prepared lifecycle groups per
-scheduler tick. These knobs only enqueue the same movement rows as the manual
-commands; existing copy/catch-up/cutover safety checks still gate completion.
+scheduler tick. `AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS` suppresses follow-on
+automatic split/merge work for tablets involved in recently completed movement
+rows. These knobs only enqueue the same movement rows as the manual commands;
+existing copy/catch-up/cutover safety checks still gate completion.
+
+Published stats are visible through:
+
+```bash
+agentdbctl tablets stats
+agentdbctl tablets stats --tablet-id 7
+```
 
 Raft catch-up:
 

@@ -142,6 +142,11 @@ impl NodeState {
 enum TabletsCommand {
     /// List tablets.
     List,
+    /// List published per-node tablet storage stats.
+    Stats {
+        #[arg(long)]
+        tablet_id: Option<i64>,
+    },
     /// Create tablet metadata idempotently.
     Create { tablet_id: i64 },
     /// Assign an unowned tablet to a fresh alive node.
@@ -538,6 +543,13 @@ async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
 async fn tablets(api: &Api, command: TabletsCommand) -> Result<Value> {
     match command {
         TabletsCommand::List => api.get("/api/admin/tablets").await,
+        TabletsCommand::Stats { tablet_id } => {
+            api.get(&format!(
+                "/api/admin/tablet-stats{}",
+                query_opt("tablet_id", tablet_id)
+            ))
+            .await
+        }
         TabletsCommand::Create { tablet_id } => {
             api.post(
                 "/api/admin/tablets/create",

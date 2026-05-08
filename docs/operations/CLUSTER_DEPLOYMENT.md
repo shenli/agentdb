@@ -269,6 +269,9 @@ Each node should have:
   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`, and
   `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`; split/merge preparation is disabled
   unless at least one split or merge threshold is set above `0`
+- tablet lifecycle cooldown (`AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`, default
+  10 minutes) to avoid immediate repeated movement after a completed lifecycle
+  group
 - routing refresh intervals
 - internal Raft RPC token (`server.internal_auth_token` or
   `AGENTDB_INTERNAL_AUTH_TOKEN`)
