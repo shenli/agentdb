@@ -1855,9 +1855,22 @@ async fn admin_tablets_returns_rows() {
 async fn admin_tablet_stats_returns_rows_and_aggregates() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
-    agentdb_meta::tablet_stats::upsert(meta.pool(), 7, "node-a", 10, 100, 1_000, 1_100, 12, 100)
-        .await
-        .unwrap();
+    agentdb_meta::tablet_stats::upsert_with_rate(
+        meta.pool(),
+        7,
+        "node-a",
+        10,
+        100,
+        1_000,
+        1_100,
+        12,
+        1_000,
+        6,
+        6_000,
+        100,
+    )
+    .await
+    .unwrap();
     agentdb_meta::tablet_stats::upsert(meta.pool(), 7, "node-b", 8, 80, 900, 980, 11, 110)
         .await
         .unwrap();
@@ -1882,6 +1895,9 @@ async fn admin_tablet_stats_returns_rows_and_aggregates() {
     assert_eq!(body["aggregates"][0]["replica_count"], 2);
     assert_eq!(body["aggregates"][0]["storage_bytes"], 1_100);
     assert_eq!(body["aggregates"][0]["applied_index"], 12);
+    assert_eq!(body["aggregates"][0]["sample_interval_ms"], 1_000);
+    assert_eq!(body["aggregates"][0]["write_ops_delta"], 6);
+    assert_eq!(body["aggregates"][0]["write_ops_per_sec_milli"], 6_000);
 }
 
 #[tokio::test]

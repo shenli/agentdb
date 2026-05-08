@@ -180,6 +180,9 @@ GET /api/admin/tablet-stats?tablet_id=7
       "value_bytes": 1048576,
       "storage_bytes": 1112576,
       "applied_index": 42,
+      "sample_interval_ms": 1000,
+      "write_ops_delta": 12,
+      "write_ops_per_sec_milli": 12000,
       "updated_at_ms": 1713900000000
     }
   ],
@@ -192,6 +195,9 @@ GET /api/admin/tablet-stats?tablet_id=7
       "value_bytes": 1048576,
       "storage_bytes": 1112576,
       "applied_index": 42,
+      "sample_interval_ms": 1000,
+      "write_ops_delta": 12,
+      "write_ops_per_sec_milli": 12000,
       "updated_at_ms": 1713900000000
     }
   ]

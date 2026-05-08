@@ -1112,13 +1112,16 @@ single-session appends or record writes.
    scheduler also has an opt-in policy pass for preparing lifecycle work. Each
    node publishes best-effort `tablet_stats` rows for its local tablet replicas
    on the heartbeat loop: key count, key bytes, value bytes, total storage
-   bytes, applied index, and update time. The scheduler aggregates those rows by
-   tablet using the max replica-observed values, then uses them with the
+   bytes, applied index, applied-index delta, sample interval, derived
+   milli-ops/sec write rate, and update time. The scheduler aggregates those
+   rows by tablet using the max replica-observed values, then uses them with the
    existing shard-span thresholds. `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
-   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`, and
-   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES` can prepare a two-way
-   split for a serving tablet whose shard span, key count, or storage bytes
-   exceed the configured threshold. `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`,
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`,
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`, and
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC` can prepare a two-way
+   split for a serving tablet whose shard span, key count, storage bytes, or
+   write rate exceed the configured threshold.
+   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`,
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS`, and
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES` can prepare a merge for
    adjacent serving tablets that are each under the configured limits.
@@ -1177,10 +1180,10 @@ single-session appends or record writes.
     Current implementation status: admin surfaces expose tablet placement and
     lifecycle metadata, tenant placement policies, and tablet range-map
     replacement for operator-controlled split/merge cutovers. Nodes publish
-    per-tablet key/byte/applied-index stats to the control plane for lifecycle
-    policy decisions, and `GET /api/admin/tablet-stats` exposes raw per-node
-    rows plus aggregate max values. Runtime metrics for object-store mirror
-    backlog are exposed through `/api/admin/content-mirror`; live local Raft
+    per-tablet key/byte/applied-index/write-rate stats to the control plane for
+    lifecycle policy decisions, and `GET /api/admin/tablet-stats` exposes raw
+    per-node rows plus aggregate max values. Runtime metrics for object-store
+    mirror backlog are exposed through `/api/admin/content-mirror`; live local Raft
     tablet/replica commit and applied indexes, configured-replica lag, and
     catch-up-required flags are exposed through `/api/admin/raft`. Retained
     snapshot age, expiry, size, checksum, source, and target are exposed through
@@ -1207,8 +1210,8 @@ single-session appends or record writes.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
 - Do not claim full autonomous production operation until lifecycle policies
-  also include write-rate/compaction-debt metrics and failure-injection
-  validation end to end.
+  also include compaction-debt metrics and failure-injection validation end to
+  end.
 
 ## Open Decisions
 
