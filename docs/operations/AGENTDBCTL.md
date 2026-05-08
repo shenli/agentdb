@@ -87,12 +87,14 @@ agentdbctl tablets movements --status pending
 agentdbctl tablets complete-merge --source-tablet-id 8 --source-tablet-id 9 10 --map-epoch 3 --min-applied-index 1024
 ```
 
-Prepare fences metadata, creates destination tablets, seeds destination replica
-intent, and enqueues `tablet_movements` state-copy work. The local tablet
-movement executor copies state for pending rows when this node hosts a
-destination replica; it uses a healthy caught-up local source replica when
-available and otherwise fetches the filtered source snapshot from a healthy
-caught-up remote source replica over the internal authenticated movement
+Prepare starts only from `serving` source tablets and requires destination
+tablets to be missing or already `creating` with no owned ranges in the same
+placement scope. It then fences metadata, creates destination tablets, seeds
+destination replica intent, and enqueues `tablet_movements` state-copy work. The
+local tablet movement executor copies state for pending rows when this node
+hosts a destination replica; it uses a healthy caught-up local source replica
+when available and otherwise fetches the filtered source snapshot from a
+healthy caught-up remote source replica over the internal authenticated movement
 endpoint. Tablet replica metadata changes notify cluster workers, so new
 split/merge destination replicas are opened as local Raft runtime groups by the
 registry sync loop. The scheduler leader scans movement rows, marks them
