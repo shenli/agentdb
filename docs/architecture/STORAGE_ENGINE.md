@@ -262,7 +262,7 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
 | Runtime data | Persisted runtime state can be opened with a tablet router backed by one local replicated log per local `tablet_replicas` row | Tablet-local applied state stores per routed tablet |
 | Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; token-protected internal HTTP Raft message/snapshot RPC and retrying outbox workers are wired | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
-| Split/merge | Admin APIs, `agentdbctl`, movement rows, destination state copy, and range-map cutover are implemented; policy-driven split/merge scheduling remains open | Control-plane tablet lifecycle changes shard-range ownership |
+| Split/merge | Admin APIs, `agentdbctl`, movement rows, destination state copy, range-map cutover, and opt-in policy scheduling by shard span, size, write rate, and retained-log compaction debt are implemented | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
 | Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
 
@@ -995,8 +995,8 @@ single-session appends or record writes.
    per tablet: a second promotion/removal is rejected while the first change is
    still pending commit, and `/api/admin/raft` exposes pending configuration
    changes plus outbound raft-message backlog. Remaining production work is
-   policy-driven split/merge scheduling, deeper tablet-aware compaction tuning,
-   and broader failure-injection coverage for operator confidence.
+   deeper tablet-aware compaction tuning and broader failure-injection coverage
+   for operator confidence.
 
 7. Add snapshot and catch-up support.
 
@@ -1060,8 +1060,7 @@ single-session appends or record writes.
    registered. `GET /api/admin/raft` includes configured-only tablets even when
    the local API node has not opened a Raft group, so replacement learner intent
    is visible before local runtime bootstrap. Remaining production work is
-   policy-driven split/merge scheduling and deeper tablet-aware compaction
-   tuning.
+   deeper tablet-aware compaction tuning.
 
 8. Add tablet split and rebalance.
 
@@ -1217,7 +1216,7 @@ single-session appends or record writes.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
 - Do not claim full autonomous production operation until lifecycle policies
-  also include compaction-debt metrics and failure-injection validation end to
+  have deeper LSM compaction signals and failure-injection validation end to
   end.
 
 ## Open Decisions

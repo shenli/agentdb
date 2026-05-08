@@ -138,6 +138,45 @@ async fn runtime_persisted_writes_replicate_with_raft_rs_quorum() {
     assert_eq!(hydrated.external_key, "raft-rs-tenant");
 }
 
+#[tokio::test]
+async fn runtime_raft_rs_log_compaction_reduces_tablet_compaction_debt() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(1, raft_configs).unwrap();
+    group.elect(1).unwrap();
+
+    let leader_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let leader_runtime = Runtime::with_kv_and_replicated_log(leader_kv, content(), logs[0].clone());
+    leader_runtime
+        .create_tenant(NewTenant {
+            external_key: "raft-rs-debt-tenant".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    let before = leader_runtime.local_tablet_storage_stats().unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(before[0].applied_index > 0);
+    assert!(before[0].compaction_debt_ops > 0);
+
+    let compacted = leader_runtime
+        .compact_tablet_log_through(RUNTIME_PRIMARY_TABLET_ID, before[0].applied_index)
+        .unwrap();
+    assert!(compacted > 0);
+
+    let after = leader_runtime.local_tablet_storage_stats().unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].compaction_debt_ops, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
     let dir = TempDir::new().unwrap();
