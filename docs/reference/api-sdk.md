@@ -183,6 +183,7 @@ GET /api/admin/tablet-stats?tablet_id=7
       "sample_interval_ms": 1000,
       "write_ops_delta": 12,
       "write_ops_per_sec_milli": 12000,
+      "compaction_debt_ops": 500,
       "updated_at_ms": 1713900000000
     }
   ],
@@ -198,6 +199,7 @@ GET /api/admin/tablet-stats?tablet_id=7
       "sample_interval_ms": 1000,
       "write_ops_delta": 12,
       "write_ops_per_sec_milli": 12000,
+      "compaction_debt_ops": 500,
       "updated_at_ms": 1713900000000
     }
   ]

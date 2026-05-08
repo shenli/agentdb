@@ -11,7 +11,20 @@ use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
-type TabletStatsRow = (i64, String, i64, i64, i64, i64, i64, i64, i64, i64, i64);
+type TabletStatsRow = (
+    i64,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabletStats {
@@ -25,6 +38,7 @@ pub struct TabletStats {
     pub sample_interval_ms: i64,
     pub write_ops_delta: i64,
     pub write_ops_per_sec_milli: i64,
+    pub compaction_debt_ops: i64,
     pub updated_at_ms: i64,
 }
 
@@ -40,6 +54,7 @@ pub struct TabletStatsAggregate {
     pub sample_interval_ms: i64,
     pub write_ops_delta: i64,
     pub write_ops_per_sec_milli: i64,
+    pub compaction_debt_ops: i64,
     pub updated_at_ms: i64,
 }
 
@@ -67,6 +82,7 @@ pub async fn upsert(
         0,
         0,
         0,
+        0,
         now_ms,
     )
     .await
@@ -85,6 +101,7 @@ pub async fn upsert_with_rate(
     sample_interval_ms: i64,
     write_ops_delta: i64,
     write_ops_per_sec_milli: i64,
+    compaction_debt_ops: i64,
     now_ms: i64,
 ) -> MetaResult<()> {
     validate_non_negative(tablet_id, "tablet_id")?;
@@ -97,13 +114,14 @@ pub async fn upsert_with_rate(
     validate_non_negative(sample_interval_ms, "sample_interval_ms")?;
     validate_non_negative(write_ops_delta, "write_ops_delta")?;
     validate_non_negative(write_ops_per_sec_milli, "write_ops_per_sec_milli")?;
+    validate_non_negative(compaction_debt_ops, "compaction_debt_ops")?;
     validate_non_negative(now_ms, "now_ms")?;
     sqlx::query(
         "INSERT INTO tablet_stats
             (tablet_id, node_id, key_count, key_bytes, value_bytes,
              storage_bytes, applied_index, sample_interval_ms, write_ops_delta,
-             write_ops_per_sec_milli, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             write_ops_per_sec_milli, compaction_debt_ops, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (tablet_id, node_id) DO UPDATE SET
             key_count = excluded.key_count,
             key_bytes = excluded.key_bytes,
@@ -113,6 +131,7 @@ pub async fn upsert_with_rate(
             sample_interval_ms = excluded.sample_interval_ms,
             write_ops_delta = excluded.write_ops_delta,
             write_ops_per_sec_milli = excluded.write_ops_per_sec_milli,
+            compaction_debt_ops = excluded.compaction_debt_ops,
             updated_at_ms = excluded.updated_at_ms",
     )
     .bind(tablet_id)
@@ -125,6 +144,7 @@ pub async fn upsert_with_rate(
     .bind(sample_interval_ms)
     .bind(write_ops_delta)
     .bind(write_ops_per_sec_milli)
+    .bind(compaction_debt_ops)
     .bind(now_ms)
     .execute(pool)
     .await?;
@@ -135,7 +155,8 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TabletStats>> {
     let rows: Vec<TabletStatsRow> = sqlx::query_as(
         "SELECT tablet_id, node_id, key_count, key_bytes, value_bytes,
                 storage_bytes, applied_index, sample_interval_ms,
-                write_ops_delta, write_ops_per_sec_milli, updated_at_ms
+                write_ops_delta, write_ops_per_sec_milli, compaction_debt_ops,
+                updated_at_ms
            FROM tablet_stats
           ORDER BY tablet_id, node_id",
     )
@@ -148,7 +169,8 @@ pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<Ta
     let rows: Vec<TabletStatsRow> = sqlx::query_as(
         "SELECT tablet_id, node_id, key_count, key_bytes, value_bytes,
                 storage_bytes, applied_index, sample_interval_ms,
-                write_ops_delta, write_ops_per_sec_milli, updated_at_ms
+                write_ops_delta, write_ops_per_sec_milli, compaction_debt_ops,
+                updated_at_ms
            FROM tablet_stats
           WHERE tablet_id = ?
           ORDER BY storage_bytes DESC, write_ops_per_sec_milli DESC, node_id",
@@ -177,6 +199,8 @@ pub async fn list_aggregates(pool: &AnyPool) -> MetaResult<Vec<TabletStatsAggreg
                 aggregate.write_ops_per_sec_milli = aggregate
                     .write_ops_per_sec_milli
                     .max(stats.write_ops_per_sec_milli);
+                aggregate.compaction_debt_ops =
+                    aggregate.compaction_debt_ops.max(stats.compaction_debt_ops);
                 aggregate.updated_at_ms = aggregate.updated_at_ms.max(stats.updated_at_ms);
             })
             .or_insert(TabletStatsAggregate {
@@ -190,6 +214,7 @@ pub async fn list_aggregates(pool: &AnyPool) -> MetaResult<Vec<TabletStatsAggreg
                 sample_interval_ms: stats.sample_interval_ms,
                 write_ops_delta: stats.write_ops_delta,
                 write_ops_per_sec_milli: stats.write_ops_per_sec_milli,
+                compaction_debt_ops: stats.compaction_debt_ops,
                 updated_at_ms: stats.updated_at_ms,
             });
     }
@@ -234,6 +259,7 @@ fn into_stats(
         sample_interval_ms,
         write_ops_delta,
         write_ops_per_sec_milli,
+        compaction_debt_ops,
         updated_at_ms,
     ): TabletStatsRow,
 ) -> TabletStats {
@@ -248,6 +274,7 @@ fn into_stats(
         sample_interval_ms,
         write_ops_delta,
         write_ops_per_sec_milli,
+        compaction_debt_ops,
         updated_at_ms,
     }
 }
@@ -285,19 +312,22 @@ mod tests {
         assert_eq!(aggregate.storage_bytes, 1_100);
         assert_eq!(aggregate.applied_index, 12);
         assert_eq!(aggregate.write_ops_per_sec_milli, 0);
+        assert_eq!(aggregate.compaction_debt_ops, 0);
     }
 
     #[tokio::test]
     async fn upsert_with_rate_lists_and_aggregates_write_rate() {
         let p = pool().await;
         upsert_with_rate(
-            &p, 7, "node-a", 10, 100, 1_000, 1_100, 24, 1_000, 12, 12_000, 200,
+            &p, 7, "node-a", 10, 100, 1_000, 1_100, 24, 1_000, 12, 12_000, 500, 200,
         )
         .await
         .unwrap();
-        upsert_with_rate(&p, 7, "node-b", 8, 80, 900, 980, 20, 1_000, 8, 8_000, 210)
-            .await
-            .unwrap();
+        upsert_with_rate(
+            &p, 7, "node-b", 8, 80, 900, 980, 20, 1_000, 8, 8_000, 250, 210,
+        )
+        .await
+        .unwrap();
 
         let rows = list_by_tablet(&p, 7).await.unwrap();
         assert_eq!(rows[0].sample_interval_ms, 1_000);
@@ -312,6 +342,7 @@ mod tests {
             .unwrap();
         assert_eq!(aggregate.write_ops_delta, 12);
         assert_eq!(aggregate.write_ops_per_sec_milli, 12_000);
+        assert_eq!(aggregate.compaction_debt_ops, 500);
     }
 
     #[tokio::test]

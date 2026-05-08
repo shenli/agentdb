@@ -1867,6 +1867,7 @@ async fn admin_tablet_stats_returns_rows_and_aggregates() {
         1_000,
         6,
         6_000,
+        500,
         100,
     )
     .await
@@ -1898,6 +1899,7 @@ async fn admin_tablet_stats_returns_rows_and_aggregates() {
     assert_eq!(body["aggregates"][0]["sample_interval_ms"], 1_000);
     assert_eq!(body["aggregates"][0]["write_ops_delta"], 6);
     assert_eq!(body["aggregates"][0]["write_ops_per_sec_milli"], 6_000);
+    assert_eq!(body["aggregates"][0]["compaction_debt_ops"], 500);
 }
 
 #[tokio::test]

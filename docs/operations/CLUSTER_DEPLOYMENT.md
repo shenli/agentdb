@@ -269,9 +269,10 @@ Each node should have:
   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`, and
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC`
   (`AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC_MILLI` for milli-op
-  precision), and `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`; split/merge
-  preparation is disabled unless at least one split or merge threshold is set
-  above `0`
+  precision), `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_COMPACTION_DEBT_OPS` for
+  retained committed log entries, and `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`;
+  split/merge preparation is disabled unless at least one split or merge
+  threshold is set above `0`
 - tablet lifecycle cooldown (`AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`, default
   10 minutes) to avoid immediate repeated movement after a completed lifecycle
   group

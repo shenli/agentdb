@@ -1113,14 +1113,19 @@ single-session appends or record writes.
    node publishes best-effort `tablet_stats` rows for its local tablet replicas
    on the heartbeat loop: key count, key bytes, value bytes, total storage
    bytes, applied index, applied-index delta, sample interval, derived
-   milli-ops/sec write rate, and update time. The scheduler aggregates those
-   rows by tablet using the max replica-observed values, then uses them with the
-   existing shard-span thresholds. `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
+   milli-ops/sec write rate, retained committed log entries, and update time.
+   The retained-log count is the current compaction-debt signal: committed and
+   applied entries still present in the tablet-local log after state-machine
+   apply. The scheduler aggregates rows by tablet using the max
+   replica-observed values, then uses them with the existing shard-span
+   thresholds. `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
    `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`,
-   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`, and
-   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC` can prepare a two-way
-   split for a serving tablet whose shard span, key count, storage bytes, or
-   write rate exceed the configured threshold.
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`,
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC`, and
+   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_COMPACTION_DEBT_OPS` can prepare a
+   two-way split for a serving tablet whose shard span, key count, storage
+   bytes, write rate, or retained-log compaction debt exceed the configured
+   threshold.
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS`,
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS`, and
    `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES` can prepare a merge for
@@ -1180,19 +1185,21 @@ single-session appends or record writes.
     Current implementation status: admin surfaces expose tablet placement and
     lifecycle metadata, tenant placement policies, and tablet range-map
     replacement for operator-controlled split/merge cutovers. Nodes publish
-    per-tablet key/byte/applied-index/write-rate stats to the control plane for
-    lifecycle policy decisions, and `GET /api/admin/tablet-stats` exposes raw
-    per-node rows plus aggregate max values. Runtime metrics for object-store
-    mirror backlog are exposed through `/api/admin/content-mirror`; live local Raft
-    tablet/replica commit and applied indexes, configured-replica lag, and
-    catch-up-required flags are exposed through `/api/admin/raft`. Retained
-    snapshot age, expiry, size, checksum, source, and target are exposed through
+    per-tablet key/byte/applied-index/write-rate/retained-log stats to the
+    control plane for lifecycle policy decisions, and
+    `GET /api/admin/tablet-stats` exposes raw per-node rows plus aggregate max
+    values. Runtime metrics for object-store mirror backlog are exposed through
+    `/api/admin/content-mirror`; live local Raft tablet/replica commit and
+    applied indexes, configured-replica lag, and catch-up-required flags are
+    exposed through `/api/admin/raft`. Retained snapshot age, expiry, size,
+    checksum, source, and target are exposed through
     `/api/admin/raft/snapshots`. Retained snapshot object deletion is handled
     by the server prune worker when shared object storage is configured, and
     retained object snapshots are consumed by the server restore worker for
     local node bootstrap/catch-up. `POST /api/admin/raft/catch-up` and
     `agentdbctl raft catch-up` provide an operator-triggered catch-up path for
-    lagging replicas. Compaction debt still needs the underlying worker.
+    lagging replicas. Full LSM compaction debt is still a deeper storage-engine
+    signal; the current lifecycle signal is retained committed log entries.
 
 ## Non-Goals
 
