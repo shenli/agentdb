@@ -2489,22 +2489,25 @@ async fn run_cluster_scheduler_tick(
         )
         .await?;
         let changed_count = report.changed_count();
-        if changed_count > 0 {
-            if let Some(registry) = raft_registry {
-                let membership_changes = apply_scheduler_rebalance_raft_membership_changes(
-                    meta,
-                    registry,
-                    &report.actions,
-                )
-                .await?;
-                if membership_changes > 0 {
-                    tracing::info!(
-                        node_id = %node_id,
-                        membership_changes,
-                        "scheduler proposed raft membership changes for completed replacements"
-                    );
-                }
+        if let Some(registry) = raft_registry {
+            let membership_changes = if changed_count > 0 {
+                apply_scheduler_rebalance_raft_membership_changes(meta, registry, &report.actions)
+                    .await?
+            } else {
+                0
+            };
+            let retired_draining_sources =
+                retire_draining_rebalance_raft_replicas(meta, registry).await?;
+            if membership_changes > 0 || retired_draining_sources > 0 {
+                tracing::info!(
+                    node_id = %node_id,
+                    membership_changes,
+                    retired_draining_sources,
+                    "scheduler converged raft membership for rebalance"
+                );
             }
+        }
+        if changed_count > 0 {
             status.add_tablet_reassignments(changed_count as u64);
             tracing::info!(
                 node_id = %node_id,
@@ -2628,6 +2631,86 @@ async fn apply_scheduler_rebalance_raft_membership_changes(
         }
     }
     Ok(changed)
+}
+
+async fn retire_draining_rebalance_raft_replicas(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+) -> agentdb_meta::MetaResult<usize> {
+    let tablets: BTreeMap<i64, agentdb_meta::tablets::Tablet> =
+        agentdb_meta::tablets::list_all(meta.pool())
+            .await?
+            .into_iter()
+            .map(|tablet| (tablet.tablet_id, tablet))
+            .collect();
+    let replicas = agentdb_meta::tablet_replicas::list_all(meta.pool()).await?;
+    let mut retired = 0usize;
+    for replica in replicas {
+        if replica.role == "log_only" || replica.health != "draining" {
+            continue;
+        }
+        if tablets
+            .get(&replica.tablet_id)
+            .and_then(|tablet| tablet.owner_node_id.as_deref())
+            == Some(replica.node_id.as_str())
+        {
+            continue;
+        }
+        let statuses = match registry.status_for(replica.tablet_id) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                tracing::debug!(
+                    tablet_id = replica.tablet_id,
+                    node_id = %replica.node_id,
+                    error = %error,
+                    "skipping draining raft replica retirement; local group is not registered"
+                );
+                continue;
+            }
+        };
+        let Some(leader_id) = raft_leader_id_from_statuses(&statuses) else {
+            tracing::warn!(
+                tablet_id = replica.tablet_id,
+                node_id = %replica.node_id,
+                "skipping draining raft replica retirement; no known leader"
+            );
+            continue;
+        };
+        let raft_node_id = match agentdb_storage::stable_raft_node_id(&replica.node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = replica.tablet_id,
+                    node_id = %replica.node_id,
+                    error = %error,
+                    "skipping draining raft replica retirement; node id is invalid"
+                );
+                continue;
+            }
+        };
+        match registry.remove_node(replica.tablet_id, leader_id, raft_node_id) {
+            Ok(()) => {
+                if agentdb_meta::tablet_replicas::delete(
+                    meta.pool(),
+                    replica.tablet_id,
+                    &replica.node_id,
+                )
+                .await?
+                {
+                    retired += 1;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = replica.tablet_id,
+                    node_id = %replica.node_id,
+                    error = %error,
+                    "failed to retire draining raft replica"
+                );
+            }
+        }
+    }
+    Ok(retired)
 }
 
 fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
@@ -3636,7 +3719,7 @@ region = "us-west-2"
     async fn scheduler_rebalance_membership_change_skips_unregistered_group() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
-        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "draining", 10, 10, 100)
             .await
             .unwrap();
         tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 10, 10, 100)
@@ -3664,6 +3747,45 @@ region = "us-west-2"
             .unwrap();
         assert!(replicas.iter().any(|replica| replica.node_id == "node-b"));
         assert!(replicas.iter().any(|replica| replica.node_id == "node-a"));
+
+        assert_eq!(
+            retire_draining_rebalance_raft_replicas(&meta, &registry)
+                .await
+                .unwrap(),
+            0
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "learner",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(7, configs, leader_id)
+            .expect("open local raft group");
+        group.elect(leader_id).expect("elect target leader");
+        registry.register(7, group).unwrap();
+        assert_eq!(
+            retire_draining_rebalance_raft_replicas(&meta, &registry)
+                .await
+                .unwrap(),
+            1
+        );
+        let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap();
+        assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
     }
 
     #[tokio::test]

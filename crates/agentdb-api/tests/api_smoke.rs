@@ -2656,7 +2656,7 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
     let registry = RaftRsGroupRegistry::shared();
     let state = AppState::new(runtime)
         .with_meta(meta.clone())
-        .with_raft_registry(registry);
+        .with_raft_registry(registry.clone());
     let app = spawn_app_with_state(state).await;
     let applied: serde_json::Value = app
         .client
@@ -2684,10 +2684,35 @@ async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered
     let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
         .await
         .unwrap();
-    assert!(replicas.iter().any(|replica| replica.node_id == "node-b"));
+    assert!(replicas
+        .iter()
+        .any(|replica| replica.node_id == "node-b" && replica.health == "draining"));
     assert!(replicas
         .iter()
         .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
+
+    let dir = TempDir::new().unwrap();
+    let configs = vec![
+        RaftRsNodeConfig::from_control_plane_replica(7, "node-a", "voter", dir.path()).unwrap(),
+        RaftRsNodeConfig::from_control_plane_replica(7, "node-b", "learner", dir.path()).unwrap(),
+    ];
+    let leader_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+    let (group, _log) = RaftRsSharedGroup::open_local(7, configs, leader_id).unwrap();
+    group.elect(leader_id).unwrap();
+    registry.register(7, group).unwrap();
+
+    app.client
+        .post(format!("{}/api/admin/tablets/rebalance", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        .await
+        .unwrap();
+    assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
 }
 
 #[tokio::test]

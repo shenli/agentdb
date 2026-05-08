@@ -111,8 +111,8 @@ And a very small amount of direct metadata admin:
   for assigning unowned tablets, preparing replacement learners for tablets on
   fresh draining nodes, completing prepared replacements once their targets are
   healthy and caught up, promoting completed targets in Raft when the local
-  group is registered, retiring old sources from Raft, and evening out fresh
-  `alive` node load
+  group is registered, retrying `draining` source retirement, and evening out
+  fresh `alive` node load
 - `agentdbctl raft status` for local Raft group status, configured replica
   progress, replication lag, catch-up-needed visibility, and configured-only
   tablets that have not opened a local Raft group on the queried API node
@@ -148,8 +148,8 @@ when metadata-backed cluster mode is enabled:
 - expired-tablet ownership clearing
 - automatic tablet rebalance attempts that assign unowned tablets, move fresh
   draining owners through cooperative handoff, promote completed replacement
-  targets in Raft when possible, retire old sources, and even out fresh `alive`
-  node load
+  targets in Raft when possible, retry `draining` source retirement, and even
+  out fresh `alive` node load
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.

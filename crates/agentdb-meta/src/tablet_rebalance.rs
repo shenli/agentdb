@@ -399,9 +399,20 @@ async fn complete_ready_replacement_intent(
             now_ms,
         )
         .await?;
-        tablets::complete_handoff(pool, tablet.tablet_id, source_node_id)
+        let changed = tablets::complete_handoff(pool, tablet.tablet_id, source_node_id)
             .await?
-            .is_some()
+            .is_some();
+        if changed {
+            let _ = tablet_replicas::set_health(
+                pool,
+                tablet.tablet_id,
+                source_node_id,
+                "draining",
+                now_ms,
+            )
+            .await?;
+        }
+        changed
     };
     Ok(RebalanceStep {
         action: Some(RebalanceAction {
@@ -641,6 +652,13 @@ mod tests {
             .find(|replica| replica.node_id == "node-b")
             .unwrap();
         assert_eq!(target.role, "voter");
+        let source = tablet_replicas::list_by_tablet(&p, 7)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|replica| replica.node_id == "node-a")
+            .unwrap();
+        assert_eq!(source.health, "draining");
         let lagging = tablets::get(&p, 8).await.unwrap().unwrap();
         assert_eq!(lagging.owner_node_id.as_deref(), Some("node-a"));
         assert_eq!(lagging.handoff_target_node_id.as_deref(), Some("node-b"));

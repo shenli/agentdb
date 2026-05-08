@@ -2845,6 +2845,7 @@ async fn rebalance_admin_tablets(
     if !body.dry_run {
         if let Some(registry) = s.raft_registry.as_ref() {
             apply_rebalance_raft_membership_changes(meta, registry, &report.actions).await?;
+            retire_draining_rebalance_raft_replicas(meta, registry).await?;
         }
     }
     Ok(Json(report))
@@ -2926,6 +2927,68 @@ async fn apply_rebalance_raft_membership_changes(
         }
     }
     Ok(changed)
+}
+
+async fn retire_draining_rebalance_raft_replicas(
+    meta: &agentdb_meta::MetaStore,
+    registry: &crate::raft_ingress::RaftRsGroupRegistry,
+) -> Result<usize, ApiError> {
+    let tablets: BTreeMap<i64, tablets::Tablet> = tablets::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|tablet| (tablet.tablet_id, tablet))
+        .collect();
+    let replicas = tablet_replicas::list_all(meta.pool())
+        .await
+        .map_err(internal_error)?;
+    let mut retired = 0usize;
+    for replica in replicas {
+        if replica.role == "log_only" || replica.health != "draining" {
+            continue;
+        }
+        if tablets
+            .get(&replica.tablet_id)
+            .and_then(|tablet| tablet.owner_node_id.as_deref())
+            == Some(replica.node_id.as_str())
+        {
+            continue;
+        }
+        let Ok(statuses) = registry.status_for(replica.tablet_id) else {
+            continue;
+        };
+        let Some(leader_id) = raft_leader_id_from_statuses(&statuses) else {
+            continue;
+        };
+        let raft_node_id = match agentdb_storage::stable_raft_node_id(&replica.node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = replica.tablet_id,
+                    node_id = %replica.node_id,
+                    error = %error,
+                    "skipping draining raft replica retirement; node id is invalid"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = registry.remove_node(replica.tablet_id, leader_id, raft_node_id) {
+            tracing::warn!(
+                tablet_id = replica.tablet_id,
+                node_id = %replica.node_id,
+                error = %error,
+                "failed to retire draining raft replica"
+            );
+            continue;
+        }
+        if tablet_replicas::delete(meta.pool(), replica.tablet_id, &replica.node_id)
+            .await
+            .map_err(internal_error)?
+        {
+            retired += 1;
+        }
+    }
+    Ok(retired)
 }
 
 fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
