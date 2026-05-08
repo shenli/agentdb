@@ -79,23 +79,25 @@ Today, the control-plane schema already has the early shape of this model:
 - `tenant_policies`: tenant placement class, placement scope, encryption class,
   key policy reference, and policy versions.
 
-Those rows are control-plane routing metadata only. The current runtime still
-uses a single `KvStore` backend for data; tablets are not yet independent Raft
-groups or independent LSM instances.
+Those rows are control-plane routing metadata. In clustered mode, local tablet
+writes now flow through per-tablet `raft-rs` groups backed by TiKV
+`raft-engine` before the runtime applies them to tablet-local KV state. The
+remaining storage gap is not "add Raft"; it is splitting the physical LSM layout
+so hot or large tablets can compact independently and eventually move between
+storage tiers without dragging unrelated tablet state with them.
 
-The storage crate now has two target-facing seams:
+The storage crate has these target-facing seams:
 
 - `TabletKvStore`: a tablet-local namespace over the existing `KvStore`.
-- `ReplicatedLog`: a commit-before-apply boundary with a durable single-node
-  implementation. This is not Raft yet; it is the interface the Raft-backed log
-  should replace.
+- `ReplicatedLog`: a commit-before-apply boundary implemented by both
+  single-node logs and the `raft-rs`/`raft-engine` backed quorum log.
 - `LoggedTabletStateMachine`: a core-layer command application boundary that
   serializes deterministic tablet commands through `ReplicatedLog` before
   applying them to `TabletKvStore`.
 
 ## Current Write Path
 
-The current hot path is single-node:
+Single-node mode still uses the direct local path:
 
 ```text
 API request
@@ -106,14 +108,27 @@ API request
   -> return success
 ```
 
+Cluster mode routes owner-local writes through the tablet's Raft log first:
+
+```text
+API request
+  -> authenticate and resolve internal tenant scope
+  -> route to tablet owner
+  -> propose TabletCommand to local raft-rs RawNode
+  -> persist Ready entries/HardState in raft-engine
+  -> commit after quorum
+  -> apply committed command to tablet-local KV state
+  -> acknowledge after local visibility
+```
+
 For RocksDB, durability comes from the local RocksDB write path. For SlateDB,
 runtime metadata is written through SlateDB to object storage. Artifact bytes
 may be written to local filesystem or object storage through `ContentBackend`.
 
-This has several important limitations:
+The remaining storage-engine limitations are:
 
-- There is no multi-node consensus on the hot write path.
-- A node-local RocksDB instance is not enough for node-loss durability.
+- The current physical KV layout can still put too many tablets in one LSM
+  instance.
 - SlateDB over object storage validates the KV abstraction, but it is not a
   replacement for quorum replication.
 - Synchronous object-store writes are too slow and variable for ordinary
@@ -952,12 +967,21 @@ single-session appends or record writes.
    `RaftRsNodeConfig` values with per-tablet raft-engine directories. The HTTP
    API exposes token-protected internal Raft message and snapshot ingress
    endpoints, and server config wires the shared token from
-   `server.internal_auth_token` or `AGENTDB_INTERNAL_AUTH_TOKEN`.
+   `server.internal_auth_token` or `AGENTDB_INTERNAL_AUTH_TOKEN`. During token
+   rotation, ingress can also accept `server.internal_auth_previous_token` or
+   `AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN`; outbound RPCs always use the current
+   token. Inbound message/snapshot handlers validate that the `from` and `to`
+   Raft node IDs map to configured `tablet_replicas` rows when metadata is
+   enabled, preventing authenticated but misrouted peer traffic from entering a
+   local group.
    `RaftRsHttpClient` can deliver wire messages and snapshots to those
    endpoints. `RaftRsGroupRegistry` maps local tablet ids to
    `RaftRsSharedGroup` instances for ingress dispatch, and `RaftRsHttpOutbox`
-   plus `spawn_raft_rs_outbox_worker` provide retryable outbox draining. Server
-   startup now bootstraps local `raft-rs` tablet groups from
+   plus `spawn_raft_rs_outbox_worker` provide retryable outbox draining. The
+   server outbox worker is bounded by
+   `AGENTDB_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK` so a backed-up peer cannot make
+   one tick drain an unbounded queue. Server startup now bootstraps local
+   `raft-rs` tablet groups from
    `tablet_replicas`, opens only the local node's raft-engine state while
    retaining the full voter/learner ConfState, loads peer URLs from `nodes`,
    refreshes those URLs periodically and on control-plane change hints, and
@@ -967,9 +991,12 @@ single-session appends or record writes.
    route-owned tablets can acknowledge writes only after Raft commit. The local
    Raft append path now releases its group lock while waiting for peer
    responses, allowing the HTTP outbox and ingress workers to complete
-   multi-node election and quorum commit. Remaining production work is
-   policy-driven split/merge scheduling and deeper tablet-aware compaction
-   tuning.
+   multi-node election and quorum commit. Configuration changes are serialized
+   per tablet: a second promotion/removal is rejected while the first change is
+   still pending commit, and `/api/admin/raft` exposes pending configuration
+   changes plus outbound raft-message backlog. Remaining production work is
+   policy-driven split/merge scheduling, deeper tablet-aware compaction tuning,
+   and broader failure-injection coverage for operator confidence.
 
 7. Add snapshot and catch-up support.
 

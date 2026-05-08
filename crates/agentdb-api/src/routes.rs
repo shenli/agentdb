@@ -576,6 +576,7 @@ struct AdminTabletReplacementCompleteResponse {
     target_node_id: String,
     required_applied_index: i64,
     raft_membership_changed: bool,
+    raft_membership_operations: Vec<RaftMembershipOperationStatus>,
     retired_source: bool,
     tablet: AdminTabletView,
     source_replica: Option<AdminTabletReplicaView>,
@@ -686,6 +687,8 @@ struct RaftStatusResponse {
     tablet_count: usize,
     configured_replica_count: usize,
     unhealthy_replica_count: usize,
+    pending_conf_change_count: usize,
+    outbound_message_count: usize,
     tablets: Vec<RaftTabletStatus>,
 }
 
@@ -705,6 +708,8 @@ struct RaftReplicaStatus {
     term: u64,
     commit_index: u64,
     applied_index: u64,
+    pending_conf_change: bool,
+    outbound_message_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -728,6 +733,19 @@ struct RaftConfiguredReplicaStatus {
     runtime_term: Option<u64>,
     runtime_commit_index: Option<u64>,
     runtime_applied_index: Option<u64>,
+    membership_state: String,
+    pending_conf_change: bool,
+    outbound_message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RaftMembershipOperationStatus {
+    tablet_id: i64,
+    operation: &'static str,
+    node_id: String,
+    raft_node_id: Option<u64>,
+    status: &'static str,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -887,6 +905,11 @@ async fn post_internal_raft_message(
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    if let Err(response) =
+        validate_internal_raft_peer_ids(&s, body.tablet_id, body.from, body.to).await
+    {
+        return response;
+    }
     match ingress.step_wire_message(agentdb_storage::RaftRsWireMessage {
         tablet_id: body.tablet_id,
         from: body.from,
@@ -949,6 +972,11 @@ async fn post_internal_raft_snapshot(
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    if let Err(response) =
+        validate_internal_raft_peer_ids(&s, body.tablet_id, body.from, body.to).await
+    {
+        return response;
+    }
     match ingress.install_snapshot_transfer(
         body.to,
         agentdb_storage::RaftRsSnapshotTransfer {
@@ -1061,11 +1089,62 @@ fn validate_internal_raft_request(state: &AppState, headers: &HeaderMap) -> Resu
     let presented = headers
         .get(INTERNAL_AUTH_HEADER)
         .and_then(|value| value.to_str().ok());
-    if presented != Some(expected.as_ref()) {
+    let previous = state
+        .internal_auth_previous_token
+        .as_ref()
+        .map(|token| token.as_ref());
+    let matches_current = presented == Some(expected.as_ref());
+    let matches_previous = previous.is_some_and(|previous| presented == Some(previous));
+    if !matches_current && !matches_previous {
         return Err(internal_raft_error(
             StatusCode::UNAUTHORIZED,
             "RAFT_INTERNAL_AUTH_FAILED",
             "invalid internal raft RPC token",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_internal_raft_peer_ids(
+    state: &AppState,
+    tablet_id: i64,
+    from: u64,
+    to: u64,
+) -> Result<(), Response> {
+    if tablet_id <= 0 || from == 0 || to == 0 {
+        return Err(internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "RAFT_PEER_INVALID",
+            "raft tablet_id, from, and to must be positive",
+        ));
+    }
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    let replicas = tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+        .await
+        .map_err(|err| {
+            internal_raft_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RAFT_PEER_LOOKUP_FAILED",
+                err.to_string(),
+            )
+        })?;
+    let has_from = replicas.iter().any(|replica| {
+        agentdb_storage::stable_raft_node_id(&replica.node_id)
+            .is_ok_and(|candidate| candidate == from)
+    });
+    let has_to = replicas.iter().any(|replica| {
+        agentdb_storage::stable_raft_node_id(&replica.node_id)
+            .is_ok_and(|candidate| candidate == to)
+    });
+    if !has_from || !has_to {
+        return Err(internal_raft_error(
+            StatusCode::FORBIDDEN,
+            "RAFT_PEER_NOT_CONFIGURED",
+            format!(
+                "raft message peers are not configured for tablet {tablet_id}: from_configured={has_from}, to_configured={has_to}"
+            ),
         ));
     }
     Ok(())
@@ -2781,6 +2860,7 @@ async fn complete_admin_tablet_replacement(
 
     let retire_source = body.retire_source.unwrap_or(false);
     let mut raft_membership_changed = false;
+    let mut raft_membership_operations = Vec::new();
     if let Some(registry) = s.raft_registry.as_ref() {
         if let Ok(statuses) = registry.status_for(tablet_id) {
             let leader_id = statuses
@@ -2796,17 +2876,59 @@ async fn complete_admin_tablet_replacement(
                 .ok_or_else(|| invalid_admin_request("tablet raft group has no known leader"))?;
             let target_raft_node_id = agentdb_storage::stable_raft_node_id(&body.target_node_id)
                 .map_err(internal_error)?;
-            registry
-                .promote_to_voter(tablet_id, leader_id, target_raft_node_id)
-                .map_err(internal_error)?;
-            raft_membership_changed = true;
+            match registry.promote_to_voter(tablet_id, leader_id, target_raft_node_id) {
+                Ok(()) => {
+                    raft_membership_changed = true;
+                    raft_membership_operations.push(RaftMembershipOperationStatus {
+                        tablet_id,
+                        operation: "promote_to_voter",
+                        node_id: body.target_node_id.clone(),
+                        raft_node_id: Some(target_raft_node_id),
+                        status: "applied",
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    raft_membership_operations.push(RaftMembershipOperationStatus {
+                        tablet_id,
+                        operation: "promote_to_voter",
+                        node_id: body.target_node_id.clone(),
+                        raft_node_id: Some(target_raft_node_id),
+                        status: "failed",
+                        error: Some(message.clone()),
+                    });
+                    return Err(internal_error(message));
+                }
+            }
             if retire_source {
                 if let Some(source_node_id) = source_node_id.as_ref() {
                     let source_raft_node_id = agentdb_storage::stable_raft_node_id(source_node_id)
                         .map_err(internal_error)?;
-                    registry
-                        .remove_node(tablet_id, leader_id, source_raft_node_id)
-                        .map_err(internal_error)?;
+                    match registry.remove_node(tablet_id, leader_id, source_raft_node_id) {
+                        Ok(()) => {
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "remove_node",
+                                node_id: source_node_id.clone(),
+                                raft_node_id: Some(source_raft_node_id),
+                                status: "applied",
+                                error: None,
+                            });
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "remove_node",
+                                node_id: source_node_id.clone(),
+                                raft_node_id: Some(source_raft_node_id),
+                                status: "failed",
+                                error: Some(message.clone()),
+                            });
+                            return Err(internal_error(message));
+                        }
+                    }
                 }
             }
         } else if retire_source {
@@ -2866,6 +2988,7 @@ async fn complete_admin_tablet_replacement(
         target_node_id: body.target_node_id,
         required_applied_index,
         raft_membership_changed,
+        raft_membership_operations,
         retired_source: retire_source,
         tablet: tablet_view(tablet),
         source_replica: source_replica.map(tablet_replica_view),
@@ -2878,7 +3001,7 @@ async fn rebalance_admin_tablets(
     Json(body): Json<RebalanceTabletsBody>,
 ) -> Result<Json<tablet_rebalance::RebalanceReport>, ApiError> {
     let meta = meta_required(&s)?;
-    let report = tablet_rebalance::run(
+    let mut report = tablet_rebalance::run(
         meta.pool(),
         tablet_rebalance::RebalanceRequest {
             dry_run: body.dry_run,
@@ -2891,7 +3014,8 @@ async fn rebalance_admin_tablets(
     .map_err(internal_error)?;
     if !body.dry_run {
         if let Some(registry) = s.raft_registry.as_ref() {
-            apply_rebalance_raft_membership_changes(meta, registry, &report.actions).await?;
+            report.membership_operations =
+                apply_rebalance_raft_membership_changes(meta, registry, &report.actions).await?;
             retire_draining_rebalance_raft_replicas(meta, registry).await?;
         }
     }
@@ -2902,8 +3026,8 @@ async fn apply_rebalance_raft_membership_changes(
     meta: &agentdb_meta::MetaStore,
     registry: &crate::raft_ingress::RaftRsGroupRegistry,
     actions: &[tablet_rebalance::RebalanceAction],
-) -> Result<usize, ApiError> {
-    let mut changed = 0usize;
+) -> Result<Vec<tablet_rebalance::RebalanceMembershipOperation>, ApiError> {
+    let mut operations = Vec::new();
     for action in actions {
         if action.action != "complete_replacement" || !action.changed {
             continue;
@@ -2926,6 +3050,14 @@ async fn apply_rebalance_raft_membership_changes(
                     error = %error,
                     "skipping rebalance raft membership change; target node id is invalid"
                 );
+                operations.push(tablet_rebalance::RebalanceMembershipOperation {
+                    tablet_id: action.tablet_id,
+                    operation: "promote_to_voter",
+                    node_id: target_node_id.to_string(),
+                    raft_node_id: None,
+                    status: "failed",
+                    error: Some(error.to_string()),
+                });
                 continue;
             }
         };
@@ -2938,9 +3070,24 @@ async fn apply_rebalance_raft_membership_changes(
                 error = %error,
                 "failed to promote rebalance target in raft"
             );
+            operations.push(tablet_rebalance::RebalanceMembershipOperation {
+                tablet_id: action.tablet_id,
+                operation: "promote_to_voter",
+                node_id: target_node_id.to_string(),
+                raft_node_id: Some(target_raft_node_id),
+                status: "failed",
+                error: Some(error.to_string()),
+            });
             continue;
         }
-        changed += 1;
+        operations.push(tablet_rebalance::RebalanceMembershipOperation {
+            tablet_id: action.tablet_id,
+            operation: "promote_to_voter",
+            node_id: target_node_id.to_string(),
+            raft_node_id: Some(target_raft_node_id),
+            status: "applied",
+            error: None,
+        });
 
         let Some(source_node_id) = action.source_node_id.as_deref() else {
             continue;
@@ -2954,6 +3101,14 @@ async fn apply_rebalance_raft_membership_changes(
                     error = %error,
                     "skipping rebalance source retirement; source node id is invalid"
                 );
+                operations.push(tablet_rebalance::RebalanceMembershipOperation {
+                    tablet_id: action.tablet_id,
+                    operation: "remove_node",
+                    node_id: source_node_id.to_string(),
+                    raft_node_id: None,
+                    status: "failed",
+                    error: Some(error.to_string()),
+                });
                 continue;
             }
         };
@@ -2964,16 +3119,39 @@ async fn apply_rebalance_raft_membership_changes(
                 error = %error,
                 "failed to retire rebalance source from raft"
             );
+            operations.push(tablet_rebalance::RebalanceMembershipOperation {
+                tablet_id: action.tablet_id,
+                operation: "remove_node",
+                node_id: source_node_id.to_string(),
+                raft_node_id: Some(source_raft_node_id),
+                status: "failed",
+                error: Some(error.to_string()),
+            });
             continue;
         }
+        operations.push(tablet_rebalance::RebalanceMembershipOperation {
+            tablet_id: action.tablet_id,
+            operation: "remove_node",
+            node_id: source_node_id.to_string(),
+            raft_node_id: Some(source_raft_node_id),
+            status: "applied",
+            error: None,
+        });
         if tablet_replicas::delete(meta.pool(), action.tablet_id, source_node_id)
             .await
             .map_err(internal_error)?
         {
-            changed += 1;
+            operations.push(tablet_rebalance::RebalanceMembershipOperation {
+                tablet_id: action.tablet_id,
+                operation: "delete_source_replica",
+                node_id: source_node_id.to_string(),
+                raft_node_id: Some(source_raft_node_id),
+                status: "applied",
+                error: None,
+            });
         }
     }
-    Ok(changed)
+    Ok(operations)
 }
 
 async fn retire_draining_rebalance_raft_replicas(
@@ -3158,6 +3336,8 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
             tablet_count: tablets.len(),
             configured_replica_count,
             unhealthy_replica_count,
+            pending_conf_change_count: 0,
+            outbound_message_count: 0,
             tablets,
         }));
     };
@@ -3177,6 +3357,8 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
                     term: status.term,
                     commit_index: status.commit_index,
                     applied_index: status.applied_index,
+                    pending_conf_change: status.pending_conf_change,
+                    outbound_message_count: status.outbound_message_count,
                 })
                 .collect();
             let configured = configured_by_tablet
@@ -3206,12 +3388,28 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
     ));
     let configured_replica_count = configured_by_tablet.values().map(Vec::len).sum();
     let unhealthy_replica_count = count_unhealthy_configured_replicas(&configured_by_tablet);
+    let pending_conf_change_count = tablets
+        .iter()
+        .filter(|tablet| {
+            tablet
+                .replicas
+                .iter()
+                .any(|replica| replica.pending_conf_change)
+        })
+        .count();
+    let outbound_message_count = tablets
+        .iter()
+        .flat_map(|tablet| &tablet.replicas)
+        .map(|replica| replica.outbound_message_count)
+        .sum();
     Ok(Json(RaftStatusResponse {
         enabled: true,
         control_plane_enabled: s.meta.is_some(),
         tablet_count: tablets.len(),
         configured_replica_count,
         unhealthy_replica_count,
+        pending_conf_change_count,
+        outbound_message_count,
         tablets,
     }))
 }
@@ -3689,6 +3887,25 @@ fn configured_raft_replica_statuses(
             let replication_lag = source_applied_index.saturating_sub(replica_applied_index);
             let latest_snapshot =
                 latest_snapshots.get(&(replica.tablet_id, replica.node_id.clone()));
+            let pending_conf_change = runtime
+                .map(|status| status.pending_conf_change)
+                .unwrap_or(false);
+            let outbound_message_count = runtime
+                .map(|status| status.outbound_message_count)
+                .unwrap_or(0);
+            let membership_state = if pending_conf_change {
+                "membership_change_pending"
+            } else if replica.role == "learner" {
+                "catching_up"
+            } else if replica.health == "draining" {
+                "retirement_pending"
+            } else if replica.health == "unreachable" {
+                "unreachable"
+            } else if replication_lag > 0 || replica.health == "lagging" {
+                "catch_up_required"
+            } else {
+                "stable"
+            };
             RaftConfiguredReplicaStatus {
                 node_id: replica.node_id.clone(),
                 raft_node_id,
@@ -3711,6 +3928,9 @@ fn configured_raft_replica_statuses(
                 runtime_term: runtime.map(|status| status.term),
                 runtime_commit_index: runtime.map(|status| status.commit_index),
                 runtime_applied_index: runtime.map(|status| status.applied_index),
+                membership_state: membership_state.into(),
+                pending_conf_change,
+                outbound_message_count,
             }
         })
         .collect()

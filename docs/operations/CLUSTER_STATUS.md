@@ -5,27 +5,35 @@ AgentDB.
 
 ## Short Version
 
-AgentDB does **not** currently have a supported, documented, user-facing
-cluster deployment mode.
+AgentDB now has a real clustered write path in the repository: tablet writes in
+cluster mode can commit through per-tablet TiKV `raft-rs` groups with durable
+TiKV `raft-engine` logs, internal HTTP raft transport, snapshot catch-up, and
+rebalance-driven membership convergence.
 
-There is distributed-design and routing work in the repository, but there is
-not yet a stable operator contract for running a real AgentDB cluster.
+That is still different from a supported, documented, user-facing cluster
+product. The remaining gap is operator hardening: failure-injection coverage,
+stable SLOs, alerting, documented runbooks, and storage lifecycle policy.
 
 ## What Exists Today
 
-The codebase and docs already contain pieces that point toward future
-distributed operation:
+The codebase and docs contain these cluster pieces:
 
 - routing status and routing decision endpoints
 - cluster health and readiness summary endpoints
 - control-plane metadata helpers
 - explicit tablet ownership admin primitives
-- design work for placement/routing/tablets
-- runbooks that mention boxes/tablets and future cluster behavior
-- performance notes from prototype multi-box experiments
+- per-tablet `raft-rs` quorum logs backed by `raft-engine`
+- authenticated internal raft message and snapshot endpoints
+- inbound raft peer validation against configured `tablet_replicas`
+- current/previous internal auth token support for rotation
+- bounded raft outbox flushing with `AGENTDB_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK`
+- retained raft snapshot metadata plus restore/prune workers
+- rebalance, replacement, split, and merge control-plane workflows
+- `/api/admin/raft` status with leader, term, commit/apply index, configured
+  replica lag, pending membership-change state, and outbound-message backlog
 
-Those pieces are useful for development direction, but they are **not** the
-same thing as a supported cluster product.
+Those pieces are useful for development and internal evaluation, but they are
+**not** the same thing as a supported cluster product.
 
 ## What Is Not Yet Supported
 
@@ -36,7 +44,7 @@ These are not currently documented as stable operator procedures:
 - remove a node
 - replace a failed node
 - drain a node
-- automatically rebalance tenants, sessions, or placements
+- operate automatic rebalance as a stable SLO-backed workflow
 - perform a rolling restart
 - perform a rolling upgrade
 - recover a partially failed cluster
@@ -217,9 +225,9 @@ AgentDB is not there yet as a user-facing product.
 The honest operational message today is:
 
 - **supported**: single-node AgentDB
-- **evaluation only**: single-node AgentDB packaged with Docker, Compose, or
-  Helm
-- **future work**: true multi-node clustered AgentDB
+- **evaluation only**: clustered AgentDB with tablet Raft quorum enabled
+- **future work**: production-hardened multi-node AgentDB with published SLOs,
+  runbooks, alerts, and compatibility guarantees
 
 Forward-looking target-state docs exist for that future work:
 

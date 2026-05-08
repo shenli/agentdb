@@ -40,12 +40,23 @@ pub struct RebalanceReport {
     pub owner_counts_after: HashMap<String, usize>,
     pub actions: Vec<RebalanceAction>,
     pub skipped: Vec<RebalanceAction>,
+    pub membership_operations: Vec<RebalanceMembershipOperation>,
 }
 
 impl RebalanceReport {
     pub fn changed_count(&self) -> usize {
         self.actions.iter().filter(|action| action.changed).count()
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RebalanceMembershipOperation {
+    pub tablet_id: i64,
+    pub operation: &'static str,
+    pub node_id: String,
+    pub raft_node_id: Option<u64>,
+    pub status: &'static str,
+    pub error: Option<String>,
 }
 
 pub async fn run(
@@ -117,6 +128,7 @@ pub async fn run(
             owner_counts_after: counts_after,
             actions,
             skipped,
+            membership_operations: Vec::new(),
         });
     }
 
@@ -304,6 +316,7 @@ pub async fn run(
         owner_counts_after: counts_after,
         actions,
         skipped,
+        membership_operations: Vec::new(),
     })
 }
 
