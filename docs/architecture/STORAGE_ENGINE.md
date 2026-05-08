@@ -1145,9 +1145,9 @@ single-session appends or record writes.
   concepts.
 - Do not add implicit cross-tablet two-phase commit for ordinary session
   operations.
-- Do not claim clustered production safety until quorum replication, snapshots,
-  catch-up, split/merge movement, retained snapshot policy, and operational
-  recovery are implemented end to end.
+- Do not claim full autonomous production operation until policy-driven
+  split/merge scheduling, compaction-debt automation, and failure-injection
+  validation are implemented end to end.
 
 ## Open Decisions
 
