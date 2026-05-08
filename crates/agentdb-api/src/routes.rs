@@ -50,7 +50,9 @@ use crate::dto::{
     TransitionSessionLifecycleBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
-use crate::internal_raft_http::RaftRsHttpOutbox;
+use crate::internal_raft_http::{
+    RaftRsHttpOutbox, TabletMovementSnapshotExportRequest, TabletMovementSnapshotExportResponse,
+};
 use crate::routing_http::{
     route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_FORWARDED_BY,
     HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_ID,
@@ -81,6 +83,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/internal/raft/snapshots",
             post(post_internal_raft_snapshot),
+        )
+        .route(
+            "/api/internal/tablet-movements/snapshot/export",
+            post(post_internal_tablet_movement_snapshot_export),
         )
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
@@ -991,6 +997,54 @@ async fn post_internal_raft_snapshot(
             StatusCode::BAD_REQUEST,
             "RAFT_SNAPSHOT_REJECTED",
             err.to_string(),
+        ),
+    }
+}
+
+async fn post_internal_tablet_movement_snapshot_export(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TabletMovementSnapshotExportRequest>,
+) -> Response {
+    if let Err(response) = validate_internal_raft_request(&s, &headers) {
+        return response;
+    }
+    match s.runtime.export_tablet_snapshot_payload_for_shard_range(
+        body.source_tablet_id,
+        body.target_tablet_id,
+        body.start_shard,
+        body.end_shard,
+        body.shard_count,
+    ) {
+        Ok(payload) => {
+            let applied_index = match serde_json::from_slice::<
+                agentdb_core::tablet_state::TabletStateSnapshot,
+            >(&payload)
+            {
+                Ok(snapshot) => snapshot.applied_index,
+                Err(err) => {
+                    return internal_raft_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "TABLET_MOVEMENT_SNAPSHOT_INVALID",
+                        format!("exported tablet movement snapshot is invalid: {err}"),
+                    )
+                }
+            };
+            (
+                StatusCode::OK,
+                Json(TabletMovementSnapshotExportResponse {
+                    source_tablet_id: body.source_tablet_id,
+                    target_tablet_id: body.target_tablet_id,
+                    applied_index,
+                    payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => internal_raft_error(
+            StatusCode::BAD_REQUEST,
+            "TABLET_MOVEMENT_SNAPSHOT_EXPORT_REJECTED",
+            err.message,
         ),
     }
 }

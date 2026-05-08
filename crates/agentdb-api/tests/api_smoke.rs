@@ -6,7 +6,10 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use agentdb_api::{
     internal_raft_http::{RaftRsHttpClient, RaftRsHttpOutbox},
@@ -18,14 +21,17 @@ use agentdb_api::{
     state::{ProxyPolicy, RaftRsIngress},
     AppState,
 };
-use agentdb_core::{runtime::FetchRequest, Id, IdKind, NewAgent, NewSession, NewTenant, Runtime};
+use agentdb_core::{
+    runtime::FetchRequest, Id, IdKind, NewAgent, NewSession, NewTenant, Runtime,
+    RUNTIME_PRIMARY_TABLET_ID,
+};
 use agentdb_meta::{
     nodes::Node, session_locators, tablet_replicas, tablet_snapshots, tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
-    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, RaftRsNodeConfig,
+    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, KvStore, RaftRsNodeConfig,
     RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
-    RaftRsWireMessage, ReplicatedLog,
+    RaftRsWireMessage, ReplicatedLog, RocksKvStore, SingleNodeReplicatedLog,
 };
 use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
@@ -1352,6 +1358,67 @@ async fn internal_raft_http_client_sends_message_and_snapshot() {
 
     assert_eq!(ingress.messages.lock().unwrap()[0].payload, b"msg");
     assert_eq!(ingress.snapshots.lock().unwrap()[0].payload, b"snapshot");
+}
+
+#[tokio::test]
+async fn internal_tablet_movement_snapshot_export_returns_retargeted_payload() {
+    let dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+    let runtime = Runtime::with_kv_and_replicated_logs(
+        kv.clone(),
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([
+            (
+                RUNTIME_PRIMARY_TABLET_ID,
+                Arc::new(SingleNodeReplicatedLog::new(kv.clone()))
+                    as Arc<dyn ReplicatedLog + Send + Sync>,
+            ),
+            (
+                7,
+                Arc::new(SingleNodeReplicatedLog::new(kv)) as Arc<dyn ReplicatedLog + Send + Sync>,
+            ),
+        ]),
+    );
+    let create_runtime = runtime.clone();
+    let tenant = runtime
+        .with_tablet_context(7, async move {
+            create_runtime
+                .create_tenant(NewTenant {
+                    external_key: "movement-export".into(),
+                    policy: json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_internal_auth_token("secret");
+    let app = spawn_app_with_state(state).await;
+    let client = RaftRsHttpClient::new("secret");
+
+    let response = client
+        .export_tablet_movement_snapshot(
+            &app.base,
+            &agentdb_api::internal_raft_http::TabletMovementSnapshotExportRequest {
+                source_tablet_id: 7,
+                target_tablet_id: 8,
+                start_shard: 0,
+                end_shard: 16_383,
+                shard_count: 16_384,
+            },
+        )
+        .await
+        .unwrap();
+    let payload = response.payload().unwrap();
+    let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
+        serde_json::from_slice(&payload).unwrap();
+
+    assert_eq!(response.source_tablet_id, 7);
+    assert_eq!(response.target_tablet_id, 8);
+    assert_eq!(snapshot.tablet_id, 8);
+    assert!(snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.key == format!("record/tenant/{}", tenant.tenant_id).into_bytes()));
 }
 
 #[tokio::test]

@@ -344,6 +344,10 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             startup.meta.clone(),
             startup.node_id.clone(),
             runtime.clone(),
+            config
+                .internal_auth_token
+                .clone()
+                .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
             node_address,
             config.route_region.clone(),
             startup.scheduler_status.clone(),
@@ -2273,6 +2277,7 @@ fn spawn_cluster_workers(
     meta: agentdb_meta::MetaStore,
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
+    movement_snapshot_client: Option<agentdb_api::internal_raft_http::RaftRsHttpClient>,
     node_address: String,
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
@@ -2312,6 +2317,7 @@ fn spawn_cluster_workers(
     let movement_meta = meta.clone();
     let movement_node_id = node_id.clone();
     let movement_runtime = runtime.clone();
+    let movement_snapshot_client = movement_snapshot_client.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(
             config.tablet_movement_executor_interval_ms,
@@ -2322,6 +2328,7 @@ fn spawn_cluster_workers(
             match run_local_tablet_movement_executor_tick(
                 &movement_meta,
                 &movement_runtime,
+                movement_snapshot_client.as_ref(),
                 &movement_node_id,
                 now_ms,
                 config.tablet_movement_batch_size,
@@ -2521,6 +2528,7 @@ async fn run_tablet_movement_tick(
 async fn run_local_tablet_movement_executor_tick(
     meta: &agentdb_meta::MetaStore,
     runtime: &Arc<agentdb_core::Runtime>,
+    movement_snapshot_client: Option<&agentdb_api::internal_raft_http::RaftRsHttpClient>,
     node_id: &str,
     now_ms: i64,
     batch_size: i64,
@@ -2530,17 +2538,24 @@ async fn run_local_tablet_movement_executor_tick(
     let mut by_destination =
         BTreeMap::<i64, Vec<agentdb_meta::tablet_movements::TabletMovement>>::new();
     for movement in pending {
-        if !registered_tablets.contains(&movement.source_tablet_id)
-            || !registered_tablets.contains(&movement.destination_tablet_id)
+        if !registered_tablets.contains(&movement.destination_tablet_id) {
+            continue;
+        }
+        let source_is_local = registered_tablets.contains(&movement.source_tablet_id)
+            && local_serving_replica(meta, movement.source_tablet_id, node_id)
+                .await?
+                .is_some();
+        if !source_is_local
+            && (movement_snapshot_client.is_none()
+                || source_replica_url(meta, movement.source_tablet_id, node_id)
+                    .await?
+                    .is_none())
         {
             continue;
         }
-        if local_serving_replica(meta, movement.source_tablet_id, node_id)
+        if local_serving_replica(meta, movement.destination_tablet_id, node_id)
             .await?
             .is_none()
-            || local_serving_replica(meta, movement.destination_tablet_id, node_id)
-                .await?
-                .is_none()
         {
             continue;
         }
@@ -2586,15 +2601,45 @@ async fn run_local_tablet_movement_executor_tick(
                 );
                 continue;
             };
-            let payload = runtime
-                .export_tablet_snapshot_payload_for_shard_range(
-                    movement.source_tablet_id,
-                    movement.destination_tablet_id,
-                    movement.start_shard,
-                    movement.end_shard,
-                    scope.shard_count,
-                )
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let payload = if registered_tablets.contains(&movement.source_tablet_id)
+                && local_serving_replica(meta, movement.source_tablet_id, node_id)
+                    .await?
+                    .is_some()
+            {
+                runtime
+                    .export_tablet_snapshot_payload_for_shard_range(
+                        movement.source_tablet_id,
+                        movement.destination_tablet_id,
+                        movement.start_shard,
+                        movement.end_shard,
+                        scope.shard_count,
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            } else {
+                let client = movement_snapshot_client
+                    .ok_or_else(|| anyhow::anyhow!("tablet movement snapshot client is missing"))?;
+                let base_url = source_replica_url(meta, movement.source_tablet_id, node_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no remote source replica URL for tablet {}",
+                            movement.source_tablet_id
+                        )
+                    })?;
+                client
+                    .export_tablet_movement_snapshot(
+                        &base_url,
+                        &agentdb_api::internal_raft_http::TabletMovementSnapshotExportRequest {
+                            source_tablet_id: movement.source_tablet_id,
+                            target_tablet_id: movement.destination_tablet_id,
+                            start_shard: movement.start_shard,
+                            end_shard: movement.end_shard,
+                            shard_count: scope.shard_count,
+                        },
+                    )
+                    .await?
+                    .payload()?
+            };
             let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
                 serde_json::from_slice(&payload)?;
             let installed = match movement_type {
@@ -2663,6 +2708,26 @@ async fn local_serving_replica(
             .into_iter()
             .find(|replica| replica.node_id == node_id && replica.role != "log_only"),
     )
+}
+
+async fn source_replica_url(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    local_node_id: &str,
+) -> anyhow::Result<Option<String>> {
+    for replica in agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await? {
+        if replica.node_id == local_node_id || replica.role == "log_only" {
+            continue;
+        }
+        let Some(node) = agentdb_meta::nodes::get(meta.pool(), &replica.node_id).await? else {
+            continue;
+        };
+        if node.address.trim().is_empty() {
+            continue;
+        }
+        return Ok(Some(node.address));
+    }
+    Ok(None)
 }
 
 async fn tablet_movement_destination_ready(
@@ -3482,7 +3547,7 @@ region = "us-west-2"
             .unwrap();
 
         let executed =
-            run_local_tablet_movement_executor_tick(&meta, &runtime, "node-a", 2_000, 64)
+            run_local_tablet_movement_executor_tick(&meta, &runtime, None, "node-a", 2_000, 64)
                 .await
                 .unwrap();
 
