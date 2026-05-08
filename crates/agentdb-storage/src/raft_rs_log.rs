@@ -802,7 +802,11 @@ impl RaftRsGroup {
             .wl()
             .compact(up_to_index.saturating_add(1))
             .map_err(map_raft_error)?;
-        node.compact_engine_entries(up_to_index)
+        let persisted_deleted = node.compact_engine_entries(up_to_index)?;
+        let retained_before = node.committed.len();
+        node.committed.retain(|entry| entry.index > up_to_index);
+        let retained_deleted = retained_before.saturating_sub(node.committed.len());
+        Ok(persisted_deleted.max(retained_deleted))
     }
 
     fn status(&self) -> Vec<RaftRsReplicaStatus> {
@@ -1341,11 +1345,14 @@ mod tests {
         logs[0].append(7, b"first".to_vec()).unwrap();
         logs[0].append(7, b"second".to_vec()).unwrap();
 
-        let deleted = logs[0].compact(7, 1).unwrap();
+        let before = logs[0].committed_entries(7, 0, 10).unwrap();
+        assert_eq!(before.len(), 2);
+        let deleted = logs[0].compact(7, before[0].index).unwrap();
 
         assert!(deleted >= 1);
         let entries = logs[0].committed_entries(7, 0, 10).unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, b"second");
     }
 
     #[test]
