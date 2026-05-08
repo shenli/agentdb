@@ -1045,11 +1045,15 @@ single-session appends or record writes.
    range-map cutovers only after destination replicas are healthy and caught up
    to the source applied index. Prepare also writes `tablet_movements` rows,
    giving Raft/state-copy workers an explicit source-to-destination work queue
-   with shard range and required applied index. Complete marks those movement
-   rows `completed`. The system does not yet perform the copy/replay itself or
-   actively bootstrap split-created Raft groups; those workers must process
-   `tablet_movements` and update `tablet_replicas` progress before cutover
-   succeeds.
+   with shard range and required applied index. The scheduler leader now scans
+   pending movement rows (`AGENTDB_TABLET_MOVEMENT_BATCH_SIZE`, default `64`)
+   and marks them `completed` after every destination serving replica is healthy
+   and has `applied_index >= required_applied_index`. Complete also marks rows
+   completed as part of the explicit cutover path. The system still does not
+   perform range-aware state copy/replay itself or actively bootstrap
+   split-created Raft groups; those workers must update `tablet_replicas`
+   progress before cutover succeeds and before the movement worker can close
+   the row.
 
 9. Add compressed tablet-map ranges.
 
