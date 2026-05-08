@@ -1057,10 +1057,13 @@ single-session appends or record writes.
    is included in every child snapshot so validation data is present wherever a
    routed session may land. A merge destination can install source snapshots
    non-destructively so multiple source tablets can be combined. The active
-   copy/replay worker and split-created Raft group bootstrap are still not
-   wired; those workers must use the snapshot primitives and update
-   `tablet_replicas` progress before cutover succeeds and before the movement
-   worker can close the row.
+   local same-node copy/replay executor is wired into cluster workers: when a
+   node hosts both the source and destination replicas for a pending movement,
+   it exports the filtered source snapshot, installs it into the destination
+   tablet, and updates that node's destination `tablet_replicas` progress and
+   health. The scheduler leader still owns final movement completion once every
+   destination serving replica is ready. Cross-node source streaming and
+   split-created Raft group bootstrap are still follow-up work.
 
 9. Add compressed tablet-map ranges.
 

@@ -32,6 +32,7 @@ const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
+const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
@@ -342,6 +343,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         spawn_cluster_workers(
             startup.meta.clone(),
             startup.node_id.clone(),
+            runtime.clone(),
             node_address,
             config.route_region.clone(),
             startup.scheduler_status.clone(),
@@ -538,6 +540,7 @@ struct ClusterWorkerConfig {
     reaper_safety_margin_ms: i64,
     rebalance_max_movements: usize,
     tablet_movement_batch_size: i64,
+    tablet_movement_executor_interval_ms: u64,
 }
 
 impl ClusterWorkerConfig {
@@ -575,6 +578,11 @@ impl ClusterWorkerConfig {
                 DEFAULT_TABLET_MOVEMENT_BATCH_SIZE,
             )
             .clamp(1, 1_000),
+            tablet_movement_executor_interval_ms: env_u64(
+                "AGENTDB_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS",
+                DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS,
+            )
+            .max(1_000),
         }
     }
 }
@@ -2264,6 +2272,7 @@ fn spawn_route_snapshot_refresher(
 fn spawn_cluster_workers(
     meta: agentdb_meta::MetaStore,
     node_id: String,
+    runtime: Arc<agentdb_core::Runtime>,
     node_address: String,
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
@@ -2296,6 +2305,44 @@ fn spawn_cluster_workers(
             .await
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
+            }
+        }
+    });
+
+    let movement_meta = meta.clone();
+    let movement_node_id = node_id.clone();
+    let movement_runtime = runtime.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            config.tablet_movement_executor_interval_ms,
+        ));
+        loop {
+            interval.tick().await;
+            let now_ms = now_ms_i64();
+            match run_local_tablet_movement_executor_tick(
+                &movement_meta,
+                &movement_runtime,
+                &movement_node_id,
+                now_ms,
+                config.tablet_movement_batch_size,
+            )
+            .await
+            {
+                Ok(executed_count) if executed_count > 0 => {
+                    tracing::info!(
+                        node_id = %movement_node_id,
+                        executed_count,
+                        "local tablet movement executor copied runtime snapshots"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        node_id = %movement_node_id,
+                        error = %error,
+                        "local tablet movement executor failed"
+                    );
+                }
             }
         }
     });
@@ -2469,6 +2516,153 @@ async fn run_tablet_movement_tick(
         }
     }
     Ok(completed)
+}
+
+async fn run_local_tablet_movement_executor_tick(
+    meta: &agentdb_meta::MetaStore,
+    runtime: &Arc<agentdb_core::Runtime>,
+    node_id: &str,
+    now_ms: i64,
+    batch_size: i64,
+) -> anyhow::Result<usize> {
+    let pending = agentdb_meta::tablet_movements::list_pending(meta.pool(), batch_size).await?;
+    let registered_tablets = runtime.registered_tablet_ids();
+    let mut by_destination =
+        BTreeMap::<i64, Vec<agentdb_meta::tablet_movements::TabletMovement>>::new();
+    for movement in pending {
+        if !registered_tablets.contains(&movement.source_tablet_id)
+            || !registered_tablets.contains(&movement.destination_tablet_id)
+        {
+            continue;
+        }
+        if local_serving_replica(meta, movement.source_tablet_id, node_id)
+            .await?
+            .is_none()
+            || local_serving_replica(meta, movement.destination_tablet_id, node_id)
+                .await?
+                .is_none()
+        {
+            continue;
+        }
+        by_destination
+            .entry(movement.destination_tablet_id)
+            .or_default()
+            .push(movement);
+    }
+
+    let mut executed = 0usize;
+    for (destination_tablet_id, movements) in by_destination {
+        let movement_type = movements[0].movement_type.as_str();
+        if movement_type == "split" && movements.len() != 1 {
+            tracing::warn!(
+                destination_tablet_id,
+                movement_count = movements.len(),
+                "skipping ambiguous split movement group"
+            );
+            continue;
+        }
+        if movements
+            .iter()
+            .any(|movement| movement.movement_type.as_str() != movement_type)
+        {
+            tracing::warn!(
+                destination_tablet_id,
+                "skipping mixed tablet movement group"
+            );
+            continue;
+        }
+
+        let mut max_installed_index = 0i64;
+        let mut installed_count = 0usize;
+        for movement in &movements {
+            let Some(scope) =
+                agentdb_meta::placement_scopes::get(meta.pool(), &movement.placement_scope_id)
+                    .await?
+            else {
+                tracing::warn!(
+                    movement_id = %movement.movement_id,
+                    placement_scope_id = %movement.placement_scope_id,
+                    "skipping tablet movement with missing placement scope"
+                );
+                continue;
+            };
+            let payload = runtime
+                .export_tablet_snapshot_payload_for_shard_range(
+                    movement.source_tablet_id,
+                    movement.destination_tablet_id,
+                    movement.start_shard,
+                    movement.end_shard,
+                    scope.shard_count,
+                )
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
+                serde_json::from_slice(&payload)?;
+            let installed = match movement_type {
+                "split" => runtime
+                    .install_tablet_snapshot_payload_and_rehydrate(
+                        movement.destination_tablet_id,
+                        &payload,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                "merge" => runtime
+                    .install_tablet_snapshot_payload_merge_and_rehydrate(
+                        movement.destination_tablet_id,
+                        &payload,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                other => {
+                    tracing::warn!(
+                        movement_id = %movement.movement_id,
+                        movement_type = other,
+                        "skipping unsupported tablet movement type"
+                    );
+                    false
+                }
+            };
+            if installed {
+                installed_count += 1;
+                max_installed_index = max_installed_index.max(snapshot.applied_index as i64);
+            }
+        }
+
+        if installed_count != movements.len() {
+            continue;
+        }
+        agentdb_meta::tablet_replicas::set_progress(
+            meta.pool(),
+            destination_tablet_id,
+            node_id,
+            max_installed_index,
+            max_installed_index,
+            now_ms,
+        )
+        .await?;
+        agentdb_meta::tablet_replicas::set_health(
+            meta.pool(),
+            destination_tablet_id,
+            node_id,
+            "healthy",
+            now_ms,
+        )
+        .await?;
+        executed += installed_count;
+    }
+    Ok(executed)
+}
+
+async fn local_serving_replica(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    node_id: &str,
+) -> agentdb_meta::MetaResult<Option<agentdb_meta::tablet_replicas::TabletReplica>> {
+    Ok(
+        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+            .await?
+            .into_iter()
+            .find(|replica| replica.node_id == node_id && replica.role != "log_only"),
+    )
 }
 
 async fn tablet_movement_destination_ready(
@@ -2916,6 +3110,7 @@ region = "us-west-2"
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -2955,6 +3150,7 @@ region = "us-west-2"
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
             .await
@@ -2995,6 +3191,7 @@ region = "us-west-2"
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -3047,6 +3244,7 @@ region = "us-west-2"
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -3118,6 +3316,7 @@ region = "us-west-2"
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -3219,6 +3418,92 @@ region = "us-west-2"
             .unwrap();
         assert_eq!(movement.status, "pending");
         assert_eq!(movement.completed_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn local_tablet_movement_executor_installs_split_snapshot_and_updates_progress() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 1_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "learner", "lagging", 0, 0, 1_000)
+            .await
+            .unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "split:7:8",
+            "split",
+            7,
+            8,
+            agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID,
+            0,
+            16_383,
+            1,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
+            Arc::new(agentdb_storage::RocksKvStore::open(dir.path()).unwrap());
+        let runtime = agentdb_core::Runtime::with_kv_and_replicated_logs(
+            kv.clone(),
+            Arc::new(agentdb_storage::InMemoryContentBackend::default()),
+            BTreeMap::from([
+                (
+                    agentdb_core::RUNTIME_PRIMARY_TABLET_ID,
+                    Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv.clone()))
+                        as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                ),
+                (
+                    7,
+                    Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv.clone()))
+                        as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                ),
+                (
+                    8,
+                    Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv))
+                        as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
+                ),
+            ]),
+        );
+        let create_runtime = runtime.clone();
+        let tenant = runtime
+            .with_tablet_context(7, async move {
+                create_runtime
+                    .create_tenant(agentdb_core::NewTenant {
+                        external_key: "local-movement".into(),
+                        policy: serde_json::json!({}),
+                    })
+                    .await
+            })
+            .await
+            .unwrap();
+
+        let executed =
+            run_local_tablet_movement_executor_tick(&meta, &runtime, "node-a", 2_000, 64)
+                .await
+                .unwrap();
+
+        assert_eq!(executed, 1);
+        let replica = tablet_replicas::list_by_tablet(meta.pool(), 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|replica| replica.node_id == "node-a")
+            .unwrap();
+        assert_eq!(replica.health, "healthy");
+        assert_eq!(replica.applied_index, 1);
+
+        let read_runtime = runtime.clone();
+        let moved_tenant = runtime
+            .with_tablet_context(8, async move {
+                read_runtime.get_tenant(&tenant.tenant_id).await
+            })
+            .await
+            .unwrap();
+        assert_eq!(moved_tenant.external_key, "local-movement");
     }
 
     #[tokio::test]
