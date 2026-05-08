@@ -261,6 +261,14 @@ impl LoggedTabletStateMachine {
         let next_applied_index = self.applied_index().max(snapshot.applied_index);
         let mut ops = Vec::with_capacity(snapshot.entries.len() + 1);
         for entry in &snapshot.entries {
+            if let Some(existing) = self.store.get(&entry.key)? {
+                if existing != entry.value {
+                    return Err(agentdb_storage::Error::Other(format!(
+                        "snapshot merge conflict for key `{}`",
+                        String::from_utf8_lossy(&entry.key)
+                    )));
+                }
+            }
             ops.push(WriteOp::Put {
                 key: entry.key.clone(),
                 value: entry.value.clone(),
@@ -855,6 +863,31 @@ mod tests {
         assert_eq!(
             target.store().get(b"incoming").unwrap().as_deref(),
             Some(&b"right"[..])
+        );
+    }
+
+    #[test]
+    fn snapshot_merge_install_rejects_conflicting_existing_entries() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_kv = Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+        let target = LoggedTabletStateMachine::single_node(target_kv, 9).unwrap();
+        target.store().put(b"shared", b"old").unwrap();
+        let snapshot = TabletStateSnapshot {
+            tablet_id: 9,
+            applied_index: 4,
+            entries: vec![TabletSnapshotEntry {
+                key: b"shared".to_vec(),
+                value: b"new".to_vec(),
+            }],
+        };
+
+        let err = target.install_snapshot_merge(&snapshot).unwrap_err();
+
+        assert!(err.to_string().contains("snapshot merge conflict"));
+        assert_eq!(target.applied_index(), 0);
+        assert_eq!(
+            target.store().get(b"shared").unwrap().as_deref(),
+            Some(&b"old"[..])
         );
     }
 
