@@ -74,6 +74,7 @@ pub struct TabletStorageStats {
     pub value_bytes: u64,
     pub storage_bytes: u64,
     pub applied_index: u64,
+    pub compaction_debt_ops: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +322,10 @@ impl LoggedTabletStateMachine {
             key_bytes = key_bytes.saturating_add(key.len() as u64);
             value_bytes = value_bytes.saturating_add(value.len() as u64);
         }
+        let compaction_debt_ops = self
+            .log
+            .committed_entries(self.tablet_id, 0, usize::MAX)?
+            .len() as u64;
         Ok(TabletStorageStats {
             tablet_id: self.tablet_id,
             key_count,
@@ -328,6 +333,7 @@ impl LoggedTabletStateMachine {
             value_bytes,
             storage_bytes: key_bytes.saturating_add(value_bytes),
             applied_index: self.applied_index(),
+            compaction_debt_ops,
         })
     }
 }
@@ -648,6 +654,10 @@ mod tests {
         assert_eq!(stats.value_bytes, 18);
         assert_eq!(stats.storage_bytes, 22);
         assert_eq!(stats.applied_index, 1);
+        assert_eq!(stats.compaction_debt_ops, 1);
+
+        assert_eq!(machine.compact_log_through(1).unwrap(), 1);
+        assert_eq!(machine.storage_stats().unwrap().compaction_debt_ops, 0);
     }
 
     #[test]

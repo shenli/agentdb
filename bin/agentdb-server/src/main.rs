@@ -572,6 +572,7 @@ struct ClusterWorkerConfig {
     tablet_lifecycle_split_max_storage_bytes: i64,
     tablet_lifecycle_merge_max_storage_bytes: i64,
     tablet_lifecycle_split_min_write_ops_per_sec_milli: i64,
+    tablet_lifecycle_split_max_compaction_debt_ops: i64,
     tablet_lifecycle_max_actions: usize,
     tablet_lifecycle_cooldown_ms: i64,
 }
@@ -644,6 +645,11 @@ impl ClusterWorkerConfig {
                 "AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC_MILLI",
                 env_i64("AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC", 0)
                     .saturating_mul(1_000),
+            )
+            .max(0),
+            tablet_lifecycle_split_max_compaction_debt_ops: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_COMPACTION_DEBT_OPS",
+                0,
             )
             .max(0),
             tablet_lifecycle_max_actions: env_usize(
@@ -2597,6 +2603,7 @@ async fn run_local_tablet_stats_tick(
             sample_interval_ms,
             write_ops_delta,
             write_ops_per_sec_milli,
+            u64_to_i64_saturating(stats.compaction_debt_ops),
             now_ms,
         )
         .await?;
@@ -3008,6 +3015,7 @@ async fn run_tablet_lifecycle_policy_tick(
         && config.tablet_lifecycle_split_max_storage_bytes == 0
         && config.tablet_lifecycle_merge_max_storage_bytes == 0
         && config.tablet_lifecycle_split_min_write_ops_per_sec_milli == 0
+        && config.tablet_lifecycle_split_max_compaction_debt_ops == 0
     {
         return Ok(TabletLifecyclePolicyReport::default());
     }
@@ -3203,6 +3211,7 @@ fn lifecycle_split_enabled(config: &ClusterWorkerConfig) -> bool {
         || config.tablet_lifecycle_split_max_keys > 0
         || config.tablet_lifecycle_split_max_storage_bytes > 0
         || config.tablet_lifecycle_split_min_write_ops_per_sec_milli > 0
+        || config.tablet_lifecycle_split_max_compaction_debt_ops > 0
 }
 
 fn lifecycle_merge_enabled(config: &ClusterWorkerConfig) -> bool {
@@ -3226,6 +3235,9 @@ fn should_split_tablet(
                 || (config.tablet_lifecycle_split_min_write_ops_per_sec_milli > 0
                     && stats.write_ops_per_sec_milli
                         >= config.tablet_lifecycle_split_min_write_ops_per_sec_milli)
+                || (config.tablet_lifecycle_split_max_compaction_debt_ops > 0
+                    && stats.compaction_debt_ops
+                        > config.tablet_lifecycle_split_max_compaction_debt_ops)
         })
 }
 
@@ -4111,6 +4123,7 @@ mod tests {
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         }
@@ -4499,6 +4512,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4548,6 +4562,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4598,6 +4613,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4660,6 +4676,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4741,6 +4758,7 @@ region = "us-west-2"
             tablet_lifecycle_split_max_storage_bytes: 0,
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4912,6 +4930,7 @@ region = "us-west-2"
             1_000,
             10,
             10_000,
+            500,
             200,
         )
         .await
@@ -4919,6 +4938,43 @@ region = "us-west-2"
 
         let mut config = lifecycle_config(0, 0);
         config.tablet_lifecycle_split_min_write_ops_per_sec_milli = 5_000;
+        let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(report.prepared_split_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_prepares_split_from_compaction_debt_stats() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 20, 20, 100)
+            .await
+            .unwrap();
+        tablet_stats::upsert_with_rate(
+            meta.pool(),
+            7,
+            "node-a",
+            10,
+            100,
+            1_500,
+            1_600,
+            20,
+            1_000,
+            10,
+            10_000,
+            500,
+            200,
+        )
+        .await
+        .unwrap();
+
+        let mut config = lifecycle_config(0, 0);
+        config.tablet_lifecycle_split_max_compaction_debt_ops = 100;
         let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &config)
             .await
             .unwrap();

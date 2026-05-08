@@ -116,6 +116,10 @@ splits when the heartbeat-derived applied-index write rate reaches the
 configured rate. Use
 `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC_MILLI` when sub-1-op/sec
 precision is needed. Set
+`AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_COMPACTION_DEBT_OPS` to split when a
+tablet's retained committed log entries exceed the threshold; this is the
+current retained-log compaction-debt signal, not a full LSM compaction metric.
+Set
 `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS` to prepare a merge for adjacent
 serving tablets whose individual spans are at or below the threshold.
 `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS` and
