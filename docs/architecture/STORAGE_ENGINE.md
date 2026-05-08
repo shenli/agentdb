@@ -531,7 +531,10 @@ State meanings:
 - `draining`: no new writes should be routed here; in-flight requests finish or
   fail with stale epoch.
 - `tombstoned`: the tablet no longer owns shards. Local state can be deleted
-  after retention, snapshot, and audit requirements are satisfied.
+  after retention, snapshot, and audit requirements are satisfied. Runtime
+  registry sync ignores tombstoned tablets, and the scheduler removes their
+  replica rows so old source Raft groups stop being reopened after split/merge
+  cutover.
 
 ### Split Flow
 
@@ -1074,7 +1077,9 @@ single-session appends or record writes.
    `tablet_replicas` progress and health. `tablet_replicas` changes emit the
    tablet metadata notification used by cluster workers, so split/merge-created
    destination replicas are opened as local `raft-rs` runtime groups by the
-   same registry sync path used at startup.
+   same registry sync path used at startup. After cutover, the scheduler deletes
+   replica metadata for tombstoned source tablets; registry sync ignores any
+   remaining tombstoned replicas and unregisters local runtime Raft groups.
 
 9. Add compressed tablet-map ranges.
 

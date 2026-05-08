@@ -153,6 +153,8 @@ when metadata-backed cluster mode is enabled:
 - automatic split/merge movement convergence that marks copied movement rows
   completed and publishes the prepared range-map cutover once the whole group
   is ready
+- tombstoned-tablet replica cleanup so split/merge source Raft groups stop
+  being reopened after cutover
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.

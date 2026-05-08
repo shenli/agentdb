@@ -143,6 +143,15 @@ pub async fn delete(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult
     Ok(rows > 0)
 }
 
+pub async fn delete_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<u64> {
+    let rows = sqlx::query("DELETE FROM tablet_replicas WHERE tablet_id = ?")
+        .bind(tablet_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows)
+}
+
 fn validate_role(role: &str) -> MetaResult<()> {
     match role {
         "voter" | "learner" | "log_only" => Ok(()),
@@ -266,5 +275,23 @@ mod tests {
             .unwrap();
         assert!(delete(&p, 7, "node-a").await.unwrap());
         assert!(!delete(&p, 7, "node-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_by_tablet_removes_all_replicas_for_tablet() {
+        let p = pool().await;
+        upsert(&p, 7, "node-a", "voter", "healthy", 1, 1, 100)
+            .await
+            .unwrap();
+        upsert(&p, 7, "node-b", "learner", "lagging", 0, 0, 100)
+            .await
+            .unwrap();
+        upsert(&p, 8, "node-a", "voter", "healthy", 1, 1, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(delete_by_tablet(&p, 7).await.unwrap(), 2);
+        assert!(list_by_tablet(&p, 7).await.unwrap().is_empty());
+        assert_eq!(list_by_tablet(&p, 8).await.unwrap().len(), 1);
     }
 }
