@@ -98,10 +98,10 @@ And a very small amount of direct metadata admin:
   promote a healthy, caught-up replacement target to owner; use
   `--min-applied-index` when source replica progress is unavailable and
   `--retire-source` when the old owner should be removed from replica metadata
-- `agentdbctl tablets prepare-split` / `complete-split` to fence a parent
-  tablet, create child tablet metadata, and publish the child range-map cutover
-  after destination replicas are healthy and caught up
-- `agentdbctl tablets prepare-merge` / `complete-merge` to fence source
+- `agentdbctl tablets prepare-split` / `complete-split` to fence a serving
+  parent tablet, create child tablet metadata, and publish the child range-map
+  cutover after destination replicas are healthy and caught up
+- `agentdbctl tablets prepare-merge` / `complete-merge` to fence serving source
   tablets, create destination tablet metadata, and publish the merged range-map
   cutover after destination replicas are healthy and caught up
 - `agentdbctl tablets movements --status pending` to inspect split/merge

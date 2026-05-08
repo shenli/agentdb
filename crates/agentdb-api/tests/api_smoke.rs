@@ -2157,6 +2157,122 @@ async fn admin_tablet_ranges_replace_round_trip() {
 }
 
 #[tokio::test]
+async fn admin_tablet_split_merge_prepare_rejects_conflicting_lifecycle_state() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        7,
+        "default",
+        "serving",
+        Some("raft/7"),
+        0,
+        100,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        8,
+        "default",
+        "serving",
+        Some("raft/8"),
+        0,
+        100,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "default", 100, 199, 8, 1, 100)
+        .await
+        .unwrap();
+    let app = spawn_app_with_state(AppState::new(runtime).with_meta(meta.clone())).await;
+
+    let rejected_destination = app
+        .client
+        .post(format!("{}/api/admin/tablets/7/split/prepare", app.base))
+        .json(&json!({
+            "child_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 8},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 9}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_destination.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    agentdb_meta::tablets::set_state(meta.pool(), 7, "splitting")
+        .await
+        .unwrap();
+    let rejected_source = app
+        .client
+        .post(format!("{}/api/admin/tablets/7/split/prepare", app.base))
+        .json(&json!({
+            "child_ranges": [
+                {"start_shard": 0, "end_shard": 49, "tablet_id": 10},
+                {"start_shard": 50, "end_shard": 99, "tablet_id": 11}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_source.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        30,
+        "merge-scope",
+        "serving",
+        Some("raft/30"),
+        0,
+        100,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablets::create_with_placement(
+        meta.pool(),
+        31,
+        "merge-scope",
+        "merging",
+        Some("raft/31"),
+        0,
+        100,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "merge-scope", 0, 49, 30, 1, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablet_ranges::upsert(meta.pool(), "merge-scope", 50, 99, 31, 1, 100)
+        .await
+        .unwrap();
+    let rejected_merge_source = app
+        .client
+        .post(format!("{}/api/admin/tablets/merge/prepare", app.base))
+        .json(&json!({
+            "placement_scope_id": "merge-scope",
+            "source_tablet_ids": [30, 31],
+            "destination_tablet_id": 32
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_merge_source.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
 async fn admin_tablet_split_merge_lifecycle_round_trip() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();

@@ -1701,6 +1701,42 @@ async fn create_lifecycle_tablet_if_missing(
     Ok(true)
 }
 
+fn ensure_prepare_source_serving(tablet: &tablets::Tablet, action: &str) -> Result<(), ApiError> {
+    if tablet.state != "serving" {
+        return Err(invalid_admin_request(format!(
+            "{action} prepare requires source tablet {} to be `serving`, got `{}`",
+            tablet.tablet_id, tablet.state
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_prepare_destination_available(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    placement_scope_id: &str,
+    action: &str,
+) -> Result<(), ApiError> {
+    if let Some(tablet) = tablets::get(meta.pool(), tablet_id)
+        .await
+        .map_err(internal_error)?
+    {
+        if tablet.state != "creating" {
+            return Err(invalid_admin_request(format!(
+                "{action} prepare destination tablet {tablet_id} must be missing or `creating`, got `{}`",
+                tablet.state
+            )));
+        }
+    }
+    let existing_ranges = scoped_ranges_for_tablet(meta, tablet_id, placement_scope_id).await?;
+    if !existing_ranges.is_empty() {
+        return Err(invalid_admin_request(format!(
+            "{action} prepare destination tablet {tablet_id} already owns ranges in placement scope {placement_scope_id}"
+        )));
+    }
+    Ok(())
+}
+
 async fn source_applied_index(
     meta: &agentdb_meta::MetaStore,
     source_tablet_ids: &[i64],
@@ -1972,6 +2008,7 @@ async fn prepare_admin_tablet_split(
 ) -> Result<Json<AdminTabletRangeLifecycleResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let source = get_tablet_or_404(meta, tablet_id).await?;
+    ensure_prepare_source_serving(&source, "split")?;
     if body.child_ranges.len() < 2 {
         return Err(invalid_admin_request(
             "split prepare requires at least two child ranges",
@@ -2008,6 +2045,8 @@ async fn prepare_admin_tablet_split(
         .map(|range| range.tablet_id)
         .collect();
     for child in &body.child_ranges {
+        ensure_prepare_destination_available(meta, child.tablet_id, &placement_scope_id, "split")
+            .await?;
         changed |=
             create_lifecycle_tablet_if_missing(meta, &source, child.tablet_id, "creating", now_ms)
                 .await?;
@@ -2217,6 +2256,7 @@ async fn prepare_admin_tablet_merge(
     let mut old_ranges = Vec::new();
     for source_id in &body.source_tablet_ids {
         let source = get_tablet_or_404(meta, *source_id).await?;
+        ensure_prepare_source_serving(&source, "merge")?;
         if source.placement_scope_id != first_source.placement_scope_id {
             return Err(invalid_admin_request(
                 "merge sources must have the same placement scope",
@@ -2233,6 +2273,13 @@ async fn prepare_admin_tablet_merge(
     let new_range = union_replacement_range(&old_ranges, body.destination_tablet_id)?;
     tablet_ranges::validate_replacement_plan(&old_bounds, &[new_range])
         .map_err(|err| invalid_admin_request(err.to_string()))?;
+    ensure_prepare_destination_available(
+        meta,
+        body.destination_tablet_id,
+        &placement_scope_id,
+        "merge",
+    )
+    .await?;
     let now_ms = now_ms_i64();
     let mut changed = create_lifecycle_tablet_if_missing(
         meta,

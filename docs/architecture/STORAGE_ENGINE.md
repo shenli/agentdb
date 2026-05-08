@@ -1050,10 +1050,12 @@ single-session appends or record writes.
    prepares owned-tablet movement by creating learner replica intent for the
    target, and completes prepared replacements once the target is healthy and
    caught up. Admin split/merge lifecycle endpoints and `agentdbctl tablets`
-   commands can now prepare fenced source/destination tablet metadata, seed
-   destination replica intent from source replica placement, and complete atomic
-   range-map cutovers only after destination replicas are healthy and caught up
-   to the source applied index. Prepare also writes `tablet_movements` rows,
+   commands can now prepare fenced source/destination tablet metadata only from
+   `serving` sources and missing or already-`creating` destinations that do not
+   own ranges in the placement scope. They seed destination replica intent from
+   source replica placement, and complete atomic range-map cutovers only after
+   destination replicas are healthy and caught up to the source applied index.
+   Prepare also writes `tablet_movements` rows,
    giving Raft/state-copy workers an explicit source-to-destination work queue
    with shard range and required applied index. The scheduler leader now scans
    movement rows (`AGENTDB_TABLET_MOVEMENT_BATCH_SIZE`, default `64`), marks
