@@ -109,8 +109,15 @@ emergency/manual recovery after separately proving state safety.
 Automatic preparation is opt-in. Set
 `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS` to prepare a two-way split for a
 serving tablet whose contiguous shard span exceeds the threshold. Set
+`AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS` or
+`AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES` to split from locally
+published tablet stats instead. Set
 `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS` to prepare a merge for adjacent
 serving tablets whose individual spans are at or below the threshold.
+`AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS` and
+`AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES` add stat-based merge caps;
+when those caps are configured, tablets without stats are skipped rather than
+merged blindly.
 `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS` bounds prepared lifecycle groups per
 scheduler tick. These knobs only enqueue the same movement rows as the manual
 commands; existing copy/catch-up/cutover safety checks still gate completion.

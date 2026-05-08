@@ -50,7 +50,7 @@ use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
     LoggedTabletStateMachine, TabletCommand, TabletSnapshotShardFilter, TabletStateMachine,
-    TabletStateSnapshot, TabletWriteOp,
+    TabletStateSnapshot, TabletStorageStats, TabletWriteOp,
 };
 use crate::tenant::{NewTenant, Tenant};
 
@@ -796,6 +796,19 @@ impl RuntimeTabletRouterKvStore {
         self.with_handle(tablet_id, |handle| {
             handle.state_machine.compact_log_through(up_to_index)
         })
+    }
+
+    fn storage_stats(&self) -> agentdb_storage::Result<Vec<TabletStorageStats>> {
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut stats = Vec::with_capacity(tablets.len());
+        for handle in tablets.values() {
+            stats.push(handle.state_machine.storage_stats()?);
+        }
+        stats.sort_by_key(|stats| stats.tablet_id);
+        Ok(stats)
     }
 }
 
@@ -1634,6 +1647,13 @@ impl Runtime {
             .as_ref()
             .map(|router| router.tablet_ids())
             .unwrap_or_else(|| BTreeSet::from([RUNTIME_PRIMARY_TABLET_ID]))
+    }
+
+    pub fn local_tablet_storage_stats(&self) -> Result<Vec<TabletStorageStats>> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(Vec::new());
+        };
+        router.storage_stats().map_err(internal)
     }
 
     pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {

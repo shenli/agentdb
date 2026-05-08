@@ -566,6 +566,10 @@ struct ClusterWorkerConfig {
     tablet_movement_executor_interval_ms: u64,
     tablet_lifecycle_split_max_shards: i64,
     tablet_lifecycle_merge_max_shards: i64,
+    tablet_lifecycle_split_max_keys: i64,
+    tablet_lifecycle_merge_max_keys: i64,
+    tablet_lifecycle_split_max_storage_bytes: i64,
+    tablet_lifecycle_merge_max_storage_bytes: i64,
     tablet_lifecycle_max_actions: usize,
 }
 
@@ -616,6 +620,20 @@ impl ClusterWorkerConfig {
             .max(0),
             tablet_lifecycle_merge_max_shards: env_i64(
                 "AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_SHARDS",
+                0,
+            )
+            .max(0),
+            tablet_lifecycle_split_max_keys: env_i64("AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS", 0)
+                .max(0),
+            tablet_lifecycle_merge_max_keys: env_i64("AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS", 0)
+                .max(0),
+            tablet_lifecycle_split_max_storage_bytes: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES",
+                0,
+            )
+            .max(0),
+            tablet_lifecycle_merge_max_storage_bytes: env_i64(
+                "AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES",
                 0,
             )
             .max(0),
@@ -2388,6 +2406,7 @@ fn spawn_cluster_workers(
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
+    let heartbeat_runtime = runtime.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -2410,6 +2429,30 @@ fn spawn_cluster_workers(
             .await
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
+            }
+            match run_local_tablet_stats_tick(
+                &heartbeat_meta,
+                &heartbeat_runtime,
+                &heartbeat_node_id,
+                now_ms,
+            )
+            .await
+            {
+                Ok(published_count) if published_count > 0 => {
+                    tracing::debug!(
+                        node_id = %heartbeat_node_id,
+                        published_count,
+                        "published local tablet storage stats"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        node_id = %heartbeat_node_id,
+                        error = %error,
+                        "local tablet storage stats publication failed"
+                    );
+                }
             }
         }
     });
@@ -2500,6 +2543,32 @@ async fn heartbeat_node_once(
     .await
 }
 
+async fn run_local_tablet_stats_tick(
+    meta: &agentdb_meta::MetaStore,
+    runtime: &Arc<agentdb_core::Runtime>,
+    node_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<usize> {
+    let stats = runtime
+        .local_tablet_storage_stats()
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    for stats in &stats {
+        agentdb_meta::tablet_stats::upsert(
+            meta.pool(),
+            stats.tablet_id,
+            node_id,
+            u64_to_i64_saturating(stats.key_count),
+            u64_to_i64_saturating(stats.key_bytes),
+            u64_to_i64_saturating(stats.value_bytes),
+            u64_to_i64_saturating(stats.storage_bytes),
+            u64_to_i64_saturating(stats.applied_index),
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(stats.len())
+}
+
 async fn run_cluster_scheduler_tick(
     meta: &agentdb_meta::MetaStore,
     node_id: &str,
@@ -2562,6 +2631,18 @@ async fn run_cluster_scheduler_tick(
     if !dead_nodes.is_empty() {
         status.add_dead_nodes_marked(dead_nodes.len() as u64);
         tracing::info!(node_id = %node_id, dead_nodes = ?dead_nodes, "scheduler marked stale nodes dead");
+    }
+    let deleted_stale_tablet_stats = agentdb_meta::tablet_stats::delete_stale(
+        pool,
+        now_ms.saturating_sub(config.stale_node_threshold_ms).max(0),
+    )
+    .await?;
+    if deleted_stale_tablet_stats > 0 {
+        tracing::debug!(
+            node_id = %node_id,
+            deleted_stale_tablet_stats,
+            "scheduler deleted stale tablet storage stats"
+        );
     }
 
     let cleared = agentdb_meta::tablets::clear_expired_ownership(
@@ -2869,12 +2950,21 @@ async fn run_tablet_lifecycle_policy_tick(
 ) -> agentdb_meta::MetaResult<TabletLifecyclePolicyReport> {
     if config.tablet_lifecycle_split_max_shards == 0
         && config.tablet_lifecycle_merge_max_shards == 0
+        && config.tablet_lifecycle_split_max_keys == 0
+        && config.tablet_lifecycle_merge_max_keys == 0
+        && config.tablet_lifecycle_split_max_storage_bytes == 0
+        && config.tablet_lifecycle_merge_max_storage_bytes == 0
     {
         return Ok(TabletLifecyclePolicyReport::default());
     }
 
     let tablets = agentdb_meta::tablets::list_all(meta.pool()).await?;
     let ranges = agentdb_meta::tablet_ranges::list_all(meta.pool()).await?;
+    let stats_by_tablet: BTreeMap<_, _> = agentdb_meta::tablet_stats::list_aggregates(meta.pool())
+        .await?
+        .into_iter()
+        .map(|stats| (stats.tablet_id, stats))
+        .collect();
     let open_movements =
         agentdb_meta::tablet_movements::list_open(meta.pool(), config.tablet_movement_batch_size)
             .await?;
@@ -2897,7 +2987,7 @@ async fn run_tablet_lifecycle_policy_tick(
         .max(1);
     let mut report = TabletLifecyclePolicyReport::default();
 
-    if config.tablet_lifecycle_split_max_shards > 0 {
+    if lifecycle_split_enabled(config) {
         let mut split_candidates: Vec<_> = tablets
             .iter()
             .filter(|tablet| tablet.state == "serving")
@@ -2924,7 +3014,8 @@ async fn run_tablet_lifecycle_policy_tick(
                 continue;
             };
             let shard_count = shard_count(start_shard, end_shard);
-            if shard_count <= config.tablet_lifecycle_split_max_shards || shard_count < 2 {
+            let stats = stats_by_tablet.get(&tablet.tablet_id);
+            if !should_split_tablet(config, shard_count, stats) || shard_count < 2 {
                 continue;
             }
             if lifecycle_source_applied_index(meta, &[tablet.tablet_id])
@@ -2958,7 +3049,7 @@ async fn run_tablet_lifecycle_policy_tick(
         }
     }
 
-    if config.tablet_lifecycle_merge_max_shards > 0
+    if lifecycle_merge_enabled(config)
         && report.prepared_split_count + report.prepared_merge_count
             < config.tablet_lifecycle_max_actions
     {
@@ -2987,11 +3078,13 @@ async fn run_tablet_lifecycle_policy_tick(
             {
                 continue;
             }
-            if shard_count(left.start_shard, left.end_shard)
-                > config.tablet_lifecycle_merge_max_shards
-                || shard_count(right.start_shard, right.end_shard)
-                    > config.tablet_lifecycle_merge_max_shards
-            {
+            if !should_merge_tablets(
+                config,
+                shard_count(left.start_shard, left.end_shard),
+                stats_by_tablet.get(&left.tablet_id),
+                shard_count(right.start_shard, right.end_shard),
+                stats_by_tablet.get(&right.tablet_id),
+            ) {
                 continue;
             }
             let Some(left_tablet) = tablet_by_id.get(&left.tablet_id) else {
@@ -3036,6 +3129,69 @@ async fn run_tablet_lifecycle_policy_tick(
     }
 
     Ok(report)
+}
+
+fn lifecycle_split_enabled(config: &ClusterWorkerConfig) -> bool {
+    config.tablet_lifecycle_split_max_shards > 0
+        || config.tablet_lifecycle_split_max_keys > 0
+        || config.tablet_lifecycle_split_max_storage_bytes > 0
+}
+
+fn lifecycle_merge_enabled(config: &ClusterWorkerConfig) -> bool {
+    config.tablet_lifecycle_merge_max_shards > 0
+        || config.tablet_lifecycle_merge_max_keys > 0
+        || config.tablet_lifecycle_merge_max_storage_bytes > 0
+}
+
+fn should_split_tablet(
+    config: &ClusterWorkerConfig,
+    shard_count: i64,
+    stats: Option<&agentdb_meta::tablet_stats::TabletStatsAggregate>,
+) -> bool {
+    (config.tablet_lifecycle_split_max_shards > 0
+        && shard_count > config.tablet_lifecycle_split_max_shards)
+        || stats.is_some_and(|stats| {
+            (config.tablet_lifecycle_split_max_keys > 0
+                && stats.key_count > config.tablet_lifecycle_split_max_keys)
+                || (config.tablet_lifecycle_split_max_storage_bytes > 0
+                    && stats.storage_bytes > config.tablet_lifecycle_split_max_storage_bytes)
+        })
+}
+
+fn should_merge_tablets(
+    config: &ClusterWorkerConfig,
+    left_shard_count: i64,
+    left_stats: Option<&agentdb_meta::tablet_stats::TabletStatsAggregate>,
+    right_shard_count: i64,
+    right_stats: Option<&agentdb_meta::tablet_stats::TabletStatsAggregate>,
+) -> bool {
+    tablet_within_merge_limits(config, left_shard_count, left_stats)
+        && tablet_within_merge_limits(config, right_shard_count, right_stats)
+}
+
+fn tablet_within_merge_limits(
+    config: &ClusterWorkerConfig,
+    shard_count: i64,
+    stats: Option<&agentdb_meta::tablet_stats::TabletStatsAggregate>,
+) -> bool {
+    if config.tablet_lifecycle_merge_max_shards > 0
+        && shard_count > config.tablet_lifecycle_merge_max_shards
+    {
+        return false;
+    }
+    if config.tablet_lifecycle_merge_max_keys > 0
+        && !stats.is_some_and(|stats| stats.key_count <= config.tablet_lifecycle_merge_max_keys)
+    {
+        return false;
+    }
+    if config.tablet_lifecycle_merge_max_storage_bytes > 0
+        && !stats.is_some_and(|stats| {
+            stats.storage_bytes <= config.tablet_lifecycle_merge_max_storage_bytes
+        })
+    {
+        return false;
+    }
+    true
 }
 
 async fn prepare_lifecycle_split(
@@ -3810,6 +3966,10 @@ fn now_ms_i64() -> i64 {
         .unwrap_or(0)
 }
 
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -3835,7 +3995,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use agentdb_meta::{
-        nodes, tablet_movements, tablet_ranges, tablet_replicas, tablets, MetaStore,
+        nodes, tablet_movements, tablet_ranges, tablet_replicas, tablet_stats, tablets, MetaStore,
     };
     use agentdb_storage::ReplicatedLog;
 
@@ -3875,6 +4035,10 @@ mod tests {
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: split_max_shards,
             tablet_lifecycle_merge_max_shards: merge_max_shards,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         }
     }
@@ -4247,6 +4411,10 @@ region = "us-west-2"
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: 0,
             tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
@@ -4290,6 +4458,10 @@ region = "us-west-2"
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: 0,
             tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status, None)
@@ -4334,6 +4506,10 @@ region = "us-west-2"
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: 0,
             tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
@@ -4390,6 +4566,10 @@ region = "us-west-2"
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: 0,
             tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
@@ -4465,6 +4645,10 @@ region = "us-west-2"
             tablet_movement_executor_interval_ms: 5_000,
             tablet_lifecycle_split_max_shards: 0,
             tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_max_actions: 4,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
@@ -4581,6 +4765,76 @@ region = "us-west-2"
                 && movement.destination_tablet_id == 9
                 && movement.required_applied_index == 9
         }));
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_prepares_split_from_storage_stats() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 99, 7, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 12, 12, 100)
+            .await
+            .unwrap();
+        tablet_stats::upsert(meta.pool(), 7, "node-a", 10, 100, 1_500, 1_600, 12, 200)
+            .await
+            .unwrap();
+
+        let mut config = lifecycle_config(0, 0);
+        config.tablet_lifecycle_split_max_storage_bytes = 1_000;
+        let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(report.prepared_split_count, 1);
+        let movements = tablet_movements::list_pending(meta.pool(), 10)
+            .await
+            .unwrap();
+        assert_eq!(movements.len(), 2);
+        assert!(movements
+            .iter()
+            .all(|movement| movement.movement_type == "split"));
+    }
+
+    #[tokio::test]
+    async fn tablet_lifecycle_policy_prepares_merge_from_storage_stats() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::get_or_create(meta.pool(), 8, 100).await.unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 0, 49, 7, 1, 100)
+            .await
+            .unwrap();
+        tablet_ranges::upsert(meta.pool(), "default", 50, 99, 8, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 7, 7, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 9, 9, 100)
+            .await
+            .unwrap();
+        tablet_stats::upsert(meta.pool(), 7, "node-a", 3, 30, 300, 330, 7, 200)
+            .await
+            .unwrap();
+        tablet_stats::upsert(meta.pool(), 8, "node-a", 4, 40, 400, 440, 9, 200)
+            .await
+            .unwrap();
+
+        let mut config = lifecycle_config(0, 0);
+        config.tablet_lifecycle_merge_max_storage_bytes = 500;
+        let report = run_tablet_lifecycle_policy_tick(&meta, 1_000, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(report.prepared_merge_count, 1);
+        let movements = tablet_movements::list_pending(meta.pool(), 10)
+            .await
+            .unwrap();
+        assert_eq!(movements.len(), 2);
+        assert!(movements
+            .iter()
+            .all(|movement| movement.movement_type == "merge"));
     }
 
     #[tokio::test]
