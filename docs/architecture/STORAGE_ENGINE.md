@@ -1019,12 +1019,14 @@ single-session appends or record writes.
    marks the target as the handoff destination so catch-up workers have explicit
    control-plane work to converge. Later rebalance passes complete prepared
    replacements once the target replica is healthy and its applied index has
-   caught up to the source. `GET /api/admin/raft` includes configured-only
-   tablets even when the local API node has not opened a Raft group, so
-   replacement learner intent is visible before local runtime bootstrap.
-   Remaining production work is integrating the workflow with split/merge
-   placement policy and proposing Raft membership changes from the scheduler
-   path.
+   caught up to the source; when the scheduler node has the local Raft group
+   registered, it also proposes the learner-to-voter membership promotion for
+   the completed target. `GET /api/admin/raft` includes configured-only tablets
+   even when the local API node has not opened a Raft group, so replacement
+   learner intent is visible before local runtime bootstrap. Remaining
+   production work is tabletizing the runtime state model so every route-owned
+   tablet has its own state machine instead of the current primary-tablet
+   runtime log.
 
 8. Add tablet split and rebalance.
 

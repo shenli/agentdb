@@ -348,6 +348,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .internal_auth_token
                 .clone()
                 .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
+            raft_registry.clone(),
             node_address,
             config.route_region.clone(),
             startup.scheduler_status.clone(),
@@ -2278,6 +2279,7 @@ fn spawn_cluster_workers(
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
     movement_snapshot_client: Option<agentdb_api::internal_raft_http::RaftRsHttpClient>,
+    raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
     node_address: String,
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
@@ -2363,8 +2365,15 @@ fn spawn_cluster_workers(
         loop {
             interval.tick().await;
             let now_ms = now_ms_i64();
-            if let Err(error) =
-                run_cluster_scheduler_tick(&meta, &node_id, now_ms, config, &scheduler_status).await
+            if let Err(error) = run_cluster_scheduler_tick(
+                &meta,
+                &node_id,
+                now_ms,
+                config,
+                &scheduler_status,
+                raft_registry.as_deref(),
+            )
+            .await
             {
                 tracing::warn!(node_id = %node_id, error = %error, "cluster scheduler tick failed");
             }
@@ -2399,6 +2408,7 @@ async fn run_cluster_scheduler_tick(
     now_ms: i64,
     config: ClusterWorkerConfig,
     status: &agentdb_api::state::SchedulerStatus,
+    raft_registry: Option<&agentdb_api::raft_ingress::RaftRsGroupRegistry>,
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
@@ -2480,6 +2490,17 @@ async fn run_cluster_scheduler_tick(
         .await?;
         let changed_count = report.changed_count();
         if changed_count > 0 {
+            if let Some(registry) = raft_registry {
+                let membership_changes =
+                    apply_scheduler_rebalance_raft_membership_changes(registry, &report.actions);
+                if membership_changes > 0 {
+                    tracing::info!(
+                        node_id = %node_id,
+                        membership_changes,
+                        "scheduler proposed raft membership changes for completed replacements"
+                    );
+                }
+            }
             status.add_tablet_reassignments(changed_count as u64);
             tracing::info!(
                 node_id = %node_id,
@@ -2501,6 +2522,76 @@ async fn run_cluster_scheduler_tick(
         }
     }
     Ok(())
+}
+
+fn apply_scheduler_rebalance_raft_membership_changes(
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    actions: &[agentdb_meta::tablet_rebalance::RebalanceAction],
+) -> usize {
+    let mut changed = 0usize;
+    for action in actions {
+        if action.action != "complete_replacement" || !action.changed {
+            continue;
+        }
+        let Some(target_node_id) = action.target_node_id.as_deref() else {
+            continue;
+        };
+        let statuses = match registry.status_for(action.tablet_id) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                tracing::debug!(
+                    tablet_id = action.tablet_id,
+                    error = %error,
+                    "skipping scheduler raft membership change; local group is not registered"
+                );
+                continue;
+            }
+        };
+        let Some(leader_id) = raft_leader_id_from_statuses(&statuses) else {
+            tracing::warn!(
+                tablet_id = action.tablet_id,
+                "skipping scheduler raft membership change; no known leader"
+            );
+            continue;
+        };
+        let target_raft_node_id = match agentdb_storage::stable_raft_node_id(target_node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    target_node_id,
+                    error = %error,
+                    "skipping scheduler raft membership change; target node id is invalid"
+                );
+                continue;
+            }
+        };
+        match registry.promote_to_voter(action.tablet_id, leader_id, target_raft_node_id) {
+            Ok(()) => changed += 1,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    target_node_id,
+                    error = %error,
+                    "scheduler failed to promote replacement target in raft"
+                );
+            }
+        }
+    }
+    changed
+}
+
+fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
+    statuses
+        .iter()
+        .find(|status| status.role == "Leader")
+        .map(|status| status.node_id)
+        .or_else(|| {
+            statuses
+                .iter()
+                .find(|status| status.leader_id != 0)
+                .map(|status| status.leader_id)
+        })
 }
 
 async fn run_tablet_movement_tick(
@@ -3212,7 +3303,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3252,7 +3343,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3293,7 +3384,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3346,7 +3437,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3418,7 +3509,7 @@ region = "us-west-2"
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
         };
-        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
             .await
             .unwrap();
 
@@ -3432,6 +3523,47 @@ region = "us-west-2"
             .iter()
             .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[test]
+    fn scheduler_rebalance_membership_change_promotes_completed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "learner",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(7, configs, leader_id)
+            .expect("open local raft group");
+        group.elect(leader_id).expect("elect source leader");
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let changed = apply_scheduler_rebalance_raft_membership_changes(
+            &registry,
+            &[agentdb_meta::tablet_rebalance::RebalanceAction {
+                action: "complete_replacement",
+                tablet_id: 7,
+                source_node_id: Some("node-b".into()),
+                target_node_id: Some("node-a".into()),
+                changed: true,
+                reason: "target_caught_up",
+            }],
+        );
+
+        assert_eq!(changed, 1);
     }
 
     #[tokio::test]
