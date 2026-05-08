@@ -6,7 +6,7 @@ use std::{
 
 use base64::Engine as _;
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use agentdb_storage::{RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsWireMessage};
 
@@ -67,6 +67,19 @@ impl RaftRsHttpClient {
             .await
     }
 
+    pub async fn export_tablet_movement_snapshot(
+        &self,
+        base_url: &str,
+        request: &TabletMovementSnapshotExportRequest,
+    ) -> Result<TabletMovementSnapshotExportResponse, RaftRsHttpError> {
+        self.post_for_json(
+            base_url,
+            "/api/internal/tablet-movements/snapshot/export",
+            request,
+        )
+        .await
+    }
+
     async fn post<T: Serialize + ?Sized>(
         &self,
         base_url: &str,
@@ -85,6 +98,30 @@ impl RaftRsHttpClient {
         let status = response.status();
         if status == StatusCode::ACCEPTED {
             Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(RaftRsHttpError::Rejected { status, body })
+        }
+    }
+
+    async fn post_for_json<T: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        base_url: &str,
+        path: &str,
+        body: &T,
+    ) -> Result<R, RaftRsHttpError> {
+        let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+        let response = self
+            .client
+            .post(url)
+            .header(INTERNAL_AUTH_HEADER, self.token.as_ref())
+            .json(body)
+            .send()
+            .await
+            .map_err(RaftRsHttpError::Request)?;
+        let status = response.status();
+        if status.is_success() {
+            response.json().await.map_err(RaftRsHttpError::Request)
         } else {
             let body = response.text().await.unwrap_or_default();
             Err(RaftRsHttpError::Rejected { status, body })
@@ -221,6 +258,7 @@ pub enum RaftRsHttpError {
     Rejected { status: StatusCode, body: String },
     MissingPeerUrl,
     Storage(agentdb_storage::Error),
+    InvalidPayload(String),
 }
 
 impl std::fmt::Display for RaftRsHttpError {
@@ -232,6 +270,7 @@ impl std::fmt::Display for RaftRsHttpError {
             }
             Self::MissingPeerUrl => write!(f, "raft-rs HTTP peer URL is not configured"),
             Self::Storage(err) => write!(f, "raft-rs storage error: {err}"),
+            Self::InvalidPayload(err) => write!(f, "invalid internal HTTP payload: {err}"),
         }
     }
 }
@@ -254,6 +293,31 @@ struct RaftSnapshotBody {
     index: u64,
     term: u64,
     payload_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabletMovementSnapshotExportRequest {
+    pub source_tablet_id: i64,
+    pub target_tablet_id: i64,
+    pub start_shard: i64,
+    pub end_shard: i64,
+    pub shard_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabletMovementSnapshotExportResponse {
+    pub source_tablet_id: i64,
+    pub target_tablet_id: i64,
+    pub applied_index: u64,
+    pub payload_base64: String,
+}
+
+impl TabletMovementSnapshotExportResponse {
+    pub fn payload(&self) -> Result<Vec<u8>, RaftRsHttpError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.payload_base64)
+            .map_err(|err| RaftRsHttpError::InvalidPayload(err.to_string()))
+    }
 }
 
 fn encode_payload(payload: &[u8]) -> String {
