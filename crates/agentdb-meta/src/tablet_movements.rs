@@ -98,7 +98,7 @@ pub async fn mark_completed(pool: &AnyPool, movement_id: &str, now_ms: i64) -> M
     let rows = sqlx::query(
         "UPDATE tablet_movements
             SET status = 'completed', updated_at_ms = ?, completed_at_ms = ?
-          WHERE movement_id = ? AND status != 'completed'",
+          WHERE movement_id = ? AND status = 'pending'",
     )
     .bind(now_ms)
     .bind(now_ms)
@@ -107,6 +107,10 @@ pub async fn mark_completed(pool: &AnyPool, movement_id: &str, now_ms: i64) -> M
     .await?
     .rows_affected();
     Ok(rows > 0)
+}
+
+pub async fn list_pending(pool: &AnyPool, limit: i64) -> MetaResult<Vec<TabletMovement>> {
+    list_recent(pool, Some("pending"), limit).await
 }
 
 pub async fn get(pool: &AnyPool, movement_id: &str) -> MetaResult<Option<TabletMovement>> {
@@ -267,6 +271,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].required_applied_index, 13);
         assert_eq!(rows[0].status, "pending");
+        assert_eq!(list_pending(&p, 10).await.unwrap(), rows);
 
         assert!(mark_completed(&p, "split:7:8", 300).await.unwrap());
         let rows = list_recent(&p, Some("completed"), 10).await.unwrap();

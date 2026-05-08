@@ -31,6 +31,7 @@ const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
+const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
@@ -536,6 +537,7 @@ struct ClusterWorkerConfig {
     reaper_tick_ms: u64,
     reaper_safety_margin_ms: i64,
     rebalance_max_movements: usize,
+    tablet_movement_batch_size: i64,
 }
 
 impl ClusterWorkerConfig {
@@ -568,6 +570,11 @@ impl ClusterWorkerConfig {
                 "AGENTDB_REBALANCE_MAX_MOVEMENTS",
                 DEFAULT_REBALANCE_MAX_MOVEMENTS,
             ),
+            tablet_movement_batch_size: env_i64(
+                "AGENTDB_TABLET_MOVEMENT_BATCH_SIZE",
+                DEFAULT_TABLET_MOVEMENT_BATCH_SIZE,
+            )
+            .clamp(1, 1_000),
         }
     }
 }
@@ -2428,7 +2435,60 @@ async fn run_cluster_scheduler_tick(
             );
         }
     }
+    if config.tablet_movement_batch_size > 0 {
+        let completed_count =
+            run_tablet_movement_tick(meta, now_ms, config.tablet_movement_batch_size).await?;
+        if completed_count > 0 {
+            tracing::info!(
+                node_id = %node_id,
+                completed_count,
+                "scheduler completed ready tablet movement rows"
+            );
+        }
+    }
     Ok(())
+}
+
+async fn run_tablet_movement_tick(
+    meta: &agentdb_meta::MetaStore,
+    now_ms: i64,
+    batch_size: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let pending = agentdb_meta::tablet_movements::list_pending(meta.pool(), batch_size).await?;
+    let mut completed = 0;
+    for movement in pending {
+        if tablet_movement_destination_ready(meta, &movement).await?
+            && agentdb_meta::tablet_movements::mark_completed(
+                meta.pool(),
+                &movement.movement_id,
+                now_ms,
+            )
+            .await?
+        {
+            completed += 1;
+        }
+    }
+    Ok(completed)
+}
+
+async fn tablet_movement_destination_ready(
+    meta: &agentdb_meta::MetaStore,
+    movement: &agentdb_meta::tablet_movements::TabletMovement,
+) -> agentdb_meta::MetaResult<bool> {
+    let replicas =
+        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), movement.destination_tablet_id)
+            .await?;
+    let mut serving_replicas = 0usize;
+    for replica in replicas {
+        if replica.role == "log_only" {
+            continue;
+        }
+        serving_replicas += 1;
+        if replica.health != "healthy" || replica.applied_index < movement.required_applied_index {
+            return Ok(false);
+        }
+    }
+    Ok(serving_replicas > 0)
 }
 
 async fn refresh_route_snapshot(
@@ -2479,7 +2539,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentdb_meta::{nodes, tablet_replicas, tablets, MetaStore};
+    use agentdb_meta::{nodes, tablet_movements, tablet_replicas, tablets, MetaStore};
     use agentdb_storage::ReplicatedLog;
 
     fn base_opts() -> ServeOpts {
@@ -2855,6 +2915,7 @@ region = "us-west-2"
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -2893,6 +2954,7 @@ region = "us-west-2"
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
         };
         run_cluster_scheduler_tick(&meta, "follower-b", 2_000, config, &status)
             .await
@@ -2932,6 +2994,7 @@ region = "us-west-2"
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -2983,6 +3046,7 @@ region = "us-west-2"
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -3053,6 +3117,7 @@ region = "us-west-2"
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
             rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
         };
         run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status)
             .await
@@ -3068,6 +3133,92 @@ region = "us-west-2"
             .iter()
             .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
         assert_eq!(status.snapshot().tablet_reassignments_total, 1);
+    }
+
+    #[tokio::test]
+    async fn tablet_movement_tick_completes_ready_destinations() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "split:7:8",
+            "split",
+            7,
+            8,
+            "tenant:paid-a",
+            0,
+            49,
+            42,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 42, 42, 1_010)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(
+            meta.pool(),
+            8,
+            "node-b",
+            "learner",
+            "healthy",
+            50,
+            50,
+            1_010,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run_tablet_movement_tick(&meta, 2_000, 64).await.unwrap(), 1);
+
+        let movement = tablet_movements::get(meta.pool(), "split:7:8")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(movement.status, "completed");
+        assert_eq!(movement.completed_at_ms, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn tablet_movement_tick_leaves_unready_destinations_pending() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        tablet_movements::upsert_pending(
+            meta.pool(),
+            "merge:7:8:9",
+            "merge",
+            7,
+            9,
+            "tenant:paid-a",
+            0,
+            99,
+            42,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 9, "node-a", "voter", "healthy", 42, 42, 1_010)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(
+            meta.pool(),
+            9,
+            "node-b",
+            "learner",
+            "healthy",
+            41,
+            41,
+            1_010,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run_tablet_movement_tick(&meta, 2_000, 64).await.unwrap(), 0);
+
+        let movement = tablet_movements::get(meta.pool(), "merge:7:8:9")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(movement.status, "pending");
+        assert_eq!(movement.completed_at_ms, None);
     }
 
     #[tokio::test]
