@@ -115,8 +115,9 @@ Current admin controls:
 - `agentdbctl tablets assign <tablet_id> <node_id>` can pre-claim an unowned
   tablet for a fresh `alive` node.
 - `agentdbctl tablets rebalance --dry-run` previews assignment and movement.
-- `agentdbctl tablets rebalance` assigns unowned tablets and marks
-  load-balancing handoffs.
+- `agentdbctl tablets rebalance` assigns unowned tablets, marks load-balancing
+  handoffs, and completes healthy caught-up replacements with Raft membership
+  promotion/source retirement when the serving API node has the local group.
 - The scheduler leader also runs the same rebalance policy automatically when
   metadata-backed cluster mode is enabled. Use `AGENTDB_REBALANCE_MAX_MOVEMENTS`
   to cap movements per scheduler tick; set it to `0` to disable automatic
@@ -194,7 +195,9 @@ If the node dies:
 Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
 the lease reaper clears expired tablet ownership. Once tablets are unowned,
 `agentdbctl tablets rebalance` or the automatic scheduler rebalance pass can
-assign them to fresh `alive` nodes.
+assign them to fresh `alive` nodes. Cooperative rebalance does not force-move a
+dead source; Raft membership retirement is tied to healthy caught-up
+replacement completion.
 
 ### Backup And Restore
 

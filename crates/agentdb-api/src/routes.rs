@@ -2842,7 +2842,103 @@ async fn rebalance_admin_tablets(
     )
     .await
     .map_err(internal_error)?;
+    if !body.dry_run {
+        if let Some(registry) = s.raft_registry.as_ref() {
+            apply_rebalance_raft_membership_changes(meta, registry, &report.actions).await?;
+        }
+    }
     Ok(Json(report))
+}
+
+async fn apply_rebalance_raft_membership_changes(
+    meta: &agentdb_meta::MetaStore,
+    registry: &crate::raft_ingress::RaftRsGroupRegistry,
+    actions: &[tablet_rebalance::RebalanceAction],
+) -> Result<usize, ApiError> {
+    let mut changed = 0usize;
+    for action in actions {
+        if action.action != "complete_replacement" || !action.changed {
+            continue;
+        }
+        let Some(target_node_id) = action.target_node_id.as_deref() else {
+            continue;
+        };
+        let Ok(statuses) = registry.status_for(action.tablet_id) else {
+            continue;
+        };
+        let Some(leader_id) = raft_leader_id_from_statuses(&statuses) else {
+            continue;
+        };
+        let target_raft_node_id = match agentdb_storage::stable_raft_node_id(target_node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    target_node_id,
+                    error = %error,
+                    "skipping rebalance raft membership change; target node id is invalid"
+                );
+                continue;
+            }
+        };
+        if let Err(error) =
+            registry.promote_to_voter(action.tablet_id, leader_id, target_raft_node_id)
+        {
+            tracing::warn!(
+                tablet_id = action.tablet_id,
+                target_node_id,
+                error = %error,
+                "failed to promote rebalance target in raft"
+            );
+            continue;
+        }
+        changed += 1;
+
+        let Some(source_node_id) = action.source_node_id.as_deref() else {
+            continue;
+        };
+        let source_raft_node_id = match agentdb_storage::stable_raft_node_id(source_node_id) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = action.tablet_id,
+                    source_node_id,
+                    error = %error,
+                    "skipping rebalance source retirement; source node id is invalid"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = registry.remove_node(action.tablet_id, leader_id, source_raft_node_id) {
+            tracing::warn!(
+                tablet_id = action.tablet_id,
+                source_node_id,
+                error = %error,
+                "failed to retire rebalance source from raft"
+            );
+            continue;
+        }
+        if tablet_replicas::delete(meta.pool(), action.tablet_id, source_node_id)
+            .await
+            .map_err(internal_error)?
+        {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+fn raft_leader_id_from_statuses(statuses: &[agentdb_storage::RaftRsReplicaStatus]) -> Option<u64> {
+    statuses
+        .iter()
+        .find(|status| status.role == "Leader")
+        .map(|status| status.node_id)
+        .or_else(|| {
+            statuses
+                .iter()
+                .find(|status| status.leader_id != 0)
+                .map(|status| status.leader_id)
+        })
 }
 
 #[derive(Debug, Deserialize)]

@@ -245,9 +245,9 @@ apply workers, log compaction policy, index maintenance, and recovery.
 | Routing slots | `shards` table with 16,384 fixed rows | Virtual shards remain stable routing slots |
 | Routing hash | Session fallback can hash `tenant_id + session_id`; record/search should use `tenant_id + sharding_key` when present | All placement-sensitive paths use a tenant-internal routing key |
 | Physical unit | `tablets` table tracks owner, lease, epoch, and handoff metadata | Tablet is the Raft group, local LSM, snapshot, compaction, and movement unit |
-| Runtime data | Persisted runtime state is stored through `TabletKvStore` under the primary runtime tablet namespace | Tablet-local applied state stores per routed tablet |
+| Runtime data | Persisted runtime state can be opened with a tablet router backed by one local replicated log per local `tablet_replicas` row | Tablet-local applied state stores per routed tablet |
 | Replication | `ReplicatedLog` has single-node, legacy leader-driven quorum, and `raft-rs`/`raft-engine` backed implementations; token-protected internal HTTP Raft message/snapshot RPC and retrying outbox workers are wired | `raft-rs` consensus with durable local Raft logs in `raft-engine` |
-| Split/merge | Not implemented | Control-plane tablet lifecycle changes shard-range ownership |
+| Split/merge | Admin APIs, `agentdbctl`, movement rows, destination state copy, and range-map cutover are implemented; policy-driven split/merge scheduling remains open | Control-plane tablet lifecycle changes shard-range ownership |
 | Placement policy | `tenant_policies` records placement class and placement scope for routing | Control-plane policy drives dedicated vs shared placement, quotas, and encryption class |
 | Encryption policy | `tenant_policies` records encryption class, key policy reference, and encryption policy version | Control plane stores key references and versions; raw keys stay in KMS |
 
@@ -959,14 +959,14 @@ single-session appends or record writes.
    retaining the full voter/learner ConfState, loads peer URLs from `nodes`,
    refreshes those URLs periodically and on control-plane change hints, and
    periodically re-syncs the local registry as `tablet_replicas` changes.
-   Cluster-mode server startup injects the local `raft-rs` log for the current
-   runtime primary tablet into `Runtime::with_kv_and_replicated_log`, so the
-   hot metadata/event write path acknowledges only after Raft commit. The local
+   Cluster-mode server startup injects every local `raft-rs` log returned by
+   registry bootstrap into `Runtime::with_kv_and_replicated_logs`, so local
+   route-owned tablets can acknowledge writes only after Raft commit. The local
    Raft append path now releases its group lock while waiting for peer
    responses, allowing the HTTP outbox and ingress workers to complete
-   multi-node election and quorum commit. The remaining production work is
-   tabletizing the runtime state model so each route-owned tablet has its own
-   state machine instead of the current primary-tablet runtime log.
+   multi-node election and quorum commit. Remaining production work is
+   policy-driven split/merge scheduling and deeper tablet-aware compaction
+   tuning.
 
 7. Add snapshot and catch-up support.
 
@@ -1022,12 +1022,13 @@ single-session appends or record writes.
    caught up to the source; when the scheduler node has the local Raft group
    registered, it also proposes the learner-to-voter membership promotion for
    the completed target, removes the old source from Raft, and deletes the
-   retired source replica row. `GET /api/admin/raft` includes configured-only
-   tablets even when the local API node has not opened a Raft group, so
-   replacement learner intent is visible before local runtime bootstrap. Remaining
-   production work is tabletizing the runtime state model so every route-owned
-   tablet has its own state machine instead of the current primary-tablet
-   runtime log.
+   retired source replica row. Operator-triggered `agentdbctl tablets
+   rebalance` uses the same API-side membership convergence when the serving API
+   node has the local Raft group registered. `GET /api/admin/raft` includes
+   configured-only tablets even when the local API node has not opened a Raft
+   group, so replacement learner intent is visible before local runtime
+   bootstrap. Remaining production work is policy-driven split/merge scheduling
+   and deeper tablet-aware compaction tuning.
 
 8. Add tablet split and rebalance.
 
