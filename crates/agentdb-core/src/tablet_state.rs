@@ -769,8 +769,33 @@ mod tests {
                         value: b"event-a".to_vec(),
                     },
                     TabletWriteOp::Put {
+                        key: b"event_by_id/tenant-a/evt_a".to_vec(),
+                        value: serde_json::to_vec(&serde_json::json!({
+                            "session_id": session_a,
+                            "seq": 1,
+                        }))
+                        .unwrap(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"record/session_alias/tenant-a/current".to_vec(),
+                        value: session_a.as_bytes().to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: format!("record/idempotency/tenant-a::append::{session_a}::idem-a")
+                            .into_bytes(),
+                        value: b"idempotency-a".to_vec(),
+                    },
+                    TabletWriteOp::Put {
                         key: format!("record/session/tenant-a/{session_b}").into_bytes(),
                         value: b"session-b".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"event_by_id/tenant-a/evt_b".to_vec(),
+                        value: serde_json::to_vec(&serde_json::json!({
+                            "session_id": session_b,
+                            "seq": 1,
+                        }))
+                        .unwrap(),
                     },
                 ],
             })
@@ -796,7 +821,10 @@ mod tests {
             keys,
             vec![
                 format!("event/tenant-a/{session_a}/00000000000000000001"),
+                "event_by_id/tenant-a/evt_a".to_string(),
+                format!("record/idempotency/tenant-a::append::{session_a}::idem-a"),
                 format!("record/session/tenant-a/{session_a}"),
+                "record/session_alias/tenant-a/current".to_string(),
                 "record/tenant/tenant-a".to_string(),
             ]
         );
