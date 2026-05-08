@@ -1049,11 +1049,14 @@ single-session appends or record writes.
    pending movement rows (`AGENTDB_TABLET_MOVEMENT_BATCH_SIZE`, default `64`)
    and marks them `completed` after every destination serving replica is healthy
    and has `applied_index >= required_applied_index`. Complete also marks rows
-   completed as part of the explicit cutover path. The system still does not
-   perform range-aware state copy/replay itself or actively bootstrap
-   split-created Raft groups; those workers must update `tablet_replicas`
-   progress before cutover succeeds and before the movement worker can close
-   the row.
+   completed as part of the explicit cutover path. Runtime tablet snapshots now
+   have the primitives required by those workers: a source tablet can export a
+   shard-range-filtered snapshot already retargeted to a split child tablet,
+   and a merge destination can install source snapshots non-destructively so
+   multiple source tablets can be combined. The active copy/replay worker and
+   split-created Raft group bootstrap are still not wired; those workers must
+   use the snapshot primitives and update `tablet_replicas` progress before
+   cutover succeeds and before the movement worker can close the row.
 
 9. Add compressed tablet-map ranges.
 

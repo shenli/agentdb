@@ -291,6 +291,158 @@ async fn runtime_tablet_context_routes_writes_and_snapshots_by_tablet() {
 }
 
 #[tokio::test]
+async fn runtime_exports_retargeted_shard_snapshot_for_split_install() {
+    let source_dir = TempDir::new().unwrap();
+    let source_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+    let source_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_runtime = Runtime::with_kv_and_replicated_logs(
+        source_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, source_primary_log),
+            (7, source_tablet_log),
+        ]),
+    );
+
+    let create_runtime = source_runtime.clone();
+    let tenant = source_runtime
+        .with_tablet_context(7, async move {
+            create_runtime
+                .create_tenant(NewTenant {
+                    external_key: "retargeted-tablet-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    let payload = source_runtime
+        .export_tablet_snapshot_payload_for_shard_range(7, 8, 0, 63, 64)
+        .unwrap();
+
+    let target_dir = TempDir::new().unwrap();
+    let target_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+    let target_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_runtime = Runtime::with_kv_and_replicated_logs(
+        target_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, target_primary_log),
+            (8, target_tablet_log),
+        ]),
+    );
+    assert!(target_runtime
+        .install_tablet_snapshot_payload_and_rehydrate(8, &payload)
+        .await
+        .unwrap());
+
+    let read_runtime = target_runtime.clone();
+    let hydrated = target_runtime
+        .with_tablet_context(8, async move {
+            read_runtime.get_tenant(&tenant.tenant_id).await
+        })
+        .await
+        .unwrap();
+    assert_eq!(hydrated.external_key, "retargeted-tablet-tenant");
+}
+
+#[tokio::test]
+async fn runtime_merge_installs_snapshot_without_deleting_existing_target_rows() {
+    let source_dir = TempDir::new().unwrap();
+    let source_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+    let source_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_runtime = Runtime::with_kv_and_replicated_logs(
+        source_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, source_primary_log),
+            (7, source_tablet_log),
+        ]),
+    );
+    let create_runtime = source_runtime.clone();
+    let source_tenant = source_runtime
+        .with_tablet_context(7, async move {
+            create_runtime
+                .create_tenant(NewTenant {
+                    external_key: "merge-source-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+    let payload = source_runtime
+        .export_tablet_snapshot_payload_for_shard_range(7, 9, 0, 63, 64)
+        .unwrap();
+
+    let target_dir = TempDir::new().unwrap();
+    let target_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+    let target_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_runtime = Runtime::with_kv_and_replicated_logs(
+        target_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, target_primary_log),
+            (9, target_tablet_log),
+        ]),
+    );
+    let create_target_runtime = target_runtime.clone();
+    let target_tenant = target_runtime
+        .with_tablet_context(9, async move {
+            create_target_runtime
+                .create_tenant(NewTenant {
+                    external_key: "merge-target-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+        })
+        .await
+        .unwrap();
+
+    assert!(target_runtime
+        .install_tablet_snapshot_payload_merge_and_rehydrate(9, &payload)
+        .await
+        .unwrap());
+
+    let source_read_runtime = target_runtime.clone();
+    let source_hydrated = target_runtime
+        .with_tablet_context(9, async move {
+            source_read_runtime
+                .get_tenant(&source_tenant.tenant_id)
+                .await
+        })
+        .await
+        .unwrap();
+    let target_read_runtime = target_runtime.clone();
+    let target_hydrated = target_runtime
+        .with_tablet_context(9, async move {
+            target_read_runtime
+                .get_tenant(&target_tenant.tenant_id)
+                .await
+        })
+        .await
+        .unwrap();
+    assert_eq!(source_hydrated.external_key, "merge-source-tenant");
+    assert_eq!(target_hydrated.external_key, "merge-target-tenant");
+}
+
+#[tokio::test]
 async fn runtime_can_register_new_replicated_tablets_after_startup() {
     let dir = TempDir::new().unwrap();
     let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(dir.path()).unwrap());

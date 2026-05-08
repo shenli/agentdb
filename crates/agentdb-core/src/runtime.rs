@@ -49,7 +49,8 @@ use crate::segment::{
 use crate::session::{ForkRef, Lifecycle, NewSession, Session};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
-    LoggedTabletStateMachine, TabletCommand, TabletStateMachine, TabletStateSnapshot, TabletWriteOp,
+    LoggedTabletStateMachine, TabletCommand, TabletSnapshotShardFilter, TabletStateMachine,
+    TabletStateSnapshot, TabletWriteOp,
 };
 use crate::tenant::{NewTenant, Tenant};
 
@@ -740,6 +741,23 @@ impl RuntimeTabletRouterKvStore {
         })
     }
 
+    fn export_snapshot_payload_for_shard_range(
+        &self,
+        source_tablet_id: i64,
+        filter: TabletSnapshotShardFilter,
+    ) -> agentdb_storage::Result<Vec<u8>> {
+        self.with_handle(source_tablet_id, |handle| {
+            let snapshot = handle
+                .state_machine
+                .export_snapshot_for_shard_range(filter)?;
+            serde_json::to_vec(&snapshot).map_err(|err| {
+                agentdb_storage::Error::Other(format!(
+                    "encode tablet {source_tablet_id} filtered runtime snapshot: {err}"
+                ))
+            })
+        })
+    }
+
     fn install_snapshot_payload(
         &self,
         tablet_id: i64,
@@ -752,6 +770,21 @@ impl RuntimeTabletRouterKvStore {
         })?;
         self.with_handle(tablet_id, |handle| {
             handle.state_machine.install_snapshot(&snapshot)
+        })
+    }
+
+    fn install_snapshot_payload_merge(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> agentdb_storage::Result<()> {
+        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|err| {
+            agentdb_storage::Error::Other(format!(
+                "decode tablet {tablet_id} runtime snapshot: {err}"
+            ))
+        })?;
+        self.with_handle(tablet_id, |handle| {
+            handle.state_machine.install_snapshot_merge(&snapshot)
         })
     }
 
@@ -1500,6 +1533,33 @@ impl Runtime {
         router.export_snapshot_payload(tablet_id).map_err(internal)
     }
 
+    pub fn export_tablet_snapshot_payload_for_shard_range(
+        &self,
+        source_tablet_id: i64,
+        target_tablet_id: i64,
+        start_shard: i64,
+        end_shard: i64,
+        shard_count: i64,
+    ) -> Result<Vec<u8>> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "runtime tablet snapshots require a replicated tablet router",
+            ));
+        };
+        router
+            .export_snapshot_payload_for_shard_range(
+                source_tablet_id,
+                TabletSnapshotShardFilter {
+                    target_tablet_id,
+                    start_shard,
+                    end_shard,
+                    shard_count,
+                },
+            )
+            .map_err(internal)
+    }
+
     pub fn install_tablet_snapshot_payload(&self, tablet_id: i64, payload: &[u8]) -> Result<bool> {
         let Some(router) = self.tablet_router.as_ref() else {
             return Ok(false);
@@ -1510,12 +1570,38 @@ impl Runtime {
         Ok(true)
     }
 
+    pub fn install_tablet_snapshot_payload_merge(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(false);
+        };
+        router
+            .install_snapshot_payload_merge(tablet_id, payload)
+            .map_err(internal)?;
+        Ok(true)
+    }
+
     pub async fn install_tablet_snapshot_payload_and_rehydrate(
         &self,
         tablet_id: i64,
         payload: &[u8],
     ) -> Result<bool> {
         if !self.install_tablet_snapshot_payload(tablet_id, payload)? {
+            return Ok(false);
+        }
+        self.rehydrate_from_persist().await?;
+        Ok(true)
+    }
+
+    pub async fn install_tablet_snapshot_payload_merge_and_rehydrate(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        if !self.install_tablet_snapshot_payload_merge(tablet_id, payload)? {
             return Ok(false);
         }
         self.rehydrate_from_persist().await?;
