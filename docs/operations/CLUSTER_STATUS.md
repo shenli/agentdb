@@ -166,6 +166,8 @@ when metadata-backed cluster mode is enabled:
   bytes, value bytes, storage bytes, applied index, applied-index delta,
   sample interval, write ops/sec, retained committed log entries, and update
   time
+- opt-in local tablet log compaction by retained committed-entry debt through
+  `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,

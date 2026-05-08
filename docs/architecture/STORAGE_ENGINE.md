@@ -1137,7 +1137,11 @@ single-session appends or record writes.
    tablets busy forever. Operators can inspect raw and aggregate stats through
    `GET /api/admin/tablet-stats` or `agentdbctl tablets stats`. The policy pass
    only prepares metadata and movement rows; existing snapshot copy, catch-up,
-   and cutover checks still decide when the range map can change.
+   and cutover checks still decide when the range map can change. Separately,
+   the heartbeat worker can compact local tablet logs when
+   `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS` is above `0` and the retained
+   committed-entry count reaches the threshold. This reduces retained-log debt
+   for healthy tablets that do not currently need peer snapshot catch-up.
 
 9. Add compressed tablet-map ranges.
 
@@ -1197,8 +1201,11 @@ single-session appends or record writes.
     retained object snapshots are consumed by the server restore worker for
     local node bootstrap/catch-up. `POST /api/admin/raft/catch-up` and
     `agentdbctl raft catch-up` provide an operator-triggered catch-up path for
-    lagging replicas. Full LSM compaction debt is still a deeper storage-engine
-    signal; the current lifecycle signal is retained committed log entries.
+    lagging replicas. The heartbeat worker can also compact local tablet logs
+    by retained committed-entry count with
+    `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`. Full LSM compaction debt is
+    still a deeper storage-engine signal; the current lifecycle signal is
+    retained committed log entries.
 
 ## Non-Goals
 

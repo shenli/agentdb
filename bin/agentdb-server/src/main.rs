@@ -573,6 +573,7 @@ struct ClusterWorkerConfig {
     tablet_lifecycle_merge_max_storage_bytes: i64,
     tablet_lifecycle_split_min_write_ops_per_sec_milli: i64,
     tablet_lifecycle_split_max_compaction_debt_ops: i64,
+    tablet_log_compaction_min_debt_ops: u64,
     tablet_lifecycle_max_actions: usize,
     tablet_lifecycle_cooldown_ms: i64,
 }
@@ -652,6 +653,10 @@ impl ClusterWorkerConfig {
                 0,
             )
             .max(0),
+            tablet_log_compaction_min_debt_ops: env_u64(
+                "AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS",
+                0,
+            ),
             tablet_lifecycle_max_actions: env_usize(
                 "AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS",
                 DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS,
@@ -2450,6 +2455,26 @@ fn spawn_cluster_workers(
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
             }
+            match run_local_tablet_log_compaction_tick(
+                &heartbeat_runtime,
+                config.tablet_log_compaction_min_debt_ops,
+            ) {
+                Ok(compacted_count) if compacted_count > 0 => {
+                    tracing::debug!(
+                        node_id = %heartbeat_node_id,
+                        compacted_count,
+                        "compacted local tablet logs from retained-log debt"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        node_id = %heartbeat_node_id,
+                        error = %error,
+                        "local tablet log compaction failed"
+                    );
+                }
+            }
             match run_local_tablet_stats_tick(
                 &heartbeat_meta,
                 &heartbeat_runtime,
@@ -2561,6 +2586,31 @@ async fn heartbeat_node_once(
         region,
     )
     .await
+}
+
+fn run_local_tablet_log_compaction_tick(
+    runtime: &Arc<agentdb_core::Runtime>,
+    min_debt_ops: u64,
+) -> anyhow::Result<usize> {
+    if min_debt_ops == 0 {
+        return Ok(0);
+    }
+    let stats = runtime
+        .local_tablet_storage_stats()
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let mut compacted_count = 0usize;
+    for stats in stats {
+        if stats.applied_index == 0 || stats.compaction_debt_ops < min_debt_ops {
+            continue;
+        }
+        let compacted = runtime
+            .compact_tablet_log_through(stats.tablet_id, stats.applied_index)
+            .map_err(|error| anyhow::anyhow!("{:?}", error))?;
+        if compacted > 0 {
+            compacted_count += 1;
+        }
+    }
+    Ok(compacted_count)
 }
 
 async fn run_local_tablet_stats_tick(
@@ -4124,6 +4174,7 @@ mod tests {
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         }
@@ -4137,6 +4188,42 @@ mod tests {
         );
         assert_eq!(tablet_write_rate_sample(16, 1_000, 10, 2_000), (0, 0, 0));
         assert_eq!(tablet_write_rate_sample(10, 2_000, 16, 2_000), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn local_tablet_log_compaction_tick_compacts_debt_above_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn agentdb_storage::KvStore + Send + Sync> =
+            Arc::new(agentdb_storage::RocksKvStore::open(dir.path()).unwrap());
+        let log: Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync> =
+            Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv.clone()));
+        let content: Arc<dyn agentdb_storage::ContentBackend> =
+            Arc::new(agentdb_storage::InMemoryContentBackend::default());
+        let runtime = agentdb_core::runtime::Runtime::with_kv_and_replicated_log(kv, content, log);
+        runtime
+            .create_tenant(agentdb_core::tenant::NewTenant {
+                external_key: "compaction-tick-tenant".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        let before = runtime.local_tablet_storage_stats().unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].applied_index > 0);
+        assert!(before[0].compaction_debt_ops > 0);
+        assert_eq!(
+            run_local_tablet_log_compaction_tick(&runtime, before[0].compaction_debt_ops + 1)
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            run_local_tablet_log_compaction_tick(&runtime, 1).unwrap(),
+            1
+        );
+        let after = runtime.local_tablet_storage_stats().unwrap();
+        assert_eq!(after[0].compaction_debt_ops, 0);
     }
 
     #[test]
@@ -4513,6 +4600,7 @@ region = "us-west-2"
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4563,6 +4651,7 @@ region = "us-west-2"
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4614,6 +4703,7 @@ region = "us-west-2"
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4677,6 +4767,7 @@ region = "us-west-2"
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
@@ -4759,6 +4850,7 @@ region = "us-west-2"
             tablet_lifecycle_merge_max_storage_bytes: 0,
             tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
             tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
             tablet_lifecycle_max_actions: 4,
             tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
         };
