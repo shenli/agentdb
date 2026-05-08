@@ -66,6 +66,83 @@ pub struct TabletSnapshotEntry {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletSnapshotShardFilter {
+    pub target_tablet_id: i64,
+    pub start_shard: i64,
+    pub end_shard: i64,
+    pub shard_count: i64,
+}
+
+impl TabletSnapshotShardFilter {
+    fn validate(&self) -> StorageResult<()> {
+        if self.target_tablet_id < 0 {
+            return Err(agentdb_storage::Error::Other(
+                "target_tablet_id must be non-negative".into(),
+            ));
+        }
+        if self.shard_count <= 0 {
+            return Err(agentdb_storage::Error::Other(
+                "shard_count must be positive".into(),
+            ));
+        }
+        if self.start_shard < 0 || self.end_shard < self.start_shard {
+            return Err(agentdb_storage::Error::Other(format!(
+                "invalid shard range {}..{}",
+                self.start_shard, self.end_shard
+            )));
+        }
+        if self.end_shard >= self.shard_count {
+            return Err(agentdb_storage::Error::Other(format!(
+                "shard range {}..{} exceeds shard_count {}",
+                self.start_shard, self.end_shard, self.shard_count
+            )));
+        }
+        Ok(())
+    }
+
+    fn contains_key(&self, key: &[u8], value: &[u8]) -> StorageResult<bool> {
+        self.validate()?;
+        let placement = classify_snapshot_entry(key, value)?;
+        let shard = stable_shard(
+            &placement.tenant_id,
+            placement.routing_key.as_deref(),
+            self.shard_count,
+        );
+        Ok(shard >= self.start_shard && shard <= self.end_shard)
+    }
+}
+
+impl TabletStateSnapshot {
+    pub fn retarget(&self, target_tablet_id: i64) -> StorageResult<Self> {
+        if target_tablet_id < 0 {
+            return Err(agentdb_storage::Error::Other(
+                "target_tablet_id must be non-negative".into(),
+            ));
+        }
+        Ok(Self {
+            tablet_id: target_tablet_id,
+            applied_index: self.applied_index,
+            entries: self.entries.clone(),
+        })
+    }
+
+    pub fn filter_for_shard_range(&self, filter: TabletSnapshotShardFilter) -> StorageResult<Self> {
+        filter.validate()?;
+        let mut entries = Vec::new();
+        for entry in &self.entries {
+            if filter.contains_key(&entry.key, &entry.value)? {
+                entries.push(entry.clone());
+            }
+        }
+        Ok(Self {
+            tablet_id: filter.target_tablet_id,
+            applied_index: self.applied_index,
+            entries,
+        })
+    }
+}
+
 pub trait TabletStateMachine: Send + Sync {
     fn commit(&self, command: TabletCommand) -> StorageResult<TabletApplyResult>;
     fn apply_committed(&self) -> StorageResult<usize>;
@@ -126,6 +203,13 @@ impl LoggedTabletStateMachine {
         })
     }
 
+    pub fn export_snapshot_for_shard_range(
+        &self,
+        filter: TabletSnapshotShardFilter,
+    ) -> StorageResult<TabletStateSnapshot> {
+        self.export_snapshot()?.filter_for_shard_range(filter)
+    }
+
     pub fn install_snapshot(&self, snapshot: &TabletStateSnapshot) -> StorageResult<()> {
         if snapshot.tablet_id != self.tablet_id {
             return Err(agentdb_storage::Error::Other(format!(
@@ -157,6 +241,37 @@ impl LoggedTabletStateMachine {
             .applied_index
             .lock()
             .expect("tablet applied-index lock poisoned") = snapshot.applied_index;
+        Ok(())
+    }
+
+    pub fn install_snapshot_merge(&self, snapshot: &TabletStateSnapshot) -> StorageResult<()> {
+        if snapshot.tablet_id != self.tablet_id {
+            return Err(agentdb_storage::Error::Other(format!(
+                "snapshot tablet_id {} does not match state machine tablet_id {}",
+                snapshot.tablet_id, self.tablet_id
+            )));
+        }
+        for entry in &snapshot.entries {
+            validate_user_key(&entry.key)?;
+        }
+
+        let next_applied_index = self.applied_index().max(snapshot.applied_index);
+        let mut ops = Vec::with_capacity(snapshot.entries.len() + 1);
+        for entry in &snapshot.entries {
+            ops.push(WriteOp::Put {
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+            });
+        }
+        ops.push(WriteOp::Put {
+            key: APPLIED_INDEX_KEY.to_vec(),
+            value: next_applied_index.to_be_bytes().to_vec(),
+        });
+        self.store.write_batch(ops)?;
+        *self
+            .applied_index
+            .lock()
+            .expect("tablet applied-index lock poisoned") = next_applied_index;
         Ok(())
     }
 
@@ -263,6 +378,157 @@ fn validate_user_key(key: &[u8]) -> StorageResult<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEntryPlacement {
+    tenant_id: String,
+    routing_key: Option<String>,
+}
+
+fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEntryPlacement> {
+    let key = std::str::from_utf8(key).map_err(|err| {
+        agentdb_storage::Error::Other(format!("snapshot entry key is not utf8: {err}"))
+    })?;
+    if let Some(tenant_id) = key.strip_prefix("record/tenant/") {
+        return placement(tenant_id, None);
+    }
+    if key.starts_with("record/tenant_alias/") {
+        let tenant_id = std::str::from_utf8(value).map_err(|err| {
+            agentdb_storage::Error::Other(format!("tenant alias snapshot value is not utf8: {err}"))
+        })?;
+        return placement(tenant_id, None);
+    }
+    if let Some(rest) = key.strip_prefix("record/agent/") {
+        return placement(first_segment(rest)?, None);
+    }
+    if let Some(rest) = key.strip_prefix("record/agent_alias/") {
+        return placement(first_segment(rest)?, None);
+    }
+    if let Some(rest) = key.strip_prefix("record/session/") {
+        let (tenant_id, session_id) = first_two_segments(rest)?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("record/session_alias/") {
+        let tenant_id = first_segment(rest)?;
+        let session_id = std::str::from_utf8(value).map_err(|err| {
+            agentdb_storage::Error::Other(format!(
+                "session alias snapshot value is not utf8: {err}"
+            ))
+        })?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("record/session_segment/") {
+        let (tenant_id, session_id) = first_two_segments(rest)?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("record/session_by_agent/") {
+        let mut parts = rest.splitn(3, '/');
+        let tenant_id = parts.next().unwrap_or_default();
+        let _agent_id = parts.next().unwrap_or_default();
+        let session_id = parts.next().unwrap_or_default();
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("event/") {
+        let (tenant_id, session_id) = first_two_segments(rest)?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("event_by_id/") {
+        let tenant_id = first_segment(rest)?;
+        let pointer: serde_json::Value = serde_json::from_slice(value).map_err(|err| {
+            agentdb_storage::Error::Other(format!("event_by_id snapshot value is invalid: {err}"))
+        })?;
+        let session_id = pointer
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                agentdb_storage::Error::Other(
+                    "event_by_id snapshot value is missing session_id".into(),
+                )
+            })?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("record/idempotency/") {
+        let mut parts = rest.splitn(4, "::");
+        let tenant_id = parts.next().unwrap_or_default();
+        let operation = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let routing_key = (operation == "append").then_some(target);
+        return placement(tenant_id, routing_key);
+    }
+    for prefix in [
+        "record/artifact/",
+        "record/artifact_by_sha256/",
+        "record/searchable/",
+        "record/searchable_by_namespace/",
+        "record/searchable_commit/",
+        "record/searchable_index_outbox/",
+        "record/skill/",
+        "record/skill_unique/",
+        "record/agent_skill/",
+    ] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            return placement(first_segment(rest)?, None);
+        }
+    }
+    Err(agentdb_storage::Error::Other(format!(
+        "snapshot entry key `{key}` cannot be classified for shard movement"
+    )))
+}
+
+fn placement(tenant_id: &str, routing_key: Option<&str>) -> StorageResult<SnapshotEntryPlacement> {
+    if tenant_id.is_empty() {
+        return Err(agentdb_storage::Error::Other(
+            "snapshot entry tenant_id is empty".into(),
+        ));
+    }
+    Ok(SnapshotEntryPlacement {
+        tenant_id: tenant_id.to_string(),
+        routing_key: routing_key
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn first_segment(value: &str) -> StorageResult<&str> {
+    value
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| agentdb_storage::Error::Other("missing key segment".into()))
+}
+
+fn first_two_segments(value: &str) -> StorageResult<(&str, &str)> {
+    let mut parts = value.split('/');
+    let first = parts
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| agentdb_storage::Error::Other("missing first key segment".into()))?;
+    let second = parts
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| agentdb_storage::Error::Other("missing second key segment".into()))?;
+    Ok((first, second))
+}
+
+fn stable_shard(tenant_id: &str, routing_key: Option<&str>, shard_count: i64) -> i64 {
+    let mut bytes =
+        Vec::with_capacity(tenant_id.len() + 1 + routing_key.map(str::len).unwrap_or_default());
+    bytes.extend_from_slice(tenant_id.as_bytes());
+    if let Some(routing_key) = routing_key.filter(|key| !key.is_empty()) {
+        bytes.push(0xff);
+        bytes.extend_from_slice(routing_key.as_bytes());
+    }
+    (fnv1a64(&bytes) % shard_count as u64) as i64
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -467,6 +733,92 @@ mod tests {
         assert_eq!(
             restarted.store().get(b"k").unwrap().as_deref(),
             Some(&b"fresh"[..])
+        );
+    }
+
+    #[test]
+    fn snapshot_filter_retargets_and_keeps_only_requested_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let source = LoggedTabletStateMachine::single_node(kv, 7).unwrap();
+        let session_a = "sess_a";
+        let shard_a = stable_shard("tenant-a", Some(session_a), 64);
+        let session_b = (0..128)
+            .map(|idx| format!("sess_b_{idx}"))
+            .find(|session| stable_shard("tenant-a", Some(session), 64) != shard_a)
+            .unwrap();
+        let shard_b = stable_shard("tenant-a", Some(session_b.as_str()), 64);
+        assert_ne!(shard_a, shard_b);
+        source
+            .commit(TabletCommand::WriteBatch {
+                ops: vec![
+                    TabletWriteOp::Put {
+                        key: format!("record/session/tenant-a/{session_a}").into_bytes(),
+                        value: b"session-a".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: format!("event/tenant-a/{session_a}/00000000000000000001")
+                            .into_bytes(),
+                        value: b"event-a".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: format!("record/session/tenant-a/{session_b}").into_bytes(),
+                        value: b"session-b".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
+
+        let filtered = source
+            .export_snapshot_for_shard_range(TabletSnapshotShardFilter {
+                target_tablet_id: 8,
+                start_shard: shard_a,
+                end_shard: shard_a,
+                shard_count: 64,
+            })
+            .unwrap();
+
+        assert_eq!(filtered.tablet_id, 8);
+        assert_eq!(filtered.applied_index, 1);
+        let keys: Vec<_> = filtered
+            .entries
+            .iter()
+            .map(|entry| String::from_utf8(entry.key.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                format!("event/tenant-a/{session_a}/00000000000000000001"),
+                format!("record/session/tenant-a/{session_a}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_merge_install_preserves_existing_entries() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_kv = Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+        let target = LoggedTabletStateMachine::single_node(target_kv, 9).unwrap();
+        target.store().put(b"existing", b"left").unwrap();
+        let snapshot = TabletStateSnapshot {
+            tablet_id: 9,
+            applied_index: 4,
+            entries: vec![TabletSnapshotEntry {
+                key: b"incoming".to_vec(),
+                value: b"right".to_vec(),
+            }],
+        };
+
+        target.install_snapshot_merge(&snapshot).unwrap();
+
+        assert_eq!(target.applied_index(), 4);
+        assert_eq!(
+            target.store().get(b"existing").unwrap().as_deref(),
+            Some(&b"left"[..])
+        );
+        assert_eq!(
+            target.store().get(b"incoming").unwrap().as_deref(),
+            Some(&b"right"[..])
         );
     }
 
