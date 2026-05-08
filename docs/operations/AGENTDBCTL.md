@@ -98,7 +98,9 @@ split/merge destination replicas are opened as local Raft runtime groups by the
 registry sync loop. The scheduler leader scans movement rows, marks them
 completed once all destination serving replicas report healthy and caught up,
 and then publishes the split/merge range-map cutover when the whole prepared
-movement group is complete. The explicit `complete-*` commands remain for
+movement group is complete. After cutover, tombstoned source tablets are
+ignored by runtime Raft registry sync and their replica rows are removed by the
+scheduler cleanup pass. The explicit `complete-*` commands remain for
 operator-controlled cutover or recovery. Use `--allow-unready` only for
 emergency/manual recovery after separately proving state safety.
 

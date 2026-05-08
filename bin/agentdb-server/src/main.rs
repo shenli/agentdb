@@ -1527,11 +1527,21 @@ async fn sync_raft_rs_registry(
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
 ) -> anyhow::Result<RaftRsRegistryBootstrap> {
     let local_raft_node_id = agentdb_storage::stable_raft_node_id(local_node_id)?;
+    let tablet_states: BTreeMap<i64, String> = agentdb_meta::tablets::list_all(meta.pool())
+        .await?
+        .into_iter()
+        .map(|tablet| (tablet.tablet_id, tablet.state))
+        .collect();
     let local_tablet_ids: BTreeSet<_> = agentdb_meta::tablet_replicas::list_all(meta.pool())
         .await?
         .into_iter()
         .filter(|replica| {
             replica.node_id == local_node_id && matches!(replica.role.as_str(), "voter" | "learner")
+        })
+        .filter(|replica| {
+            tablet_states
+                .get(&replica.tablet_id)
+                .map_or(true, |state| state != "tombstoned")
         })
         .map(|replica| replica.tablet_id)
         .collect();
@@ -2540,6 +2550,14 @@ async fn run_cluster_scheduler_tick(
                 "scheduler completed ready tablet movement cutovers"
             );
         }
+        let deleted_tombstoned_replicas = cleanup_tombstoned_tablet_replicas(meta).await?;
+        if deleted_tombstoned_replicas > 0 {
+            tracing::info!(
+                node_id = %node_id,
+                deleted_tombstoned_replicas,
+                "scheduler cleaned up tombstoned tablet replicas"
+            );
+        }
     }
     Ok(())
 }
@@ -2759,6 +2777,20 @@ async fn run_tablet_movement_tick(
         }
     }
     Ok(completed)
+}
+
+async fn cleanup_tombstoned_tablet_replicas(
+    meta: &agentdb_meta::MetaStore,
+) -> agentdb_meta::MetaResult<u64> {
+    let mut deleted = 0u64;
+    for tablet in agentdb_meta::tablets::list_all(meta.pool()).await? {
+        if tablet.state != "tombstoned" {
+            continue;
+        }
+        deleted +=
+            agentdb_meta::tablet_replicas::delete_by_tablet(meta.pool(), tablet.tablet_id).await?;
+    }
+    Ok(deleted)
 }
 
 async fn complete_ready_tablet_movement_cutovers(
@@ -4140,6 +4172,40 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn tombstoned_tablet_cleanup_deletes_replica_rows() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let scope = agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
+        tablets::create_with_placement(meta.pool(), 7, scope, "tombstoned", Some("raft/7"), 0, 100)
+            .await
+            .unwrap();
+        tablets::create_with_placement(meta.pool(), 8, scope, "serving", Some("raft/8"), 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 1, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "learner", "healthy", 1, 1, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 8, "node-a", "voter", "healthy", 1, 1, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(cleanup_tombstoned_tablet_replicas(&meta).await.unwrap(), 2);
+        assert!(tablet_replicas::list_by_tablet(meta.pool(), 7)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            tablet_replicas::list_by_tablet(meta.pool(), 8)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn tablet_movement_cutover_completes_ready_split_group() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let scope = agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
@@ -4595,6 +4661,32 @@ region = "us-west-2"
             .unwrap();
 
         assert!(bootstrap.tablet_ids.is_empty());
+        assert!(registry.tablet_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn raft_rs_registry_sync_ignores_tombstoned_local_replicas() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scope = agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
+        tablets::create_with_placement(meta.pool(), 7, scope, "tombstoned", Some("raft/7"), 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        let bootstrap = sync_raft_rs_registry(&meta, "node-a", dir.path(), registry.clone())
+            .await
+            .unwrap();
+
+        assert!(bootstrap.tablet_ids.is_empty());
+        assert!(bootstrap.bootstrapped_tablet_ids.is_empty());
+        assert!(bootstrap.local_logs.is_empty());
         assert!(registry.tablet_ids().is_empty());
     }
 
