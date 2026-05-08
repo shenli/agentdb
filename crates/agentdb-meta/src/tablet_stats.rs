@@ -11,7 +11,7 @@ use sqlx::AnyPool;
 
 use crate::error::{MetaError, MetaResult};
 
-type TabletStatsRow = (i64, String, i64, i64, i64, i64, i64, i64);
+type TabletStatsRow = (i64, String, i64, i64, i64, i64, i64, i64, i64, i64, i64);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabletStats {
@@ -22,6 +22,9 @@ pub struct TabletStats {
     pub value_bytes: i64,
     pub storage_bytes: i64,
     pub applied_index: i64,
+    pub sample_interval_ms: i64,
+    pub write_ops_delta: i64,
+    pub write_ops_per_sec_milli: i64,
     pub updated_at_ms: i64,
 }
 
@@ -34,6 +37,9 @@ pub struct TabletStatsAggregate {
     pub value_bytes: i64,
     pub storage_bytes: i64,
     pub applied_index: i64,
+    pub sample_interval_ms: i64,
+    pub write_ops_delta: i64,
+    pub write_ops_per_sec_milli: i64,
     pub updated_at_ms: i64,
 }
 
@@ -49,6 +55,38 @@ pub async fn upsert(
     applied_index: i64,
     now_ms: i64,
 ) -> MetaResult<()> {
+    upsert_with_rate(
+        pool,
+        tablet_id,
+        node_id,
+        key_count,
+        key_bytes,
+        value_bytes,
+        storage_bytes,
+        applied_index,
+        0,
+        0,
+        0,
+        now_ms,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_with_rate(
+    pool: &AnyPool,
+    tablet_id: i64,
+    node_id: &str,
+    key_count: i64,
+    key_bytes: i64,
+    value_bytes: i64,
+    storage_bytes: i64,
+    applied_index: i64,
+    sample_interval_ms: i64,
+    write_ops_delta: i64,
+    write_ops_per_sec_milli: i64,
+    now_ms: i64,
+) -> MetaResult<()> {
     validate_non_negative(tablet_id, "tablet_id")?;
     validate_non_empty(node_id, "node_id")?;
     validate_non_negative(key_count, "key_count")?;
@@ -56,18 +94,25 @@ pub async fn upsert(
     validate_non_negative(value_bytes, "value_bytes")?;
     validate_non_negative(storage_bytes, "storage_bytes")?;
     validate_non_negative(applied_index, "applied_index")?;
+    validate_non_negative(sample_interval_ms, "sample_interval_ms")?;
+    validate_non_negative(write_ops_delta, "write_ops_delta")?;
+    validate_non_negative(write_ops_per_sec_milli, "write_ops_per_sec_milli")?;
     validate_non_negative(now_ms, "now_ms")?;
     sqlx::query(
         "INSERT INTO tablet_stats
             (tablet_id, node_id, key_count, key_bytes, value_bytes,
-             storage_bytes, applied_index, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             storage_bytes, applied_index, sample_interval_ms, write_ops_delta,
+             write_ops_per_sec_milli, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (tablet_id, node_id) DO UPDATE SET
             key_count = excluded.key_count,
             key_bytes = excluded.key_bytes,
             value_bytes = excluded.value_bytes,
             storage_bytes = excluded.storage_bytes,
             applied_index = excluded.applied_index,
+            sample_interval_ms = excluded.sample_interval_ms,
+            write_ops_delta = excluded.write_ops_delta,
+            write_ops_per_sec_milli = excluded.write_ops_per_sec_milli,
             updated_at_ms = excluded.updated_at_ms",
     )
     .bind(tablet_id)
@@ -77,6 +122,9 @@ pub async fn upsert(
     .bind(value_bytes)
     .bind(storage_bytes)
     .bind(applied_index)
+    .bind(sample_interval_ms)
+    .bind(write_ops_delta)
+    .bind(write_ops_per_sec_milli)
     .bind(now_ms)
     .execute(pool)
     .await?;
@@ -86,7 +134,8 @@ pub async fn upsert(
 pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TabletStats>> {
     let rows: Vec<TabletStatsRow> = sqlx::query_as(
         "SELECT tablet_id, node_id, key_count, key_bytes, value_bytes,
-                storage_bytes, applied_index, updated_at_ms
+                storage_bytes, applied_index, sample_interval_ms,
+                write_ops_delta, write_ops_per_sec_milli, updated_at_ms
            FROM tablet_stats
           ORDER BY tablet_id, node_id",
     )
@@ -98,10 +147,11 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TabletStats>> {
 pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<TabletStats>> {
     let rows: Vec<TabletStatsRow> = sqlx::query_as(
         "SELECT tablet_id, node_id, key_count, key_bytes, value_bytes,
-                storage_bytes, applied_index, updated_at_ms
+                storage_bytes, applied_index, sample_interval_ms,
+                write_ops_delta, write_ops_per_sec_milli, updated_at_ms
            FROM tablet_stats
           WHERE tablet_id = ?
-          ORDER BY storage_bytes DESC, node_id",
+          ORDER BY storage_bytes DESC, write_ops_per_sec_milli DESC, node_id",
     )
     .bind(tablet_id)
     .fetch_all(pool)
@@ -121,6 +171,12 @@ pub async fn list_aggregates(pool: &AnyPool) -> MetaResult<Vec<TabletStatsAggreg
                 aggregate.value_bytes = aggregate.value_bytes.max(stats.value_bytes);
                 aggregate.storage_bytes = aggregate.storage_bytes.max(stats.storage_bytes);
                 aggregate.applied_index = aggregate.applied_index.max(stats.applied_index);
+                aggregate.sample_interval_ms =
+                    aggregate.sample_interval_ms.max(stats.sample_interval_ms);
+                aggregate.write_ops_delta = aggregate.write_ops_delta.max(stats.write_ops_delta);
+                aggregate.write_ops_per_sec_milli = aggregate
+                    .write_ops_per_sec_milli
+                    .max(stats.write_ops_per_sec_milli);
                 aggregate.updated_at_ms = aggregate.updated_at_ms.max(stats.updated_at_ms);
             })
             .or_insert(TabletStatsAggregate {
@@ -131,6 +187,9 @@ pub async fn list_aggregates(pool: &AnyPool) -> MetaResult<Vec<TabletStatsAggreg
                 value_bytes: stats.value_bytes,
                 storage_bytes: stats.storage_bytes,
                 applied_index: stats.applied_index,
+                sample_interval_ms: stats.sample_interval_ms,
+                write_ops_delta: stats.write_ops_delta,
+                write_ops_per_sec_milli: stats.write_ops_per_sec_milli,
                 updated_at_ms: stats.updated_at_ms,
             });
     }
@@ -172,6 +231,9 @@ fn into_stats(
         value_bytes,
         storage_bytes,
         applied_index,
+        sample_interval_ms,
+        write_ops_delta,
+        write_ops_per_sec_milli,
         updated_at_ms,
     ): TabletStatsRow,
 ) -> TabletStats {
@@ -183,6 +245,9 @@ fn into_stats(
         value_bytes,
         storage_bytes,
         applied_index,
+        sample_interval_ms,
+        write_ops_delta,
+        write_ops_per_sec_milli,
         updated_at_ms,
     }
 }
@@ -219,6 +284,34 @@ mod tests {
         assert_eq!(aggregate.replica_count, 2);
         assert_eq!(aggregate.storage_bytes, 1_100);
         assert_eq!(aggregate.applied_index, 12);
+        assert_eq!(aggregate.write_ops_per_sec_milli, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_with_rate_lists_and_aggregates_write_rate() {
+        let p = pool().await;
+        upsert_with_rate(
+            &p, 7, "node-a", 10, 100, 1_000, 1_100, 24, 1_000, 12, 12_000, 200,
+        )
+        .await
+        .unwrap();
+        upsert_with_rate(&p, 7, "node-b", 8, 80, 900, 980, 20, 1_000, 8, 8_000, 210)
+            .await
+            .unwrap();
+
+        let rows = list_by_tablet(&p, 7).await.unwrap();
+        assert_eq!(rows[0].sample_interval_ms, 1_000);
+        assert_eq!(rows[0].write_ops_delta, 12);
+        assert_eq!(rows[0].write_ops_per_sec_milli, 12_000);
+
+        let aggregate = list_aggregates(&p)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|aggregate| aggregate.tablet_id == 7)
+            .unwrap();
+        assert_eq!(aggregate.write_ops_delta, 12);
+        assert_eq!(aggregate.write_ops_per_sec_milli, 12_000);
     }
 
     #[tokio::test]

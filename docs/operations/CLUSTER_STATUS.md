@@ -163,7 +163,8 @@ when metadata-backed cluster mode is enabled:
   completed and publishes the prepared range-map cutover once the whole group
   is ready
 - local tablet storage stats publication on the heartbeat loop: key count, key
-  bytes, value bytes, storage bytes, applied index, and update time
+  bytes, value bytes, storage bytes, applied index, applied-index delta,
+  sample interval, write ops/sec, and update time
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
@@ -171,7 +172,8 @@ when metadata-backed cluster mode is enabled:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_KEYS`,
   `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_KEYS`,
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_STORAGE_BYTES`,
-  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`, and
+  `AGENTDB_TABLET_LIFECYCLE_MERGE_MAX_STORAGE_BYTES`,
+  `AGENTDB_TABLET_LIFECYCLE_SPLIT_MIN_WRITE_OPS_PER_SEC`, and
   `AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS`
 - lifecycle cooldown (`AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`, default 10
   minutes) so recently completed split/merge rows do not trigger immediate

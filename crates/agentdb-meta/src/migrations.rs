@@ -145,6 +145,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/021_tablet_stats.sql"),
         include_str!("../migrations/021_tablet_stats.pg.sql"),
     ),
+    (
+        22,
+        "tablet runtime write-rate statistics",
+        include_str!("../migrations/022_tablet_stats_write_rate.sql"),
+        include_str!("../migrations/022_tablet_stats_write_rate.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the
