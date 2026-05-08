@@ -1022,13 +1022,16 @@ single-session appends or record writes.
    caught up to the source; when the scheduler node has the local Raft group
    registered, it also proposes the learner-to-voter membership promotion for
    the completed target, removes the old source from Raft, and deletes the
-   retired source replica row. Operator-triggered `agentdbctl tablets
-   rebalance` uses the same API-side membership convergence when the serving API
-   node has the local Raft group registered. `GET /api/admin/raft` includes
-   configured-only tablets even when the local API node has not opened a Raft
-   group, so replacement learner intent is visible before local runtime
-   bootstrap. Remaining production work is policy-driven split/merge scheduling
-   and deeper tablet-aware compaction tuning.
+   retired source replica row. If ownership completes before the local Raft
+   group is available, the source replica is marked `draining`; later rebalance
+   passes retry retirement once a node with the local group observes the row.
+   Operator-triggered `agentdbctl tablets rebalance` uses the same API-side
+   membership convergence when the serving API node has the local Raft group
+   registered. `GET /api/admin/raft` includes configured-only tablets even when
+   the local API node has not opened a Raft group, so replacement learner intent
+   is visible before local runtime bootstrap. Remaining production work is
+   policy-driven split/merge scheduling and deeper tablet-aware compaction
+   tuning.
 
 8. Add tablet split and rebalance.
 

@@ -70,9 +70,11 @@ replacement intent by marking the target as a learner and handoff destination;
 the next rebalance pass can complete the ownership handoff after the target is
 healthy and caught up. When the scheduler node has the local Raft group
 registered, automatic completion also promotes the target to voter, removes the
-source from Raft, and deletes the retired source replica row. Use `raft
-catch-up` to accelerate convergence and `complete-replacement` when you need
-explicit operator-controlled promotion or source retirement.
+source from Raft, and deletes the retired source replica row. If ownership
+completion runs before the local Raft group is available, the old source
+replica is left as `draining` and later rebalance passes retry Raft retirement.
+Use `raft catch-up` to accelerate convergence and `complete-replacement` when
+you need explicit operator-controlled promotion or source retirement.
 
 Split/merge lifecycle:
 

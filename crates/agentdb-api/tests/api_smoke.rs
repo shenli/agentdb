@@ -2610,6 +2610,112 @@ async fn admin_tablet_rebalance_promotes_target_and_retires_source_in_raft() {
 }
 
 #[tokio::test]
+async fn admin_tablet_rebalance_skips_raft_retirement_when_group_is_unregistered() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-a",
+        "http://127.0.0.1:18080",
+        None,
+        "alive",
+        i64::MAX,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::nodes::upsert(
+        meta.pool(),
+        "node-b",
+        "http://127.0.0.1:18081",
+        None,
+        "alive",
+        i64::MAX,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    agentdb_meta::tablets::get_or_create(meta.pool(), 7, 100)
+        .await
+        .unwrap();
+    agentdb_meta::tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 20_000)
+        .await
+        .unwrap();
+    agentdb_meta::tablets::mark_for_handoff(meta.pool(), 7, "node-a")
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 10, 10, 100)
+        .await
+        .unwrap();
+    tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 10, 10, 100)
+        .await
+        .unwrap();
+
+    let registry = RaftRsGroupRegistry::shared();
+    let state = AppState::new(runtime)
+        .with_meta(meta.clone())
+        .with_raft_registry(registry.clone());
+    let app = spawn_app_with_state(state).await;
+    let applied: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablets/rebalance", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(applied["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| { action["action"] == "complete_replacement" && action["tablet_id"] == 7 }));
+    let tablet = agentdb_meta::tablets::get(meta.pool(), 7)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        .await
+        .unwrap();
+    assert!(replicas
+        .iter()
+        .any(|replica| replica.node_id == "node-b" && replica.health == "draining"));
+    assert!(replicas
+        .iter()
+        .any(|replica| replica.node_id == "node-a" && replica.role == "voter"));
+
+    let dir = TempDir::new().unwrap();
+    let configs = vec![
+        RaftRsNodeConfig::from_control_plane_replica(7, "node-a", "voter", dir.path()).unwrap(),
+        RaftRsNodeConfig::from_control_plane_replica(7, "node-b", "learner", dir.path()).unwrap(),
+    ];
+    let leader_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+    let (group, _log) = RaftRsSharedGroup::open_local(7, configs, leader_id).unwrap();
+    group.elect(leader_id).unwrap();
+    registry.register(7, group).unwrap();
+
+    app.client
+        .post(format!("{}/api/admin/tablets/rebalance", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
+        .await
+        .unwrap();
+    assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+}
+
+#[tokio::test]
 async fn admin_nodes_returns_503_when_meta_is_missing() {
     let app = spawn_app().await;
 
