@@ -1051,12 +1051,19 @@ single-session appends or record writes.
    and has `applied_index >= required_applied_index`. Complete also marks rows
    completed as part of the explicit cutover path. Runtime tablet snapshots now
    have the primitives required by those workers: a source tablet can export a
-   shard-range-filtered snapshot already retargeted to a split child tablet,
-   and a merge destination can install source snapshots non-destructively so
-   multiple source tablets can be combined. The active copy/replay worker and
-   split-created Raft group bootstrap are still not wired; those workers must
-   use the snapshot primitives and update `tablet_replicas` progress before
-   cutover succeeds and before the movement worker can close the row.
+   shard-range-filtered snapshot already retargeted to a split child tablet.
+   Routing-key rows such as sessions, events, and append idempotency records
+   are filtered by virtual shard; tenant-global metadata without a routing key
+   is included in every child snapshot so validation data is present wherever a
+   routed session may land. A merge destination can install source snapshots
+   non-destructively so multiple source tablets can be combined. The active
+   local same-node copy/replay executor is wired into cluster workers: when a
+   node hosts both the source and destination replicas for a pending movement,
+   it exports the filtered source snapshot, installs it into the destination
+   tablet, and updates that node's destination `tablet_replicas` progress and
+   health. The scheduler leader still owns final movement completion once every
+   destination serving replica is ready. Cross-node source streaming and
+   split-created Raft group bootstrap are still follow-up work.
 
 9. Add compressed tablet-map ranges.
 

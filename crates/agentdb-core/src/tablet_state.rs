@@ -104,6 +104,9 @@ impl TabletSnapshotShardFilter {
     fn contains_key(&self, key: &[u8], value: &[u8]) -> StorageResult<bool> {
         self.validate()?;
         let placement = classify_snapshot_entry(key, value)?;
+        if placement.routing_key.is_none() {
+            return Ok(true);
+        }
         let shard = stable_shard(
             &placement.tenant_id,
             placement.routing_key.as_deref(),
@@ -258,6 +261,14 @@ impl LoggedTabletStateMachine {
         let next_applied_index = self.applied_index().max(snapshot.applied_index);
         let mut ops = Vec::with_capacity(snapshot.entries.len() + 1);
         for entry in &snapshot.entries {
+            if let Some(existing) = self.store.get(&entry.key)? {
+                if existing != entry.value {
+                    return Err(agentdb_storage::Error::Other(format!(
+                        "snapshot merge conflict for key `{}`",
+                        String::from_utf8_lossy(&entry.key)
+                    )));
+                }
+            }
             ops.push(WriteOp::Put {
                 key: entry.key.clone(),
                 value: entry.value.clone(),
@@ -753,6 +764,10 @@ mod tests {
             .commit(TabletCommand::WriteBatch {
                 ops: vec![
                     TabletWriteOp::Put {
+                        key: b"record/tenant/tenant-a".to_vec(),
+                        value: b"tenant-global".to_vec(),
+                    },
+                    TabletWriteOp::Put {
                         key: format!("record/session/tenant-a/{session_a}").into_bytes(),
                         value: b"session-a".to_vec(),
                     },
@@ -762,8 +777,33 @@ mod tests {
                         value: b"event-a".to_vec(),
                     },
                     TabletWriteOp::Put {
+                        key: b"event_by_id/tenant-a/evt_a".to_vec(),
+                        value: serde_json::to_vec(&serde_json::json!({
+                            "session_id": session_a,
+                            "seq": 1,
+                        }))
+                        .unwrap(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"record/session_alias/tenant-a/current".to_vec(),
+                        value: session_a.as_bytes().to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: format!("record/idempotency/tenant-a::append::{session_a}::idem-a")
+                            .into_bytes(),
+                        value: b"idempotency-a".to_vec(),
+                    },
+                    TabletWriteOp::Put {
                         key: format!("record/session/tenant-a/{session_b}").into_bytes(),
                         value: b"session-b".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: b"event_by_id/tenant-a/evt_b".to_vec(),
+                        value: serde_json::to_vec(&serde_json::json!({
+                            "session_id": session_b,
+                            "seq": 1,
+                        }))
+                        .unwrap(),
                     },
                 ],
             })
@@ -789,7 +829,11 @@ mod tests {
             keys,
             vec![
                 format!("event/tenant-a/{session_a}/00000000000000000001"),
+                "event_by_id/tenant-a/evt_a".to_string(),
+                format!("record/idempotency/tenant-a::append::{session_a}::idem-a"),
                 format!("record/session/tenant-a/{session_a}"),
+                "record/session_alias/tenant-a/current".to_string(),
+                "record/tenant/tenant-a".to_string(),
             ]
         );
     }
@@ -819,6 +863,31 @@ mod tests {
         assert_eq!(
             target.store().get(b"incoming").unwrap().as_deref(),
             Some(&b"right"[..])
+        );
+    }
+
+    #[test]
+    fn snapshot_merge_install_rejects_conflicting_existing_entries() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_kv = Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+        let target = LoggedTabletStateMachine::single_node(target_kv, 9).unwrap();
+        target.store().put(b"shared", b"old").unwrap();
+        let snapshot = TabletStateSnapshot {
+            tablet_id: 9,
+            applied_index: 4,
+            entries: vec![TabletSnapshotEntry {
+                key: b"shared".to_vec(),
+                value: b"new".to_vec(),
+            }],
+        };
+
+        let err = target.install_snapshot_merge(&snapshot).unwrap_err();
+
+        assert!(err.to_string().contains("snapshot merge conflict"));
+        assert_eq!(target.applied_index(), 0);
+        assert_eq!(
+            target.store().get(b"shared").unwrap().as_deref(),
+            Some(&b"old"[..])
         );
     }
 

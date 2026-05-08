@@ -87,9 +87,11 @@ Prepare fences metadata, creates destination tablets, seeds destination replica
 intent, and enqueues `tablet_movements` state-copy work. Complete publishes the
 range-map cutover and lifecycle states after destination replicas are healthy
 and caught up to the source applied index, then marks movements completed. The
-scheduler leader also scans pending movement rows and auto-completes them once
-all destination serving replicas report healthy and caught up, so operators can
-use `agentdbctl tablets movements --status pending` as the open-work view. Use
+local tablet movement executor copies state for pending rows when the same node
+hosts both the source and destination replicas. The scheduler leader also scans
+pending movement rows and auto-completes them once all destination serving
+replicas report healthy and caught up, so operators can use
+`agentdbctl tablets movements --status pending` as the open-work view. Use
 `--allow-unready` only for emergency/manual recovery after separately proving
 state safety.
 
