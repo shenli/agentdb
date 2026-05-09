@@ -336,7 +336,7 @@ fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
             .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
             .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
             .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "1500")
+            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "5000")
             .env("AGENTDB_REAPER_TICK_MS", "500")
             .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "4")
             .env("AWS_EC2_METADATA_DISABLED", "true")
@@ -595,9 +595,13 @@ async fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Resu
         .post(format!("{base}{path}"))
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}{path}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 fn string_field(value: &Value, field: &str) -> Result<String> {
