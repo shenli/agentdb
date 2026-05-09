@@ -662,7 +662,7 @@ impl RaftRsGroup {
 
     fn expire_leader_lease(&mut self, node_id: u64) -> Result<()> {
         let node = self.node_mut(node_id)?;
-        if node.raw.status().ss.raft_state != StateRole::Leader {
+        if node.raw.status().ss.raft_state == StateRole::Follower {
             // Let this follower grant pre-votes after an externally detected
             // owner failure without ticking it into its own campaign.
             node.raw.raft.election_elapsed = usize::MAX / 4;
