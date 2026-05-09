@@ -467,7 +467,21 @@ async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration)
             let raft = get_json(client, &node.url, "/api/admin/raft").await?;
             ready &= raft["enabled"] == true
                 && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
+                && raft["unhealthy_replica_count"].as_u64().unwrap_or(1) == 0
+                && raft["outbound_message_count"].as_u64().unwrap_or(1) == 0
                 && raft["summary"]["leaderless_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["multi_leader_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["commit_index_drift_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["applied_index_drift_tablet_count"]
                     .as_u64()
                     .unwrap_or(1)
                     == 0;
@@ -486,7 +500,13 @@ async fn wait_raft_observable(client: &Client, base: &str, timeout: Duration) ->
     let start = tokio::time::Instant::now();
     loop {
         let raft = get_json(client, base, "/api/admin/raft").await?;
-        if raft["enabled"] == true && raft["tablet_count"].as_u64().unwrap_or(0) >= 1 {
+        if raft["enabled"] == true
+            && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
+            && raft["summary"]["leaderless_tablet_count"]
+                .as_u64()
+                .unwrap_or(1)
+                == 0
+        {
             return Ok(());
         }
         if start.elapsed() > timeout {

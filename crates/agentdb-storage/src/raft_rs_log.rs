@@ -32,7 +32,7 @@ use crate::{Error, LogCommit, LogEntry, ReplicatedLog, Result};
 
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
-const APPEND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const APPEND_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const APPEND_WAIT_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
