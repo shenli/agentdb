@@ -449,6 +449,8 @@ async fn run_smoke(
     }
 
     if args.chaos {
+        eprintln!("chaos: waiting for post-setup raft convergence");
+        wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
         run_chaos(
             args,
             client,
@@ -482,6 +484,8 @@ async fn run_chaos(
         args.chaos_iterations
     );
     for iteration in 0..args.chaos_iterations {
+        eprintln!("chaos: waiting for raft convergence before next fault");
+        wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
         let victim_index = rng.next_usize(nodes.len());
         let victim = &nodes[victim_index];
         let owner_before = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
