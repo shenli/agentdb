@@ -1905,8 +1905,30 @@ fn spawn_raft_rs_tick_worker(
                     BTreeMap::new()
                 }
             };
+            let raft_node_to_node_id = match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
+                Ok(replicas) => replicas
+                    .into_iter()
+                    .filter_map(|replica| {
+                        agentdb_storage::stable_raft_node_id(&replica.node_id)
+                            .ok()
+                            .map(|raft_node_id| ((replica.tablet_id, raft_node_id), replica.node_id))
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        ?error,
+                        "failed to load tablet replicas for raft-rs tick"
+                    );
+                    BTreeMap::new()
+                }
+            };
             for (tablet_id, group) in registry.groups_snapshot() {
-                let local_is_leader = group.status().iter().any(|status| {
+                let statuses = group.status();
+                let local_status = statuses
+                    .iter()
+                    .find(|status| status.node_id == local_raft_node_id);
+                let local_is_leader = statuses.iter().any(|status| {
                     status.node_id == local_raft_node_id && status.role.as_str() == "Leader"
                 });
                 let owner_node_id = tablets_by_id
@@ -1918,8 +1940,16 @@ fn spawn_raft_rs_tick_worker(
                         .get(owner)
                         .is_none_or(|node| node.state.as_str() != "alive")
                 });
+                let raft_leader_unavailable = local_status
+                    .filter(|status| status.leader_id != 0)
+                    .and_then(|status| raft_node_to_node_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|leader_node_id| {
+                        nodes_by_id
+                            .get(leader_node_id)
+                            .is_none_or(|node| node.state.as_str() != "alive")
+                    });
                 if !local_is_owner && !local_is_leader {
-                    if owner_unavailable {
+                    if owner_unavailable || raft_leader_unavailable {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
                             tracing::warn!(
                                 tablet_id,
