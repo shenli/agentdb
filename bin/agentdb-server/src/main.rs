@@ -269,11 +269,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         .as_ref()
                         .expect("slatedb requires object store config"),
                 )?;
-                tracing::info!(prefix = %SLATEDB_RUNTIME_PREFIX, "opened SlateDB runtime backend");
-                Arc::new(
-                    agentdb_storage::SlateKvStore::open(object_store, SLATEDB_RUNTIME_PREFIX)
-                        .await?,
-                )
+                let prefix = slate_runtime_prefix(&config);
+                tracing::info!(prefix = %prefix, "opened SlateDB runtime backend");
+                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &prefix).await?)
             }
         };
 
@@ -1070,6 +1068,29 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
             Ok(Arc::new(builder.build()?))
         }
     }
+}
+
+fn slate_runtime_prefix(config: &ResolvedServeConfig) -> String {
+    if matches!(config.deployment_mode, DeploymentMode::Cluster) {
+        if let Some(node_id) = config.route_node_id.as_deref() {
+            return format!(
+                "{SLATEDB_RUNTIME_PREFIX}/nodes/{}",
+                object_path_component(node_id)
+            );
+        }
+    }
+    SLATEDB_RUNTIME_PREFIX.to_string()
+}
+
+fn object_path_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
