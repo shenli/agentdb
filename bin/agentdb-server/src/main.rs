@@ -1962,6 +1962,15 @@ fn spawn_raft_rs_tick_worker(
                                 "failed to expire local raft-rs leader lease"
                             );
                         }
+                        if let Err(error) = group.tick(local_raft_node_id) {
+                            tracing::warn!(
+                                tablet_id,
+                                local_node_id,
+                                local_raft_node_id,
+                                ?error,
+                                "failed to tick local raft-rs group after owner became unavailable"
+                            );
+                        }
                     }
                     continue;
                 }
