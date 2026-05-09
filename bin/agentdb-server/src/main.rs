@@ -425,6 +425,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         Duration::from_millis(raft_outbox_interval_ms),
                         raft_outbox_max_messages_per_tick,
                     );
+                    campaign_owned_raft_tablets(
+                        &startup.meta,
+                        &startup.node_id,
+                        local_raft_node_id,
+                        &registry,
+                    )
+                    .await?;
                     let raft_snapshot_interval_ms = env_u64(
                         "AGENTDB_RAFT_SNAPSHOT_INTERVAL_MS",
                         DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS,
@@ -1865,6 +1872,42 @@ fn spawn_raft_rs_tick_worker(
             }
         }
     });
+}
+
+async fn campaign_owned_raft_tablets(
+    meta: &agentdb_meta::MetaStore,
+    local_node_id: &str,
+    local_raft_node_id: u64,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+) -> anyhow::Result<usize> {
+    let mut campaigns = 0usize;
+    let groups: BTreeMap<_, _> = registry.groups_snapshot().into_iter().collect();
+    for tablet in agentdb_meta::tablets::list_owned_by(meta.pool(), local_node_id).await? {
+        let Some(group) = groups.get(&tablet.tablet_id) else {
+            continue;
+        };
+        match group.elect(local_raft_node_id) {
+            Ok(()) => {
+                campaigns += 1;
+                tracing::info!(
+                    tablet_id = tablet.tablet_id,
+                    local_node_id,
+                    local_raft_node_id,
+                    "started raft-rs campaign for locally owned tablet"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = tablet.tablet_id,
+                    local_node_id,
+                    local_raft_node_id,
+                    ?error,
+                    "failed to campaign for locally owned raft-rs tablet"
+                );
+            }
+        }
+    }
+    Ok(campaigns)
 }
 
 fn spawn_raft_rs_message_outbox_worker(
