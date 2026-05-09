@@ -78,7 +78,7 @@ pub async fn insert(
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO admin_audit
              (ts_ms, actor_token_id, method, path, query, status, client_ip)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id",
     )
     .bind(ts_ms)
@@ -107,22 +107,33 @@ pub async fn list(pool: &AnyPool, filter: &AuditFilter) -> MetaResult<Vec<AuditR
            FROM admin_audit
           WHERE 1=1",
     );
+    let mut next_param = 1;
     if filter.since_ms.is_some() {
-        sql.push_str(" AND ts_ms >= ?");
+        sql.push_str(" AND ts_ms >= $");
+        sql.push_str(&next_param.to_string());
+        next_param += 1;
     }
     if filter.until_ms.is_some() {
-        sql.push_str(" AND ts_ms < ?");
+        sql.push_str(" AND ts_ms < $");
+        sql.push_str(&next_param.to_string());
+        next_param += 1;
     }
     if filter.actor_token_id.is_some() {
-        sql.push_str(" AND actor_token_id = ?");
+        sql.push_str(" AND actor_token_id = $");
+        sql.push_str(&next_param.to_string());
+        next_param += 1;
     }
     if filter.path_prefix.is_some() {
         // SQLite `LIKE` with `ESCAPE '\'` so a prefix
         // containing `%` or `_` doesn't accidentally widen
         // the match.
-        sql.push_str(r" AND path LIKE ? ESCAPE '\'");
+        sql.push_str(r" AND path LIKE $");
+        sql.push_str(&next_param.to_string());
+        sql.push_str(r" ESCAPE '\'");
+        next_param += 1;
     }
-    sql.push_str(" ORDER BY id DESC LIMIT ?");
+    sql.push_str(" ORDER BY id DESC LIMIT $");
+    sql.push_str(&next_param.to_string());
 
     let mut q = sqlx::query_as::<_, AuditRow>(&sql);
     if let Some(since) = filter.since_ms {

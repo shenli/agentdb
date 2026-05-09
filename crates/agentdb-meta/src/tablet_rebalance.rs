@@ -164,7 +164,10 @@ pub async fn run(
         if actions.len() >= request.max_movements {
             break;
         }
-        let Some(target) = least_loaded_node(&counts_after) else {
+        let Some(target) =
+            select_unowned_tablet_target(pool, tablet.tablet_id, &counts_after, &fresh_alive_nodes)
+                .await?
+        else {
             break;
         };
         let changed = if request.dry_run {
@@ -172,14 +175,33 @@ pub async fn run(
         } else {
             let assigned = tablets::assign_to(pool, tablet.tablet_id, &target).await?;
             if assigned {
+                let target_replica = tablet_replicas::list_by_tablet(pool, tablet.tablet_id)
+                    .await?
+                    .into_iter()
+                    .find(|replica| replica.node_id == target);
+                let lease_expires_at_ms = assignment_lease_expires_at_ms(&request, now_ms);
+                tablets::assume_ownership(
+                    pool,
+                    tablet.tablet_id,
+                    tablet.epoch,
+                    &target,
+                    lease_expires_at_ms,
+                )
+                .await?;
                 tablet_replicas::upsert(
                     pool,
                     tablet.tablet_id,
                     &target,
                     "voter",
                     "healthy",
-                    0,
-                    0,
+                    target_replica
+                        .as_ref()
+                        .map(|replica| replica.applied_index)
+                        .unwrap_or(0),
+                    target_replica
+                        .as_ref()
+                        .map(|replica| replica.match_index)
+                        .unwrap_or(0),
                     now_ms,
                 )
                 .await?;
@@ -318,6 +340,15 @@ pub async fn run(
         skipped,
         membership_operations: Vec::new(),
     })
+}
+
+fn assignment_lease_expires_at_ms(request: &RebalanceRequest, now_ms: i64) -> i64 {
+    let lease_ms = request
+        .stale_threshold_ms
+        .max(1)
+        .saturating_mul(10)
+        .max(30_000);
+    now_ms.saturating_add(lease_ms)
 }
 
 struct RebalanceStep {
@@ -525,6 +556,47 @@ fn least_loaded_node(counts: &HashMap<String, usize>) -> Option<String> {
     least_loaded_node_with_count(counts).map(|(node, _)| node)
 }
 
+async fn select_unowned_tablet_target(
+    pool: &AnyPool,
+    tablet_id: i64,
+    counts: &HashMap<String, usize>,
+    fresh_alive_nodes: &HashSet<String>,
+) -> MetaResult<Option<String>> {
+    let replicas = tablet_replicas::list_by_tablet(pool, tablet_id).await?;
+    let best_ready_index = replicas
+        .iter()
+        .filter(|replica| {
+            fresh_alive_nodes.contains(&replica.node_id)
+                && replica.role == "voter"
+                && replica.health == "healthy"
+        })
+        .map(|replica| replica.applied_index)
+        .max();
+    let Some(best_ready_index) = best_ready_index else {
+        return Ok(least_loaded_node(counts));
+    };
+    let candidates: HashSet<String> = replicas
+        .into_iter()
+        .filter(|replica| {
+            fresh_alive_nodes.contains(&replica.node_id)
+                && replica.role == "voter"
+                && replica.health == "healthy"
+                && replica.applied_index == best_ready_index
+        })
+        .map(|replica| replica.node_id)
+        .collect();
+    Ok(counts
+        .iter()
+        .map(|(node_id, count)| (node_id.clone(), *count))
+        .filter(|(node_id, _)| candidates.contains(node_id))
+        .min_by(|(left_node, left_count), (right_node, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_node.cmp(right_node))
+        })
+        .map(|(node_id, _)| node_id))
+}
+
 fn least_loaded_node_with_count(counts: &HashMap<String, usize>) -> Option<(String, usize)> {
     counts
         .iter()
@@ -607,6 +679,54 @@ mod tests {
         assert!(assigned_replicas
             .iter()
             .any(|replica| replica.role == "voter" && replica.health == "healthy"));
+        let assigned = tablets::get(&p, 4).await.unwrap().unwrap();
+        assert!(assigned.lease_expires_at_ms > 2_000);
+    }
+
+    #[tokio::test]
+    async fn assigns_unowned_tablet_to_most_caught_up_healthy_voter() {
+        let p = pool().await;
+        nodes::upsert(&p, "node-a", "a", None, "alive", 1_000, None, None)
+            .await
+            .unwrap();
+        nodes::upsert(&p, "node-b", "b", None, "alive", 1_000, None, None)
+            .await
+            .unwrap();
+        tablets::get_or_create(&p, 7, 100).await.unwrap();
+        tablet_replicas::upsert(&p, 7, "node-a", "voter", "healthy", 100, 100, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(&p, 7, "node-b", "voter", "healthy", 90, 90, 100)
+            .await
+            .unwrap();
+
+        let report = run(
+            &p,
+            RebalanceRequest {
+                dry_run: false,
+                stale_threshold_ms: 15_000,
+                max_movements: 8,
+            },
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.action == "assign"
+                && action.tablet_id == 7
+                && action.target_node_id.as_deref() == Some("node-a")
+        }));
+        let tablet = tablets::get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        let owner_replica = tablet_replicas::list_by_tablet(&p, 7)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|replica| replica.node_id == "node-a")
+            .unwrap();
+        assert_eq!(owner_replica.applied_index, 100);
+        assert_eq!(owner_replica.match_index, 100);
     }
 
     #[tokio::test]

@@ -73,7 +73,7 @@ pub async fn upsert(
         "INSERT INTO tenant_policies
             (tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
              encryption_policy_version, policy_version, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (tenant_id) DO UPDATE SET
             placement_class = excluded.placement_class,
             placement_scope_id = excluded.placement_scope_id,
@@ -101,7 +101,7 @@ pub async fn get(pool: &AnyPool, tenant_id: &str) -> MetaResult<Option<TenantPol
         "SELECT tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
                 encryption_policy_version, policy_version, updated_at_ms
            FROM tenant_policies
-          WHERE tenant_id = ?",
+          WHERE tenant_id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(pool)
@@ -135,7 +135,7 @@ pub async fn list_by_placement_scope(
         "SELECT tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
                 encryption_policy_version, policy_version, updated_at_ms
            FROM tenant_policies
-          WHERE placement_scope_id = ?
+          WHERE placement_scope_id = $1
           ORDER BY tenant_id",
     )
     .bind(placement_scope_id)
@@ -145,7 +145,7 @@ pub async fn list_by_placement_scope(
 }
 
 pub async fn delete(pool: &AnyPool, tenant_id: &str) -> MetaResult<bool> {
-    let rows = sqlx::query("DELETE FROM tenant_policies WHERE tenant_id = ?")
+    let rows = sqlx::query("DELETE FROM tenant_policies WHERE tenant_id = $1")
         .bind(tenant_id)
         .execute(pool)
         .await?

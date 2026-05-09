@@ -165,6 +165,17 @@ impl NetworkedRaftRsRuntimeCluster {
             }
         }
     }
+
+    async fn elect_leader(&self, node_id: u64) {
+        self.groups[&node_id].campaign(node_id).unwrap();
+        self.pump_until(&HashSet::new(), || {
+            self.groups[&node_id]
+                .status()
+                .iter()
+                .any(|status| status.node_id == node_id && status.role == "Leader")
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -357,6 +368,29 @@ async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
         RaftRsSharedGroup::open_local(RUNTIME_PRIMARY_TABLET_ID, raft_configs, 3).unwrap();
     let groups = BTreeMap::from([(1, group_1), (2, group_2), (3, group_3)]);
 
+    groups[&1].campaign(1).unwrap();
+    for _ in 0..1_000 {
+        let mut messages = Vec::new();
+        for group in groups.values() {
+            messages.extend(group.take_wire_messages());
+        }
+        for message in messages {
+            groups
+                .get(&message.to)
+                .expect("target raft group")
+                .step_wire_message(message)
+                .unwrap();
+        }
+        if groups[&1]
+            .status()
+            .iter()
+            .any(|status| status.node_id == 1 && status.role == "Leader")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
     let leader_kv: Arc<dyn KvStore + Send + Sync> =
         Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
     let follower_kv: Arc<dyn KvStore + Send + Sync> =
@@ -401,6 +435,7 @@ async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raft_rs_failure_injection_commits_with_follower_loss_and_catches_up_after_rejoin() {
     let cluster = NetworkedRaftRsRuntimeCluster::new();
+    cluster.elect_leader(1).await;
     let leader_runtime = cluster.runtime(1);
     let create_a_runtime = leader_runtime.clone();
     let create_a = tokio::spawn(async move {

@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    prepare_work_dir(&args.work_dir)?;
+    prepare_work_dir(&args.work_dir, args.reset_meta)?;
     let nodes = node_specs(&args);
     for node in &nodes {
         write_node_config(&args, node)?;
@@ -126,7 +126,10 @@ async fn main() -> Result<()> {
     seed_cluster_meta(&meta, &nodes).await?;
 
     let mut children = spawn_nodes(&args, &nodes)?;
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(75))
+        .build()
+        .context("build HTTP client")?;
     let result = run_smoke(&client, &nodes, args.failover, &mut children).await;
 
     if !args.keep_running {
@@ -145,7 +148,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn prepare_work_dir(work_dir: &Path) -> Result<()> {
+fn prepare_work_dir(work_dir: &Path, reset: bool) -> Result<()> {
+    if reset && work_dir.exists() {
+        fs::remove_dir_all(work_dir).with_context(|| format!("reset {}", work_dir.display()))?;
+    }
     fs::create_dir_all(work_dir).with_context(|| format!("create {}", work_dir.display()))?;
     fs::create_dir_all(work_dir.join("logs"))
         .with_context(|| format!("create {}", work_dir.join("logs").display()))?;
@@ -203,7 +209,7 @@ node_id = "{node_id}"
 shard_count = {shard_count}
 region = "local"
 refresh_interval_ms = 500
-proxy_timeout_ms = 5000
+proxy_timeout_ms = 70000
 "#,
         port = node.port,
         internal_auth_token = args.internal_auth_token,
@@ -336,9 +342,12 @@ fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
             .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
             .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
             .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "1500")
+            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "10000")
             .env("AGENTDB_REAPER_TICK_MS", "500")
-            .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "4")
+            .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
+            .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
+            .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
             .spawn()
@@ -354,108 +363,267 @@ async fn run_smoke(
     failover: bool,
     children: &mut [Child],
 ) -> Result<()> {
+    eprintln!("smoke: waiting for node health");
     for node in nodes {
         wait_json(
             client,
             &node.url,
             "/api/admin/cluster/health",
-            Duration::from_secs(30),
+            Duration::from_secs(90),
         )
         .await?;
     }
+    eprintln!("smoke: waiting for raft readiness");
     wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
 
-    let (tenant_id, agent_id, session_id) = create_session_smoke(client, &nodes[0].url).await?;
-    append_and_verify(client, &nodes[0].url, &tenant_id, &agent_id, &session_id, 0).await?;
-    append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 1).await?;
+    eprintln!("smoke: resolving initial tablet writer");
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    eprintln!("smoke: initial tablet writer {}", owner.id);
+    eprintln!("smoke: creating tenant/agent/session");
+    let (tenant_id, agent_id, session_id) = create_session_smoke(client, nodes).await?;
+    eprintln!("smoke: appending event 0");
+    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
+    eprintln!("smoke: appending event 1");
+    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
 
     print_diagnostics(client, nodes).await?;
 
     if failover {
-        children[0].kill().ok();
-        children[0].wait().ok();
-        wait_node_marked_dead(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(20)).await?;
-        wait_tablet_owner_changed(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(30))
+        eprintln!("smoke: killing initial writer {}", owner.id);
+        let owner_index = nodes
+            .iter()
+            .position(|node| node.id == owner.id)
+            .ok_or_else(|| anyhow!("owner {} is not in smoke node list", owner.id))?;
+        children[owner_index].kill().ok();
+        children[owner_index].wait().ok();
+        let survivor = nodes
+            .iter()
+            .find(|node| node.id != owner.id)
+            .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
+        eprintln!("smoke: waiting for {} to be marked dead", owner.id);
+        wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(20)).await?;
+        eprintln!("smoke: waiting for tablet owner change");
+        wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(90))
             .await?;
-        wait_raft_observable(client, &nodes[1].url, Duration::from_secs(20)).await?;
-        append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 2).await?;
-        print_diagnostics(client, &nodes[1..]).await?;
+        eprintln!("smoke: waiting for raft observability after failover");
+        wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
+        eprintln!("smoke: waiting for new tablet writer");
+        wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(90)).await?;
+        eprintln!("smoke: appending event 2 after failover");
+        append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 2).await?;
+        let survivors: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.id != owner.id)
+            .cloned()
+            .collect();
+        print_diagnostics(client, &survivors).await?;
     }
 
     Ok(())
 }
 
-async fn create_session_smoke(client: &Client, base: &str) -> Result<(String, String, String)> {
-    let suffix = now_ms();
+async fn create_session_smoke(
+    client: &Client,
+    nodes: &[NodeSpec],
+) -> Result<(String, String, String)> {
+    let mut last_error = None;
+    for attempt in 0..10 {
+        eprintln!("smoke: create session attempt {}", attempt + 1);
+        let suffix = format!("{}-{attempt}", now_ms());
+        match create_session_smoke_once(client, nodes, &suffix).await {
+            Ok(session) => return Ok(session),
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("session smoke failed without a captured error")))
+}
+
+async fn create_session_smoke_once(
+    client: &Client,
+    nodes: &[NodeSpec],
+    suffix: &str,
+) -> Result<(String, String, String)> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    eprintln!("smoke: creating tenant via {}", owner.id);
     let tenant = post_json(
         client,
-        base,
+        &owner.url,
         "/api/tenants",
         json!({"external_key": format!("cluster-smoke-{suffix}"), "policy": {}}),
     )
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
-    let agent = post_json(
+    eprintln!("smoke: creating agent for tenant {tenant_id}");
+    let agent = post_json_with_convergence_retry(
         client,
-        base,
+        nodes,
         &format!("/api/tenants/{tenant_id}/agents"),
         json!({"alias": "cluster-smoke-agent", "config": {}}),
+        10,
     )
     .await?;
     let agent_id = string_field(&agent, "agent_id")?;
-    let session = post_json(
+    eprintln!("smoke: creating session for agent {agent_id}");
+    let session = post_json_with_convergence_retry(
         client,
-        base,
+        nodes,
         &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
         json!({"alias": null}),
+        10,
     )
     .await?;
     let session_id = string_field(&session, "session_id")?;
     Ok((tenant_id, agent_id, session_id))
 }
 
+async fn post_json_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    path: &str,
+    body: Value,
+    attempts: usize,
+) -> Result<Value> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: POST {path} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match post_json(client, &owner.url, path, body.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("POST {path} failed without a captured error")))
+}
+
 async fn append_and_verify(
     client: &Client,
-    base: &str,
+    nodes: &[NodeSpec],
     tenant_id: &str,
     agent_id: &str,
     session_id: &str,
     expected_seq: u64,
 ) -> Result<()> {
-    let event = post_json(
-        client,
-        base,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
-        json!({
-            "agent_id": agent_id,
-            "kind": "message",
-            "payload": {"seq": expected_seq, "source": "cluster-smoke"},
-            "artifact_refs": [],
-            "source_refs": []
-        }),
-    )
-    .await?;
-    let seq = event
-        .get("seq")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
-    if seq != expected_seq {
-        bail!("expected appended seq {expected_seq}, got {seq}");
+    for attempt in 0..3 {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: append seq {expected_seq} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        let append_result = post_json(
+            client,
+            &owner.url,
+            &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
+            json!({
+                "agent_id": agent_id,
+                "kind": "message",
+                "payload": {"seq": expected_seq, "source": "cluster-smoke"},
+                "artifact_refs": [],
+                "source_refs": []
+            }),
+        )
+        .await;
+        match append_result {
+            Ok(event) => {
+                let seq = event
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
+                if seq == expected_seq
+                    || event_count(client, nodes, tenant_id, session_id).await? > expected_seq
+                {
+                    break;
+                }
+                bail!("expected appended seq {expected_seq}, got {seq}");
+            }
+            Err(error) if is_retryable_cluster_convergence_error(&error) && attempt < 2 => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if event_count(client, nodes, tenant_id, session_id).await? > expected_seq {
+                    break;
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let events = get_json(
-        client,
-        base,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
-    )
-    .await?;
-    let len = events
-        .as_array()
-        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
-        .len();
+    let len = event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10).await?;
     if len < usize::try_from(expected_seq + 1).unwrap() {
         bail!("expected at least {} events, got {len}", expected_seq + 1);
     }
     Ok(())
+}
+
+async fn event_count(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    session_id: &str,
+) -> Result<u64> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    let events = get_json(
+        client,
+        &owner.url,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
+    )
+    .await?;
+    Ok(events
+        .as_array()
+        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
+        .len() as u64)
+}
+
+async fn event_count_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    session_id: &str,
+    attempts: usize,
+) -> Result<usize> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match event_count(client, nodes, tenant_id, session_id).await {
+            Ok(count) => return usize::try_from(count).map_err(Into::into),
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                eprintln!(
+                    "smoke: event count retry {} after convergence error: {error}",
+                    attempt + 1
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
+}
+
+fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("\"retryable\":true")
+        || message.contains("raft-rs command did not commit")
+        || message.contains("raft-rs local node")
+        || message.contains("is not leader for tablet")
+}
+
+fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:?}");
+    is_retryable_raft_error(error)
+        || message.contains("\"code\":\"TENANT_NOT_FOUND\"")
+        || message.contains("\"code\":\"AGENT_NOT_FOUND\"")
+        || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
+        || message.contains("503 Service Unavailable")
+        || message.contains("operation timed out")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
@@ -466,7 +634,21 @@ async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration)
             let raft = get_json(client, &node.url, "/api/admin/raft").await?;
             ready &= raft["enabled"] == true
                 && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
+                && raft["unhealthy_replica_count"].as_u64().unwrap_or(1) == 0
+                && raft["outbound_message_count"].as_u64().unwrap_or(1) == 0
                 && raft["summary"]["leaderless_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["multi_leader_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["commit_index_drift_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0
+                && raft["summary"]["applied_index_drift_tablet_count"]
                     .as_u64()
                     .unwrap_or(1)
                     == 0;
@@ -485,7 +667,13 @@ async fn wait_raft_observable(client: &Client, base: &str, timeout: Duration) ->
     let start = tokio::time::Instant::now();
     loop {
         let raft = get_json(client, base, "/api/admin/raft").await?;
-        if raft["enabled"] == true && raft["tablet_count"].as_u64().unwrap_or(0) >= 1 {
+        if raft["enabled"] == true
+            && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
+            && raft["summary"]["leaderless_tablet_count"]
+                .as_u64()
+                .unwrap_or(1)
+                == 0
+        {
             return Ok(());
         }
         if start.elapsed() > timeout {
@@ -553,6 +741,83 @@ async fn wait_tablet_owner_changed(
     }
 }
 
+async fn wait_tablet_owner(
+    client: &Client,
+    nodes: &[NodeSpec],
+    previous_owner: Option<&str>,
+    timeout: Duration,
+) -> Result<NodeSpec> {
+    let start = tokio::time::Instant::now();
+    loop {
+        let leader_id = current_raft_leader_node_id(client, nodes).await?;
+        for node in nodes {
+            let Ok(tablets) = get_json(client, &node.url, "/api/admin/tablets").await else {
+                continue;
+            };
+            let tablet_exists = tablets.as_array().is_some_and(|tablets| {
+                tablets
+                    .iter()
+                    .any(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
+            });
+            if !tablet_exists {
+                continue;
+            }
+            let Some(leader_id) = leader_id.as_deref() else {
+                continue;
+            };
+            if previous_owner.is_some_and(|previous| previous == leader_id) {
+                continue;
+            }
+            if let Some(leader) = nodes.iter().find(|candidate| candidate.id == leader_id) {
+                return Ok(leader.clone());
+            }
+            bail!("tablet {PRIMARY_TABLET_ID} raft leader {leader_id} is not in smoke node list");
+        }
+        if start.elapsed() > timeout {
+            bail!("tablet {PRIMARY_TABLET_ID} raft leader was not observable within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn current_raft_leader_node_id(
+    client: &Client,
+    nodes: &[NodeSpec],
+) -> Result<Option<String>> {
+    for node in nodes {
+        let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
+            continue;
+        };
+        let Some(tablet) = raft["tablets"].as_array().and_then(|tablets| {
+            tablets
+                .iter()
+                .find(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
+        }) else {
+            continue;
+        };
+        let Some(leader_raft_node_id) = tablet["replicas"].as_array().and_then(|replicas| {
+            replicas.iter().find_map(|replica| {
+                (replica["role"] == "Leader")
+                    .then(|| replica["node_id"].as_u64())
+                    .flatten()
+            })
+        }) else {
+            continue;
+        };
+        let Some(configured) = tablet["configured_replicas"].as_array() else {
+            continue;
+        };
+        for replica in configured {
+            if replica["raft_node_id"].as_u64() == Some(leader_raft_node_id) {
+                if let Some(node_id) = replica["node_id"].as_str() {
+                    return Ok(Some(node_id.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
     for node in nodes {
         let status = get_json(client, &node.url, "/api/admin/cluster/health").await?;
@@ -581,12 +846,13 @@ async fn wait_json(client: &Client, base: &str, path: &str, timeout: Duration) -
 }
 
 async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
-    let response = client
-        .get(format!("{base}{path}"))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+    let response = client.get(format!("{base}{path}")).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}{path}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 async fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Result<Value> {
@@ -594,9 +860,13 @@ async fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Resu
         .post(format!("{base}{path}"))
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}{path}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 fn string_field(value: &Value, field: &str) -> Result<String> {

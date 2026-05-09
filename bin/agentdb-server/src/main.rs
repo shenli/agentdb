@@ -36,6 +36,8 @@ const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS: usize = 4;
 const DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RAFT_TICK_INTERVAL_MS: u64 = 100;
+const DEFAULT_RAFT_OWNER_CAMPAIGN_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
@@ -191,7 +193,7 @@ struct InitConfigOpts {
     force: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Cli::parse();
@@ -269,11 +271,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         .as_ref()
                         .expect("slatedb requires object store config"),
                 )?;
-                tracing::info!(prefix = %SLATEDB_RUNTIME_PREFIX, "opened SlateDB runtime backend");
-                Arc::new(
-                    agentdb_storage::SlateKvStore::open(object_store, SLATEDB_RUNTIME_PREFIX)
-                        .await?,
-                )
+                let prefix = slate_runtime_prefix(&config);
+                tracing::info!(prefix = %prefix, "opened SlateDB runtime backend");
+                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &prefix).await?)
             }
         };
 
@@ -386,6 +386,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .max(1);
                 if let Some(registry) = raft_registry.clone() {
                     refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
+                    let local_raft_node_id =
+                        agentdb_storage::stable_raft_node_id(&startup.node_id)?;
+                    let raft_tick_interval_ms = env_u64(
+                        "AGENTDB_RAFT_TICK_INTERVAL_MS",
+                        DEFAULT_RAFT_TICK_INTERVAL_MS,
+                    )
+                    .max(50);
                     let raft_snapshot_store = match config.object_store.as_ref() {
                         Some(object_store_config) => Some(Arc::new(RaftSnapshotObjectStore::new(
                             build_object_store(object_store_config)?,
@@ -407,6 +414,25 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         outbox.clone(),
                         config.route_refresh_interval_ms,
                     );
+                    spawn_raft_rs_tick_worker(
+                        startup.meta.clone(),
+                        startup.node_id.clone(),
+                        registry.clone(),
+                        local_raft_node_id,
+                        Duration::from_millis(raft_tick_interval_ms),
+                    );
+                    let raft_owner_campaign_interval_ms = env_u64(
+                        "AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS",
+                        DEFAULT_RAFT_OWNER_CAMPAIGN_INTERVAL_MS,
+                    )
+                    .max(100);
+                    spawn_raft_rs_owner_campaign_worker(
+                        startup.meta.clone(),
+                        startup.node_id.clone(),
+                        local_raft_node_id,
+                        registry.clone(),
+                        Duration::from_millis(raft_owner_campaign_interval_ms),
+                    );
                     spawn_raft_rs_message_outbox_worker(
                         startup.meta.clone(),
                         registry.clone(),
@@ -414,6 +440,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         Duration::from_millis(raft_outbox_interval_ms),
                         raft_outbox_max_messages_per_tick,
                     );
+                    campaign_owned_raft_tablets(
+                        &startup.meta,
+                        &startup.node_id,
+                        local_raft_node_id,
+                        &registry,
+                    )
+                    .await?;
                     let raft_snapshot_interval_ms = env_u64(
                         "AGENTDB_RAFT_SNAPSHOT_INTERVAL_MS",
                         DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS,
@@ -1057,7 +1090,7 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
                 .bucket
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("s3 object store requires bucket"))?;
-            let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+            let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
             if let Some(region) = &config.region {
                 builder = builder.with_region(region);
             }
@@ -1070,6 +1103,29 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
             Ok(Arc::new(builder.build()?))
         }
     }
+}
+
+fn slate_runtime_prefix(config: &ResolvedServeConfig) -> String {
+    if matches!(config.deployment_mode, DeploymentMode::Cluster) {
+        if let Some(node_id) = config.route_node_id.as_deref() {
+            return format!(
+                "{SLATEDB_RUNTIME_PREFIX}/nodes/{}",
+                object_path_component(node_id)
+            );
+        }
+    }
+    SLATEDB_RUNTIME_PREFIX.to_string()
+}
+
+fn object_path_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1809,6 +1865,256 @@ fn spawn_raft_rs_peer_url_refresher(
     });
 }
 
+fn spawn_raft_rs_tick_worker(
+    meta: agentdb_meta::MetaStore,
+    local_node_id: String,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    local_raft_node_id: u64,
+    interval: Duration,
+) {
+    let interval = interval.max(Duration::from_millis(50));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let tablets_by_id = match agentdb_meta::tablets::list_all(meta.pool()).await {
+                Ok(tablets) => tablets
+                    .into_iter()
+                    .map(|tablet| (tablet.tablet_id, tablet))
+                    .collect::<BTreeMap<_, _>>(),
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        ?error,
+                        "failed to load tablets for raft-rs tick"
+                    );
+                    BTreeMap::new()
+                }
+            };
+            let nodes_by_id = match agentdb_meta::nodes::list_all(meta.pool()).await {
+                Ok(nodes) => nodes
+                    .into_iter()
+                    .map(|node| (node.node_id.clone(), node))
+                    .collect::<BTreeMap<_, _>>(),
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        ?error,
+                        "failed to load nodes for raft-rs tick"
+                    );
+                    BTreeMap::new()
+                }
+            };
+            let raft_node_to_node_id =
+                match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
+                    Ok(replicas) => replicas
+                        .into_iter()
+                        .filter_map(|replica| {
+                            agentdb_storage::stable_raft_node_id(&replica.node_id)
+                                .ok()
+                                .map(|raft_node_id| {
+                                    ((replica.tablet_id, raft_node_id), replica.node_id)
+                                })
+                        })
+                        .collect::<BTreeMap<_, _>>(),
+                    Err(error) => {
+                        tracing::warn!(
+                            local_node_id,
+                            ?error,
+                            "failed to load tablet replicas for raft-rs tick"
+                        );
+                        BTreeMap::new()
+                    }
+                };
+            for (tablet_id, group) in registry.groups_snapshot() {
+                let statuses = group.status();
+                let local_status = statuses
+                    .iter()
+                    .find(|status| status.node_id == local_raft_node_id);
+                let local_is_leader = statuses.iter().any(|status| {
+                    status.node_id == local_raft_node_id && status.role.as_str() == "Leader"
+                });
+                let owner_node_id = tablets_by_id
+                    .get(&tablet_id)
+                    .and_then(|tablet| tablet.owner_node_id.as_deref());
+                let local_is_owner = owner_node_id == Some(local_node_id.as_str());
+                let owner_unavailable = owner_node_id.is_none_or(|owner| {
+                    nodes_by_id
+                        .get(owner)
+                        .is_none_or(|node| node.state.as_str() != "alive")
+                });
+                let raft_leader_unavailable = local_status
+                    .filter(|status| status.leader_id != 0)
+                    .and_then(|status| raft_node_to_node_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|leader_node_id| {
+                        nodes_by_id
+                            .get(leader_node_id)
+                            .is_none_or(|node| node.state.as_str() != "alive")
+                    });
+                if !local_is_owner && !local_is_leader {
+                    if owner_unavailable || raft_leader_unavailable {
+                        if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+                            tracing::warn!(
+                                tablet_id,
+                                local_node_id,
+                                local_raft_node_id,
+                                ?error,
+                                "failed to expire local raft-rs leader lease"
+                            );
+                        }
+                        let failover_candidate = raft_node_to_node_id
+                            .iter()
+                            .filter_map(|((replica_tablet_id, raft_node_id), node_id)| {
+                                (*replica_tablet_id == tablet_id
+                                    && nodes_by_id
+                                        .get(node_id)
+                                        .is_some_and(|node| node.state.as_str() == "alive"))
+                                .then_some(*raft_node_id)
+                            })
+                            .min();
+                        if failover_candidate == Some(local_raft_node_id) {
+                            if let Err(error) = group.tick(local_raft_node_id) {
+                                tracing::warn!(
+                                    tablet_id,
+                                    local_node_id,
+                                    local_raft_node_id,
+                                    ?error,
+                                    "failed to tick local raft-rs group after owner became unavailable"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Err(error) = group.tick(local_raft_node_id) {
+                    tracing::warn!(
+                        tablet_id,
+                        local_node_id,
+                        local_raft_node_id,
+                        ?error,
+                        "failed to tick local raft-rs group"
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn spawn_raft_rs_owner_campaign_worker(
+    meta: agentdb_meta::MetaStore,
+    local_node_id: String,
+    local_raft_node_id: u64,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    interval: Duration,
+) {
+    let interval = interval.max(Duration::from_millis(100));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match campaign_owned_raft_tablets(&meta, &local_node_id, local_raft_node_id, &registry)
+                .await
+            {
+                Ok(campaigns) if campaigns > 0 => {
+                    tracing::debug!(
+                        local_node_id,
+                        local_raft_node_id,
+                        campaigns,
+                        "requested raft-rs owner campaigns"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        local_raft_node_id,
+                        ?error,
+                        "failed to reconcile raft-rs owner campaigns"
+                    );
+                }
+            }
+        }
+    });
+}
+
+async fn campaign_owned_raft_tablets(
+    meta: &agentdb_meta::MetaStore,
+    local_node_id: &str,
+    local_raft_node_id: u64,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+) -> anyhow::Result<usize> {
+    let mut campaigns = 0usize;
+    let groups: BTreeMap<_, _> = registry.groups_snapshot().into_iter().collect();
+    for tablet in agentdb_meta::tablets::list_owned_by(meta.pool(), local_node_id).await? {
+        let Some(group) = groups.get(&tablet.tablet_id) else {
+            continue;
+        };
+        if !local_tablet_replica_is_voter(meta, tablet.tablet_id, local_node_id).await? {
+            tracing::debug!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                "skipping raft-rs owner campaign because local replica is not a voter"
+            );
+            continue;
+        }
+        let local_status = group
+            .status()
+            .into_iter()
+            .find(|status| status.node_id == local_raft_node_id);
+        let Some(local_status) = local_status else {
+            continue;
+        };
+        if local_status.role == "Leader" {
+            continue;
+        }
+        if local_status.role != "Follower" {
+            tracing::debug!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                role = %local_status.role,
+                "skipping raft-rs owner campaign because local node is already campaigning"
+            );
+            continue;
+        }
+        match group.campaign(local_raft_node_id) {
+            Ok(()) => {
+                campaigns += 1;
+                tracing::info!(
+                    tablet_id = tablet.tablet_id,
+                    local_node_id,
+                    local_raft_node_id,
+                    "requested raft-rs campaign for locally owned tablet"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = tablet.tablet_id,
+                    local_node_id,
+                    local_raft_node_id,
+                    ?error,
+                    "failed to campaign for locally owned raft-rs tablet"
+                );
+            }
+        }
+    }
+    Ok(campaigns)
+}
+
+async fn local_tablet_replica_is_voter(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    local_node_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(
+        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+            .await?
+            .into_iter()
+            .any(|replica| replica.node_id == local_node_id && replica.role == "voter"),
+    )
+}
+
 fn spawn_raft_rs_message_outbox_worker(
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
@@ -1838,6 +2144,7 @@ async fn run_raft_rs_message_outbox_tick(
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages_per_tick: usize,
 ) -> anyhow::Result<usize> {
+    refresh_raft_rs_peer_urls(meta, registry, outbox).await?;
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
         if sent >= max_messages_per_tick {
@@ -1875,6 +2182,7 @@ async fn flush_raft_rs_group_messages_with_health(
         group.restore_wire_messages(messages[send_limit..].to_vec())?;
     }
     let mut sent = 0usize;
+    let mut failed = Vec::new();
     for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
@@ -1885,10 +2193,19 @@ async fn flush_raft_rs_group_messages_with_health(
             Err(error) => {
                 set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "unreachable")
                     .await?;
-                group.restore_wire_messages(messages[index..send_limit].to_vec())?;
-                return Err(anyhow::anyhow!(error));
+                tracing::debug!(
+                    tablet_id,
+                    from = message.from,
+                    to = message.to,
+                    ?error,
+                    "deferred raft-rs message to unreachable peer"
+                );
+                failed.push(messages[index].clone());
             }
         }
+    }
+    if !failed.is_empty() {
+        group.restore_wire_messages(failed)?;
     }
     Ok(sent)
 }
@@ -2746,6 +3063,24 @@ async fn run_cluster_scheduler_tick(
         status.add_dead_nodes_marked(dead_nodes.len() as u64);
         tracing::info!(node_id = %node_id, dead_nodes = ?dead_nodes, "scheduler marked stale nodes dead");
     }
+    let mut cleared_dead_owner_tablets = Vec::new();
+    for dead_node in agentdb_meta::nodes::list_all(pool)
+        .await?
+        .into_iter()
+        .filter(|node| node.state == "dead")
+    {
+        cleared_dead_owner_tablets.extend(
+            agentdb_meta::tablets::clear_ownership_by_owner(pool, &dead_node.node_id).await?,
+        );
+    }
+    if !cleared_dead_owner_tablets.is_empty() {
+        status.add_tablet_reassignments(cleared_dead_owner_tablets.len() as u64);
+        tracing::info!(
+            node_id = %node_id,
+            tablets = ?cleared_dead_owner_tablets,
+            "scheduler cleared tablet ownership from dead nodes"
+        );
+    }
     let deleted_stale_tablet_stats = agentdb_meta::tablet_stats::delete_stale(
         pool,
         now_ms.saturating_sub(config.stale_node_threshold_ms).max(0),
@@ -2768,6 +3103,24 @@ async fn run_cluster_scheduler_tick(
     if !cleared.is_empty() {
         status.add_tablet_reassignments(cleared.len() as u64);
         tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
+    }
+
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "scheduler aligned tablet ownership with raft leaders"
+            );
+        }
     }
 
     if config.rebalance_max_movements > 0 {
@@ -2853,6 +3206,68 @@ async fn run_cluster_scheduler_tick(
         }
     }
     Ok(())
+}
+
+async fn reconcile_raft_leader_tablet_ownership(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    now_ms: i64,
+    lease_ms: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let mut aligned = 0usize;
+    for (tablet_id, group) in registry.groups_snapshot() {
+        let Some(leader_raft_node_id) = group
+            .status()
+            .into_iter()
+            .find_map(|status| (status.leader_id != 0).then_some(status.leader_id))
+        else {
+            continue;
+        };
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let Some(leader_replica) = replicas.into_iter().find(|replica| {
+            matches!(replica.role.as_str(), "voter" | "learner")
+                && agentdb_storage::stable_raft_node_id(&replica.node_id)
+                    .is_ok_and(|raft_node_id| raft_node_id == leader_raft_node_id)
+        }) else {
+            continue;
+        };
+        if leader_replica.role != "voter" {
+            continue;
+        }
+        let Some(node) = agentdb_meta::nodes::get(meta.pool(), &leader_replica.node_id).await?
+        else {
+            continue;
+        };
+        if node.state != "alive" {
+            continue;
+        }
+        let Some(tablet) = agentdb_meta::tablets::get(meta.pool(), tablet_id).await? else {
+            continue;
+        };
+        if tablet.state != "serving" {
+            continue;
+        }
+        let same_owner = tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str());
+        let renew_threshold_ms = now_ms.saturating_add(lease_ms / 2);
+        if same_owner && tablet.lease_expires_at_ms > renew_threshold_ms {
+            continue;
+        }
+        match agentdb_meta::tablets::assume_ownership(
+            meta.pool(),
+            tablet_id,
+            tablet.epoch,
+            &leader_replica.node_id,
+            now_ms + lease_ms,
+        )
+        .await
+        {
+            Ok(_) => aligned += 1,
+            Err(agentdb_meta::MetaError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(aligned)
 }
 
 async fn apply_scheduler_rebalance_raft_membership_changes(
@@ -4625,6 +5040,76 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_tick_clears_dead_owner_before_lease_expiry_and_reassigns() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            10_000,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 60_000)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
+            tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
+            tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
+        };
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
+            .await
+            .unwrap();
+
+        let stale_node = nodes::get(meta.pool(), "node-b").await.unwrap().unwrap();
+        assert_eq!(stale_node.state, "dead");
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert!(tablet.lease_expires_at_ms > 10_000);
+
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.dead_nodes_marked_total, 1);
+        assert_eq!(snapshot.tablet_reassignments_total, 2);
+    }
+
+    #[tokio::test]
     async fn scheduler_tick_as_follower_does_not_reap() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         agentdb_meta::scheduler::try_acquire(meta.pool(), "leader-a", 30_000, 1_000)
@@ -5296,6 +5781,147 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_aligns_tablet_owner_to_raft_leader() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:30100",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://node-a",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 2_500)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let leader_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let renewed = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(renewed, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(tablet.epoch, 2);
+        assert_eq!(tablet.lease_expires_at_ms, 32_000);
+    }
+
+    #[tokio::test]
     async fn tablet_movement_tick_completes_ready_destinations() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         tablet_movements::upsert_pending(
@@ -5956,6 +6582,125 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn raft_owner_campaign_requests_campaign_for_local_voter_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assign_to(meta.pool(), 7, "node-a").await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(
+            7,
+            [
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-a",
+                    "voter",
+                    dir.path(),
+                )
+                .unwrap(),
+            ],
+            local_raft_node_id,
+        )
+        .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let campaigns = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(campaigns, 1);
+        let status = registry.status_for(7).unwrap();
+        assert!(status
+            .iter()
+            .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
+
+        let repeated = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+        assert_eq!(repeated, 0);
+    }
+
+    #[tokio::test]
+    async fn raft_owner_campaign_skips_local_learner_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assign_to(meta.pool(), 7, "node-a").await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(
+            7,
+            [
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-a",
+                    "learner",
+                    dir.path(),
+                )
+                .unwrap(),
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-b",
+                    "voter",
+                    dir.path(),
+                )
+                .unwrap(),
+            ],
+            local_raft_node_id,
+        )
+        .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let campaigns = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(campaigns, 0);
+        let status = registry.status_for(7).unwrap();
+        assert!(!status
+            .iter()
+            .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
+    }
+
+    #[tokio::test]
     async fn raft_rs_peer_urls_load_from_control_plane_nodes() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         nodes::upsert(
@@ -6275,11 +7020,11 @@ region = "us-west-2"
             .unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
 
-        let err = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
+        let sent = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(err.to_string().contains("peer URL is not configured"));
+        assert_eq!(sent, 0);
         assert_eq!(group.take_wire_messages().len(), 1);
         let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
             .await

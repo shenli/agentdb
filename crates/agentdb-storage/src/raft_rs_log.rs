@@ -32,7 +32,7 @@ use crate::{Error, LogCommit, LogEntry, ReplicatedLog, Result};
 
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
-const APPEND_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const APPEND_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const APPEND_WAIT_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +318,13 @@ impl RaftRsSharedGroup {
             .elect(node_id)
     }
 
+    pub fn campaign(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .campaign(node_id)
+    }
+
     pub fn status(&self) -> Vec<RaftRsReplicaStatus> {
         self.inner
             .lock()
@@ -372,6 +379,13 @@ impl RaftRsSharedGroup {
             .lock()
             .expect("raft-rs group lock poisoned")
             .tick(node_id)
+    }
+
+    pub fn expire_leader_lease(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .expire_leader_lease(node_id)
     }
 
     pub fn flush_wire_messages_to(&self, transport: &dyn RaftRsTransport) -> Result<usize> {
@@ -432,37 +446,29 @@ impl RaftRsSharedGroup {
             if group.node_count() > 1 {
                 return group.append(node_id, tablet_id, command);
             }
+            group.validate_append_target(node_id, tablet_id)?;
+            if !group.is_leader(node_id)? {
+                return Err(Error::Other(format!(
+                    "raft-rs local node {node_id} is not leader for tablet {tablet_id}"
+                )));
+            }
         }
         let started_at = Instant::now();
-        let mut campaign_started = false;
         let mut proposed_after = None;
         loop {
             let maybe_commit = {
                 let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
                 group.validate_append_target(node_id, tablet_id)?;
                 if proposed_after.is_none() {
-                    if !group.is_leader(node_id)? {
-                        if !campaign_started {
-                            group
-                                .node_mut(node_id)?
-                                .raw
-                                .campaign()
-                                .map_err(map_raft_error)?;
-                            campaign_started = true;
-                        }
-                        group.drive_until_idle()?;
-                        None
-                    } else {
-                        let previous_applied_index = group.node(node_id)?.last_applied_index;
-                        group
-                            .node_mut(node_id)?
-                            .raw
-                            .propose(Vec::new(), command.clone())
-                            .map_err(map_raft_error)?;
-                        proposed_after = Some(previous_applied_index);
-                        group.drive_until_idle()?;
-                        group.find_committed_after(node_id, tablet_id, previous_applied_index)?
-                    }
+                    let previous_applied_index = group.node(node_id)?.last_applied_index;
+                    group
+                        .node_mut(node_id)?
+                        .raw
+                        .propose(Vec::new(), command.clone())
+                        .map_err(map_raft_error)?;
+                    proposed_after = Some(previous_applied_index);
+                    group.drive_until_idle()?;
+                    group.find_committed_after(node_id, tablet_id, previous_applied_index)?
                 } else {
                     group.drive_until_idle()?;
                     group.find_committed_after(
@@ -476,13 +482,8 @@ impl RaftRsSharedGroup {
                 return Ok(commit);
             }
             if started_at.elapsed() >= APPEND_WAIT_TIMEOUT {
-                let reason = if proposed_after.is_some() {
-                    "command did not commit"
-                } else {
-                    "node did not become leader"
-                };
                 return Err(Error::Other(format!(
-                    "raft-rs {reason} for tablet {tablet_id} before timeout"
+                    "raft-rs command did not commit for tablet {tablet_id} before timeout"
                 )));
             }
             thread::sleep(APPEND_WAIT_POLL);
@@ -659,6 +660,16 @@ impl RaftRsGroup {
         self.drive_until_idle()
     }
 
+    fn expire_leader_lease(&mut self, node_id: u64) -> Result<()> {
+        let node = self.node_mut(node_id)?;
+        if node.raw.status().ss.raft_state == StateRole::Follower {
+            // Let this follower grant pre-votes after an externally detected
+            // owner failure without ticking it into its own campaign.
+            node.raw.raft.election_elapsed = usize::MAX / 4;
+        }
+        Ok(())
+    }
+
     fn propose_membership_change(
         &mut self,
         leader_id: u64,
@@ -740,17 +751,21 @@ impl RaftRsGroup {
     }
 
     fn elect(&mut self, node_id: u64) -> Result<()> {
-        self.node_mut(node_id)?
-            .raw
-            .campaign()
-            .map_err(map_raft_error)?;
-        self.drive_until_idle()?;
+        self.campaign(node_id)?;
         if self.node(node_id)?.raw.status().ss.raft_state != StateRole::Leader {
             return Err(Error::Other(format!(
                 "raft-rs node {node_id} did not become leader"
             )));
         }
         Ok(())
+    }
+
+    fn campaign(&mut self, node_id: u64) -> Result<()> {
+        self.node_mut(node_id)?
+            .raw
+            .campaign()
+            .map_err(map_raft_error)?;
+        self.drive_until_idle()
     }
 
     fn append(&mut self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
@@ -970,8 +985,8 @@ impl RaftRsNode {
             heartbeat_tick: 3,
             max_size_per_msg: u64::MAX,
             max_inflight_msgs: 256,
-            check_quorum: true,
-            pre_vote: true,
+            check_quorum: false,
+            pre_vote: false,
             ..Default::default()
         };
         raft_config.validate().map_err(map_raft_error)?;
@@ -1787,6 +1802,29 @@ mod tests {
         let (group_2, log_2) = RaftRsSharedGroup::open_local(7, configs.clone(), 2).unwrap();
         let (group_3, log_3) = RaftRsSharedGroup::open_local(7, configs, 3).unwrap();
         let groups = BTreeMap::from([(1, group_1.clone()), (2, group_2), (3, group_3)]);
+
+        group_1.campaign(1).unwrap();
+        for _ in 0..1_000 {
+            let mut messages = Vec::new();
+            for group in groups.values() {
+                messages.extend(group.take_wire_messages());
+            }
+            for message in messages {
+                groups
+                    .get(&message.to)
+                    .expect("target raft group")
+                    .step_wire_message(message)
+                    .unwrap();
+            }
+            if group_1
+                .status()
+                .iter()
+                .any(|status| status.node_id == 1 && status.role == "Leader")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         let append = std::thread::spawn(move || log_1.append(7, b"network-quorum".to_vec()));
         for _ in 0..1_000 {

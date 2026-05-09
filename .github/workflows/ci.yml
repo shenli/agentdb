@@ -1,6 +1,11 @@
-# Pull-request CI. The first project-wide automated check —
-# previously every PR landed without verification and the human
-# reviewer had to remember to `cargo test`.
+# Manual CI. Automatic GitHub CI is intentionally disabled for
+# cost control; the default pre-merge validation path is the
+# local runner on li-dev:
+#
+#   scripts/local-ci.sh
+#
+# Keep this workflow as an on-demand cloud fallback when a PR
+# needs GitHub-hosted verification.
 #
 # Linux-only by design. macOS minutes on GH Actions are 10×
 # Linux minutes; we don't need OS coverage for build correctness
@@ -17,36 +22,18 @@
 
 name: ci
 
-# Skip CI on docs-only changes. Docs can't break the build,
-# so the cargo + SDK smoke-test time is wasted heat (and
-# runner-disk pressure) for a Markdown edit.
-#
-# `paths-ignore` is OR'd against the trigger: a PR that touches
-# any non-listed path runs CI normally; a PR that touches ONLY
-# listed paths skips the whole workflow.
-#
-# Workflow files themselves (`.github/workflows/**`) stay
-# unfiltered — a CI change must be CI-tested. README, AGENTS,
-# LLMS, ARCHITECTURE, runbooks, and per-SDK READMEs are all
-# safe to skip.
 on:
-  pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      run_sdks:
+        description: "Run Python + TypeScript SDK smoke tests"
+        required: false
+        default: true
+        type: boolean
 
-# Cancel an in-flight run when a new push lands on the same PR
-# branch — saves runner time on noisy PRs.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -118,6 +105,7 @@ jobs:
 
   sdks:
     name: SDK smoke (Python + TypeScript)
+    if: ${{ inputs.run_sdks }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

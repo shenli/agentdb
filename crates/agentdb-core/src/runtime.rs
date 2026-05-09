@@ -565,6 +565,7 @@ impl RuntimeTabletKvStore {
 
 impl KvStore for RuntimeTabletKvStore {
     fn get(&self, key: &[u8]) -> agentdb_storage::Result<Option<Vec<u8>>> {
+        self.state_machine.apply_committed()?;
         self.store.get(key)
     }
 
@@ -580,6 +581,7 @@ impl KvStore for RuntimeTabletKvStore {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
+        self.state_machine.apply_committed()?;
         self.store.scan_prefix(prefix)
     }
 
@@ -594,10 +596,12 @@ impl KvStore for RuntimeTabletKvStore {
     }
 
     fn snapshot<'a>(&'a self) -> agentdb_storage::Result<Box<dyn KvSnapshot + 'a>> {
+        self.state_machine.apply_committed()?;
         self.store.snapshot()
     }
 
     fn snapshot_owned(self: Arc<Self>) -> agentdb_storage::Result<Arc<dyn KvSnapshot>> {
+        self.state_machine.apply_committed()?;
         self.store.clone().snapshot_owned()
     }
 }
@@ -809,6 +813,18 @@ impl RuntimeTabletRouterKvStore {
         }
         stats.sort_by_key(|stats| stats.tablet_id);
         Ok(stats)
+    }
+
+    fn apply_committed(&self) -> agentdb_storage::Result<usize> {
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut applied = 0usize;
+        for handle in tablets.values() {
+            applied = applied.saturating_add(handle.state_machine.apply_committed()?);
+        }
+        Ok(applied)
     }
 }
 
@@ -1701,6 +1717,21 @@ impl Runtime {
         Ok(())
     }
 
+    async fn refresh_replicated_state(&self) -> Result<()> {
+        if self
+            .tablet_router
+            .as_ref()
+            .map(|router| router.apply_committed())
+            .transpose()
+            .map_err(internal)?
+            .unwrap_or(0)
+            > 0
+        {
+            self.rehydrate_from_persist().await?;
+        }
+        Ok(())
+    }
+
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {
         self.kms
             .resolve_tenant_key(tenant_id.as_str(), operation)
@@ -1710,6 +1741,7 @@ impl Runtime {
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
     /// match a live (non-soft-deleted) tenant.
     pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
+        self.refresh_replicated_state().await?;
         let s = self.state.lock().await;
         s.tenants
             .get(tenant_id.as_str())
@@ -2357,6 +2389,7 @@ impl Runtime {
     }
 
     pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
+        self.refresh_replicated_state().await?;
         let a = {
             let mut s = self.state.lock().await;
             let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
@@ -2434,6 +2467,7 @@ impl Runtime {
         req: NewSession,
         session_id: Option<Id>,
     ) -> Result<Session> {
+        self.refresh_replicated_state().await?;
         let sess = {
             let mut s = self.state.lock().await;
             let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
@@ -4131,6 +4165,8 @@ impl Runtime {
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
+        self.refresh_replicated_state().await?;
+
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
         let idem_full_key = req
@@ -4404,6 +4440,12 @@ impl Runtime {
                 drop(s);
                 return Err(internal(e));
             }
+            let key = (req.session_id.as_str().to_string(), seq);
+            s.event_by_id.insert(
+                envelope.event_id.as_str().to_string(),
+                (envelope.session_id.as_str().to_string(), envelope.seq),
+            );
+            s.events.insert(key, envelope);
         } else {
             // In-memory backend: keep the events map populated, and
             // mirror the `event_by_id` secondary-index entry that the
@@ -4725,6 +4767,7 @@ impl Runtime {
     /// exist. Returns an empty vec if `from_seq` is past the session's last
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
+        self.refresh_replicated_state().await?;
         let (session, hot_in_memory) = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -4748,20 +4791,17 @@ impl Runtime {
                     format!("{}", req.session_id),
                 ));
             }
-            let hot = if self.persist.is_none() {
-                let lo = (
-                    req.session_id.as_str().to_string(),
-                    req.from_seq.max(session.warm_head_from_seq),
-                );
-                let hi = (req.session_id.as_str().to_string(), u64::MAX);
-                s.events
-                    .range(lo..=hi)
-                    .take(req.limit)
-                    .map(|(_, v)| v.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let lo = (
+                req.session_id.as_str().to_string(),
+                req.from_seq.max(session.warm_head_from_seq),
+            );
+            let hi = (req.session_id.as_str().to_string(), u64::MAX);
+            let hot = s
+                .events
+                .range(lo..=hi)
+                .take(req.limit)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>();
             (session.clone(), hot)
         };
 
@@ -4799,13 +4839,22 @@ impl Runtime {
         }
         let hot_from_seq = req.from_seq.max(session.warm_head_from_seq);
         let hot = if self.persist.is_some() {
-            self.read_hot_events_from_persist(
-                &req.tenant_id,
-                &req.session_id,
-                hot_from_seq,
-                remaining,
-            )
-            .await?
+            let mut hot = self
+                .read_hot_events_from_persist(
+                    &req.tenant_id,
+                    &req.session_id,
+                    hot_from_seq,
+                    remaining,
+                )
+                .await?;
+            for event in hot_in_memory {
+                if !hot.iter().any(|existing| existing.seq == event.seq) {
+                    hot.push(event);
+                }
+            }
+            hot.sort_by_key(|event| event.seq);
+            hot.truncate(remaining);
+            hot
         } else {
             hot_in_memory
         };

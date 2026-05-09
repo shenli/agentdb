@@ -49,10 +49,11 @@ pub struct Tablet {
 /// already present. Returns the row as it now exists on-disk.
 pub async fn get_or_create(pool: &AnyPool, tablet_id: i64, now_ms: i64) -> MetaResult<Tablet> {
     // Try insert first; if the PK already exists we fall through to
-    // lookup. `INSERT OR IGNORE` is idempotent and doesn't error.
+    // lookup. `ON CONFLICT DO NOTHING` is idempotent across SQLite/Postgres.
     sqlx::query(
-        "INSERT OR IGNORE INTO tablets (tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms)
-         VALUES (?, NULL, 0, 0, ?)",
+        "INSERT INTO tablets (tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms)
+         VALUES ($1, NULL, 0, 0, $2)
+         ON CONFLICT (tablet_id) DO NOTHING",
     )
     .bind(tablet_id)
     .bind(now_ms)
@@ -60,7 +61,7 @@ pub async fn get_or_create(pool: &AnyPool, tablet_id: i64, now_ms: i64) -> MetaR
     .await?;
     get(pool, tablet_id)
         .await?
-        .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after insert-or-ignore")))
+        .ok_or_else(|| MetaError::NotFound(format!("tablet {tablet_id} after insert")))
 }
 
 pub async fn create_with_placement(
@@ -85,7 +86,7 @@ pub async fn create_with_placement(
         "INSERT INTO tablets
             (tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
              placement_scope_id, state, raft_group_id, encryption_policy_version)
-         VALUES (?, NULL, 0, 0, ?, ?, ?, ?, ?)",
+         VALUES ($1, NULL, 0, 0, $2, $3, $4, $5, $6)",
     )
     .bind(tablet_id)
     .bind(now_ms)
@@ -105,7 +106,7 @@ pub async fn get(pool: &AnyPool, tablet_id: i64) -> MetaResult<Option<Tablet>> {
         "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
                 handoff_target_node_id, placement_scope_id, state, raft_group_id,
                 encryption_policy_version
-         FROM tablets WHERE tablet_id = ?",
+         FROM tablets WHERE tablet_id = $1",
     )
     .bind(tablet_id)
     .fetch_optional(pool)
@@ -131,10 +132,10 @@ pub async fn assume_ownership(
 ) -> MetaResult<Tablet> {
     let rows = sqlx::query(
         "UPDATE tablets
-           SET owner_node_id       = ?,
+           SET owner_node_id       = $1,
                epoch               = epoch + 1,
-               lease_expires_at_ms = ?
-         WHERE tablet_id = ? AND epoch = ?",
+               lease_expires_at_ms = $2
+         WHERE tablet_id = $3 AND epoch = $4",
     )
     .bind(new_owner)
     .bind(new_lease_expires_at_ms)
@@ -185,7 +186,7 @@ pub async fn clear_expired_ownership(
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT tablet_id FROM tablets
          WHERE owner_node_id IS NOT NULL
-           AND lease_expires_at_ms + ? < ?
+           AND lease_expires_at_ms + $1 < $2
          ORDER BY tablet_id",
     )
     .bind(safety_margin_ms)
@@ -200,10 +201,41 @@ pub async fn clear_expired_ownership(
                    lease_expires_at_ms = 0,
                    epoch = epoch + 1
              WHERE owner_node_id IS NOT NULL
-               AND lease_expires_at_ms + ? < ?",
+               AND lease_expires_at_ms + $1 < $2",
         )
         .bind(safety_margin_ms)
         .bind(now_ms)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// Clear every tablet currently owned by `owner_node_id`, regardless of lease
+/// expiry. The scheduler uses this after a node is marked dead, where waiting
+/// for the old owner's lease would delay failover even though the liveness
+/// decision has already been fenced in the control plane.
+pub async fn clear_ownership_by_owner(pool: &AnyPool, owner_node_id: &str) -> MetaResult<Vec<i64>> {
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT tablet_id FROM tablets
+         WHERE owner_node_id = $1
+         ORDER BY tablet_id",
+    )
+    .bind(owner_node_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let ids: Vec<i64> = rows.into_iter().map(|(id,)| id).collect();
+    if !ids.is_empty() {
+        sqlx::query(
+            "UPDATE tablets
+               SET owner_node_id = NULL,
+                   lease_expires_at_ms = 0,
+                   epoch = epoch + 1
+             WHERE owner_node_id = $1",
+        )
+        .bind(owner_node_id)
         .execute(&mut *tx)
         .await?;
     }
@@ -234,7 +266,7 @@ pub async fn relinquish(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> {
     let rows = sqlx::query(
         "UPDATE tablets \
             SET owner_node_id = NULL, lease_expires_at_ms = 0, epoch = epoch + 1 \
-            WHERE tablet_id = ? AND owner_node_id IS NOT NULL",
+            WHERE tablet_id = $1 AND owner_node_id IS NOT NULL",
     )
     .bind(tablet_id)
     .execute(pool)
@@ -259,8 +291,8 @@ pub async fn relinquish(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> {
 /// owned".
 pub async fn assign_to(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult<bool> {
     let rows = sqlx::query(
-        "UPDATE tablets SET owner_node_id = ? \
-           WHERE tablet_id = ? AND owner_node_id IS NULL",
+        "UPDATE tablets SET owner_node_id = $1 \
+           WHERE tablet_id = $2 AND owner_node_id IS NULL",
     )
     .bind(node_id)
     .bind(tablet_id)
@@ -278,7 +310,7 @@ pub async fn list_owned_by(pool: &AnyPool, node_id: &str) -> MetaResult<Vec<Tabl
         "SELECT tablet_id, owner_node_id, epoch, lease_expires_at_ms, created_at_ms,
                 handoff_target_node_id, placement_scope_id, state, raft_group_id,
                 encryption_policy_version
-           FROM tablets WHERE owner_node_id = ? ORDER BY tablet_id",
+           FROM tablets WHERE owner_node_id = $1 ORDER BY tablet_id",
     )
     .bind(node_id)
     .fetch_all(pool)
@@ -304,7 +336,7 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Tablet>> {
 
 pub async fn set_state(pool: &AnyPool, tablet_id: i64, state: &str) -> MetaResult<bool> {
     validate_state(state)?;
-    let rows = sqlx::query("UPDATE tablets SET state = ?, epoch = epoch + 1 WHERE tablet_id = ?")
+    let rows = sqlx::query("UPDATE tablets SET state = $1, epoch = epoch + 1 WHERE tablet_id = $2")
         .bind(state)
         .bind(tablet_id)
         .execute(pool)
@@ -318,7 +350,7 @@ pub async fn set_raft_group(
     tablet_id: i64,
     raft_group_id: Option<&str>,
 ) -> MetaResult<bool> {
-    let rows = sqlx::query("UPDATE tablets SET raft_group_id = ? WHERE tablet_id = ?")
+    let rows = sqlx::query("UPDATE tablets SET raft_group_id = $1 WHERE tablet_id = $2")
         .bind(raft_group_id)
         .bind(tablet_id)
         .execute(pool)
@@ -339,8 +371,8 @@ pub async fn set_encryption_policy_version(
     }
     let rows = sqlx::query(
         "UPDATE tablets
-            SET encryption_policy_version = ?, epoch = epoch + 1
-          WHERE tablet_id = ?",
+            SET encryption_policy_version = $1, epoch = epoch + 1
+          WHERE tablet_id = $2",
     )
     .bind(encryption_policy_version)
     .bind(tablet_id)
@@ -369,8 +401,8 @@ pub async fn mark_for_handoff(
 ) -> MetaResult<bool> {
     let rows = sqlx::query(
         "UPDATE tablets \
-            SET handoff_target_node_id = ? \
-            WHERE tablet_id = ? AND owner_node_id IS NOT NULL",
+            SET handoff_target_node_id = $1 \
+            WHERE tablet_id = $2 AND owner_node_id IS NOT NULL",
     )
     .bind(target_node_id)
     .bind(tablet_id)
@@ -406,7 +438,7 @@ pub async fn complete_handoff(
     let mut tx = pool.begin().await?;
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT owner_node_id, handoff_target_node_id \
-            FROM tablets WHERE tablet_id = ?",
+            FROM tablets WHERE tablet_id = $1",
     )
     .bind(tablet_id)
     .fetch_optional(&mut *tx)
@@ -425,11 +457,11 @@ pub async fn complete_handoff(
     }
     let updated = sqlx::query(
         "UPDATE tablets \
-            SET owner_node_id = ?, \
+            SET owner_node_id = $1, \
                 handoff_target_node_id = NULL, \
                 lease_expires_at_ms = 0, \
                 epoch = epoch + 1 \
-            WHERE tablet_id = ? AND owner_node_id = ? AND handoff_target_node_id = ?",
+            WHERE tablet_id = $2 AND owner_node_id = $3 AND handoff_target_node_id = $4",
     )
     .bind(&target)
     .bind(tablet_id)
@@ -449,7 +481,7 @@ pub async fn complete_handoff(
 pub async fn cancel_handoff(pool: &AnyPool, tablet_id: i64) -> MetaResult<bool> {
     let rows = sqlx::query(
         "UPDATE tablets SET handoff_target_node_id = NULL \
-            WHERE tablet_id = ? AND handoff_target_node_id IS NOT NULL",
+            WHERE tablet_id = $1 AND handoff_target_node_id IS NOT NULL",
     )
     .bind(tablet_id)
     .execute(pool)
@@ -874,5 +906,31 @@ mod tests {
         // excludes it.
         let second = clear_expired_ownership(&p, 0, 10_000).await.unwrap();
         assert!(second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_ownership_by_owner_only_clears_matching_owner() {
+        let p = pool().await;
+        for id in [1, 2, 3] {
+            get_or_create(&p, id, 100).await.unwrap();
+        }
+        assume_ownership(&p, 1, 0, "node-a", 50_000).await.unwrap();
+        assume_ownership(&p, 2, 0, "node-b", 50_000).await.unwrap();
+        assume_ownership(&p, 3, 0, "node-a", 50_000).await.unwrap();
+
+        let cleared = clear_ownership_by_owner(&p, "node-a").await.unwrap();
+
+        assert_eq!(cleared, vec![1, 3]);
+        let t1 = get(&p, 1).await.unwrap().unwrap();
+        let t2 = get(&p, 2).await.unwrap().unwrap();
+        let t3 = get(&p, 3).await.unwrap().unwrap();
+        assert_eq!(t1.owner_node_id, None);
+        assert_eq!(t1.lease_expires_at_ms, 0);
+        assert_eq!(t1.epoch, 2);
+        assert_eq!(t2.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(t2.lease_expires_at_ms, 50_000);
+        assert_eq!(t3.owner_node_id, None);
+        assert_eq!(t3.lease_expires_at_ms, 0);
+        assert_eq!(t3.epoch, 2);
     }
 }

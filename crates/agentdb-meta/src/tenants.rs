@@ -16,7 +16,7 @@ pub struct Tenant {
 /// Lookup by external id. Returns `Ok(None)` if the tenant doesn't exist.
 pub async fn get_by_external(pool: &AnyPool, external_id: &str) -> MetaResult<Option<Tenant>> {
     let row: Option<(i64, String, i64)> = sqlx::query_as(
-        "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE external_id = ?",
+        "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE external_id = $1",
     )
     .bind(external_id)
     .fetch_optional(pool)
@@ -35,7 +35,7 @@ pub async fn get_by_external(pool: &AnyPool, external_id: &str) -> MetaResult<Op
 /// tenant identity from the locator's `tenant_internal_id`.
 pub async fn get_by_internal(pool: &AnyPool, internal_id: i64) -> MetaResult<Option<Tenant>> {
     let row: Option<(i64, String, i64)> = sqlx::query_as(
-        "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE internal_id = ?",
+        "SELECT internal_id, external_id, created_at_ms FROM tenants WHERE internal_id = $1",
     )
     .bind(internal_id)
     .fetch_optional(pool)
@@ -55,7 +55,7 @@ pub async fn create(pool: &AnyPool, external_id: &str, now_ms: i64) -> MetaResul
     // dialect-agnostic and avoids SQLite's
     // `last_insert_rowid` (unsupported on AnyQueryResult).
     let result: Result<(i64,), _> = sqlx::query_as(
-        "INSERT INTO tenants (external_id, created_at_ms) VALUES (?, ?) RETURNING internal_id",
+        "INSERT INTO tenants (external_id, created_at_ms) VALUES ($1, $2) RETURNING internal_id",
     )
     .bind(external_id)
     .bind(now_ms)

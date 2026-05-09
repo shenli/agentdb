@@ -10,11 +10,11 @@
 //!   `AGENTDB_META_URL` (a `postgres://user:pw@host/db`
 //!   URL).
 //!
-//! Internally every query runs through `sqlx::Any` which
-//! rewrites the `?` placeholders to `$N` for Postgres. The
-//! small number of truly dialect-specific SQL statements
-//! (migrations, `VACUUM INTO`, `pg_dump`) branch on the
-//! [`MetaBackend`] discriminant.
+//! Runtime queries use `$N` placeholders, which both Postgres
+//! and SQLite accept through `sqlx::Any`. The small number of
+//! truly dialect-specific SQL statements (migrations,
+//! `VACUUM INTO`, `pg_dump`) branch on the [`MetaBackend`]
+//! discriminant.
 
 pub mod admin_tokens;
 pub mod audit;

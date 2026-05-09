@@ -5,7 +5,7 @@ use sqlx::AnyPool;
 use crate::error::MetaResult;
 
 pub async fn get(pool: &AnyPool, key: &str) -> MetaResult<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM config WHERE key = ?")
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM config WHERE key = $1")
         .bind(key)
         .fetch_optional(pool)
         .await?;
@@ -14,7 +14,7 @@ pub async fn get(pool: &AnyPool, key: &str) -> MetaResult<Option<String>> {
 
 pub async fn set(pool: &AnyPool, key: &str, value: &str, now_ms: i64) -> MetaResult<()> {
     sqlx::query(
-        "INSERT INTO config (key, value, updated_at_ms) VALUES (?, ?, ?)
+        "INSERT INTO config (key, value, updated_at_ms) VALUES ($1, $2, $3)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
     )
     .bind(key)
@@ -26,7 +26,7 @@ pub async fn set(pool: &AnyPool, key: &str, value: &str, now_ms: i64) -> MetaRes
 }
 
 pub async fn delete(pool: &AnyPool, key: &str) -> MetaResult<()> {
-    sqlx::query("DELETE FROM config WHERE key = ?")
+    sqlx::query("DELETE FROM config WHERE key = $1")
         .bind(key)
         .execute(pool)
         .await?;

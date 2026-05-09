@@ -25,7 +25,7 @@ pub struct PlacementScope {
 pub async fn get(pool: &AnyPool, placement_scope_id: &str) -> MetaResult<Option<PlacementScope>> {
     let row: Option<PlacementScopeRow> = sqlx::query_as(
         "SELECT placement_scope_id, kind, shard_count, hash_seed, state, epoch, created_at_ms
-           FROM placement_scopes WHERE placement_scope_id = ?",
+           FROM placement_scopes WHERE placement_scope_id = $1",
     )
     .bind(placement_scope_id)
     .fetch_optional(pool)
@@ -46,8 +46,8 @@ pub async fn upsert(
     if let Some(scope) = existing {
         sqlx::query(
             "UPDATE placement_scopes
-                SET kind = ?, shard_count = ?, hash_seed = ?, state = ?, epoch = ?, created_at_ms = ?
-              WHERE placement_scope_id = ?",
+                SET kind = $1, shard_count = $2, hash_seed = $3, state = $4, epoch = $5, created_at_ms = $6
+              WHERE placement_scope_id = $7",
         )
         .bind(kind)
         .bind(shard_count)
@@ -62,7 +62,7 @@ pub async fn upsert(
         sqlx::query(
             "INSERT INTO placement_scopes
                 (placement_scope_id, kind, shard_count, hash_seed, state, epoch, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, 0, ?)",
+             VALUES ($1, $2, $3, $4, $5, 0, $6)",
         )
         .bind(placement_scope_id)
         .bind(kind)

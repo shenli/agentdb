@@ -40,7 +40,7 @@ pub async fn upsert(
     sqlx::query(
         "INSERT INTO tablet_replicas
             (tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (tablet_id, node_id) DO UPDATE SET
             role = excluded.role,
             health = excluded.health,
@@ -72,8 +72,8 @@ pub async fn set_progress(
     validate_index(match_index, "match_index")?;
     let rows = sqlx::query(
         "UPDATE tablet_replicas
-            SET applied_index = ?, match_index = ?, updated_at_ms = ?
-          WHERE tablet_id = ? AND node_id = ?",
+            SET applied_index = $1, match_index = $2, updated_at_ms = $3
+          WHERE tablet_id = $4 AND node_id = $5",
     )
     .bind(applied_index)
     .bind(match_index)
@@ -96,8 +96,8 @@ pub async fn set_health(
     validate_health(health)?;
     let rows = sqlx::query(
         "UPDATE tablet_replicas
-            SET health = ?, updated_at_ms = ?
-          WHERE tablet_id = ? AND node_id = ?",
+            SET health = $1, updated_at_ms = $2
+          WHERE tablet_id = $3 AND node_id = $4",
     )
     .bind(health)
     .bind(now_ms)
@@ -113,7 +113,7 @@ pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<Ta
     let rows: Vec<TabletReplicaRow> = sqlx::query_as(
         "SELECT tablet_id, node_id, role, health, applied_index, match_index, updated_at_ms
            FROM tablet_replicas
-          WHERE tablet_id = ?
+          WHERE tablet_id = $1
           ORDER BY node_id",
     )
     .bind(tablet_id)
@@ -134,7 +134,7 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TabletReplica>> {
 }
 
 pub async fn delete(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult<bool> {
-    let rows = sqlx::query("DELETE FROM tablet_replicas WHERE tablet_id = ? AND node_id = ?")
+    let rows = sqlx::query("DELETE FROM tablet_replicas WHERE tablet_id = $1 AND node_id = $2")
         .bind(tablet_id)
         .bind(node_id)
         .execute(pool)
@@ -144,7 +144,7 @@ pub async fn delete(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaResult
 }
 
 pub async fn delete_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<u64> {
-    let rows = sqlx::query("DELETE FROM tablet_replicas WHERE tablet_id = ?")
+    let rows = sqlx::query("DELETE FROM tablet_replicas WHERE tablet_id = $1")
         .bind(tablet_id)
         .execute(pool)
         .await?

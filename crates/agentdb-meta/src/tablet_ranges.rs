@@ -55,10 +55,10 @@ pub async fn upsert(
     let overlap: Option<TabletRangeRow> = sqlx::query_as(
         "SELECT placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms
            FROM tablet_ranges
-          WHERE placement_scope_id = ?
-            AND start_shard <= ?
-            AND end_shard >= ?
-            AND NOT (start_shard = ? AND end_shard = ?)
+          WHERE placement_scope_id = $1
+            AND start_shard <= $2
+            AND end_shard >= $3
+            AND NOT (start_shard = $4 AND end_shard = $5)
           LIMIT 1",
     )
     .bind(placement_scope_id)
@@ -78,7 +78,7 @@ pub async fn upsert(
     }
     sqlx::query(
         "DELETE FROM tablet_ranges
-          WHERE placement_scope_id = ? AND start_shard = ? AND end_shard = ?",
+          WHERE placement_scope_id = $1 AND start_shard = $2 AND end_shard = $3",
     )
     .bind(placement_scope_id)
     .bind(start_shard)
@@ -88,7 +88,7 @@ pub async fn upsert(
     sqlx::query(
         "INSERT INTO tablet_ranges
             (placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(placement_scope_id)
     .bind(start_shard)
@@ -110,7 +110,7 @@ pub async fn find(
     let row: Option<TabletRangeRow> = sqlx::query_as(
         "SELECT placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms
            FROM tablet_ranges
-          WHERE placement_scope_id = ? AND start_shard <= ? AND end_shard >= ?
+          WHERE placement_scope_id = $1 AND start_shard <= $2 AND end_shard >= $3
           ORDER BY map_epoch DESC, start_shard DESC
           LIMIT 1",
     )
@@ -137,7 +137,7 @@ pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<Ta
     let rows: Vec<TabletRangeRow> = sqlx::query_as(
         "SELECT placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms
            FROM tablet_ranges
-          WHERE tablet_id = ?
+          WHERE tablet_id = $1
           ORDER BY placement_scope_id, start_shard, end_shard",
     )
     .bind(tablet_id)
@@ -154,7 +154,7 @@ pub async fn delete(
 ) -> MetaResult<bool> {
     let rows = sqlx::query(
         "DELETE FROM tablet_ranges
-          WHERE placement_scope_id = ? AND start_shard = ? AND end_shard = ?",
+          WHERE placement_scope_id = $1 AND start_shard = $2 AND end_shard = $3",
     )
     .bind(placement_scope_id)
     .bind(start_shard)
@@ -189,7 +189,7 @@ pub async fn replace_ranges(
     for old in old_ranges {
         let rows = sqlx::query(
             "DELETE FROM tablet_ranges
-              WHERE placement_scope_id = ? AND start_shard = ? AND end_shard = ?",
+              WHERE placement_scope_id = $1 AND start_shard = $2 AND end_shard = $3",
         )
         .bind(placement_scope_id)
         .bind(old.start_shard)
@@ -209,9 +209,9 @@ pub async fn replace_ranges(
     let overlap: Option<TabletRangeRow> = sqlx::query_as(
         "SELECT placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms
            FROM tablet_ranges
-          WHERE placement_scope_id = ?
-            AND start_shard <= ?
-            AND end_shard >= ?
+          WHERE placement_scope_id = $1
+            AND start_shard <= $2
+            AND end_shard >= $3
           LIMIT 1",
     )
     .bind(placement_scope_id)
@@ -232,7 +232,7 @@ pub async fn replace_ranges(
         sqlx::query(
             "INSERT INTO tablet_ranges
                 (placement_scope_id, start_shard, end_shard, tablet_id, map_epoch, updated_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(placement_scope_id)
         .bind(new.start_shard)

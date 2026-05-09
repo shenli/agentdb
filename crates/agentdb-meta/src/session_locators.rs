@@ -59,7 +59,7 @@ pub struct SessionLocator {
 
 /// Upsert idempotency policy:
 ///
-/// - `INSERT OR IGNORE` on the PK. If the locator already
+/// - `ON CONFLICT DO NOTHING` on the PK. If the locator already
 ///   exists, do not overwrite — the existing record's
 ///   tablet_id is the authoritative current placement, and
 ///   blindly replacing it on every write would erase the
@@ -81,9 +81,10 @@ pub async fn upsert(
     created_at_ms: i64,
 ) -> MetaResult<bool> {
     let rows = sqlx::query(
-        "INSERT OR IGNORE INTO session_locators \
+        "INSERT INTO session_locators \
             (session_id, tenant_internal_id, tenant_external_id, tablet_id, shard_id, created_at_ms) \
-            VALUES (?, ?, ?, ?, ?, ?)",
+            VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (session_id) DO NOTHING",
     )
     .bind(session_id)
     .bind(tenant_internal_id)
@@ -105,7 +106,7 @@ pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionL
     LOCATOR_GETS.fetch_add(1, Ordering::Relaxed);
     let row: Option<LocatorRow> = sqlx::query_as(
         "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
-            FROM session_locators WHERE session_id = ?",
+            FROM session_locators WHERE session_id = $1",
     )
     .bind(session_id)
     .fetch_optional(pool)
@@ -126,7 +127,7 @@ pub async fn update_tablet(
     session_id: &str,
     new_tablet_id: i64,
 ) -> MetaResult<bool> {
-    let rows = sqlx::query("UPDATE session_locators SET tablet_id = ? WHERE session_id = ?")
+    let rows = sqlx::query("UPDATE session_locators SET tablet_id = $1 WHERE session_id = $2")
         .bind(new_tablet_id)
         .bind(session_id)
         .execute(pool)
@@ -139,7 +140,7 @@ pub async fn update_tablet(
 /// removed (e.g., admin delete). Returns `true` when a row
 /// existed prior; `false` when the call was a no-op.
 pub async fn delete(pool: &AnyPool, session_id: &str) -> MetaResult<bool> {
-    let rows = sqlx::query("DELETE FROM session_locators WHERE session_id = ?")
+    let rows = sqlx::query("DELETE FROM session_locators WHERE session_id = $1")
         .bind(session_id)
         .execute(pool)
         .await?
@@ -155,7 +156,7 @@ pub async fn delete_by_tenant_external(
     pool: &AnyPool,
     tenant_external_id: &str,
 ) -> MetaResult<u64> {
-    let rows = sqlx::query("DELETE FROM session_locators WHERE tenant_external_id = ?")
+    let rows = sqlx::query("DELETE FROM session_locators WHERE tenant_external_id = $1")
         .bind(tenant_external_id)
         .execute(pool)
         .await?
@@ -182,9 +183,9 @@ pub async fn list_by_tenant_external(
         Some(after) => sqlx::query_as(
             "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
-                WHERE tenant_external_id = ? AND session_id > ? \
+                WHERE tenant_external_id = $1 AND session_id > $2 \
                 ORDER BY session_id ASC \
-                LIMIT ?",
+                LIMIT $3",
         )
         .bind(tenant_external_id)
         .bind(after)
@@ -194,9 +195,9 @@ pub async fn list_by_tenant_external(
         None => sqlx::query_as(
             "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
-                WHERE tenant_external_id = ? \
+                WHERE tenant_external_id = $1 \
                 ORDER BY session_id ASC \
-                LIMIT ?",
+                LIMIT $2",
         )
         .bind(tenant_external_id)
         .bind(limit)
@@ -239,9 +240,9 @@ pub async fn list_by_tenant(
         Some(after) => sqlx::query_as(
             "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
-                WHERE tenant_internal_id = ? AND session_id > ? \
+                WHERE tenant_internal_id = $1 AND session_id > $2 \
                 ORDER BY session_id ASC \
-                LIMIT ?",
+                LIMIT $3",
         )
         .bind(tenant_internal_id)
         .bind(after)
@@ -251,9 +252,9 @@ pub async fn list_by_tenant(
         None => sqlx::query_as(
             "SELECT session_id, tenant_internal_id, tablet_id, shard_id, created_at_ms, tenant_external_id \
                 FROM session_locators \
-                WHERE tenant_internal_id = ? \
+                WHERE tenant_internal_id = $1 \
                 ORDER BY session_id ASC \
-                LIMIT ?",
+                LIMIT $2",
         )
         .bind(tenant_internal_id)
         .bind(limit)
