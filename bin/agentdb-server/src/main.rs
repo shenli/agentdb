@@ -37,6 +37,7 @@ const DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS: usize = 4;
 const DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_TICK_INTERVAL_MS: u64 = 100;
+const DEFAULT_RAFT_OWNER_CAMPAIGN_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
@@ -417,6 +418,18 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         registry.clone(),
                         local_raft_node_id,
                         Duration::from_millis(raft_tick_interval_ms),
+                    );
+                    let raft_owner_campaign_interval_ms = env_u64(
+                        "AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS",
+                        DEFAULT_RAFT_OWNER_CAMPAIGN_INTERVAL_MS,
+                    )
+                    .max(100);
+                    spawn_raft_rs_owner_campaign_worker(
+                        startup.meta.clone(),
+                        startup.node_id.clone(),
+                        local_raft_node_id,
+                        registry.clone(),
+                        Duration::from_millis(raft_owner_campaign_interval_ms),
                     );
                     spawn_raft_rs_message_outbox_worker(
                         startup.meta.clone(),
@@ -1874,6 +1887,43 @@ fn spawn_raft_rs_tick_worker(
     });
 }
 
+fn spawn_raft_rs_owner_campaign_worker(
+    meta: agentdb_meta::MetaStore,
+    local_node_id: String,
+    local_raft_node_id: u64,
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    interval: Duration,
+) {
+    let interval = interval.max(Duration::from_millis(100));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match campaign_owned_raft_tablets(&meta, &local_node_id, local_raft_node_id, &registry)
+                .await
+            {
+                Ok(campaigns) if campaigns > 0 => {
+                    tracing::debug!(
+                        local_node_id,
+                        local_raft_node_id,
+                        campaigns,
+                        "requested raft-rs owner campaigns"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        local_node_id,
+                        local_raft_node_id,
+                        ?error,
+                        "failed to reconcile raft-rs owner campaigns"
+                    );
+                }
+            }
+        }
+    });
+}
+
 async fn campaign_owned_raft_tablets(
     meta: &agentdb_meta::MetaStore,
     local_node_id: &str,
@@ -1886,14 +1936,30 @@ async fn campaign_owned_raft_tablets(
         let Some(group) = groups.get(&tablet.tablet_id) else {
             continue;
         };
-        match group.elect(local_raft_node_id) {
+        if !local_tablet_replica_is_voter(meta, tablet.tablet_id, local_node_id).await? {
+            tracing::debug!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                "skipping raft-rs owner campaign because local replica is not a voter"
+            );
+            continue;
+        }
+        if group
+            .status()
+            .iter()
+            .any(|status| status.node_id == local_raft_node_id && status.role.as_str() == "Leader")
+        {
+            continue;
+        }
+        match group.campaign(local_raft_node_id) {
             Ok(()) => {
                 campaigns += 1;
                 tracing::info!(
                     tablet_id = tablet.tablet_id,
                     local_node_id,
                     local_raft_node_id,
-                    "started raft-rs campaign for locally owned tablet"
+                    "requested raft-rs campaign for locally owned tablet"
                 );
             }
             Err(error) => {
@@ -1908,6 +1974,19 @@ async fn campaign_owned_raft_tablets(
         }
     }
     Ok(campaigns)
+}
+
+async fn local_tablet_replica_is_voter(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+    local_node_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(
+        agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id)
+            .await?
+            .into_iter()
+            .any(|replica| replica.node_id == local_node_id && replica.role == "voter"),
+    )
 }
 
 fn spawn_raft_rs_message_outbox_worker(
@@ -6054,6 +6133,125 @@ region = "us-west-2"
         assert_eq!(bootstrap.bootstrapped_tablet_ids, vec![8]);
         assert!(registry.tablet_ids().contains(&8));
         assert!(runtime.registered_tablet_ids().contains(&8));
+    }
+
+    #[tokio::test]
+    async fn raft_owner_campaign_requests_campaign_for_local_voter_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assign_to(meta.pool(), 7, "node-a").await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(
+            7,
+            [
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-a",
+                    "voter",
+                    dir.path(),
+                )
+                .unwrap(),
+            ],
+            local_raft_node_id,
+        )
+        .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let campaigns = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(campaigns, 1);
+        let status = registry.status_for(7).unwrap();
+        assert!(status
+            .iter()
+            .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
+
+        let repeated = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+        assert_eq!(repeated, 0);
+    }
+
+    #[tokio::test]
+    async fn raft_owner_campaign_skips_local_learner_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assign_to(meta.pool(), 7, "node-a").await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "learner", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let (group, _log) = agentdb_storage::RaftRsSharedGroup::open_local(
+            7,
+            [
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-a",
+                    "learner",
+                    dir.path(),
+                )
+                .unwrap(),
+                agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                    7,
+                    "node-b",
+                    "voter",
+                    dir.path(),
+                )
+                .unwrap(),
+            ],
+            local_raft_node_id,
+        )
+        .unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let campaigns = campaign_owned_raft_tablets(&meta, "node-a", local_raft_node_id, &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(campaigns, 0);
+        let status = registry.status_for(7).unwrap();
+        assert!(!status
+            .iter()
+            .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
     }
 
     #[tokio::test]

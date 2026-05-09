@@ -318,6 +318,13 @@ impl RaftRsSharedGroup {
             .elect(node_id)
     }
 
+    pub fn campaign(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .campaign(node_id)
+    }
+
     pub fn status(&self) -> Vec<RaftRsReplicaStatus> {
         self.inner
             .lock()
@@ -740,17 +747,21 @@ impl RaftRsGroup {
     }
 
     fn elect(&mut self, node_id: u64) -> Result<()> {
-        self.node_mut(node_id)?
-            .raw
-            .campaign()
-            .map_err(map_raft_error)?;
-        self.drive_until_idle()?;
+        self.campaign(node_id)?;
         if self.node(node_id)?.raw.status().ss.raft_state != StateRole::Leader {
             return Err(Error::Other(format!(
                 "raft-rs node {node_id} did not become leader"
             )));
         }
         Ok(())
+    }
+
+    fn campaign(&mut self, node_id: u64) -> Result<()> {
+        self.node_mut(node_id)?
+            .raw
+            .campaign()
+            .map_err(map_raft_error)?;
+        self.drive_until_idle()
     }
 
     fn append(&mut self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
