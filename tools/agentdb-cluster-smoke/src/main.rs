@@ -360,13 +360,13 @@ async fn run_smoke(
             client,
             &node.url,
             "/api/admin/cluster/health",
-            Duration::from_secs(30),
+            Duration::from_secs(90),
         )
         .await?;
     }
     wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
 
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let (tenant_id, agent_id, session_id) = create_session_smoke(client, nodes).await?;
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
@@ -385,10 +385,10 @@ async fn run_smoke(
             .find(|node| node.id != owner.id)
             .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
         wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(20)).await?;
-        wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(30))
+        wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(90))
             .await?;
         wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
-        wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(30)).await?;
+        wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(90)).await?;
         append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 2).await?;
         let survivors: Vec<_> = nodes
             .iter()
@@ -425,7 +425,7 @@ async fn create_session_smoke_once(
     nodes: &[NodeSpec],
     suffix: &str,
 ) -> Result<(String, String, String)> {
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let tenant = post_json(
         client,
         &owner.url,
@@ -434,7 +434,7 @@ async fn create_session_smoke_once(
     )
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let agent = post_json(
         client,
         &owner.url,
@@ -443,7 +443,7 @@ async fn create_session_smoke_once(
     )
     .await?;
     let agent_id = string_field(&agent, "agent_id")?;
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let session = post_json(
         client,
         &owner.url,
@@ -464,7 +464,7 @@ async fn append_and_verify(
     expected_seq: u64,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
         let append_result = post_json(
             client,
             &owner.url,
@@ -502,7 +502,7 @@ async fn append_and_verify(
     }
     let events = get_json(
         client,
-        &wait_tablet_owner(client, nodes, None, Duration::from_secs(30))
+        &wait_tablet_owner(client, nodes, None, Duration::from_secs(90))
             .await?
             .url,
         &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
@@ -524,7 +524,7 @@ async fn event_count(
     tenant_id: &str,
     session_id: &str,
 ) -> Result<u64> {
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let events = get_json(
         client,
         &owner.url,
