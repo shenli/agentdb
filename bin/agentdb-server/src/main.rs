@@ -2034,11 +2034,24 @@ async fn campaign_owned_raft_tablets(
             );
             continue;
         }
-        if group
+        let local_status = group
             .status()
-            .iter()
-            .any(|status| status.node_id == local_raft_node_id && status.role.as_str() == "Leader")
-        {
+            .into_iter()
+            .find(|status| status.node_id == local_raft_node_id);
+        let Some(local_status) = local_status else {
+            continue;
+        };
+        if local_status.role == "Leader" {
+            continue;
+        }
+        if local_status.role != "Follower" {
+            tracing::debug!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                role = %local_status.role,
+                "skipping raft-rs owner campaign because local node is already campaigning"
+            );
             continue;
         }
         match group.campaign(local_raft_node_id) {
