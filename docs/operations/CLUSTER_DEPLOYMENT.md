@@ -276,6 +276,9 @@ Each node should have:
 - tablet lifecycle cooldown (`AGENTDB_TABLET_LIFECYCLE_COOLDOWN_MS`, default
   10 minutes) to avoid immediate repeated movement after a completed lifecycle
   group
+- retained-log compaction threshold
+  (`AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`; `0` disables local log
+  compaction by debt)
 - routing refresh intervals
 - internal Raft RPC token (`server.internal_auth_token` or
   `AGENTDB_INTERNAL_AUTH_TOKEN`)

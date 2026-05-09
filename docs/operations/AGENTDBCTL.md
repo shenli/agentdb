@@ -132,6 +132,12 @@ automatic split/merge work for tablets involved in recently completed movement
 rows. These knobs only enqueue the same movement rows as the manual commands;
 existing copy/catch-up/cutover safety checks still gate completion.
 
+Retained-log cleanup is also opt-in. Set
+`AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS` to compact local tablet logs when
+a tablet's retained committed log entries reach the threshold. This is separate
+from split/merge policy: it reduces local log debt for healthy tablets without
+preparing movement rows.
+
 Published stats are visible through:
 
 ```bash
