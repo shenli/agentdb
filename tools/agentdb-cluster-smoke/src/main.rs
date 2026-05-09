@@ -557,18 +557,7 @@ async fn append_and_verify(
             Err(error) => return Err(error),
         }
     }
-    let events = get_json(
-        client,
-        &wait_tablet_owner(client, nodes, None, Duration::from_secs(90))
-            .await?
-            .url,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
-    )
-    .await?;
-    let len = events
-        .as_array()
-        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
-        .len();
+    let len = event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10).await?;
     if len < usize::try_from(expected_seq + 1).unwrap() {
         bail!("expected at least {} events, got {len}", expected_seq + 1);
     }
@@ -594,6 +583,31 @@ async fn event_count(
         .len() as u64)
 }
 
+async fn event_count_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    session_id: &str,
+    attempts: usize,
+) -> Result<usize> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match event_count(client, nodes, tenant_id, session_id).await {
+            Ok(count) => return usize::try_from(count).map_err(Into::into),
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                eprintln!(
+                    "smoke: event count retry {} after convergence error: {error}",
+                    attempt + 1
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
+}
+
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("\"retryable\":true")
@@ -608,6 +622,7 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("\"code\":\"TENANT_NOT_FOUND\"")
         || message.contains("\"code\":\"AGENT_NOT_FOUND\"")
         || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
+        || message.contains("503 Service Unavailable")
         || message.contains("operation timed out")
 }
 
@@ -831,12 +846,13 @@ async fn wait_json(client: &Client, base: &str, path: &str, timeout: Duration) -
 }
 
 async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
-    let response = client
-        .get(format!("{base}{path}"))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.json().await?)
+    let response = client.get(format!("{base}{path}")).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}{path}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
 }
 
 async fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Result<Value> {
