@@ -1057,7 +1057,7 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
                 .bucket
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("s3 object store requires bucket"))?;
-            let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+            let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
             if let Some(region) = &config.region {
                 builder = builder.with_region(region);
             }
