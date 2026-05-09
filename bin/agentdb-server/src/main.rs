@@ -2981,6 +2981,24 @@ async fn run_cluster_scheduler_tick(
         tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
     }
 
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "scheduler aligned tablet ownership with raft leaders"
+            );
+        }
+    }
+
     if config.rebalance_max_movements > 0 {
         let report = agentdb_meta::tablet_rebalance::run(
             pool,
@@ -3064,6 +3082,65 @@ async fn run_cluster_scheduler_tick(
         }
     }
     Ok(())
+}
+
+async fn reconcile_raft_leader_tablet_ownership(
+    meta: &agentdb_meta::MetaStore,
+    registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
+    now_ms: i64,
+    lease_ms: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let mut aligned = 0usize;
+    for (tablet_id, group) in registry.groups_snapshot() {
+        let Some(leader_raft_node_id) = group
+            .status()
+            .into_iter()
+            .find_map(|status| (status.leader_id != 0).then_some(status.leader_id))
+        else {
+            continue;
+        };
+        let replicas =
+            agentdb_meta::tablet_replicas::list_by_tablet(meta.pool(), tablet_id).await?;
+        let Some(leader_replica) = replicas.into_iter().find(|replica| {
+            matches!(replica.role.as_str(), "voter" | "learner")
+                && agentdb_storage::stable_raft_node_id(&replica.node_id)
+                    .is_ok_and(|raft_node_id| raft_node_id == leader_raft_node_id)
+        }) else {
+            continue;
+        };
+        if leader_replica.role != "voter" {
+            continue;
+        }
+        let Some(node) = agentdb_meta::nodes::get(meta.pool(), &leader_replica.node_id).await?
+        else {
+            continue;
+        };
+        if node.state != "alive" {
+            continue;
+        }
+        let Some(tablet) = agentdb_meta::tablets::get(meta.pool(), tablet_id).await? else {
+            continue;
+        };
+        if tablet.state != "serving"
+            || tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str())
+        {
+            continue;
+        }
+        match agentdb_meta::tablets::assume_ownership(
+            meta.pool(),
+            tablet_id,
+            tablet.epoch,
+            &leader_replica.node_id,
+            now_ms + lease_ms,
+        )
+        .await
+        {
+            Ok(_) => aligned += 1,
+            Err(agentdb_meta::MetaError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(aligned)
 }
 
 async fn apply_scheduler_rebalance_raft_membership_changes(
@@ -5574,6 +5651,87 @@ region = "us-west-2"
             .await
             .unwrap();
         assert!(!replicas.iter().any(|replica| replica.node_id == "node-b"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_aligns_tablet_owner_to_raft_leader() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:30100",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 2);
     }
 
     #[tokio::test]
