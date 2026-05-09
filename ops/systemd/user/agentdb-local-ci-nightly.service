@@ -1,0 +1,10 @@
+[Unit]
+Description=AgentDB nightly local CI with cluster chaos
+Wants=agentdb-local-ci-dashboard.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/work/agentdb
+Environment=LOCAL_CI_RUN_ROOT=%h/agentdb-ci-runs
+Environment=LOCAL_CI_NIGHTLY_CHAOS_ITERATIONS=48
+ExecStart=%h/work/agentdb/scripts/local-ci-nightly.sh

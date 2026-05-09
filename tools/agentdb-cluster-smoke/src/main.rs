@@ -81,6 +81,22 @@ struct Args {
     /// Also kill the initial owner and verify the surviving nodes stay observable.
     #[arg(long)]
     failover: bool,
+
+    /// Run bounded random node kill/restart iterations while verifying writes.
+    #[arg(long)]
+    chaos: bool,
+
+    /// Number of chaos kill/restart iterations.
+    #[arg(long, default_value_t = 12)]
+    chaos_iterations: usize,
+
+    /// Seed for deterministic chaos victim selection. Defaults to current time.
+    #[arg(long)]
+    chaos_seed: Option<u64>,
+
+    /// Maximum delay inserted between chaos actions.
+    #[arg(long, default_value_t = 1500)]
+    chaos_max_sleep_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +118,11 @@ async fn main() -> Result<()> {
     }
     if args.internal_auth_token.len() < 16 {
         bail!("internal auth token must be at least 16 characters");
+    }
+    if args.failover && args.chaos {
+        bail!(
+            "--failover and --chaos are separate scenarios; run them as separate smoke invocations"
+        );
     }
     if !args.server_bin.exists() {
         bail!(
@@ -130,7 +151,7 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(75))
         .build()
         .context("build HTTP client")?;
-    let result = run_smoke(&client, &nodes, args.failover, &mut children).await;
+    let result = run_smoke(&args, &client, &nodes, &mut children).await;
 
     if !args.keep_running {
         stop_children(&mut children);
@@ -331,36 +352,42 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
 fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
     let mut children = Vec::new();
     for node in nodes {
-        let log = fs::File::create(&node.log_path)?;
-        let err = log.try_clone()?;
-        let child = Command::new(&args.server_bin)
-            .arg("serve")
-            .arg("--config")
-            .arg(&node.config_path)
-            .env("AGENTDB_META_BACKEND", "postgres")
-            .env("AGENTDB_META_URL", &args.meta_url)
-            .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
-            .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
-            .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "10000")
-            .env("AGENTDB_REAPER_TICK_MS", "500")
-            .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
-            .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
-            .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
-            .env("AWS_EC2_METADATA_DISABLED", "true")
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .with_context(|| format!("spawn {}", node.id))?;
-        children.push(child);
+        children.push(spawn_node(args, node)?);
     }
     Ok(children)
 }
 
+fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&node.log_path)?;
+    let err = log.try_clone()?;
+    Command::new(&args.server_bin)
+        .arg("serve")
+        .arg("--config")
+        .arg(&node.config_path)
+        .env("AGENTDB_META_BACKEND", "postgres")
+        .env("AGENTDB_META_URL", &args.meta_url)
+        .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
+        .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
+        .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
+        .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "10000")
+        .env("AGENTDB_REAPER_TICK_MS", "500")
+        .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
+        .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
+        .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .with_context(|| format!("spawn {}", node.id))
+}
+
 async fn run_smoke(
+    args: &Args,
     client: &Client,
     nodes: &[NodeSpec],
-    failover: bool,
     children: &mut [Child],
 ) -> Result<()> {
     eprintln!("smoke: waiting for node health");
@@ -385,10 +412,11 @@ async fn run_smoke(
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
     eprintln!("smoke: appending event 1");
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
+    let mut next_seq = 2;
 
     print_diagnostics(client, nodes).await?;
 
-    if failover {
+    if args.failover {
         eprintln!("smoke: killing initial writer {}", owner.id);
         let owner_index = nodes
             .iter()
@@ -409,8 +437,9 @@ async fn run_smoke(
         wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
         eprintln!("smoke: waiting for new tablet writer");
         wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(90)).await?;
-        eprintln!("smoke: appending event 2 after failover");
-        append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 2).await?;
+        eprintln!("smoke: appending event {next_seq} after failover");
+        append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, next_seq).await?;
+        next_seq += 1;
         let survivors: Vec<_> = nodes
             .iter()
             .filter(|node| node.id != owner.id)
@@ -419,7 +448,135 @@ async fn run_smoke(
         print_diagnostics(client, &survivors).await?;
     }
 
+    if args.chaos {
+        run_chaos(
+            args,
+            client,
+            nodes,
+            children,
+            &tenant_id,
+            &agent_id,
+            &session_id,
+            next_seq,
+        )
+        .await?;
+    }
+
     Ok(())
+}
+
+async fn run_chaos(
+    args: &Args,
+    client: &Client,
+    nodes: &[NodeSpec],
+    children: &mut [Child],
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    mut next_seq: u64,
+) -> Result<()> {
+    let seed = args.chaos_seed.unwrap_or_else(|| now_ms() as u64);
+    let mut rng = SimpleRng::new(seed);
+    eprintln!(
+        "chaos: starting {} iterations with seed {seed}",
+        args.chaos_iterations
+    );
+    for iteration in 0..args.chaos_iterations {
+        let victim_index = rng.next_usize(nodes.len());
+        let victim = &nodes[victim_index];
+        let owner_before = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "chaos: iteration {} killing {} (owner_before={})",
+            iteration + 1,
+            victim.id,
+            owner_before.id
+        );
+        children[victim_index].kill().ok();
+        children[victim_index].wait().ok();
+
+        let survivors: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| (index != victim_index).then_some(node.clone()))
+            .collect();
+        if owner_before.id == victim.id {
+            let survivor = survivors
+                .first()
+                .ok_or_else(|| anyhow!("chaos requires at least one surviving node"))?;
+            wait_node_marked_dead(client, &survivor.url, &victim.id, Duration::from_secs(20))
+                .await?;
+            wait_tablet_owner_changed(client, &survivor.url, &victim.id, Duration::from_secs(90))
+                .await?;
+        } else {
+            sleep_random(&mut rng, args.chaos_max_sleep_ms).await;
+        }
+
+        eprintln!(
+            "chaos: appending event {next_seq} while {} is down",
+            victim.id
+        );
+        append_and_verify(
+            client, &survivors, tenant_id, agent_id, session_id, next_seq,
+        )
+        .await?;
+        next_seq += 1;
+
+        eprintln!("chaos: restarting {}", victim.id);
+        children[victim_index] = spawn_node(args, victim)?;
+        wait_json(
+            client,
+            &victim.url,
+            "/api/admin/cluster/health",
+            Duration::from_secs(90),
+        )
+        .await?;
+        sleep_random(&mut rng, args.chaos_max_sleep_ms).await;
+
+        eprintln!(
+            "chaos: appending event {next_seq} after {} restart",
+            victim.id
+        );
+        append_and_verify(client, nodes, tenant_id, agent_id, session_id, next_seq).await?;
+        next_seq += 1;
+    }
+
+    eprintln!("chaos: waiting for all nodes to converge");
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
+    let len = event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10).await?;
+    if len < usize::try_from(next_seq).unwrap() {
+        bail!("chaos expected at least {next_seq} events, got {len}");
+    }
+    print_diagnostics(client, nodes).await?;
+    Ok(())
+}
+
+async fn sleep_random(rng: &mut SimpleRng, max_ms: u64) {
+    if max_ms == 0 {
+        return;
+    }
+    let delay_ms = 100 + (rng.next_u64() % max_ms);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+struct SimpleRng(u64);
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        (self.next_u64() as usize) % upper
+    }
 }
 
 async fn create_session_smoke(

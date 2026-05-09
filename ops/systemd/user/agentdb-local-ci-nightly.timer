@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AgentDB nightly local CI
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=agentdb-local-ci-nightly.service
+
+[Install]
+WantedBy=timers.target
