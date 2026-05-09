@@ -1705,6 +1705,13 @@ impl Runtime {
         Ok(())
     }
 
+    async fn refresh_replicated_state(&self) -> Result<()> {
+        if self.tablet_router.is_some() {
+            self.rehydrate_from_persist().await?;
+        }
+        Ok(())
+    }
+
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {
         self.kms
             .resolve_tenant_key(tenant_id.as_str(), operation)
@@ -1714,6 +1721,7 @@ impl Runtime {
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
     /// match a live (non-soft-deleted) tenant.
     pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
+        self.refresh_replicated_state().await?;
         let s = self.state.lock().await;
         s.tenants
             .get(tenant_id.as_str())
@@ -2334,6 +2342,7 @@ impl Runtime {
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
+        self.refresh_replicated_state().await?;
         let t = {
             let mut s = self.state.lock().await;
             // External keys are tenant-name slots; a duplicate is an
@@ -2361,6 +2370,7 @@ impl Runtime {
     }
 
     pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
+        self.refresh_replicated_state().await?;
         let a = {
             let mut s = self.state.lock().await;
             let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
@@ -2438,6 +2448,7 @@ impl Runtime {
         req: NewSession,
         session_id: Option<Id>,
     ) -> Result<Session> {
+        self.refresh_replicated_state().await?;
         let sess = {
             let mut s = self.state.lock().await;
             let policy = active_tenant_policy_for_id(&s, &req.tenant_id).ok_or_else(|| {
@@ -4135,6 +4146,8 @@ impl Runtime {
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
+        self.refresh_replicated_state().await?;
+
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
         let idem_full_key = req
@@ -4729,6 +4742,7 @@ impl Runtime {
     /// exist. Returns an empty vec if `from_seq` is past the session's last
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
+        self.refresh_replicated_state().await?;
         let (session, hot_in_memory) = {
             let s = self.state.lock().await;
             let tenant_live = s
