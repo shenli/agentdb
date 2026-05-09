@@ -999,7 +999,7 @@ impl RaftRsNode {
             max_size_per_msg: u64::MAX,
             max_inflight_msgs: 256,
             check_quorum: true,
-            pre_vote: true,
+            pre_vote: false,
             ..Default::default()
         };
         raft_config.validate().map_err(map_raft_error)?;
