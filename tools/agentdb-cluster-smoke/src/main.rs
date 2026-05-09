@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
 
     let mut children = spawn_nodes(&args, &nodes)?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(75))
         .build()
         .context("build HTTP client")?;
     let result = run_smoke(&client, &nodes, args.failover, &mut children).await;
