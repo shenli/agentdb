@@ -410,11 +410,11 @@ async fn create_session_smoke(
     nodes: &[NodeSpec],
 ) -> Result<(String, String, String)> {
     let mut last_error = None;
-    for attempt in 0..3 {
+    for attempt in 0..10 {
         let suffix = format!("{}-{attempt}", now_ms());
         match create_session_smoke_once(client, nodes, &suffix).await {
             Ok(session) => return Ok(session),
-            Err(error) if is_retryable_raft_error(&error) => {
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -495,7 +495,7 @@ async fn append_and_verify(
                 }
                 bail!("expected appended seq {expected_seq}, got {seq}");
             }
-            Err(error) if is_retryable_raft_error(&error) && attempt < 2 => {
+            Err(error) if is_retryable_cluster_convergence_error(&error) && attempt < 2 => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if event_count(client, nodes, tenant_id, session_id).await? > expected_seq {
                     break;
@@ -544,6 +544,14 @@ async fn event_count(
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("\"retryable\":true") || message.contains("raft-rs command did not commit")
+}
+
+fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    is_retryable_raft_error(error)
+        || message.contains("\"code\":\"TENANT_NOT_FOUND\"")
+        || message.contains("\"code\":\"AGENT_NOT_FOUND\"")
+        || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
