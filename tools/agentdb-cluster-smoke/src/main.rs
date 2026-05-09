@@ -550,7 +550,7 @@ fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
 }
 
 fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
+    let message = format!("{error:?}");
     is_retryable_raft_error(error)
         || message.contains("\"code\":\"TENANT_NOT_FOUND\"")
         || message.contains("\"code\":\"AGENT_NOT_FOUND\"")
