@@ -36,6 +36,7 @@ const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_TABLET_LIFECYCLE_MAX_ACTIONS: usize = 4;
 const DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS: i64 = 10 * 60 * 1_000;
 const DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RAFT_TICK_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_INTERVAL_MS: u64 = 100;
 const DEFAULT_RAFT_OUTBOX_MAX_MESSAGES_PER_TICK: usize = 1_024;
 const DEFAULT_RAFT_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
@@ -384,6 +385,13 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .max(1);
                 if let Some(registry) = raft_registry.clone() {
                     refresh_raft_rs_peer_urls(&startup.meta, &registry, &outbox).await?;
+                    let local_raft_node_id =
+                        agentdb_storage::stable_raft_node_id(&startup.node_id)?;
+                    let raft_tick_interval_ms = env_u64(
+                        "AGENTDB_RAFT_TICK_INTERVAL_MS",
+                        DEFAULT_RAFT_TICK_INTERVAL_MS,
+                    )
+                    .max(50);
                     let raft_snapshot_store = match config.object_store.as_ref() {
                         Some(object_store_config) => Some(Arc::new(RaftSnapshotObjectStore::new(
                             build_object_store(object_store_config)?,
@@ -404,6 +412,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         registry.clone(),
                         outbox.clone(),
                         config.route_refresh_interval_ms,
+                    );
+                    spawn_raft_rs_tick_worker(
+                        registry.clone(),
+                        local_raft_node_id,
+                        Duration::from_millis(raft_tick_interval_ms),
                     );
                     spawn_raft_rs_message_outbox_worker(
                         startup.meta.clone(),
@@ -1824,6 +1837,30 @@ fn spawn_raft_rs_peer_url_refresher(
                             );
                         }
                     }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_raft_rs_tick_worker(
+    registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
+    local_raft_node_id: u64,
+    interval: Duration,
+) {
+    let interval = interval.max(Duration::from_millis(50));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            for (tablet_id, group) in registry.groups_snapshot() {
+                if let Err(error) = group.tick(local_raft_node_id) {
+                    tracing::warn!(
+                        tablet_id,
+                        local_raft_node_id,
+                        ?error,
+                        "failed to tick local raft-rs group"
+                    );
                 }
             }
         }
