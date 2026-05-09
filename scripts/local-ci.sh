@@ -7,6 +7,7 @@ RUN_CARGO=1
 RUN_SDK=1
 RUN_CLUSTER=1
 RUN_CLIPPY=1
+RUN_FMT=1
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,7 @@ Runs the local CI pipeline:
 
 Options:
   --cargo-only       Run only fmt/clippy/cargo tests.
+  --no-fmt           Skip cargo fmt --check.
   --no-clippy        Skip clippy.
   --no-sdk           Skip Python/TypeScript SDK tests.
   --no-cluster       Skip the real cluster failover smoke.
@@ -40,6 +42,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-clippy)
       RUN_CLIPPY=0
+      ;;
+    --no-fmt)
+      RUN_FMT=0
       ;;
     --no-sdk)
       RUN_SDK=0
@@ -107,7 +112,9 @@ run_shell_stage() {
 }
 
 if [[ "$RUN_CARGO" == "1" ]]; then
-  run_stage cargo-fmt cargo fmt --check
+  if [[ "$RUN_FMT" == "1" ]]; then
+    run_stage cargo-fmt cargo fmt --check
+  fi
   if [[ "$RUN_CLIPPY" == "1" ]]; then
     run_stage cargo-clippy cargo clippy --workspace --tests -- -D warnings
   fi
