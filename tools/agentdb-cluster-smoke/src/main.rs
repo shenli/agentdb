@@ -366,21 +366,45 @@ async fn run_smoke(
     }
     wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
 
-    let (tenant_id, agent_id, session_id) = create_session_smoke(client, &nodes[0].url).await?;
-    append_and_verify(client, &nodes[0].url, &tenant_id, &agent_id, &session_id, 0).await?;
-    append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 1).await?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
+    let (tenant_id, agent_id, session_id) = create_session_smoke(client, &owner.url).await?;
+    append_and_verify(client, &owner.url, &tenant_id, &agent_id, &session_id, 0).await?;
+    append_and_verify(client, &owner.url, &tenant_id, &agent_id, &session_id, 1).await?;
 
     print_diagnostics(client, nodes).await?;
 
     if failover {
-        children[0].kill().ok();
-        children[0].wait().ok();
-        wait_node_marked_dead(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(20)).await?;
-        wait_tablet_owner_changed(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(30))
+        let owner_index = nodes
+            .iter()
+            .position(|node| node.id == owner.id)
+            .ok_or_else(|| anyhow!("owner {} is not in smoke node list", owner.id))?;
+        children[owner_index].kill().ok();
+        children[owner_index].wait().ok();
+        let survivor = nodes
+            .iter()
+            .find(|node| node.id != owner.id)
+            .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
+        wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(20)).await?;
+        wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(30))
             .await?;
-        wait_raft_observable(client, &nodes[1].url, Duration::from_secs(20)).await?;
-        append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 2).await?;
-        print_diagnostics(client, &nodes[1..]).await?;
+        wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
+        let new_owner =
+            wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(30)).await?;
+        append_and_verify(
+            client,
+            &new_owner.url,
+            &tenant_id,
+            &agent_id,
+            &session_id,
+            2,
+        )
+        .await?;
+        let survivors: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.id != owner.id)
+            .cloned()
+            .collect();
+        print_diagnostics(client, &survivors).await?;
     }
 
     Ok(())
@@ -569,6 +593,44 @@ async fn wait_tablet_owner_changed(
             bail!(
                 "tablet {PRIMARY_TABLET_ID} did not move away from {old_owner} within {timeout:?}"
             );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_tablet_owner(
+    client: &Client,
+    nodes: &[NodeSpec],
+    previous_owner: Option<&str>,
+    timeout: Duration,
+) -> Result<NodeSpec> {
+    let start = tokio::time::Instant::now();
+    loop {
+        for node in nodes {
+            let Ok(tablets) = get_json(client, &node.url, "/api/admin/tablets").await else {
+                continue;
+            };
+            let Some(owner_id) = tablets.as_array().and_then(|tablets| {
+                tablets.iter().find_map(|tablet| {
+                    if tablet["tablet_id"] == PRIMARY_TABLET_ID {
+                        tablet["owner_node_id"].as_str()
+                    } else {
+                        None
+                    }
+                })
+            }) else {
+                continue;
+            };
+            if previous_owner.is_some_and(|previous| previous == owner_id) {
+                continue;
+            }
+            if let Some(owner) = nodes.iter().find(|candidate| candidate.id == owner_id) {
+                return Ok(owner.clone());
+            }
+            bail!("tablet {PRIMARY_TABLET_ID} owner {owner_id} is not in smoke node list");
+        }
+        if start.elapsed() > timeout {
+            bail!("tablet {PRIMARY_TABLET_ID} owner was not observable within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
