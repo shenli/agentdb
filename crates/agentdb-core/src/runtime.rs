@@ -565,6 +565,7 @@ impl RuntimeTabletKvStore {
 
 impl KvStore for RuntimeTabletKvStore {
     fn get(&self, key: &[u8]) -> agentdb_storage::Result<Option<Vec<u8>>> {
+        self.state_machine.apply_committed()?;
         self.store.get(key)
     }
 
@@ -580,6 +581,7 @@ impl KvStore for RuntimeTabletKvStore {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
+        self.state_machine.apply_committed()?;
         self.store.scan_prefix(prefix)
     }
 
@@ -594,10 +596,12 @@ impl KvStore for RuntimeTabletKvStore {
     }
 
     fn snapshot<'a>(&'a self) -> agentdb_storage::Result<Box<dyn KvSnapshot + 'a>> {
+        self.state_machine.apply_committed()?;
         self.store.snapshot()
     }
 
     fn snapshot_owned(self: Arc<Self>) -> agentdb_storage::Result<Arc<dyn KvSnapshot>> {
+        self.state_machine.apply_committed()?;
         self.store.clone().snapshot_owned()
     }
 }
