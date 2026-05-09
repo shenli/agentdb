@@ -669,37 +669,32 @@ async fn wait_tablet_owner(
 ) -> Result<NodeSpec> {
     let start = tokio::time::Instant::now();
     loop {
+        let leader_id = current_raft_leader_node_id(client, nodes).await?;
         for node in nodes {
             let Ok(tablets) = get_json(client, &node.url, "/api/admin/tablets").await else {
                 continue;
             };
-            let Some(owner_id) = tablets.as_array().and_then(|tablets| {
-                tablets.iter().find_map(|tablet| {
-                    if tablet["tablet_id"] == PRIMARY_TABLET_ID {
-                        tablet["owner_node_id"].as_str()
-                    } else {
-                        None
-                    }
-                })
-            }) else {
+            let tablet_exists = tablets.as_array().is_some_and(|tablets| {
+                tablets
+                    .iter()
+                    .any(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
+            });
+            if !tablet_exists {
+                continue;
+            }
+            let Some(leader_id) = leader_id.as_deref() else {
                 continue;
             };
-            if previous_owner.is_some_and(|previous| previous == owner_id) {
+            if previous_owner.is_some_and(|previous| previous == leader_id) {
                 continue;
             }
-            let Some(leader_id) = current_raft_leader_node_id(client, nodes).await? else {
-                continue;
-            };
-            if leader_id != owner_id {
-                continue;
+            if let Some(leader) = nodes.iter().find(|candidate| candidate.id == leader_id) {
+                return Ok(leader.clone());
             }
-            if let Some(owner) = nodes.iter().find(|candidate| candidate.id == owner_id) {
-                return Ok(owner.clone());
-            }
-            bail!("tablet {PRIMARY_TABLET_ID} owner {owner_id} is not in smoke node list");
+            bail!("tablet {PRIMARY_TABLET_ID} raft leader {leader_id} is not in smoke node list");
         }
         if start.elapsed() > timeout {
-            bail!("tablet {PRIMARY_TABLET_ID} owner was not observable within {timeout:?}");
+            bail!("tablet {PRIMARY_TABLET_ID} raft leader was not observable within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
