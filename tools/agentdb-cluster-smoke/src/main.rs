@@ -203,7 +203,7 @@ node_id = "{node_id}"
 shard_count = {shard_count}
 region = "local"
 refresh_interval_ms = 500
-proxy_timeout_ms = 5000
+proxy_timeout_ms = 70000
 "#,
         port = node.port,
         internal_auth_token = args.internal_auth_token,
