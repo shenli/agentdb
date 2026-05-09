@@ -126,7 +126,10 @@ async fn main() -> Result<()> {
     seed_cluster_meta(&meta, &nodes).await?;
 
     let mut children = spawn_nodes(&args, &nodes)?;
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build HTTP client")?;
     let result = run_smoke(&client, &nodes, args.failover, &mut children).await;
 
     if !args.keep_running {
