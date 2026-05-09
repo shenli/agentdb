@@ -1905,24 +1905,27 @@ fn spawn_raft_rs_tick_worker(
                     BTreeMap::new()
                 }
             };
-            let raft_node_to_node_id = match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
-                Ok(replicas) => replicas
-                    .into_iter()
-                    .filter_map(|replica| {
-                        agentdb_storage::stable_raft_node_id(&replica.node_id)
-                            .ok()
-                            .map(|raft_node_id| ((replica.tablet_id, raft_node_id), replica.node_id))
-                    })
-                    .collect::<BTreeMap<_, _>>(),
-                Err(error) => {
-                    tracing::warn!(
-                        local_node_id,
-                        ?error,
-                        "failed to load tablet replicas for raft-rs tick"
-                    );
-                    BTreeMap::new()
-                }
-            };
+            let raft_node_to_node_id =
+                match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
+                    Ok(replicas) => replicas
+                        .into_iter()
+                        .filter_map(|replica| {
+                            agentdb_storage::stable_raft_node_id(&replica.node_id)
+                                .ok()
+                                .map(|raft_node_id| {
+                                    ((replica.tablet_id, raft_node_id), replica.node_id)
+                                })
+                        })
+                        .collect::<BTreeMap<_, _>>(),
+                    Err(error) => {
+                        tracing::warn!(
+                            local_node_id,
+                            ?error,
+                            "failed to load tablet replicas for raft-rs tick"
+                        );
+                        BTreeMap::new()
+                    }
+                };
             for (tablet_id, group) in registry.groups_snapshot() {
                 let statuses = group.status();
                 let local_status = statuses

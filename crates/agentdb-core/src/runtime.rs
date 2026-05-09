@@ -814,6 +814,18 @@ impl RuntimeTabletRouterKvStore {
         stats.sort_by_key(|stats| stats.tablet_id);
         Ok(stats)
     }
+
+    fn apply_committed(&self) -> agentdb_storage::Result<usize> {
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut applied = 0usize;
+        for handle in tablets.values() {
+            applied = applied.saturating_add(handle.state_machine.apply_committed()?);
+        }
+        Ok(applied)
+    }
 }
 
 impl KvStore for RuntimeTabletRouterKvStore {
@@ -1706,7 +1718,15 @@ impl Runtime {
     }
 
     async fn refresh_replicated_state(&self) -> Result<()> {
-        if self.tablet_router.is_some() {
+        if self
+            .tablet_router
+            .as_ref()
+            .map(|router| router.apply_committed())
+            .transpose()
+            .map_err(internal)?
+            .unwrap_or(0)
+            > 0
+        {
             self.rehydrate_from_persist().await?;
         }
         Ok(())
