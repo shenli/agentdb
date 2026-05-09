@@ -441,25 +441,47 @@ async fn create_session_smoke_once(
     )
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
-    let agent = post_json(
+    let agent = post_json_with_convergence_retry(
         client,
-        &owner.url,
+        nodes,
         &format!("/api/tenants/{tenant_id}/agents"),
         json!({"alias": "cluster-smoke-agent", "config": {}}),
+        10,
     )
     .await?;
     let agent_id = string_field(&agent, "agent_id")?;
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
-    let session = post_json(
+    let session = post_json_with_convergence_retry(
         client,
-        &owner.url,
+        nodes,
         &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
         json!({"alias": null}),
+        10,
     )
     .await?;
     let session_id = string_field(&session, "session_id")?;
     Ok((tenant_id, agent_id, session_id))
+}
+
+async fn post_json_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    path: &str,
+    body: Value,
+    attempts: usize,
+) -> Result<Value> {
+    let mut last_error = None;
+    for _ in 0..attempts.max(1) {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        match post_json(client, &owner.url, path, body.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("POST {path} failed without a captured error")))
 }
 
 async fn append_and_verify(
