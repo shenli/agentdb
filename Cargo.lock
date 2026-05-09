@@ -20,6 +20,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentdb-cluster-smoke"
+version = "0.1.0"
+dependencies = [
+ "agentdb-meta",
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "agentdb-core"
 version = "0.1.0"
 dependencies = [

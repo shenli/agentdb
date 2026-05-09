@@ -10,6 +10,7 @@ members = [
     "crates/agentdb-meta",
     "bin/agentdbctl",
     "bin/agentdb-server",
+    "tools/agentdb-cluster-smoke",
 ]
 
 [workspace.package]

@@ -901,6 +901,7 @@ async fn admin_raft_status_reports_disabled_mode() {
 #[tokio::test]
 async fn admin_raft_status_reports_registered_tablets() {
     let (_dir, group, _logs) = test_raft_group();
+    group.elect(1).unwrap();
     let registry = RaftRsGroupRegistry::shared();
     registry.register(7, group).unwrap();
     let state = AppState::new(Runtime::in_memory()).with_raft_registry(registry);
@@ -922,7 +923,7 @@ async fn admin_raft_status_reports_registered_tablets() {
     assert_eq!(body["tablet_count"], 1);
     assert_eq!(body["tablets"][0]["tablet_id"], 7);
     assert_eq!(body["tablets"][0]["replicas"].as_array().unwrap().len(), 3);
-    assert_eq!(body["summary"]["leaderless_tablet_count"], 1);
+    assert_eq!(body["summary"]["leaderless_tablet_count"], 0);
     assert_eq!(body["summary"]["commit_index_drift_tablet_count"], 0);
 }
 

@@ -70,6 +70,11 @@ agentdbctl tablets list
 agentdbctl drain status
 ```
 
+For local real-process validation of the current Raft path, use
+[REAL_CLUSTER_SMOKE.md](REAL_CLUSTER_SMOKE.md). That smoke harness is a
+development validation tool; it is not a supported production bootstrap
+procedure.
+
 The repository now has cluster-facing visibility endpoints:
 
 - `GET /api/admin/scheduler`

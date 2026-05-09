@@ -3506,14 +3506,20 @@ fn raft_ops_summary(tablets: &[RaftTabletStatus], now_ms: i64) -> RaftOpsSummary
 
     for tablet in tablets {
         if tablet.local_group_open {
-            let leader_count = tablet
+            let local_leader_count = tablet
                 .replicas
                 .iter()
                 .filter(|replica| replica.role == "Leader")
                 .count();
-            if leader_count == 0 {
+            let known_leader_count = tablet
+                .replicas
+                .iter()
+                .filter_map(|replica| (replica.leader_id != 0).then_some(replica.leader_id))
+                .collect::<BTreeSet<_>>()
+                .len();
+            if local_leader_count == 0 && known_leader_count == 0 {
                 summary.leaderless_tablet_count += 1;
-            } else if leader_count > 1 {
+            } else if local_leader_count > 1 || known_leader_count > 1 {
                 summary.multi_leader_tablet_count += 1;
             }
 
