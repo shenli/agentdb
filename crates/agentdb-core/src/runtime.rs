@@ -4440,6 +4440,12 @@ impl Runtime {
                 drop(s);
                 return Err(internal(e));
             }
+            let key = (req.session_id.as_str().to_string(), seq);
+            s.event_by_id.insert(
+                envelope.event_id.as_str().to_string(),
+                (envelope.session_id.as_str().to_string(), envelope.seq),
+            );
+            s.events.insert(key, envelope);
         } else {
             // In-memory backend: keep the events map populated, and
             // mirror the `event_by_id` secondary-index entry that the
@@ -4785,20 +4791,17 @@ impl Runtime {
                     format!("{}", req.session_id),
                 ));
             }
-            let hot = if self.persist.is_none() {
-                let lo = (
-                    req.session_id.as_str().to_string(),
-                    req.from_seq.max(session.warm_head_from_seq),
-                );
-                let hi = (req.session_id.as_str().to_string(), u64::MAX);
-                s.events
-                    .range(lo..=hi)
-                    .take(req.limit)
-                    .map(|(_, v)| v.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let lo = (
+                req.session_id.as_str().to_string(),
+                req.from_seq.max(session.warm_head_from_seq),
+            );
+            let hi = (req.session_id.as_str().to_string(), u64::MAX);
+            let hot = s
+                .events
+                .range(lo..=hi)
+                .take(req.limit)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>();
             (session.clone(), hot)
         };
 
@@ -4836,13 +4839,22 @@ impl Runtime {
         }
         let hot_from_seq = req.from_seq.max(session.warm_head_from_seq);
         let hot = if self.persist.is_some() {
-            self.read_hot_events_from_persist(
-                &req.tenant_id,
-                &req.session_id,
-                hot_from_seq,
-                remaining,
-            )
-            .await?
+            let mut hot = self
+                .read_hot_events_from_persist(
+                    &req.tenant_id,
+                    &req.session_id,
+                    hot_from_seq,
+                    remaining,
+                )
+                .await?;
+            for event in hot_in_memory {
+                if !hot.iter().any(|existing| existing.seq == event.seq) {
+                    hot.push(event);
+                }
+            }
+            hot.sort_by_key(|event| event.seq);
+            hot.truncate(remaining);
+            hot
         } else {
             hot_in_memory
         };
