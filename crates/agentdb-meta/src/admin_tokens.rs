@@ -116,7 +116,7 @@ pub async fn mint(
 
     sqlx::query(
         "INSERT INTO admin_tokens (token_id, token_hash_b64, description, created_at_ms, revoked_at_ms, scope)
-             VALUES (?, ?, ?, ?, NULL, ?)",
+             VALUES ($1, $2, $3, $4, NULL, $5)",
     )
     .bind(&token_id)
     .bind(&hash_b64)
@@ -197,8 +197,8 @@ pub async fn list_active(pool: &AnyPool) -> MetaResult<Vec<TokenSummary>> {
 /// revoked or nonexistent token returns `false`.
 pub async fn revoke(pool: &AnyPool, token_id: &str, now_ms: i64) -> MetaResult<bool> {
     let n = sqlx::query(
-        "UPDATE admin_tokens SET revoked_at_ms = ?
-           WHERE token_id = ? AND revoked_at_ms IS NULL",
+        "UPDATE admin_tokens SET revoked_at_ms = $1
+           WHERE token_id = $2 AND revoked_at_ms IS NULL",
     )
     .bind(now_ms)
     .bind(token_id)
@@ -257,7 +257,7 @@ mod tests {
         assert!(minted.plaintext.starts_with(TOKEN_PREFIX));
         // Plaintext never hits the DB.
         let (rows,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM admin_tokens WHERE token_hash_b64 = ?")
+            sqlx::query_as("SELECT COUNT(*) FROM admin_tokens WHERE token_hash_b64 = $1")
                 .bind(B64.encode(sha256(minted.plaintext.as_bytes())))
                 .fetch_one(&p)
                 .await

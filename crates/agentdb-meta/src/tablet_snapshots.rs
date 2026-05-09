@@ -79,7 +79,7 @@ pub async fn record(
              target_node_id, target_raft_node_id, snapshot_index, snapshot_term,
              size_bytes, sha256_hex, storage_uri, status, created_at_ms,
              updated_at_ms, expires_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          ON CONFLICT (snapshot_id) DO UPDATE SET
             tablet_id = excluded.tablet_id,
             source_node_id = excluded.source_node_id,
@@ -130,9 +130,9 @@ pub async fn list_recent(
                     size_bytes, sha256_hex, storage_uri, status, created_at_ms,
                     updated_at_ms, expires_at_ms
                FROM tablet_snapshots
-              WHERE tablet_id = ?
+              WHERE tablet_id = $1
               ORDER BY created_at_ms DESC, snapshot_index DESC
-              LIMIT ?",
+              LIMIT $2",
             )
             .bind(tablet_id)
             .bind(limit)
@@ -146,9 +146,9 @@ pub async fn list_recent(
                     size_bytes, sha256_hex, storage_uri, status, created_at_ms,
                     updated_at_ms, expires_at_ms
                FROM tablet_snapshots
-              WHERE tablet_id = ? AND status != 'deleted'
+              WHERE tablet_id = $1 AND status != 'deleted'
               ORDER BY created_at_ms DESC, snapshot_index DESC
-              LIMIT ?",
+              LIMIT $2",
             )
             .bind(tablet_id)
             .bind(limit)
@@ -163,7 +163,7 @@ pub async fn list_recent(
                     updated_at_ms, expires_at_ms
                FROM tablet_snapshots
               ORDER BY created_at_ms DESC, snapshot_index DESC
-              LIMIT ?",
+              LIMIT $1",
             )
             .bind(limit)
             .fetch_all(pool)
@@ -178,7 +178,7 @@ pub async fn list_recent(
                FROM tablet_snapshots
               WHERE status != 'deleted'
               ORDER BY created_at_ms DESC, snapshot_index DESC
-              LIMIT ?",
+              LIMIT $1",
             )
             .bind(limit)
             .fetch_all(pool)
@@ -213,7 +213,7 @@ pub async fn latest_available_for_target(
                 size_bytes, sha256_hex, storage_uri, status, created_at_ms,
                 updated_at_ms, expires_at_ms
            FROM tablet_snapshots
-          WHERE status = 'available' AND target_node_id = ?
+          WHERE status = 'available' AND target_node_id = $1
           ORDER BY tablet_id, snapshot_index DESC",
     )
     .bind(target_node_id)
@@ -243,9 +243,9 @@ pub async fn list_expired(
            FROM tablet_snapshots
           WHERE status != 'deleted'
             AND expires_at_ms IS NOT NULL
-            AND expires_at_ms <= ?
+            AND expires_at_ms <= $1
           ORDER BY expires_at_ms ASC, created_at_ms ASC
-          LIMIT ?",
+          LIMIT $2",
     )
     .bind(now_ms)
     .bind(limit)
@@ -260,7 +260,7 @@ pub async fn count_expired(pool: &AnyPool, now_ms: i64) -> MetaResult<i64> {
            FROM tablet_snapshots
           WHERE status != 'deleted'
             AND expires_at_ms IS NOT NULL
-            AND expires_at_ms <= ?",
+            AND expires_at_ms <= $1",
     )
     .bind(now_ms)
     .fetch_one(pool)
@@ -275,7 +275,7 @@ pub async fn mark_expired_deleted(pool: &AnyPool, now_ms: i64, dry_run: bool) ->
           WHERE status != 'deleted'
             AND storage_uri IS NULL
             AND expires_at_ms IS NOT NULL
-            AND expires_at_ms <= ?",
+            AND expires_at_ms <= $1",
     )
     .bind(now_ms)
     .fetch_one(pool)
@@ -285,11 +285,11 @@ pub async fn mark_expired_deleted(pool: &AnyPool, now_ms: i64, dry_run: bool) ->
     }
     sqlx::query(
         "UPDATE tablet_snapshots
-            SET status = 'deleted', updated_at_ms = ?
+            SET status = 'deleted', updated_at_ms = $1
           WHERE status != 'deleted'
             AND storage_uri IS NULL
             AND expires_at_ms IS NOT NULL
-            AND expires_at_ms <= ?",
+            AND expires_at_ms <= $2",
     )
     .bind(now_ms)
     .bind(now_ms)
@@ -306,8 +306,8 @@ pub async fn mark_deleted(pool: &AnyPool, snapshot_id: &str, now_ms: i64) -> Met
     }
     let rows = sqlx::query(
         "UPDATE tablet_snapshots
-            SET status = 'deleted', updated_at_ms = ?
-          WHERE snapshot_id = ?",
+            SET status = 'deleted', updated_at_ms = $1
+          WHERE snapshot_id = $2",
     )
     .bind(now_ms)
     .bind(snapshot_id)

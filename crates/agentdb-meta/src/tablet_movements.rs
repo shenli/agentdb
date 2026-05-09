@@ -66,7 +66,7 @@ pub async fn upsert_pending(
             (movement_id, movement_type, source_tablet_id, destination_tablet_id,
              placement_scope_id, start_shard, end_shard, required_applied_index,
              status, created_at_ms, updated_at_ms, completed_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, NULL)
          ON CONFLICT (movement_id) DO UPDATE SET
              movement_type = excluded.movement_type,
              source_tablet_id = excluded.source_tablet_id,
@@ -97,8 +97,8 @@ pub async fn upsert_pending(
 pub async fn mark_completed(pool: &AnyPool, movement_id: &str, now_ms: i64) -> MetaResult<bool> {
     let rows = sqlx::query(
         "UPDATE tablet_movements
-            SET status = 'completed', updated_at_ms = ?, completed_at_ms = ?
-          WHERE movement_id = ? AND status = 'pending'",
+            SET status = 'completed', updated_at_ms = $1, completed_at_ms = $2
+          WHERE movement_id = $3 AND status = 'pending'",
     )
     .bind(now_ms)
     .bind(now_ms)
@@ -121,7 +121,7 @@ pub async fn list_open(pool: &AnyPool, limit: i64) -> MetaResult<Vec<TabletMovem
            FROM tablet_movements
           WHERE status IN ('pending', 'completed')
           ORDER BY updated_at_ms DESC, movement_id
-          LIMIT ?",
+          LIMIT $1",
     )
     .bind(limit.clamp(1, 1_000))
     .fetch_all(pool)
@@ -141,8 +141,8 @@ pub async fn list_open_split_group(
            FROM tablet_movements
           WHERE status IN ('pending', 'completed')
             AND movement_type = 'split'
-            AND placement_scope_id = ?
-            AND source_tablet_id = ?
+            AND placement_scope_id = $1
+            AND source_tablet_id = $2
           ORDER BY start_shard, end_shard, destination_tablet_id, movement_id",
     )
     .bind(placement_scope_id)
@@ -164,8 +164,8 @@ pub async fn list_open_merge_group(
            FROM tablet_movements
           WHERE status IN ('pending', 'completed')
             AND movement_type = 'merge'
-            AND placement_scope_id = ?
-            AND destination_tablet_id = ?
+            AND placement_scope_id = $1
+            AND destination_tablet_id = $2
           ORDER BY start_shard, end_shard, source_tablet_id, movement_id",
     )
     .bind(placement_scope_id)
@@ -181,7 +181,7 @@ pub async fn get(pool: &AnyPool, movement_id: &str) -> MetaResult<Option<TabletM
                 placement_scope_id, start_shard, end_shard, required_applied_index,
                 status, created_at_ms, updated_at_ms, completed_at_ms
            FROM tablet_movements
-          WHERE movement_id = ?",
+          WHERE movement_id = $1",
     )
     .bind(movement_id)
     .fetch_optional(pool)
@@ -204,9 +204,9 @@ pub async fn list_recent(
                     placement_scope_id, start_shard, end_shard, required_applied_index,
                     status, created_at_ms, updated_at_ms, completed_at_ms
                FROM tablet_movements
-              WHERE status = ?
+              WHERE status = $1
               ORDER BY updated_at_ms DESC, movement_id
-              LIMIT ?",
+              LIMIT $2",
         )
         .bind(status)
         .bind(limit)
@@ -219,7 +219,7 @@ pub async fn list_recent(
                     status, created_at_ms, updated_at_ms, completed_at_ms
                FROM tablet_movements
               ORDER BY updated_at_ms DESC, movement_id
-              LIMIT ?",
+              LIMIT $1",
         )
         .bind(limit)
         .fetch_all(pool)

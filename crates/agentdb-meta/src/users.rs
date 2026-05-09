@@ -59,7 +59,7 @@ pub async fn create(
         "INSERT INTO users
              (user_id, tenant_external, iterations,
               salt_b64, stored_key_b64, server_key_b64, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(user_id)
     .bind(tenant_external)
@@ -101,7 +101,7 @@ pub async fn get(pool: &AnyPool, user_id: &str) -> MetaResult<Option<User>> {
     let row: Option<(String, String, i64, String, String, String, i64)> = sqlx::query_as(
         "SELECT user_id, tenant_external, iterations,
                 salt_b64, stored_key_b64, server_key_b64, created_at_ms
-         FROM users WHERE user_id = ?",
+         FROM users WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -144,7 +144,7 @@ pub async fn list(pool: &AnyPool) -> MetaResult<Vec<UserSummary>> {
 /// not an error — returns `false`. Returns `true` on actual
 /// deletion so admin endpoints can distinguish 204 vs. 404.
 pub async fn delete(pool: &AnyPool, user_id: &str) -> MetaResult<bool> {
-    let n = sqlx::query("DELETE FROM users WHERE user_id = ?")
+    let n = sqlx::query("DELETE FROM users WHERE user_id = $1")
         .bind(user_id)
         .execute(pool)
         .await?

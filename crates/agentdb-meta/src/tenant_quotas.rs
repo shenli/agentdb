@@ -30,7 +30,7 @@ pub async fn upsert(
 ) -> MetaResult<()> {
     sqlx::query(
         "INSERT INTO tenant_quotas (tenant_id, max_qps, burst, updated_at_ms)
-             VALUES (?, ?, ?, ?)
+             VALUES ($1, $2, $3, $4)
          ON CONFLICT(tenant_id) DO UPDATE SET
              max_qps = excluded.max_qps,
              burst = excluded.burst,
@@ -48,7 +48,7 @@ pub async fn upsert(
 /// Return the quota for `tenant_id`, or `None` if absent.
 pub async fn get(pool: &AnyPool, tenant_id: &str) -> MetaResult<Option<TenantQuota>> {
     let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT tenant_id, max_qps, burst, updated_at_ms FROM tenant_quotas WHERE tenant_id = ?",
+        "SELECT tenant_id, max_qps, burst, updated_at_ms FROM tenant_quotas WHERE tenant_id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(pool)
@@ -63,7 +63,7 @@ pub async fn get(pool: &AnyPool, tenant_id: &str) -> MetaResult<Option<TenantQuo
 
 /// Delete the quota. Returns `true` if a row existed.
 pub async fn delete(pool: &AnyPool, tenant_id: &str) -> MetaResult<bool> {
-    let n = sqlx::query("DELETE FROM tenant_quotas WHERE tenant_id = ?")
+    let n = sqlx::query("DELETE FROM tenant_quotas WHERE tenant_id = $1")
         .bind(tenant_id)
         .execute(pool)
         .await?

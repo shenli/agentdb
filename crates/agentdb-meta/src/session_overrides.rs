@@ -15,7 +15,7 @@ pub struct SessionOverride {
 
 pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionOverride>> {
     let row: Option<(String, i64, i64)> = sqlx::query_as(
-        "SELECT session_id, tablet_id, created_at_ms FROM session_overrides WHERE session_id = ?",
+        "SELECT session_id, tablet_id, created_at_ms FROM session_overrides WHERE session_id = $1",
     )
     .bind(session_id)
     .fetch_optional(pool)
@@ -29,7 +29,7 @@ pub async fn get(pool: &AnyPool, session_id: &str) -> MetaResult<Option<SessionO
 
 pub async fn set(pool: &AnyPool, session_id: &str, tablet_id: i64, now_ms: i64) -> MetaResult<()> {
     sqlx::query(
-        "INSERT INTO session_overrides (session_id, tablet_id, created_at_ms) VALUES (?, ?, ?)
+        "INSERT INTO session_overrides (session_id, tablet_id, created_at_ms) VALUES ($1, $2, $3)
          ON CONFLICT (session_id) DO UPDATE SET tablet_id = excluded.tablet_id",
     )
     .bind(session_id)
@@ -41,7 +41,7 @@ pub async fn set(pool: &AnyPool, session_id: &str, tablet_id: i64, now_ms: i64) 
 }
 
 pub async fn delete(pool: &AnyPool, session_id: &str) -> MetaResult<()> {
-    sqlx::query("DELETE FROM session_overrides WHERE session_id = ?")
+    sqlx::query("DELETE FROM session_overrides WHERE session_id = $1")
         .bind(session_id)
         .execute(pool)
         .await?;

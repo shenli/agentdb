@@ -121,7 +121,7 @@ pub async fn upsert_with_rate(
             (tablet_id, node_id, key_count, key_bytes, value_bytes,
              storage_bytes, applied_index, sample_interval_ms, write_ops_delta,
              write_ops_per_sec_milli, compaction_debt_ops, updated_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (tablet_id, node_id) DO UPDATE SET
             key_count = excluded.key_count,
             key_bytes = excluded.key_bytes,
@@ -172,7 +172,7 @@ pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<Ta
                 write_ops_delta, write_ops_per_sec_milli, compaction_debt_ops,
                 updated_at_ms
            FROM tablet_stats
-          WHERE tablet_id = ?
+          WHERE tablet_id = $1
           ORDER BY storage_bytes DESC, write_ops_per_sec_milli DESC, node_id",
     )
     .bind(tablet_id)
@@ -223,7 +223,7 @@ pub async fn list_aggregates(pool: &AnyPool) -> MetaResult<Vec<TabletStatsAggreg
 
 pub async fn delete_stale(pool: &AnyPool, older_than_ms: i64) -> MetaResult<u64> {
     validate_non_negative(older_than_ms, "older_than_ms")?;
-    let rows = sqlx::query("DELETE FROM tablet_stats WHERE updated_at_ms < ?")
+    let rows = sqlx::query("DELETE FROM tablet_stats WHERE updated_at_ms < $1")
         .bind(older_than_ms)
         .execute(pool)
         .await?

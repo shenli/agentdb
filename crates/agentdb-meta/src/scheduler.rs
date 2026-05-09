@@ -63,7 +63,7 @@ pub async fn try_acquire(
             sqlx::query(
                 "INSERT INTO scheduler_leader
                    (id, node_id, epoch, expires_at_ms, acquired_at_ms)
-                 VALUES (1, ?, 1, ?, ?)",
+                 VALUES (1, $1, 1, $2, $3)",
             )
             .bind(node_id)
             .bind(new_expiry)
@@ -94,8 +94,8 @@ pub async fn try_acquire(
             };
             let rows = sqlx::query(
                 "UPDATE scheduler_leader
-                   SET node_id = ?, epoch = ?, expires_at_ms = ?, acquired_at_ms = ?
-                 WHERE id = 1 AND epoch = ?",
+                   SET node_id = $1, epoch = $2, expires_at_ms = $3, acquired_at_ms = $4
+                 WHERE id = 1 AND epoch = $5",
             )
             .bind(node_id)
             .bind(new_epoch)
@@ -132,8 +132,8 @@ pub async fn renew(
 ) -> MetaResult<LeaderRow> {
     let rows = sqlx::query(
         "UPDATE scheduler_leader
-           SET expires_at_ms = ?
-         WHERE id = 1 AND node_id = ? AND epoch = ?",
+           SET expires_at_ms = $1
+         WHERE id = 1 AND node_id = $2 AND epoch = $3",
     )
     .bind(new_expires_at_ms)
     .bind(node_id)

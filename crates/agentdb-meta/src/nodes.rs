@@ -56,7 +56,7 @@ pub async fn upsert(
     // SQLite's ON CONFLICT upsert syntax.
     sqlx::query(
         "INSERT INTO nodes (node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (node_id) DO UPDATE SET
               address = excluded.address,
               mongo_address = excluded.mongo_address,
@@ -79,7 +79,7 @@ pub async fn upsert(
 }
 
 pub async fn heartbeat(pool: &AnyPool, node_id: &str, now_ms: i64) -> MetaResult<()> {
-    let rows = sqlx::query("UPDATE nodes SET last_heartbeat_ms = ? WHERE node_id = ?")
+    let rows = sqlx::query("UPDATE nodes SET last_heartbeat_ms = $1 WHERE node_id = $2")
         .bind(now_ms)
         .bind(node_id)
         .execute(pool)
@@ -97,13 +97,14 @@ pub async fn heartbeat(pool: &AnyPool, node_id: &str, now_ms: i64) -> MetaResult
 /// `POST /api/admin/drain` uses it to flip state to `"draining"`
 /// without accidentally wiping the advertised address.
 pub async fn set_state(pool: &AnyPool, node_id: &str, state: &str, now_ms: i64) -> MetaResult<()> {
-    let rows = sqlx::query("UPDATE nodes SET state = ?, last_heartbeat_ms = ? WHERE node_id = ?")
-        .bind(state)
-        .bind(now_ms)
-        .bind(node_id)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let rows =
+        sqlx::query("UPDATE nodes SET state = $1, last_heartbeat_ms = $2 WHERE node_id = $3")
+            .bind(state)
+            .bind(now_ms)
+            .bind(node_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
     if rows == 0 {
         return Err(MetaError::NotFound(format!("node {node_id}")));
     }
@@ -113,7 +114,7 @@ pub async fn set_state(pool: &AnyPool, node_id: &str, state: &str, now_ms: i64) 
 pub async fn get(pool: &AnyPool, node_id: &str) -> MetaResult<Option<Node>> {
     let row: Option<NodeRow> = sqlx::query_as(
         "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region \
-           FROM nodes WHERE node_id = ?",
+           FROM nodes WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(pool)
@@ -162,7 +163,7 @@ fn into_node(row: NodeRow) -> Node {
 pub async fn mark_dead_if_stale(pool: &AnyPool, deadline_ms: i64) -> MetaResult<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "UPDATE nodes SET state = 'dead' \
-           WHERE state = 'alive' AND last_heartbeat_ms < ? \
+           WHERE state = 'alive' AND last_heartbeat_ms < $1 \
          RETURNING node_id",
     )
     .bind(deadline_ms)
@@ -182,7 +183,7 @@ pub async fn mark_dead_if_stale(pool: &AnyPool, deadline_ms: i64) -> MetaResult<
 pub async fn gc_dead(pool: &AnyPool, gc_deadline_ms: i64) -> MetaResult<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "DELETE FROM nodes \
-           WHERE state = 'dead' AND last_heartbeat_ms < ? \
+           WHERE state = 'dead' AND last_heartbeat_ms < $1 \
          RETURNING node_id",
     )
     .bind(gc_deadline_ms)
@@ -195,7 +196,7 @@ pub async fn gc_dead(pool: &AnyPool, gc_deadline_ms: i64) -> MetaResult<Vec<Stri
 /// removed, `false` when the id wasn't present. Used by the
 /// `DELETE /api/admin/nodes/:id` operator-recovery path.
 pub async fn remove(pool: &AnyPool, node_id: &str) -> MetaResult<bool> {
-    let rows = sqlx::query("DELETE FROM nodes WHERE node_id = ?")
+    let rows = sqlx::query("DELETE FROM nodes WHERE node_id = $1")
         .bind(node_id)
         .execute(pool)
         .await?
@@ -208,7 +209,7 @@ pub async fn remove(pool: &AnyPool, node_id: &str) -> MetaResult<bool> {
 pub async fn stale(pool: &AnyPool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
     let rows: Vec<NodeRow> = sqlx::query_as(
         "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region
-           FROM nodes WHERE last_heartbeat_ms < ? ORDER BY last_heartbeat_ms",
+           FROM nodes WHERE last_heartbeat_ms < $1 ORDER BY last_heartbeat_ms",
     )
     .bind(threshold_ms)
     .fetch_all(pool)

@@ -28,12 +28,14 @@ pub async fn seed_shards(pool: &AnyPool, s: i64, now_ms: i64) -> MetaResult<()> 
     if count >= s {
         return Ok(());
     }
-    // Bulk insert. A simple loop with INSERT OR IGNORE is fine for
+    // Bulk insert. A simple loop with `ON CONFLICT DO NOTHING` is fine for
     // a one-time init path; performance is not critical.
     let mut tx = pool.begin().await?;
     for shard_id in 0..s {
         sqlx::query(
-            "INSERT OR IGNORE INTO shards (shard_id, tablet_id, updated_at_ms) VALUES (?, NULL, ?)",
+            "INSERT INTO shards (shard_id, tablet_id, updated_at_ms)
+             VALUES ($1, NULL, $2)
+             ON CONFLICT (shard_id) DO NOTHING",
         )
         .bind(shard_id)
         .bind(now_ms)
@@ -52,7 +54,7 @@ pub async fn set_assignment(
     tablet_id: Option<i64>,
     now_ms: i64,
 ) -> MetaResult<()> {
-    sqlx::query("UPDATE shards SET tablet_id = ?, updated_at_ms = ? WHERE shard_id = ?")
+    sqlx::query("UPDATE shards SET tablet_id = $1, updated_at_ms = $2 WHERE shard_id = $3")
         .bind(tablet_id)
         .bind(now_ms)
         .bind(shard_id)
@@ -63,7 +65,7 @@ pub async fn set_assignment(
 
 pub async fn get_assignment(pool: &AnyPool, shard_id: i64) -> MetaResult<Option<i64>> {
     let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT tablet_id FROM shards WHERE shard_id = ?")
+        sqlx::query_as("SELECT tablet_id FROM shards WHERE shard_id = $1")
             .bind(shard_id)
             .fetch_optional(pool)
             .await?;
@@ -117,7 +119,7 @@ pub async fn list_overrides(pool: &AnyPool) -> MetaResult<Vec<ShardRow>> {
 /// at that tablet so it can reassign them to a live tablet.
 pub async fn list_by_tablet(pool: &AnyPool, tablet_id: i64) -> MetaResult<Vec<i64>> {
     let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT shard_id FROM shards WHERE tablet_id = ? ORDER BY shard_id")
+        sqlx::query_as("SELECT shard_id FROM shards WHERE tablet_id = $1 ORDER BY shard_id")
             .bind(tablet_id)
             .fetch_all(pool)
             .await?;
