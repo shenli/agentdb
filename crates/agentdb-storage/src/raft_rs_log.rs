@@ -998,7 +998,7 @@ impl RaftRsNode {
             heartbeat_tick: 3,
             max_size_per_msg: u64::MAX,
             max_inflight_msgs: 256,
-            check_quorum: true,
+            check_quorum: false,
             pre_vote: false,
             ..Default::default()
         };
