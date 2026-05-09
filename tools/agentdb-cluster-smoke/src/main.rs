@@ -367,9 +367,9 @@ async fn run_smoke(
     wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
 
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
-    let (tenant_id, agent_id, session_id) = create_session_smoke(client, &owner.url).await?;
-    append_and_verify(client, &owner.url, &tenant_id, &agent_id, &session_id, 0).await?;
-    append_and_verify(client, &owner.url, &tenant_id, &agent_id, &session_id, 1).await?;
+    let (tenant_id, agent_id, session_id) = create_session_smoke(client, nodes).await?;
+    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
+    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
 
     print_diagnostics(client, nodes).await?;
 
@@ -388,17 +388,8 @@ async fn run_smoke(
         wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(30))
             .await?;
         wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
-        let new_owner =
-            wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(30)).await?;
-        append_and_verify(
-            client,
-            &new_owner.url,
-            &tenant_id,
-            &agent_id,
-            &session_id,
-            2,
-        )
-        .await?;
+        wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(30)).await?;
+        append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 2).await?;
         let survivors: Vec<_> = nodes
             .iter()
             .filter(|node| node.id != owner.id)
@@ -410,11 +401,14 @@ async fn run_smoke(
     Ok(())
 }
 
-async fn create_session_smoke(client: &Client, base: &str) -> Result<(String, String, String)> {
+async fn create_session_smoke(
+    client: &Client,
+    nodes: &[NodeSpec],
+) -> Result<(String, String, String)> {
     let mut last_error = None;
     for attempt in 0..3 {
         let suffix = format!("{}-{attempt}", now_ms());
-        match create_session_smoke_once(client, base, &suffix).await {
+        match create_session_smoke_once(client, nodes, &suffix).await {
             Ok(session) => return Ok(session),
             Err(error) if is_retryable_raft_error(&error) => {
                 last_error = Some(error);
@@ -428,28 +422,31 @@ async fn create_session_smoke(client: &Client, base: &str) -> Result<(String, St
 
 async fn create_session_smoke_once(
     client: &Client,
-    base: &str,
+    nodes: &[NodeSpec],
     suffix: &str,
 ) -> Result<(String, String, String)> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
     let tenant = post_json(
         client,
-        base,
+        &owner.url,
         "/api/tenants",
         json!({"external_key": format!("cluster-smoke-{suffix}"), "policy": {}}),
     )
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
     let agent = post_json(
         client,
-        base,
+        &owner.url,
         &format!("/api/tenants/{tenant_id}/agents"),
         json!({"alias": "cluster-smoke-agent", "config": {}}),
     )
     .await?;
     let agent_id = string_field(&agent, "agent_id")?;
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
     let session = post_json(
         client,
-        base,
+        &owner.url,
         &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
         json!({"alias": null}),
     )
@@ -460,16 +457,17 @@ async fn create_session_smoke_once(
 
 async fn append_and_verify(
     client: &Client,
-    base: &str,
+    nodes: &[NodeSpec],
     tenant_id: &str,
     agent_id: &str,
     session_id: &str,
     expected_seq: u64,
 ) -> Result<()> {
     for attempt in 0..3 {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
         let append_result = post_json(
             client,
-            base,
+            &owner.url,
             &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
             json!({
                 "agent_id": agent_id,
@@ -487,7 +485,7 @@ async fn append_and_verify(
                     .and_then(Value::as_u64)
                     .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
                 if seq == expected_seq
-                    || event_count(client, base, tenant_id, session_id).await? > expected_seq
+                    || event_count(client, nodes, tenant_id, session_id).await? > expected_seq
                 {
                     break;
                 }
@@ -495,7 +493,7 @@ async fn append_and_verify(
             }
             Err(error) if is_retryable_raft_error(&error) && attempt < 2 => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                if event_count(client, base, tenant_id, session_id).await? > expected_seq {
+                if event_count(client, nodes, tenant_id, session_id).await? > expected_seq {
                     break;
                 }
             }
@@ -504,7 +502,9 @@ async fn append_and_verify(
     }
     let events = get_json(
         client,
-        base,
+        &wait_tablet_owner(client, nodes, None, Duration::from_secs(30))
+            .await?
+            .url,
         &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
     )
     .await?;
@@ -520,13 +520,14 @@ async fn append_and_verify(
 
 async fn event_count(
     client: &Client,
-    base: &str,
+    nodes: &[NodeSpec],
     tenant_id: &str,
     session_id: &str,
 ) -> Result<u64> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(30)).await?;
     let events = get_json(
         client,
-        base,
+        &owner.url,
         &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
     )
     .await?;
