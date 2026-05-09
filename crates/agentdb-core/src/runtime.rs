@@ -2342,7 +2342,6 @@ impl Runtime {
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
-        self.refresh_replicated_state().await?;
         let t = {
             let mut s = self.state.lock().await;
             // External keys are tenant-name slots; a duplicate is an
