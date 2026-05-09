@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentDB local CI static dashboard
+
+[Service]
+Type=simple
+WorkingDirectory=%h/work/agentdb
+Environment=LOCAL_CI_RUN_ROOT=%h/agentdb-ci-runs
+Environment=LOCAL_CI_DASHBOARD_HOST=127.0.0.1
+Environment=LOCAL_CI_DASHBOARD_PORT=8099
+ExecStart=%h/work/agentdb/scripts/local-ci-serve.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

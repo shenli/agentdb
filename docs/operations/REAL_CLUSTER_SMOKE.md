@@ -23,6 +23,9 @@ Useful options:
 # Include the owner-kill failover probe.
 scripts/real-cluster-smoke-compose.sh --failover
 
+# Include bounded random kill/restart chaos.
+scripts/real-cluster-smoke-compose.sh --chaos --chaos-iterations 48
+
 # Leave Postgres and MinIO running after the smoke finishes.
 AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1 scripts/real-cluster-smoke-compose.sh
 
@@ -126,6 +129,25 @@ The failover probe kills the initial owner process, waits for the scheduler to
 mark it dead and move tablet ownership, then attempts another append through a
 surviving node. This is the first real-process validation target for the Raft
 and rebalance path.
+
+## Optional Chaos Probe
+
+```bash
+scripts/real-cluster-smoke.sh --chaos --chaos-iterations 48 --keep-work-dir
+```
+
+The chaos probe is intended for nightly stability testing. It keeps the cluster
+within quorum by killing and restarting one node at a time, then verifies writes
+while the node is down and again after it rejoins. A deterministic run can be
+replayed with:
+
+```bash
+scripts/real-cluster-smoke.sh --chaos --chaos-seed 12345
+```
+
+This is not a full network-partition test yet. It targets the most common local
+stability regressions: leader loss, follower loss/rejoin, restart recovery, and
+replica catch-up after missed writes.
 
 ## Generated Files
 
