@@ -446,37 +446,29 @@ impl RaftRsSharedGroup {
             if group.node_count() > 1 {
                 return group.append(node_id, tablet_id, command);
             }
+            group.validate_append_target(node_id, tablet_id)?;
+            if !group.is_leader(node_id)? {
+                return Err(Error::Other(format!(
+                    "raft-rs local node {node_id} is not leader for tablet {tablet_id}"
+                )));
+            }
         }
         let started_at = Instant::now();
-        let mut campaign_started = false;
         let mut proposed_after = None;
         loop {
             let maybe_commit = {
                 let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
                 group.validate_append_target(node_id, tablet_id)?;
                 if proposed_after.is_none() {
-                    if !group.is_leader(node_id)? {
-                        if !campaign_started {
-                            group
-                                .node_mut(node_id)?
-                                .raw
-                                .campaign()
-                                .map_err(map_raft_error)?;
-                            campaign_started = true;
-                        }
-                        group.drive_until_idle()?;
-                        None
-                    } else {
-                        let previous_applied_index = group.node(node_id)?.last_applied_index;
-                        group
-                            .node_mut(node_id)?
-                            .raw
-                            .propose(Vec::new(), command.clone())
-                            .map_err(map_raft_error)?;
-                        proposed_after = Some(previous_applied_index);
-                        group.drive_until_idle()?;
-                        group.find_committed_after(node_id, tablet_id, previous_applied_index)?
-                    }
+                    let previous_applied_index = group.node(node_id)?.last_applied_index;
+                    group
+                        .node_mut(node_id)?
+                        .raw
+                        .propose(Vec::new(), command.clone())
+                        .map_err(map_raft_error)?;
+                    proposed_after = Some(previous_applied_index);
+                    group.drive_until_idle()?;
+                    group.find_committed_after(node_id, tablet_id, previous_applied_index)?
                 } else {
                     group.drive_until_idle()?;
                     group.find_committed_after(
@@ -490,13 +482,8 @@ impl RaftRsSharedGroup {
                 return Ok(commit);
             }
             if started_at.elapsed() >= APPEND_WAIT_TIMEOUT {
-                let reason = if proposed_after.is_some() {
-                    "command did not commit"
-                } else {
-                    "node did not become leader"
-                };
                 return Err(Error::Other(format!(
-                    "raft-rs {reason} for tablet {tablet_id} before timeout"
+                    "raft-rs command did not commit for tablet {tablet_id} before timeout"
                 )));
             }
             thread::sleep(APPEND_WAIT_POLL);
@@ -1815,6 +1802,29 @@ mod tests {
         let (group_2, log_2) = RaftRsSharedGroup::open_local(7, configs.clone(), 2).unwrap();
         let (group_3, log_3) = RaftRsSharedGroup::open_local(7, configs, 3).unwrap();
         let groups = BTreeMap::from([(1, group_1.clone()), (2, group_2), (3, group_3)]);
+
+        group_1.campaign(1).unwrap();
+        for _ in 0..1_000 {
+            let mut messages = Vec::new();
+            for group in groups.values() {
+                messages.extend(group.take_wire_messages());
+            }
+            for message in messages {
+                groups
+                    .get(&message.to)
+                    .expect("target raft group")
+                    .step_wire_message(message)
+                    .unwrap();
+            }
+            if group_1
+                .status()
+                .iter()
+                .any(|status| status.node_id == 1 && status.role == "Leader")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         let append = std::thread::spawn(move || log_1.append(7, b"network-quorum".to_vec()));
         for _ in 0..1_000 {

@@ -150,8 +150,7 @@ async fn main() -> Result<()> {
 
 fn prepare_work_dir(work_dir: &Path, reset: bool) -> Result<()> {
     if reset && work_dir.exists() {
-        fs::remove_dir_all(work_dir)
-            .with_context(|| format!("reset {}", work_dir.display()))?;
+        fs::remove_dir_all(work_dir).with_context(|| format!("reset {}", work_dir.display()))?;
     }
     fs::create_dir_all(work_dir).with_context(|| format!("create {}", work_dir.display()))?;
     fs::create_dir_all(work_dir.join("logs"))
@@ -491,7 +490,11 @@ async fn post_json_with_convergence_retry(
     let mut last_error = None;
     for attempt in 0..attempts.max(1) {
         let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
-        eprintln!("smoke: POST {path} attempt {} via {}", attempt + 1, owner.id);
+        eprintln!(
+            "smoke: POST {path} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
         match post_json(client, &owner.url, path, body.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
@@ -593,7 +596,10 @@ async fn event_count(
 
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
-    message.contains("\"retryable\":true") || message.contains("raft-rs command did not commit")
+    message.contains("\"retryable\":true")
+        || message.contains("raft-rs command did not commit")
+        || message.contains("raft-rs local node")
+        || message.contains("is not leader for tablet")
 }
 
 fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
