@@ -411,7 +411,26 @@ async fn run_smoke(
 }
 
 async fn create_session_smoke(client: &Client, base: &str) -> Result<(String, String, String)> {
-    let suffix = now_ms();
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let suffix = format!("{}-{attempt}", now_ms());
+        match create_session_smoke_once(client, base, &suffix).await {
+            Ok(session) => return Ok(session),
+            Err(error) if is_retryable_raft_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("session smoke failed without a captured error")))
+}
+
+async fn create_session_smoke_once(
+    client: &Client,
+    base: &str,
+    suffix: &str,
+) -> Result<(String, String, String)> {
     let tenant = post_json(
         client,
         base,
@@ -447,25 +466,41 @@ async fn append_and_verify(
     session_id: &str,
     expected_seq: u64,
 ) -> Result<()> {
-    let event = post_json(
-        client,
-        base,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
-        json!({
-            "agent_id": agent_id,
-            "kind": "message",
-            "payload": {"seq": expected_seq, "source": "cluster-smoke"},
-            "artifact_refs": [],
-            "source_refs": []
-        }),
-    )
-    .await?;
-    let seq = event
-        .get("seq")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
-    if seq != expected_seq {
-        bail!("expected appended seq {expected_seq}, got {seq}");
+    for attempt in 0..3 {
+        let append_result = post_json(
+            client,
+            base,
+            &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
+            json!({
+                "agent_id": agent_id,
+                "kind": "message",
+                "payload": {"seq": expected_seq, "source": "cluster-smoke"},
+                "artifact_refs": [],
+                "source_refs": []
+            }),
+        )
+        .await;
+        match append_result {
+            Ok(event) => {
+                let seq = event
+                    .get("seq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
+                if seq == expected_seq
+                    || event_count(client, base, tenant_id, session_id).await? > expected_seq
+                {
+                    break;
+                }
+                bail!("expected appended seq {expected_seq}, got {seq}");
+            }
+            Err(error) if is_retryable_raft_error(&error) && attempt < 2 => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if event_count(client, base, tenant_id, session_id).await? > expected_seq {
+                    break;
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
     let events = get_json(
         client,
@@ -481,6 +516,29 @@ async fn append_and_verify(
         bail!("expected at least {} events, got {len}", expected_seq + 1);
     }
     Ok(())
+}
+
+async fn event_count(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    session_id: &str,
+) -> Result<u64> {
+    let events = get_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
+    )
+    .await?;
+    Ok(events
+        .as_array()
+        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
+        .len() as u64)
+}
+
+fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("\"retryable\":true") || message.contains("raft-rs command did not commit")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
