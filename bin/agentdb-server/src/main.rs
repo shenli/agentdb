@@ -2926,6 +2926,24 @@ async fn run_cluster_scheduler_tick(
         status.add_dead_nodes_marked(dead_nodes.len() as u64);
         tracing::info!(node_id = %node_id, dead_nodes = ?dead_nodes, "scheduler marked stale nodes dead");
     }
+    let mut cleared_dead_owner_tablets = Vec::new();
+    for dead_node in agentdb_meta::nodes::list_all(pool)
+        .await?
+        .into_iter()
+        .filter(|node| node.state == "dead")
+    {
+        cleared_dead_owner_tablets.extend(
+            agentdb_meta::tablets::clear_ownership_by_owner(pool, &dead_node.node_id).await?,
+        );
+    }
+    if !cleared_dead_owner_tablets.is_empty() {
+        status.add_tablet_reassignments(cleared_dead_owner_tablets.len() as u64);
+        tracing::info!(
+            node_id = %node_id,
+            tablets = ?cleared_dead_owner_tablets,
+            "scheduler cleared tablet ownership from dead nodes"
+        );
+    }
     let deleted_stale_tablet_stats = agentdb_meta::tablet_stats::delete_stale(
         pool,
         now_ms.saturating_sub(config.stale_node_threshold_ms).max(0),
@@ -4802,6 +4820,76 @@ region = "us-west-2"
         assert_eq!(snapshot.dead_nodes_marked_total, 1);
         assert_eq!(snapshot.tablet_reassignments_total, 1);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_tick_clears_dead_owner_before_lease_expiry_and_reassigns() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:18080",
+            None,
+            "alive",
+            10_000,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            None,
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        tablets::get_or_create(meta.pool(), 7, 100).await.unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 60_000)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        let config = ClusterWorkerConfig {
+            heartbeat_interval_ms: 5_000,
+            scheduler_lease_ms: 30_000,
+            scheduler_renew_interval_ms: 10_000,
+            stale_node_threshold_ms: 1_000,
+            reaper_tick_ms: 10_000,
+            reaper_safety_margin_ms: 0,
+            rebalance_max_movements: 8,
+            tablet_movement_batch_size: 64,
+            tablet_movement_executor_interval_ms: 5_000,
+            tablet_lifecycle_split_max_shards: 0,
+            tablet_lifecycle_merge_max_shards: 0,
+            tablet_lifecycle_split_max_keys: 0,
+            tablet_lifecycle_merge_max_keys: 0,
+            tablet_lifecycle_split_max_storage_bytes: 0,
+            tablet_lifecycle_merge_max_storage_bytes: 0,
+            tablet_lifecycle_split_min_write_ops_per_sec_milli: 0,
+            tablet_lifecycle_split_max_compaction_debt_ops: 0,
+            tablet_log_compaction_min_debt_ops: 0,
+            tablet_lifecycle_max_actions: 4,
+            tablet_lifecycle_cooldown_ms: DEFAULT_TABLET_LIFECYCLE_COOLDOWN_MS,
+        };
+        run_cluster_scheduler_tick(&meta, "leader-a", 10_000, config, &status, None)
+            .await
+            .unwrap();
+
+        let stale_node = nodes::get(meta.pool(), "node-b").await.unwrap().unwrap();
+        assert_eq!(stale_node.state, "dead");
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert!(tablet.lease_expires_at_ms > 10_000);
+
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.dead_nodes_marked_total, 1);
+        assert_eq!(snapshot.tablet_reassignments_total, 2);
     }
 
     #[tokio::test]

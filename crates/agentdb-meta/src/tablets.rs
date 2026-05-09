@@ -212,6 +212,37 @@ pub async fn clear_expired_ownership(
     Ok(ids)
 }
 
+/// Clear every tablet currently owned by `owner_node_id`, regardless of lease
+/// expiry. The scheduler uses this after a node is marked dead, where waiting
+/// for the old owner's lease would delay failover even though the liveness
+/// decision has already been fenced in the control plane.
+pub async fn clear_ownership_by_owner(pool: &AnyPool, owner_node_id: &str) -> MetaResult<Vec<i64>> {
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT tablet_id FROM tablets
+         WHERE owner_node_id = $1
+         ORDER BY tablet_id",
+    )
+    .bind(owner_node_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let ids: Vec<i64> = rows.into_iter().map(|(id,)| id).collect();
+    if !ids.is_empty() {
+        sqlx::query(
+            "UPDATE tablets
+               SET owner_node_id = NULL,
+                   lease_expires_at_ms = 0,
+                   epoch = epoch + 1
+             WHERE owner_node_id = $1",
+        )
+        .bind(owner_node_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
 /// Forcibly relinquish a single tablet — clear `owner_node_id`,
 /// zero `lease_expires_at_ms`, and bump `epoch`. Returns `true`
 /// when the row was relinquished by this call, `false` when the
@@ -875,5 +906,31 @@ mod tests {
         // excludes it.
         let second = clear_expired_ownership(&p, 0, 10_000).await.unwrap();
         assert!(second.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_ownership_by_owner_only_clears_matching_owner() {
+        let p = pool().await;
+        for id in [1, 2, 3] {
+            get_or_create(&p, id, 100).await.unwrap();
+        }
+        assume_ownership(&p, 1, 0, "node-a", 50_000).await.unwrap();
+        assume_ownership(&p, 2, 0, "node-b", 50_000).await.unwrap();
+        assume_ownership(&p, 3, 0, "node-a", 50_000).await.unwrap();
+
+        let cleared = clear_ownership_by_owner(&p, "node-a").await.unwrap();
+
+        assert_eq!(cleared, vec![1, 3]);
+        let t1 = get(&p, 1).await.unwrap().unwrap();
+        let t2 = get(&p, 2).await.unwrap().unwrap();
+        let t3 = get(&p, 3).await.unwrap().unwrap();
+        assert_eq!(t1.owner_node_id, None);
+        assert_eq!(t1.lease_expires_at_ms, 0);
+        assert_eq!(t1.epoch, 2);
+        assert_eq!(t2.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(t2.lease_expires_at_ms, 50_000);
+        assert_eq!(t3.owner_node_id, None);
+        assert_eq!(t3.lease_expires_at_ms, 0);
+        assert_eq!(t3.epoch, 2);
     }
 }

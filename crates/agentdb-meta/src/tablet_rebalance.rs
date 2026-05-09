@@ -172,6 +172,15 @@ pub async fn run(
         } else {
             let assigned = tablets::assign_to(pool, tablet.tablet_id, &target).await?;
             if assigned {
+                let lease_expires_at_ms = assignment_lease_expires_at_ms(&request, now_ms);
+                tablets::assume_ownership(
+                    pool,
+                    tablet.tablet_id,
+                    tablet.epoch,
+                    &target,
+                    lease_expires_at_ms,
+                )
+                .await?;
                 tablet_replicas::upsert(
                     pool,
                     tablet.tablet_id,
@@ -318,6 +327,15 @@ pub async fn run(
         skipped,
         membership_operations: Vec::new(),
     })
+}
+
+fn assignment_lease_expires_at_ms(request: &RebalanceRequest, now_ms: i64) -> i64 {
+    let lease_ms = request
+        .stale_threshold_ms
+        .max(1)
+        .saturating_mul(10)
+        .max(30_000);
+    now_ms.saturating_add(lease_ms)
 }
 
 struct RebalanceStep {
@@ -607,6 +625,8 @@ mod tests {
         assert!(assigned_replicas
             .iter()
             .any(|replica| replica.role == "voter" && replica.health == "healthy"));
+        let assigned = tablets::get(&p, 4).await.unwrap().unwrap();
+        assert!(assigned.lease_expires_at_ms > 2_000);
     }
 
     #[tokio::test]
