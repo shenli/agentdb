@@ -184,11 +184,14 @@ pub async fn apply(pool: &AnyPool, dialect: MetaDialect) -> MetaResult<()> {
     sqlx::query(bootstrap_sql).execute(pool).await?;
 
     for &(version, desc, sqlite_sql, pg_sql) in MIGRATIONS {
-        let already_applied: Option<(i64,)> =
-            sqlx::query_as("SELECT version FROM schema_migrations WHERE version = ?")
-                .bind(version)
-                .fetch_optional(pool)
-                .await?;
+        let version_sql = match dialect {
+            MetaDialect::Sqlite => "SELECT version FROM schema_migrations WHERE version = ?",
+            MetaDialect::Postgres => "SELECT version FROM schema_migrations WHERE version = $1",
+        };
+        let already_applied: Option<(i64,)> = sqlx::query_as(version_sql)
+            .bind(version)
+            .fetch_optional(pool)
+            .await?;
         if already_applied.is_some() {
             continue;
         }
@@ -215,14 +218,20 @@ pub async fn apply(pool: &AnyPool, dialect: MetaDialect) -> MetaResult<()> {
             })?;
         }
         let now_ms = now_ms();
-        sqlx::query(
-            "INSERT INTO schema_migrations (version, applied_at_ms, description) VALUES (?, ?, ?)",
-        )
-        .bind(version)
-        .bind(now_ms)
-        .bind(desc)
-        .execute(pool)
-        .await?;
+        let insert_sql = match dialect {
+            MetaDialect::Sqlite => {
+                "INSERT INTO schema_migrations (version, applied_at_ms, description) VALUES (?, ?, ?)"
+            }
+            MetaDialect::Postgres => {
+                "INSERT INTO schema_migrations (version, applied_at_ms, description) VALUES ($1, $2, $3)"
+            }
+        };
+        sqlx::query(insert_sql)
+            .bind(version)
+            .bind(now_ms)
+            .bind(desc)
+            .execute(pool)
+            .await?;
         tracing::info!(%version, %desc, dialect = dialect.as_str(), "applied control-plane migration");
     }
     Ok(())
