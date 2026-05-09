@@ -381,6 +381,13 @@ impl RaftRsSharedGroup {
             .tick(node_id)
     }
 
+    pub fn expire_leader_lease(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .expire_leader_lease(node_id)
+    }
+
     pub fn flush_wire_messages_to(&self, transport: &dyn RaftRsTransport) -> Result<usize> {
         self.inner
             .lock()
@@ -664,6 +671,16 @@ impl RaftRsGroup {
     fn tick(&mut self, node_id: u64) -> Result<()> {
         self.node_mut(node_id)?.raw.tick();
         self.drive_until_idle()
+    }
+
+    fn expire_leader_lease(&mut self, node_id: u64) -> Result<()> {
+        let node = self.node_mut(node_id)?;
+        if node.raw.status().ss.raft_state != StateRole::Leader {
+            // Let this follower grant pre-votes after an externally detected
+            // owner failure without ticking it into its own campaign.
+            node.raw.raft.election_elapsed = usize::MAX / 4;
+        }
+        Ok(())
     }
 
     fn propose_membership_change(
