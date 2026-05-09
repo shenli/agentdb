@@ -367,6 +367,13 @@ impl RaftRsSharedGroup {
             .step_wire_message(message)
     }
 
+    pub fn tick(&self, node_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .tick(node_id)
+    }
+
     pub fn flush_wire_messages_to(&self, transport: &dyn RaftRsTransport) -> Result<usize> {
         self.inner
             .lock()
@@ -647,6 +654,11 @@ impl RaftRsGroup {
         self.drive_until_idle()
     }
 
+    fn tick(&mut self, node_id: u64) -> Result<()> {
+        self.node_mut(node_id)?.raw.tick();
+        self.drive_until_idle()
+    }
+
     fn propose_membership_change(
         &mut self,
         leader_id: u64,
@@ -798,6 +810,11 @@ impl RaftRsGroup {
             )));
         }
         let node = self.node_mut(node_id)?;
+        let snapshot = node
+            .storage
+            .snapshot(up_to_index, node_id)
+            .map_err(map_raft_error)?;
+        node.persist_snapshot(&snapshot)?;
         node.storage
             .wl()
             .compact(up_to_index.saturating_add(1))

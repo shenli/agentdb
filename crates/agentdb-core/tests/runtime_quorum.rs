@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agentdb_core::runtime::Runtime;
@@ -7,7 +8,8 @@ use agentdb_core::RUNTIME_PRIMARY_TABLET_ID;
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
-    RaftRsNodeRole, RaftRsSharedGroup, ReplicatedLog, RocksKvStore, SingleNodeReplicatedLog,
+    RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, ReplicatedLog, RocksKvStore,
+    SingleNodeReplicatedLog,
 };
 use tempfile::TempDir;
 
@@ -69,6 +71,100 @@ fn quorum_node(
 
 fn content() -> Arc<dyn ContentBackend> {
     Arc::new(InMemoryContentBackend::default())
+}
+
+struct NetworkedRaftRsRuntimeCluster {
+    _dir: TempDir,
+    groups: BTreeMap<u64, RaftRsSharedGroup>,
+    logs: BTreeMap<u64, Arc<RaftRsReplicatedLog>>,
+    kv_dirs: BTreeMap<u64, PathBuf>,
+}
+
+impl NetworkedRaftRsRuntimeCluster {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let raft_configs: Vec<_> = (1..=3)
+            .map(|node_id| RaftRsNodeConfig {
+                node_id,
+                role: RaftRsNodeRole::Voter,
+                raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+            })
+            .collect();
+        let mut groups = BTreeMap::new();
+        let mut logs = BTreeMap::new();
+        let mut kv_dirs = BTreeMap::new();
+        for node_id in 1..=3 {
+            let (group, log) = RaftRsSharedGroup::open_local(
+                RUNTIME_PRIMARY_TABLET_ID,
+                raft_configs.clone(),
+                node_id,
+            )
+            .unwrap();
+            groups.insert(node_id, group);
+            logs.insert(node_id, log);
+            kv_dirs.insert(node_id, dir.path().join(format!("kv-n{node_id}")));
+        }
+        Self {
+            _dir: dir,
+            groups,
+            logs,
+            kv_dirs,
+        }
+    }
+
+    fn runtime(&self, node_id: u64) -> Arc<Runtime> {
+        let kv: Arc<dyn KvStore + Send + Sync> =
+            Arc::new(RocksKvStore::open(&self.kv_dirs[&node_id]).unwrap());
+        let log: Arc<dyn ReplicatedLog + Send + Sync> = self.logs[&node_id].clone();
+        Runtime::with_kv_and_replicated_log(kv, content(), log)
+    }
+
+    async fn pump_until<F>(&self, isolated_nodes: &HashSet<u64>, mut done: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..2_000 {
+            self.pump_once(isolated_nodes);
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("raft-rs network did not reach expected condition");
+    }
+
+    fn pump_once(&self, isolated_nodes: &HashSet<u64>) -> usize {
+        for (node_id, group) in &self.groups {
+            if !isolated_nodes.contains(node_id) {
+                group.tick(*node_id).unwrap();
+            }
+        }
+        let mut messages = Vec::new();
+        for group in self.groups.values() {
+            messages.extend(group.take_wire_messages());
+        }
+        let delivered = messages.len();
+        for message in messages {
+            if isolated_nodes.contains(&message.from) || isolated_nodes.contains(&message.to) {
+                continue;
+            }
+            self.groups
+                .get(&message.to)
+                .expect("target raft group")
+                .step_wire_message(message)
+                .unwrap();
+        }
+        delivered
+    }
+
+    fn drain(&self) {
+        let isolated = HashSet::new();
+        for _ in 0..50 {
+            if self.pump_once(&isolated) == 0 {
+                break;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -177,6 +273,72 @@ async fn runtime_raft_rs_log_compaction_reduces_tablet_compaction_debt() {
     assert_eq!(after[0].compaction_debt_ops, 0);
 }
 
+#[tokio::test]
+async fn runtime_raft_rs_restarts_after_log_compaction_and_continues_writes() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) =
+        RaftRsSharedGroup::open(RUNTIME_PRIMARY_TABLET_ID, raft_configs.clone()).unwrap();
+    group.elect(1).unwrap();
+
+    let kv_path = dir.path().join("kv-n1");
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(&kv_path).unwrap());
+    let runtime = Runtime::with_kv_and_replicated_log(kv, content(), logs[0].clone());
+    let before_restart = runtime
+        .create_tenant(NewTenant {
+            external_key: "before-compact-restart".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let applied_index = runtime.local_tablet_storage_stats().unwrap()[0].applied_index;
+    assert!(
+        runtime
+            .compact_tablet_log_through(RUNTIME_PRIMARY_TABLET_ID, applied_index)
+            .unwrap()
+            > 0
+    );
+    drop(runtime);
+    drop(logs);
+    drop(group);
+
+    let (reopened_group, reopened_logs) =
+        RaftRsSharedGroup::open(RUNTIME_PRIMARY_TABLET_ID, raft_configs).unwrap();
+    reopened_group.elect(1).unwrap();
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(&kv_path).unwrap());
+    let reopened = Runtime::with_kv_and_replicated_log(kv, content(), reopened_logs[0].clone());
+    let after_restart = reopened
+        .create_tenant(NewTenant {
+            external_key: "after-compact-restart".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reopened
+            .get_tenant(&before_restart.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "before-compact-restart"
+    );
+    assert_eq!(
+        reopened
+            .get_tenant(&after_restart.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "after-compact-restart"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
     let dir = TempDir::new().unwrap();
@@ -234,6 +396,183 @@ async fn runtime_persisted_writes_replicate_with_networked_raft_rs_quorum() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "raft-rs-network-tenant");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_rs_failure_injection_commits_with_follower_loss_and_catches_up_after_rejoin() {
+    let cluster = NetworkedRaftRsRuntimeCluster::new();
+    let leader_runtime = cluster.runtime(1);
+    let create_a_runtime = leader_runtime.clone();
+    let create_a = tokio::spawn(async move {
+        create_a_runtime
+            .create_tenant(NewTenant {
+                external_key: "partition-a".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+    });
+
+    let isolated = HashSet::from([3]);
+    cluster
+        .pump_until(&isolated, || create_a.is_finished())
+        .await;
+    let tenant_a = create_a.await.unwrap().unwrap();
+
+    let follower_two = cluster.runtime(2);
+    assert_eq!(
+        follower_two
+            .get_tenant(&tenant_a.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "partition-a"
+    );
+    assert!(cluster
+        .runtime(3)
+        .get_tenant(&tenant_a.tenant_id)
+        .await
+        .is_err());
+
+    let create_b_runtime = leader_runtime.clone();
+    let create_b = tokio::spawn(async move {
+        create_b_runtime
+            .create_tenant(NewTenant {
+                external_key: "partition-b".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+    });
+    cluster
+        .pump_until(&HashSet::new(), || create_b.is_finished())
+        .await;
+    let tenant_b = create_b.await.unwrap().unwrap();
+    cluster.drain();
+
+    let rejoined = cluster.runtime(3);
+    assert_eq!(
+        rejoined
+            .get_tenant(&tenant_a.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "partition-a"
+    );
+    assert_eq!(
+        rejoined
+            .get_tenant(&tenant_b.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "partition-b"
+    );
+}
+
+#[tokio::test]
+async fn raft_rs_failure_injection_recovers_old_leader_with_snapshot_after_leader_loss() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(RUNTIME_PRIMARY_TABLET_ID, raft_configs).unwrap();
+    group.elect(1).unwrap();
+
+    let kv1: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let kv2: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n2")).unwrap());
+    let old_leader = Runtime::with_kv_and_replicated_log(kv1, content(), logs[0].clone());
+    let new_leader = Runtime::with_kv_and_replicated_log(kv2, content(), logs[1].clone());
+
+    let before_loss = old_leader
+        .create_tenant(NewTenant {
+            external_key: "before-leader-loss".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    group.mark_unavailable(1).unwrap();
+    for _ in 0..50 {
+        if group.elect(2).is_ok() {
+            break;
+        }
+        group.tick(2).unwrap();
+        group.tick(3).unwrap();
+    }
+    let after_loss = new_leader
+        .create_tenant(NewTenant {
+            external_key: "after-leader-loss".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    let kv3: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n3")).unwrap());
+    let surviving_follower = Runtime::with_kv_and_replicated_log(kv3, content(), logs[2].clone());
+    assert_eq!(
+        surviving_follower
+            .get_tenant(&before_loss.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "before-leader-loss"
+    );
+    assert_eq!(
+        surviving_follower
+            .get_tenant(&after_loss.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "after-leader-loss"
+    );
+
+    group.mark_available(1).unwrap();
+    let after_rejoin = new_leader
+        .create_tenant(NewTenant {
+            external_key: "after-old-leader-rejoin".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let application_snapshot = new_leader
+        .export_tablet_snapshot_payload(RUNTIME_PRIMARY_TABLET_ID)
+        .unwrap();
+    let transfer = group
+        .build_snapshot_transfer(2, 1, application_snapshot)
+        .unwrap();
+    let application_snapshot = group.install_snapshot_transfer(1, transfer).unwrap();
+    drop(old_leader);
+    let kv1: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let rejoined_old_leader = Runtime::with_kv_and_replicated_log(kv1, content(), logs[0].clone());
+    assert!(rejoined_old_leader
+        .install_tablet_snapshot_payload_and_rehydrate(
+            RUNTIME_PRIMARY_TABLET_ID,
+            &application_snapshot
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        rejoined_old_leader
+            .get_tenant(&after_loss.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "after-leader-loss"
+    );
+    assert_eq!(
+        rejoined_old_leader
+            .get_tenant(&after_rejoin.tenant_id)
+            .await
+            .unwrap()
+            .external_key,
+        "after-old-leader-rejoin"
+    );
 }
 
 #[tokio::test]
