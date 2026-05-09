@@ -14,6 +14,7 @@ export AGENTDB_S3_REGION="${AGENTDB_S3_REGION:-us-east-1}"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
 export AWS_ALLOW_HTTP="${AWS_ALLOW_HTTP:-true}"
+export AWS_EC2_METADATA_DISABLED="${AWS_EC2_METADATA_DISABLED:-true}"
 
 cd "$ROOT"
 cargo build -q -p agentdb-server -p agentdbctl -p agentdb-cluster-smoke

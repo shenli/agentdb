@@ -339,6 +339,7 @@ fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
             .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "1500")
             .env("AGENTDB_REAPER_TICK_MS", "500")
             .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "4")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
             .spawn()
