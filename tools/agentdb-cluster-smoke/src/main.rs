@@ -372,7 +372,7 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
         .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-        .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "10000")
+        .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "30000")
         .env("AGENTDB_REAPER_TICK_MS", "500")
         .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
@@ -429,7 +429,7 @@ async fn run_smoke(
             .find(|node| node.id != owner.id)
             .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
         eprintln!("smoke: waiting for {} to be marked dead", owner.id);
-        wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(20)).await?;
+        wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(45)).await?;
         eprintln!("smoke: waiting for tablet owner change");
         wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(90))
             .await?;
@@ -507,7 +507,7 @@ async fn run_chaos(
             let survivor = survivors
                 .first()
                 .ok_or_else(|| anyhow!("chaos requires at least one surviving node"))?;
-            wait_node_marked_dead(client, &survivor.url, &victim.id, Duration::from_secs(20))
+            wait_node_marked_dead(client, &survivor.url, &victim.id, Duration::from_secs(45))
                 .await?;
             wait_tablet_owner_changed(client, &survivor.url, &victim.id, Duration::from_secs(90))
                 .await?;
