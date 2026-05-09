@@ -1,0 +1,626 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use agentdb_meta::{nodes, tablet_ranges, tablet_replicas, tablets, MetaStore};
+use anyhow::{anyhow, bail, Context, Result};
+use clap::Parser;
+use reqwest::Client;
+use serde_json::{json, Value};
+
+const DEFAULT_INTERNAL_TOKEN: &str = "agentdb-cluster-smoke-token";
+const DEFAULT_SHARD_COUNT: i64 = agentdb_meta::shards::DEFAULT_SHARD_COUNT;
+const PRIMARY_TABLET_ID: i64 = 1;
+
+#[derive(Debug, Parser)]
+#[command(about = "Run a throwaway multi-process AgentDB cluster smoke test")]
+struct Args {
+    /// Throwaway Postgres URL for AgentDB metadata.
+    #[arg(long, env = "AGENTDB_META_URL")]
+    meta_url: String,
+
+    /// Path to the agentdb-server binary.
+    #[arg(
+        long,
+        env = "AGENTDB_SERVER_BIN",
+        default_value = "target/debug/agentdb-server"
+    )]
+    server_bin: PathBuf,
+
+    /// Work directory for generated configs, data dirs, and logs.
+    #[arg(
+        long,
+        env = "AGENTDB_CLUSTER_SMOKE_WORK_DIR",
+        default_value = "/tmp/agentdb-cluster-smoke"
+    )]
+    work_dir: PathBuf,
+
+    /// Number of local server processes to launch.
+    #[arg(long, default_value_t = 3)]
+    nodes: usize,
+
+    /// First HTTP port. Node i listens on base_port + i.
+    #[arg(long, default_value_t = 30100)]
+    base_port: u16,
+
+    /// S3-compatible endpoint, for example MinIO.
+    #[arg(
+        long,
+        env = "AGENTDB_S3_ENDPOINT",
+        default_value = "http://127.0.0.1:9000"
+    )]
+    s3_endpoint: String,
+
+    /// S3 bucket used by SlateDB/content/snapshot storage.
+    #[arg(long, env = "AGENTDB_S3_BUCKET", default_value = "agentdb-smoke")]
+    s3_bucket: String,
+
+    /// S3 region used by the object_store client.
+    #[arg(long, env = "AGENTDB_S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+
+    /// Shared token for internal Raft and movement RPCs.
+    #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN", default_value = DEFAULT_INTERNAL_TOKEN)]
+    internal_auth_token: String,
+
+    /// Delete cluster-control rows from the metadata database before seeding.
+    #[arg(long)]
+    reset_meta: bool,
+
+    /// Keep server processes alive after the smoke test completes.
+    #[arg(long)]
+    keep_running: bool,
+
+    /// Keep generated work directory on success.
+    #[arg(long)]
+    keep_work_dir: bool,
+
+    /// Also kill the initial owner and verify the surviving nodes stay observable.
+    #[arg(long)]
+    failover: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NodeSpec {
+    id: String,
+    port: u16,
+    url: String,
+    config_path: PathBuf,
+    data_dir: PathBuf,
+    content_dir: PathBuf,
+    log_path: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.nodes < 3 {
+        bail!("--nodes must be at least 3 for a quorum smoke test");
+    }
+    if args.internal_auth_token.len() < 16 {
+        bail!("internal auth token must be at least 16 characters");
+    }
+    if !args.server_bin.exists() {
+        bail!(
+            "agentdb-server binary not found at {}; run `cargo build -p agentdb-server` or pass --server-bin",
+            args.server_bin.display()
+        );
+    }
+
+    prepare_work_dir(&args.work_dir)?;
+    let nodes = node_specs(&args);
+    for node in &nodes {
+        write_node_config(&args, node)?;
+    }
+
+    let meta = MetaStore::open_postgres(&args.meta_url)
+        .await
+        .context("open metadata store")?;
+    if args.reset_meta {
+        reset_cluster_meta(&meta).await?;
+    }
+    ensure_cluster_meta_empty(&meta).await?;
+    seed_cluster_meta(&meta, &nodes).await?;
+
+    let mut children = spawn_nodes(&args, &nodes)?;
+    let client = Client::new();
+    let result = run_smoke(&client, &nodes, args.failover, &mut children).await;
+
+    if !args.keep_running {
+        stop_children(&mut children);
+    } else {
+        eprintln!(
+            "cluster left running; logs are under {}",
+            args.work_dir.display()
+        );
+    }
+
+    result?;
+    if !args.keep_work_dir && !args.keep_running {
+        let _ = fs::remove_dir_all(&args.work_dir);
+    }
+    Ok(())
+}
+
+fn prepare_work_dir(work_dir: &Path) -> Result<()> {
+    fs::create_dir_all(work_dir).with_context(|| format!("create {}", work_dir.display()))?;
+    fs::create_dir_all(work_dir.join("logs"))
+        .with_context(|| format!("create {}", work_dir.join("logs").display()))?;
+    Ok(())
+}
+
+fn node_specs(args: &Args) -> Vec<NodeSpec> {
+    (0..args.nodes)
+        .map(|index| {
+            let id = format!("node-{}", (b'a' + u8::try_from(index).unwrap()) as char);
+            let port = args.base_port + u16::try_from(index).unwrap();
+            NodeSpec {
+                config_path: args.work_dir.join(format!("{id}.toml")),
+                data_dir: args.work_dir.join(&id).join("runtime"),
+                content_dir: args.work_dir.join(&id).join("content"),
+                log_path: args.work_dir.join("logs").join(format!("{id}.log")),
+                url: format!("http://127.0.0.1:{port}"),
+                id,
+                port,
+            }
+        })
+        .collect()
+}
+
+fn write_node_config(args: &Args, node: &NodeSpec) -> Result<()> {
+    fs::create_dir_all(&node.data_dir)?;
+    fs::create_dir_all(&node.content_dir)?;
+    let text = format!(
+        r#"[deployment]
+mode = "cluster"
+
+[server]
+bind = "127.0.0.1:{port}"
+internal_auth_token = "{internal_auth_token}"
+
+[storage]
+data_dir = "{data_dir}"
+content_dir = "{content_dir}"
+
+[storage.kv]
+backend = "slatedb"
+
+[storage.content]
+backend = "object_store"
+
+[storage.object_store]
+backend = "s3"
+bucket = "{bucket}"
+region = "{region}"
+endpoint = "{endpoint}"
+allow_http = true
+
+[routing]
+node_id = "{node_id}"
+shard_count = {shard_count}
+region = "local"
+refresh_interval_ms = 500
+proxy_timeout_ms = 5000
+"#,
+        port = node.port,
+        internal_auth_token = args.internal_auth_token,
+        data_dir = node.data_dir.display(),
+        content_dir = node.content_dir.display(),
+        bucket = args.s3_bucket,
+        region = args.s3_region,
+        endpoint = args.s3_endpoint,
+        node_id = node.id,
+        shard_count = DEFAULT_SHARD_COUNT,
+    );
+    fs::write(&node.config_path, text)?;
+    Ok(())
+}
+
+async fn reset_cluster_meta(meta: &MetaStore) -> Result<()> {
+    let pool = meta.pool();
+    for table in [
+        "tablet_snapshots",
+        "tablet_stats",
+        "tablet_movements",
+        "tablet_replicas",
+        "tablet_ranges",
+        "session_overrides",
+        "shards",
+        "tablets",
+        "nodes",
+        "scheduler_leader",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(pool)
+            .await
+            .with_context(|| format!("clear {table}"))?;
+    }
+    Ok(())
+}
+
+async fn ensure_cluster_meta_empty(meta: &MetaStore) -> Result<()> {
+    let pool = meta.pool();
+    let (node_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM nodes")
+        .fetch_one(pool)
+        .await?;
+    let (tablet_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tablets")
+        .fetch_one(pool)
+        .await?;
+    let (replica_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tablet_replicas")
+        .fetch_one(pool)
+        .await?;
+    if node_count != 0 || tablet_count != 0 || replica_count != 0 {
+        bail!(
+            "metadata store is not empty (nodes={node_count}, tablets={tablet_count}, replicas={replica_count}); use --reset-meta only with a throwaway database"
+        );
+    }
+    Ok(())
+}
+
+async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<()> {
+    let pool = meta.pool();
+    let now_ms = now_ms();
+    tablets::create_with_placement(
+        pool,
+        PRIMARY_TABLET_ID,
+        "default",
+        "serving",
+        Some("tablet-1"),
+        0,
+        now_ms,
+    )
+    .await?;
+    tablets::assign_to(pool, PRIMARY_TABLET_ID, &node_specs[0].id).await?;
+    let tablet = tablets::get(pool, PRIMARY_TABLET_ID)
+        .await?
+        .ok_or_else(|| anyhow!("seeded tablet missing"))?;
+    tablets::assume_ownership(
+        pool,
+        PRIMARY_TABLET_ID,
+        tablet.epoch,
+        &node_specs[0].id,
+        now_ms + 300_000,
+    )
+    .await?;
+    tablet_ranges::upsert(
+        pool,
+        "default",
+        0,
+        DEFAULT_SHARD_COUNT - 1,
+        PRIMARY_TABLET_ID,
+        1,
+        now_ms,
+    )
+    .await?;
+    for node in node_specs {
+        nodes::upsert(
+            pool,
+            &node.id,
+            &node.url,
+            None,
+            "alive",
+            now_ms,
+            Some("local-a"),
+            Some("local"),
+        )
+        .await?;
+        tablet_replicas::upsert(
+            pool,
+            PRIMARY_TABLET_ID,
+            &node.id,
+            "voter",
+            "healthy",
+            0,
+            0,
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
+    let mut children = Vec::new();
+    for node in nodes {
+        let log = fs::File::create(&node.log_path)?;
+        let err = log.try_clone()?;
+        let child = Command::new(&args.server_bin)
+            .arg("serve")
+            .arg("--config")
+            .arg(&node.config_path)
+            .env("AGENTDB_META_BACKEND", "postgres")
+            .env("AGENTDB_META_URL", &args.meta_url)
+            .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
+            .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
+            .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
+            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "1500")
+            .env("AGENTDB_REAPER_TICK_MS", "500")
+            .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "4")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .with_context(|| format!("spawn {}", node.id))?;
+        children.push(child);
+    }
+    Ok(children)
+}
+
+async fn run_smoke(
+    client: &Client,
+    nodes: &[NodeSpec],
+    failover: bool,
+    children: &mut [Child],
+) -> Result<()> {
+    for node in nodes {
+        wait_json(
+            client,
+            &node.url,
+            "/api/admin/cluster/health",
+            Duration::from_secs(30),
+        )
+        .await?;
+    }
+    wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
+
+    let (tenant_id, agent_id, session_id) = create_session_smoke(client, &nodes[0].url).await?;
+    append_and_verify(client, &nodes[0].url, &tenant_id, &agent_id, &session_id, 0).await?;
+    append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 1).await?;
+
+    print_diagnostics(client, nodes).await?;
+
+    if failover {
+        children[0].kill().ok();
+        children[0].wait().ok();
+        wait_node_marked_dead(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(20)).await?;
+        wait_tablet_owner_changed(client, &nodes[1].url, &nodes[0].id, Duration::from_secs(30))
+            .await?;
+        wait_raft_observable(client, &nodes[1].url, Duration::from_secs(20)).await?;
+        append_and_verify(client, &nodes[1].url, &tenant_id, &agent_id, &session_id, 2).await?;
+        print_diagnostics(client, &nodes[1..]).await?;
+    }
+
+    Ok(())
+}
+
+async fn create_session_smoke(client: &Client, base: &str) -> Result<(String, String, String)> {
+    let suffix = now_ms();
+    let tenant = post_json(
+        client,
+        base,
+        "/api/tenants",
+        json!({"external_key": format!("cluster-smoke-{suffix}"), "policy": {}}),
+    )
+    .await?;
+    let tenant_id = string_field(&tenant, "tenant_id")?;
+    let agent = post_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/agents"),
+        json!({"alias": "cluster-smoke-agent", "config": {}}),
+    )
+    .await?;
+    let agent_id = string_field(&agent, "agent_id")?;
+    let session = post_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
+        json!({"alias": null}),
+    )
+    .await?;
+    let session_id = string_field(&session, "session_id")?;
+    Ok((tenant_id, agent_id, session_id))
+}
+
+async fn append_and_verify(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    expected_seq: u64,
+) -> Result<()> {
+    let event = post_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events"),
+        json!({
+            "agent_id": agent_id,
+            "kind": "message",
+            "payload": {"seq": expected_seq, "source": "cluster-smoke"},
+            "artifact_refs": [],
+            "source_refs": []
+        }),
+    )
+    .await?;
+    let seq = event
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
+    if seq != expected_seq {
+        bail!("expected appended seq {expected_seq}, got {seq}");
+    }
+    let events = get_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
+    )
+    .await?;
+    let len = events
+        .as_array()
+        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
+        .len();
+    if len < usize::try_from(expected_seq + 1).unwrap() {
+        bail!("expected at least {} events, got {len}", expected_seq + 1);
+    }
+    Ok(())
+}
+
+async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        let mut ready = true;
+        for node in nodes {
+            let raft = get_json(client, &node.url, "/api/admin/raft").await?;
+            ready &= raft["enabled"] == true
+                && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
+                && raft["summary"]["leaderless_tablet_count"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    == 0;
+        }
+        if ready {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("raft groups did not become ready within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_raft_observable(client: &Client, base: &str, timeout: Duration) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        let raft = get_json(client, base, "/api/admin/raft").await?;
+        if raft["enabled"] == true && raft["tablet_count"].as_u64().unwrap_or(0) >= 1 {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("raft status did not become observable within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_node_marked_dead(
+    client: &Client,
+    base: &str,
+    node_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        let nodes = get_json(client, base, "/api/admin/nodes").await?;
+        let dead = nodes
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .any(|node| node["node_id"] == node_id && node["state"] == "dead")
+            })
+            .unwrap_or(false);
+        if dead {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("node {node_id} was not marked dead within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_tablet_owner_changed(
+    client: &Client,
+    base: &str,
+    old_owner: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        let tablets = get_json(client, base, "/api/admin/tablets").await?;
+        let moved = tablets
+            .as_array()
+            .map(|tablets| {
+                tablets.iter().any(|tablet| {
+                    tablet["tablet_id"] == PRIMARY_TABLET_ID
+                        && tablet["owner_node_id"].as_str().is_some()
+                        && tablet["owner_node_id"] != old_owner
+                })
+            })
+            .unwrap_or(false);
+        if moved {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!(
+                "tablet {PRIMARY_TABLET_ID} did not move away from {old_owner} within {timeout:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
+    for node in nodes {
+        let status = get_json(client, &node.url, "/api/admin/cluster/health").await?;
+        let raft = get_json(client, &node.url, "/api/admin/raft").await?;
+        let scheduler = get_json(client, &node.url, "/api/admin/scheduler").await?;
+        println!(
+            "{} health={} raft_summary={} scheduler={}",
+            node.id, status["status"], raft["summary"], scheduler
+        );
+    }
+    Ok(())
+}
+
+async fn wait_json(client: &Client, base: &str, path: &str, timeout: Duration) -> Result<Value> {
+    let start = tokio::time::Instant::now();
+    loop {
+        match get_json(client, base, path).await {
+            Ok(value) => return Ok(value),
+            Err(error) if start.elapsed() <= timeout => {
+                let _ = error;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error).with_context(|| format!("wait for {base}{path}")),
+        }
+    }
+}
+
+async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
+    let response = client
+        .get(format!("{base}{path}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json().await?)
+}
+
+async fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Result<Value> {
+    let response = client
+        .post(format!("{base}{path}"))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json().await?)
+}
+
+fn string_field(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("missing string field {field}: {value}"))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn stop_children(children: &mut [Child]) {
+    for child in children.iter_mut() {
+        let _ = child.kill();
+    }
+    for child in children.iter_mut() {
+        let _ = child.wait();
+    }
+}
