@@ -624,6 +624,12 @@ async fn wait_tablet_owner(
             if previous_owner.is_some_and(|previous| previous == owner_id) {
                 continue;
             }
+            let Some(leader_id) = current_raft_leader_node_id(client, nodes).await? else {
+                continue;
+            };
+            if leader_id != owner_id {
+                continue;
+            }
             if let Some(owner) = nodes.iter().find(|candidate| candidate.id == owner_id) {
                 return Ok(owner.clone());
             }
@@ -634,6 +640,44 @@ async fn wait_tablet_owner(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+async fn current_raft_leader_node_id(
+    client: &Client,
+    nodes: &[NodeSpec],
+) -> Result<Option<String>> {
+    for node in nodes {
+        let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
+            continue;
+        };
+        let Some(tablet) = raft["tablets"].as_array().and_then(|tablets| {
+            tablets
+                .iter()
+                .find(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
+        }) else {
+            continue;
+        };
+        let Some(leader_raft_node_id) = tablet["replicas"].as_array().and_then(|replicas| {
+            replicas.iter().find_map(|replica| {
+                (replica["role"] == "Leader")
+                    .then(|| replica["node_id"].as_u64())
+                    .flatten()
+            })
+        }) else {
+            continue;
+        };
+        let Some(configured) = tablet["configured_replicas"].as_array() else {
+            continue;
+        };
+        for replica in configured {
+            if replica["raft_node_id"].as_u64() == Some(leader_raft_node_id) {
+                if let Some(node_id) = replica["node_id"].as_str() {
+                    return Ok(Some(node_id.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
