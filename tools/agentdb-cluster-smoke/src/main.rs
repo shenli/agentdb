@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    prepare_work_dir(&args.work_dir)?;
+    prepare_work_dir(&args.work_dir, args.reset_meta)?;
     let nodes = node_specs(&args);
     for node in &nodes {
         write_node_config(&args, node)?;
@@ -145,7 +145,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn prepare_work_dir(work_dir: &Path) -> Result<()> {
+fn prepare_work_dir(work_dir: &Path, reset: bool) -> Result<()> {
+    if reset && work_dir.exists() {
+        fs::remove_dir_all(work_dir)
+            .with_context(|| format!("reset {}", work_dir.display()))?;
+    }
     fs::create_dir_all(work_dir).with_context(|| format!("create {}", work_dir.display()))?;
     fs::create_dir_all(work_dir.join("logs"))
         .with_context(|| format!("create {}", work_dir.join("logs").display()))?;
