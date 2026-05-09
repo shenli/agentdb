@@ -4,7 +4,61 @@ This runbook validates the current multi-process Raft path on one development
 machine. It is intentionally a throwaway harness, not a production bootstrap
 procedure.
 
-## Prerequisites
+## One-Command Local Stack
+
+The easiest local path is the Compose-backed wrapper:
+
+```bash
+scripts/real-cluster-smoke-compose.sh
+```
+
+This starts Postgres and MinIO, creates the bucket, builds the local AgentDB
+binaries, seeds a throwaway cluster topology, starts three local AgentDB server
+processes, runs the smoke checks, and keeps diagnostics under
+`/tmp/agentdb-cluster-smoke`.
+
+Useful options:
+
+```bash
+# Include the owner-kill failover probe.
+scripts/real-cluster-smoke-compose.sh --failover
+
+# Leave Postgres and MinIO running after the smoke finishes.
+AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1 scripts/real-cluster-smoke-compose.sh
+
+# Leave AgentDB server processes running for manual inspection.
+scripts/real-cluster-smoke-compose.sh --keep-running
+```
+
+`--keep-running` also keeps the Compose dependency containers up. Without
+`--keep-running`, set `AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1` when you want to keep
+Postgres and MinIO running after the smoke exits.
+
+Default local ports:
+
+- Postgres: `127.0.0.1:55432`
+- MinIO API: `127.0.0.1:19000`
+- MinIO console: `127.0.0.1:19001`
+- AgentDB nodes: `127.0.0.1:30100`, `30101`, `30102`
+
+Override them with:
+
+```bash
+AGENTDB_CLUSTER_SMOKE_POSTGRES_PORT=55433 \
+AGENTDB_CLUSTER_SMOKE_MINIO_PORT=19010 \
+AGENTDB_CLUSTER_SMOKE_MINIO_CONSOLE_PORT=19011 \
+scripts/real-cluster-smoke-compose.sh
+```
+
+The wrapper intentionally runs only Postgres and MinIO in containers. AgentDB
+itself runs as local child processes so the harness can kill the owner process,
+collect per-node logs, and inspect generated configs directly.
+
+## Manual Dependencies
+
+Use this path when you already have Postgres and S3-compatible storage running.
+
+### Prerequisites
 
 - Postgres database dedicated to this smoke run.
 - S3-compatible object store with an existing bucket. MinIO is suitable.
@@ -30,7 +84,7 @@ mc alias set agentdb-smoke http://127.0.0.1:9000 minioadmin minioadmin
 mc mb --ignore-existing agentdb-smoke/agentdb-smoke
 ```
 
-## Run
+### Run
 
 ```bash
 export AGENTDB_META_URL=postgres://agentdb:agentdb@127.0.0.1:5432/agentdb_smoke
@@ -75,15 +129,20 @@ and rebalance path.
 
 ## Generated Files
 
-By default the harness uses `/tmp/agentdb-cluster-smoke` and removes it after a
-successful run. Use `--keep-work-dir` to retain:
+The low-level `scripts/real-cluster-smoke.sh` removes the work directory after a
+successful run unless `--keep-work-dir` is passed. The Compose wrapper always
+passes `--keep-work-dir` and stores dependency diagnostics there too.
+
+The work directory contains:
 
 - `node-a.toml`, `node-b.toml`, `node-c.toml`
 - per-node runtime and content directories
 - per-node logs under `logs/`
+- Compose dependency logs under `diagnostics/`
 
 ## Safety
 
-Use a disposable Postgres database. `scripts/real-cluster-smoke.sh` passes
-`--reset-meta`, which deletes rows from cluster metadata tables before seeding
-the smoke topology.
+Use a disposable Postgres database. Both smoke scripts pass `--reset-meta`,
+which deletes rows from cluster metadata tables before seeding the smoke
+topology. The Compose wrapper runs against its own default database and leaves
+volumes in place unless you remove them with Docker Compose.
