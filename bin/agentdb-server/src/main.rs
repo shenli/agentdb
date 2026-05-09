@@ -3223,9 +3223,12 @@ async fn reconcile_raft_leader_tablet_ownership(
         let Some(tablet) = agentdb_meta::tablets::get(meta.pool(), tablet_id).await? else {
             continue;
         };
-        if tablet.state != "serving"
-            || tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str())
-        {
+        if tablet.state != "serving" {
+            continue;
+        }
+        let same_owner = tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str());
+        let renew_threshold_ms = now_ms.saturating_add(lease_ms / 2);
+        if same_owner && tablet.lease_expires_at_ms > renew_threshold_ms {
             continue;
         }
         match agentdb_meta::tablets::assume_ownership(
@@ -5834,6 +5837,66 @@ region = "us-west-2"
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
         assert_eq!(tablet.epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://node-a",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 2_500)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let leader_id = agentdb_storage::stable_raft_node_id("node-a").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let renewed = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(renewed, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(tablet.epoch, 2);
+        assert_eq!(tablet.lease_expires_at_ms, 32_000);
     }
 
     #[tokio::test]
