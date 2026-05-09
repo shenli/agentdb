@@ -2144,6 +2144,7 @@ async fn run_raft_rs_message_outbox_tick(
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages_per_tick: usize,
 ) -> anyhow::Result<usize> {
+    refresh_raft_rs_peer_urls(meta, registry, outbox).await?;
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
         if sent >= max_messages_per_tick {
