@@ -415,8 +415,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         config.route_refresh_interval_ms,
                     );
                     spawn_raft_rs_tick_worker(
-                        startup.meta.clone(),
-                        startup.node_id.clone(),
                         registry.clone(),
                         local_raft_node_id,
                         Duration::from_millis(raft_tick_interval_ms),
@@ -1866,8 +1864,6 @@ fn spawn_raft_rs_peer_url_refresher(
 }
 
 fn spawn_raft_rs_tick_worker(
-    meta: agentdb_meta::MetaStore,
-    local_node_id: String,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     local_raft_node_id: u64,
     interval: Duration,
@@ -1877,32 +1873,13 @@ fn spawn_raft_rs_tick_worker(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let owned_tablet_ids =
-                match agentdb_meta::tablets::list_owned_by(meta.pool(), &local_node_id).await {
-                    Ok(tablets) => tablets
-                        .into_iter()
-                        .map(|tablet| tablet.tablet_id)
-                        .collect::<BTreeSet<_>>(),
-                    Err(error) => {
-                        tracing::warn!(
-                            local_node_id,
-                            ?error,
-                            "failed to load owned tablets for raft-rs tick"
-                        );
-                        BTreeSet::new()
-                    }
-                };
             for (tablet_id, group) in registry.groups_snapshot() {
-                let local_is_leader = group.status().iter().any(|status| {
-                    status.node_id == local_raft_node_id && status.role.as_str() == "Leader"
-                });
-                if !local_is_leader && !owned_tablet_ids.contains(&tablet_id) {
-                    continue;
-                }
+                // Followers must tick too: raft-rs uses ticks to expire leader leases and
+                // pre-vote state, which lets them grant the metadata owner's campaign after
+                // failover. Explicit campaign requests remain ownership-gated separately.
                 if let Err(error) = group.tick(local_raft_node_id) {
                     tracing::warn!(
                         tablet_id,
-                        local_node_id,
                         local_raft_node_id,
                         ?error,
                         "failed to tick local raft-rs group"
