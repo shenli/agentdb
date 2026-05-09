@@ -362,6 +362,7 @@ async fn run_smoke(
     failover: bool,
     children: &mut [Child],
 ) -> Result<()> {
+    eprintln!("smoke: waiting for node health");
     for node in nodes {
         wait_json(
             client,
@@ -371,16 +372,23 @@ async fn run_smoke(
         )
         .await?;
     }
+    eprintln!("smoke: waiting for raft readiness");
     wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
 
+    eprintln!("smoke: resolving initial tablet writer");
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    eprintln!("smoke: initial tablet writer {}", owner.id);
+    eprintln!("smoke: creating tenant/agent/session");
     let (tenant_id, agent_id, session_id) = create_session_smoke(client, nodes).await?;
+    eprintln!("smoke: appending event 0");
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
+    eprintln!("smoke: appending event 1");
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
 
     print_diagnostics(client, nodes).await?;
 
     if failover {
+        eprintln!("smoke: killing initial writer {}", owner.id);
         let owner_index = nodes
             .iter()
             .position(|node| node.id == owner.id)
@@ -391,11 +399,16 @@ async fn run_smoke(
             .iter()
             .find(|node| node.id != owner.id)
             .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
+        eprintln!("smoke: waiting for {} to be marked dead", owner.id);
         wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(20)).await?;
+        eprintln!("smoke: waiting for tablet owner change");
         wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(90))
             .await?;
+        eprintln!("smoke: waiting for raft observability after failover");
         wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
+        eprintln!("smoke: waiting for new tablet writer");
         wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(90)).await?;
+        eprintln!("smoke: appending event 2 after failover");
         append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 2).await?;
         let survivors: Vec<_> = nodes
             .iter()
@@ -414,6 +427,7 @@ async fn create_session_smoke(
 ) -> Result<(String, String, String)> {
     let mut last_error = None;
     for attempt in 0..10 {
+        eprintln!("smoke: create session attempt {}", attempt + 1);
         let suffix = format!("{}-{attempt}", now_ms());
         match create_session_smoke_once(client, nodes, &suffix).await {
             Ok(session) => return Ok(session),
@@ -433,6 +447,7 @@ async fn create_session_smoke_once(
     suffix: &str,
 ) -> Result<(String, String, String)> {
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    eprintln!("smoke: creating tenant via {}", owner.id);
     let tenant = post_json(
         client,
         &owner.url,
@@ -441,6 +456,7 @@ async fn create_session_smoke_once(
     )
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
+    eprintln!("smoke: creating agent for tenant {tenant_id}");
     let agent = post_json_with_convergence_retry(
         client,
         nodes,
@@ -450,6 +466,7 @@ async fn create_session_smoke_once(
     )
     .await?;
     let agent_id = string_field(&agent, "agent_id")?;
+    eprintln!("smoke: creating session for agent {agent_id}");
     let session = post_json_with_convergence_retry(
         client,
         nodes,
@@ -470,8 +487,9 @@ async fn post_json_with_convergence_retry(
     attempts: usize,
 ) -> Result<Value> {
     let mut last_error = None;
-    for _ in 0..attempts.max(1) {
+    for attempt in 0..attempts.max(1) {
         let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!("smoke: POST {path} attempt {} via {}", attempt + 1, owner.id);
         match post_json(client, &owner.url, path, body.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
@@ -494,6 +512,11 @@ async fn append_and_verify(
 ) -> Result<()> {
     for attempt in 0..3 {
         let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: append seq {expected_seq} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
         let append_result = post_json(
             client,
             &owner.url,
