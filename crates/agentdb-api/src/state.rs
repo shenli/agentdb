@@ -102,6 +102,9 @@ pub struct SchedulerStatus {
     is_leader: Arc<AtomicBool>,
     dead_nodes_marked_total: Arc<AtomicU64>,
     tablet_reassignments_total: Arc<AtomicU64>,
+    local_tablet_log_compactions_total: Arc<AtomicU64>,
+    local_tablet_log_compaction_failures_total: Arc<AtomicU64>,
+    local_tablet_log_compaction_last_tick_at_ms: Arc<AtomicI64>,
     last_tick_at_ms: Arc<AtomicI64>,
 }
 
@@ -114,6 +117,9 @@ impl SchedulerStatus {
             is_leader: Arc::new(AtomicBool::new(false)),
             dead_nodes_marked_total: Arc::new(AtomicU64::new(0)),
             tablet_reassignments_total: Arc::new(AtomicU64::new(0)),
+            local_tablet_log_compactions_total: Arc::new(AtomicU64::new(0)),
+            local_tablet_log_compaction_failures_total: Arc::new(AtomicU64::new(0)),
+            local_tablet_log_compaction_last_tick_at_ms: Arc::new(AtomicI64::new(0)),
             last_tick_at_ms: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -126,6 +132,15 @@ impl SchedulerStatus {
             is_leader: self.is_leader.load(Ordering::SeqCst),
             dead_nodes_marked_total: self.dead_nodes_marked_total.load(Ordering::SeqCst),
             tablet_reassignments_total: self.tablet_reassignments_total.load(Ordering::SeqCst),
+            local_tablet_log_compactions_total: self
+                .local_tablet_log_compactions_total
+                .load(Ordering::SeqCst),
+            local_tablet_log_compaction_failures_total: self
+                .local_tablet_log_compaction_failures_total
+                .load(Ordering::SeqCst),
+            local_tablet_log_compaction_last_tick_at_ms: self
+                .local_tablet_log_compaction_last_tick_at_ms
+                .load(Ordering::SeqCst),
             last_tick_at_ms: self.last_tick_at_ms.load(Ordering::SeqCst),
         }
     }
@@ -151,6 +166,18 @@ impl SchedulerStatus {
             .fetch_add(n, Ordering::SeqCst);
     }
 
+    pub fn add_local_tablet_log_compactions(&self, n: u64, now_ms: i64) {
+        self.local_tablet_log_compactions_total
+            .fetch_add(n, Ordering::SeqCst);
+        self.local_tablet_log_compaction_last_tick_at_ms
+            .store(now_ms, Ordering::SeqCst);
+    }
+
+    pub fn add_local_tablet_log_compaction_failure(&self) {
+        self.local_tablet_log_compaction_failures_total
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn set_last_tick_at_ms(&self, now_ms: i64) {
         self.last_tick_at_ms.store(now_ms, Ordering::SeqCst);
     }
@@ -164,6 +191,9 @@ pub struct SchedulerStatusSnapshot {
     pub is_leader: bool,
     pub dead_nodes_marked_total: u64,
     pub tablet_reassignments_total: u64,
+    pub local_tablet_log_compactions_total: u64,
+    pub local_tablet_log_compaction_failures_total: u64,
+    pub local_tablet_log_compaction_last_tick_at_ms: i64,
     pub last_tick_at_ms: i64,
 }
 

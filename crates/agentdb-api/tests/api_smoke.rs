@@ -894,6 +894,8 @@ async fn admin_raft_status_reports_disabled_mode() {
 
     assert_eq!(body["enabled"], false);
     assert_eq!(body["tablet_count"], 0);
+    assert_eq!(body["summary"]["leaderless_tablet_count"], 0);
+    assert_eq!(body["summary"]["catch_up_required_replica_count"], 0);
 }
 
 #[tokio::test]
@@ -920,6 +922,8 @@ async fn admin_raft_status_reports_registered_tablets() {
     assert_eq!(body["tablet_count"], 1);
     assert_eq!(body["tablets"][0]["tablet_id"], 7);
     assert_eq!(body["tablets"][0]["replicas"].as_array().unwrap().len(), 3);
+    assert_eq!(body["summary"]["leaderless_tablet_count"], 1);
+    assert_eq!(body["summary"]["commit_index_drift_tablet_count"], 0);
 }
 
 #[tokio::test]
@@ -955,6 +959,8 @@ async fn admin_raft_status_joins_control_plane_replica_metadata() {
     assert_eq!(body["control_plane_enabled"], true);
     assert_eq!(body["configured_replica_count"], 2);
     assert_eq!(body["unhealthy_replica_count"], 1);
+    assert_eq!(body["summary"]["catch_up_required_replica_count"], 1);
+    assert_eq!(body["summary"]["lagging_replica_count"], 1);
     let configured = body["tablets"][0]["configured_replicas"]
         .as_array()
         .unwrap();
@@ -1004,6 +1010,8 @@ async fn admin_raft_status_reports_configured_only_replicas() {
         body["tablets"][0]["configured_replicas"][0]["catch_up_required"],
         true
     );
+    assert_eq!(body["summary"]["catch_up_required_replica_count"], 1);
+    assert_eq!(body["summary"]["snapshot_absent_for_catch_up_count"], 1);
 }
 
 #[tokio::test]
@@ -3272,6 +3280,8 @@ async fn admin_scheduler_reports_status_snapshot() {
     scheduler.update_leader("node-a", 7, 42_000, true);
     scheduler.add_dead_nodes_marked(2);
     scheduler.add_tablet_reassignments(3);
+    scheduler.add_local_tablet_log_compactions(4, 40_500);
+    scheduler.add_local_tablet_log_compaction_failure();
     scheduler.set_last_tick_at_ms(41_000);
     let state = AppState::new(runtime).with_scheduler(scheduler);
     let app = spawn_app_with_state(state).await;
@@ -3294,6 +3304,9 @@ async fn admin_scheduler_reports_status_snapshot() {
     assert_eq!(body["is_leader"], true);
     assert_eq!(body["dead_nodes_marked_total"], 2);
     assert_eq!(body["tablet_reassignments_total"], 3);
+    assert_eq!(body["local_tablet_log_compactions_total"], 4);
+    assert_eq!(body["local_tablet_log_compaction_failures_total"], 1);
+    assert_eq!(body["local_tablet_log_compaction_last_tick_at_ms"], 40_500);
     assert_eq!(body["last_tick_at_ms"], 41_000);
 }
 

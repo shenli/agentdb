@@ -30,7 +30,9 @@ The codebase and docs contain these cluster pieces:
 - retained raft snapshot metadata plus restore/prune workers
 - rebalance, replacement, split, and merge control-plane workflows
 - `/api/admin/raft` status with leader, term, commit/apply index, configured
-  replica lag, pending membership-change state, and outbound-message backlog
+  replica lag, pending membership-change state, outbound-message backlog, and
+  aggregate health counters for leaderless tablets, index drift, lagging
+  replicas, catch-up needs, and expired catch-up snapshots
 
 Those pieces are useful for development and internal evaluation, but they are
 **not** the same thing as a supported cluster product.
@@ -123,8 +125,9 @@ And a very small amount of direct metadata admin:
   group is registered, retrying `draining` source retirement, and evening out
   fresh `alive` node load
 - `agentdbctl raft status` for local Raft group status, configured replica
-  progress, replication lag, catch-up-needed visibility, and configured-only
-  tablets that have not opened a local Raft group on the queried API node
+  progress, replication lag, aggregate health summary, catch-up-needed
+  visibility, and configured-only tablets that have not opened a local Raft
+  group on the queried API node
 - `agentdbctl raft catch-up --dry-run` for previewing snapshot catch-up
   candidates, and `agentdbctl raft catch-up` for manually sending snapshots to
   lagging voter/learner replicas
@@ -167,7 +170,9 @@ when metadata-backed cluster mode is enabled:
   sample interval, write ops/sec, retained committed log entries, and update
   time
 - opt-in local tablet log compaction by retained committed-entry debt through
-  `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`
+  `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`; `GET /api/admin/scheduler`
+  and `agentdbctl status` expose local compaction success/failure counters so
+  operators can distinguish an idle worker from a stuck one
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
