@@ -2432,6 +2432,7 @@ fn spawn_cluster_workers(
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
     let heartbeat_runtime = runtime.clone();
+    let heartbeat_scheduler_status = scheduler_status.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -2460,6 +2461,8 @@ fn spawn_cluster_workers(
                 config.tablet_log_compaction_min_debt_ops,
             ) {
                 Ok(compacted_count) if compacted_count > 0 => {
+                    heartbeat_scheduler_status
+                        .add_local_tablet_log_compactions(compacted_count as u64, now_ms);
                     tracing::debug!(
                         node_id = %heartbeat_node_id,
                         compacted_count,
@@ -2468,6 +2471,7 @@ fn spawn_cluster_workers(
                 }
                 Ok(_) => {}
                 Err(error) => {
+                    heartbeat_scheduler_status.add_local_tablet_log_compaction_failure();
                     tracing::warn!(
                         node_id = %heartbeat_node_id,
                         error = %error,

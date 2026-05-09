@@ -611,6 +611,9 @@ struct SchedulerStatusResponse {
     is_leader: bool,
     dead_nodes_marked_total: u64,
     tablet_reassignments_total: u64,
+    local_tablet_log_compactions_total: u64,
+    local_tablet_log_compaction_failures_total: u64,
+    local_tablet_log_compaction_last_tick_at_ms: i64,
     last_tick_at_ms: i64,
 }
 
@@ -701,7 +704,23 @@ struct RaftStatusResponse {
     unhealthy_replica_count: usize,
     pending_conf_change_count: usize,
     outbound_message_count: usize,
+    summary: RaftOpsSummary,
     tablets: Vec<RaftTabletStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RaftOpsSummary {
+    leaderless_tablet_count: usize,
+    multi_leader_tablet_count: usize,
+    commit_index_drift_tablet_count: usize,
+    applied_index_drift_tablet_count: usize,
+    max_commit_index_gap: u64,
+    max_applied_index_gap: u64,
+    catch_up_required_replica_count: usize,
+    lagging_replica_count: usize,
+    unreachable_replica_count: usize,
+    snapshot_absent_for_catch_up_count: usize,
+    expired_snapshot_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1301,6 +1320,9 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
             is_leader: false,
             dead_nodes_marked_total: 0,
             tablet_reassignments_total: 0,
+            local_tablet_log_compactions_total: 0,
+            local_tablet_log_compaction_failures_total: 0,
+            local_tablet_log_compaction_last_tick_at_ms: 0,
             last_tick_at_ms: 0,
         });
     Json(SchedulerStatusResponse {
@@ -1310,6 +1332,11 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         is_leader: snapshot.is_leader,
         dead_nodes_marked_total: snapshot.dead_nodes_marked_total,
         tablet_reassignments_total: snapshot.tablet_reassignments_total,
+        local_tablet_log_compactions_total: snapshot.local_tablet_log_compactions_total,
+        local_tablet_log_compaction_failures_total: snapshot
+            .local_tablet_log_compaction_failures_total,
+        local_tablet_log_compaction_last_tick_at_ms: snapshot
+            .local_tablet_log_compaction_last_tick_at_ms,
         last_tick_at_ms: snapshot.last_tick_at_ms,
     })
 }
@@ -3374,6 +3401,7 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
             now_ms,
             &BTreeSet::new(),
         );
+        let summary = raft_ops_summary(&tablets, now_ms);
         return Ok(Json(RaftStatusResponse {
             enabled: false,
             control_plane_enabled: s.meta.is_some(),
@@ -3382,6 +3410,7 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
             unhealthy_replica_count,
             pending_conf_change_count: 0,
             outbound_message_count: 0,
+            summary,
             tablets,
         }));
     };
@@ -3446,6 +3475,7 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
         .flat_map(|tablet| &tablet.replicas)
         .map(|replica| replica.outbound_message_count)
         .sum();
+    let summary = raft_ops_summary(&tablets, now_ms);
     Ok(Json(RaftStatusResponse {
         enabled: true,
         control_plane_enabled: s.meta.is_some(),
@@ -3454,8 +3484,91 @@ async fn get_raft_status(State(s): State<AppState>) -> Result<Json<RaftStatusRes
         unhealthy_replica_count,
         pending_conf_change_count,
         outbound_message_count,
+        summary,
         tablets,
     }))
+}
+
+fn raft_ops_summary(tablets: &[RaftTabletStatus], now_ms: i64) -> RaftOpsSummary {
+    let mut summary = RaftOpsSummary {
+        leaderless_tablet_count: 0,
+        multi_leader_tablet_count: 0,
+        commit_index_drift_tablet_count: 0,
+        applied_index_drift_tablet_count: 0,
+        max_commit_index_gap: 0,
+        max_applied_index_gap: 0,
+        catch_up_required_replica_count: 0,
+        lagging_replica_count: 0,
+        unreachable_replica_count: 0,
+        snapshot_absent_for_catch_up_count: 0,
+        expired_snapshot_count: 0,
+    };
+
+    for tablet in tablets {
+        if tablet.local_group_open {
+            let leader_count = tablet
+                .replicas
+                .iter()
+                .filter(|replica| replica.role == "Leader")
+                .count();
+            if leader_count == 0 {
+                summary.leaderless_tablet_count += 1;
+            } else if leader_count > 1 {
+                summary.multi_leader_tablet_count += 1;
+            }
+
+            let commit_gap = index_gap(tablet.replicas.iter().map(|replica| replica.commit_index));
+            if commit_gap > 0 {
+                summary.commit_index_drift_tablet_count += 1;
+                summary.max_commit_index_gap = summary.max_commit_index_gap.max(commit_gap);
+            }
+            let applied_gap =
+                index_gap(tablet.replicas.iter().map(|replica| replica.applied_index));
+            if applied_gap > 0 {
+                summary.applied_index_drift_tablet_count += 1;
+                summary.max_applied_index_gap = summary.max_applied_index_gap.max(applied_gap);
+            }
+        }
+
+        for replica in &tablet.configured_replicas {
+            if replica.catch_up_required {
+                summary.catch_up_required_replica_count += 1;
+                if replica.last_snapshot_index.is_none() {
+                    summary.snapshot_absent_for_catch_up_count += 1;
+                }
+            }
+            if replica.health == "lagging" || replica.replication_lag > 0 {
+                summary.lagging_replica_count += 1;
+            }
+            if replica.health == "unreachable" || replica.membership_state == "unreachable" {
+                summary.unreachable_replica_count += 1;
+            }
+            if replica
+                .last_snapshot_expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+            {
+                summary.expired_snapshot_count += 1;
+            }
+        }
+    }
+
+    summary
+}
+
+fn index_gap(indexes: impl Iterator<Item = u64>) -> u64 {
+    let mut min = u64::MAX;
+    let mut max = 0;
+    let mut count = 0;
+    for index in indexes {
+        min = min.min(index);
+        max = max.max(index);
+        count += 1;
+    }
+    if count < 2 {
+        0
+    } else {
+        max.saturating_sub(min)
+    }
 }
 
 fn configured_only_raft_tablet_statuses(

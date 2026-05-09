@@ -841,14 +841,16 @@ fn render_status(value: &Value) -> String {
     .unwrap();
     writeln!(
         out,
-        "nodes={} alive={} stale={} tablets={} unowned={} leader={} reassignments={}",
+        "nodes={} alive={} stale={} tablets={} unowned={} leader={} reassignments={} log_compactions={} log_compaction_failures={}",
         text(&health["summary"]["node_count"]),
         text(&health["summary"]["alive_node_count"]),
         text(&health["summary"]["stale_node_count"]),
         text(&health["summary"]["tablet_count"]),
         text(&health["summary"]["unowned_tablet_count"]),
         text(&scheduler["leader_node_id"]),
-        text(&scheduler["tablet_reassignments_total"])
+        text(&scheduler["tablet_reassignments_total"]),
+        text(&scheduler["local_tablet_log_compactions_total"]),
+        text(&scheduler["local_tablet_log_compaction_failures_total"])
     )
     .unwrap();
     if let Some(reasons) = readiness.get("reasons").and_then(Value::as_array) {
