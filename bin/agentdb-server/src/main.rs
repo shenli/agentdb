@@ -1953,23 +1953,35 @@ fn spawn_raft_rs_tick_worker(
                     });
                 if !local_is_owner && !local_is_leader {
                     if owner_unavailable || raft_leader_unavailable {
-                        if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
-                            tracing::warn!(
-                                tablet_id,
-                                local_node_id,
-                                local_raft_node_id,
-                                ?error,
-                                "failed to expire local raft-rs leader lease"
-                            );
-                        }
-                        if let Err(error) = group.tick(local_raft_node_id) {
-                            tracing::warn!(
-                                tablet_id,
-                                local_node_id,
-                                local_raft_node_id,
-                                ?error,
-                                "failed to tick local raft-rs group after owner became unavailable"
-                            );
+                        let failover_candidate = raft_node_to_node_id
+                            .iter()
+                            .filter_map(|((replica_tablet_id, raft_node_id), node_id)| {
+                                (*replica_tablet_id == tablet_id
+                                    && nodes_by_id
+                                        .get(node_id)
+                                        .is_some_and(|node| node.state.as_str() == "alive"))
+                                .then_some(*raft_node_id)
+                            })
+                            .min();
+                        if failover_candidate == Some(local_raft_node_id) {
+                            if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+                                tracing::warn!(
+                                    tablet_id,
+                                    local_node_id,
+                                    local_raft_node_id,
+                                    ?error,
+                                    "failed to expire local raft-rs leader lease"
+                                );
+                            }
+                            if let Err(error) = group.tick(local_raft_node_id) {
+                                tracing::warn!(
+                                    tablet_id,
+                                    local_node_id,
+                                    local_raft_node_id,
+                                    ?error,
+                                    "failed to tick local raft-rs group after owner became unavailable"
+                                );
+                            }
                         }
                     }
                     continue;
