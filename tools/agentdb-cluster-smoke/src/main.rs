@@ -336,7 +336,7 @@ fn spawn_nodes(args: &Args, nodes: &[NodeSpec]) -> Result<Vec<Child>> {
             .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
             .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
             .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "5000")
+            .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "10000")
             .env("AGENTDB_REAPER_TICK_MS", "500")
             .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "4")
             .env("AWS_EC2_METADATA_DISABLED", "true")
