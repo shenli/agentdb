@@ -19,6 +19,6 @@ cd "$ROOT"
 cargo build -q -p agentdb-server -p agentdbctl -p agentdb-cluster-smoke
 
 exec target/debug/agentdb-cluster-smoke \
-  --server-bin target/debug/agentdb-server \
+  --server-bin target/debug/agentdb \
   --reset-meta \
   "$@"
