@@ -1,0 +1,59 @@
+# Local dependencies for the real-cluster smoke harness.
+#
+# This compose file deliberately runs only shared dependencies. The AgentDB
+# server processes still run as local child processes so the harness can kill,
+# restart, and inspect them directly.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${AGENTDB_CLUSTER_SMOKE_POSTGRES_USER:-agentdb}
+      POSTGRES_PASSWORD: ${AGENTDB_CLUSTER_SMOKE_POSTGRES_PASSWORD:-agentdb}
+      POSTGRES_DB: ${AGENTDB_CLUSTER_SMOKE_POSTGRES_DB:-agentdb_smoke}
+    ports:
+      - "${AGENTDB_CLUSTER_SMOKE_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${AGENTDB_CLUSTER_SMOKE_POSTGRES_USER:-agentdb} -d ${AGENTDB_CLUSTER_SMOKE_POSTGRES_DB:-agentdb_smoke}",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - agentdb-cluster-smoke-postgres:/var/lib/postgresql/data
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "${AGENTDB_CLUSTER_SMOKE_MINIO_PORT:-19000}:9000"
+      - "${AGENTDB_CLUSTER_SMOKE_MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - agentdb-cluster-smoke-minio:/data
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AGENTDB_S3_BUCKET: ${AGENTDB_S3_BUCKET:-agentdb-smoke}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set agentdb-smoke http://minio:9000 "$$AWS_ACCESS_KEY_ID" "$$AWS_SECRET_ACCESS_KEY"; do
+          sleep 1
+        done
+        mc mb --ignore-existing "agentdb-smoke/$$AGENTDB_S3_BUCKET"
+
+volumes:
+  agentdb-cluster-smoke-postgres:
+  agentdb-cluster-smoke-minio:
