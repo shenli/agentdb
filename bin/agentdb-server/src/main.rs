@@ -2055,6 +2055,7 @@ async fn flush_raft_rs_group_messages_with_health(
         group.restore_wire_messages(messages[send_limit..].to_vec())?;
     }
     let mut sent = 0usize;
+    let mut failed = Vec::new();
     for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
@@ -2065,10 +2066,19 @@ async fn flush_raft_rs_group_messages_with_health(
             Err(error) => {
                 set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "unreachable")
                     .await?;
-                group.restore_wire_messages(messages[index..send_limit].to_vec())?;
-                return Err(anyhow::anyhow!(error));
+                tracing::debug!(
+                    tablet_id,
+                    from = message.from,
+                    to = message.to,
+                    ?error,
+                    "deferred raft-rs message to unreachable peer"
+                );
+                failed.push(messages[index].clone());
             }
         }
+    }
+    if !failed.is_empty() {
+        group.restore_wire_messages(failed)?;
     }
     Ok(sent)
 }
@@ -6662,11 +6672,11 @@ region = "us-west-2"
             .unwrap();
         let outbox = agentdb_api::internal_raft_http::RaftRsHttpOutbox::new("secret");
 
-        let err = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
+        let sent = flush_raft_rs_group_messages_with_health(&meta, 7, &group, &outbox, 1_024)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(err.to_string().contains("peer URL is not configured"));
+        assert_eq!(sent, 0);
         assert_eq!(group.take_wire_messages().len(), 1);
         let replicas = tablet_replicas::list_by_tablet(meta.pool(), 7)
             .await
