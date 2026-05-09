@@ -698,8 +698,12 @@ async fn append_and_verify(
                     .get("seq")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
-                if seq == expected_seq
-                    || event_count(client, nodes, tenant_id, session_id).await? > expected_seq
+                if seq == expected_seq {
+                    break;
+                }
+                if event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10)
+                    .await?
+                    > usize::try_from(expected_seq).unwrap()
                 {
                     break;
                 }
@@ -707,7 +711,10 @@ async fn append_and_verify(
             }
             Err(error) if is_retryable_cluster_convergence_error(&error) && attempt < 2 => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                if event_count(client, nodes, tenant_id, session_id).await? > expected_seq {
+                if event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10)
+                    .await?
+                    > usize::try_from(expected_seq).unwrap()
+                {
                     break;
                 }
             }
