@@ -781,6 +781,7 @@ async fn run_cell(
     let samples = Arc::new(Mutex::new(Vec::<OperationSample>::new()));
     let deadline = Instant::now() + duration;
     let fixtures = Arc::new(flatten_fixtures(manifest)?);
+    let config = Arc::new(manifest.config.clone());
     let mut handles = Vec::new();
 
     for worker_id in 0..concurrency {
@@ -788,6 +789,7 @@ async fn run_cell(
         let args = args.clone_for_worker();
         let samples = samples.clone();
         let fixtures = fixtures.clone();
+        let config = config.clone();
         let raw_writer = raw_writer.clone();
         let pg_pool = pg_pool.clone();
         handles.push(tokio::spawn(async move {
@@ -800,6 +802,7 @@ async fn run_cell(
                     &client,
                     pg_pool.as_deref(),
                     &args,
+                    &config,
                     &fixtures,
                     &mut rng,
                     operation,
@@ -867,6 +870,7 @@ async fn run_one_operation(
     client: &Client,
     pg_pool: Option<&PgPool>,
     args: &RunArgs,
+    config: &DatasetConfig,
     fixtures: &[FlatSession],
     rng: &mut StdRng,
     operation: Operation,
@@ -877,7 +881,7 @@ async fn run_one_operation(
     let fixture = &fixtures[rng.gen_range(0..fixtures.len())];
     if args.backend == "postgres-event-log" {
         let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
-        return run_one_postgres_operation(pool, args, fixture, rng, operation).await;
+        return run_one_postgres_operation(pool, args, config, fixture, rng, operation).await;
     }
     match operation {
         Operation::AppendFetch => {
@@ -950,16 +954,7 @@ async fn run_one_operation(
             .map(|_| ())
         }
         Operation::Artifact => {
-            let bytes = deterministic_bytes(1024, rng);
-            post_bytes(
-                client,
-                &args.base_url,
-                &format!("/api/tenants/{}/artifacts", fixture.tenant_id),
-                bytes,
-                "application/octet-stream",
-            )
-            .await
-            .map(|_| ())
+            run_one_agentdb_artifact_operation(client, args, config, fixture, rng).await
         }
     }
 }
@@ -1228,6 +1223,98 @@ async fn append_and_fetch(
     Ok(())
 }
 
+async fn run_one_agentdb_artifact_operation(
+    client: &Client,
+    args: &RunArgs,
+    config: &DatasetConfig,
+    fixture: &FlatSession,
+    rng: &mut StdRng,
+) -> Result<()> {
+    match config.artifact_mode {
+        ArtifactMode::Reference => append_event(
+            client,
+            &args.base_url,
+            &fixture.tenant_id,
+            &fixture.agent_id,
+            &fixture.session_id,
+            "artifact",
+            json!({
+                "role": "tool",
+                "content": "external artifact reference",
+                "external_artifact_refs": [{
+                    "content_uri": format!("bench://runtime-artifact/{}", rng.gen::<u64>()),
+                    "content_type": "application/octet-stream",
+                    "bytes": config.artifact_large_bytes,
+                    "sha256": format!("{:016x}", rng.gen::<u64>())
+                }]
+            }),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map(|_| ()),
+        ArtifactMode::ContentBackend => {
+            let size = if rng.gen_bool(0.2) {
+                config.artifact_large_bytes
+            } else {
+                config.artifact_small_bytes
+            };
+            let bytes = deterministic_bytes(size, rng);
+            post_bytes(
+                client,
+                &args.base_url,
+                &format!("/api/tenants/{}/artifacts", fixture.tenant_id),
+                bytes,
+                "application/octet-stream",
+            )
+            .await
+            .map(|_| ())
+        }
+        ArtifactMode::Mixed => {
+            if rng.gen_bool(0.5) {
+                append_event(
+                    client,
+                    &args.base_url,
+                    &fixture.tenant_id,
+                    &fixture.agent_id,
+                    &fixture.session_id,
+                    "artifact",
+                    json!({
+                        "role": "tool",
+                        "content": "external artifact reference",
+                        "external_artifact_refs": [{
+                            "content_uri": format!("bench://runtime-artifact/{}", rng.gen::<u64>()),
+                            "content_type": "application/octet-stream",
+                            "bytes": config.artifact_large_bytes,
+                            "sha256": format!("{:016x}", rng.gen::<u64>())
+                        }]
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                let size = if rng.gen_bool(0.2) {
+                    config.artifact_large_bytes
+                } else {
+                    config.artifact_small_bytes
+                };
+                let bytes = deterministic_bytes(size, rng);
+                post_bytes(
+                    client,
+                    &args.base_url,
+                    &format!("/api/tenants/{}/artifacts", fixture.tenant_id),
+                    bytes,
+                    "application/octet-stream",
+                )
+                .await
+                .map(|_| ())
+            }
+        }
+    }
+}
+
 async fn create_record(
     client: &Client,
     base_url: &str,
@@ -1261,6 +1348,7 @@ async fn create_record(
 async fn run_one_postgres_operation(
     pool: &PgPool,
     args: &RunArgs,
+    config: &DatasetConfig,
     fixture: &FlatSession,
     rng: &mut StdRng,
     operation: Operation,
@@ -1330,16 +1418,25 @@ async fn run_one_postgres_operation(
             )
             .await
         }
-        Operation::Artifact => pg_create_artifact_reference(
-            pool,
-            &args.run_id,
-            &fixture.tenant_id,
-            &fixture.session_id,
-            1024,
-            rng,
-        )
-        .await
-        .map(|_| ()),
+        Operation::Artifact => {
+            let bytes = match config.artifact_mode {
+                ArtifactMode::ContentBackend | ArtifactMode::Mixed if rng.gen_bool(0.2) => {
+                    config.artifact_large_bytes
+                }
+                ArtifactMode::ContentBackend | ArtifactMode::Mixed => config.artifact_small_bytes,
+                ArtifactMode::Reference => config.artifact_large_bytes,
+            };
+            pg_create_artifact_reference(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                bytes,
+                rng,
+            )
+            .await
+            .map(|_| ())
+        }
     }
 }
 
