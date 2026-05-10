@@ -699,6 +699,7 @@ async fn run(args: RunArgs) -> Result<()> {
             &args,
             &manifest,
             concurrency,
+            warmup.as_secs_f64(),
             duration,
             args.seed + concurrency as u64,
             raw_writer.clone(),
@@ -756,6 +757,7 @@ async fn run_cell_warmup(
         args,
         manifest,
         concurrency,
+        0.0,
         duration,
         seed,
         None,
@@ -770,6 +772,7 @@ async fn run_cell(
     args: &RunArgs,
     manifest: &DatasetManifest,
     concurrency: usize,
+    warmup_secs: f64,
     duration: Duration,
     seed: u64,
     raw_writer: Option<Arc<Mutex<BufWriter<File>>>>,
@@ -850,7 +853,7 @@ async fn run_cell(
         .collect();
     Ok(CellReport {
         concurrency,
-        warmup_secs: 0.0,
+        warmup_secs,
         duration_secs: duration.as_secs_f64(),
         successful_ops,
         errors,
