@@ -231,8 +231,10 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 
 - **Operate and debug**:
   [docs/operations/PERFORMANCE.md](docs/operations/PERFORMANCE.md) has
-  benchmark notes, and [docs/runbooks/README.md](docs/runbooks/README.md)
-  links runbooks for API errors that include `doc_url`.
+  benchmark notes; [docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md)
+  defines the MongoDB/Postgres comparison plan; and
+  [docs/runbooks/README.md](docs/runbooks/README.md) links runbooks for API
+  errors that include `doc_url`.
 
 - **Roadmap and planning archive**:
   [docs/roadmap.md](docs/roadmap.md) covers future direction; historical plans

@@ -29,6 +29,9 @@ or implementation plans.
   friendly admin workflows
 - [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
   and current performance notes
+- [operations/AGENTDB_BENCH.md](operations/AGENTDB_BENCH.md) - design and
+  testing plan for comparing AgentDB with MongoDB and Postgres on agent-runtime
+  workloads
 - [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
   codes and `doc_url` links
 
