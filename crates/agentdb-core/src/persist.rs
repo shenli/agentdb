@@ -464,13 +464,11 @@ impl Persist {
         from_seq: u64,
         limit: usize,
     ) -> KvResult<Vec<EventEnvelope>> {
-        // KvStore::scan_prefix uses its argument as both the starting key AND
-        // the prefix-filter, so we cannot seek to `event_key(.., from_seq)`
-        // and still see later keys in the same session — they would not start
-        // with the seq-specific stem. Scan the full session-scoped prefix and
-        // filter the lower bound client-side. For V2.0 sessions are small.
         let prefix = format!("event/{tenant_id}/{session_id}/");
-        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let start = event_key(tenant_id, session_id, from_seq);
+        let iter = self
+            .kv
+            .scan_prefix_from(prefix.as_bytes(), start.as_bytes())?;
         let mut out = Vec::new();
         for res in iter {
             let (_k, v) = res?;

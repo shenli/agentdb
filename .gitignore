@@ -7,3 +7,4 @@ data/
 workload/agentdb-workload
 workload/perf-probe
 perf-out/
+bench-out/

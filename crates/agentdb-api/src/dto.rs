@@ -81,6 +81,8 @@ pub struct ForkSessionBody {
 pub struct FetchQuery {
     #[serde(default)]
     pub from_seq: u64,
+    #[serde(default)]
+    pub latest: bool,
     #[serde(default = "default_fetch_limit")]
     pub limit: usize,
 }

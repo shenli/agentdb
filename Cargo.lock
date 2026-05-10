@@ -20,6 +20,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentdb-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bson",
+ "clap",
+ "futures",
+ "mongodb",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "agentdb-cluster-smoke"
 version = "0.1.0"
 dependencies = [

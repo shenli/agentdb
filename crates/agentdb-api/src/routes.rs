@@ -4891,14 +4891,18 @@ async fn fetch_events(
         };
     let runtime = s.runtime.clone();
     let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime
-            .fetch_from_seq(FetchRequest {
-                tenant_id: tid,
-                session_id: sid,
-                from_seq: q.from_seq,
-                limit: q.limit,
-            })
-            .await
+        if q.latest {
+            runtime.fetch_recent(tid, sid, q.limit).await
+        } else {
+            runtime
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: tid,
+                    session_id: sid,
+                    from_seq: q.from_seq,
+                    limit: q.limit,
+                })
+                .await
+        }
     })
     .await?;
     Ok(with_headers(Json(events).into_response(), route_headers))

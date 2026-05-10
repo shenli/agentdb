@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -496,6 +496,7 @@ fn priority_rank(p: Priority) -> u8 {
 
 pub struct Runtime {
     state: Mutex<State>,
+    session_commit_locks: StdMutex<BTreeMap<String, Weak<Mutex<()>>>>,
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
@@ -583,6 +584,11 @@ impl KvStore for RuntimeTabletKvStore {
     fn scan_prefix(&self, prefix: &[u8]) -> agentdb_storage::Result<KvIter> {
         self.state_machine.apply_committed()?;
         self.store.scan_prefix(prefix)
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        self.state_machine.apply_committed()?;
+        self.store.scan_prefix_from(prefix, start)
     }
 
     fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
@@ -876,6 +882,27 @@ impl KvStore for RuntimeTabletRouterKvStore {
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
 
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        if let Some(tablet_id) = self.resolve_tablet_id()? {
+            return self.with_handle(tablet_id, |handle| {
+                handle.kv_store.scan_prefix_from(prefix, start)
+            });
+        }
+
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut rows = BTreeMap::new();
+        for handle in tablets.values() {
+            for item in handle.kv_store.scan_prefix_from(prefix, start)? {
+                let (key, value) = item?;
+                rows.entry(key).or_insert(value);
+            }
+        }
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
     fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -919,6 +946,18 @@ impl KvSnapshot for RuntimeTabletRouterSnapshot {
             .rows
             .iter()
             .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect();
+        Ok(Box::new(rows.into_iter()))
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        let prefix = prefix.to_vec();
+        let start = start.to_vec();
+        let rows: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix) && key.as_slice() >= start.as_slice())
             .map(|(key, value)| Ok((key.clone(), value.clone())))
             .collect();
         Ok(Box::new(rows.into_iter()))
@@ -1337,6 +1376,7 @@ impl Runtime {
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            session_commit_locks: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1352,6 +1392,7 @@ impl Runtime {
     pub fn in_memory_with_kms(kms: Arc<dyn KmsKeyResolver>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            session_commit_locks: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1370,6 +1411,7 @@ impl Runtime {
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            session_commit_locks: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1533,6 +1575,7 @@ impl Runtime {
 
         Arc::new(Self {
             state: Mutex::new(hydration.state),
+            session_commit_locks: StdMutex::new(BTreeMap::new()),
             idem,
             persist: Some(persist),
             content,
@@ -1550,6 +1593,23 @@ impl Runtime {
         F: Future<Output = T>,
     {
         CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future).await
+    }
+
+    fn session_commit_lock(&self, session_id: &Id) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .session_commit_locks
+            .lock()
+            .expect("session commit lock map poisoned");
+        let key = session_id.as_str().to_string();
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        lock
     }
 
     pub fn export_tablet_snapshot_payload(&self, tablet_id: i64) -> Result<Vec<u8>> {
@@ -1968,6 +2028,8 @@ impl Runtime {
         session_id: &Id,
         target: Lifecycle,
     ) -> Result<SessionStorageSummary> {
+        let session_commit_lock = self.session_commit_lock(session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
         match target {
             Lifecycle::Warm => {
                 let updated = {
@@ -2010,6 +2072,8 @@ impl Runtime {
         session_id: &Id,
         target: Lifecycle,
     ) -> Result<SessionStorageSummary> {
+        let session_commit_lock = self.session_commit_lock(session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
         if !matches!(target, Lifecycle::Warm | Lifecycle::Cold) {
             return Err(Error::new(
                 ErrorCode::PolicyDenied,
@@ -2329,6 +2393,8 @@ impl Runtime {
     }
 
     pub async fn delete_session(&self, tenant_id: &Id, session_id: &Id) -> Result<()> {
+        let session_commit_lock = self.session_commit_lock(session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
         let mut s = self.state.lock().await;
         let live = s.sessions.get(session_id.as_str()).is_some_and(|sess| {
             sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
@@ -4206,7 +4272,9 @@ impl Runtime {
             ));
         }
 
-        let mut s = self.state.lock().await;
+        let session_commit_lock = self.session_commit_lock(&req.session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
+        let s = self.state.lock().await;
 
         // Re-check under the state lock to close the concurrent-append race:
         // another task could have committed our key between the optimistic check
@@ -4361,24 +4429,25 @@ impl Runtime {
         let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
         let (seq, _prior_policy_version, session_snapshot) = {
-            // Re-acquire mutable access to the session row to mint the seq
-            // and bump `last_active_at_ms`. The validation above already
-            // confirmed the session is the right tenant + agent; no
-            // additional checks needed here.
+            // Mint the seq from the current session snapshot but do not make
+            // the mutation visible until the durable batch succeeds. The
+            // per-session commit lock above preserves same-session ordering
+            // while allowing unrelated sessions to persist concurrently.
             let session = s
                 .sessions
-                .get_mut(req.session_id.as_str())
+                .get(req.session_id.as_str())
                 .expect("session presence checked above");
-            if session.lifecycle != Lifecycle::Warm {
-                session.lifecycle = Lifecycle::Warm;
-                session.warm_head_from_seq = session.next_seq;
+            let mut snapshot = session.clone();
+            if snapshot.lifecycle != Lifecycle::Warm {
+                snapshot.lifecycle = Lifecycle::Warm;
+                snapshot.warm_head_from_seq = snapshot.next_seq;
             }
-            let seq = session.next_seq;
-            let pv = session.policy_version;
-            session.next_seq += 1;
-            session.last_active_at_ms = crate::now_ms();
-            session.policy_version = policy.version;
-            (seq, pv, session.clone())
+            let seq = snapshot.next_seq;
+            let pv = snapshot.policy_version;
+            snapshot.next_seq += 1;
+            snapshot.last_active_at_ms = crate::now_ms();
+            snapshot.policy_version = policy.version;
+            (seq, pv, snapshot)
         };
 
         let envelope = EventEnvelope::create(NewEvent {
@@ -4418,54 +4487,43 @@ impl Runtime {
             created_at_ms: crate::now_ms(),
         });
 
-        // Atomic commit. With persist=Some, we use KvStore::write_batch to bind
-        // event + session + idempotency record into a single durable write so
-        // the Task 9 invariant (idempotency record commit is in the same atomic
-        // boundary as the event+session commit) survives crashes.
+        drop(s);
+
+        // Atomic durable commit. The expensive storage call happens outside
+        // the global state mutex; same-session ordering is protected by the
+        // session commit lock held for the whole append. This keeps
+        // read-after-write semantics after the call returns, but lets appends
+        // for different sessions make storage progress in parallel.
         if let Some(p) = &self.persist {
             let pair = idem_full_key
                 .as_ref()
                 .zip(idem_record.as_ref())
                 .map(|(k, r)| (k.as_str(), r));
-            // If the batch fails we must NOT have mutated visible state. We've
-            // already touched session.next_seq above, so on failure we roll it
-            // back before returning an error.
             if let Err(e) = p.append_batch(&envelope, &session_snapshot, pair) {
-                if let Some(sess) = s.sessions.get_mut(req.session_id.as_str()) {
-                    sess.next_seq = seq;
-                    // last_active_at_ms is monotonic-ish; leaving it advanced
-                    // is harmless and reverting would require capturing the
-                    // pre-image. Skip for simplicity.
-                }
-                drop(s);
                 return Err(internal(e));
             }
-            let key = (req.session_id.as_str().to_string(), seq);
-            s.event_by_id.insert(
-                envelope.event_id.as_str().to_string(),
-                (envelope.session_id.as_str().to_string(), envelope.seq),
-            );
-            s.events.insert(key, envelope);
-        } else {
-            // In-memory backend: keep the events map populated, and
-            // mirror the `event_by_id` secondary-index entry that the
-            // KV backend writes via `append_batch`. Without this the
-            // in-memory `lookup_event_by_id` would always return None,
-            // which is asymmetric with the KV path.
-            let key = (req.session_id.as_str().to_string(), seq);
-            s.event_by_id.insert(
-                envelope.event_id.as_str().to_string(),
-                (envelope.session_id.as_str().to_string(), envelope.seq),
-            );
-            s.events.insert(key, envelope);
         }
 
-        // Record the idempotency result while still holding the state lock so
-        // concurrent appends with the same key serialize cleanly: any racing
-        // caller will observe this record on its under-lock re-check and replay
-        // instead of committing a second event. Lock order is (state -> idem)
-        // and the idempotency store never reaches back into state, so there is
-        // no deadlock risk despite holding both briefly.
+        let mut s = self.state.lock().await;
+        s.sessions
+            .insert(req.session_id.as_str().to_string(), session_snapshot);
+        // In-memory backend: keep the events map populated, and mirror the
+        // `event_by_id` secondary-index entry that the KV backend writes via
+        // `append_batch`. The persisted backend keeps this in memory too so
+        // same-process reads can avoid a storage lookup.
+        let key = (req.session_id.as_str().to_string(), seq);
+        s.event_by_id.insert(
+            envelope.event_id.as_str().to_string(),
+            (envelope.session_id.as_str().to_string(), envelope.seq),
+        );
+        s.events.insert(key, envelope);
+
+        // Record the idempotency result before releasing the per-session
+        // commit lock, so a same-session retry with the same key observes this
+        // record on its under-lock re-check and replays instead of committing a
+        // second event. Lock order is (state -> idem) and the idempotency store
+        // never reaches back into state, so there is no deadlock risk despite
+        // holding both briefly.
         if let (Some(full), Some(rec)) = (idem_full_key, idem_record) {
             self.idem.put(full, rec);
         }
@@ -4505,18 +4563,25 @@ impl Runtime {
         }
         let appended = self.append(req).await?;
 
-        // KV-backed: scan the session's events from storage so we don't need to
-        // also keep an in-memory copy. `fetch_from_seq` now merges sealed
-        // cold segments with the warm head transparently, so use it as the
-        // canonical read path and then keep only the newest `last`.
-        let mut recent = self
-            .fetch_from_seq(FetchRequest {
+        // Fetch only the tail window needed for context. A full-session fetch
+        // makes append+fetch latency grow with session length and serializes
+        // far more storage work than the API requires.
+        let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
+        let from_seq = appended
+            .seq
+            .saturating_add(1)
+            .saturating_sub(last_seq_count);
+        let mut recent = if last == 0 {
+            Vec::new()
+        } else {
+            self.fetch_from_seq(FetchRequest {
                 tenant_id,
                 session_id,
-                from_seq: 0,
-                limit: usize::MAX,
+                from_seq,
+                limit: last,
             })
-            .await?;
+            .await?
+        };
         if recent.len() > last {
             let drop_n = recent.len() - last;
             recent.drain(0..drop_n);
@@ -4863,6 +4928,56 @@ impl Runtime {
             out.truncate(req.limit);
         }
         Ok(out)
+    }
+
+    /// Return up to `limit` latest events for a session in ascending seq order.
+    ///
+    /// This is the common agent-context read path. It computes the lower bound
+    /// from the authoritative session `next_seq` and then reuses
+    /// `fetch_from_seq`, so callers avoid stale fixture-side high-watermarks
+    /// and do not need to scan from the beginning of the session.
+    pub async fn fetch_recent(
+        &self,
+        tenant_id: Id,
+        session_id: Id,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.refresh_replicated_state().await?;
+        let from_seq = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", session_id),
+                ));
+            }
+            let session = s
+                .sessions
+                .get(session_id.as_str())
+                .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+            if session.deleted_at_ms.is_some() || session.tenant_id.as_str() != tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", session_id),
+                ));
+            }
+            let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+            session.next_seq.saturating_sub(limit)
+        };
+        self.fetch_from_seq(FetchRequest {
+            tenant_id,
+            session_id,
+            from_seq,
+            limit,
+        })
+        .await
     }
 }
 
