@@ -934,7 +934,7 @@ async fn post_internal_raft_message(
     };
     let payload = match decode_base64(&body.payload_base64) {
         Ok(payload) => payload,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) =
         validate_internal_raft_peer_ids(&s, body.tablet_id, body.from, body.to).await
@@ -1001,7 +1001,7 @@ async fn post_internal_raft_snapshot(
     };
     let payload = match decode_base64(&body.payload_base64) {
         Ok(payload) => payload,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(response) =
         validate_internal_raft_peer_ids(&s, body.tablet_id, body.from, body.to).await
@@ -1181,15 +1181,15 @@ async fn validate_internal_raft_peer_ids(
     Ok(())
 }
 
-fn decode_base64(value: &str) -> Result<Vec<u8>, Response> {
+fn decode_base64(value: &str) -> Result<Vec<u8>, Box<Response>> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|err| {
-            internal_raft_error(
+            Box::new(internal_raft_error(
                 StatusCode::BAD_REQUEST,
                 "RAFT_PAYLOAD_INVALID",
                 format!("invalid base64 raft payload: {err}"),
-            )
+            ))
         })
 }
 
@@ -2117,7 +2117,7 @@ async fn get_admin_tablet_stats(
         .filter(|aggregate| {
             query
                 .tablet_id
-                .is_none_or(|tablet_id| aggregate.tablet_id == tablet_id)
+                .map_or(true, |tablet_id| aggregate.tablet_id == tablet_id)
         })
         .collect();
     Ok(Json(AdminTabletStatsResponse { stats, aggregates }))
@@ -4446,13 +4446,15 @@ async fn create_session(
     }
     let route_headers = match guard_routing_key_request(
         &s,
-        &tid,
-        Some(preallocated_session_id.as_str()),
-        &original_uri,
-        &headers,
-        Method::POST,
-        Some(forward_body),
-        extra_forward_headers,
+        RoutingKeyGuardRequest {
+            tenant_id: &tid,
+            routing_key: Some(preallocated_session_id.as_str()),
+            original_uri: &original_uri,
+            headers: &headers,
+            method: Method::POST,
+            body: Some(forward_body),
+            extra_forward_headers,
+        },
     )
     .await
     {
@@ -5347,28 +5349,35 @@ async fn delete_tenant_session_locators(state: &AppState, tenant_id: &Id) -> Res
     Ok(())
 }
 
-async fn guard_routing_key_request(
-    state: &AppState,
-    tenant_id: &Id,
-    routing_key: Option<&str>,
-    original_uri: &axum::http::Uri,
-    headers: &HeaderMap,
+struct RoutingKeyGuardRequest<'a> {
+    tenant_id: &'a Id,
+    routing_key: Option<&'a str>,
+    original_uri: &'a axum::http::Uri,
+    headers: &'a HeaderMap,
     method: Method,
     body: Option<Vec<u8>>,
     extra_forward_headers: HeaderMap,
+}
+
+async fn guard_routing_key_request(
+    state: &AppState,
+    request: RoutingKeyGuardRequest<'_>,
 ) -> Result<HeaderMap, Response> {
-    let path_and_query = original_uri
+    let path_and_query = request
+        .original_uri
         .path_and_query()
         .map(|path| path.as_str())
-        .unwrap_or_else(|| original_uri.path());
-    match state
-        .routing
-        .guard_routing_key(tenant_id.as_str(), routing_key, path_and_query, headers)
-    {
+        .unwrap_or_else(|| request.original_uri.path());
+    match state.routing.guard_routing_key(
+        request.tenant_id.as_str(),
+        request.routing_key,
+        path_and_query,
+        request.headers,
+    ) {
         RouteGuardOutcome::ServeLocal(headers) => Ok(headers),
         RouteGuardOutcome::Forward(mut forward) => {
-            forward.headers.extend(extra_forward_headers);
-            Err(execute_forward(state, forward, method, body).await)
+            forward.headers.extend(request.extra_forward_headers);
+            Err(execute_forward(state, forward, request.method, request.body).await)
         }
         RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
     }

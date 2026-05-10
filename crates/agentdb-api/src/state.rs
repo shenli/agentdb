@@ -183,6 +183,12 @@ impl SchedulerStatus {
     }
 }
 
+impl Default for SchedulerStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct SchedulerStatusSnapshot {
     pub leader_node_id: Option<String>,

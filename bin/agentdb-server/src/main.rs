@@ -49,6 +49,11 @@ const DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH: i64 = 256;
 const DEFAULT_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
+type ContentBackendBundle = (
+    Arc<dyn agentdb_storage::ContentBackend>,
+    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
 struct Cli {
@@ -59,7 +64,7 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
     /// Start the HTTP server with the runtime router.
-    Serve(ServeOpts),
+    Serve(Box<ServeOpts>),
     /// Start a batteries-included local developer server.
     Dev(DevOpts),
     /// Check local single-node configuration and data directories.
@@ -251,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Cli::parse();
     match args.cmd {
-        Cmd::Serve(opts) => serve(opts).await,
+        Cmd::Serve(opts) => serve(*opts).await,
         Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
@@ -411,18 +416,20 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
         let node_address = format!("http://{}", config.bind);
         spawn_cluster_workers(
-            startup.meta.clone(),
-            startup.node_id.clone(),
-            runtime.clone(),
-            config
-                .internal_auth_token
-                .clone()
-                .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
-            raft_registry.clone(),
-            node_address,
-            config.route_region.clone(),
-            startup.scheduler_status.clone(),
-            state.drain.clone(),
+            ClusterWorkerDeps {
+                meta: startup.meta.clone(),
+                node_id: startup.node_id.clone(),
+                runtime: runtime.clone(),
+                movement_snapshot_client: config
+                    .internal_auth_token
+                    .clone()
+                    .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
+                raft_registry: raft_registry.clone(),
+                node_address,
+                region: config.route_region.clone(),
+                scheduler_status: startup.scheduler_status.clone(),
+                drain: state.drain.clone(),
+            },
             ClusterWorkerConfig::from_env(),
         );
         if let Some(bootstrap) = startup.raft_bootstrap {
@@ -521,16 +528,16 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         DEFAULT_RAFT_SNAPSHOT_RETENTION_MS,
                     )
                     .max(0);
-                    spawn_raft_rs_snapshot_worker(
-                        startup.meta.clone(),
-                        registry.clone(),
-                        runtime.clone(),
+                    spawn_raft_rs_snapshot_worker(RaftRsSnapshotWorker {
+                        meta: startup.meta.clone(),
+                        registry: registry.clone(),
+                        runtime: runtime.clone(),
                         outbox,
-                        Duration::from_millis(raft_snapshot_interval_ms),
-                        raft_snapshot_min_lag,
-                        raft_snapshot_retention_ms,
-                        raft_snapshot_store.clone(),
-                    );
+                        interval: Duration::from_millis(raft_snapshot_interval_ms),
+                        min_lag: raft_snapshot_min_lag,
+                        retention_ms: raft_snapshot_retention_ms,
+                        snapshot_store: raft_snapshot_store.clone(),
+                    });
                     if let Some(snapshot_store) = raft_snapshot_store {
                         let restore_interval_ms = env_u64(
                             "AGENTDB_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS",
@@ -1331,12 +1338,7 @@ impl RaftSnapshotObjectStore {
     }
 }
 
-fn build_content_backend(
-    config: &ResolvedServeConfig,
-) -> anyhow::Result<(
-    Arc<dyn agentdb_storage::ContentBackend>,
-    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
-)> {
+fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
     match config.content_backend {
         ContentBackendKind::LocalFs => {
             let content_dir = config.content_dir.clone();
@@ -2095,16 +2097,15 @@ async fn sync_raft_rs_registry_and_runtime(
     }
     let expected: BTreeSet<_> = bootstrap.tablet_ids.iter().copied().collect();
     for tablet_id in runtime.registered_tablet_ids() {
-        if !expected.contains(&tablet_id) {
-            if runtime
+        if !expected.contains(&tablet_id)
+            && runtime
                 .unregister_replicated_tablet(tablet_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?
-            {
-                tracing::info!(
-                    tablet_id,
-                    "unregistered runtime raft tablet after metadata sync"
-                );
-            }
+        {
+            tracing::info!(
+                tablet_id,
+                "unregistered runtime raft tablet after metadata sync"
+            );
         }
     }
     Ok(bootstrap)
@@ -2274,10 +2275,10 @@ fn spawn_raft_rs_tick_worker(
                     .get(&tablet_id)
                     .and_then(|tablet| tablet.owner_node_id.as_deref());
                 let local_is_owner = owner_node_id == Some(local_node_id.as_str());
-                let owner_unavailable = owner_node_id.is_none_or(|owner| {
+                let owner_unavailable = owner_node_id.map_or(true, |owner| {
                     nodes_by_id
                         .get(owner)
-                        .is_none_or(|node| node.state.as_str() != "alive")
+                        .map_or(true, |node| node.state.as_str() != "alive")
                 });
                 let raft_leader_unavailable = local_status
                     .filter(|status| status.leader_id != 0)
@@ -2285,7 +2286,7 @@ fn spawn_raft_rs_tick_worker(
                     .is_some_and(|leader_node_id| {
                         nodes_by_id
                             .get(leader_node_id)
-                            .is_none_or(|node| node.state.as_str() != "alive")
+                            .map_or(true, |node| node.state.as_str() != "alive")
                     });
                 if !local_is_owner && !local_is_leader {
                     if owner_unavailable || raft_leader_unavailable {
@@ -2546,7 +2547,7 @@ async fn flush_raft_rs_group_messages_with_health(
     Ok(sent)
 }
 
-fn spawn_raft_rs_snapshot_worker(
+struct RaftRsSnapshotWorker {
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     runtime: Arc<agentdb_core::Runtime>,
@@ -2555,7 +2556,19 @@ fn spawn_raft_rs_snapshot_worker(
     min_lag: u64,
     retention_ms: i64,
     snapshot_store: Option<Arc<RaftSnapshotObjectStore>>,
-) {
+}
+
+fn spawn_raft_rs_snapshot_worker(worker: RaftRsSnapshotWorker) {
+    let RaftRsSnapshotWorker {
+        meta,
+        registry,
+        runtime,
+        outbox,
+        interval,
+        min_lag,
+        retention_ms,
+        snapshot_store,
+    } = worker;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         loop {
@@ -3068,7 +3081,7 @@ fn spawn_route_snapshot_refresher(
     });
 }
 
-fn spawn_cluster_workers(
+struct ClusterWorkerDeps {
     meta: agentdb_meta::MetaStore,
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
@@ -3078,8 +3091,20 @@ fn spawn_cluster_workers(
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
     drain: agentdb_api::state::DrainState,
-    config: ClusterWorkerConfig,
-) {
+}
+
+fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
+    let ClusterWorkerDeps {
+        meta,
+        node_id,
+        runtime,
+        movement_snapshot_client,
+        raft_registry,
+        node_address,
+        region,
+        scheduler_status,
+        drain,
+    } = deps;
     let heartbeat_meta = meta.clone();
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
