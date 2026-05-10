@@ -9,7 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use bson::{doc, Bson, DateTime as BsonDateTime, Document};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use futures::TryStreamExt;
+use mongodb::options::{
+    ClientOptions, FindOneAndUpdateOptions, FindOptions, IndexOptions, ReturnDocument,
+};
+use mongodb::{Client as MongoClient, Database as MongoDatabase, IndexModel};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::{Client, StatusCode};
@@ -48,6 +54,10 @@ struct PrepareArgs {
     base_url: String,
     #[arg(long, default_value = "postgres://bench:bench@127.0.0.1:5433/bench")]
     pg_dsn: String,
+    #[arg(long, default_value = "mongodb://127.0.0.1:27017")]
+    mongo_uri: String,
+    #[arg(long, default_value = "agentdb_bench")]
+    mongo_db: String,
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
     out: PathBuf,
     #[arg(long)]
@@ -98,6 +108,10 @@ struct RunArgs {
     base_url: String,
     #[arg(long, default_value = "postgres://bench:bench@127.0.0.1:5433/bench")]
     pg_dsn: String,
+    #[arg(long, default_value = "mongodb://127.0.0.1:27017")]
+    mongo_uri: String,
+    #[arg(long, default_value = "agentdb_bench")]
+    mongo_db: String,
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
     out: PathBuf,
     #[arg(long)]
@@ -298,6 +312,9 @@ async fn main() -> Result<()> {
 async fn prepare(args: PrepareArgs) -> Result<()> {
     if args.backend == "postgres-event-log" {
         return prepare_postgres_event_log(args).await;
+    }
+    if args.backend == "mongodb-event-log" {
+        return prepare_mongodb_event_log(args).await;
     }
     ensure_agentdb_backend(&args.backend)?;
     let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
@@ -662,6 +679,167 @@ async fn prepare_postgres_event_log(args: PrepareArgs) -> Result<()> {
     Ok(())
 }
 
+async fn prepare_mongodb_event_log(args: PrepareArgs) -> Result<()> {
+    let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
+    let run_dir = args.out.join("runs").join(&run_id);
+    create_new_run_dir(&run_dir)?;
+
+    let config = dataset_config(&args);
+    let database_config = DatabaseConfig {
+        backend: args.backend.clone(),
+        storage_engine: "mongodb-event-log".into(),
+        content_engine: "metadata-reference".into(),
+        data_dir: None,
+        content_dir: None,
+        durability_profile: args.durability_profile.clone(),
+        note: "MongoDB event-log baseline stores normalized session/event documents and artifact metadata references; large blob bytes are not stored inline by default."
+            .into(),
+    };
+    write_json(run_dir.join("config.json"), &config)?;
+    write_json(run_dir.join("database-config.json"), &database_config)?;
+    write_json(run_dir.join("host-manifest.json"), &host_manifest())?;
+    write_json(run_dir.join("software-manifest.json"), &software_manifest())?;
+
+    let db = connect_mongodb(&args.mongo_uri, &args.mongo_db).await?;
+    init_mongodb_event_log_schema(&db).await?;
+    reset_mongodb_run(&db, &run_id).await?;
+
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut tenants = Vec::new();
+    let mut artifact_stats = ArtifactStats::default();
+
+    for tenant_idx in 0..config.tenants {
+        let external_key = format!("bench-{run_id}-tenant-{tenant_idx}");
+        let tenant_id = format!("ten-mg-{tenant_idx:06}");
+        mongo_create_tenant(&db, &run_id, &tenant_id, &external_key).await?;
+        let mut agents = Vec::new();
+
+        for agent_idx in 0..config.agents_per_tenant {
+            let alias = format!("bench-agent-{tenant_idx}-{agent_idx}");
+            let agent_id = format!("agt-mg-{tenant_idx:06}-{agent_idx:06}");
+            mongo_create_agent(&db, &run_id, &tenant_id, &agent_id, &alias).await?;
+            let mut sessions = Vec::new();
+
+            for session_idx in 0..config.sessions_per_agent {
+                let alias = format!("bench-session-{tenant_idx}-{agent_idx}-{session_idx}");
+                let session_id = format!("ses-mg-{tenant_idx:06}-{agent_idx:06}-{session_idx:06}");
+                mongo_create_session(
+                    &db,
+                    &run_id,
+                    &tenant_id,
+                    &agent_id,
+                    &session_id,
+                    &alias,
+                    None,
+                    None,
+                )
+                .await?;
+
+                for seq in 0..config.events_per_session {
+                    let prepared_artifact = mongo_maybe_create_artifact(
+                        &db,
+                        &run_id,
+                        &tenant_id,
+                        &session_id,
+                        &config,
+                        &mut rng,
+                    )
+                    .await?;
+                    artifact_stats.content_backend_artifacts +=
+                        prepared_artifact.content_backend_artifacts;
+                    artifact_stats.content_backend_bytes += prepared_artifact.content_backend_bytes;
+                    artifact_stats.external_reference_artifacts +=
+                        prepared_artifact.external_reference_artifacts;
+                    artifact_stats.external_reference_bytes +=
+                        prepared_artifact.external_reference_bytes;
+                    let mut payload =
+                        event_payload(&config, &mut rng, tenant_idx, agent_idx, session_idx, seq);
+                    if !prepared_artifact.external_refs.is_empty() {
+                        payload["external_artifact_refs"] =
+                            Value::Array(prepared_artifact.external_refs.clone());
+                    }
+                    mongo_insert_event(
+                        &db,
+                        &run_id,
+                        &tenant_id,
+                        &agent_id,
+                        &session_id,
+                        seq as i64,
+                        "message",
+                        &payload,
+                        &prepared_artifact.artifact_refs,
+                    )
+                    .await?;
+                }
+                mongo_set_next_seq(
+                    &db,
+                    &run_id,
+                    &tenant_id,
+                    &session_id,
+                    config.events_per_session as i64,
+                )
+                .await?;
+
+                for record_idx in 0..config.records_per_session {
+                    mongo_create_record(&db, &run_id, &tenant_id, &session_id, record_idx, &config)
+                        .await?;
+                }
+
+                let mut child_sessions = Vec::new();
+                for fork_idx in 0..config.forks_per_parent {
+                    let child_id = format!("{session_id}-fork-{fork_idx}");
+                    mongo_create_session(
+                        &db,
+                        &run_id,
+                        &tenant_id,
+                        &agent_id,
+                        &child_id,
+                        &format!("{alias}-fork-{fork_idx}"),
+                        Some(&session_id),
+                        Some(config.events_per_session.saturating_sub(1) as i64),
+                    )
+                    .await?;
+                    child_sessions.push(child_id);
+                }
+
+                sessions.push(SessionFixture {
+                    session_id,
+                    alias,
+                    events_written: config.events_per_session,
+                    child_sessions,
+                });
+            }
+
+            agents.push(AgentFixture {
+                agent_id,
+                alias,
+                sessions,
+            });
+        }
+
+        tenants.push(TenantFixture {
+            tenant_id,
+            external_key,
+            agents,
+        });
+    }
+
+    let manifest = DatasetManifest {
+        schema_version: 1,
+        run_id: run_id.clone(),
+        backend: args.backend,
+        base_url: args.mongo_uri,
+        created_at_ms: now_ms(),
+        config,
+        database_config,
+        artifact_stats,
+        tenants,
+    };
+    write_json(run_dir.join("dataset.json"), &manifest)?;
+    println!("prepared mongodb dataset {run_id} at {}", run_dir.display());
+    Ok(())
+}
+
 async fn run(args: RunArgs) -> Result<()> {
     ensure_benchmark_backend(&args.backend)?;
     let run_dir = args.out.join("runs").join(&args.run_id);
@@ -673,9 +851,18 @@ async fn run(args: RunArgs) -> Result<()> {
     let pg_pool = if args.backend == "postgres-event-log" {
         Some(Arc::new(connect_postgres(&args.pg_dsn).await?))
     } else {
-        wait_ready(&client, &args.base_url).await?;
         None
     };
+    let mongo_db = if args.backend == "mongodb-event-log" {
+        Some(Arc::new(
+            connect_mongodb(&args.mongo_uri, &args.mongo_db).await?,
+        ))
+    } else {
+        None
+    };
+    if args.backend == "agentdb-native-rocksdb" {
+        wait_ready(&client, &args.base_url).await?;
+    }
     let database_config = read_json(run_dir.join("database-config.json")).unwrap_or_else(|_| {
         json!({
             "backend": args.backend.clone(),
@@ -693,7 +880,17 @@ async fn run(args: RunArgs) -> Result<()> {
 
     let mut cells = Vec::new();
     for concurrency in concurrencies {
-        run_cell_warmup(&client, &args, &manifest, concurrency, warmup, args.seed).await?;
+        run_cell_warmup(
+            &client,
+            &args,
+            &manifest,
+            concurrency,
+            warmup,
+            args.seed,
+            pg_pool.clone(),
+            mongo_db.clone(),
+        )
+        .await?;
         let cell = run_cell(
             &client,
             &args,
@@ -704,6 +901,7 @@ async fn run(args: RunArgs) -> Result<()> {
             args.seed + concurrency as u64,
             raw_writer.clone(),
             pg_pool.clone(),
+            mongo_db.clone(),
         )
         .await?;
         print_cell(&cell);
@@ -724,6 +922,9 @@ async fn run(args: RunArgs) -> Result<()> {
         database_config,
         config: json!({
             "base_url": args.base_url,
+            "pg_dsn": if args.backend == "postgres-event-log" { Some(args.pg_dsn.as_str()) } else { None },
+            "mongo_uri": if args.backend == "mongodb-event-log" { Some(args.mongo_uri.as_str()) } else { None },
+            "mongo_db": if args.backend == "mongodb-event-log" { Some(args.mongo_db.as_str()) } else { None },
             "concurrency": args.concurrency,
             "warmup": args.warmup,
             "duration": args.duration,
@@ -748,6 +949,8 @@ async fn run_cell_warmup(
     concurrency: usize,
     duration: Duration,
     seed: u64,
+    pg_pool: Option<Arc<PgPool>>,
+    mongo_db: Option<Arc<MongoDatabase>>,
 ) -> Result<()> {
     if duration.is_zero() {
         return Ok(());
@@ -761,7 +964,8 @@ async fn run_cell_warmup(
         duration,
         seed,
         None,
-        None,
+        pg_pool,
+        mongo_db,
     )
     .await?;
     Ok(())
@@ -777,6 +981,7 @@ async fn run_cell(
     seed: u64,
     raw_writer: Option<Arc<Mutex<BufWriter<File>>>>,
     pg_pool: Option<Arc<PgPool>>,
+    mongo_db: Option<Arc<MongoDatabase>>,
 ) -> Result<CellReport> {
     let samples = Arc::new(Mutex::new(Vec::<OperationSample>::new()));
     let deadline = Instant::now() + duration;
@@ -792,6 +997,7 @@ async fn run_cell(
         let config = config.clone();
         let raw_writer = raw_writer.clone();
         let pg_pool = pg_pool.clone();
+        let mongo_db = mongo_db.clone();
         handles.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed + worker_id as u64);
             while Instant::now() < deadline {
@@ -806,6 +1012,7 @@ async fn run_cell(
                     &fixtures,
                     &mut rng,
                     operation,
+                    mongo_db.as_deref(),
                 )
                 .await;
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
@@ -874,6 +1081,7 @@ async fn run_one_operation(
     fixtures: &[FlatSession],
     rng: &mut StdRng,
     operation: Operation,
+    mongo_db: Option<&MongoDatabase>,
 ) -> Result<()> {
     if fixtures.is_empty() {
         return Err(anyhow!("dataset has no sessions"));
@@ -882,6 +1090,10 @@ async fn run_one_operation(
     if args.backend == "postgres-event-log" {
         let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
         return run_one_postgres_operation(pool, args, config, fixture, rng, operation).await;
+    }
+    if args.backend == "mongodb-event-log" {
+        let db = mongo_db.ok_or_else(|| anyhow!("mongodb backend missing database"))?;
+        return run_one_mongodb_operation(db, args, config, fixture, rng, operation).await;
     }
     match operation {
         Operation::AppendFetch => {
@@ -998,6 +1210,8 @@ impl RunArgs {
             out: self.out.clone(),
             run_id: self.run_id.clone(),
             pg_dsn: self.pg_dsn.clone(),
+            mongo_uri: self.mongo_uri.clone(),
+            mongo_db: self.mongo_db.clone(),
             workload: self.workload,
             concurrency: self.concurrency.clone(),
             warmup: self.warmup.clone(),
@@ -1766,6 +1980,526 @@ async fn pg_create_artifact_reference(
     })
 }
 
+async fn connect_mongodb(uri: &str, db_name: &str) -> Result<MongoDatabase> {
+    let mut options = ClientOptions::parse(uri)
+        .await
+        .with_context(|| format!("parse mongodb uri {uri}"))?;
+    options.app_name = Some("agentdb-bench".into());
+    let client = MongoClient::with_options(options).context("create mongodb client")?;
+    let db = client.database(db_name);
+    db.run_command(doc! {"ping": 1}, None)
+        .await
+        .with_context(|| format!("connect mongodb {uri}/{db_name}"))?;
+    Ok(db)
+}
+
+async fn init_mongodb_event_log_schema(db: &MongoDatabase) -> Result<()> {
+    create_mongo_index(
+        db,
+        "tenants",
+        doc! {"run_id": 1, "tenant_id": 1},
+        true,
+        "tenants_run_tenant_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "agents",
+        doc! {"run_id": 1, "tenant_id": 1, "agent_id": 1},
+        true,
+        "agents_run_tenant_agent_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "sessions",
+        doc! {"run_id": 1, "tenant_id": 1, "session_id": 1},
+        true,
+        "sessions_run_tenant_session_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "sessions",
+        doc! {"run_id": 1, "tenant_id": 1, "agent_id": 1, "updated_at": -1},
+        false,
+        "sessions_agent_recent",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "events",
+        doc! {"run_id": 1, "tenant_id": 1, "session_id": 1, "seq": 1},
+        true,
+        "events_run_tenant_session_seq_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "events",
+        doc! {"run_id": 1, "tenant_id": 1, "session_id": 1, "seq": -1},
+        false,
+        "events_recent",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "records",
+        doc! {"run_id": 1, "tenant_id": 1, "record_id": 1},
+        true,
+        "records_run_tenant_record_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "records",
+        doc! {"run_id": 1, "tenant_id": 1, "session_id": 1},
+        false,
+        "records_scope",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "records",
+        doc! {"run_id": 1, "tenant_id": 1, "tags": 1},
+        false,
+        "records_tags",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "artifacts",
+        doc! {"run_id": 1, "tenant_id": 1, "artifact_id": 1},
+        true,
+        "artifacts_run_tenant_artifact_unique",
+    )
+    .await?;
+    create_mongo_index(
+        db,
+        "artifacts",
+        doc! {"run_id": 1, "tenant_id": 1, "session_id": 1},
+        false,
+        "artifacts_session",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_mongo_index(
+    db: &MongoDatabase,
+    collection: &str,
+    keys: Document,
+    unique: bool,
+    name: &str,
+) -> Result<()> {
+    let options = IndexOptions::builder()
+        .name(Some(name.to_string()))
+        .unique(Some(unique))
+        .build();
+    let model = IndexModel::builder().keys(keys).options(options).build();
+    db.collection::<Document>(collection)
+        .create_index(model, None)
+        .await?;
+    Ok(())
+}
+
+async fn reset_mongodb_run(db: &MongoDatabase, run_id: &str) -> Result<()> {
+    for collection in [
+        "artifacts",
+        "records",
+        "events",
+        "sessions",
+        "agents",
+        "tenants",
+    ] {
+        db.collection::<Document>(collection)
+            .delete_many(doc! {"run_id": run_id}, None)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn mongo_create_tenant(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    external_key: &str,
+) -> Result<()> {
+    db.collection::<Document>("tenants")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "external_key": external_key,
+                "created_at": BsonDateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn mongo_create_agent(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    alias: &str,
+) -> Result<()> {
+    db.collection::<Document>("agents")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "alias": alias,
+                "config": {"bench": true},
+                "created_at": BsonDateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mongo_create_session(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    alias: &str,
+    fork_parent_id: Option<&str>,
+    fork_at_seq: Option<i64>,
+) -> Result<()> {
+    let now = BsonDateTime::now();
+    db.collection::<Document>("sessions")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "alias": alias,
+                "next_seq": 0_i64,
+                "fork_parent_id": fork_parent_id.map(Bson::from).unwrap_or(Bson::Null),
+                "fork_at_seq": fork_at_seq.map(Bson::from).unwrap_or(Bson::Null),
+                "created_at": now,
+                "updated_at": now,
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn mongo_set_next_seq(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    next_seq: i64,
+) -> Result<()> {
+    db.collection::<Document>("sessions")
+        .update_one(
+            doc! {"run_id": run_id, "tenant_id": tenant_id, "session_id": session_id},
+            doc! {"$set": {"next_seq": next_seq, "updated_at": BsonDateTime::now()}},
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mongo_insert_event(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    seq: i64,
+    kind: &str,
+    payload: &Value,
+    artifact_refs: &[Value],
+) -> Result<()> {
+    db.collection::<Document>("events")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "seq": seq,
+                "kind": kind,
+                "payload": bson::to_bson(payload)?,
+                "artifact_refs": bson::to_bson(artifact_refs)?,
+                "source_refs": Bson::Array(Vec::new()),
+                "created_at": BsonDateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn mongo_append_fetch(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    last: usize,
+    payload: &Value,
+) -> Result<()> {
+    let sessions = db.collection::<Document>("sessions");
+    let options = FindOneAndUpdateOptions::builder()
+        .return_document(Some(ReturnDocument::After))
+        .build();
+    let session = sessions
+        .find_one_and_update(
+            doc! {"run_id": run_id, "tenant_id": tenant_id, "session_id": session_id},
+            doc! {"$inc": {"next_seq": 1_i64}, "$set": {"updated_at": BsonDateTime::now()}},
+            options,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("mongodb session not found: {session_id}"))?;
+    let seq = session
+        .get_i64("next_seq")
+        .or_else(|_| session.get_i32("next_seq").map(i64::from))?
+        - 1;
+    mongo_insert_event(
+        db,
+        run_id,
+        tenant_id,
+        agent_id,
+        session_id,
+        seq,
+        "message",
+        payload,
+        &[],
+    )
+    .await?;
+    mongo_fetch_recent(db, run_id, tenant_id, session_id, last).await?;
+    Ok(())
+}
+
+async fn mongo_fetch_recent(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    last: usize,
+) -> Result<()> {
+    let options = FindOptions::builder()
+        .sort(doc! {"seq": -1})
+        .limit(last as i64)
+        .build();
+    let mut cursor = db
+        .collection::<Document>("events")
+        .find(
+            doc! {"run_id": run_id, "tenant_id": tenant_id, "session_id": session_id},
+            options,
+        )
+        .await?;
+    while cursor.try_next().await?.is_some() {}
+    Ok(())
+}
+
+async fn mongo_create_record(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    record_idx: usize,
+    config: &DatasetConfig,
+) -> Result<()> {
+    let record_id = format!("rec-mg-{session_id}-{record_idx}");
+    db.collection::<Document>("records")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "record_id": record_id,
+                "session_id": session_id,
+                "namespace": ["bench", "session"],
+                "tags": ["bench", "memory"],
+                "text": format!("bench memory record {record_idx} for {session_id}"),
+                "metadata": {
+                    "bench": true,
+                    "record_index": record_idx as i64,
+                    "payload": "x".repeat(config.payload_bytes.min(4096)),
+                },
+                "created_at": BsonDateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn mongo_maybe_create_artifact(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    config: &DatasetConfig,
+    rng: &mut StdRng,
+) -> Result<PreparedArtifact> {
+    if config.artifact_rate <= 0.0 || !rng.gen_bool(config.artifact_rate.clamp(0.0, 1.0)) {
+        return Ok(PreparedArtifact::default());
+    }
+    mongo_create_artifact_reference(
+        db,
+        run_id,
+        tenant_id,
+        session_id,
+        config.artifact_large_bytes,
+        rng,
+    )
+    .await
+}
+
+async fn mongo_create_artifact_reference(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    bytes: usize,
+    rng: &mut StdRng,
+) -> Result<PreparedArtifact> {
+    let artifact_id = format!("art-mg-{}", rng.gen::<u64>());
+    let content_uri = format!("bench://mongodb-artifact/{artifact_id}");
+    let sha256 = format!("{:016x}", rng.gen::<u64>());
+    db.collection::<Document>("artifacts")
+        .insert_one(
+            doc! {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "artifact_id": &artifact_id,
+                "session_id": session_id,
+                "content_uri": &content_uri,
+                "content_type": "application/octet-stream",
+                "bytes": bytes as i64,
+                "sha256": &sha256,
+                "created_at": BsonDateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(PreparedArtifact {
+        artifact_refs: Vec::new(),
+        external_refs: vec![json!({
+            "artifact_id": artifact_id,
+            "content_uri": content_uri,
+            "content_type": "application/octet-stream",
+            "bytes": bytes,
+            "sha256": sha256
+        })],
+        content_backend_artifacts: 0,
+        content_backend_bytes: 0,
+        external_reference_artifacts: 1,
+        external_reference_bytes: bytes as u64,
+    })
+}
+
+async fn run_one_mongodb_operation(
+    db: &MongoDatabase,
+    args: &RunArgs,
+    config: &DatasetConfig,
+    fixture: &FlatSession,
+    rng: &mut StdRng,
+    operation: Operation,
+) -> Result<()> {
+    match operation {
+        Operation::AppendFetch => {
+            mongo_append_fetch(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &fixture.session_id,
+                args.fetch_last_n,
+                &json!({
+                    "role": "assistant",
+                    "content": deterministic_string(128, rng),
+                    "bench_op": "append_fetch"
+                }),
+            )
+            .await
+        }
+        Operation::FetchRecent => {
+            mongo_fetch_recent(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                args.fetch_last_n,
+            )
+            .await
+        }
+        Operation::RecordWrite => {
+            mongo_create_record(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                rng.gen_range(0..1_000_000),
+                &DatasetConfig::small_runtime(args.seed),
+            )
+            .await
+        }
+        Operation::RecordSearch => {
+            let options = FindOptions::builder()
+                .sort(doc! {"created_at": -1})
+                .limit(10)
+                .build();
+            let mut cursor = db
+                .collection::<Document>("records")
+                .find(
+                    doc! {"run_id": &args.run_id, "tenant_id": &fixture.tenant_id, "tags": "bench"},
+                    options,
+                )
+                .await?;
+            while cursor.try_next().await?.is_some() {}
+            Ok(())
+        }
+        Operation::Fork => {
+            let child_id = format!("{}-runtime-fork-{}", fixture.session_id, rng.gen::<u64>());
+            mongo_create_session(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &child_id,
+                &child_id,
+                Some(&fixture.session_id),
+                Some(fixture.events_written.saturating_sub(1) as i64),
+            )
+            .await
+        }
+        Operation::Artifact => {
+            let bytes = match config.artifact_mode {
+                ArtifactMode::ContentBackend | ArtifactMode::Mixed if rng.gen_bool(0.2) => {
+                    config.artifact_large_bytes
+                }
+                ArtifactMode::ContentBackend | ArtifactMode::Mixed => config.artifact_small_bytes,
+                ArtifactMode::Reference => config.artifact_large_bytes,
+            };
+            mongo_create_artifact_reference(
+                db,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                bytes,
+                rng,
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
 async fn post_json<T: Serialize + ?Sized>(
     client: &Client,
     base_url: &str,
@@ -1971,11 +2705,14 @@ fn ensure_agentdb_backend(backend: &str) -> Result<()> {
 }
 
 fn ensure_benchmark_backend(backend: &str) -> Result<()> {
-    if backend == "agentdb-native-rocksdb" || backend == "postgres-event-log" {
+    if backend == "agentdb-native-rocksdb"
+        || backend == "postgres-event-log"
+        || backend == "mongodb-event-log"
+    {
         return Ok(());
     }
     Err(anyhow!(
-        "backend {backend:?} is not implemented yet; supported backends: agentdb-native-rocksdb, postgres-event-log"
+        "backend {backend:?} is not implemented yet; supported backends: agentdb-native-rocksdb, postgres-event-log, mongodb-event-log"
     ))
 }
 

@@ -24,7 +24,10 @@ name = "agentdb-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bson",
  "clap",
+ "futures",
+ "mongodb",
  "rand 0.8.6",
  "reqwest",
  "serde",

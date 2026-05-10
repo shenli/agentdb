@@ -1,8 +1,8 @@
 # agentdb-bench
 
 `agentdb-bench` prepares and runs synthetic agent-runtime workloads against
-AgentDB. The first implemented backend is `agentdb-native-rocksdb`: native HTTP
-API plus local RocksDB storage.
+AgentDB, Postgres, and MongoDB. The primary AgentDB backend is
+`agentdb-native-rocksdb`: native HTTP API plus local RocksDB storage.
 
 In this profile, RocksDB stores metadata and indexes. Artifact bytes are written
 through AgentDB's content engine, which is local filesystem in the example
@@ -38,6 +38,17 @@ The Postgres baseline uses `benchmarks/postgres/docker-compose.yml` and
 artifact metadata references. It does not put large artifact bytes into a JSONB
 session row.
 
+Run the normalized MongoDB event-log baseline:
+
+```bash
+PROFILE=smoke scripts/agentdb-bench-mongodb.sh
+```
+
+The MongoDB baseline uses `benchmarks/mongodb/docker-compose.yml` and the
+`mongodb-event-log` backend. It stores sessions, events, records, and artifacts
+in separate collections with tenant/session/sequence indexes. It intentionally
+does not use the naive single-session-document model for the default comparison.
+
 Prepare a dataset:
 
 ```bash
@@ -65,6 +76,26 @@ cargo run -p agentdb-bench -- run \
   --concurrency 1,4,16 \
   --warmup 5s \
   --duration 30s
+```
+
+For MongoDB directly:
+
+```bash
+cargo run -p agentdb-bench -- prepare \
+  --backend mongodb-event-log \
+  --mongo-uri mongodb://127.0.0.1:27017 \
+  --mongo-db agentdb_bench \
+  --run-id smoke-mongo \
+  --out bench-out \
+  --profile smoke
+
+cargo run -p agentdb-bench -- run \
+  --backend mongodb-event-log \
+  --mongo-uri mongodb://127.0.0.1:27017 \
+  --mongo-db agentdb_bench \
+  --run-id smoke-mongo \
+  --out bench-out \
+  --workload mixed-agent-loop
 ```
 
 Outputs are written under `bench-out/runs/<run-id>/`:

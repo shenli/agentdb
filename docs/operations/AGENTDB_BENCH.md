@@ -42,7 +42,7 @@ Non-goals:
 | `agentdb-native-rocksdb` | First AgentDB target: native HTTP API with local RocksDB storage. |
 | `agentdb-mongodb-api` | Optional adapter-overhead run through the MongoDB-compatible API. |
 | `mongodb-session-doc` | Naive MongoDB model: one document per session with an embedded event array. |
-| `mongodb-event-log` | Reasonable MongoDB model: sessions, events, records, and artifacts collections. |
+| `mongodb-event-log` | Implemented MongoDB baseline: sessions, events, records, and artifacts collections. |
 | `postgres-jsonb-session` | Naive Postgres model: one session row with a JSONB event array. |
 | `postgres-event-log` | Reasonable Postgres model: normalized sessions/events/records/artifacts tables. |
 | `postgres-event-log-vector` | Optional tuned Postgres model with `pgvector`, full-text indexes, and JSONB indexes. |
@@ -280,6 +280,17 @@ db.records.createIndex({ tenant_id: 1, session_id: 1, sharding_key: 1 })
 db.records.createIndex({ tenant_id: 1, tags: 1 })
 db.records.createIndex({ tenant_id: 1, text: "text" })
 ```
+
+Repo-local runner:
+
+```bash
+PROFILE=smoke scripts/agentdb-bench-mongodb.sh
+```
+
+The implemented runner accepts the same dataset knobs as the AgentDB/Postgres
+runners, plus `MONGO_PORT`, `MONGO_URI`, and `MONGO_DB`. It uses reference-mode
+artifact metadata by default so the comparison measures agent runtime metadata
+paths instead of large blob storage.
 
 Fork behavior should be reported in two modes if both are implemented:
 
