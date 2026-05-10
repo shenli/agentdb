@@ -2384,9 +2384,11 @@ fn cluster_node_unavailable(
     now_ms: i64,
     stale_node_threshold_ms: i64,
 ) -> bool {
+    let stale_deadline_ms = now_ms.saturating_sub(stale_node_threshold_ms);
     node.map_or(true, |node| {
         node.state.as_str() != "alive"
-            || node.last_heartbeat_ms <= now_ms.saturating_sub(stale_node_threshold_ms)
+            || (node.last_heartbeat_ms <= stale_deadline_ms
+                && node.joined_at_ms <= stale_deadline_ms)
     })
 }
 
@@ -7279,6 +7281,22 @@ region = "us-west-2"
 
         assert!(cluster_node_unavailable(Some(&stale), 10_000, 5_000));
         assert!(cluster_node_available(Some(&fresh), 10_000, 5_000));
+    }
+
+    #[test]
+    fn raft_failover_gives_recently_joined_nodes_startup_grace() {
+        let warming = agentdb_meta::nodes::Node {
+            node_id: "node-c".to_string(),
+            address: "http://node-c".to_string(),
+            mongo_address: None,
+            state: "alive".to_string(),
+            last_heartbeat_ms: 1_000,
+            joined_at_ms: 9_000,
+            availability_zone: None,
+            region: None,
+        };
+
+        assert!(cluster_node_available(Some(&warming), 10_000, 5_000));
     }
 
     #[test]
