@@ -161,14 +161,36 @@ Read-heavy AgentDB workloads also scale: `agentdb-isolate-fetch` reached about
 36k ops/s at 16 workers.
 
 MongoDB shows a different curve in the same local setup after adding the
-compound record-search index. It is weaker at 1-4 workers but batches/scales
-better at 8-32 workers in this synthetic local driver workload:
+compound record-search index. It is weaker at 1-4 workers but reports higher
+throughput at 16-32 workers in this synthetic local driver workload:
 
 | Run | Workload | c=1 | c=2 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `mongo-sweep-mixed` | `mixed-agent-loop` | 2971 ops/s | 1505 ops/s | 2658 ops/s | 7685 ops/s | 24874 ops/s | 25253 ops/s |
 | `agentdb-sweep-mixed` | `mixed-agent-loop` | 5082 ops/s | 3812 ops/s | 6940 ops/s | 9538 ops/s | 7727 ops/s | 7805 ops/s |
 | `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | n/a | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+
+Interpretation: the MongoDB c=16/c=32 result should not be summarized as
+"MongoDB is faster than AgentDB" or "MongoDB wins overall." It means the current
+standalone MongoDB event-log baseline, driven directly through the MongoDB
+driver, scales better than the current single-node/single-tablet AgentDB HTTP
+profile on this specific mixed workload at high client concurrency. The result
+is useful because it exposes where AgentDB still needs work, but it is not yet
+a product-level comparison:
+
+- The AgentDB run is still a single runtime tablet and single local durable log;
+  the next fair AgentDB scale profile needs multi-tablet routing and then the
+  real Raft quorum profile.
+- The MongoDB baseline uses a direct database driver path, while AgentDB uses
+  the native HTTP server path; report this adapter difference instead of hiding
+  it inside one winner/loser table.
+- The mixed workload aggregates several operations. Any claim should include
+  per-operation latency/throughput so append/fetch, long-context reads, record
+  writes, search, fork, and artifact-reference writes can be compared
+  separately.
+- These are short local runs. Longer steady-state runs should capture CPU,
+  disk I/O, cache warmth, connection-pool behavior, and p95/p99 latency before
+  turning the numbers into external messaging.
 
 The next AgentDB performance task should therefore be multi-tablet/cluster
 distribution and quorum durability profiling, not session-count tuning. For

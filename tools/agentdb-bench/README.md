@@ -37,6 +37,13 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 The detailed reports are stored on `li-dev` under
 `/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
 
+Do not read these as a final AgentDB-vs-MongoDB/Postgres ranking. The current
+MongoDB event-log baseline has shown higher high-concurrency throughput on the
+synthetic `mixed-agent-loop`, but that compares a direct MongoDB driver path
+with a single-tablet AgentDB HTTP profile. Use the reports to identify
+follow-up work: multi-tablet AgentDB routing, durable quorum profiles,
+per-operation breakdowns, and longer steady-state runs.
+
 Run the normalized Postgres event-log baseline:
 
 ```bash
