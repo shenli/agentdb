@@ -456,10 +456,12 @@ async fn run_smoke(
             client,
             nodes,
             children,
-            &tenant_id,
-            &agent_id,
-            &session_id,
-            next_seq,
+            ChaosSession {
+                tenant_id: &tenant_id,
+                agent_id: &agent_id,
+                session_id: &session_id,
+                next_seq,
+            },
         )
         .await?;
     }
@@ -467,16 +469,24 @@ async fn run_smoke(
     Ok(())
 }
 
+struct ChaosSession<'a> {
+    tenant_id: &'a str,
+    agent_id: &'a str,
+    session_id: &'a str,
+    next_seq: u64,
+}
+
 async fn run_chaos(
     args: &Args,
     client: &Client,
     nodes: &[NodeSpec],
     children: &mut [Child],
-    tenant_id: &str,
-    agent_id: &str,
-    session_id: &str,
-    mut next_seq: u64,
+    session: ChaosSession<'_>,
 ) -> Result<()> {
+    let tenant_id = session.tenant_id;
+    let agent_id = session.agent_id;
+    let session_id = session.session_id;
+    let mut next_seq = session.next_seq;
     let seed = args.chaos_seed.unwrap_or_else(|| now_ms() as u64);
     let mut rng = SimpleRng::new(seed);
     eprintln!(
