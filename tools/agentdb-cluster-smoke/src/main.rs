@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -1019,6 +1020,7 @@ async fn current_raft_leader_node_id(
     client: &Client,
     nodes: &[NodeSpec],
 ) -> Result<Option<String>> {
+    let live_node_ids = current_live_node_ids(client, nodes).await;
     for node in nodes {
         let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
             continue;
@@ -1045,12 +1047,34 @@ async fn current_raft_leader_node_id(
         for replica in configured {
             if replica["raft_node_id"].as_u64() == Some(leader_raft_node_id) {
                 if let Some(node_id) = replica["node_id"].as_str() {
-                    return Ok(Some(node_id.to_string()));
+                    if live_node_ids.contains(node_id) {
+                        return Ok(Some(node_id.to_string()));
+                    }
                 }
             }
         }
     }
     Ok(None)
+}
+
+async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
+    for node in nodes {
+        let Ok(response) = get_json(client, &node.url, "/api/admin/nodes").await else {
+            continue;
+        };
+        let Some(items) = response.as_array() else {
+            continue;
+        };
+        return items
+            .iter()
+            .filter_map(|node| {
+                let node_id = node["node_id"].as_str()?;
+                let live = node["state"] == "alive" && node["is_stale"] == false;
+                live.then_some(node_id.to_string())
+            })
+            .collect();
+    }
+    BTreeSet::new()
 }
 
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
