@@ -2288,8 +2288,11 @@ fn spawn_raft_rs_tick_worker(
                             .get(leader_node_id)
                             .map_or(true, |node| node.state.as_str() != "alive")
                     });
+                let raft_leader_missing = local_status.is_some_and(|status| {
+                    status.leader_id == 0 && status.role.as_str() != "Leader"
+                });
                 if !local_is_owner && !local_is_leader {
-                    if owner_unavailable || raft_leader_unavailable {
+                    if owner_unavailable || raft_leader_unavailable || raft_leader_missing {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
                             tracing::warn!(
                                 tablet_id,
