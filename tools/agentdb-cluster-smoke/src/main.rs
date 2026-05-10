@@ -802,6 +802,7 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
         || message.contains("503 Service Unavailable")
         || message.contains("operation timed out")
+        || message.contains("raft leader was not observable")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
