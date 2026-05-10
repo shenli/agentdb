@@ -3109,8 +3109,6 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
-    let heartbeat_runtime = runtime.clone();
-    let heartbeat_scheduler_status = scheduler_status.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -3134,40 +3132,53 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
             }
+        }
+    });
+
+    let maintenance_meta = meta.clone();
+    let maintenance_node_id = node_id.clone();
+    let maintenance_runtime = runtime.clone();
+    let maintenance_scheduler_status = scheduler_status.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        loop {
+            interval.tick().await;
+            let now_ms = now_ms_i64();
             match run_local_tablet_log_compaction_tick(
-                &heartbeat_runtime,
+                &maintenance_runtime,
                 config.tablet_log_compaction_min_debt_ops,
             ) {
                 Ok(compacted_count) if compacted_count > 0 => {
-                    heartbeat_scheduler_status
+                    maintenance_scheduler_status
                         .add_local_tablet_log_compactions(compacted_count as u64, now_ms);
                     tracing::debug!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         compacted_count,
                         "compacted local tablet logs from retained-log debt"
                     );
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    heartbeat_scheduler_status.add_local_tablet_log_compaction_failure();
+                    maintenance_scheduler_status.add_local_tablet_log_compaction_failure();
                     tracing::warn!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         error = %error,
                         "local tablet log compaction failed"
                     );
                 }
             }
             match run_local_tablet_stats_tick(
-                &heartbeat_meta,
-                &heartbeat_runtime,
-                &heartbeat_node_id,
+                &maintenance_meta,
+                &maintenance_runtime,
+                &maintenance_node_id,
                 now_ms,
             )
             .await
             {
                 Ok(published_count) if published_count > 0 => {
                     tracing::debug!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         published_count,
                         "published local tablet storage stats"
                     );
@@ -3175,7 +3186,7 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         error = %error,
                         "local tablet storage stats publication failed"
                     );
