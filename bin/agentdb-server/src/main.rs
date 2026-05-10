@@ -2354,11 +2354,11 @@ fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplic
 }
 
 fn should_attempt_raft_failover_tick(
-    owner_unavailable: bool,
+    _owner_unavailable: bool,
     raft_leader_unavailable: bool,
     raft_leader_missing: bool,
 ) -> bool {
-    owner_unavailable || raft_leader_unavailable || raft_leader_missing
+    raft_leader_unavailable || raft_leader_missing
 }
 
 fn spawn_raft_rs_owner_campaign_worker(
@@ -7224,6 +7224,11 @@ region = "us-west-2"
 
         assert!(!local_raft_leader_missing(Some(&local_status)));
         assert!(!should_attempt_raft_failover_tick(false, false, false));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_when_only_control_plane_owner_is_missing() {
+        assert!(!should_attempt_raft_failover_tick(true, false, false));
     }
 
     #[test]
