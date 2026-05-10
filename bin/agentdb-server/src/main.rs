@@ -2288,11 +2288,13 @@ fn spawn_raft_rs_tick_worker(
                             .get(leader_node_id)
                             .map_or(true, |node| node.state.as_str() != "alive")
                     });
-                let raft_leader_missing = local_status.is_some_and(|status| {
-                    status.leader_id == 0 && status.role.as_str() != "Leader"
-                });
+                let raft_leader_missing = local_raft_leader_missing(local_status);
                 if !local_is_owner && !local_is_leader {
-                    if owner_unavailable || raft_leader_unavailable || raft_leader_missing {
+                    if should_attempt_raft_failover_tick(
+                        owner_unavailable,
+                        raft_leader_unavailable,
+                        raft_leader_missing,
+                    ) {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
                             tracing::warn!(
                                 tablet_id,
@@ -2314,7 +2316,9 @@ fn spawn_raft_rs_tick_worker(
                             .min();
                         if failover_candidate == Some(local_raft_node_id) {
                             let result = if raft_leader_missing {
-                                group.campaign(local_raft_node_id)
+                                group
+                                    .campaign(local_raft_node_id)
+                                    .and_then(|()| group.tick(local_raft_node_id))
                             } else {
                                 group.tick(local_raft_node_id)
                             };
@@ -2343,6 +2347,18 @@ fn spawn_raft_rs_tick_worker(
             }
         }
     });
+}
+
+fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplicaStatus>) -> bool {
+    local_status.is_some_and(|status| status.leader_id == 0 && status.role.as_str() != "Leader")
+}
+
+fn should_attempt_raft_failover_tick(
+    owner_unavailable: bool,
+    raft_leader_unavailable: bool,
+    raft_leader_missing: bool,
+) -> bool {
+    owner_unavailable || raft_leader_unavailable || raft_leader_missing
 }
 
 fn spawn_raft_rs_owner_campaign_worker(
@@ -3596,11 +3612,8 @@ async fn reconcile_raft_leader_tablet_ownership(
 ) -> agentdb_meta::MetaResult<usize> {
     let mut aligned = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
-        let Some(leader_raft_node_id) = group
-            .status()
-            .into_iter()
-            .find_map(|status| (status.leader_id != 0).then_some(status.leader_id))
-        else {
+        let statuses = group.status();
+        let Some(leader_raft_node_id) = raft_leader_id_from_statuses(&statuses) else {
             continue;
         };
         let replicas =
@@ -6285,6 +6298,62 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_assigns_unowned_tablet_to_raft_leader_after_dead_owner_clear() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 1);
+    }
+
+    #[tokio::test]
     async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -7121,6 +7190,68 @@ region = "us-west-2"
         assert!(!status
             .iter()
             .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
+    }
+
+    #[test]
+    fn raft_failover_tick_runs_when_local_replica_has_no_observed_leader() {
+        let local_status = agentdb_storage::RaftRsReplicaStatus {
+            node_id: 11,
+            role: "Follower".to_string(),
+            leader_id: 0,
+            term: 42,
+            commit_index: 10,
+            applied_index: 10,
+            pending_conf_change: false,
+            outbound_message_count: 0,
+        };
+
+        assert!(local_raft_leader_missing(Some(&local_status)));
+        assert!(should_attempt_raft_failover_tick(false, false, true));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_when_healthy_leader_is_observed() {
+        let local_status = agentdb_storage::RaftRsReplicaStatus {
+            node_id: 11,
+            role: "Follower".to_string(),
+            leader_id: 22,
+            term: 42,
+            commit_index: 10,
+            applied_index: 10,
+            pending_conf_change: false,
+            outbound_message_count: 0,
+        };
+
+        assert!(!local_raft_leader_missing(Some(&local_status)));
+        assert!(!should_attempt_raft_failover_tick(false, false, false));
+    }
+
+    #[test]
+    fn raft_leader_id_from_statuses_accepts_leader_role_without_leader_id() {
+        let statuses = vec![
+            agentdb_storage::RaftRsReplicaStatus {
+                node_id: 11,
+                role: "Leader".to_string(),
+                leader_id: 0,
+                term: 42,
+                commit_index: 10,
+                applied_index: 10,
+                pending_conf_change: false,
+                outbound_message_count: 0,
+            },
+            agentdb_storage::RaftRsReplicaStatus {
+                node_id: 22,
+                role: "Follower".to_string(),
+                leader_id: 11,
+                term: 42,
+                commit_index: 10,
+                applied_index: 10,
+                pending_conf_change: false,
+                outbound_message_count: 0,
+            },
+        ];
+
+        assert_eq!(raft_leader_id_from_statuses(&statuses), Some(11));
     }
 
     #[tokio::test]

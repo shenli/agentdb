@@ -1075,3 +1075,29 @@ fn stop_children(children: &mut [Child]) {
         let _ = child.wait();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_classifier_treats_leader_discovery_gap_as_transient() {
+        let error = anyhow!("tablet 1 raft leader was not observable within 90s");
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_treats_session_not_found_as_transient() {
+        let error = anyhow!(r#"HTTP 404: {{"code":"SESSION_NOT_FOUND"}}"#);
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_rejects_unrelated_errors() {
+        let error = anyhow!("schema validation failed");
+
+        assert!(!is_retryable_cluster_convergence_error(&error));
+    }
+}
