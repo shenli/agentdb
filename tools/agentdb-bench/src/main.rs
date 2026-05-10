@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::TryStreamExt;
 use mongodb::options::{
     ClientOptions, FindOneAndUpdateOptions, FindOptions, IndexOptions, ReturnDocument,
+    UpdateOptions,
 };
 use mongodb::{Client as MongoClient, Database as MongoDatabase, IndexModel};
 use rand::rngs::StdRng;
@@ -2316,8 +2317,9 @@ async fn mongo_create_record(
 ) -> Result<()> {
     let record_id = format!("rec-mg-{session_id}-{record_idx}");
     db.collection::<Document>("records")
-        .insert_one(
-            doc! {
+        .update_one(
+            doc! {"run_id": run_id, "tenant_id": tenant_id, "record_id": &record_id},
+            doc! {"$setOnInsert": {
                 "run_id": run_id,
                 "tenant_id": tenant_id,
                 "record_id": record_id,
@@ -2331,8 +2333,8 @@ async fn mongo_create_record(
                     "payload": "x".repeat(config.payload_bytes.min(4096)),
                 },
                 "created_at": BsonDateTime::now(),
-            },
-            None,
+            }},
+            UpdateOptions::builder().upsert(true).build(),
         )
         .await?;
     Ok(())
