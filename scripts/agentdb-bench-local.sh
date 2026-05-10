@@ -100,6 +100,7 @@ run_args=(
 )
 
 [[ -n "${FETCH_LAST_N:-}" ]] && run_args+=(--fetch-last-n "${FETCH_LAST_N}")
+[[ "${NO_RAW_JSONL:-0}" == "1" ]] && run_args+=(--no-raw-jsonl)
 [[ -n "${SEED:-}" ]] && run_args+=(--seed "${SEED}")
 
 "${ROOT}/target/debug/agentdb-bench" "${run_args[@]}" \

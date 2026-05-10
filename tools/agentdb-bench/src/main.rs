@@ -1,5 +1,8 @@
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -104,6 +107,8 @@ struct RunArgs {
     duration: String,
     #[arg(long, default_value_t = 20)]
     fetch_last_n: usize,
+    #[arg(long)]
+    no_raw_jsonl: bool,
     #[arg(long, default_value_t = 43)]
     seed: u64,
 }
@@ -231,6 +236,7 @@ struct CellReport {
     errors: u64,
     ops_per_sec: f64,
     latency: LatencyReport,
+    operations: Vec<OperationReport>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -241,6 +247,38 @@ struct LatencyReport {
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OperationReport {
+    operation: String,
+    successful_ops: u64,
+    errors: u64,
+    first_error: Option<String>,
+    latency: LatencyReport,
+}
+
+#[derive(Clone, Debug)]
+struct OperationSample {
+    operation: Operation,
+    latency_ms: f64,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationRecord {
+    schema_version: u32,
+    run_id: String,
+    backend: String,
+    workload: Workload,
+    concurrency: usize,
+    worker_id: usize,
+    operation: String,
+    started_at_ms: u64,
+    latency_ms: f64,
+    success: bool,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -467,6 +505,14 @@ async fn run(args: RunArgs) -> Result<()> {
             "note": "database-config.json was not found for this run"
         })
     });
+    let raw_writer = if !args.no_raw_jsonl {
+        let raw_path = run_dir.join("raw.jsonl");
+        let file =
+            File::create(&raw_path).with_context(|| format!("create {}", raw_path.display()))?;
+        Some(Arc::new(Mutex::new(BufWriter::new(file))))
+    } else {
+        None
+    };
 
     let mut cells = Vec::new();
     for concurrency in concurrencies {
@@ -478,10 +524,14 @@ async fn run(args: RunArgs) -> Result<()> {
             concurrency,
             duration,
             args.seed + concurrency as u64,
+            raw_writer.clone(),
         )
         .await?;
         print_cell(&cell);
         cells.push(cell);
+    }
+    if let Some(writer) = &raw_writer {
+        writer.lock().await.flush()?;
     }
 
     let report = BenchReport {
@@ -499,6 +549,7 @@ async fn run(args: RunArgs) -> Result<()> {
             "warmup": args.warmup,
             "duration": args.duration,
             "fetch_last_n": args.fetch_last_n,
+            "raw_jsonl": !args.no_raw_jsonl,
             "seed": args.seed
         }),
         cells,
@@ -522,7 +573,7 @@ async fn run_cell_warmup(
     if duration.is_zero() {
         return Ok(());
     }
-    let _ = run_cell(client, args, manifest, concurrency, duration, seed).await?;
+    let _ = run_cell(client, args, manifest, concurrency, duration, seed, None).await?;
     Ok(())
 }
 
@@ -533,9 +584,9 @@ async fn run_cell(
     concurrency: usize,
     duration: Duration,
     seed: u64,
+    raw_writer: Option<Arc<Mutex<BufWriter<File>>>>,
 ) -> Result<CellReport> {
-    let samples = Arc::new(Mutex::new(Vec::new()));
-    let errors = Arc::new(Mutex::new(0_u64));
+    let samples = Arc::new(Mutex::new(Vec::<OperationSample>::new()));
     let deadline = Instant::now() + duration;
     let fixtures = Arc::new(flatten_fixtures(manifest)?);
     let mut handles = Vec::new();
@@ -544,30 +595,62 @@ async fn run_cell(
         let client = client.clone();
         let args = args.clone_for_worker();
         let samples = samples.clone();
-        let errors = errors.clone();
         let fixtures = fixtures.clone();
+        let raw_writer = raw_writer.clone();
         handles.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed + worker_id as u64);
             while Instant::now() < deadline {
+                let operation = choose_operation(args.workload, &mut rng);
+                let started_at_ms = now_ms();
                 let started = Instant::now();
-                let result = run_one_operation(&client, &args, &fixtures, &mut rng).await;
+                let result =
+                    run_one_operation(&client, &args, &fixtures, &mut rng, operation).await;
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-                if result.is_ok() {
-                    samples.lock().await.push(elapsed);
-                } else {
-                    *errors.lock().await += 1;
+                let error = result.err().map(|err| err.to_string());
+                let success = error.is_none();
+                let sample = OperationSample {
+                    operation,
+                    latency_ms: elapsed,
+                    success,
+                    error: error.clone(),
+                };
+                samples.lock().await.push(sample);
+
+                if let Some(writer) = &raw_writer {
+                    let record = OperationRecord {
+                        schema_version: 1,
+                        run_id: args.run_id.clone(),
+                        backend: args.backend.clone(),
+                        workload: args.workload,
+                        concurrency,
+                        worker_id,
+                        operation: operation.as_str().into(),
+                        started_at_ms,
+                        latency_ms: elapsed,
+                        success,
+                        error,
+                    };
+                    let mut writer = writer.lock().await;
+                    serde_json::to_writer(&mut *writer, &record)?;
+                    writer.write_all(b"\n")?;
                 }
             }
+            Ok::<(), anyhow::Error>(())
         }));
     }
 
     for handle in handles {
-        handle.await?;
+        handle.await??;
     }
 
     let samples = samples.lock().await.clone();
-    let errors = *errors.lock().await;
-    let successful_ops = samples.len() as u64;
+    let successful_ops = samples.iter().filter(|sample| sample.success).count() as u64;
+    let errors = samples.len() as u64 - successful_ops;
+    let successful_latencies = samples
+        .iter()
+        .filter(|sample| sample.success)
+        .map(|sample| sample.latency_ms)
+        .collect();
     Ok(CellReport {
         concurrency,
         warmup_secs: 0.0,
@@ -575,7 +658,8 @@ async fn run_cell(
         successful_ops,
         errors,
         ops_per_sec: successful_ops as f64 / duration.as_secs_f64(),
-        latency: summarize_latency(samples),
+        latency: summarize_latency(successful_latencies),
+        operations: summarize_operations(&samples),
     })
 }
 
@@ -584,12 +668,13 @@ async fn run_one_operation(
     args: &RunArgs,
     fixtures: &[FlatSession],
     rng: &mut StdRng,
+    operation: Operation,
 ) -> Result<()> {
     if fixtures.is_empty() {
         return Err(anyhow!("dataset has no sessions"));
     }
     let fixture = &fixtures[rng.gen_range(0..fixtures.len())];
-    match choose_operation(args.workload, rng) {
+    match operation {
         Operation::AppendFetch => {
             append_and_fetch(
                 client,
@@ -682,7 +767,7 @@ struct FlatSession {
     events_written: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Operation {
     AppendFetch,
     FetchRecent,
@@ -690,6 +775,19 @@ enum Operation {
     RecordSearch,
     Fork,
     Artifact,
+}
+
+impl Operation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Operation::AppendFetch => "append_fetch",
+            Operation::FetchRecent => "fetch_recent",
+            Operation::RecordWrite => "record_write",
+            Operation::RecordSearch => "record_search",
+            Operation::Fork => "fork",
+            Operation::Artifact => "artifact",
+        }
+    }
 }
 
 impl RunArgs {
@@ -704,6 +802,7 @@ impl RunArgs {
             warmup: self.warmup.clone(),
             duration: self.duration.clone(),
             fetch_last_n: self.fetch_last_n,
+            no_raw_jsonl: self.no_raw_jsonl,
             seed: self.seed,
         }
     }
@@ -1271,6 +1370,26 @@ fn write_markdown_report(
             cell.latency.max_ms
         ));
     }
+    out.push_str("\n## Operation Breakdown\n\n");
+    out.push_str(
+        "| concurrency | operation | ops | errors | p50 ms | p95 ms | p99 ms | max ms |\n",
+    );
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    for cell in &report.cells {
+        for op in &cell.operations {
+            out.push_str(&format!(
+                "| {} | `{}` | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+                cell.concurrency,
+                op.operation,
+                op.successful_ops,
+                op.errors,
+                op.latency.p50_ms,
+                op.latency.p95_ms,
+                op.latency.p99_ms,
+                op.latency.max_ms
+            ));
+        }
+    }
     fs::write(path, out)?;
     Ok(())
 }
@@ -1336,6 +1455,33 @@ fn percentile(samples: &[f64], q: f64) -> f64 {
     }
     let idx = ((samples.len() - 1) as f64 * q).round() as usize;
     samples[idx.min(samples.len() - 1)]
+}
+
+fn summarize_operations(samples: &[OperationSample]) -> Vec<OperationReport> {
+    let mut grouped: BTreeMap<Operation, Vec<&OperationSample>> = BTreeMap::new();
+    for sample in samples {
+        grouped.entry(sample.operation).or_default().push(sample);
+    }
+
+    grouped
+        .into_iter()
+        .map(|(operation, samples)| {
+            let successful_ops = samples.iter().filter(|sample| sample.success).count() as u64;
+            let errors = samples.len() as u64 - successful_ops;
+            let latencies = samples
+                .iter()
+                .filter(|sample| sample.success)
+                .map(|sample| sample.latency_ms)
+                .collect();
+            OperationReport {
+                operation: operation.as_str().into(),
+                successful_ops,
+                errors,
+                first_error: samples.iter().find_map(|sample| sample.error.clone()),
+                latency: summarize_latency(latencies),
+            }
+        })
+        .collect()
 }
 
 fn print_cell(cell: &CellReport) {

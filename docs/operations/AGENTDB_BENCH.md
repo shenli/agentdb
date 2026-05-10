@@ -456,7 +456,8 @@ Scale profiles should vary one dimension at a time:
 - Add backend trait, workload trait, config parsing, deterministic ID/payload
   generation, histogram collection, JSONL output, and summary JSON output.
   Initial status: implemented as a first native-AgentDB harness; generic
-  backend traits and raw JSONL are still follow-up work.
+  backend traits are still follow-up work. Raw JSONL and per-operation latency
+  summaries are implemented.
 - Add `prepare` and `run` subcommands. `prepare` owns synthetic dataset
   creation for tenants, agents, sessions, chat history, records, forks, and
   artifacts. Initial status: implemented for tenants, agents, sessions, chat

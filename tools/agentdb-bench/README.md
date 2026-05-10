@@ -59,5 +59,10 @@ Outputs are written under `bench-out/runs/<run-id>/`:
 - `host-manifest.json` records hardware and OS information.
 - `software-manifest.json` records toolchain and runtime versions.
 - `database-config.json` records storage/content engine configuration.
+- `raw.jsonl` records each measured operation by operation type, latency,
+  success/failure, and worker ID. Set `NO_RAW_JSONL=1` when using
+  `scripts/agentdb-bench-local.sh` if raw operation output is too expensive for
+  a large run.
 - `report-*.json` contains machine-readable latency summaries.
-- `report.md` contains a compact human-readable report.
+- `report.md` contains a compact human-readable report with aggregate and
+  per-operation latency tables.
