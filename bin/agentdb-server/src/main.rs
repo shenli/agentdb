@@ -2313,13 +2313,18 @@ fn spawn_raft_rs_tick_worker(
                             })
                             .min();
                         if failover_candidate == Some(local_raft_node_id) {
-                            if let Err(error) = group.tick(local_raft_node_id) {
+                            let result = if raft_leader_missing {
+                                group.campaign(local_raft_node_id)
+                            } else {
+                                group.tick(local_raft_node_id)
+                            };
+                            if let Err(error) = result {
                                 tracing::warn!(
                                     tablet_id,
                                     local_node_id,
                                     local_raft_node_id,
                                     ?error,
-                                    "failed to tick local raft-rs group after owner became unavailable"
+                                    "failed to recover local raft-rs group after owner or leader became unavailable"
                                 );
                             }
                         }
