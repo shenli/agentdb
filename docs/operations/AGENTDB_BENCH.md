@@ -112,20 +112,33 @@ Recommended `li-dev` rules:
 ## Current Scaling Finding
 
 The local RocksDB AgentDB benchmark currently exercises a single runtime tablet
-and single durable tablet log. On `li-dev`, this shape is very fast at low and
-moderate concurrency, but append-heavy workloads flatten or regress after about
-8 workers:
+and single durable tablet log. The first `li-dev` runs were very fast at low and
+moderate concurrency, but append-heavy workloads flattened or regressed after
+about 8 workers:
 
 | Run | Workload | Dataset | c=1 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---|---:|---:|---:|---:|---:|
 | `agentdb-isolate-append` | `append-fetch-hot` | 32 sessions | 4382 ops/s | 7854 ops/s | 8243 ops/s | 3754 ops/s | 3839 ops/s |
 | `agentdb-append-more-sessions` | `append-fetch-hot` | 320 sessions | 4301 ops/s | 7768 ops/s | 8397 ops/s | 3537 ops/s | 3433 ops/s |
 
-The larger-session run does not improve the high-concurrency collapse, so the
-limit is not primarily logical hot-session contention. It is consistent with
-single-tablet/single-log serialization in the durable append path. Read-heavy
-AgentDB workloads do scale: `agentdb-isolate-fetch` reached about 36k ops/s at
-16 workers.
+The larger-session run did not improve the high-concurrency collapse, so the
+limit was not primarily logical hot-session contention. The immediate bottleneck
+was the append path holding the global runtime state mutex while waiting for the
+durable RocksDB/replicated-log batch. That serialized unrelated sessions before
+storage could make progress.
+
+The `perf(runtime): narrow append state lock` change moves durable append I/O
+outside the global state mutex while keeping a per-session commit lock for
+same-session sequence ordering, idempotency replay, delete, and lifecycle
+transitions. On the same `li-dev` shape, append-heavy throughput no longer
+collapses at higher concurrency:
+
+| Run | Workload | Dataset | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---:|---:|---:|---:|---:|
+| `agentdb-append-lockfix` | `append-fetch-hot` | 320 sessions | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
+
+Read-heavy AgentDB workloads also scale: `agentdb-isolate-fetch` reached about
+36k ops/s at 16 workers.
 
 MongoDB shows a different curve in the same local setup after adding the
 compound record-search index. It is weaker at 1-4 workers but batches/scales
@@ -135,10 +148,11 @@ better at 8-32 workers in this synthetic local driver workload:
 |---|---|---:|---:|---:|---:|---:|---:|
 | `mongo-sweep-mixed` | `mixed-agent-loop` | 2971 ops/s | 1505 ops/s | 2658 ops/s | 7685 ops/s | 24874 ops/s | 25253 ops/s |
 | `agentdb-sweep-mixed` | `mixed-agent-loop` | 5082 ops/s | 3812 ops/s | 6940 ops/s | 9538 ops/s | 7727 ops/s | 7805 ops/s |
+| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | n/a | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
 
-The next AgentDB performance task should therefore be to benchmark and optimize
-multi-tablet append distribution, not to tune session count. For local
-comparison claims, report the single-tablet profile explicitly and add a
+The next AgentDB performance task should therefore be multi-tablet/cluster
+distribution and quorum durability profiling, not session-count tuning. For
+local comparison claims, report the single-tablet profile explicitly and add a
 separate multi-tablet/cluster profile once the runner can route a prepared
 dataset across tablets.
 

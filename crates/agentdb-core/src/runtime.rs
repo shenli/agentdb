@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -496,7 +496,7 @@ fn priority_rank(p: Priority) -> u8 {
 
 pub struct Runtime {
     state: Mutex<State>,
-    session_commit_locks: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    session_commit_locks: StdMutex<BTreeMap<String, Weak<Mutex<()>>>>,
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
@@ -1600,10 +1600,16 @@ impl Runtime {
             .session_commit_locks
             .lock()
             .expect("session commit lock map poisoned");
-        locks
-            .entry(session_id.as_str().to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        let key = session_id.as_str().to_string();
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        lock
     }
 
     pub fn export_tablet_snapshot_payload(&self, tablet_id: i64) -> Result<Vec<u8>> {
