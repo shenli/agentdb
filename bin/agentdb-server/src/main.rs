@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,6 +60,8 @@ struct Cli {
 enum Cmd {
     /// Start the HTTP server with the runtime router.
     Serve(ServeOpts),
+    /// Start a batteries-included local developer server.
+    Dev(DevOpts),
     /// Check local single-node configuration and data directories.
     Doctor(DoctorOpts),
     /// Write a starter single-node config file.
@@ -153,6 +156,52 @@ struct ServeOpts {
     /// also be set with AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN.
     #[arg(long, env = "AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN")]
     internal_auth_previous_token: Option<String>,
+
+    /// Optional workspace bootstrap used by the `agentdb dev` wrapper.
+    #[arg(skip)]
+    dev_bootstrap: Option<DevBootstrap>,
+}
+
+#[derive(Parser, Debug)]
+struct DevOpts {
+    /// `host:port` to bind. Defaults to `127.0.0.1:7878`.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
+
+    /// MongoDB wire-protocol compatibility listener. Defaults to `127.0.0.1:7879`.
+    #[arg(long)]
+    mongo_bind: Option<SocketAddr>,
+
+    /// Disable the MongoDB compatibility listener.
+    #[arg(long)]
+    no_mongo: bool,
+
+    /// Use persistent local storage instead of the default in-memory runtime.
+    #[arg(long)]
+    persistent: bool,
+
+    /// Filesystem path for persistent developer state when `--persistent` is set.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Workspace alias to create or reuse.
+    #[arg(long, default_value = "dev")]
+    workspace: String,
+
+    /// Agent alias to create or reuse inside the workspace.
+    #[arg(long, default_value = "demo-agent")]
+    agent: String,
+
+    /// Session alias to create or reuse inside the workspace.
+    #[arg(long, default_value = "demo-session")]
+    session: String,
+}
+
+#[derive(Debug, Clone)]
+struct DevBootstrap {
+    workspace: String,
+    agent: String,
+    session: String,
 }
 
 #[derive(Parser, Debug)]
@@ -180,6 +229,10 @@ struct DoctorOpts {
     /// Alias for `--in-memory`.
     #[arg(long)]
     dev: bool,
+
+    /// Also check local developer tools used by SDKs, examples, local CI, and cluster smoke.
+    #[arg(long)]
+    dev_tools: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -199,12 +252,14 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
     match args.cmd {
         Cmd::Serve(opts) => serve(opts).await,
+        Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
     }
 }
 
 async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
+    let dev_bootstrap = opts.dev_bootstrap.clone();
     let config = ResolvedServeConfig::from_serve_opts(opts)?;
     if !config.in_memory {
         std::fs::create_dir_all(&config.data_dir)?;
@@ -304,6 +359,10 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         interval_ms = record_index_worker_interval_ms,
         "started record index outbox worker"
     );
+
+    if let Some(bootstrap) = dev_bootstrap.as_ref() {
+        print_dev_bootstrap(&runtime, &config, bootstrap).await?;
+    }
 
     if let Some(mongo_bind) = config.mongo_bind {
         let mongo_listener = tokio::net::TcpListener::bind(mongo_bind).await?;
@@ -534,6 +593,46 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     tracing::info!(addr = %config.bind, "agentdb listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn dev(opts: DevOpts) -> anyhow::Result<()> {
+    serve(serve_opts_from_dev_opts(opts)).await
+}
+
+fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
+    let mongo_bind = if opts.no_mongo {
+        None
+    } else {
+        Some(
+            opts.mongo_bind
+                .unwrap_or_else(|| "127.0.0.1:7879".parse().expect("default mongo bind parses")),
+        )
+    };
+    ServeOpts {
+        config: None,
+        bind: opts.bind,
+        data_dir: opts.data_dir,
+        content_dir: None,
+        in_memory: !opts.persistent,
+        dev: !opts.persistent,
+        route_node_id: None,
+        route_shard_count: None,
+        route_region: None,
+        route_location: None,
+        route_refresh_interval_ms: None,
+        route_proxy_timeout_ms: None,
+        route_proxy_max_response_bytes: None,
+        mongo_bind,
+        mongo_username: None,
+        mongo_password: None,
+        internal_auth_token: None,
+        internal_auth_previous_token: None,
+        dev_bootstrap: Some(DevBootstrap {
+            workspace: opts.workspace,
+            agent: opts.agent,
+            session: opts.session,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1411,7 +1510,122 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
     );
 }
 
+async fn print_dev_bootstrap(
+    runtime: &agentdb_core::Runtime,
+    config: &ResolvedServeConfig,
+    bootstrap: &DevBootstrap,
+) -> anyhow::Result<()> {
+    let tenant = ensure_dev_tenant(runtime, &bootstrap.workspace).await?;
+    let agent = ensure_dev_agent(runtime, &tenant, &bootstrap.agent).await?;
+    let session = ensure_dev_session(runtime, &tenant, &agent, &bootstrap.session).await?;
+
+    println!("AgentDB dev workspace ready");
+    println!(
+        "  workspace: {} ({})",
+        bootstrap.workspace, tenant.tenant_id
+    );
+    println!("  agent:     {} ({})", bootstrap.agent, agent.agent_id);
+    println!(
+        "  session:   {} ({})",
+        bootstrap.session, session.session_id
+    );
+    println!(
+        "  python:    AGENTDB_URL=http://{} AGENTDB_WORKSPACE={} python examples/agents/python/openai_agents_quickstart.py",
+        config.bind, bootstrap.workspace
+    );
+    println!(
+        "  mongodb:   mongosh \"mongodb://{}/?directConnection=true\"",
+        config
+            .mongo_bind
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "<disabled>".into())
+    );
+    println!("  doctor:    agentdb doctor --dev --dev-tools");
+    println!("  local CI:  scripts/local-ci-status.sh --logs");
+    Ok(())
+}
+
+async fn ensure_dev_tenant(
+    runtime: &agentdb_core::Runtime,
+    workspace: &str,
+) -> anyhow::Result<agentdb_core::Tenant> {
+    match runtime
+        .create_tenant(agentdb_core::NewTenant {
+            external_key: workspace.to_string(),
+            policy: serde_json::json!({}),
+        })
+        .await
+    {
+        Ok(tenant) => Ok(tenant),
+        Err(error) if error.code == agentdb_core::ErrorCode::AliasConflict => runtime
+            .list_tenants()
+            .await
+            .into_iter()
+            .find(|tenant| tenant.external_key == workspace)
+            .ok_or_else(|| anyhow::anyhow!("workspace alias conflict but tenant was not found")),
+        Err(error) => Err(anyhow::anyhow!("{error:?}")),
+    }
+}
+
+async fn ensure_dev_agent(
+    runtime: &agentdb_core::Runtime,
+    tenant: &agentdb_core::Tenant,
+    alias: &str,
+) -> anyhow::Result<agentdb_core::Agent> {
+    match runtime
+        .create_agent(agentdb_core::NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: Some(alias.to_string()),
+            config: serde_json::json!({"created_by": "agentdb dev"}),
+        })
+        .await
+    {
+        Ok(agent) => Ok(agent),
+        Err(error) if error.code == agentdb_core::ErrorCode::AliasConflict => {
+            let agents = runtime
+                .list_agents(&tenant.tenant_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            agents
+                .into_iter()
+                .find(|agent| agent.alias.as_deref() == Some(alias))
+                .ok_or_else(|| anyhow::anyhow!("agent alias conflict but agent was not found"))
+        }
+        Err(error) => Err(anyhow::anyhow!("{error:?}")),
+    }
+}
+
+async fn ensure_dev_session(
+    runtime: &agentdb_core::Runtime,
+    tenant: &agentdb_core::Tenant,
+    agent: &agentdb_core::Agent,
+    alias: &str,
+) -> anyhow::Result<agentdb_core::Session> {
+    match runtime
+        .create_session(agentdb_core::NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: Some(alias.to_string()),
+        })
+        .await
+    {
+        Ok(session) => Ok(session),
+        Err(error) if error.code == agentdb_core::ErrorCode::AliasConflict => {
+            let sessions = runtime
+                .list_sessions(&tenant.tenant_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            sessions
+                .into_iter()
+                .find(|session| session.alias.as_deref() == Some(alias))
+                .ok_or_else(|| anyhow::anyhow!("session alias conflict but session was not found"))
+        }
+        Err(error) => Err(anyhow::anyhow!("{error:?}")),
+    }
+}
+
 fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
+    let check_dev_tools = opts.dev_tools;
     let config = ResolvedServeConfig::from_doctor_opts(opts)?;
     let mut failed = false;
 
@@ -1461,6 +1675,34 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(mongo_bind) = config.mongo_bind {
+        match std::net::TcpListener::bind(mongo_bind) {
+            Ok(listener) => {
+                drop(listener);
+                println!("  ok: mongodb bind address is available ({mongo_bind})");
+            }
+            Err(error) => {
+                failed = true;
+                println!("  error: cannot bind mongodb listener {mongo_bind}: {error}");
+            }
+        }
+    }
+
+    if check_dev_tools {
+        failed |= !check_command_available("cargo", &["--version"]);
+        failed |= !check_command_available("python3", &["--version"]);
+        failed |= !check_command_available("npm", &["--version"]);
+        failed |= !check_command_available("docker", &["--version"]);
+        failed |= !check_libclang();
+        failed |= !check_repo_path("Python SDK", "clients/python/pyproject.toml");
+        failed |= !check_repo_path("TypeScript SDK", "clients/typescript/package.json");
+        failed |= !check_repo_path(
+            "OpenAI Agents SDK adapter",
+            "adapters/openai-agents-agentdb/pyproject.toml",
+        );
+        check_local_ci_dashboard();
+    }
+
     if failed {
         anyhow::bail!("doctor found configuration problems");
     }
@@ -1472,6 +1714,100 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
         describe_deployment_mode(&config)
     );
     Ok(())
+}
+
+fn check_command_available(command: &str, args: &[&str]) -> bool {
+    match Command::new(command).args(args).output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            let version = version.lines().next().unwrap_or("available");
+            println!("  ok: {command} {version}");
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "  error: {command} is present but failed: {}",
+                stderr.lines().next().unwrap_or("unknown error")
+            );
+            false
+        }
+        Err(error) => {
+            println!("  error: {command} not available: {error}");
+            false
+        }
+    }
+}
+
+fn check_libclang() -> bool {
+    if let Ok(path) = std::env::var("LIBCLANG_PATH") {
+        let root = PathBuf::from(&path);
+        if root.join("libclang.so").exists()
+            || root.join("libclang.dylib").exists()
+            || root.join("libclang.dll").exists()
+        {
+            println!("  ok: LIBCLANG_PATH={path}");
+            return true;
+        }
+        if std::fs::read_dir(&root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("libclang"))
+        {
+            println!("  ok: LIBCLANG_PATH={path}");
+            return true;
+        }
+        println!("  error: LIBCLANG_PATH is set but no libclang library was found at {path}");
+        return false;
+    }
+
+    for candidate in [
+        "/usr/lib/llvm-14/lib",
+        "/usr/lib/llvm-15/lib",
+        "/usr/lib/llvm-16/lib",
+        "/opt/homebrew/opt/llvm/lib",
+        "/usr/local/opt/llvm/lib",
+    ] {
+        let root = PathBuf::from(candidate);
+        if root.join("libclang.so").exists()
+            || root.join("libclang.dylib").exists()
+            || std::fs::read_dir(&root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("libclang"))
+        {
+            println!("  ok: libclang found at {candidate}");
+            return true;
+        }
+    }
+    println!("  error: libclang not found; set LIBCLANG_PATH before building RocksDB bindings");
+    false
+}
+
+fn check_repo_path(label: &str, path: &str) -> bool {
+    if PathBuf::from(path).exists() {
+        println!("  ok: {label} present ({path})");
+        true
+    } else {
+        println!("  error: {label} missing ({path})");
+        false
+    }
+}
+
+fn check_local_ci_dashboard() {
+    match std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:8099".parse().expect("dashboard address parses"),
+        Duration::from_millis(250),
+    ) {
+        Ok(_) => println!("  ok: local CI dashboard is reachable at http://127.0.0.1:8099"),
+        Err(_) => println!(
+            "  note: local CI dashboard is not running; start scripts/local-ci-serve.sh if needed"
+        ),
+    }
 }
 
 fn describe_deployment_mode(config: &ResolvedServeConfig) -> &'static str {
@@ -4571,6 +4907,7 @@ mod tests {
             mongo_password: None,
             internal_auth_token: None,
             internal_auth_previous_token: None,
+            dev_bootstrap: None,
         }
     }
 
@@ -4666,6 +5003,48 @@ mod tests {
                 .unwrap()
                 .in_memory
         );
+    }
+
+    #[test]
+    fn dev_command_defaults_enable_mongo_and_bootstrap_workspace() {
+        let opts = serve_opts_from_dev_opts(DevOpts {
+            bind: None,
+            mongo_bind: None,
+            no_mongo: false,
+            persistent: false,
+            data_dir: None,
+            workspace: "dev".into(),
+            agent: "demo-agent".into(),
+            session: "demo-session".into(),
+        });
+
+        assert!(opts.dev);
+        assert!(opts.in_memory);
+        assert_eq!(opts.mongo_bind, Some("127.0.0.1:7879".parse().unwrap()));
+        let bootstrap = opts.dev_bootstrap.unwrap();
+        assert_eq!(bootstrap.workspace, "dev");
+        assert_eq!(bootstrap.agent, "demo-agent");
+        assert_eq!(bootstrap.session, "demo-session");
+    }
+
+    #[test]
+    fn dev_command_persistent_mode_uses_data_dir_and_can_disable_mongo() {
+        let opts = serve_opts_from_dev_opts(DevOpts {
+            bind: Some("127.0.0.1:9000".parse().unwrap()),
+            mongo_bind: None,
+            no_mongo: true,
+            persistent: true,
+            data_dir: Some(PathBuf::from("/tmp/agentdb-dev")),
+            workspace: "workspace".into(),
+            agent: "agent".into(),
+            session: "session".into(),
+        });
+
+        assert_eq!(opts.bind, Some("127.0.0.1:9000".parse().unwrap()));
+        assert!(!opts.dev);
+        assert!(!opts.in_memory);
+        assert_eq!(opts.data_dir, Some(PathBuf::from("/tmp/agentdb-dev")));
+        assert_eq!(opts.mongo_bind, None);
     }
 
     #[test]

@@ -7,7 +7,7 @@ and durable runtime state.
 
 ```bash
 # 1. Start the server (one terminal)
-cargo run -p agentdb-server -- serve --dev
+cargo run -p agentdb-server -- dev
 
 # 2. Run from the repo checkout (another terminal)
 python examples/agents/python/quickstart.py
@@ -19,6 +19,23 @@ python examples/agents/python/quickstart.py
 
 You should see three turns of output, each showing the rolling working memory
 grow by one event, then a fork that inherits the parent's events at fork time.
+
+## OpenAI Agents SDK session adapter
+
+```bash
+cargo run -p agentdb-server -- dev
+python examples/agents/python/openai_agents_quickstart.py
+```
+
+The default run does not require an OpenAI API key; it exercises the OpenAI
+Agents SDK custom session protocol over AgentDB and prints the materialized
+session items. To run a live Agents SDK call:
+
+```bash
+pip install openai-agents
+OPENAI_API_KEY=... AGENTDB_OPENAI_LIVE=1 \
+  python examples/agents/python/openai_agents_quickstart.py
+```
 
 ## Session-first runtime demo
 
