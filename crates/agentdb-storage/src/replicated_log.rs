@@ -5,7 +5,10 @@
 //! implementation so the state machine can be wired through a log boundary
 //! before distributed consensus lands.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{Error, KvStore, Result, WriteOp};
 
@@ -381,26 +384,43 @@ impl RaftQuorumReplicatedLog {
 pub struct SingleNodeReplicatedLog {
     kv: Arc<dyn KvStore + Send + Sync>,
     term: u64,
+    next_index_by_tablet: Arc<Mutex<BTreeMap<i64, u64>>>,
 }
 
 impl SingleNodeReplicatedLog {
     pub fn new(kv: Arc<dyn KvStore + Send + Sync>) -> Self {
-        Self { kv, term: 1 }
+        Self {
+            kv,
+            term: 1,
+            next_index_by_tablet: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub fn with_term(kv: Arc<dyn KvStore + Send + Sync>, term: u64) -> Self {
-        Self { kv, term }
+        Self {
+            kv,
+            term,
+            next_index_by_tablet: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 }
 
 impl ReplicatedLog for SingleNodeReplicatedLog {
     fn append(&self, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         validate_tablet_id(tablet_id)?;
-        let index = max_index(self.kv.as_ref(), tablet_id)? + 1;
+        let mut next_by_tablet = self
+            .next_index_by_tablet
+            .lock()
+            .expect("single-node log next-index lock poisoned");
+        let index = match next_by_tablet.get(&tablet_id).copied() {
+            Some(next_index) => next_index,
+            None => max_index(self.kv.as_ref(), tablet_id)?.saturating_add(1),
+        };
         self.kv.write_batch(vec![WriteOp::Put {
             key: log_key(tablet_id, index),
             value: command,
         }])?;
+        next_by_tablet.insert(tablet_id, index.saturating_add(1));
         Ok(LogCommit {
             tablet_id,
             index,
@@ -419,23 +439,23 @@ impl ReplicatedLog for SingleNodeReplicatedLog {
             return Ok(Vec::new());
         }
         let prefix = log_prefix(tablet_id);
+        let start = log_key(tablet_id, after_index.saturating_add(1));
         let mut entries = Vec::new();
-        for item in self.kv.scan_prefix(&prefix)? {
+        for item in self.kv.scan_prefix_from(&prefix, &start)? {
             let (key, command) = item?;
             let Some(index) = parse_log_index(&key, &prefix) else {
                 continue;
             };
-            if index > after_index {
-                entries.push(LogEntry {
-                    tablet_id,
-                    index,
-                    term: self.term,
-                    command,
-                });
+            entries.push(LogEntry {
+                tablet_id,
+                index,
+                term: self.term,
+                command,
+            });
+            if entries.len() >= limit {
+                break;
             }
         }
-        entries.sort_by_key(|entry| entry.index);
-        entries.truncate(limit);
         Ok(entries)
     }
 
