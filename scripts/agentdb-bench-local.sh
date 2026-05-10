@@ -14,6 +14,7 @@ WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
+BUILD_PROFILE="${BUILD_PROFILE:-release}"
 
 STATE_ROOT="${STATE_ROOT:-${OUT}/state/${RUN_ID}}"
 DATA_DIR="${DATA_DIR:-${STATE_ROOT}/rocksdb}"
@@ -29,9 +30,15 @@ if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
   exit 1
 fi
 
-cargo build -p agentdb-server -p agentdb-bench
+if [[ "${BUILD_PROFILE}" == "release" ]]; then
+  cargo build --release -p agentdb-server -p agentdb-bench
+  BIN_DIR="${ROOT}/target/release"
+else
+  cargo build -p agentdb-server -p agentdb-bench
+  BIN_DIR="${ROOT}/target/debug"
+fi
 
-"${ROOT}/target/debug/agentdb" serve \
+"${BIN_DIR}/agentdb" serve \
   --bind "${BIND}" \
   --data-dir "${DATA_DIR}" \
   --content-dir "${CONTENT_DIR}" \
@@ -84,7 +91,7 @@ prepare_args=(
 [[ -n "${FORKS_PER_PARENT:-}" ]] && prepare_args+=(--forks-per-parent "${FORKS_PER_PARENT}")
 [[ -n "${SEED:-}" ]] && prepare_args+=(--seed "${SEED}")
 
-"${ROOT}/target/debug/agentdb-bench" "${prepare_args[@]}" \
+"${BIN_DIR}/agentdb-bench" "${prepare_args[@]}" \
   >"${LOG_DIR}/prepare.log" 2>&1
 
 run_args=(
@@ -103,7 +110,7 @@ run_args=(
 [[ "${NO_RAW_JSONL:-0}" == "1" ]] && run_args+=(--no-raw-jsonl)
 [[ -n "${SEED:-}" ]] && run_args+=(--seed "${SEED}")
 
-"${ROOT}/target/debug/agentdb-bench" "${run_args[@]}" \
+"${BIN_DIR}/agentdb-bench" "${run_args[@]}" \
   | tee "${LOG_DIR}/run.log"
 
 echo "run_id=${RUN_ID}"

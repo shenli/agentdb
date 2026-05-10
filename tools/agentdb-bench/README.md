@@ -24,6 +24,9 @@ PROFILE=smoke ARTIFACT_MODE=content-backend \
   scripts/agentdb-bench-local.sh
 ```
 
+The runner builds release binaries by default. Set `BUILD_PROFILE=debug` for a
+faster development-only smoke.
+
 Run the normalized Postgres event-log baseline:
 
 ```bash

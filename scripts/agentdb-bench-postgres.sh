@@ -11,6 +11,7 @@ CONCURRENCY="${CONCURRENCY:-1,4}"
 WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
+BUILD_PROFILE="${BUILD_PROFILE:-release}"
 PG_PORT="${PG_PORT:-5433}"
 PG_DSN="${PG_DSN:-postgres://bench:bench@127.0.0.1:${PG_PORT}/bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/postgres"
@@ -31,7 +32,13 @@ if ! docker compose -f "${COMPOSE_DIR}/docker-compose.yml" exec -T postgres \
   exit 1
 fi
 
-cargo build -p agentdb-bench
+if [[ "${BUILD_PROFILE}" == "release" ]]; then
+  cargo build --release -p agentdb-bench
+  BIN_DIR="${ROOT}/target/release"
+else
+  cargo build -p agentdb-bench
+  BIN_DIR="${ROOT}/target/debug"
+fi
 
 prepare_args=(
   prepare
@@ -57,7 +64,7 @@ prepare_args=(
 [[ -n "${FORKS_PER_PARENT:-}" ]] && prepare_args+=(--forks-per-parent "${FORKS_PER_PARENT}")
 [[ -n "${SEED:-}" ]] && prepare_args+=(--seed "${SEED}")
 
-"${ROOT}/target/debug/agentdb-bench" "${prepare_args[@]}"
+"${BIN_DIR}/agentdb-bench" "${prepare_args[@]}"
 
 run_args=(
   run
@@ -75,7 +82,7 @@ run_args=(
 [[ "${NO_RAW_JSONL:-0}" == "1" ]] && run_args+=(--no-raw-jsonl)
 [[ -n "${SEED:-}" ]] && run_args+=(--seed "${SEED}")
 
-"${ROOT}/target/debug/agentdb-bench" "${run_args[@]}"
+"${BIN_DIR}/agentdb-bench" "${run_args[@]}"
 
 echo "run_id=${RUN_ID}"
 echo "report=${OUT}/runs/${RUN_ID}/report.md"
