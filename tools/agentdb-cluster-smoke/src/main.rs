@@ -414,6 +414,8 @@ async fn run_smoke(
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
     let mut next_seq = 2;
 
+    eprintln!("smoke: waiting for raft convergence after setup writes");
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
     print_diagnostics(client, nodes).await?;
 
     if args.failover {
