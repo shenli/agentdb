@@ -1,6 +1,6 @@
 use agentdb_core::agent::NewAgent;
 use agentdb_core::errors::ErrorCode;
-use agentdb_core::runtime::{AppendRequest, Runtime};
+use agentdb_core::runtime::{AppendRequest, FetchRequest, Runtime};
 use agentdb_core::session::NewSession;
 use agentdb_core::tenant::NewTenant;
 
@@ -234,6 +234,51 @@ async fn concurrent_idempotent_appends_resolve_consistently() {
             .map(|e| (e.seq, &e.kind))
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_non_idempotent_appends_keep_same_session_seq_order() {
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+
+    let mut tasks = Vec::new();
+    for i in 0..64_u64 {
+        let rt = rt.clone();
+        let t = t.clone();
+        let a = a.clone();
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            rt.append(AppendRequest::simple(
+                &t,
+                &a,
+                &s,
+                "k",
+                serde_json::json!({ "i": i }),
+            ))
+            .await
+        }));
+    }
+
+    let mut seqs = Vec::new();
+    for task in tasks {
+        seqs.push(task.await.unwrap().unwrap().seq);
+    }
+    seqs.sort_unstable();
+    assert_eq!(seqs, (0..64_u64).collect::<Vec<_>>());
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id,
+            session_id: s.session_id,
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 64);
+    for (expected, event) in events.iter().enumerate() {
+        assert_eq!(event.seq, expected as u64);
+    }
 }
 
 #[tokio::test]
