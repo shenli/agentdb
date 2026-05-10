@@ -415,6 +415,8 @@ async fn run_smoke(
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
     let mut next_seq = 2;
 
+    eprintln!("smoke: forcing raft catch-up snapshot after setup writes");
+    force_raft_catch_up(client, nodes).await?;
     eprintln!("smoke: waiting for raft convergence after setup writes");
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
     print_diagnostics(client, nodes).await?;
@@ -837,6 +839,24 @@ async fn event_count_with_convergence_retry(
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
+}
+
+async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    let response = post_json(
+        client,
+        &owner.url,
+        "/api/admin/raft/catch-up",
+        json!({"tablet_id": PRIMARY_TABLET_ID, "min_lag": 0}),
+    )
+    .await?;
+    if response["failures"]
+        .as_array()
+        .is_some_and(|failures| !failures.is_empty())
+    {
+        bail!("raft catch-up reported failures: {response}");
+    }
+    Ok(())
 }
 
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
