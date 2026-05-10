@@ -63,6 +63,33 @@ async fn fetch_from_seq_respects_limit() {
 }
 
 #[tokio::test]
+async fn fetch_recent_returns_latest_events_in_order() {
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    for i in 0..6_u64 {
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "k",
+            serde_json::json!({"i": i}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let events = rt
+        .fetch_recent(t.tenant_id.clone(), s.session_id.clone(), 3)
+        .await
+        .unwrap();
+
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].seq, 3);
+    assert_eq!(events[1].seq, 4);
+    assert_eq!(events[2].seq, 5);
+}
+
+#[tokio::test]
 async fn fetch_from_seq_empty_when_past_end() {
     let rt = Runtime::in_memory();
     let (t, a, s) = rt.bootstrap_test_session().await;

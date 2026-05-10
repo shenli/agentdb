@@ -1113,19 +1113,16 @@ async fn run_one_operation(
             )
             .await
         }
-        Operation::FetchRecent => {
-            let from_seq = fixture.events_written.saturating_sub(args.fetch_last_n) as u64;
-            get_ok(
-                client,
-                &args.base_url,
-                &format!(
-                    "/api/tenants/{}/sessions/{}/events?from_seq={from_seq}&limit={}",
-                    fixture.tenant_id, fixture.session_id, args.fetch_last_n
-                ),
-            )
-            .await
-            .map(|_| ())
-        }
+        Operation::FetchRecent => get_ok(
+            client,
+            &args.base_url,
+            &format!(
+                "/api/tenants/{}/sessions/{}/events?latest=true&limit={}",
+                fixture.tenant_id, fixture.session_id, args.fetch_last_n
+            ),
+        )
+        .await
+        .map(|_| ()),
         Operation::RecordWrite => {
             create_record(
                 client,
@@ -1641,6 +1638,28 @@ async fn run_one_postgres_operation(
                 ArtifactMode::ContentBackend | ArtifactMode::Mixed => config.artifact_small_bytes,
                 ArtifactMode::Reference => config.artifact_large_bytes,
             };
+            if matches!(config.artifact_mode, ArtifactMode::Reference) {
+                return pg_append_event(
+                    pool,
+                    &args.run_id,
+                    &fixture.tenant_id,
+                    &fixture.agent_id,
+                    &fixture.session_id,
+                    "artifact",
+                    &json!({
+                        "role": "tool",
+                        "content": "external artifact reference",
+                        "external_artifact_refs": [{
+                            "content_uri": format!("bench://runtime-artifact/{}", rng.gen::<u64>()),
+                            "content_type": "application/octet-stream",
+                            "bytes": bytes,
+                            "sha256": format!("{:016x}", rng.gen::<u64>())
+                        }]
+                    }),
+                )
+                .await
+                .map(|_| ());
+            }
             pg_create_artifact_reference(
                 pool,
                 &args.run_id,
@@ -1820,6 +1839,35 @@ async fn pg_append_fetch(
     last: usize,
     payload: &Value,
 ) -> Result<()> {
+    pg_append_event(
+        pool, run_id, tenant_id, agent_id, session_id, "message", payload,
+    )
+    .await?;
+
+    let _rows = sqlx::query(
+        "SELECT seq, payload FROM agentdb_bench.events
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
+         ORDER BY seq DESC
+         LIMIT $4",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(last as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_append_event(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    kind: &str,
+    payload: &Value,
+) -> Result<i64> {
     let mut tx = pool.begin().await?;
     let seq: i64 = sqlx::query_scalar(
         "UPDATE agentdb_bench.sessions
@@ -1836,31 +1884,19 @@ async fn pg_append_fetch(
     sqlx::query(
         "INSERT INTO agentdb_bench.events
          (run_id, tenant_id, agent_id, session_id, seq, kind, payload)
-         VALUES ($1, $2, $3, $4, $5, 'message', $6::jsonb)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
     )
     .bind(run_id)
     .bind(tenant_id)
     .bind(agent_id)
     .bind(session_id)
     .bind(seq)
+    .bind(kind)
     .bind(payload.to_string())
     .execute(&mut *tx)
     .await?;
-
-    let _rows = sqlx::query(
-        "SELECT seq, payload FROM agentdb_bench.events
-         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
-         ORDER BY seq DESC
-         LIMIT $4",
-    )
-    .bind(run_id)
-    .bind(tenant_id)
-    .bind(session_id)
-    .bind(last as i64)
-    .fetch_all(&mut *tx)
-    .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(seq)
 }
 
 async fn pg_fetch_recent(
@@ -2253,6 +2289,23 @@ async fn mongo_append_fetch(
     last: usize,
     payload: &Value,
 ) -> Result<()> {
+    mongo_append_event(
+        db, run_id, tenant_id, agent_id, session_id, "message", payload,
+    )
+    .await?;
+    mongo_fetch_recent(db, run_id, tenant_id, session_id, last).await?;
+    Ok(())
+}
+
+async fn mongo_append_event(
+    db: &MongoDatabase,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    kind: &str,
+    payload: &Value,
+) -> Result<i64> {
     let sessions = db.collection::<Document>("sessions");
     let options = FindOneAndUpdateOptions::builder()
         .return_document(Some(ReturnDocument::After))
@@ -2276,13 +2329,12 @@ async fn mongo_append_fetch(
         agent_id,
         session_id,
         seq,
-        "message",
+        kind,
         payload,
         &[],
     )
     .await?;
-    mongo_fetch_recent(db, run_id, tenant_id, session_id, last).await?;
-    Ok(())
+    Ok(seq)
 }
 
 async fn mongo_fetch_recent(
@@ -2488,6 +2540,28 @@ async fn run_one_mongodb_operation(
                 ArtifactMode::ContentBackend | ArtifactMode::Mixed => config.artifact_small_bytes,
                 ArtifactMode::Reference => config.artifact_large_bytes,
             };
+            if matches!(config.artifact_mode, ArtifactMode::Reference) {
+                return mongo_append_event(
+                    db,
+                    &args.run_id,
+                    &fixture.tenant_id,
+                    &fixture.agent_id,
+                    &fixture.session_id,
+                    "artifact",
+                    &json!({
+                        "role": "tool",
+                        "content": "external artifact reference",
+                        "external_artifact_refs": [{
+                            "content_uri": format!("bench://runtime-artifact/{}", rng.gen::<u64>()),
+                            "content_type": "application/octet-stream",
+                            "bytes": bytes,
+                            "sha256": format!("{:016x}", rng.gen::<u64>())
+                        }]
+                    }),
+                )
+                .await
+                .map(|_| ());
+            }
             mongo_create_artifact_reference(
                 db,
                 &args.run_id,

@@ -4909,6 +4909,56 @@ impl Runtime {
         }
         Ok(out)
     }
+
+    /// Return up to `limit` latest events for a session in ascending seq order.
+    ///
+    /// This is the common agent-context read path. It computes the lower bound
+    /// from the authoritative session `next_seq` and then reuses
+    /// `fetch_from_seq`, so callers avoid stale fixture-side high-watermarks
+    /// and do not need to scan from the beginning of the session.
+    pub async fn fetch_recent(
+        &self,
+        tenant_id: Id,
+        session_id: Id,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.refresh_replicated_state().await?;
+        let from_seq = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", session_id),
+                ));
+            }
+            let session = s
+                .sessions
+                .get(session_id.as_str())
+                .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+            if session.deleted_at_ms.is_some() || session.tenant_id.as_str() != tenant_id.as_str() {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{}", session_id),
+                ));
+            }
+            let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+            session.next_seq.saturating_sub(limit)
+        };
+        self.fetch_from_seq(FetchRequest {
+            tenant_id,
+            session_id,
+            from_seq,
+            limit,
+        })
+        .await
+    }
 }
 
 /// V2.2 search request for `Runtime::search_records`. Either `text`,
