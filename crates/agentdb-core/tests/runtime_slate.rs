@@ -20,7 +20,8 @@ async fn archived_session_storage_works_with_slate_kv() {
     let content_root = TempDir::new().unwrap();
 
     let kv = open_slate_kv(kv_root.path()).await;
-    let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(content_root.path()));
+    let content: Arc<dyn ContentBackend> =
+        Arc::new(LocalFsContentBackend::new(content_root.path()));
     let rt = Runtime::with_kv(kv, content);
 
     let tenant = rt
@@ -137,7 +138,11 @@ async fn archived_session_storage_survives_slate_restart_and_resume() {
         }
 
         let archived = rt
-            .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+            .transition_session_lifecycle(
+                &tenant.tenant_id,
+                &session.session_id,
+                Lifecycle::Archive,
+            )
             .await
             .unwrap();
         assert_eq!(archived.lifecycle, Lifecycle::Archive);
@@ -146,7 +151,8 @@ async fn archived_session_storage_survives_slate_restart_and_resume() {
     };
 
     let kv = open_slate_kv(kv_root.path()).await;
-    let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(content_root.path()));
+    let content: Arc<dyn ContentBackend> =
+        Arc::new(LocalFsContentBackend::new(content_root.path()));
     let rt = Runtime::with_kv(kv, content);
 
     let archived = rt
