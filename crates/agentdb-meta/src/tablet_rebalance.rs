@@ -313,11 +313,13 @@ pub async fn run(
     }
 
     for tablet in tablets.iter().filter(|tablet| {
-        tablet.owner_node_id.as_ref().is_some_and(|owner| {
-            node_state
-                .get(owner)
-                .is_none_or(|(state, stale)| *stale || state == "dead")
-        })
+        tablet
+            .owner_node_id
+            .as_ref()
+            .is_some_and(|owner| match node_state.get(owner) {
+                Some((state, stale)) => *stale || state == "dead",
+                None => true,
+            })
     }) {
         skipped.push(RebalanceAction {
             action: "handoff",
