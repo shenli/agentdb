@@ -585,6 +585,11 @@ impl KvStore for RuntimeTabletKvStore {
         self.store.scan_prefix(prefix)
     }
 
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        self.state_machine.apply_committed()?;
+        self.store.scan_prefix_from(prefix, start)
+    }
+
     fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -876,6 +881,27 @@ impl KvStore for RuntimeTabletRouterKvStore {
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
 
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        if let Some(tablet_id) = self.resolve_tablet_id()? {
+            return self.with_handle(tablet_id, |handle| {
+                handle.kv_store.scan_prefix_from(prefix, start)
+            });
+        }
+
+        let tablets = self
+            .tablets
+            .read()
+            .expect("runtime tablet router lock poisoned");
+        let mut rows = BTreeMap::new();
+        for handle in tablets.values() {
+            for item in handle.kv_store.scan_prefix_from(prefix, start)? {
+                let (key, value) = item?;
+                rows.entry(key).or_insert(value);
+            }
+        }
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
     fn write_batch(&self, ops: Vec<WriteOp>) -> agentdb_storage::Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -919,6 +945,18 @@ impl KvSnapshot for RuntimeTabletRouterSnapshot {
             .rows
             .iter()
             .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect();
+        Ok(Box::new(rows.into_iter()))
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> agentdb_storage::Result<KvIter> {
+        let prefix = prefix.to_vec();
+        let start = start.to_vec();
+        let rows: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix) && key.as_slice() >= start.as_slice())
             .map(|(key, value)| Ok((key.clone(), value.clone())))
             .collect();
         Ok(Box::new(rows.into_iter()))
