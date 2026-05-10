@@ -92,7 +92,7 @@ pub fn stable_raft_node_id(node_id: &str) -> Result<u64> {
     let digest = Sha256::digest(node_id.as_bytes());
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&digest[..8]);
-    Ok(u64::from_be_bytes(raw).max(1))
+    Ok((u64::from_be_bytes(raw) & i64::MAX as u64).max(1))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1424,6 +1424,9 @@ mod tests {
         assert!(first.raft_engine_dir.ends_with("tablet-7/node-a.us-west"));
         assert_eq!(stable_raft_node_id("42").unwrap(), 42);
         assert!(stable_raft_node_id("").is_err());
+        assert!(stable_raft_node_id("node-a").unwrap() <= i64::MAX as u64);
+        assert!(stable_raft_node_id("node-b").unwrap() <= i64::MAX as u64);
+        assert!(stable_raft_node_id("node-c").unwrap() <= i64::MAX as u64);
     }
 
     #[test]
