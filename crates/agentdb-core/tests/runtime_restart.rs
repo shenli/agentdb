@@ -498,7 +498,11 @@ async fn archived_sessions_survive_restart_and_resume() {
             .unwrap();
         }
         let storage = rt
-            .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+            .transition_session_lifecycle(
+                &tenant.tenant_id,
+                &session.session_id,
+                Lifecycle::Archive,
+            )
             .await
             .unwrap();
         assert!(storage.archive_manifest.is_some());

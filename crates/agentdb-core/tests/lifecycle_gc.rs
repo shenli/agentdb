@@ -158,10 +158,7 @@ async fn cold_transition_seals_history_and_append_reopens_warm_head() {
         .unwrap();
     assert_eq!(cold_fetch.len(), 3);
     assert_eq!(
-        cold_fetch
-            .iter()
-            .map(|event| event.seq)
-            .collect::<Vec<_>>(),
+        cold_fetch.iter().map(|event| event.seq).collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
 
