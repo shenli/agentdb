@@ -27,6 +27,16 @@ PROFILE=smoke ARTIFACT_MODE=content-backend \
 The runner builds release binaries by default. Set `BUILD_PROFILE=debug` for a
 faster development-only smoke.
 
+Latest `li-dev` AgentDB local RocksDB results captured for this PR:
+
+| Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---:|---:|---:|---:|---:|
+| `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
+| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+
+The detailed reports are stored on `li-dev` under
+`/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
+
 Run the normalized Postgres event-log baseline:
 
 ```bash

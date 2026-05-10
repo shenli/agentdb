@@ -15,6 +15,26 @@ The benchmark must be reproducible, transparent, and conservative. Any public
 claim must include the exact schema, hardware, durability setting, workload mix,
 git SHA, and database versions used for the run.
 
+## Latest `li-dev` Results
+
+These are the current single-node local RocksDB results from `li-dev` after the
+append-path lock narrowing change in this PR. They use release binaries,
+local RocksDB metadata/index storage, local filesystem content storage,
+`PROFILE=default-agent-runtime`, 1 tenant, 1 agent, 320 sessions, 8 seeded
+events per session, 1 seeded record per session, `FETCH_LAST_N=8`, 3s warmup,
+and 8s measured duration.
+
+| Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 | Report |
+|---|---|---:|---:|---:|---:|---:|---|
+| `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-append-lockfix/runs/agentdb-append-lockfix/report.md` |
+| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mixed-lockfix/runs/agentdb-mixed-lockfix/report.md` |
+
+Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
+from roughly 3.4k ops/s to 14.0k ops/s, and `mixed-agent-loop` at c=32 moved
+from roughly 7.8k ops/s to 16.8k ops/s. These are not product claims yet:
+MongoDB/Postgres comparison runs, longer durations, and durable quorum profiles
+must be reported separately.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent
