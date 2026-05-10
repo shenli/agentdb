@@ -875,6 +875,7 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
         || message.contains("503 Service Unavailable")
         || message.contains("operation timed out")
+        || message.contains("connection closed before message completed")
         || message.contains("raft leader was not observable")
 }
 
@@ -1188,6 +1189,13 @@ mod tests {
     #[test]
     fn retry_classifier_treats_session_not_found_as_transient() {
         let error = anyhow!(r#"HTTP 404: {{"code":"SESSION_NOT_FOUND"}}"#);
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_treats_connection_close_as_transient() {
+        let error = anyhow!("connection closed before message completed");
 
         assert!(is_retryable_cluster_convergence_error(&error));
     }
