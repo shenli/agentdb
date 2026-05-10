@@ -459,24 +459,21 @@ impl RaftRsSharedGroup {
             let maybe_commit = {
                 let mut group = self.inner.lock().expect("raft-rs group lock poisoned");
                 group.validate_append_target(node_id, tablet_id)?;
-                if proposed_after.is_none() {
-                    let previous_applied_index = group.node(node_id)?.last_applied_index;
-                    group
-                        .node_mut(node_id)?
-                        .raw
-                        .propose(Vec::new(), command.clone())
-                        .map_err(map_raft_error)?;
-                    proposed_after = Some(previous_applied_index);
-                    group.drive_until_idle()?;
-                    group.find_committed_after(node_id, tablet_id, previous_applied_index)?
-                } else {
-                    group.drive_until_idle()?;
-                    group.find_committed_after(
-                        node_id,
-                        tablet_id,
-                        proposed_after.expect("proposal index set"),
-                    )?
-                }
+                let previous_applied_index = match proposed_after {
+                    Some(index) => index,
+                    None => {
+                        let previous_applied_index = group.node(node_id)?.last_applied_index;
+                        group
+                            .node_mut(node_id)?
+                            .raw
+                            .propose(Vec::new(), command.clone())
+                            .map_err(map_raft_error)?;
+                        proposed_after = Some(previous_applied_index);
+                        previous_applied_index
+                    }
+                };
+                group.drive_until_idle()?;
+                group.find_committed_after(node_id, tablet_id, previous_applied_index)?
             };
             if let Some(commit) = maybe_commit {
                 return Ok(commit);
@@ -710,7 +707,7 @@ impl RaftRsGroup {
             .storage
             .snapshot(node.last_applied_index, to)
             .map_err(map_raft_error)?;
-        snapshot.set_data(application_snapshot.into());
+        snapshot.set_data(application_snapshot);
         Ok(RaftRsSnapshotTransfer::from_snapshot(
             self.tablet_id,
             from,
@@ -1145,8 +1142,10 @@ struct RaftEngineReplay {
 }
 
 fn open_engine(path: &Path) -> Result<RaftEngine> {
-    let mut config = RaftEngineConfig::default();
-    config.dir = path.to_string_lossy().into_owned();
+    let config = RaftEngineConfig {
+        dir: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
     RaftEngine::open(config).map_err(map_raft_engine_error)
 }
 
