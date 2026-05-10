@@ -13,6 +13,7 @@ use std::{
 use crate::{Error, KvStore, Result, WriteOp};
 
 const LOG_PREFIX: &[u8] = b"tablet_log/";
+const LOG_NEXT_PREFIX: &[u8] = b"tablet_log_next/";
 const RAFT_LOG_PREFIX: &[u8] = b"raft_log/";
 const RAFT_COMMIT_PREFIX: &[u8] = b"raft_commit/";
 
@@ -414,13 +415,20 @@ impl ReplicatedLog for SingleNodeReplicatedLog {
             .expect("single-node log next-index lock poisoned");
         let index = match next_by_tablet.get(&tablet_id).copied() {
             Some(next_index) => next_index,
-            None => max_index(self.kv.as_ref(), tablet_id)?.saturating_add(1),
+            None => load_next_log_index(self.kv.as_ref(), tablet_id)?,
         };
-        self.kv.write_batch(vec![WriteOp::Put {
-            key: log_key(tablet_id, index),
-            value: command,
-        }])?;
-        next_by_tablet.insert(tablet_id, index.saturating_add(1));
+        let next_index = index.saturating_add(1);
+        self.kv.write_batch(vec![
+            WriteOp::Put {
+                key: log_key(tablet_id, index),
+                value: command,
+            },
+            WriteOp::Put {
+                key: log_next_key(tablet_id),
+                value: next_index.to_be_bytes().to_vec(),
+            },
+        ])?;
+        next_by_tablet.insert(tablet_id, next_index);
         Ok(LogCommit {
             tablet_id,
             index,
@@ -500,6 +508,17 @@ fn max_index(kv: &dyn KvStore, tablet_id: i64) -> Result<u64> {
         }
     }
     Ok(max)
+}
+
+fn load_next_log_index(kv: &dyn KvStore, tablet_id: i64) -> Result<u64> {
+    if let Some(bytes) = kv.get(&log_next_key(tablet_id))? {
+        let raw: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Other("invalid single-node log next index".into()))?;
+        return Ok(u64::from_be_bytes(raw));
+    }
+    Ok(max_index(kv, tablet_id)?.saturating_add(1))
 }
 
 fn max_raft_index(kv: &dyn KvStore, tablet_id: i64) -> Result<u64> {
@@ -613,6 +632,15 @@ fn log_prefix(tablet_id: i64) -> Vec<u8> {
     format!("{}{:020}/", String::from_utf8_lossy(LOG_PREFIX), tablet_id).into_bytes()
 }
 
+fn log_next_key(tablet_id: i64) -> Vec<u8> {
+    format!(
+        "{}{:020}",
+        String::from_utf8_lossy(LOG_NEXT_PREFIX),
+        tablet_id
+    )
+    .into_bytes()
+}
+
 fn raft_log_prefix(tablet_id: i64) -> Vec<u8> {
     format!(
         "{}{:020}/",
@@ -719,6 +747,22 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].index, 3);
         assert_eq!(entries[0].command, b"third");
+    }
+
+    #[test]
+    fn single_node_log_persists_next_index_across_compaction_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let log = SingleNodeReplicatedLog::new(kv.clone());
+
+        log.append(7, b"first".to_vec()).unwrap();
+        log.append(7, b"second".to_vec()).unwrap();
+        assert_eq!(log.compact(7, 2).unwrap(), 2);
+
+        let restarted = SingleNodeReplicatedLog::new(kv);
+        let third = restarted.append(7, b"third".to_vec()).unwrap();
+
+        assert_eq!(third.index, 3);
     }
 
     #[test]
