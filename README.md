@@ -92,7 +92,7 @@ are:
 Run an in-memory development server:
 
 ```bash
-cargo run -p agentdb-server -- serve --dev
+cargo run -p agentdb-server -- dev
 ```
 
 The API listens on:
@@ -113,10 +113,21 @@ Open the session dashboard at:
 http://127.0.0.1:7878/dashboard/
 ```
 
+`agentdb dev` also enables the local MongoDB compatibility listener at
+`127.0.0.1:7879`, creates a `dev` workspace with a demo agent/session, and
+prints copy-paste commands for SDK examples, diagnostics, and local CI status.
+
+Check the full local developer environment:
+
+```bash
+cargo run -p agentdb-server -- doctor --dev --dev-tools
+```
+
 ### MongoDB Client Compatibility
 
 AgentDB can also expose a narrow MongoDB-compatible listener for existing
-MongoDB clients and tools. Start the dev server with a MongoDB listener:
+MongoDB clients and tools. `agentdb dev` enables it by default; the lower-level
+server command is:
 
 ```bash
 cargo run -p agentdb-server -- serve --dev --mongo-bind 127.0.0.1:7879
@@ -297,6 +308,29 @@ console.log(result.seq, result.recent.map((event) => event.payload));
 
 For local development against an unauthenticated server without `/api/me`, use
 `await db.workspace("acme")` to bind an explicit workspace alias.
+
+## OpenAI Agents SDK
+
+Start the local developer server:
+
+```bash
+cargo run -p agentdb-server -- dev
+```
+
+Run the adapter quickstart without an OpenAI API key:
+
+```bash
+python examples/agents/python/openai_agents_quickstart.py
+```
+
+That exercises the OpenAI Agents SDK session protocol over AgentDB. To run a
+live SDK call:
+
+```bash
+pip install openai-agents
+OPENAI_API_KEY=... AGENTDB_OPENAI_LIVE=1 \
+  python examples/agents/python/openai_agents_quickstart.py
+```
 
 ## Workspace Layout
 

@@ -46,3 +46,14 @@ you already have canonical AgentDB IDs. New integrations should prefer
 
 For local development against the OSS server, pass `workspace="dev"` because
 the local server may not expose hosted user-info yet.
+
+From a repo checkout, the fastest local smoke is:
+
+```bash
+cargo run -p agentdb-server -- dev
+python examples/agents/python/openai_agents_quickstart.py
+```
+
+The quickstart defaults to a protocol-only run that does not require an OpenAI
+API key. Set `AGENTDB_OPENAI_LIVE=1` and `OPENAI_API_KEY` to run a live Agents
+SDK call.
