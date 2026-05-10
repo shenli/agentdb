@@ -20,6 +20,18 @@ pub struct SessionSegment {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewSessionSegment {
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub seq_start: u64,
+    pub seq_end: u64,
+    pub bytes: u64,
+    pub sha256: String,
+    pub content_key_id: Option<String>,
+    pub content_key_version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSegmentFile {
     pub runtime_version: String,
@@ -58,27 +70,18 @@ pub struct SessionArchiveFile {
 }
 
 impl SessionSegment {
-    pub fn new(
-        tenant_id: crate::Id,
-        session_id: crate::Id,
-        seq_start: u64,
-        seq_end: u64,
-        bytes: u64,
-        sha256: String,
-        content_key_id: Option<String>,
-        content_key_version: Option<String>,
-    ) -> Self {
+    pub fn new(req: NewSessionSegment) -> Self {
         Self {
             segment_id: Id::new(IdKind::Segment),
-            tenant_id,
-            session_id,
-            seq_start,
-            seq_end,
-            event_count: seq_end.saturating_sub(seq_start) + 1,
-            bytes,
-            sha256,
-            content_key_id,
-            content_key_version,
+            tenant_id: req.tenant_id,
+            session_id: req.session_id,
+            seq_start: req.seq_start,
+            seq_end: req.seq_end,
+            event_count: req.seq_end.saturating_sub(req.seq_start) + 1,
+            bytes: req.bytes,
+            sha256: req.sha256,
+            content_key_id: req.content_key_id,
+            content_key_version: req.content_key_version,
             created_at_ms: crate::now_ms(),
         }
     }
