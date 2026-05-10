@@ -5,6 +5,7 @@
 //! `--in-memory` to get the ephemeral backend (useful for smoke tests and
 //! local dev).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -2245,7 +2246,7 @@ fn spawn_raft_rs_tick_worker(
                     BTreeMap::new()
                 }
             };
-            let raft_node_to_node_id =
+            let raft_replicas_by_id =
                 match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
                     Ok(replicas) => replicas
                         .into_iter()
@@ -2253,7 +2254,10 @@ fn spawn_raft_rs_tick_worker(
                             agentdb_storage::stable_raft_node_id(&replica.node_id)
                                 .ok()
                                 .map(|raft_node_id| {
-                                    ((replica.tablet_id, raft_node_id), replica.node_id)
+                                    (
+                                        (replica.tablet_id, raft_node_id),
+                                        (replica.node_id, replica.applied_index),
+                                    )
                                 })
                         })
                         .collect::<BTreeMap<_, _>>(),
@@ -2288,8 +2292,8 @@ fn spawn_raft_rs_tick_worker(
                 });
                 let raft_leader_unavailable = local_status
                     .filter(|status| status.leader_id != 0)
-                    .and_then(|status| raft_node_to_node_id.get(&(tablet_id, status.leader_id)))
-                    .is_some_and(|leader_node_id| {
+                    .and_then(|status| raft_replicas_by_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|(leader_node_id, _)| {
                         cluster_node_unavailable(
                             nodes_by_id.get(leader_node_id),
                             now_ms,
@@ -2312,18 +2316,23 @@ fn spawn_raft_rs_tick_worker(
                                 "failed to expire local raft-rs leader lease"
                             );
                         }
-                        let failover_candidate = raft_node_to_node_id
+                        let failover_candidate = raft_replicas_by_id
                             .iter()
-                            .filter_map(|((replica_tablet_id, raft_node_id), node_id)| {
-                                (*replica_tablet_id == tablet_id
-                                    && cluster_node_available(
-                                        nodes_by_id.get(node_id),
-                                        now_ms,
-                                        stale_node_threshold_ms,
-                                    ))
-                                .then_some(*raft_node_id)
+                            .filter_map(
+                                |((replica_tablet_id, raft_node_id), (node_id, applied_index))| {
+                                    (*replica_tablet_id == tablet_id
+                                        && cluster_node_available(
+                                            nodes_by_id.get(node_id),
+                                            now_ms,
+                                            stale_node_threshold_ms,
+                                        ))
+                                    .then_some((*raft_node_id, *applied_index))
+                                },
+                            )
+                            .max_by_key(|(raft_node_id, applied_index)| {
+                                (*applied_index, Reverse(*raft_node_id))
                             })
-                            .min();
+                            .map(|(raft_node_id, _)| raft_node_id);
                         if failover_candidate == Some(local_raft_node_id) {
                             let result = if raft_leader_missing {
                                 group
