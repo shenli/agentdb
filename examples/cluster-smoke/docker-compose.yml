@@ -53,6 +53,7 @@ services:
           sleep 1
         done
         mc mb --ignore-existing "agentdb-smoke/$$AGENTDB_S3_BUCKET"
+        mc rm --recursive --force "agentdb-smoke/$$AGENTDB_S3_BUCKET" || true
 
 volumes:
   agentdb-cluster-smoke-postgres:
