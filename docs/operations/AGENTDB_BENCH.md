@@ -475,6 +475,8 @@ Scale profiles should vary one dimension at a time:
 
 - Implement `agentdb-native`, `mongodb-session-doc`,
   `mongodb-event-log`, `postgres-jsonb-session`, and `postgres-event-log`.
+  Initial status: `agentdb-native-rocksdb` and `postgres-event-log` are
+  implemented; MongoDB and Postgres JSONB-session remain follow-up work.
 - Start AgentDB with local RocksDB storage for the first AgentDB profile.
 - Add adapter conformance tests for dataset prepare, append, fetch, fork,
   records, search, artifact metadata, and artifact payload/reference behavior.

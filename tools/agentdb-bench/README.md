@@ -24,6 +24,17 @@ PROFILE=smoke ARTIFACT_MODE=content-backend \
   scripts/agentdb-bench-local.sh
 ```
 
+Run the normalized Postgres event-log baseline:
+
+```bash
+PROFILE=smoke scripts/agentdb-bench-postgres.sh
+```
+
+The Postgres baseline uses `benchmarks/postgres/docker-compose.yml` and
+`benchmarks/postgres/event_log.sql`. It stores normalized session/event rows and
+artifact metadata references. It does not put large artifact bytes into a JSONB
+session row.
+
 Prepare a dataset:
 
 ```bash

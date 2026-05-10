@@ -15,6 +15,7 @@ use rand::{Rng, SeedableRng};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::Mutex;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:7878";
@@ -45,6 +46,8 @@ struct PrepareArgs {
     backend: String,
     #[arg(long, default_value = DEFAULT_BASE_URL)]
     base_url: String,
+    #[arg(long, default_value = "postgres://bench:bench@127.0.0.1:5433/bench")]
+    pg_dsn: String,
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
     out: PathBuf,
     #[arg(long)]
@@ -93,6 +96,8 @@ struct RunArgs {
     backend: String,
     #[arg(long, default_value = DEFAULT_BASE_URL)]
     base_url: String,
+    #[arg(long, default_value = "postgres://bench:bench@127.0.0.1:5433/bench")]
+    pg_dsn: String,
     #[arg(long, default_value = DEFAULT_OUT_DIR)]
     out: PathBuf,
     #[arg(long)]
@@ -291,6 +296,9 @@ async fn main() -> Result<()> {
 }
 
 async fn prepare(args: PrepareArgs) -> Result<()> {
+    if args.backend == "postgres-event-log" {
+        return prepare_postgres_event_log(args).await;
+    }
     ensure_agentdb_backend(&args.backend)?;
     let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
     let run_dir = args.out.join("runs").join(&run_id);
@@ -490,15 +498,184 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     Ok(())
 }
 
+async fn prepare_postgres_event_log(args: PrepareArgs) -> Result<()> {
+    let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
+    let run_dir = args.out.join("runs").join(&run_id);
+    create_new_run_dir(&run_dir)?;
+
+    let config = dataset_config(&args);
+    let database_config = DatabaseConfig {
+        backend: args.backend.clone(),
+        storage_engine: "postgres-event-log".into(),
+        content_engine: "metadata-reference".into(),
+        data_dir: None,
+        content_dir: None,
+        durability_profile: args.durability_profile.clone(),
+        note: "Postgres event-log baseline stores normalized session/event rows and artifact metadata references; large blob bytes are not stored inline by default."
+            .into(),
+    };
+    write_json(run_dir.join("config.json"), &config)?;
+    write_json(run_dir.join("database-config.json"), &database_config)?;
+    write_json(run_dir.join("host-manifest.json"), &host_manifest())?;
+    write_json(run_dir.join("software-manifest.json"), &software_manifest())?;
+
+    let pool = connect_postgres(&args.pg_dsn).await?;
+    init_postgres_event_log_schema(&pool).await?;
+    reset_postgres_run(&pool, &run_id).await?;
+
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut tenants = Vec::new();
+    let mut artifact_stats = ArtifactStats::default();
+
+    for tenant_idx in 0..config.tenants {
+        let external_key = format!("bench-{run_id}-tenant-{tenant_idx}");
+        let tenant_id = format!("ten-pg-{tenant_idx:06}");
+        pg_create_tenant(&pool, &run_id, &tenant_id, &external_key).await?;
+        let mut agents = Vec::new();
+
+        for agent_idx in 0..config.agents_per_tenant {
+            let alias = format!("bench-agent-{tenant_idx}-{agent_idx}");
+            let agent_id = format!("agt-pg-{tenant_idx:06}-{agent_idx:06}");
+            pg_create_agent(&pool, &run_id, &tenant_id, &agent_id, &alias).await?;
+            let mut sessions = Vec::new();
+
+            for session_idx in 0..config.sessions_per_agent {
+                let alias = format!("bench-session-{tenant_idx}-{agent_idx}-{session_idx}");
+                let session_id = format!("ses-pg-{tenant_idx:06}-{agent_idx:06}-{session_idx:06}");
+                pg_create_session(
+                    &pool,
+                    &run_id,
+                    &tenant_id,
+                    &agent_id,
+                    &session_id,
+                    &alias,
+                    None,
+                    None,
+                )
+                .await?;
+
+                for seq in 0..config.events_per_session {
+                    let prepared_artifact = pg_maybe_create_artifact(
+                        &pool,
+                        &run_id,
+                        &tenant_id,
+                        &session_id,
+                        &config,
+                        &mut rng,
+                    )
+                    .await?;
+                    artifact_stats.content_backend_artifacts +=
+                        prepared_artifact.content_backend_artifacts;
+                    artifact_stats.content_backend_bytes += prepared_artifact.content_backend_bytes;
+                    artifact_stats.external_reference_artifacts +=
+                        prepared_artifact.external_reference_artifacts;
+                    artifact_stats.external_reference_bytes +=
+                        prepared_artifact.external_reference_bytes;
+                    let mut payload =
+                        event_payload(&config, &mut rng, tenant_idx, agent_idx, session_idx, seq);
+                    if !prepared_artifact.external_refs.is_empty() {
+                        payload["external_artifact_refs"] =
+                            Value::Array(prepared_artifact.external_refs.clone());
+                    }
+                    pg_insert_event(
+                        &pool,
+                        &run_id,
+                        &tenant_id,
+                        &agent_id,
+                        &session_id,
+                        seq as i64,
+                        "message",
+                        &payload,
+                        &prepared_artifact.artifact_refs,
+                    )
+                    .await?;
+                }
+                pg_set_next_seq(
+                    &pool,
+                    &run_id,
+                    &tenant_id,
+                    &session_id,
+                    config.events_per_session as i64,
+                )
+                .await?;
+
+                for record_idx in 0..config.records_per_session {
+                    pg_create_record(&pool, &run_id, &tenant_id, &session_id, record_idx, &config)
+                        .await?;
+                }
+
+                let mut child_sessions = Vec::new();
+                for fork_idx in 0..config.forks_per_parent {
+                    let child_id = format!("{session_id}-fork-{fork_idx}");
+                    pg_create_session(
+                        &pool,
+                        &run_id,
+                        &tenant_id,
+                        &agent_id,
+                        &child_id,
+                        &format!("{alias}-fork-{fork_idx}"),
+                        Some(&session_id),
+                        Some(config.events_per_session.saturating_sub(1) as i64),
+                    )
+                    .await?;
+                    child_sessions.push(child_id);
+                }
+
+                sessions.push(SessionFixture {
+                    session_id,
+                    alias,
+                    events_written: config.events_per_session,
+                    child_sessions,
+                });
+            }
+
+            agents.push(AgentFixture {
+                agent_id,
+                alias,
+                sessions,
+            });
+        }
+
+        tenants.push(TenantFixture {
+            tenant_id,
+            external_key,
+            agents,
+        });
+    }
+
+    let manifest = DatasetManifest {
+        schema_version: 1,
+        run_id: run_id.clone(),
+        backend: args.backend,
+        base_url: args.pg_dsn,
+        created_at_ms: now_ms(),
+        config,
+        database_config,
+        artifact_stats,
+        tenants,
+    };
+    write_json(run_dir.join("dataset.json"), &manifest)?;
+    println!(
+        "prepared postgres dataset {run_id} at {}",
+        run_dir.display()
+    );
+    Ok(())
+}
+
 async fn run(args: RunArgs) -> Result<()> {
-    ensure_agentdb_backend(&args.backend)?;
+    ensure_benchmark_backend(&args.backend)?;
     let run_dir = args.out.join("runs").join(&args.run_id);
     let manifest: DatasetManifest = read_json(run_dir.join("dataset.json"))?;
     let concurrencies = parse_concurrency(&args.concurrency)?;
     let warmup = parse_duration(&args.warmup)?;
     let duration = parse_duration(&args.duration)?;
     let client = Client::new();
-    wait_ready(&client, &args.base_url).await?;
+    let pg_pool = if args.backend == "postgres-event-log" {
+        Some(Arc::new(connect_postgres(&args.pg_dsn).await?))
+    } else {
+        wait_ready(&client, &args.base_url).await?;
+        None
+    };
     let database_config = read_json(run_dir.join("database-config.json")).unwrap_or_else(|_| {
         json!({
             "backend": args.backend.clone(),
@@ -525,6 +702,7 @@ async fn run(args: RunArgs) -> Result<()> {
             duration,
             args.seed + concurrency as u64,
             raw_writer.clone(),
+            pg_pool.clone(),
         )
         .await?;
         print_cell(&cell);
@@ -573,7 +751,17 @@ async fn run_cell_warmup(
     if duration.is_zero() {
         return Ok(());
     }
-    let _ = run_cell(client, args, manifest, concurrency, duration, seed, None).await?;
+    let _ = run_cell(
+        client,
+        args,
+        manifest,
+        concurrency,
+        duration,
+        seed,
+        None,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -585,6 +773,7 @@ async fn run_cell(
     duration: Duration,
     seed: u64,
     raw_writer: Option<Arc<Mutex<BufWriter<File>>>>,
+    pg_pool: Option<Arc<PgPool>>,
 ) -> Result<CellReport> {
     let samples = Arc::new(Mutex::new(Vec::<OperationSample>::new()));
     let deadline = Instant::now() + duration;
@@ -597,14 +786,22 @@ async fn run_cell(
         let samples = samples.clone();
         let fixtures = fixtures.clone();
         let raw_writer = raw_writer.clone();
+        let pg_pool = pg_pool.clone();
         handles.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed + worker_id as u64);
             while Instant::now() < deadline {
                 let operation = choose_operation(args.workload, &mut rng);
                 let started_at_ms = now_ms();
                 let started = Instant::now();
-                let result =
-                    run_one_operation(&client, &args, &fixtures, &mut rng, operation).await;
+                let result = run_one_operation(
+                    &client,
+                    pg_pool.as_deref(),
+                    &args,
+                    &fixtures,
+                    &mut rng,
+                    operation,
+                )
+                .await;
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 let error = result.err().map(|err| err.to_string());
                 let success = error.is_none();
@@ -665,6 +862,7 @@ async fn run_cell(
 
 async fn run_one_operation(
     client: &Client,
+    pg_pool: Option<&PgPool>,
     args: &RunArgs,
     fixtures: &[FlatSession],
     rng: &mut StdRng,
@@ -674,6 +872,10 @@ async fn run_one_operation(
         return Err(anyhow!("dataset has no sessions"));
     }
     let fixture = &fixtures[rng.gen_range(0..fixtures.len())];
+    if args.backend == "postgres-event-log" {
+        let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
+        return run_one_postgres_operation(pool, args, fixture, rng, operation).await;
+    }
     match operation {
         Operation::AppendFetch => {
             append_and_fetch(
@@ -797,6 +999,7 @@ impl RunArgs {
             base_url: self.base_url.clone(),
             out: self.out.clone(),
             run_id: self.run_id.clone(),
+            pg_dsn: self.pg_dsn.clone(),
             workload: self.workload,
             concurrency: self.concurrency.clone(),
             warmup: self.warmup.clone(),
@@ -1052,6 +1255,417 @@ async fn create_record(
     Ok(())
 }
 
+async fn run_one_postgres_operation(
+    pool: &PgPool,
+    args: &RunArgs,
+    fixture: &FlatSession,
+    rng: &mut StdRng,
+    operation: Operation,
+) -> Result<()> {
+    match operation {
+        Operation::AppendFetch => {
+            pg_append_fetch(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &fixture.session_id,
+                args.fetch_last_n,
+                &json!({
+                    "role": "assistant",
+                    "content": deterministic_string(128, rng),
+                    "bench_op": "append_fetch"
+                }),
+            )
+            .await
+        }
+        Operation::FetchRecent => {
+            pg_fetch_recent(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                args.fetch_last_n,
+            )
+            .await
+        }
+        Operation::RecordWrite => {
+            pg_create_record(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.session_id,
+                rng.gen_range(0..1_000_000),
+                &DatasetConfig::small_runtime(args.seed),
+            )
+            .await
+        }
+        Operation::RecordSearch => {
+            let _rows = sqlx::query(
+                "SELECT record_id FROM agentdb_bench.records
+                 WHERE run_id = $1 AND tenant_id = $2 AND tags @> ARRAY['bench']::text[]
+                 ORDER BY created_at DESC
+                 LIMIT 10",
+            )
+            .bind(&args.run_id)
+            .bind(&fixture.tenant_id)
+            .fetch_all(pool)
+            .await?;
+            Ok(())
+        }
+        Operation::Fork => {
+            let child_id = format!("{}-runtime-fork-{}", fixture.session_id, rng.gen::<u64>());
+            pg_create_session(
+                pool,
+                &args.run_id,
+                &fixture.tenant_id,
+                &fixture.agent_id,
+                &child_id,
+                &child_id,
+                Some(&fixture.session_id),
+                Some(fixture.events_written.saturating_sub(1) as i64),
+            )
+            .await
+        }
+        Operation::Artifact => pg_create_artifact_reference(
+            pool,
+            &args.run_id,
+            &fixture.tenant_id,
+            &fixture.session_id,
+            1024,
+            rng,
+        )
+        .await
+        .map(|_| ()),
+    }
+}
+
+async fn connect_postgres(dsn: &str) -> Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(32)
+        .connect(dsn)
+        .await
+        .with_context(|| format!("connect postgres {dsn}"))
+}
+
+async fn init_postgres_event_log_schema(pool: &PgPool) -> Result<()> {
+    let schema = include_str!("../../../benchmarks/postgres/event_log.sql");
+    for statement in schema.split(';') {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reset_postgres_run(pool: &PgPool, run_id: &str) -> Result<()> {
+    for table in [
+        "artifacts",
+        "records",
+        "events",
+        "sessions",
+        "agents",
+        "tenants",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM agentdb_bench.{table} WHERE run_id = $1"
+        ))
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn pg_create_tenant(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    external_key: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agentdb_bench.tenants (run_id, tenant_id, external_key)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(external_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_create_agent(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    alias: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agentdb_bench.agents (run_id, tenant_id, agent_id, alias, config)
+         VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(agent_id)
+    .bind(alias)
+    .bind(json!({"bench": true}).to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pg_create_session(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    alias: &str,
+    fork_parent_id: Option<&str>,
+    fork_at_seq: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agentdb_bench.sessions
+         (run_id, tenant_id, agent_id, session_id, alias, fork_parent_id, fork_at_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(agent_id)
+    .bind(session_id)
+    .bind(alias)
+    .bind(fork_parent_id)
+    .bind(fork_at_seq)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_set_next_seq(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    next_seq: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agentdb_bench.sessions
+         SET next_seq = $4, updated_at = now()
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(next_seq)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pg_insert_event(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    seq: i64,
+    kind: &str,
+    payload: &Value,
+    artifact_refs: &[Value],
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agentdb_bench.events
+         (run_id, tenant_id, agent_id, session_id, seq, kind, payload, artifact_refs)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(agent_id)
+    .bind(session_id)
+    .bind(seq)
+    .bind(kind)
+    .bind(payload.to_string())
+    .bind(Value::Array(artifact_refs.to_vec()).to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_append_fetch(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    last: usize,
+    payload: &Value,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let seq: i64 = sqlx::query_scalar(
+        "UPDATE agentdb_bench.sessions
+         SET next_seq = next_seq + 1, updated_at = now()
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
+         RETURNING next_seq - 1",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO agentdb_bench.events
+         (run_id, tenant_id, agent_id, session_id, seq, kind, payload)
+         VALUES ($1, $2, $3, $4, $5, 'message', $6::jsonb)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(agent_id)
+    .bind(session_id)
+    .bind(seq)
+    .bind(payload.to_string())
+    .execute(&mut *tx)
+    .await?;
+
+    let _rows = sqlx::query(
+        "SELECT seq, payload FROM agentdb_bench.events
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
+         ORDER BY seq DESC
+         LIMIT $4",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(last as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn pg_fetch_recent(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    last: usize,
+) -> Result<()> {
+    let _rows = sqlx::query(
+        "SELECT seq, payload FROM agentdb_bench.events
+         WHERE run_id = $1 AND tenant_id = $2 AND session_id = $3
+         ORDER BY seq DESC
+         LIMIT $4",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(last as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_create_record(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    record_idx: usize,
+    config: &DatasetConfig,
+) -> Result<()> {
+    let record_id = format!("rec-pg-{session_id}-{record_idx}");
+    sqlx::query(
+        "INSERT INTO agentdb_bench.records
+         (run_id, tenant_id, record_id, session_id, namespace, tags, text, metadata)
+         VALUES ($1, $2, $3, $4, ARRAY['bench','session'], ARRAY['bench','memory'], $5, $6::jsonb)
+         ON CONFLICT (run_id, tenant_id, record_id) DO NOTHING",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(record_id)
+    .bind(session_id)
+    .bind(format!("bench memory record {record_idx} for {session_id}"))
+    .bind(
+        json!({
+            "bench": true,
+            "record_index": record_idx,
+            "payload": "x".repeat(config.payload_bytes.min(4096))
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn pg_maybe_create_artifact(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    config: &DatasetConfig,
+    rng: &mut StdRng,
+) -> Result<PreparedArtifact> {
+    if config.artifact_rate <= 0.0 || !rng.gen_bool(config.artifact_rate.clamp(0.0, 1.0)) {
+        return Ok(PreparedArtifact::default());
+    }
+    pg_create_artifact_reference(
+        pool,
+        run_id,
+        tenant_id,
+        session_id,
+        config.artifact_large_bytes,
+        rng,
+    )
+    .await
+}
+
+async fn pg_create_artifact_reference(
+    pool: &PgPool,
+    run_id: &str,
+    tenant_id: &str,
+    session_id: &str,
+    bytes: usize,
+    rng: &mut StdRng,
+) -> Result<PreparedArtifact> {
+    let artifact_id = format!("art-pg-{}", rng.gen::<u64>());
+    let content_uri = format!("bench://postgres-artifact/{artifact_id}");
+    let sha256 = format!("{:016x}", rng.gen::<u64>());
+    sqlx::query(
+        "INSERT INTO agentdb_bench.artifacts
+         (run_id, tenant_id, artifact_id, session_id, content_uri, content_type, bytes, sha256)
+         VALUES ($1, $2, $3, $4, $5, 'application/octet-stream', $6, $7)",
+    )
+    .bind(run_id)
+    .bind(tenant_id)
+    .bind(&artifact_id)
+    .bind(session_id)
+    .bind(&content_uri)
+    .bind(bytes as i64)
+    .bind(&sha256)
+    .execute(pool)
+    .await?;
+    Ok(PreparedArtifact {
+        artifact_refs: Vec::new(),
+        external_refs: vec![json!({
+            "artifact_id": artifact_id,
+            "content_uri": content_uri,
+            "content_type": "application/octet-stream",
+            "bytes": bytes,
+            "sha256": sha256
+        })],
+        content_backend_artifacts: 0,
+        content_backend_bytes: 0,
+        external_reference_artifacts: 1,
+        external_reference_bytes: bytes as u64,
+    })
+}
+
 async fn post_json<T: Serialize + ?Sized>(
     client: &Client,
     base_url: &str,
@@ -1253,6 +1867,15 @@ fn ensure_agentdb_backend(backend: &str) -> Result<()> {
     }
     Err(anyhow!(
         "backend {backend:?} is not implemented yet; first slice supports agentdb-native-rocksdb"
+    ))
+}
+
+fn ensure_benchmark_backend(backend: &str) -> Result<()> {
+    if backend == "agentdb-native-rocksdb" || backend == "postgres-event-log" {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "backend {backend:?} is not implemented yet; supported backends: agentdb-native-rocksdb, postgres-event-log"
     ))
 }
 
