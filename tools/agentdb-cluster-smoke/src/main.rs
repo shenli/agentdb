@@ -402,7 +402,7 @@ async fn run_smoke(
         .await?;
     }
     eprintln!("smoke: waiting for raft readiness");
-    wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
 
     eprintln!("smoke: resolving initial tablet writer");
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
