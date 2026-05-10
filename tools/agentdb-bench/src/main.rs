@@ -2105,6 +2105,14 @@ async fn init_mongodb_event_log_schema(db: &MongoDatabase) -> Result<()> {
     .await?;
     create_mongo_index(
         db,
+        "records",
+        doc! {"run_id": 1, "tenant_id": 1, "tags": 1, "created_at": -1},
+        false,
+        "records_tags_recent",
+    )
+    .await?;
+    create_mongo_index(
+        db,
         "artifacts",
         doc! {"run_id": 1, "tenant_id": 1, "artifact_id": 1},
         true,

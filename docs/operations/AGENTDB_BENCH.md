@@ -278,6 +278,7 @@ db.events.createIndex({ tenant_id: 1, session_id: 1, seq: 1 }, { unique: true })
 db.events.createIndex({ tenant_id: 1, session_id: 1, seq: -1 })
 db.records.createIndex({ tenant_id: 1, session_id: 1, sharding_key: 1 })
 db.records.createIndex({ tenant_id: 1, tags: 1 })
+db.records.createIndex({ tenant_id: 1, tags: 1, created_at: -1 })
 db.records.createIndex({ tenant_id: 1, text: "text" })
 ```
 
