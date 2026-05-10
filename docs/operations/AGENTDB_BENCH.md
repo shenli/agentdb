@@ -158,7 +158,7 @@ agentdb-bench prepare \
   --artifact-rate 0.05 \
   --artifact-small-bytes 4096 \
   --artifact-large-bytes 1048576 \
-  --artifact-large-mode reference \
+  --artifact-mode reference \
   --payload-bytes 1024 \
   --seed 42
 
@@ -189,9 +189,9 @@ Dataset knobs:
 | `--records-per-session` | Number of memory records attached to each session. |
 | `--global-record-ratio` | Ratio of records without a session/sharding key, used to exercise global index paths. |
 | `--artifact-rate` | Fraction of events that create an artifact. |
-| `--artifact-small-bytes` | Size for inline/small artifacts. |
+| `--artifact-small-bytes` | Size for small artifacts stored through the content engine. |
 | `--artifact-large-bytes` | Size for large artifact payloads. |
-| `--artifact-large-mode` | `reference`, `inline`, or `mixed`; `reference` stores metadata plus content URI. |
+| `--artifact-mode` | `reference`, `content-backend`, or `mixed`; `content-backend` writes bytes through AgentDB's content engine, not RocksDB. |
 | `--forks-per-parent` | Number of prepared child branches per selected parent session. |
 | `--seed` | Deterministic data generation seed. |
 
@@ -224,12 +224,12 @@ The benchmark should model the product semantics directly:
 
 Artifact semantics:
 
-- Small artifact mode stores metadata and small content inline when the backend
-  supports it.
+- Small artifact mode stores metadata in the database and content through the
+  backend's content/blob path when the backend supports it.
 - Large artifact reference mode stores metadata plus `content_uri`, `size`,
   `sha256`, `media_type`, and `created_at`.
-- Large artifact inline mode is optional and should be reported separately
-  because it measures a different tradeoff.
+- Large artifact content-backend mode is optional and should be reported
+  separately because it measures content-engine write/read behavior.
 - The default comparison should use reference mode for large artifacts so the
   benchmark does not collapse into a blob-store benchmark.
 
@@ -460,13 +460,15 @@ Scale profiles should vary one dimension at a time:
 - Add `prepare` and `run` subcommands. `prepare` owns synthetic dataset
   creation for tenants, agents, sessions, chat history, records, forks, and
   artifacts. Initial status: implemented for tenants, agents, sessions, chat
-  history, records, forks, and inline artifacts. Metadata-only external artifact
-  references need a runtime/API shape before they can be represented as native
-  artifact metadata.
+  history, records, forks, and content-engine artifacts. Metadata-only external
+  artifact references need a runtime/API shape before they can be represented as
+  native artifact metadata.
 - Add Docker Compose files for local Postgres and MongoDB.
 - Add schema files for the MongoDB and Postgres profiles above.
 - Add `scripts/agentdb-bench.sh` to build AgentDB, start databases, run a smoke
-  matrix, and write `bench-out/`.
+  matrix, and write `bench-out/`. Initial status: local AgentDB-only runner is
+  implemented as `scripts/agentdb-bench-local.sh`; MongoDB/Postgres orchestration
+  is still follow-up work.
 
 ### PR 2: Backend Adapters And Correctness Tests
 

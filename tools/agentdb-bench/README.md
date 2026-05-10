@@ -4,6 +4,10 @@
 AgentDB. The first implemented backend is `agentdb-native-rocksdb`: native HTTP
 API plus local RocksDB storage.
 
+In this profile, RocksDB stores metadata and indexes. Artifact bytes are written
+through AgentDB's content engine, which is local filesystem in the example
+below. This avoids putting large blobs into RocksDB.
+
 Start a local persistent AgentDB server:
 
 ```bash
@@ -11,6 +15,13 @@ cargo run -p agentdb-server -- serve \
   --bind 127.0.0.1:7890 \
   --data-dir /tmp/agentdb-bench-data \
   --content-dir /tmp/agentdb-bench-content
+```
+
+Or run the full local RocksDB/content-engine smoke in one command:
+
+```bash
+PROFILE=smoke ARTIFACT_MODE=content-backend \
+  scripts/agentdb-bench-local.sh
 ```
 
 Prepare a dataset:
@@ -24,7 +35,9 @@ cargo run -p agentdb-bench -- prepare \
   --events-per-session 10 \
   --records-per-session 2 \
   --artifact-rate 0.2 \
-  --artifact-large-mode inline
+  --artifact-mode content-backend \
+  --data-dir /tmp/agentdb-bench-data \
+  --content-dir /tmp/agentdb-bench-content
 ```
 
 Run a workload:
@@ -45,6 +58,6 @@ Outputs are written under `bench-out/runs/<run-id>/`:
 - `dataset.json` records prepared tenant/agent/session IDs.
 - `host-manifest.json` records hardware and OS information.
 - `software-manifest.json` records toolchain and runtime versions.
+- `database-config.json` records storage/content engine configuration.
 - `report-*.json` contains machine-readable latency summaries.
 - `report.md` contains a compact human-readable report.
-

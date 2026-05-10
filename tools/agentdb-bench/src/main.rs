@@ -67,9 +67,19 @@ struct PrepareArgs {
     #[arg(long)]
     artifact_large_bytes: Option<usize>,
     #[arg(long, value_enum)]
-    artifact_large_mode: Option<ArtifactMode>,
+    artifact_mode: Option<ArtifactMode>,
     #[arg(long)]
     forks_per_parent: Option<usize>,
+    #[arg(long, default_value = "rocksdb")]
+    storage_engine: String,
+    #[arg(long, default_value = "localfs")]
+    content_engine: String,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long)]
+    content_dir: Option<PathBuf>,
+    #[arg(long, default_value = "durable-single")]
+    durability_profile: String,
     #[arg(long, default_value_t = 42)]
     seed: u64,
 }
@@ -112,7 +122,7 @@ enum Profile {
 #[serde(rename_all = "kebab-case")]
 enum ArtifactMode {
     Reference,
-    Inline,
+    ContentBackend,
     Mixed,
 }
 
@@ -139,9 +149,28 @@ struct DatasetConfig {
     artifact_rate: f64,
     artifact_small_bytes: usize,
     artifact_large_bytes: usize,
-    artifact_large_mode: ArtifactMode,
+    artifact_mode: ArtifactMode,
     forks_per_parent: usize,
     seed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ArtifactStats {
+    content_backend_artifacts: u64,
+    content_backend_bytes: u64,
+    external_reference_artifacts: u64,
+    external_reference_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DatabaseConfig {
+    backend: String,
+    storage_engine: String,
+    content_engine: String,
+    data_dir: Option<PathBuf>,
+    content_dir: Option<PathBuf>,
+    durability_profile: String,
+    note: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,6 +181,8 @@ struct DatasetManifest {
     base_url: String,
     created_at_ms: u64,
     config: DatasetConfig,
+    database_config: DatabaseConfig,
+    artifact_stats: ArtifactStats,
     tenants: Vec<TenantFixture>,
 }
 
@@ -186,6 +217,7 @@ struct BenchReport {
     generated_at_ms: u64,
     host_manifest: Value,
     software_manifest: Value,
+    database_config: Value,
     config: Value,
     cells: Vec<CellReport>,
 }
@@ -227,7 +259,18 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     create_new_run_dir(&run_dir)?;
 
     let config = dataset_config(&args);
+    let database_config = DatabaseConfig {
+        backend: args.backend.clone(),
+        storage_engine: args.storage_engine.clone(),
+        content_engine: args.content_engine.clone(),
+        data_dir: args.data_dir.clone(),
+        content_dir: args.content_dir.clone(),
+        durability_profile: args.durability_profile.clone(),
+        note: "For agentdb-native-rocksdb, RocksDB stores metadata/indexes; artifact bytes are stored by the content engine."
+            .into(),
+    };
     write_json(run_dir.join("config.json"), &config)?;
+    write_json(run_dir.join("database-config.json"), &database_config)?;
     write_json(run_dir.join("host-manifest.json"), &host_manifest())?;
     write_json(run_dir.join("software-manifest.json"), &software_manifest())?;
 
@@ -236,6 +279,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(config.seed);
 
     let mut tenants = Vec::new();
+    let mut artifact_stats = ArtifactStats::default();
     for tenant_idx in 0..config.tenants {
         let external_key = format!("bench-{run_id}-tenant-{tenant_idx}");
         let tenant = post_json(
@@ -288,6 +332,13 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                     )
                     .await?;
                     artifacts.extend(prepared_artifact.artifact_refs.iter().cloned());
+                    artifact_stats.content_backend_artifacts +=
+                        prepared_artifact.content_backend_artifacts;
+                    artifact_stats.content_backend_bytes += prepared_artifact.content_backend_bytes;
+                    artifact_stats.external_reference_artifacts +=
+                        prepared_artifact.external_reference_artifacts;
+                    artifact_stats.external_reference_bytes +=
+                        prepared_artifact.external_reference_bytes;
                     let mut payload =
                         event_payload(&config, &mut rng, tenant_idx, agent_idx, session_idx, seq);
                     if !prepared_artifact.external_refs.is_empty() {
@@ -336,6 +387,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                 }
 
                 if !artifacts.is_empty() {
+                    let artifact_summary_event = !artifacts.is_empty();
                     let payload = json!({
                         "role": "system",
                         "content": "artifact summary",
@@ -353,14 +405,21 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                         Vec::new(),
                     )
                     .await?;
+                    sessions.push(SessionFixture {
+                        session_id,
+                        alias,
+                        events_written: config.events_per_session
+                            + if artifact_summary_event { 1 } else { 0 },
+                        child_sessions,
+                    });
+                } else {
+                    sessions.push(SessionFixture {
+                        session_id,
+                        alias,
+                        events_written: config.events_per_session,
+                        child_sessions,
+                    });
                 }
-
-                sessions.push(SessionFixture {
-                    session_id,
-                    alias,
-                    events_written: config.events_per_session,
-                    child_sessions,
-                });
             }
 
             agents.push(AgentFixture {
@@ -384,6 +443,8 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         base_url: args.base_url,
         created_at_ms: now_ms(),
         config,
+        database_config,
+        artifact_stats,
         tenants,
     };
     write_json(run_dir.join("dataset.json"), &manifest)?;
@@ -400,6 +461,12 @@ async fn run(args: RunArgs) -> Result<()> {
     let duration = parse_duration(&args.duration)?;
     let client = Client::new();
     wait_ready(&client, &args.base_url).await?;
+    let database_config = read_json(run_dir.join("database-config.json")).unwrap_or_else(|_| {
+        json!({
+            "backend": args.backend.clone(),
+            "note": "database-config.json was not found for this run"
+        })
+    });
 
     let mut cells = Vec::new();
     for concurrency in concurrencies {
@@ -425,6 +492,7 @@ async fn run(args: RunArgs) -> Result<()> {
         generated_at_ms: now_ms(),
         host_manifest: host_manifest(),
         software_manifest: software_manifest(),
+        database_config,
         config: json!({
             "base_url": args.base_url,
             "concurrency": args.concurrency,
@@ -654,7 +722,7 @@ impl DatasetConfig {
             artifact_rate: 0.0,
             artifact_small_bytes: 1024,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 0,
             seed,
         }
@@ -709,6 +777,10 @@ fn flatten_fixtures(manifest: &DatasetManifest) -> Result<Vec<FlatSession>> {
 struct PreparedArtifact {
     artifact_refs: Vec<Value>,
     external_refs: Vec<Value>,
+    content_backend_artifacts: u64,
+    content_backend_bytes: u64,
+    external_reference_artifacts: u64,
+    external_reference_bytes: u64,
 }
 
 async fn maybe_create_artifact(
@@ -722,7 +794,7 @@ async fn maybe_create_artifact(
         return Ok(PreparedArtifact::default());
     }
 
-    match config.artifact_large_mode {
+    match config.artifact_mode {
         // AgentDB's current native artifact API creates metadata and blob
         // together. Metadata-only external artifact references are represented
         // in event payloads by later workload slices, not in `artifact_refs`.
@@ -734,34 +806,70 @@ async fn maybe_create_artifact(
                 "bytes": config.artifact_large_bytes,
                 "sha256": format!("{:016x}", rng.gen::<u64>())
             })],
+            content_backend_artifacts: 0,
+            content_backend_bytes: 0,
+            external_reference_artifacts: 1,
+            external_reference_bytes: config.artifact_large_bytes as u64,
         }),
-        ArtifactMode::Inline | ArtifactMode::Mixed => {
-            let size =
-                if matches!(config.artifact_large_mode, ArtifactMode::Mixed) && rng.gen_bool(0.2) {
-                    config.artifact_large_bytes
-                } else {
-                    config.artifact_small_bytes
-                };
-            let bytes = deterministic_bytes(size, rng);
-            let artifact = post_bytes(
-                client,
-                base_url,
-                &format!("/api/tenants/{tenant_id}/artifacts"),
-                bytes,
-                "application/octet-stream",
-            )
-            .await?;
-            Ok(PreparedArtifact {
-                artifact_refs: vec![json!({
-                    "artifact_id": required_str(&artifact, "artifact_id")?,
-                    "content_type": artifact.get("content_type").and_then(Value::as_str),
-                    "bytes": artifact.get("bytes").and_then(Value::as_u64),
-                    "sha256": artifact.get("sha256").and_then(Value::as_str)
-                })],
-                external_refs: Vec::new(),
-            })
+        ArtifactMode::ContentBackend => {
+            create_content_backend_artifact(client, base_url, tenant_id, config, rng).await
+        }
+        ArtifactMode::Mixed => {
+            if rng.gen_bool(0.5) {
+                Ok(PreparedArtifact {
+                    artifact_refs: Vec::new(),
+                    external_refs: vec![json!({
+                        "content_uri": format!("bench://artifact/{}", rng.gen::<u64>()),
+                        "content_type": "application/octet-stream",
+                        "bytes": config.artifact_large_bytes,
+                        "sha256": format!("{:016x}", rng.gen::<u64>())
+                    })],
+                    content_backend_artifacts: 0,
+                    content_backend_bytes: 0,
+                    external_reference_artifacts: 1,
+                    external_reference_bytes: config.artifact_large_bytes as u64,
+                })
+            } else {
+                create_content_backend_artifact(client, base_url, tenant_id, config, rng).await
+            }
         }
     }
+}
+
+async fn create_content_backend_artifact(
+    client: &Client,
+    base_url: &str,
+    tenant_id: &str,
+    config: &DatasetConfig,
+    rng: &mut StdRng,
+) -> Result<PreparedArtifact> {
+    let size = if rng.gen_bool(0.2) {
+        config.artifact_large_bytes
+    } else {
+        config.artifact_small_bytes
+    };
+    let bytes = deterministic_bytes(size, rng);
+    let artifact = post_bytes(
+        client,
+        base_url,
+        &format!("/api/tenants/{tenant_id}/artifacts"),
+        bytes,
+        "application/octet-stream",
+    )
+    .await?;
+    Ok(PreparedArtifact {
+        artifact_refs: vec![json!({
+            "artifact_id": required_str(&artifact, "artifact_id")?,
+            "content_type": artifact.get("content_type").and_then(Value::as_str),
+            "bytes": artifact.get("bytes").and_then(Value::as_u64),
+            "sha256": artifact.get("sha256").and_then(Value::as_str)
+        })],
+        external_refs: Vec::new(),
+        content_backend_artifacts: 1,
+        content_backend_bytes: size as u64,
+        external_reference_artifacts: 0,
+        external_reference_bytes: 0,
+    })
 }
 
 async fn append_event(
@@ -922,7 +1030,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.2,
             artifact_small_bytes: 1024,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 1,
             seed: args.seed,
         },
@@ -937,7 +1045,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.05,
             artifact_small_bytes: 4096,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 1,
             seed: args.seed,
         },
@@ -952,7 +1060,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.01,
             artifact_small_bytes: 4096,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 0,
             seed: args.seed,
         },
@@ -967,7 +1075,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.25,
             artifact_small_bytes: 8192,
             artifact_large_bytes: 2 * 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Mixed,
+            artifact_mode: ArtifactMode::Mixed,
             forks_per_parent: 0,
             seed: args.seed,
         },
@@ -982,7 +1090,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.01,
             artifact_small_bytes: 1024,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 0,
             seed: args.seed,
         },
@@ -997,7 +1105,7 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             artifact_rate: 0.01,
             artifact_small_bytes: 1024,
             artifact_large_bytes: 1024 * 1024,
-            artifact_large_mode: ArtifactMode::Reference,
+            artifact_mode: ArtifactMode::Reference,
             forks_per_parent: 10,
             seed: args.seed,
         },
@@ -1030,8 +1138,8 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
     if let Some(v) = args.artifact_large_bytes {
         cfg.artifact_large_bytes = v;
     }
-    if let Some(v) = args.artifact_large_mode {
-        cfg.artifact_large_mode = v;
+    if let Some(v) = args.artifact_mode {
+        cfg.artifact_mode = v;
     }
     if let Some(v) = args.forks_per_parent {
         cfg.forks_per_parent = v;
@@ -1087,6 +1195,20 @@ fn write_markdown_report(
     out.push_str(&format!("- Backend: `{}`\n", report.backend));
     out.push_str(&format!("- Workload: `{:?}`\n", report.workload));
     out.push_str(&format!(
+        "- Storage engine: `{}`\n",
+        manifest.database_config.storage_engine
+    ));
+    out.push_str(&format!(
+        "- Content engine: `{}`\n",
+        manifest.database_config.content_engine
+    ));
+    if let Some(path) = &manifest.database_config.data_dir {
+        out.push_str(&format!("- RocksDB data dir: `{}`\n", path.display()));
+    }
+    if let Some(path) = &manifest.database_config.content_dir {
+        out.push_str(&format!("- Content dir: `{}`\n", path.display()));
+    }
+    out.push_str(&format!(
         "- Dataset profile: `{}`\n",
         manifest.config.profile
     ));
@@ -1105,7 +1227,17 @@ fn write_markdown_report(
     ));
     out.push_str(&format!(
         "- Artifact mode: `{:?}`\n",
-        manifest.config.artifact_large_mode
+        manifest.config.artifact_mode
+    ));
+    out.push_str(&format!(
+        "- Content-engine artifacts: `{}` artifacts, `{}` bytes\n",
+        manifest.artifact_stats.content_backend_artifacts,
+        manifest.artifact_stats.content_backend_bytes
+    ));
+    out.push_str(&format!(
+        "- External artifact references: `{}` references, `{}` bytes\n",
+        manifest.artifact_stats.external_reference_artifacts,
+        manifest.artifact_stats.external_reference_bytes
     ));
     out.push_str(&format!(
         "- Host: `{}`\n",
