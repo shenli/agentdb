@@ -60,10 +60,24 @@ Each run contains:
   tails.
 - `*.log`: one log file per stage.
 
+The run root also contains:
+
+- `summary.html`: latest run, last successful run, last failed run, and recent
+  run history.
+- `summary.env`: machine-readable paths for latest, last successful, and last
+  failed run.
+- `index.html`: dashboard entrypoint.
+
 Check the last completed run:
 
 ```bash
 scripts/local-ci-status.sh --logs
+```
+
+Check the stability summary:
+
+```bash
+scripts/local-ci-status.sh --summary
 ```
 
 Serve the dashboard:
@@ -77,6 +91,9 @@ Then open:
 ```text
 http://127.0.0.1:8099
 ```
+
+The dashboard homepage links to `summary.html`, the latest run report, and the
+currently running report.
 
 On a remote dev box, use SSH forwarding:
 
@@ -110,12 +127,29 @@ Inspect status:
 systemctl --user status agentdb-local-ci-nightly.service
 systemctl --user list-timers agentdb-local-ci-nightly.timer
 scripts/local-ci-status.sh --root ~/agentdb-ci-runs --logs
+scripts/local-ci-status.sh --root ~/agentdb-ci-runs --summary
 ```
 
 Run immediately:
 
 ```bash
 systemctl --user start agentdb-local-ci-nightly.service
+```
+
+## Retention
+
+`scripts/local-ci.sh` prunes old run directories after each run. The default is
+to keep the newest 30 runs. Override it with:
+
+```bash
+LOCAL_CI_KEEP_RUNS=60 scripts/local-ci-nightly.sh
+```
+
+Manual cleanup:
+
+```bash
+scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30 --dry-run
+scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30
 ```
 
 ## Dirty Working Trees

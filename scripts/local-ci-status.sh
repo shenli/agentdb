@@ -4,6 +4,7 @@ set -euo pipefail
 RUN_ROOT="${LOCAL_CI_RUN_ROOT:-/tmp/agentdb-local-ci}"
 RUN_REF="latest"
 SHOW_LOGS=0
+SHOW_SUMMARY=0
 
 usage() {
   cat <<'EOF'
@@ -16,6 +17,7 @@ Options:
   --run RUN_ID     Show a specific run under ROOT/runs.
   --current        Show the currently running run.
   --logs           Also list per-stage log files.
+  --summary        Show latest, last successful, and last failed run.
   --help           Show this help.
 EOF
 }
@@ -44,6 +46,9 @@ while [[ $# -gt 0 ]]; do
     --logs)
       SHOW_LOGS=1
       ;;
+    --summary)
+      SHOW_SUMMARY=1
+      ;;
     --help|-h)
       usage
       exit 0
@@ -56,6 +61,10 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ "$SHOW_SUMMARY" == "1" ]]; then
+  exec "$(dirname "${BASH_SOURCE[0]}")/local-ci-summary.sh" --root "$RUN_ROOT"
+fi
 
 RUN_DIR="$RUN_ROOT/$RUN_REF"
 if [[ ! -e "$RUN_DIR/status.env" ]]; then

@@ -7,4 +7,5 @@ Type=oneshot
 WorkingDirectory=%h/work/agentdb
 Environment=LOCAL_CI_RUN_ROOT=%h/agentdb-ci-runs
 Environment=LOCAL_CI_NIGHTLY_CHAOS_ITERATIONS=48
+Environment=LOCAL_CI_KEEP_RUNS=30
 ExecStart=%h/work/agentdb/scripts/local-ci-nightly.sh

@@ -246,7 +246,14 @@ finish() {
     write_status failed "$EXIT_CODE" "$end_epoch"
     write_report failed
   fi
+  if [[ -x "$ROOT/scripts/local-ci-prune.sh" ]]; then
+    "$ROOT/scripts/local-ci-prune.sh" --root "$RUN_ROOT" --keep "${LOCAL_CI_KEEP_RUNS:-30}" >/dev/null || true
+  fi
+  if [[ -x "$ROOT/scripts/local-ci-summary.sh" ]]; then
+    "$ROOT/scripts/local-ci-summary.sh" --root "$RUN_ROOT" --quiet || true
+  fi
   echo "local ci status: $LOG_DIR/status.env"
+  echo "local ci summary: $RUN_ROOT/summary.html"
   exit "$EXIT_CODE"
 }
 
