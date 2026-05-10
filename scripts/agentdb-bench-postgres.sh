@@ -11,7 +11,8 @@ CONCURRENCY="${CONCURRENCY:-1,4}"
 WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
-PG_DSN="${PG_DSN:-postgres://bench:bench@127.0.0.1:5433/bench}"
+PG_PORT="${PG_PORT:-5433}"
+PG_DSN="${PG_DSN:-postgres://bench:bench@127.0.0.1:${PG_PORT}/bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/postgres"
 
 docker compose -f "${COMPOSE_DIR}/docker-compose.yml" up -d
