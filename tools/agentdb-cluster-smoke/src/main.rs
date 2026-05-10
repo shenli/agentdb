@@ -631,14 +631,9 @@ async fn create_session_smoke_once(
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
     eprintln!("smoke: creating agent for tenant {tenant_id}");
-    let agent = post_json_with_convergence_retry(
-        client,
-        nodes,
-        &format!("/api/tenants/{tenant_id}/agents"),
-        json!({"alias": "cluster-smoke-agent", "config": {}}),
-        10,
-    )
-    .await?;
+    let agent_alias = format!("cluster-smoke-agent-{suffix}");
+    let agent =
+        create_agent_with_convergence_retry(client, nodes, &tenant_id, &agent_alias, 10).await?;
     let agent_id = string_field(&agent, "agent_id")?;
     eprintln!("smoke: creating session for agent {agent_id}");
     let session = post_json_with_convergence_retry(
@@ -651,6 +646,61 @@ async fn create_session_smoke_once(
     .await?;
     let session_id = string_field(&session, "session_id")?;
     Ok((tenant_id, agent_id, session_id))
+}
+
+async fn create_agent_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    alias: &str,
+    attempts: usize,
+) -> Result<Value> {
+    let path = format!("/api/tenants/{tenant_id}/agents");
+    let body = json!({"alias": alias, "config": {}});
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: POST {path} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match post_json(client, &owner.url, &path, body.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_alias_conflict(&error) => {
+                return find_agent_by_alias(client, nodes, tenant_id, alias).await;
+            }
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("create agent {alias} failed without a captured error")))
+}
+
+async fn find_agent_by_alias(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    alias: &str,
+) -> Result<Value> {
+    let path = format!("/api/tenants/{tenant_id}/agents");
+    for node in nodes {
+        let Ok(response) = get_json(client, &node.url, &path).await else {
+            continue;
+        };
+        if let Some(agent) = response["agents"].as_array().and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent["alias"].as_str() == Some(alias))
+        }) {
+            return Ok(agent.clone());
+        }
+    }
+    bail!("agent alias {alias} conflicted but existing agent was not observable")
 }
 
 async fn post_json_with_convergence_retry(
@@ -805,6 +855,10 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("503 Service Unavailable")
         || message.contains("operation timed out")
         || message.contains("raft leader was not observable")
+}
+
+fn is_alias_conflict(error: &anyhow::Error) -> bool {
+    format!("{error:?}").contains("\"code\":\"ALIAS_CONFLICT\"")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
@@ -1099,5 +1153,12 @@ mod tests {
         let error = anyhow!("schema validation failed");
 
         assert!(!is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn alias_conflict_classifier_detects_committed_retry() {
+        let error = anyhow!(r#"HTTP 409: {{"code":"ALIAS_CONFLICT"}}"#);
+
+        assert!(is_alias_conflict(&error));
     }
 }
