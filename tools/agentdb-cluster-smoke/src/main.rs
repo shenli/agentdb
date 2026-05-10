@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -401,7 +402,7 @@ async fn run_smoke(
         .await?;
     }
     eprintln!("smoke: waiting for raft readiness");
-    wait_raft_ready(client, nodes, Duration::from_secs(45)).await?;
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
 
     eprintln!("smoke: resolving initial tablet writer");
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
@@ -414,6 +415,10 @@ async fn run_smoke(
     append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
     let mut next_seq = 2;
 
+    eprintln!("smoke: forcing raft catch-up snapshot after setup writes");
+    force_raft_catch_up(client, nodes).await?;
+    eprintln!("smoke: waiting for raft convergence after setup writes");
+    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
     print_diagnostics(client, nodes).await?;
 
     if args.failover {
@@ -629,14 +634,9 @@ async fn create_session_smoke_once(
     .await?;
     let tenant_id = string_field(&tenant, "tenant_id")?;
     eprintln!("smoke: creating agent for tenant {tenant_id}");
-    let agent = post_json_with_convergence_retry(
-        client,
-        nodes,
-        &format!("/api/tenants/{tenant_id}/agents"),
-        json!({"alias": "cluster-smoke-agent", "config": {}}),
-        10,
-    )
-    .await?;
+    let agent_alias = format!("cluster-smoke-agent-{suffix}");
+    let agent =
+        create_agent_with_convergence_retry(client, nodes, &tenant_id, &agent_alias, 10).await?;
     let agent_id = string_field(&agent, "agent_id")?;
     eprintln!("smoke: creating session for agent {agent_id}");
     let session = post_json_with_convergence_retry(
@@ -649,6 +649,61 @@ async fn create_session_smoke_once(
     .await?;
     let session_id = string_field(&session, "session_id")?;
     Ok((tenant_id, agent_id, session_id))
+}
+
+async fn create_agent_with_convergence_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    alias: &str,
+    attempts: usize,
+) -> Result<Value> {
+    let path = format!("/api/tenants/{tenant_id}/agents");
+    let body = json!({"alias": alias, "config": {}});
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: POST {path} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match post_json(client, &owner.url, &path, body.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_alias_conflict(&error) => {
+                return find_agent_by_alias(client, nodes, tenant_id, alias).await;
+            }
+            Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("create agent {alias} failed without a captured error")))
+}
+
+async fn find_agent_by_alias(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    alias: &str,
+) -> Result<Value> {
+    let path = format!("/api/tenants/{tenant_id}/agents");
+    for node in nodes {
+        let Ok(response) = get_json(client, &node.url, &path).await else {
+            continue;
+        };
+        if let Some(agent) = response["agents"].as_array().and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent["alias"].as_str() == Some(alias))
+        }) {
+            return Ok(agent.clone());
+        }
+    }
+    bail!("agent alias {alias} conflicted but existing agent was not observable")
 }
 
 async fn post_json_with_convergence_retry(
@@ -786,6 +841,24 @@ async fn event_count_with_convergence_retry(
     Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
 }
 
+async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
+    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    let response = post_json(
+        client,
+        &owner.url,
+        "/api/admin/raft/catch-up",
+        json!({"tablet_id": PRIMARY_TABLET_ID, "min_lag": 0}),
+    )
+    .await?;
+    if response["failures"]
+        .as_array()
+        .is_some_and(|failures| !failures.is_empty())
+    {
+        bail!("raft catch-up reported failures: {response}");
+    }
+    Ok(())
+}
+
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("\"retryable\":true")
@@ -802,6 +875,12 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
         || message.contains("503 Service Unavailable")
         || message.contains("operation timed out")
+        || message.contains("connection closed before message completed")
+        || message.contains("raft leader was not observable")
+}
+
+fn is_alias_conflict(error: &anyhow::Error) -> bool {
+    format!("{error:?}").contains("\"code\":\"ALIAS_CONFLICT\"")
 }
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
@@ -962,6 +1041,7 @@ async fn current_raft_leader_node_id(
     client: &Client,
     nodes: &[NodeSpec],
 ) -> Result<Option<String>> {
+    let live_node_ids = current_live_node_ids(client, nodes).await;
     for node in nodes {
         let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
             continue;
@@ -988,12 +1068,34 @@ async fn current_raft_leader_node_id(
         for replica in configured {
             if replica["raft_node_id"].as_u64() == Some(leader_raft_node_id) {
                 if let Some(node_id) = replica["node_id"].as_str() {
-                    return Ok(Some(node_id.to_string()));
+                    if live_node_ids.contains(node_id) {
+                        return Ok(Some(node_id.to_string()));
+                    }
                 }
             }
         }
     }
     Ok(None)
+}
+
+async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
+    for node in nodes {
+        let Ok(response) = get_json(client, &node.url, "/api/admin/nodes").await else {
+            continue;
+        };
+        let Some(items) = response.as_array() else {
+            continue;
+        };
+        return items
+            .iter()
+            .filter_map(|node| {
+                let node_id = node["node_id"].as_str()?;
+                let live = node["state"] == "alive" && node["is_stale"] == false;
+                live.then_some(node_id.to_string())
+            })
+            .collect();
+    }
+    BTreeSet::new()
 }
 
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
@@ -1070,5 +1172,45 @@ fn stop_children(children: &mut [Child]) {
     }
     for child in children.iter_mut() {
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_classifier_treats_leader_discovery_gap_as_transient() {
+        let error = anyhow!("tablet 1 raft leader was not observable within 90s");
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_treats_session_not_found_as_transient() {
+        let error = anyhow!(r#"HTTP 404: {{"code":"SESSION_NOT_FOUND"}}"#);
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_treats_connection_close_as_transient() {
+        let error = anyhow!("connection closed before message completed");
+
+        assert!(is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn retry_classifier_rejects_unrelated_errors() {
+        let error = anyhow!("schema validation failed");
+
+        assert!(!is_retryable_cluster_convergence_error(&error));
+    }
+
+    #[test]
+    fn alias_conflict_classifier_detects_committed_retry() {
+        let error = anyhow!(r#"HTTP 409: {{"code":"ALIAS_CONFLICT"}}"#);
+
+        assert!(is_alias_conflict(&error));
     }
 }

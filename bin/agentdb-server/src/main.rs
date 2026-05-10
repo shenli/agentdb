@@ -5,6 +5,7 @@
 //! `--in-memory` to get the ephemeral backend (useful for smoke tests and
 //! local dev).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +50,11 @@ const DEFAULT_RAFT_SNAPSHOT_PRUNE_BATCH: i64 = 256;
 const DEFAULT_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY: usize = 1024;
 
+type ContentBackendBundle = (
+    Arc<dyn agentdb_storage::ContentBackend>,
+    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "agentdb", version, about = "AgentDB runtime database")]
 struct Cli {
@@ -59,7 +65,7 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
     /// Start the HTTP server with the runtime router.
-    Serve(ServeOpts),
+    Serve(Box<ServeOpts>),
     /// Start a batteries-included local developer server.
     Dev(DevOpts),
     /// Check local single-node configuration and data directories.
@@ -251,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Cli::parse();
     match args.cmd {
-        Cmd::Serve(opts) => serve(opts).await,
+        Cmd::Serve(opts) => serve(*opts).await,
         Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
@@ -410,20 +416,23 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             config.route_refresh_interval_ms,
         );
         let node_address = format!("http://{}", config.bind);
+        let cluster_worker_config = ClusterWorkerConfig::from_env();
         spawn_cluster_workers(
-            startup.meta.clone(),
-            startup.node_id.clone(),
-            runtime.clone(),
-            config
-                .internal_auth_token
-                .clone()
-                .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
-            raft_registry.clone(),
-            node_address,
-            config.route_region.clone(),
-            startup.scheduler_status.clone(),
-            state.drain.clone(),
-            ClusterWorkerConfig::from_env(),
+            ClusterWorkerDeps {
+                meta: startup.meta.clone(),
+                node_id: startup.node_id.clone(),
+                runtime: runtime.clone(),
+                movement_snapshot_client: config
+                    .internal_auth_token
+                    .clone()
+                    .map(agentdb_api::internal_raft_http::RaftRsHttpClient::new),
+                raft_registry: raft_registry.clone(),
+                node_address,
+                region: config.route_region.clone(),
+                scheduler_status: startup.scheduler_status.clone(),
+                drain: state.drain.clone(),
+            },
+            cluster_worker_config,
         );
         if let Some(bootstrap) = startup.raft_bootstrap {
             if !bootstrap.tablet_ids.is_empty() {
@@ -479,6 +488,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         registry.clone(),
                         local_raft_node_id,
                         Duration::from_millis(raft_tick_interval_ms),
+                        cluster_worker_config.stale_node_threshold_ms,
                     );
                     let raft_owner_campaign_interval_ms = env_u64(
                         "AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS",
@@ -521,16 +531,16 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         DEFAULT_RAFT_SNAPSHOT_RETENTION_MS,
                     )
                     .max(0);
-                    spawn_raft_rs_snapshot_worker(
-                        startup.meta.clone(),
-                        registry.clone(),
-                        runtime.clone(),
+                    spawn_raft_rs_snapshot_worker(RaftRsSnapshotWorker {
+                        meta: startup.meta.clone(),
+                        registry: registry.clone(),
+                        runtime: runtime.clone(),
                         outbox,
-                        Duration::from_millis(raft_snapshot_interval_ms),
-                        raft_snapshot_min_lag,
-                        raft_snapshot_retention_ms,
-                        raft_snapshot_store.clone(),
-                    );
+                        interval: Duration::from_millis(raft_snapshot_interval_ms),
+                        min_lag: raft_snapshot_min_lag,
+                        retention_ms: raft_snapshot_retention_ms,
+                        snapshot_store: raft_snapshot_store.clone(),
+                    });
                     if let Some(snapshot_store) = raft_snapshot_store {
                         let restore_interval_ms = env_u64(
                             "AGENTDB_RAFT_SNAPSHOT_RESTORE_INTERVAL_MS",
@@ -1331,12 +1341,7 @@ impl RaftSnapshotObjectStore {
     }
 }
 
-fn build_content_backend(
-    config: &ResolvedServeConfig,
-) -> anyhow::Result<(
-    Arc<dyn agentdb_storage::ContentBackend>,
-    Option<Arc<agentdb_storage::AsyncMirrorContentBackend>>,
-)> {
+fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<ContentBackendBundle> {
     match config.content_backend {
         ContentBackendKind::LocalFs => {
             let content_dir = config.content_dir.clone();
@@ -2095,16 +2100,15 @@ async fn sync_raft_rs_registry_and_runtime(
     }
     let expected: BTreeSet<_> = bootstrap.tablet_ids.iter().copied().collect();
     for tablet_id in runtime.registered_tablet_ids() {
-        if !expected.contains(&tablet_id) {
-            if runtime
+        if !expected.contains(&tablet_id)
+            && runtime
                 .unregister_replicated_tablet(tablet_id)
                 .map_err(|error| anyhow::anyhow!(error.message))?
-            {
-                tracing::info!(
-                    tablet_id,
-                    "unregistered runtime raft tablet after metadata sync"
-                );
-            }
+        {
+            tracing::info!(
+                tablet_id,
+                "unregistered runtime raft tablet after metadata sync"
+            );
         }
     }
     Ok(bootstrap)
@@ -2207,6 +2211,7 @@ fn spawn_raft_rs_tick_worker(
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     local_raft_node_id: u64,
     interval: Duration,
+    stale_node_threshold_ms: i64,
 ) {
     let interval = interval.max(Duration::from_millis(50));
     tokio::spawn(async move {
@@ -2241,7 +2246,7 @@ fn spawn_raft_rs_tick_worker(
                     BTreeMap::new()
                 }
             };
-            let raft_node_to_node_id =
+            let raft_replicas_by_id =
                 match agentdb_meta::tablet_replicas::list_all(meta.pool()).await {
                     Ok(replicas) => replicas
                         .into_iter()
@@ -2249,7 +2254,10 @@ fn spawn_raft_rs_tick_worker(
                             agentdb_storage::stable_raft_node_id(&replica.node_id)
                                 .ok()
                                 .map(|raft_node_id| {
-                                    ((replica.tablet_id, raft_node_id), replica.node_id)
+                                    (
+                                        (replica.tablet_id, raft_node_id),
+                                        (replica.node_id, replica.applied_index),
+                                    )
                                 })
                         })
                         .collect::<BTreeMap<_, _>>(),
@@ -2262,6 +2270,7 @@ fn spawn_raft_rs_tick_worker(
                         BTreeMap::new()
                     }
                 };
+            let now_ms = now_ms_i64();
             for (tablet_id, group) in registry.groups_snapshot() {
                 let statuses = group.status();
                 let local_status = statuses
@@ -2274,21 +2283,30 @@ fn spawn_raft_rs_tick_worker(
                     .get(&tablet_id)
                     .and_then(|tablet| tablet.owner_node_id.as_deref());
                 let local_is_owner = owner_node_id == Some(local_node_id.as_str());
-                let owner_unavailable = owner_node_id.is_none_or(|owner| {
-                    nodes_by_id
-                        .get(owner)
-                        .is_none_or(|node| node.state.as_str() != "alive")
+                let owner_unavailable = owner_node_id.map_or(true, |owner| {
+                    cluster_node_unavailable(
+                        nodes_by_id.get(owner),
+                        now_ms,
+                        stale_node_threshold_ms,
+                    )
                 });
                 let raft_leader_unavailable = local_status
                     .filter(|status| status.leader_id != 0)
-                    .and_then(|status| raft_node_to_node_id.get(&(tablet_id, status.leader_id)))
-                    .is_some_and(|leader_node_id| {
-                        nodes_by_id
-                            .get(leader_node_id)
-                            .is_none_or(|node| node.state.as_str() != "alive")
+                    .and_then(|status| raft_replicas_by_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|(leader_node_id, _)| {
+                        cluster_node_unavailable(
+                            nodes_by_id.get(leader_node_id),
+                            now_ms,
+                            stale_node_threshold_ms,
+                        )
                     });
+                let raft_leader_missing = local_raft_leader_missing(local_status);
                 if !local_is_owner && !local_is_leader {
-                    if owner_unavailable || raft_leader_unavailable {
+                    if should_attempt_raft_failover_tick(
+                        owner_unavailable,
+                        raft_leader_unavailable,
+                        raft_leader_missing,
+                    ) {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
                             tracing::warn!(
                                 tablet_id,
@@ -2298,24 +2316,38 @@ fn spawn_raft_rs_tick_worker(
                                 "failed to expire local raft-rs leader lease"
                             );
                         }
-                        let failover_candidate = raft_node_to_node_id
+                        let failover_candidate = raft_replicas_by_id
                             .iter()
-                            .filter_map(|((replica_tablet_id, raft_node_id), node_id)| {
-                                (*replica_tablet_id == tablet_id
-                                    && nodes_by_id
-                                        .get(node_id)
-                                        .is_some_and(|node| node.state.as_str() == "alive"))
-                                .then_some(*raft_node_id)
+                            .filter_map(
+                                |((replica_tablet_id, raft_node_id), (node_id, applied_index))| {
+                                    (*replica_tablet_id == tablet_id
+                                        && cluster_node_available(
+                                            nodes_by_id.get(node_id),
+                                            now_ms,
+                                            stale_node_threshold_ms,
+                                        ))
+                                    .then_some((*raft_node_id, *applied_index))
+                                },
+                            )
+                            .max_by_key(|(raft_node_id, applied_index)| {
+                                (*applied_index, Reverse(*raft_node_id))
                             })
-                            .min();
+                            .map(|(raft_node_id, _)| raft_node_id);
                         if failover_candidate == Some(local_raft_node_id) {
-                            if let Err(error) = group.tick(local_raft_node_id) {
+                            let result = if raft_leader_missing {
+                                group
+                                    .campaign(local_raft_node_id)
+                                    .and_then(|()| group.tick(local_raft_node_id))
+                            } else {
+                                group.tick(local_raft_node_id)
+                            };
+                            if let Err(error) = result {
                                 tracing::warn!(
                                     tablet_id,
                                     local_node_id,
                                     local_raft_node_id,
                                     ?error,
-                                    "failed to tick local raft-rs group after owner became unavailable"
+                                    "failed to recover local raft-rs group after owner or leader became unavailable"
                                 );
                             }
                         }
@@ -2334,6 +2366,39 @@ fn spawn_raft_rs_tick_worker(
             }
         }
     });
+}
+
+fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplicaStatus>) -> bool {
+    local_status.is_some_and(|status| status.leader_id == 0 && status.role.as_str() != "Leader")
+}
+
+fn should_attempt_raft_failover_tick(
+    _owner_unavailable: bool,
+    raft_leader_unavailable: bool,
+    raft_leader_missing: bool,
+) -> bool {
+    raft_leader_unavailable || raft_leader_missing
+}
+
+fn cluster_node_available(
+    node: Option<&agentdb_meta::nodes::Node>,
+    now_ms: i64,
+    stale_node_threshold_ms: i64,
+) -> bool {
+    !cluster_node_unavailable(node, now_ms, stale_node_threshold_ms)
+}
+
+fn cluster_node_unavailable(
+    node: Option<&agentdb_meta::nodes::Node>,
+    now_ms: i64,
+    stale_node_threshold_ms: i64,
+) -> bool {
+    let stale_deadline_ms = now_ms.saturating_sub(stale_node_threshold_ms);
+    node.map_or(true, |node| {
+        node.state.as_str() != "alive"
+            || (node.last_heartbeat_ms <= stale_deadline_ms
+                && node.joined_at_ms <= stale_deadline_ms)
+    })
 }
 
 fn spawn_raft_rs_owner_campaign_worker(
@@ -2546,7 +2611,7 @@ async fn flush_raft_rs_group_messages_with_health(
     Ok(sent)
 }
 
-fn spawn_raft_rs_snapshot_worker(
+struct RaftRsSnapshotWorker {
     meta: agentdb_meta::MetaStore,
     registry: Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>,
     runtime: Arc<agentdb_core::Runtime>,
@@ -2555,7 +2620,19 @@ fn spawn_raft_rs_snapshot_worker(
     min_lag: u64,
     retention_ms: i64,
     snapshot_store: Option<Arc<RaftSnapshotObjectStore>>,
-) {
+}
+
+fn spawn_raft_rs_snapshot_worker(worker: RaftRsSnapshotWorker) {
+    let RaftRsSnapshotWorker {
+        meta,
+        registry,
+        runtime,
+        outbox,
+        interval,
+        min_lag,
+        retention_ms,
+        snapshot_store,
+    } = worker;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         loop {
@@ -3068,7 +3145,7 @@ fn spawn_route_snapshot_refresher(
     });
 }
 
-fn spawn_cluster_workers(
+struct ClusterWorkerDeps {
     meta: agentdb_meta::MetaStore,
     node_id: String,
     runtime: Arc<agentdb_core::Runtime>,
@@ -3078,14 +3155,24 @@ fn spawn_cluster_workers(
     region: Option<String>,
     scheduler_status: agentdb_api::state::SchedulerStatus,
     drain: agentdb_api::state::DrainState,
-    config: ClusterWorkerConfig,
-) {
+}
+
+fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
+    let ClusterWorkerDeps {
+        meta,
+        node_id,
+        runtime,
+        movement_snapshot_client,
+        raft_registry,
+        node_address,
+        region,
+        scheduler_status,
+        drain,
+    } = deps;
     let heartbeat_meta = meta.clone();
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
-    let heartbeat_runtime = runtime.clone();
-    let heartbeat_scheduler_status = scheduler_status.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -3109,40 +3196,53 @@ fn spawn_cluster_workers(
             {
                 tracing::warn!(node_id = %heartbeat_node_id, error = %error, "node heartbeat failed");
             }
+        }
+    });
+
+    let maintenance_meta = meta.clone();
+    let maintenance_node_id = node_id.clone();
+    let maintenance_runtime = runtime.clone();
+    let maintenance_scheduler_status = scheduler_status.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
+        loop {
+            interval.tick().await;
+            let now_ms = now_ms_i64();
             match run_local_tablet_log_compaction_tick(
-                &heartbeat_runtime,
+                &maintenance_runtime,
                 config.tablet_log_compaction_min_debt_ops,
             ) {
                 Ok(compacted_count) if compacted_count > 0 => {
-                    heartbeat_scheduler_status
+                    maintenance_scheduler_status
                         .add_local_tablet_log_compactions(compacted_count as u64, now_ms);
                     tracing::debug!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         compacted_count,
                         "compacted local tablet logs from retained-log debt"
                     );
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    heartbeat_scheduler_status.add_local_tablet_log_compaction_failure();
+                    maintenance_scheduler_status.add_local_tablet_log_compaction_failure();
                     tracing::warn!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         error = %error,
                         "local tablet log compaction failed"
                     );
                 }
             }
             match run_local_tablet_stats_tick(
-                &heartbeat_meta,
-                &heartbeat_runtime,
-                &heartbeat_node_id,
+                &maintenance_meta,
+                &maintenance_runtime,
+                &maintenance_node_id,
                 now_ms,
             )
             .await
             {
                 Ok(published_count) if published_count > 0 => {
                     tracing::debug!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         published_count,
                         "published local tablet storage stats"
                     );
@@ -3150,7 +3250,7 @@ fn spawn_cluster_workers(
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
-                        node_id = %heartbeat_node_id,
+                        node_id = %maintenance_node_id,
                         error = %error,
                         "local tablet storage stats publication failed"
                     );
@@ -3552,11 +3652,8 @@ async fn reconcile_raft_leader_tablet_ownership(
 ) -> agentdb_meta::MetaResult<usize> {
     let mut aligned = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
-        let Some(leader_raft_node_id) = group
-            .status()
-            .into_iter()
-            .find_map(|status| (status.leader_id != 0).then_some(status.leader_id))
-        else {
+        let statuses = group.status();
+        let Some(leader_raft_node_id) = raft_leader_id_from_statuses(&statuses) else {
             continue;
         };
         let replicas =
@@ -6241,6 +6338,62 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_assigns_unowned_tablet_to_raft_leader_after_dead_owner_clear() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 1);
+    }
+
+    #[tokio::test]
     async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -7077,6 +7230,110 @@ region = "us-west-2"
         assert!(!status
             .iter()
             .any(|replica| replica.node_id == local_raft_node_id && replica.role == "Leader"));
+    }
+
+    #[test]
+    fn raft_failover_tick_runs_when_local_replica_has_no_observed_leader() {
+        let local_status = agentdb_storage::RaftRsReplicaStatus {
+            node_id: 11,
+            role: "Follower".to_string(),
+            leader_id: 0,
+            term: 42,
+            commit_index: 10,
+            applied_index: 10,
+            pending_conf_change: false,
+            outbound_message_count: 0,
+        };
+
+        assert!(local_raft_leader_missing(Some(&local_status)));
+        assert!(should_attempt_raft_failover_tick(false, false, true));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_when_healthy_leader_is_observed() {
+        let local_status = agentdb_storage::RaftRsReplicaStatus {
+            node_id: 11,
+            role: "Follower".to_string(),
+            leader_id: 22,
+            term: 42,
+            commit_index: 10,
+            applied_index: 10,
+            pending_conf_change: false,
+            outbound_message_count: 0,
+        };
+
+        assert!(!local_raft_leader_missing(Some(&local_status)));
+        assert!(!should_attempt_raft_failover_tick(false, false, false));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_when_only_control_plane_owner_is_missing() {
+        assert!(!should_attempt_raft_failover_tick(true, false, false));
+    }
+
+    #[test]
+    fn raft_failover_treats_stale_alive_node_as_unavailable() {
+        let stale = agentdb_meta::nodes::Node {
+            node_id: "node-c".to_string(),
+            address: "http://node-c".to_string(),
+            mongo_address: None,
+            state: "alive".to_string(),
+            last_heartbeat_ms: 1_000,
+            joined_at_ms: 0,
+            availability_zone: None,
+            region: None,
+        };
+        let fresh = agentdb_meta::nodes::Node {
+            last_heartbeat_ms: 9_500,
+            ..stale.clone()
+        };
+
+        assert!(cluster_node_unavailable(Some(&stale), 10_000, 5_000));
+        assert!(cluster_node_available(Some(&fresh), 10_000, 5_000));
+    }
+
+    #[test]
+    fn raft_failover_gives_recently_joined_nodes_startup_grace() {
+        let warming = agentdb_meta::nodes::Node {
+            node_id: "node-c".to_string(),
+            address: "http://node-c".to_string(),
+            mongo_address: None,
+            state: "alive".to_string(),
+            last_heartbeat_ms: 1_000,
+            joined_at_ms: 9_000,
+            availability_zone: None,
+            region: None,
+        };
+
+        assert!(cluster_node_available(Some(&warming), 10_000, 5_000));
+    }
+
+    #[test]
+    fn raft_leader_id_from_statuses_accepts_leader_role_without_leader_id() {
+        let statuses = vec![
+            agentdb_storage::RaftRsReplicaStatus {
+                node_id: 11,
+                role: "Leader".to_string(),
+                leader_id: 0,
+                term: 42,
+                commit_index: 10,
+                applied_index: 10,
+                pending_conf_change: false,
+                outbound_message_count: 0,
+            },
+            agentdb_storage::RaftRsReplicaStatus {
+                node_id: 22,
+                role: "Follower".to_string(),
+                leader_id: 11,
+                term: 42,
+                commit_index: 10,
+                applied_index: 10,
+                pending_conf_change: false,
+                outbound_message_count: 0,
+            },
+        ];
+
+        assert_eq!(raft_leader_id_from_statuses(&statuses), Some(11));
     }
 
     #[tokio::test]
