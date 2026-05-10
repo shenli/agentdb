@@ -65,6 +65,10 @@ impl KvStore for RocksKvStore {
         Ok(Box::new(results.into_iter()))
     }
 
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        collect_prefix_from(&self.db, prefix, start)
+    }
+
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
         let mut batch = WriteBatch::default();
         for op in ops {
@@ -131,6 +135,10 @@ impl<'a> KvSnapshot for RocksSnapshotHandle<'a> {
         }
         Ok(Box::new(out.into_iter()))
     }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        collect_snapshot_prefix_from(&self.snap, prefix, start)
+    }
 }
 
 /// Owned snapshot: holds `Arc<DB>` itself and stores a snapshot whose
@@ -192,6 +200,58 @@ impl KvSnapshot for OwnedRocksSnapshotHandle {
         }
         Ok(Box::new(out.into_iter()))
     }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        collect_snapshot_prefix_from(&self.snap, prefix, start)
+    }
+}
+
+fn collect_prefix_from(db: &DB, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+    let prefix_vec = prefix.to_vec();
+    let start_vec = start.to_vec();
+    let iter = db.iterator(IteratorMode::From(&start_vec, Direction::Forward));
+    let mut out: Vec<KvResult> = Vec::new();
+    for res in iter {
+        match res {
+            Ok((k, v)) => {
+                if !k.starts_with(&prefix_vec) {
+                    break;
+                }
+                out.push(Ok((k.to_vec(), v.to_vec())));
+            }
+            Err(e) => {
+                out.push(Err(Error::from(e)));
+                break;
+            }
+        }
+    }
+    Ok(Box::new(out.into_iter()))
+}
+
+fn collect_snapshot_prefix_from(
+    snap: &rocksdb::Snapshot<'_>,
+    prefix: &[u8],
+    start: &[u8],
+) -> Result<KvIter> {
+    let prefix_vec = prefix.to_vec();
+    let start_vec = start.to_vec();
+    let iter = snap.iterator(IteratorMode::From(&start_vec, Direction::Forward));
+    let mut out: Vec<KvResult> = Vec::new();
+    for res in iter {
+        match res {
+            Ok((k, v)) => {
+                if !k.starts_with(&prefix_vec) {
+                    break;
+                }
+                out.push(Ok((k.to_vec(), v.to_vec())));
+            }
+            Err(e) => {
+                out.push(Err(Error::from(e)));
+                break;
+            }
+        }
+    }
+    Ok(Box::new(out.into_iter()))
 }
 
 #[cfg(test)]
@@ -240,6 +300,33 @@ mod owned_snapshot_tests {
         assert_eq!(
             restored.get(b"beta").unwrap().as_deref(),
             Some(b"b-val".as_ref())
+        );
+    }
+
+    #[test]
+    fn scan_prefix_from_seeks_to_lower_bound_within_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = RocksKvStore::open(dir.path()).unwrap();
+        store.put(b"event/t/s/00000000000000000001", b"e1").unwrap();
+        store.put(b"event/t/s/00000000000000000002", b"e2").unwrap();
+        store.put(b"event/t/s/00000000000000000003", b"e3").unwrap();
+        store
+            .put(b"event/t/other/00000000000000000003", b"other")
+            .unwrap();
+
+        let rows = store
+            .scan_prefix_from(b"event/t/s/", b"event/t/s/00000000000000000002")
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let keys: Vec<Vec<u8>> = rows.into_iter().map(|(key, _)| key).collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                b"event/t/s/00000000000000000002".to_vec(),
+                b"event/t/s/00000000000000000003".to_vec(),
+            ]
         );
     }
 

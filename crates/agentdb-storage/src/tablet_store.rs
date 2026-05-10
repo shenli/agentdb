@@ -100,6 +100,21 @@ impl KvStore for TabletKvStore {
         Self::scan_prefix(self, prefix)
     }
 
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let scoped_prefix = self.key(prefix);
+        let scoped_start = self.key(start);
+        let tablet_prefix = self.prefix.clone();
+        let iter = self.kv.scan_prefix_from(&scoped_prefix, &scoped_start)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|(key, value)| {
+                let logical = key
+                    .strip_prefix(tablet_prefix.as_slice())
+                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
+                (logical, value)
+            })
+        })))
+    }
+
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
         Self::write_batch(self, ops)
     }
@@ -144,6 +159,21 @@ impl KvSnapshot for TabletKvSnapshot<'_> {
             })
         })))
     }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let scoped_prefix = scoped_key(&self.prefix, prefix);
+        let scoped_start = scoped_key(&self.prefix, start);
+        let tablet_prefix = self.prefix.clone();
+        let iter = self.inner.scan_prefix_from(&scoped_prefix, &scoped_start)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|(key, value)| {
+                let logical = key
+                    .strip_prefix(tablet_prefix.as_slice())
+                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
+                (logical, value)
+            })
+        })))
+    }
 }
 
 struct TabletKvOwnedSnapshot {
@@ -160,6 +190,21 @@ impl KvSnapshot for TabletKvOwnedSnapshot {
         let scoped_prefix = scoped_key(&self.prefix, prefix);
         let tablet_prefix = self.prefix.clone();
         let iter = self.inner.scan_prefix(&scoped_prefix)?;
+        Ok(Box::new(iter.map(move |item| {
+            item.map(|(key, value)| {
+                let logical = key
+                    .strip_prefix(tablet_prefix.as_slice())
+                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
+                (logical, value)
+            })
+        })))
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let scoped_prefix = scoped_key(&self.prefix, prefix);
+        let scoped_start = scoped_key(&self.prefix, start);
+        let tablet_prefix = self.prefix.clone();
+        let iter = self.inner.scan_prefix_from(&scoped_prefix, &scoped_start)?;
         Ok(Box::new(iter.map(move |item| {
             item.map(|(key, value)| {
                 let logical = key

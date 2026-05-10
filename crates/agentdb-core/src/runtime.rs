@@ -4505,18 +4505,25 @@ impl Runtime {
         }
         let appended = self.append(req).await?;
 
-        // KV-backed: scan the session's events from storage so we don't need to
-        // also keep an in-memory copy. `fetch_from_seq` now merges sealed
-        // cold segments with the warm head transparently, so use it as the
-        // canonical read path and then keep only the newest `last`.
-        let mut recent = self
-            .fetch_from_seq(FetchRequest {
+        // Fetch only the tail window needed for context. A full-session fetch
+        // makes append+fetch latency grow with session length and serializes
+        // far more storage work than the API requires.
+        let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
+        let from_seq = appended
+            .seq
+            .saturating_add(1)
+            .saturating_sub(last_seq_count);
+        let mut recent = if last == 0 {
+            Vec::new()
+        } else {
+            self.fetch_from_seq(FetchRequest {
                 tenant_id,
                 session_id,
-                from_seq: 0,
-                limit: usize::MAX,
+                from_seq,
+                limit: last,
             })
-            .await?;
+            .await?
+        };
         if recent.len() > last {
             let drop_n = recent.len() - last;
             recent.drain(0..drop_n);

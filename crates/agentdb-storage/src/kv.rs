@@ -20,6 +20,15 @@ pub type KvIter = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + Send>;
 pub trait KvSnapshot: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter>;
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let start = start.to_vec();
+        let iter = self.scan_prefix(prefix)?;
+        Ok(Box::new(iter.filter(move |item| {
+            item.as_ref()
+                .map(|(key, _)| key.as_slice() >= start.as_slice())
+                .unwrap_or(true)
+        })))
+    }
 }
 
 /// Minimum surface the rest of AgentDB depends on.
@@ -31,6 +40,15 @@ pub trait KvStore: Send + Sync {
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter>;
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let start = start.to_vec();
+        let iter = self.scan_prefix(prefix)?;
+        Ok(Box::new(iter.filter(move |item| {
+            item.as_ref()
+                .map(|(key, _)| key.as_slice() >= start.as_slice())
+                .unwrap_or(true)
+        })))
+    }
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()>;
     /// Snapshot borrows from the store, so callers keep the store alive
     /// (e.g. `Arc<dyn KvStore>`) for the snapshot's lifetime.
