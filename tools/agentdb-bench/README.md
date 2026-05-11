@@ -37,6 +37,10 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
 | `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s |
 | `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s |
+| `agentdb-defaultgroup-append-only-sweep` | `append-only` | 11442 ops/s | n/a | 27082 ops/s | 32484 ops/s | 34120 ops/s |
+| `agentdb-defaultgroup-append-fetch-hot-sweep` | `append-fetch-hot` | 10103 ops/s | n/a | 23740 ops/s | 28243 ops/s | 28286 ops/s |
+| `agentdb-defaultgroup-mixed-agent-loop-sweep` | `mixed-agent-loop` | 10878 ops/s | n/a | 19719 ops/s | 24491 ops/s | 24321 ops/s |
+| `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 
 The detailed reports are stored on `li-dev` under the run-specific `OUT`
@@ -45,14 +49,17 @@ directory, usually
 for larger local runs.
 
 The latest AgentDB MongoDB API mixed result includes the narrower
-`agentdbFetchRecent` command for tail reads. Native HTTP now also has
-env-gated append group commit (`AGENTDB_APPEND_GROUP_COMMIT_US=1`) that
-coalesces queued RocksDB append writes under contention while keeping
-read-after-write semantics. This improves append-heavy c=32 throughput to about
-28k ops/s on `li-dev`; the mixed c=32 run is still about 24k ops/s, so the next
-performance work is HTTP JSON/serde/allocation cost, non-append write paths, and
-runtime/tablet
-concurrency, not only MongoDB wire-protocol tuning.
+`agentdbFetchRecent` command for tail reads. Native HTTP now also uses adaptive
+append group commit by default; set `AGENTDB_APPEND_GROUP_COMMIT=0` to disable
+it. The group writer coalesces queued RocksDB append writes under contention
+while keeping read-after-write semantics. This improves append-heavy c=32
+throughput to about 28k ops/s on `li-dev`; the mixed c=32 run is still about
+24k ops/s, so the next performance work is HTTP JSON/serde/allocation cost,
+non-append write paths, and runtime/tablet concurrency, not only MongoDB
+wire-protocol tuning.
+
+Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
+the tail-read/context serialization included in `append-fetch-hot`.
 
 Run the normalized Postgres event-log baseline:
 

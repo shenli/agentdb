@@ -154,6 +154,7 @@ enum ArtifactMode {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum Workload {
+    AppendOnly,
     AppendFetchHot,
     LongContextResume,
     ForkBranch,
@@ -1238,6 +1239,23 @@ async fn run_one_operation(
             .await;
     }
     match operation {
+        Operation::AppendOnly => append_event(
+            client,
+            &args.base_url,
+            &fixture.tenant_id,
+            &fixture.agent_id,
+            &fixture.session_id,
+            "message",
+            json!({
+                "role": "assistant",
+                "content": deterministic_string(128, rng),
+                "bench_op": "append_only"
+            }),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map(|_| ()),
         Operation::AppendFetch => {
             append_and_fetch(
                 client,
@@ -1320,6 +1338,7 @@ struct FlatSession {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Operation {
+    AppendOnly,
     AppendFetch,
     FetchRecent,
     RecordWrite,
@@ -1331,6 +1350,7 @@ enum Operation {
 impl Operation {
     fn as_str(self) -> &'static str {
         match self {
+            Operation::AppendOnly => "append_only",
             Operation::AppendFetch => "append_fetch",
             Operation::FetchRecent => "fetch_recent",
             Operation::RecordWrite => "record_write",
@@ -1384,6 +1404,7 @@ impl DatasetConfig {
 
 fn choose_operation(workload: Workload, rng: &mut StdRng) -> Operation {
     match workload {
+        Workload::AppendOnly => Operation::AppendOnly,
         Workload::AppendFetchHot => Operation::AppendFetch,
         Workload::LongContextResume => Operation::FetchRecent,
         Workload::ForkBranch => Operation::Fork,
@@ -1707,6 +1728,21 @@ async fn run_one_postgres_operation(
     operation: Operation,
 ) -> Result<()> {
     match operation {
+        Operation::AppendOnly => pg_append_event(
+            pool,
+            &args.run_id,
+            &fixture.tenant_id,
+            &fixture.agent_id,
+            &fixture.session_id,
+            "message",
+            &json!({
+                "role": "assistant",
+                "content": deterministic_string(128, rng),
+                "bench_op": "append_only"
+            }),
+        )
+        .await
+        .map(|_| ()),
         Operation::AppendFetch => {
             pg_append_fetch(
                 pool,
@@ -2621,6 +2657,21 @@ async fn run_one_mongodb_operation(
     operation: Operation,
 ) -> Result<()> {
     match operation {
+        Operation::AppendOnly => mongo_append_event(
+            db,
+            &args.run_id,
+            &fixture.tenant_id,
+            &fixture.agent_id,
+            &fixture.session_id,
+            "message",
+            &json!({
+                "role": "assistant",
+                "content": deterministic_string(128, rng),
+                "bench_op": "append_only"
+            }),
+        )
+        .await
+        .map(|_| ()),
         Operation::AppendFetch => {
             mongo_append_fetch(
                 db,
@@ -2847,6 +2898,19 @@ async fn run_one_agentdb_mongodb_operation(
 ) -> Result<()> {
     let db = mongo.database(&fixture.tenant_id);
     match operation {
+        Operation::AppendOnly => {
+            agentdb_mongo_insert_event(
+                &db,
+                &fixture.session_id,
+                "message",
+                &json!({
+                    "role": "assistant",
+                    "content": deterministic_string(128, rng),
+                    "bench_op": "append_only",
+                }),
+            )
+            .await
+        }
         Operation::AppendFetch => {
             db.run_command(
                 doc! {

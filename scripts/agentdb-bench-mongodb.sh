@@ -16,8 +16,11 @@ MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:${MONGO_PORT}}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/mongodb"
+MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
 
 export MONGO_PORT
+export MONGO_DATA_DIR
+mkdir -p "${MONGO_DATA_DIR}"
 docker compose -f "${COMPOSE_DIR}/docker-compose.yml" up -d
 
 for _ in $(seq 1 100); do

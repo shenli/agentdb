@@ -32,6 +32,10 @@ duration.
 | `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-single-mixed-v2/runs/agentdb-mongodb-api-single-mixed-v2/report.md` |
 | `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-append-sweep/runs/agentdb-adaptive-group-append-sweep/report.md` |
 | `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-mixed/runs/agentdb-adaptive-group-mixed/report.md` |
+| `agentdb-defaultgroup-append-only-sweep` | `append-only` | 11442 ops/s | n/a | 27082 ops/s | 32484 ops/s | 34120 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-append-only-sweep/runs/agentdb-defaultgroup-append-only-sweep/report.md` |
+| `agentdb-defaultgroup-append-fetch-hot-sweep` | `append-fetch-hot` | 10103 ops/s | n/a | 23740 ops/s | 28243 ops/s | 28286 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-append-fetch-hot-sweep/runs/agentdb-defaultgroup-append-fetch-hot-sweep/report.md` |
+| `agentdb-defaultgroup-mixed-agent-loop-sweep` | `mixed-agent-loop` | 10878 ops/s | n/a | 19719 ops/s | 24491 ops/s | 24321 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-mixed-agent-loop-sweep/runs/agentdb-defaultgroup-mixed-agent-loop-sweep/report.md` |
+| `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-append-only-fixed/runs/mongodb-append-only-fixed/report.md` |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
@@ -58,13 +62,13 @@ preserving read-after-write semantics: each caller still awaits the RocksDB
 batch that contains its append before returning. A fixed wait window improved
 high-concurrency throughput but hurt c=1 badly, so the implementation uses an
 adaptive fast path: direct write when there is no queue/active writer, queued
-group write when contention exists. With this enabled via
-`AGENTDB_APPEND_GROUP_COMMIT_US=1`, append-fetch c=32 reaches roughly 28.0k
-ops/s and mixed c=16 reaches roughly 25.5k ops/s. Mixed c=32 is still around
-24.2k ops/s versus MongoDB's earlier 25.6k ops/s, so AgentDB is not yet 2x
-faster on this synthetic mixed workload. The next bottleneck is broader HTTP
-JSON/serde/allocation cost and non-append write paths, not just RocksDB append
-write amplification.
+group write when contention exists. Adaptive grouping is enabled by default and
+can be disabled with `AGENTDB_APPEND_GROUP_COMMIT=0`. With grouping enabled,
+append-fetch c=32 reaches roughly 28.0k ops/s and mixed c=16 reaches roughly
+25.5k ops/s. Mixed c=32 is still around 24.2k ops/s versus MongoDB's earlier
+25.6k ops/s, so AgentDB is not yet 2x faster on this synthetic mixed workload.
+The next bottleneck is broader HTTP JSON/serde/allocation cost and non-append
+write paths, not just RocksDB append write amplification.
 
 ## Questions To Answer
 
@@ -228,6 +232,7 @@ history, records, and artifacts before a measured `run` phase.
 
 | Workload | Operation Shape | Why It Matters |
 |---|---|---|
+| `append_only` | Append a message/tool event and return only the append acknowledgement. | Isolates write sequencing, durability, and index-update cost from tail-read/context serialization. |
 | `append_fetch_hot` | Append a message/tool event, then fetch the latest N events from the same session. | Main agent runtime loop. Measures read-after-write in the same client/session. |
 | `long_context_resume` | Load sessions with 100, 1k, 10k, and 100k events, then fetch recent context and selected checkpoints. | Agents often resume long-running tasks. Full-history scans should not be required. |
 | `fork_branch` | Create branches from a parent session at a sequence number, append divergent events, then read parent and child context. | Agent planning, retries, and speculative execution need cheap branching. |
