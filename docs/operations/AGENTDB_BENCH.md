@@ -28,12 +28,21 @@ and 8s measured duration.
 |---|---|---:|---:|---:|---:|---:|---|
 | `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-append-lockfix/runs/agentdb-append-lockfix/report.md` |
 | `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mixed-lockfix/runs/agentdb-mixed-lockfix/report.md` |
+| `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-append/runs/agentdb-mongodb-api-append/report.md` |
+| `agentdb-mongodb-api-mixed` | `mixed-agent-loop` | 2917 ops/s | 1708 ops/s | 1606 ops/s | 1305 ops/s | 1312 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-mixed/runs/agentdb-mongodb-api-mixed/report.md` |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
 from roughly 3.4k ops/s to 14.0k ops/s, and `mixed-agent-loop` at c=32 moved
 from roughly 7.8k ops/s to 16.8k ops/s. These are not product claims yet:
 MongoDB/Postgres comparison runs, longer durations, and durable quorum profiles
 must be reported separately.
+
+The `agentdb-mongodb-api` profile shows that AgentDB's MongoDB-compatible
+listener can drive the hot append/fetch loop with similar order-of-magnitude
+throughput to native HTTP, but the current mixed workload is much slower through
+the wire subset. That mixed result should be treated as adapter work still
+needed, especially around context reads, record search, and fork paths, not as
+an AgentDB storage-engine limit.
 
 ## Questions To Answer
 

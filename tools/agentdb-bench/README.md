@@ -33,6 +33,8 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 |---|---|---:|---:|---:|---:|---:|
 | `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
 | `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+| `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s |
+| `agentdb-mongodb-api-mixed` | `mixed-agent-loop` | 2917 ops/s | 1708 ops/s | 1606 ops/s | 1305 ops/s | 1312 ops/s |
 
 The detailed reports are stored on `li-dev` under
 `/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
