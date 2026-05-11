@@ -200,6 +200,23 @@ update time. If RocksDB sync dominates, the likely fix is a more explicit
 durable log/group-commit design; if queue wait dominates, a single-writer
 per-session coalescing actor is the stronger candidate.
 
+Enable append-path profiling for AgentDB native or AgentDB MongoDB-API wrapper
+runs with:
+
+```bash
+APPEND_PATH_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
+```
+
+The server log then emits two low-overhead aggregate lines:
+
+| Log line | What it separates |
+|---|---|
+| `append path profile` | Runtime refresh, per-session commit-lock wait, initial state-lock wait/work, durable write, post-write state-lock wait/work, and total append latency. |
+| `adaptive write profile` | Direct versus grouped batches, requests/ops per batch, group-commit queue wait, and KV write time. |
+
+The profiling is off by default. Wrapper scripts set `RUST_LOG=info` only when
+`APPEND_PATH_PROFILE_MS` is present so normal benchmark logs stay compact.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent

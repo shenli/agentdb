@@ -61,6 +61,10 @@ case "${DURABILITY_PROFILE}" in
     exit 1
     ;;
 esac
+if [[ -n "${APPEND_PATH_PROFILE_MS:-}" ]]; then
+  agentdb_server_env+=(AGENTDB_APPEND_PATH_PROFILE_MS="${APPEND_PATH_PROFILE_MS}")
+  agentdb_server_env+=(RUST_LOG="${RUST_LOG:-info}")
+fi
 
 env "${agentdb_server_env[@]}" "${BIN_DIR}/agentdb" serve \
   --bind "${BIND}" \

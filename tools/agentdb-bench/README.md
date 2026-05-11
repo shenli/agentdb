@@ -84,6 +84,11 @@ sync writes while preserving safe append group commit. `strict-fsync` disables
 append group commit to expose per-operation fsync cost and should be treated as
 a stress profile, not the default comparison.
 
+Use `APPEND_PATH_PROFILE_MS=5000` with the AgentDB wrapper scripts to emit
+server-side append-stage profiles into the run log. This is the right first
+step before tuning durable writes because it separates session lock wait,
+state-lock work, group-commit queue wait, and RocksDB write time.
+
 Use `scripts/agentdb-bench-repeat.sh` to run clean per-seed repeats and produce
 an aggregate summary:
 

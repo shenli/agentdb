@@ -53,6 +53,7 @@ use crate::tenant::Tenant;
 type SkillUniqueRecord = ((String, String, String), String);
 
 static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
+static ADAPTIVE_WRITE_PROFILE: OnceLock<Option<AdaptiveWriteProfile>> = OnceLock::new();
 
 struct AppendPersistProfile {
     interval_ms: u64,
@@ -159,7 +160,111 @@ struct AdaptiveWriteBatcher {
 
 struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
+    enqueued_at: Instant,
     done: tokio::sync::oneshot::Sender<KvResult<()>>,
+}
+
+struct AdaptiveWriteProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    direct_batches: AtomicU64,
+    grouped_batches: AtomicU64,
+    requests: AtomicU64,
+    ops: AtomicU64,
+    queue_nanos: AtomicU64,
+    write_nanos: AtomicU64,
+}
+
+impl AdaptiveWriteProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_APPEND_PATH_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(now_millis()),
+            direct_batches: AtomicU64::new(0),
+            grouped_batches: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            ops: AtomicU64::new(0),
+            queue_nanos: AtomicU64::new(0),
+            write_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn record_direct(&self, op_count: usize, write_nanos: u128) {
+        self.direct_batches.fetch_add(1, Ordering::Relaxed);
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.ops.fetch_add(op_count as u64, Ordering::Relaxed);
+        self.record_common(0, write_nanos);
+    }
+
+    fn record_grouped(
+        &self,
+        request_count: usize,
+        op_count: usize,
+        queue_nanos: u128,
+        write_nanos: u128,
+    ) {
+        self.grouped_batches.fetch_add(1, Ordering::Relaxed);
+        self.requests
+            .fetch_add(request_count as u64, Ordering::Relaxed);
+        self.ops.fetch_add(op_count as u64, Ordering::Relaxed);
+        self.record_common(queue_nanos, write_nanos);
+    }
+
+    fn record_common(&self, queue_nanos: u128, write_nanos: u128) {
+        self.queue_nanos.fetch_add(
+            queue_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.write_nanos.fetch_add(
+            write_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+
+        let now = now_millis();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let direct_batches = self.direct_batches.swap(0, Ordering::Relaxed);
+        let grouped_batches = self.grouped_batches.swap(0, Ordering::Relaxed);
+        let batches = direct_batches + grouped_batches;
+        if batches == 0 {
+            return;
+        }
+        let requests = self.requests.swap(0, Ordering::Relaxed);
+        let ops = self.ops.swap(0, Ordering::Relaxed);
+        let queue_nanos = self.queue_nanos.swap(0, Ordering::Relaxed);
+        let write_nanos = self.write_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            direct_batches,
+            grouped_batches,
+            requests,
+            ops,
+            avg_requests_per_batch = requests as f64 / batches as f64,
+            avg_ops_per_batch = ops as f64 / batches as f64,
+            avg_queue_us = queue_nanos as f64 / requests.max(1) as f64 / 1_000.0,
+            avg_write_us = write_nanos as f64 / batches as f64 / 1_000.0,
+            "adaptive write profile"
+        );
+    }
+}
+
+fn adaptive_write_profile() -> Option<&'static AdaptiveWriteProfile> {
+    ADAPTIVE_WRITE_PROFILE
+        .get_or_init(AdaptiveWriteProfile::from_env)
+        .as_ref()
 }
 
 impl AdaptiveWriteBatcher {
@@ -209,15 +314,25 @@ impl AdaptiveWriteBatcher {
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
+            let op_count = ops.len();
+            let write_started = Instant::now();
             let result = self.kv.write_batch(ops);
+            let write_nanos = write_started.elapsed().as_nanos();
             self.writer_busy.store(0, Ordering::Release);
+            if let Some(profile) = adaptive_write_profile() {
+                profile.record_direct(op_count, write_nanos);
+            }
             return result;
         }
 
         let (done, rx) = tokio::sync::oneshot::channel();
         self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
-            .send(AdaptiveWriteRequest { ops, done })
+            .send(AdaptiveWriteRequest {
+                ops,
+                enqueued_at: Instant::now(),
+                done,
+            })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
                 drop(request);
@@ -274,10 +389,7 @@ fn adaptive_write_loop(
 
         let mut ops = Vec::with_capacity(op_count);
         let mut completions = Vec::with_capacity(requests.len());
-        for request in requests {
-            ops.extend(request.ops);
-            completions.push(request.done);
-        }
+        let request_count = requests.len();
 
         while writer_busy
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -285,8 +397,22 @@ fn adaptive_write_loop(
         {
             thread::yield_now();
         }
+        let queue_nanos = requests
+            .iter()
+            .map(|request| request.enqueued_at.elapsed().as_nanos())
+            .sum::<u128>();
+        for request in requests {
+            ops.extend(request.ops);
+            completions.push(request.done);
+        }
+
+        let write_started = Instant::now();
         let result = kv.write_batch(ops);
+        let write_nanos = write_started.elapsed().as_nanos();
         writer_busy.store(0, Ordering::Release);
+        if let Some(profile) = adaptive_write_profile() {
+            profile.record_grouped(request_count, op_count, queue_nanos, write_nanos);
+        }
         for done in completions {
             let send_result = match &result {
                 Ok(()) => Ok(()),
