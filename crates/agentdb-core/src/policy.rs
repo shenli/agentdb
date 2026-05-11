@@ -144,7 +144,7 @@ impl Default for RuntimePolicy {
 
 impl RuntimePolicy {
     pub fn from_json(v: &serde_json::Value) -> Self {
-        if v.is_null() {
+        if v.is_null() || !has_policy_keys(v) {
             return Self::default();
         }
         let mut base = v
@@ -157,7 +157,7 @@ impl RuntimePolicy {
     }
 
     pub fn merge_override(mut self, override_json: &serde_json::Value) -> Self {
-        if override_json.is_null() {
+        if override_json.is_null() || !has_policy_keys(override_json) {
             return self;
         }
         let mut base = serde_json::to_value(&self).expect("policy serializes");
@@ -165,6 +165,18 @@ impl RuntimePolicy {
         self = serde_json::from_value(base).unwrap_or(self);
         self
     }
+}
+
+fn has_policy_keys(v: &serde_json::Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return true;
+    };
+    obj.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "tier" | "version" | "priority" | "quota" | "artifact_size" | "retention" | "lifecycle"
+        )
+    })
 }
 
 fn tier_template(name: &str) -> RuntimePolicy {

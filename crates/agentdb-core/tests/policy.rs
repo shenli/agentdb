@@ -189,6 +189,22 @@ fn policy_defaults_and_priority_parse() {
 }
 
 #[test]
+fn policy_ignores_metadata_only_objects() {
+    let default_policy = RuntimePolicy::default();
+    let metadata_only = serde_json::json!({
+        "bench_run_id": "run-1",
+        "labels": ["benchmark"],
+        "nested": {"not_policy": true}
+    });
+
+    assert_eq!(RuntimePolicy::from_json(&metadata_only), default_policy);
+    assert_eq!(
+        default_policy.clone().merge_override(&metadata_only),
+        default_policy
+    );
+}
+
+#[test]
 fn tier_template_resolves_and_allows_overrides() {
     let free = RuntimePolicy::from_json(&serde_json::json!({"tier": "free"}));
     assert_eq!(free.tier.as_deref(), Some("free"));

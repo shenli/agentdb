@@ -9,11 +9,10 @@
 //!
 //! ## Atomicity contract
 //!
-//! `append_batch` is the only multi-key write and uses `KvStore::write_batch`
-//! so the event row, the updated session row, and the idempotency record (if
-//! any) all become visible together. This preserves the Task 9 invariant —
-//! idempotency record is committed in the same atomic boundary as the event +
-//! session — across crashes.
+//! Multi-key writes use `KvStore::write_batch` so each logical mutation becomes
+//! visible atomically. Append commits bundle the event row, the updated session
+//! row, and the idempotency record (if any) in one atomic boundary across
+//! crashes.
 //!
 //! ## Hydration
 //!
@@ -26,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
@@ -151,19 +150,19 @@ fn write_ops_size(ops: &[WriteOp]) -> usize {
         .sum()
 }
 
-struct AppendWriteBatcher {
+struct AdaptiveWriteBatcher {
     kv: Arc<dyn KvStore + Send + Sync>,
-    tx: mpsc::Sender<AppendWriteRequest>,
+    tx: mpsc::Sender<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
 }
 
-struct AppendWriteRequest {
+struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
     done: tokio::sync::oneshot::Sender<KvResult<()>>,
 }
 
-impl AppendWriteBatcher {
+impl AdaptiveWriteBatcher {
     fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
         if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT")
             || env_zero("AGENTDB_APPEND_GROUP_COMMIT_US")
@@ -175,20 +174,25 @@ impl AppendWriteBatcher {
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(4096);
-        Some(Arc::new(Self::new(kv, max_ops)))
+        let wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(0);
+        Some(Arc::new(Self::new(kv, max_ops, wait_us)))
     }
 
-    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<AppendWriteRequest>();
+    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize, wait_us: u64) -> Self {
+        let (tx, rx) = mpsc::channel::<AdaptiveWriteRequest>();
         let queued = Arc::new(AtomicU64::new(0));
         let writer_busy = Arc::new(AtomicU64::new(0));
         let _ = thread::Builder::new()
-            .name("agentdb-append-group-commit".into())
+            .name("agentdb-adaptive-write".into())
             .spawn({
                 let kv = kv.clone();
                 let queued = queued.clone();
                 let writer_busy = writer_busy.clone();
-                move || append_group_commit_loop(kv, rx, queued, writer_busy, max_ops)
+                move || adaptive_write_loop(kv, rx, queued, writer_busy, max_ops, wait_us)
             });
         Self {
             kv,
@@ -213,14 +217,14 @@ impl AppendWriteBatcher {
         let (done, rx) = tokio::sync::oneshot::channel();
         self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
-            .send(AppendWriteRequest { ops, done })
+            .send(AdaptiveWriteRequest { ops, done })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
                 drop(request);
-                StorageError::Other("append group commit worker stopped".into())
+                StorageError::Other("adaptive write worker stopped".into())
             })?;
         rx.await
-            .map_err(|_| StorageError::Other("append group commit worker dropped result".into()))?
+            .map_err(|_| StorageError::Other("adaptive write worker dropped result".into()))?
     }
 }
 
@@ -240,17 +244,21 @@ fn env_zero(name: &str) -> bool {
         == Some(0)
 }
 
-fn append_group_commit_loop(
+fn adaptive_write_loop(
     kv: Arc<dyn KvStore + Send + Sync>,
-    rx: mpsc::Receiver<AppendWriteRequest>,
+    rx: mpsc::Receiver<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
     max_ops: usize,
+    wait_us: u64,
 ) {
     while let Ok(first) = rx.recv() {
         let mut requests = vec![first];
         queued.fetch_sub(1, Ordering::Relaxed);
         let mut op_count = requests[0].ops.len();
+        if wait_us > 0 && queued.load(Ordering::Relaxed) > 0 {
+            thread::sleep(Duration::from_micros(wait_us));
+        }
 
         while op_count < max_ops {
             match rx.try_recv() {
@@ -283,7 +291,7 @@ fn append_group_commit_loop(
             let send_result = match &result {
                 Ok(()) => Ok(()),
                 Err(err) => Err(StorageError::Other(format!(
-                    "append group commit write failed: {err}"
+                    "adaptive write batch failed: {err}"
                 ))),
             };
             let _ = done.send(send_result);
@@ -316,7 +324,7 @@ fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Opti
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
     metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
-    append_batcher: Option<Arc<AppendWriteBatcher>>,
+    adaptive_write_batcher: Option<Arc<AdaptiveWriteBatcher>>,
 }
 
 impl Persist {
@@ -324,11 +332,11 @@ impl Persist {
         kv: Arc<dyn KvStore + Send + Sync>,
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
     ) -> Self {
-        let append_batcher = AppendWriteBatcher::from_env(kv.clone());
+        let adaptive_write_batcher = AdaptiveWriteBatcher::from_env(kv.clone());
         Self {
             kv,
             metadata_crypto,
-            append_batcher,
+            adaptive_write_batcher,
         }
     }
 
@@ -487,12 +495,20 @@ impl Persist {
     /// has no V2.1 lookup API; it's populated so a future dedup pass lands
     /// without rewriting this code path.
     pub fn put_artifact(&self, a: &Artifact) -> KvResult<()> {
+        self.write_ops(self.put_artifact_ops(a)?)
+    }
+
+    pub async fn put_artifact_async(&self, a: &Artifact) -> KvResult<()> {
+        self.write_ops_async(self.put_artifact_ops(a)?).await
+    }
+
+    fn put_artifact_ops(&self, a: &Artifact) -> KvResult<Vec<WriteOp>> {
         let artifact_context = self.artifact_context(a);
         let artifact_value = self.encrypt_metadata(
             &artifact_context,
             &serde_json::to_vec(a).expect("artifact serializes"),
         )?;
-        let ops: Vec<WriteOp> = vec![
+        Ok(vec![
             WriteOp::Put {
                 key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
                 value: artifact_value,
@@ -501,8 +517,7 @@ impl Persist {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
                 value: a.artifact_id.as_str().as_bytes().to_vec(),
             },
-        ];
-        self.kv.write_batch(ops)
+        ])
     }
 
     pub fn delete_artifact(&self, a: &Artifact) -> KvResult<()> {
@@ -616,18 +631,18 @@ impl Persist {
     }
 
     /// Atomic multi-write for the append commit path. Bundles the event row,
-    /// the updated session row, the `event_by_id` secondary index row, and
-    /// (optionally) the idempotency record so that on crash recovery either
-    /// all of them are visible or none are.
+    /// the `event_by_id` secondary index row, the optional session checkpoint,
+    /// and (optionally) the idempotency record so that on crash recovery each
+    /// committed event is durable with its lookup/idempotency metadata.
     pub async fn append_batch_async(
         &self,
         event: &EventEnvelope,
-        session: &Session,
+        session: Option<&Session>,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
         let Some(profile) = append_persist_profile() else {
             let ops = self.append_batch_ops(event, session, idem)?;
-            if let Some(batcher) = &self.append_batcher {
+            if let Some(batcher) = &self.adaptive_write_batcher {
                 return batcher.submit(ops).await;
             }
             return self.write_ops(ops);
@@ -639,7 +654,7 @@ impl Persist {
         let op_count = ops.len();
         let bytes = write_ops_size(&ops);
         let write_started = Instant::now();
-        let result = if let Some(batcher) = &self.append_batcher {
+        let result = if let Some(batcher) = &self.adaptive_write_batcher {
             batcher.submit(ops).await
         } else {
             self.write_ops(ops)
@@ -652,7 +667,7 @@ impl Persist {
     pub(crate) fn append_batch_ops(
         &self,
         event: &EventEnvelope,
-        session: &Session,
+        session: Option<&Session>,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<Vec<WriteOp>> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(4);
@@ -670,11 +685,13 @@ impl Persist {
             key: ek.into_bytes(),
             value: event_value,
         });
-        let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
-        ops.push(WriteOp::Put {
-            key: sk.into_bytes(),
-            value: serde_json::to_vec(session).expect("session serializes"),
-        });
+        if let Some(session) = session {
+            let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
+            ops.push(WriteOp::Put {
+                key: sk.into_bytes(),
+                value: serde_json::to_vec(session).expect("session serializes"),
+            });
+        }
         // Secondary index: event_by_id -> {session_id, seq}. Lets a caller
         // look up an event by its event_id without scanning the session.
         let by_id = event_by_id_key(event.tenant_id.as_str(), event.event_id.as_str());
@@ -929,6 +946,15 @@ impl Persist {
         self.write_ops(self.put_record_with_commit_seq_ops(r, commit_seq)?)
     }
 
+    pub async fn put_record_with_commit_seq_async(
+        &self,
+        r: &SearchableRecord,
+        commit_seq: Option<u64>,
+    ) -> KvResult<()> {
+        self.write_ops_async(self.put_record_with_commit_seq_ops(r, commit_seq)?)
+            .await
+    }
+
     pub(crate) fn put_record_with_commit_seq_ops(
         &self,
         r: &SearchableRecord,
@@ -980,6 +1006,14 @@ impl Persist {
 
     pub(crate) fn write_ops(&self, ops: Vec<WriteOp>) -> KvResult<()> {
         self.kv.write_batch(ops)
+    }
+
+    pub(crate) async fn write_ops_async(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        }
     }
 
     pub fn delete_record(&self, r: &SearchableRecord) -> KvResult<()> {
