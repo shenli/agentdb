@@ -18,8 +18,8 @@ git SHA, and database versions used for the run.
 ## Latest `li-dev` Results
 
 These are the current single-node local RocksDB results from `li-dev` after the
-append-path lock narrowing change in this PR. They use release binaries,
-local RocksDB metadata/index storage, local filesystem content storage,
+append-path lock narrowing and MongoDB-API recent-fetch changes in this PR. They
+use release binaries, local RocksDB metadata/index storage, local filesystem content storage,
 `PROFILE=default-agent-runtime`, 1 tenant, 1 agent, 320 sessions, 8 seeded
 events per session, 1 seeded record per session, `FETCH_LAST_N=8`, 3s warmup,
 and 8s measured duration.
@@ -27,9 +27,10 @@ and 8s measured duration.
 | Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 | Report |
 |---|---|---:|---:|---:|---:|---:|---|
 | `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-append-lockfix/runs/agentdb-append-lockfix/report.md` |
-| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mixed-lockfix/runs/agentdb-mixed-lockfix/report.md` |
+| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-native-single-mixed-v2/runs/agentdb-native-single-mixed-v2/report.md` |
 | `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-append/runs/agentdb-mongodb-api-append/report.md` |
-| `agentdb-mongodb-api-mixed` | `mixed-agent-loop` | 2917 ops/s | 1708 ops/s | 1606 ops/s | 1305 ops/s | 1312 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-mixed/runs/agentdb-mongodb-api-mixed/report.md` |
+| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-single-mixed-v2/runs/agentdb-mongodb-api-single-mixed-v2/report.md` |
+| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
 from roughly 3.4k ops/s to 14.0k ops/s, and `mixed-agent-loop` at c=32 moved
@@ -37,12 +38,22 @@ from roughly 7.8k ops/s to 16.8k ops/s. These are not product claims yet:
 MongoDB/Postgres comparison runs, longer durations, and durable quorum profiles
 must be reported separately.
 
-The `agentdb-mongodb-api` profile shows that AgentDB's MongoDB-compatible
-listener can drive the hot append/fetch loop with similar order-of-magnitude
-throughput to native HTTP, but the current mixed workload is much slower through
-the wire subset. That mixed result should be treated as adapter work still
-needed, especially around context reads, record search, and fork paths, not as
-an AgentDB storage-engine limit.
+The `agentdb-mongodb-api` profile now uses a narrower `agentdbFetchRecent`
+command instead of the heavier context-building command for the benchmark's
+tail-read operation. That raises the mixed workload from roughly 1.3k ops/s to
+roughly 12.5k ops/s at c=32, proving the original bad MongoDB-API result was
+partly adapter overhead.
+
+The remaining gap is not only the MongoDB wire layer. Native HTTP reaches
+roughly 17.4k ops/s at c=32 while the standalone MongoDB event-log baseline
+reaches roughly 25.6k ops/s on the same synthetic mixed workload. The likely
+AgentDB bottleneck for this local profile is the single runtime/server
+concurrency path: one in-process runtime state, session/event mutations that
+still coordinate through shared state, and one local RocksDB/log durability
+path. A quick local multi-tablet experiment did not improve this profile because
+the current runtime still rehydrates and indexes through a shared global state;
+it should become a separate cluster/tablet design task, not part of the current
+benchmark comparison PR.
 
 ## Questions To Answer
 
@@ -176,23 +187,26 @@ throughput at 16-32 workers in this synthetic local driver workload:
 | Run | Workload | c=1 | c=2 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `mongo-sweep-mixed` | `mixed-agent-loop` | 2971 ops/s | 1505 ops/s | 2658 ops/s | 7685 ops/s | 24874 ops/s | 25253 ops/s |
+| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | n/a | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 | `agentdb-sweep-mixed` | `mixed-agent-loop` | 5082 ops/s | 3812 ops/s | 6940 ops/s | 9538 ops/s | 7727 ops/s | 7805 ops/s |
 | `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | n/a | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | n/a | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s |
+| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | n/a | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
 
 Interpretation: the MongoDB c=16/c=32 result should not be summarized as an
 overall MongoDB-vs-AgentDB winner. It means the current standalone MongoDB
 event-log baseline, driven directly through the MongoDB driver, scales better
-than the current single-node/single-tablet AgentDB HTTP profile on this
-specific mixed workload at high client concurrency. AgentDB now also has an
-`agentdb-mongodb-api` profile through its own MongoDB-compatible listener, so
-future reports should show all three paths separately: AgentDB native HTTP,
-AgentDB MongoDB API, and real MongoDB event-log.
+than the current single-node/single-tablet AgentDB profile on this specific
+mixed workload at high client concurrency. The AgentDB MongoDB-compatible
+listener is no longer the primary explanation for the gap: native HTTP is also
+below MongoDB at c=16/c=32.
 
-The next AgentDB performance task should therefore be multi-tablet/cluster
-distribution and quorum durability profiling, not session-count tuning. For
-local comparison claims, report the single-tablet profile explicitly and add a
-separate multi-tablet/cluster profile once the runner can route a prepared
-dataset across tablets.
+The next AgentDB performance task should therefore be runtime concurrency and
+tablet/cluster distribution, not more protocol-layer tuning. For local
+comparison claims, report the single-tablet profile explicitly and add a
+separate multi-tablet/cluster profile once the runtime state model and runner
+can route a prepared dataset across tablets without rebuilding shared global
+state.
 
 ## Workloads
 

@@ -32,12 +32,19 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---:|---:|---:|---:|---:|
 | `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
-| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s |
 | `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s |
-| `agentdb-mongodb-api-mixed` | `mixed-agent-loop` | 2917 ops/s | 1708 ops/s | 1606 ops/s | 1305 ops/s | 1312 ops/s |
+| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
+| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 
 The detailed reports are stored on `li-dev` under
 `/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
+
+The latest AgentDB MongoDB API mixed result includes the narrower
+`agentdbFetchRecent` command for tail reads. That removes most of the previous
+adapter overhead, but the remaining high-concurrency gap versus MongoDB is still
+visible in native HTTP too; the next performance work is runtime/tablet
+concurrency, not only MongoDB wire-protocol tuning.
 
 Run the normalized Postgres event-log baseline:
 
