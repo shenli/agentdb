@@ -207,7 +207,8 @@ Results are on `li-dev` under
 
 | Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---|
-| AgentDB `single-node-fsync` | 256 | 858ms | 949ms | 1.00x | RocksDB sync writes plus safe append group commit. |
+| AgentDB `single-node-fsync`, initial | 256 | 858ms | 949ms | 0.29x MongoDB / 0.12x Postgres | RocksDB sync writes plus safe append group commit. |
+| AgentDB `single-node-fsync`, tuned | 648 | 122ms | 190ms | 0.73x MongoDB / 0.30x Postgres | Same-session coalescing plus fsync group-commit tuning. |
 | MongoDB `single-node-fsync` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
 | Postgres `single-node-fsync` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
 | AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
@@ -285,6 +286,13 @@ same-session `append_and_fetch` calls batched ahead of the durable write and a
 to p95 137ms / p99 217ms. This is a 2.4x AgentDB improvement for the matched
 `single-node-fsync` cell, but still below the prior MongoDB
 `single-node-fsync` sanity cell at 884 ops/s.
+
+The follow-up fsync group-commit tuning sends sync-write requests through the
+batch worker instead of letting the first writer bypass batching. With the
+default 1ms lower group-commit wait and 5ms same-session coalescing wait, the
+same 60s cell reached 648 ops/s with p95 122ms and p99 190ms. That improves
+tail latency, but still does not beat MongoDB or Postgres in the safe
+single-node fsync profile.
 
 The coalescing profile showed same-session batches around 1.4 events per batch
 and adaptive KV batches around 8 requests / 24 write ops per batch. The next

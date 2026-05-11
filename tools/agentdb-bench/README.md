@@ -58,18 +58,19 @@ The first matched `single-node-fsync` sanity run tells a different story:
 |---|---|---:|---:|---:|---|
 | Mixed loop, Zipf-1.2, `single-node-fsync` | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
 
-After same-session append coalescing, the AgentDB `single-node-fsync` cell improved
-to 622 ops/s with p95 137ms and p99 217ms on the same `li-dev` shape. That is
-a 2.4x AgentDB improvement over the first matched durable run, but it is still
-below the MongoDB `single-node-fsync` sanity cell.
+After same-session append coalescing and fsync group-commit tuning, the AgentDB
+`single-node-fsync` cell improved to 648 ops/s with p95 122ms and p99 190ms on
+the same `li-dev` shape. That is a 2.5x AgentDB improvement over the first
+matched durable run, but it is still below the MongoDB and Postgres
+`single-node-fsync` sanity cells.
 
 That `single-node-fsync` result uses RocksDB sync writes with safe append group
 commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is
 a single sanity cell, not a final comparison, but it shows the next performance
-work should instrument and optimize the durable append path before making any
-external performance claim. Publication-quality numbers still need repeated
-durable runs, working-set-exceeds-cache profiles, tenant-aware noisy-neighbor
-cells, and multi-minute runs across more workload shapes.
+work should optimize the durable append path before making any external
+performance claim. Publication-quality numbers still need repeated durable
+runs, working-set-exceeds-cache profiles, tenant-aware noisy-neighbor cells,
+and multi-minute runs across more workload shapes.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.
