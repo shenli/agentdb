@@ -200,6 +200,57 @@ update time. If RocksDB sync dominates, the likely fix is a more explicit
 durable log/group-commit design; if queue wait dominates, a single-writer
 per-session coalescing actor is the stronger candidate.
 
+Enable append-path profiling for AgentDB native or AgentDB MongoDB-API wrapper
+runs with:
+
+```bash
+APPEND_PATH_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
+```
+
+The server log then emits two low-overhead aggregate lines:
+
+| Log line | What it separates |
+|---|---|
+| `append path profile` | Runtime refresh, per-session commit-lock wait, initial state-lock wait/work, durable write, post-write state-lock wait/work, and total append latency. |
+| `adaptive write profile` | Direct versus grouped batches, requests/ops per batch, group-commit queue wait, and KV write time. |
+
+The profiling is off by default. Wrapper scripts set `RUST_LOG=info` only when
+`APPEND_PATH_PROFILE_MS` is present so normal benchmark logs stay compact.
+
+The first profiled durable-single Zipf c=32 run on `li-dev` used:
+
+```bash
+APPEND_PATH_PROFILE_MS=5000 \
+  DURABILITY_PROFILE=durable-single \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  CONCURRENCY=32 \
+  WARMUP=10s \
+  DURATION=60s \
+  scripts/agentdb-bench-local.sh
+```
+
+Run output:
+`/home/lishen/work/agentdb-bench-runs/append-path-profile/runs/agentdb-zipf-durable-profiled-r1-s43/report.md`.
+
+The throughput/latency cell was consistent with the prior durable-single run:
+255 ops/s, p95 860ms, p99 950ms. The profile attribution changed the diagnosis:
+
+| Stage | Representative measured-period average | Interpretation |
+|---|---:|---|
+| Per-session commit-lock wait | 170-210ms | Dominant cost under Zipf skew. Hot-session requests wait behind the previous same-session durable append. |
+| Durable write inside append path | 31-35ms | Large, but much smaller than same-session lock wait once the workload is hot. |
+| Adaptive write queue wait | 15-18ms | Batcher sees some cross-session grouping, but same-session requests cannot coalesce because the session lock is held through the durable write. |
+| Adaptive KV write | 16-18ms | RocksDB sync batch cost after grouping. |
+| Initial state work + update state work | Usually below 0.1ms combined | State mutation and read-side cache updates are not the bottleneck in this cell. |
+
+This points to same-session durable append serialization, not read caching or
+generic state-lock contention. The next optimization should let a per-session
+writer own sequencing and coalesce multiple same-session appends into one
+durable batch while preserving read-after-write semantics for each caller. A
+generic RocksDB tuning pass is lower priority unless a later profile shows KV
+write time dominating after same-session batching.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent

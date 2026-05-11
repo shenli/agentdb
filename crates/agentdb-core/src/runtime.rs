@@ -13,7 +13,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -57,8 +60,140 @@ use crate::tenant::{NewTenant, Tenant};
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
 const PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
 
+static APPEND_PATH_PROFILE: OnceLock<Option<AppendPathProfile>> = OnceLock::new();
+
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
+}
+
+#[derive(Default)]
+struct AppendPathSample {
+    refresh_nanos: u128,
+    session_lock_wait_nanos: u128,
+    initial_state_lock_wait_nanos: u128,
+    initial_state_work_nanos: u128,
+    durable_write_nanos: u128,
+    update_state_lock_wait_nanos: u128,
+    update_state_work_nanos: u128,
+    total_nanos: u128,
+}
+
+struct AppendPathProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    calls: AtomicU64,
+    refresh_nanos: AtomicU64,
+    session_lock_wait_nanos: AtomicU64,
+    initial_state_lock_wait_nanos: AtomicU64,
+    initial_state_work_nanos: AtomicU64,
+    durable_write_nanos: AtomicU64,
+    update_state_lock_wait_nanos: AtomicU64,
+    update_state_work_nanos: AtomicU64,
+    total_nanos: AtomicU64,
+}
+
+impl AppendPathProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_APPEND_PATH_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(crate::now_ms()),
+            calls: AtomicU64::new(0),
+            refresh_nanos: AtomicU64::new(0),
+            session_lock_wait_nanos: AtomicU64::new(0),
+            initial_state_lock_wait_nanos: AtomicU64::new(0),
+            initial_state_work_nanos: AtomicU64::new(0),
+            durable_write_nanos: AtomicU64::new(0),
+            update_state_lock_wait_nanos: AtomicU64::new(0),
+            update_state_work_nanos: AtomicU64::new(0),
+            total_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn record(&self, sample: AppendPathSample) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&self.refresh_nanos, sample.refresh_nanos);
+        add_nanos(
+            &self.session_lock_wait_nanos,
+            sample.session_lock_wait_nanos,
+        );
+        add_nanos(
+            &self.initial_state_lock_wait_nanos,
+            sample.initial_state_lock_wait_nanos,
+        );
+        add_nanos(
+            &self.initial_state_work_nanos,
+            sample.initial_state_work_nanos,
+        );
+        add_nanos(&self.durable_write_nanos, sample.durable_write_nanos);
+        add_nanos(
+            &self.update_state_lock_wait_nanos,
+            sample.update_state_lock_wait_nanos,
+        );
+        add_nanos(
+            &self.update_state_work_nanos,
+            sample.update_state_work_nanos,
+        );
+        add_nanos(&self.total_nanos, sample.total_nanos);
+
+        let now = crate::now_ms();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let calls = self.calls.swap(0, Ordering::Relaxed);
+        if calls == 0 {
+            return;
+        }
+        let refresh_nanos = self.refresh_nanos.swap(0, Ordering::Relaxed);
+        let session_lock_wait_nanos = self.session_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let initial_state_lock_wait_nanos = self
+            .initial_state_lock_wait_nanos
+            .swap(0, Ordering::Relaxed);
+        let initial_state_work_nanos = self.initial_state_work_nanos.swap(0, Ordering::Relaxed);
+        let durable_write_nanos = self.durable_write_nanos.swap(0, Ordering::Relaxed);
+        let update_state_lock_wait_nanos =
+            self.update_state_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let update_state_work_nanos = self.update_state_work_nanos.swap(0, Ordering::Relaxed);
+        let total_nanos = self.total_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            calls,
+            avg_refresh_us = avg_us(refresh_nanos, calls),
+            avg_session_lock_wait_us = avg_us(session_lock_wait_nanos, calls),
+            avg_initial_state_lock_wait_us = avg_us(initial_state_lock_wait_nanos, calls),
+            avg_initial_state_work_us = avg_us(initial_state_work_nanos, calls),
+            avg_durable_write_us = avg_us(durable_write_nanos, calls),
+            avg_update_state_lock_wait_us = avg_us(update_state_lock_wait_nanos, calls),
+            avg_update_state_work_us = avg_us(update_state_work_nanos, calls),
+            avg_total_us = avg_us(total_nanos, calls),
+            "append path profile"
+        );
+    }
+}
+
+fn append_path_profile() -> Option<&'static AppendPathProfile> {
+    APPEND_PATH_PROFILE
+        .get_or_init(AppendPathProfile::from_env)
+        .as_ref()
+}
+
+fn add_nanos(counter: &AtomicU64, nanos: u128) {
+    counter.fetch_add(nanos.min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+}
+
+fn avg_us(total_nanos: u64, calls: u64) -> f64 {
+    total_nanos as f64 / calls.max(1) as f64 / 1_000.0
 }
 
 #[derive(Debug, Clone)]
@@ -4380,7 +4515,15 @@ impl Runtime {
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
     ) -> Result<AppendCommitResponse> {
+        let path_profile = append_path_profile();
+        let total_started = path_profile.map(|_| Instant::now());
+        let mut path_sample = AppendPathSample::default();
+
+        let refresh_started = path_profile.map(|_| Instant::now());
         self.refresh_replicated_state().await?;
+        if let Some(started) = refresh_started {
+            path_sample.refresh_nanos = started.elapsed().as_nanos();
+        }
 
         // Compose the full idempotency scope key BEFORE locking state, so we can
         // short-circuit cheaply on retry.
@@ -4412,8 +4555,17 @@ impl Runtime {
             .unwrap_or(usize::MAX);
 
         let session_commit_lock = self.session_commit_lock(&req.session_id);
+        let session_lock_wait_started = path_profile.map(|_| Instant::now());
         let _session_commit_guard = session_commit_lock.lock().await;
+        if let Some(started) = session_lock_wait_started {
+            path_sample.session_lock_wait_nanos = started.elapsed().as_nanos();
+        }
+        let initial_state_lock_wait_started = path_profile.map(|_| Instant::now());
         let s = self.state.lock().await;
+        if let Some(started) = initial_state_lock_wait_started {
+            path_sample.initial_state_lock_wait_nanos = started.elapsed().as_nanos();
+        }
+        let initial_state_work_started = path_profile.map(|_| Instant::now());
 
         // Re-check under the state lock to close the concurrent-append race:
         // another task could have committed our key between the optimistic check
@@ -4665,6 +4817,9 @@ impl Runtime {
             created_at_ms: crate::now_ms(),
         });
 
+        if let Some(started) = initial_state_work_started {
+            path_sample.initial_state_work_nanos = started.elapsed().as_nanos();
+        }
         drop(s);
 
         // Atomic durable commit. The expensive storage call happens outside
@@ -4678,17 +4833,26 @@ impl Runtime {
                 .zip(idem_record.as_ref())
                 .map(|(k, r)| (k.as_str(), r));
             let session_checkpoint = persist_session_checkpoint.then_some(&session_snapshot);
+            let durable_write_started = path_profile.map(|_| Instant::now());
             if let Err(e) = p
                 .append_batch_async(&envelope, session_checkpoint, pair)
                 .await
             {
                 return Err(internal(e));
             }
+            if let Some(started) = durable_write_started {
+                path_sample.durable_write_nanos = started.elapsed().as_nanos();
+            }
         }
 
         let next_seq_after_append = session_snapshot.next_seq;
         let persist_enabled = self.persist.is_some();
+        let update_state_lock_wait_started = path_profile.map(|_| Instant::now());
         let mut s = self.state.lock().await;
+        if let Some(started) = update_state_lock_wait_started {
+            path_sample.update_state_lock_wait_nanos = started.elapsed().as_nanos();
+        }
+        let update_state_work_started = path_profile.map(|_| Instant::now());
         s.sessions
             .insert(req.session_id.as_str().to_string(), session_snapshot);
         // In-memory backend: keep the events map populated, and mirror the
@@ -4742,7 +4906,15 @@ impl Runtime {
         if let (Some(full), Some(rec)) = (idem_full_key, idem_record) {
             self.idem.put(full, rec);
         }
+        if let Some(started) = update_state_work_started {
+            path_sample.update_state_work_nanos = started.elapsed().as_nanos();
+        }
         drop(s);
+
+        if let (Some(profile), Some(started)) = (path_profile, total_started) {
+            path_sample.total_nanos = started.elapsed().as_nanos();
+            profile.record(path_sample);
+        }
 
         Ok(AppendCommitResponse {
             appended: resp,
