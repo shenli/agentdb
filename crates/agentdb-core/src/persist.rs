@@ -23,8 +23,10 @@
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
@@ -149,6 +151,97 @@ fn write_ops_size(ops: &[WriteOp]) -> usize {
         .sum()
 }
 
+struct AppendWriteBatcher {
+    tx: mpsc::Sender<AppendWriteRequest>,
+}
+
+struct AppendWriteRequest {
+    ops: Vec<WriteOp>,
+    done: tokio::sync::oneshot::Sender<KvResult<()>>,
+}
+
+impl AppendWriteBatcher {
+    fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
+        let delay_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1024);
+        Some(Arc::new(Self::new(
+            kv,
+            Duration::from_micros(delay_us),
+            max_ops,
+        )))
+    }
+
+    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_delay: Duration, max_ops: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<AppendWriteRequest>();
+        let _ = thread::Builder::new()
+            .name("agentdb-append-group-commit".into())
+            .spawn(move || append_group_commit_loop(kv, rx, max_delay, max_ops));
+        Self { tx }
+    }
+
+    async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(AppendWriteRequest { ops, done })
+            .map_err(|_| StorageError::Other("append group commit worker stopped".into()))?;
+        rx.await
+            .map_err(|_| StorageError::Other("append group commit worker dropped result".into()))?
+    }
+}
+
+fn append_group_commit_loop(
+    kv: Arc<dyn KvStore + Send + Sync>,
+    rx: mpsc::Receiver<AppendWriteRequest>,
+    max_delay: Duration,
+    max_ops: usize,
+) {
+    while let Ok(first) = rx.recv() {
+        let deadline = Instant::now() + max_delay;
+        let mut requests = vec![first];
+        let mut op_count = requests[0].ops.len();
+
+        while op_count < max_ops {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(timeout) {
+                Ok(request) => {
+                    op_count += request.ops.len();
+                    requests.push(request);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let mut ops = Vec::with_capacity(op_count);
+        let mut completions = Vec::with_capacity(requests.len());
+        for request in requests {
+            ops.extend(request.ops);
+            completions.push(request.done);
+        }
+
+        let result = kv.write_batch(ops);
+        for done in completions {
+            let send_result = match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(StorageError::Other(format!(
+                    "append group commit write failed: {err}"
+                ))),
+            };
+            let _ = done.send(send_result);
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecordIndexMutationOp {
@@ -174,6 +267,7 @@ fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Opti
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
     metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    append_batcher: Option<Arc<AppendWriteBatcher>>,
 }
 
 impl Persist {
@@ -181,9 +275,11 @@ impl Persist {
         kv: Arc<dyn KvStore + Send + Sync>,
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
     ) -> Self {
+        let append_batcher = AppendWriteBatcher::from_env(kv.clone());
         Self {
             kv,
             metadata_crypto,
+            append_batcher,
         }
     }
 
@@ -474,14 +570,18 @@ impl Persist {
     /// the updated session row, the `event_by_id` secondary index row, and
     /// (optionally) the idempotency record so that on crash recovery either
     /// all of them are visible or none are.
-    pub fn append_batch(
+    pub async fn append_batch_async(
         &self,
         event: &EventEnvelope,
         session: &Session,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
         let Some(profile) = append_persist_profile() else {
-            return self.write_ops(self.append_batch_ops(event, session, idem)?);
+            let ops = self.append_batch_ops(event, session, idem)?;
+            if let Some(batcher) = &self.append_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
         };
 
         let build_started = Instant::now();
@@ -490,7 +590,11 @@ impl Persist {
         let op_count = ops.len();
         let bytes = write_ops_size(&ops);
         let write_started = Instant::now();
-        let result = self.write_ops(ops);
+        let result = if let Some(batcher) = &self.append_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
         let write_nanos = write_started.elapsed().as_nanos();
         profile.record(op_count, bytes, build_nanos, write_nanos);
         result

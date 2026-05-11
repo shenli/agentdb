@@ -4615,7 +4615,10 @@ impl Runtime {
                 .as_ref()
                 .zip(idem_record.as_ref())
                 .map(|(k, r)| (k.as_str(), r));
-            if let Err(e) = p.append_batch(&envelope, &session_snapshot, pair) {
+            if let Err(e) = p
+                .append_batch_async(&envelope, &session_snapshot, pair)
+                .await
+            {
                 return Err(internal(e));
             }
         }
