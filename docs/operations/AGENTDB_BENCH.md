@@ -19,8 +19,9 @@ git SHA, and database versions used for the run.
 
 These are the current single-node local RocksDB results from `li-dev` after the
 append-path lock narrowing, MongoDB-API recent-fetch changes, append
-group-commit profiling/fixes, and metadata-only policy fast-pathing in this PR.
-They use release binaries, local
+group-commit profiling/fixes, metadata-only policy fast-pathing, local-route
+forwarding-body laziness, and local RocksDB default tuning. They use release
+binaries, local
 RocksDB metadata/index storage, local filesystem content storage, 1 tenant, 1
 agent, 16-320 sessions depending on the run, 3s warmup, and 8-10s measured
 duration depending on the sweep.
@@ -46,6 +47,9 @@ duration depending on the sweep.
 | `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-artifact-only-sweep/runs/agentdb-mixedpaths-artifact-only-sweep/report.md` |
 | `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-eventsource-session-mixed-sweep/runs/agentdb-final-eventsource-session-mixed-sweep/report.md` |
 | `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-policyfast-mixed-sweep/runs/agentdb-final-policyfast-mixed-sweep/report.md` |
+| `agentdb-rocks-defaults-append-sweep` | `append-only` | 14577 ops/s | n/a | 38514 ops/s | 44801 ops/s | 48985 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-append-sweep/runs/agentdb-rocks-defaults-append-sweep/report.md` |
+| `agentdb-rocks-defaults-appendfetch-sweep` | `append-fetch-hot` | 11836 ops/s | n/a | 33513 ops/s | 38569 ops/s | 41097 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-appendfetch-sweep/runs/agentdb-rocks-defaults-appendfetch-sweep/report.md` |
+| `agentdb-rocks-defaults-mixed-sweep` | `mixed-agent-loop` | 11819 ops/s | n/a | 40858 ops/s | 52422 ops/s | 55998 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-mixed-sweep/runs/agentdb-rocks-defaults-mixed-sweep/report.md` |
 | `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-append-only-fixed/runs/mongodb-append-only-fixed/report.md` |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
 | `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-final-mixed-current-shape/runs/mongodb-final-mixed-current-shape/report.md` |
@@ -82,10 +86,14 @@ resolution, returns append-and-fetch hot tails from the append commit path,
 reuses the committed state for route backpressure headers, and relies on the
 persisted event stream to recover warm-session `next_seq` instead of writing
 the full session row on every warm append. The latest run also skips full
-policy merge/deserialization for metadata-only tenant policy JSON. On `li-dev`,
-the final same-shape `mixed-agent-loop` c=32 result is 55.8k ops/s for AgentDB,
-26.2k ops/s for MongoDB, and 5.3k ops/s for Postgres. That is about 2.13x
-MongoDB and 10.47x Postgres for this synthetic mixed agent loop.
+policy merge/deserialization for metadata-only tenant policy JSON, avoids eager
+forwarding-body serialization for local session mutations, and opens RocksDB
+with larger local write buffers/background jobs. On `li-dev`, the latest
+same-shape `mixed-agent-loop` c=32 result is 56.0k ops/s for AgentDB, 26.2k
+ops/s for MongoDB, and 5.3k ops/s for Postgres. That is about 2.14x MongoDB and
+10.50x Postgres for this synthetic mixed agent loop. A compact `event_by_id`
+pointer encoding was tested in `agentdb-compact-eventptr-*` runs and rejected
+because it regressed mixed throughput.
 
 ## Questions To Answer
 
