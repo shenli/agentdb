@@ -4466,24 +4466,18 @@ async fn create_session(
     }
     let runtime = s.runtime.clone();
     let create_tid = tid.clone();
-    let local_tablet_key = preallocated_session_id.as_str().to_string();
-    let sess = with_route_or_local_tablet_context(
-        runtime.clone(),
-        &route_headers,
-        &local_tablet_key,
-        async move {
-            runtime
-                .create_session_with_id(
-                    NewSession {
-                        tenant_id: create_tid,
-                        agent_id: aid,
-                        alias: body.alias,
-                    },
-                    preallocated_session_id,
-                )
-                .await
-        },
-    )
+    let sess = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .create_session_with_id(
+                NewSession {
+                    tenant_id: create_tid,
+                    agent_id: aid,
+                    alias: body.alias,
+                },
+                preallocated_session_id,
+            )
+            .await
+    })
     .await?;
     record_session_locator(&s, &tid, &sess.session_id, &route_headers).await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
@@ -4775,26 +4769,20 @@ async fn append_event(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let local_tablet_key = sid.as_str().to_string();
-    let resp = with_route_or_local_tablet_context(
-        runtime.clone(),
-        &route_headers,
-        &local_tablet_key,
-        async move {
-            runtime
-                .append(AppendRequest {
-                    tenant_id: append_tid,
-                    agent_id: aid,
-                    session_id: append_sid,
-                    kind: body.kind,
-                    payload: body.payload,
-                    artifact_refs: body.artifact_refs,
-                    source_refs: body.source_refs,
-                    idempotency_key: idem_key,
-                })
-                .await
-        },
-    )
+    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append(AppendRequest {
+                tenant_id: append_tid,
+                agent_id: aid,
+                session_id: append_sid,
+                kind: body.kind,
+                payload: body.payload,
+                artifact_refs: body.artifact_refs,
+                source_refs: body.source_refs,
+                idempotency_key: idem_key,
+            })
+            .await
+    })
     .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
@@ -4850,30 +4838,24 @@ async fn append_and_fetch(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let local_tablet_key = sid.as_str().to_string();
-    let resp = with_route_or_local_tablet_context(
-        runtime.clone(),
-        &route_headers,
-        &local_tablet_key,
-        async move {
-            runtime
-                .append_and_fetch(
-                    AppendRequest {
-                        tenant_id: append_tid,
-                        agent_id: aid,
-                        session_id: append_sid,
-                        kind: body.kind,
-                        payload: body.payload,
-                        artifact_refs: body.artifact_refs,
-                        source_refs: body.source_refs,
-                        idempotency_key: idem_key,
-                    },
-                    body.last,
-                    body.max_bytes,
-                )
-                .await
-        },
-    )
+    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_and_fetch(
+                AppendRequest {
+                    tenant_id: append_tid,
+                    agent_id: aid,
+                    session_id: append_sid,
+                    kind: body.kind,
+                    payload: body.payload,
+                    artifact_refs: body.artifact_refs,
+                    source_refs: body.source_refs,
+                    idempotency_key: idem_key,
+                },
+                body.last,
+                body.max_bytes,
+            )
+            .await
+    })
     .await?;
     let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
@@ -4908,26 +4890,20 @@ async fn fetch_events(
             Err(response) => return Ok(response),
         };
     let runtime = s.runtime.clone();
-    let local_tablet_key = sid.as_str().to_string();
-    let events = with_route_or_local_tablet_context(
-        runtime.clone(),
-        &route_headers,
-        &local_tablet_key,
-        async move {
-            if q.latest {
-                runtime.fetch_recent(tid, sid, q.limit).await
-            } else {
-                runtime
-                    .fetch_from_seq(FetchRequest {
-                        tenant_id: tid,
-                        session_id: sid,
-                        from_seq: q.from_seq,
-                        limit: q.limit,
-                    })
-                    .await
-            }
-        },
-    )
+    let events = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        if q.latest {
+            runtime.fetch_recent(tid, sid, q.limit).await
+        } else {
+            runtime
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: tid,
+                    session_id: sid,
+                    from_seq: q.from_seq,
+                    limit: q.limit,
+                })
+                .await
+        }
+    })
     .await?;
     Ok(with_headers(Json(events).into_response(), route_headers))
 }
@@ -4963,22 +4939,16 @@ async fn fork_session(
     let runtime = s.runtime.clone();
     let fork_tid = tid.clone();
     let fork_sid = sid.clone();
-    let local_tablet_key = sid.as_str().to_string();
-    let child = with_route_or_local_tablet_context(
-        runtime.clone(),
-        &route_headers,
-        &local_tablet_key,
-        async move {
-            runtime
-                .fork_session(ForkSessionRequest {
-                    tenant_id: fork_tid,
-                    session_id: fork_sid,
-                    at_seq: body.at_seq,
-                    alias: body.alias,
-                })
-                .await
-        },
-    )
+    let child = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .fork_session(ForkSessionRequest {
+                tenant_id: fork_tid,
+                session_id: fork_sid,
+                at_seq: body.at_seq,
+                alias: body.alias,
+            })
+            .await
+    })
     .await?;
     record_session_locator(&s, &tid, &child.session_id, &route_headers).await?;
     Ok(with_headers(
@@ -5297,22 +5267,6 @@ where
         runtime.with_tablet_context(tablet_id, future).await
     } else {
         future.await
-    }
-}
-
-async fn with_route_or_local_tablet_context<F, T>(
-    runtime: Arc<agentdb_core::runtime::Runtime>,
-    headers: &HeaderMap,
-    key: &str,
-    future: F,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    if let Some(tablet_id) = route_tablet_id(headers) {
-        runtime.with_tablet_context(tablet_id, future).await
-    } else {
-        runtime.with_local_tablet_for_key(key, future).await
     }
 }
 

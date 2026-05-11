@@ -349,29 +349,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 content_mirror,
             )
         } else {
-            let local_runtime_tablets = env_u64("AGENTDB_LOCAL_RUNTIME_TABLETS", 1).clamp(1, 1024);
-            if local_runtime_tablets > 1 {
-                let logs: BTreeMap<i64, Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>> = (1
-                    ..=local_runtime_tablets)
-                    .map(|tablet_id| {
-                        (
-                            tablet_id as i64,
-                            Arc::new(agentdb_storage::SingleNodeReplicatedLog::new(kv.clone()))
-                                as Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>,
-                        )
-                    })
-                    .collect();
-                tracing::info!(
-                    tablet_count = local_runtime_tablets,
-                    "opened runtime with local single-node tablet logs"
-                );
-                (
-                    agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs),
-                    content_mirror,
-                )
-            } else {
-                (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
-            }
+            (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
         }
     };
 
