@@ -2869,11 +2869,9 @@ async fn run_one_agentdb_mongodb_operation(
         Operation::FetchRecent => {
             db.run_command(
                 doc! {
-                    "agentdbContext": "sessions",
+                    "agentdbFetchRecent": "events",
                     "session_id": &fixture.session_id,
-                    "include": ["events"],
-                    "max_events": args.fetch_last_n as i64,
-                    "max_bytes": 1_000_000_i64,
+                    "limit": args.fetch_last_n as i64,
                 },
                 None,
             )
