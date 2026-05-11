@@ -18,6 +18,19 @@ impl RocksKvStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        let parallelism = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4)
+            .min(i32::MAX as usize) as i32;
+        opts.increase_parallelism(parallelism);
+        opts.optimize_level_style_compaction(512 * 1024 * 1024);
+        opts.set_write_buffer_size(256 * 1024 * 1024);
+        opts.set_max_write_buffer_number(6);
+        opts.set_min_write_buffer_number_to_merge(1);
+        opts.set_max_background_jobs(8);
+        opts.set_level_zero_file_num_compaction_trigger(8);
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(36);
         let db = DB::open(&opts, path)?;
         Ok(Self { db: Arc::new(db) })
     }
