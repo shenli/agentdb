@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
@@ -162,7 +162,7 @@ struct AppendWriteRequest {
 
 impl AppendWriteBatcher {
     fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
-        let delay_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
+        let _enabled = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)?;
@@ -171,18 +171,14 @@ impl AppendWriteBatcher {
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1024);
-        Some(Arc::new(Self::new(
-            kv,
-            Duration::from_micros(delay_us),
-            max_ops,
-        )))
+        Some(Arc::new(Self::new(kv, max_ops)))
     }
 
-    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_delay: Duration, max_ops: usize) -> Self {
+    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize) -> Self {
         let (tx, rx) = mpsc::channel::<AppendWriteRequest>();
         let _ = thread::Builder::new()
             .name("agentdb-append-group-commit".into())
-            .spawn(move || append_group_commit_loop(kv, rx, max_delay, max_ops));
+            .spawn(move || append_group_commit_loop(kv, rx, max_ops));
         Self { tx }
     }
 
@@ -199,26 +195,20 @@ impl AppendWriteBatcher {
 fn append_group_commit_loop(
     kv: Arc<dyn KvStore + Send + Sync>,
     rx: mpsc::Receiver<AppendWriteRequest>,
-    max_delay: Duration,
     max_ops: usize,
 ) {
     while let Ok(first) = rx.recv() {
-        let deadline = Instant::now() + max_delay;
         let mut requests = vec![first];
         let mut op_count = requests[0].ops.len();
 
         while op_count < max_ops {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            if timeout.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(timeout) {
+            match rx.try_recv() {
                 Ok(request) => {
                     op_count += request.ops.len();
                     requests.push(request);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
 
