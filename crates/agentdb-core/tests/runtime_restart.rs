@@ -256,6 +256,100 @@ async fn append_and_fetch_uses_kv_recent() {
 }
 
 #[tokio::test]
+async fn fetch_recent_after_cold_append_reads_warm_tail() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    for i in 0..3_u64 {
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "history",
+            serde_json::json!({"i": i}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    rt.transition_session_lifecycle(&t.tenant_id, &s.session_id, Lifecycle::Cold)
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "tail",
+        serde_json::json!({"i": 3}),
+    ))
+    .await
+    .unwrap();
+
+    let recent = rt
+        .fetch_recent(t.tenant_id.clone(), s.session_id.clone(), 1)
+        .await
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].seq, 3);
+    assert_eq!(recent[0].kind, "tail");
+
+    let full = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 4,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        full.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[tokio::test]
+async fn persisted_hot_cache_eviction_keeps_recent_and_old_reads() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    for i in 0..2_060_u64 {
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": i}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let recent = rt
+        .fetch_recent(t.tenant_id.clone(), s.session_id.clone(), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        recent.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        vec![2055, 2056, 2057, 2058, 2059]
+    );
+
+    let old = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(old.len(), 1);
+    assert_eq!(old[0].seq, 0);
+}
+
+#[tokio::test]
 async fn event_by_id_index_is_written_and_survives_restart() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
