@@ -42,7 +42,7 @@ forensics, but they should not be the first thing a benchmark reader sees.
 
 | Cell | Shape | AgentDB | MongoDB | Postgres | Ratio |
 |---|---|---:|---:|---:|---|
-| Mixed loop, Zipf-1.2, `single-node-wal` | c=32, seed 43, 60s measured window, 1000 sessions | 53.3k ops/s | 26.0k ops/s | 13.1k ops/s | 2.05x MongoDB, 4.06x Postgres |
+| Mixed loop, Zipf-1.2, `single-node-wal` | c=32, seed 43, 60s measured window, 1000 sessions | 53.9k ops/s | 26.0k ops/s | 13.1k ops/s | 2.07x MongoDB, 4.11x Postgres |
 
 Interpret these as internal single-node benchmark cells, not product claims.
 The AgentDB API uses a fused `append-and-fetch` primitive; MongoDB and Postgres

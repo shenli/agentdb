@@ -186,9 +186,9 @@ Results are on `li-dev` under
 
 | Backend/profile | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| AgentDB `single-node-wal` | 53,302 | 0.49ms | 1.31ms | 2.11ms | 1.00x | RocksDB WAL enabled, no forced per-request media sync. |
-| MongoDB `single-node-wal` | 26,017 | 1.50ms | 2.17ms | 2.86ms | 2.05x MongoDB | Standalone acknowledged writes, no `journal=true`. |
-| Postgres `single-node-wal` | 13,114 | 0.96ms | 12.51ms | 35.80ms | 4.06x Postgres | `synchronous_commit=off`. |
+| AgentDB `single-node-wal` | 53,947 | 0.49ms | 1.29ms | 2.08ms | 1.00x | RocksDB WAL enabled, no forced per-request media sync. |
+| MongoDB `single-node-wal` | 26,017 | 1.50ms | 2.17ms | 2.86ms | 2.07x MongoDB | Standalone acknowledged writes, no `journal=true`. |
+| Postgres `single-node-wal` | 13,114 | 0.96ms | 12.51ms | 35.80ms | 4.11x Postgres | `synchronous_commit=off`. |
 
 This is the best current local setup result and should be the first number used
 for developer out-of-box performance discussions. It is still a single seed and
