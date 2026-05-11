@@ -156,6 +156,7 @@ struct AdaptiveWriteBatcher {
     tx: mpsc::Sender<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
+    wait_us: u64,
 }
 
 struct AdaptiveWriteRequest {
@@ -283,7 +284,13 @@ impl AdaptiveWriteBatcher {
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES") {
+                    1_000
+                } else {
+                    0
+                }
+            });
         Some(Arc::new(Self::new(kv, max_ops, wait_us)))
     }
 
@@ -304,11 +311,13 @@ impl AdaptiveWriteBatcher {
             tx,
             queued,
             writer_busy,
+            wait_us,
         }
     }
 
     async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        if self.queued.load(Ordering::Relaxed) == 0
+        if self.wait_us == 0
+            && self.queued.load(Ordering::Relaxed) == 0
             && self
                 .writer_busy
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -352,6 +361,15 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
+        })
+        .unwrap_or(false)
+}
+
 fn env_zero(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -371,7 +389,7 @@ fn adaptive_write_loop(
         let mut requests = vec![first];
         queued.fetch_sub(1, Ordering::Relaxed);
         let mut op_count = requests[0].ops.len();
-        if wait_us > 0 && queued.load(Ordering::Relaxed) > 0 {
+        if wait_us > 0 {
             thread::sleep(Duration::from_micros(wait_us));
         }
 
