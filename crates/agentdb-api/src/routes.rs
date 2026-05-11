@@ -4769,24 +4769,21 @@ async fn append_event(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime
-            .append(AppendRequest {
-                tenant_id: append_tid,
-                agent_id: aid,
-                session_id: append_sid,
-                kind: body.kind,
-                payload: body.payload,
-                artifact_refs: body.artifact_refs,
-                source_refs: body.source_refs,
-                idempotency_key: idem_key,
-            })
-            .await
-    })
-    .await?;
-    let backpressure = s
-        .runtime
-        .backpressure_for_tenant_and_session(&tid, &sid)
+    let (resp, backpressure) =
+        with_route_tablet_context(runtime.clone(), &route_headers, async move {
+            runtime
+                .append_with_backpressure(AppendRequest {
+                    tenant_id: append_tid,
+                    agent_id: aid,
+                    session_id: append_sid,
+                    kind: body.kind,
+                    payload: body.payload,
+                    artifact_refs: body.artifact_refs,
+                    source_refs: body.source_refs,
+                    idempotency_key: idem_key,
+                })
+                .await
+        })
         .await?;
     Ok(with_headers(
         json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
@@ -4840,28 +4837,25 @@ async fn append_and_fetch(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let resp = with_route_tablet_context(runtime.clone(), &route_headers, async move {
-        runtime
-            .append_and_fetch(
-                AppendRequest {
-                    tenant_id: append_tid,
-                    agent_id: aid,
-                    session_id: append_sid,
-                    kind: body.kind,
-                    payload: body.payload,
-                    artifact_refs: body.artifact_refs,
-                    source_refs: body.source_refs,
-                    idempotency_key: idem_key,
-                },
-                body.last,
-                body.max_bytes,
-            )
-            .await
-    })
-    .await?;
-    let backpressure = s
-        .runtime
-        .backpressure_for_tenant_and_session(&tid, &sid)
+    let (resp, backpressure) =
+        with_route_tablet_context(runtime.clone(), &route_headers, async move {
+            runtime
+                .append_and_fetch_with_backpressure(
+                    AppendRequest {
+                        tenant_id: append_tid,
+                        agent_id: aid,
+                        session_id: append_sid,
+                        kind: body.kind,
+                        payload: body.payload,
+                        artifact_refs: body.artifact_refs,
+                        source_refs: body.source_refs,
+                        idempotency_key: idem_key,
+                    },
+                    body.last,
+                    body.max_bytes,
+                )
+                .await
+        })
         .await?;
     Ok(with_headers(
         json_with_backpressure(StatusCode::OK, Json(resp), backpressure),

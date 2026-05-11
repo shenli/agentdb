@@ -43,26 +43,36 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | `agentdb-mimalloc-hotcache-append-only-sweep` | `append-only` | 12033 ops/s | n/a | 26874 ops/s | 34484 ops/s | 35249 ops/s |
 | `agentdb-mimalloc-hotcache-append-fetch-hot-sweep` | `append-fetch-hot` | 10138 ops/s | n/a | 24702 ops/s | 30354 ops/s | 31613 ops/s |
 | `agentdb-mimalloc-hotcache-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11692 ops/s | n/a | 21695 ops/s | 28290 ops/s | 25292 ops/s |
+| `agentdb-mixedpaths-append-only-sweep` | `append-only` | 12301 ops/s | n/a | 28010 ops/s | 34684 ops/s | 36592 ops/s |
+| `agentdb-mixedpaths-append-fetch-hot-sweep` | `append-fetch-hot` | 10938 ops/s | n/a | 25140 ops/s | 30746 ops/s | 31614 ops/s |
+| `agentdb-mixedpaths-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11266 ops/s | n/a | 32935 ops/s | 40515 ops/s | 41236 ops/s |
+| `agentdb-mixedpaths-record-write-only-sweep` | `record-write-only` | 11535 ops/s | n/a | 21602 ops/s | 28966 ops/s | 35192 ops/s |
+| `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s |
+| `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s |
+| `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s |
 | `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
+| `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s |
+| `postgres-final-mixed-current-shape` | `mixed-agent-loop` | 449 ops/s | n/a | 2106 ops/s | 3776 ops/s | 5334 ops/s |
 
 The detailed reports are stored on `li-dev` under the run-specific `OUT`
 directory, usually
 `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`
 for larger local runs.
 
-The latest AgentDB MongoDB API mixed result includes the narrower
-`agentdbFetchRecent` command for tail reads. Native HTTP now also uses adaptive
-append group commit by default; set `AGENTDB_APPEND_GROUP_COMMIT=0` to disable
-it. The group writer coalesces queued RocksDB append writes under contention
-while keeping read-after-write semantics. This improves append-heavy c=32
-throughput to about 28k ops/s on `li-dev`; the mixed c=32 run is still about
-24k ops/s, so the next performance work is HTTP JSON/serde/allocation cost,
-non-append write paths, and runtime/tablet concurrency, not only MongoDB
-wire-protocol tuning.
+The latest native RocksDB mixed run uses adaptive write batching, hot-tail
+append-and-fetch, route-level backpressure reuse, event-sourced session-head
+recovery, and a fast path for metadata-only tenant policy JSON. On `li-dev`,
+`agentdb-final-policyfast-mixed-sweep` reached 55.8k ops/s at c=32. The same
+benchmark shape reached 26.2k ops/s on MongoDB and 5.3k ops/s on Postgres, so
+this run is about 2.13x MongoDB and 10.47x Postgres for the synthetic mixed
+agent loop.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.
+Use `WORKLOAD=record-write-only`, `record-search-only`, `artifact-only`, or
+`fork-only` to isolate the non-append paths that contribute to
+`mixed-agent-loop` latency.
 
 Run the normalized Postgres event-log baseline:
 

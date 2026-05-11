@@ -117,6 +117,14 @@ pub struct AppendAndFetchResponse {
     pub recent: Vec<EventEnvelope>,
 }
 
+struct AppendCommitResponse {
+    appended: AppendResponse,
+    recent: Vec<EventEnvelope>,
+    recent_complete: bool,
+    backpressure: BackpressureReport,
+    backpressure_complete: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ForkSessionRequest {
     pub tenant_id: Id,
@@ -3111,22 +3119,7 @@ impl Runtime {
         agent_id: &Id,
     ) -> Result<RuntimePolicy> {
         let s = self.state.lock().await;
-        let tenant = s
-            .tenants
-            .get(tenant_id.as_str())
-            .filter(|t| t.deleted_at_ms.is_none())
-            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))?;
-        let agent = s
-            .agents
-            .get(agent_id.as_str())
-            .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
-            .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))?;
-        let base = RuntimePolicy::from_json(&tenant.policy);
-        let override_json = agent
-            .config
-            .get("policy")
-            .unwrap_or(&serde_json::Value::Null);
-        Ok(base.merge_override(override_json))
+        resolve_policy_for_agent_in_state(&s, tenant_id, agent_id)
     }
 
     pub async fn backpressure_for_tenant(&self, tenant_id: &Id) -> Result<BackpressureReport> {
@@ -3498,7 +3491,7 @@ impl Runtime {
         // Persist metadata, then update the in-memory cache. If persist
         // fails the bytes are an orphan (see atomicity caveat above).
         if let Some(p) = &self.persist {
-            p.put_artifact(&artifact).map_err(internal)?;
+            p.put_artifact_async(&artifact).await.map_err(internal)?;
         }
         let mut s = self.state.lock().await;
         s.artifacts
@@ -4369,14 +4362,35 @@ impl Runtime {
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
-        self.append_with_policy(req, None).await
+        Ok(self
+            .append_with_policy(req, None, None, None)
+            .await?
+            .appended)
+    }
+
+    pub async fn append_with_backpressure(
+        &self,
+        req: AppendRequest,
+    ) -> Result<(AppendResponse, BackpressureReport)> {
+        let tenant_id = req.tenant_id.clone();
+        let session_id = req.session_id.clone();
+        let committed = self.append_with_policy(req, None, None, None).await?;
+        let backpressure = if committed.backpressure_complete {
+            committed.backpressure
+        } else {
+            self.backpressure_for_tenant_and_session(&tenant_id, &session_id)
+                .await?
+        };
+        Ok((committed.appended, backpressure))
     }
 
     async fn append_with_policy(
         &self,
         req: AppendRequest,
         resolved_policy: Option<RuntimePolicy>,
-    ) -> Result<AppendResponse> {
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+    ) -> Result<AppendCommitResponse> {
         self.refresh_replicated_state().await?;
 
         // Compose the full idempotency scope key BEFORE locking state, so we can
@@ -4390,37 +4404,23 @@ impl Runtime {
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
-                return verify_idem_replay(&rec, &req);
+                return Ok(AppendCommitResponse {
+                    appended: verify_idem_replay(&rec, &req)?,
+                    recent: Vec::new(),
+                    recent_complete: false,
+                    backpressure: BackpressureReport::default(),
+                    backpressure_complete: false,
+                });
             }
         }
-
-        let policy = match resolved_policy {
-            Some(policy) => policy,
-            None => {
-                self.resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
-                    .await?
-            }
-        };
 
         // Inline payload size guard. Done after the idempotency short-circuit
         // (a retry that already committed should replay, not re-validate) but
         // before we lock state, so a misbehaving caller can't churn the mutex
-        // by hammering oversized payloads. The MAX_INLINE_EVENT_BYTES limit is
+        // by hammering oversized payload serialization.
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        if payload_len > policy.artifact_size.max_inline_event_bytes {
-            return Err(Error::new(
-                ErrorCode::EventTooLarge,
-                format!(
-                    "inline event payload {payload_len} bytes exceeds {} byte limit",
-                    policy.artifact_size.max_inline_event_bytes
-                ),
-            )
-            .with_suggestion(
-                "store the payload as an artifact and reference it via artifact_refs",
-            ));
-        }
 
         let session_commit_lock = self.session_commit_lock(&req.session_id);
         let _session_commit_guard = session_commit_lock.lock().await;
@@ -4432,8 +4432,44 @@ impl Runtime {
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.idem.lookup(full) {
                 drop(s);
-                return verify_idem_replay(&rec, &req);
+                return Ok(AppendCommitResponse {
+                    appended: verify_idem_replay(&rec, &req)?,
+                    recent: Vec::new(),
+                    recent_complete: false,
+                    backpressure: BackpressureReport::default(),
+                    backpressure_complete: false,
+                });
             }
+        }
+
+        let policy = match resolved_policy {
+            Some(policy) => policy,
+            None => resolve_policy_for_agent_in_state(&s, &req.tenant_id, &req.agent_id)?,
+        };
+        if let Some(max_bytes) = context_max_bytes {
+            if let Some(max) = policy.quota.max_context_bytes {
+                if max_bytes > max {
+                    return Err(Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies append_and_fetch: context byte request {max_bytes} exceeds quota {max}",
+                            policy.version
+                        ),
+                    ));
+                }
+            }
+        }
+        if payload_len > policy.artifact_size.max_inline_event_bytes {
+            return Err(Error::new(
+                ErrorCode::EventTooLarge,
+                format!(
+                    "inline event payload {payload_len} bytes exceeds {} byte limit",
+                    policy.artifact_size.max_inline_event_bytes
+                ),
+            )
+            .with_suggestion(
+                "store the payload as an artifact and reference it via artifact_refs",
+            ));
         }
 
         // Validate session + agent membership without mutating yet, so the
@@ -4578,7 +4614,7 @@ impl Runtime {
 
         let metadata_key = self.resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)?;
 
-        let (seq, _prior_policy_version, session_snapshot) = {
+        let (seq, persist_session_checkpoint, session_snapshot) = {
             // Mint the seq from the current session snapshot but do not make
             // the mutation visible until the durable batch succeeds. The
             // per-session commit lock above preserves same-session ordering
@@ -4587,17 +4623,20 @@ impl Runtime {
                 .sessions
                 .get(req.session_id.as_str())
                 .expect("session presence checked above");
+            let prior_lifecycle = session.lifecycle.clone();
+            let prior_policy_version = session.policy_version;
             let mut snapshot = session.clone();
             if snapshot.lifecycle != Lifecycle::Warm {
                 snapshot.lifecycle = Lifecycle::Warm;
                 snapshot.warm_head_from_seq = snapshot.next_seq;
             }
             let seq = snapshot.next_seq;
-            let pv = snapshot.policy_version;
             snapshot.next_seq += 1;
             snapshot.last_active_at_ms = crate::now_ms();
             snapshot.policy_version = policy.version;
-            (seq, pv, snapshot)
+            let persist_session_checkpoint =
+                prior_lifecycle != Lifecycle::Warm || prior_policy_version != policy.version;
+            (seq, persist_session_checkpoint, snapshot)
         };
 
         let envelope = EventEnvelope::create(NewEvent {
@@ -4649,14 +4688,16 @@ impl Runtime {
                 .as_ref()
                 .zip(idem_record.as_ref())
                 .map(|(k, r)| (k.as_str(), r));
+            let session_checkpoint = persist_session_checkpoint.then_some(&session_snapshot);
             if let Err(e) = p
-                .append_batch_async(&envelope, &session_snapshot, pair)
+                .append_batch_async(&envelope, session_checkpoint, pair)
                 .await
             {
                 return Err(internal(e));
             }
         }
 
+        let next_seq_after_append = session_snapshot.next_seq;
         let persist_enabled = self.persist.is_some();
         let mut s = self.state.lock().await;
         s.sessions
@@ -4671,6 +4712,38 @@ impl Runtime {
         );
         insert_runtime_event_cache(&mut s, persist_enabled, req.session_id.as_str(), envelope);
 
+        let (recent, recent_complete) = if let Some(last) = fetch_recent {
+            let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
+            let from_seq = resp.seq.saturating_add(1).saturating_sub(last_seq_count);
+            let lo = (req.session_id.as_str().to_string(), from_seq);
+            let hi = (req.session_id.as_str().to_string(), u64::MAX);
+            let mut recent = s
+                .events
+                .range(lo..=hi)
+                .take(last)
+                .map(|(_, event)| event.clone())
+                .collect::<Vec<_>>();
+            if recent.len() > last {
+                let drop_n = recent.len() - last;
+                recent.drain(0..drop_n);
+            }
+            let expected = usize::try_from(next_seq_after_append.saturating_sub(from_seq))
+                .unwrap_or(usize::MAX)
+                .min(last);
+            let complete = recent.len() >= expected;
+            (recent, complete)
+        } else {
+            (Vec::new(), false)
+        };
+
+        let backpressure = {
+            let session = s
+                .sessions
+                .get(req.session_id.as_str())
+                .expect("session was inserted above");
+            backpressure_for_tenant_session_in_state(&s, &policy, &req.tenant_id, session)
+        };
+
         // Record the idempotency result before releasing the per-session
         // commit lock, so a same-session retry with the same key observes this
         // record on its under-lock re-check and replays instead of committing a
@@ -4682,7 +4755,13 @@ impl Runtime {
         }
         drop(s);
 
-        Ok(resp)
+        Ok(AppendCommitResponse {
+            appended: resp,
+            recent,
+            recent_complete,
+            backpressure,
+            backpressure_complete: true,
+        })
     }
 
     /// Append an event and return it together with up to `last` recent events
@@ -4698,38 +4777,39 @@ impl Runtime {
         last: usize,
         max_bytes: usize,
     ) -> Result<AppendAndFetchResponse> {
+        Ok(self
+            .append_and_fetch_with_backpressure(req, last, max_bytes)
+            .await?
+            .0)
+    }
+
+    pub async fn append_and_fetch_with_backpressure(
+        &self,
+        req: AppendRequest,
+        last: usize,
+        max_bytes: usize,
+    ) -> Result<(AppendAndFetchResponse, BackpressureReport)> {
         let tenant_id = req.tenant_id.clone();
         let session_id = req.session_id.clone();
-        let policy = self
-            .resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
+        let committed = self
+            .append_with_policy(req, None, Some(last), Some(max_bytes))
             .await?;
-        if let Some(max) = policy.quota.max_context_bytes {
-            if max_bytes > max {
-                return Err(Error::new(
-                    ErrorCode::PolicyDenied,
-                    format!(
-                        "policy_version {} denies append_and_fetch: context byte request {max_bytes} exceeds quota {max}",
-                        policy.version
-                    ),
-                ));
-            }
-        }
-        let appended = self.append_with_policy(req, Some(policy)).await?;
 
         // Fetch only the tail window needed for context. A full-session fetch
         // makes append+fetch latency grow with session length and serializes
         // far more storage work than the API requires.
         let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
-        let from_seq = appended
+        let from_seq = committed
+            .appended
             .seq
             .saturating_add(1)
             .saturating_sub(last_seq_count);
-        let mut recent = if last == 0 {
-            Vec::new()
+        let mut recent = if last == 0 || committed.recent_complete {
+            committed.recent
         } else {
             self.fetch_from_seq(FetchRequest {
-                tenant_id,
-                session_id,
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
                 from_seq,
                 limit: last,
             })
@@ -4741,11 +4821,21 @@ impl Runtime {
         }
         trim_recent_to_budget(&mut recent, max_bytes);
 
-        Ok(AppendAndFetchResponse {
-            event_id: appended.event_id,
-            seq: appended.seq,
-            recent,
-        })
+        let backpressure = if committed.backpressure_complete {
+            committed.backpressure
+        } else {
+            self.backpressure_for_tenant_and_session(&tenant_id, &session_id)
+                .await?
+        };
+
+        Ok((
+            AppendAndFetchResponse {
+                event_id: committed.appended.event_id,
+                seq: committed.appended.seq,
+                recent,
+            },
+            backpressure,
+        ))
     }
 
     pub async fn build_context(&self, req: ContextRequest) -> Result<ContextResponse> {
@@ -5299,20 +5389,19 @@ impl Runtime {
             index_record_into(&mut text, &mut vec, &record, doc_id);
         }
 
-        // Persist with the state lock still held — concurrent
-        // `write_record`s for the same tenant + namespace mint distinct
-        // DocIds (counter is under the lock) and the persist order
-        // matches the index-insert order.
+        // Reserve the commit sequence under the state lock, but do not keep
+        // that lock while RocksDB does the durable write. The postings insert
+        // above is intentionally allowed to race ahead of persistence; searches
+        // only resolve records through `state.records`, which is populated
+        // after the durable write succeeds.
         let commit_seq = next_record_commit_seq(&mut s);
+        drop(s);
         if let Some(p) = &self.persist {
-            if let Err(e) = p.put_record_with_commit_seq(&record, Some(commit_seq)) {
-                // Persist failed: drop the cache + DocId mapping we
-                // were about to install. The index inserts above are
-                // not rolled back — see the long comment above.
-                drop(s);
-                return Err(internal(e));
-            }
+            p.put_record_with_commit_seq_async(&record, Some(commit_seq))
+                .await
+                .map_err(internal)?;
         }
+        let mut s = self.state.lock().await;
         s.records
             .insert(record.record_id.as_str().to_string(), record.clone());
         s.doc_to_record
@@ -5321,7 +5410,7 @@ impl Runtime {
             .insert(record.record_id.as_str().to_string(), doc_id);
         s.record_commit_seq
             .insert(record.record_id.as_str().to_string(), commit_seq);
-        s.local_record_index_watermark = commit_seq;
+        s.local_record_index_watermark = s.local_record_index_watermark.max(commit_seq);
         if self.persist.is_none() {
             if let Err(error) = self
                 .global_record_index
@@ -5335,7 +5424,7 @@ impl Runtime {
                 drop(s);
                 return Err(error);
             }
-            s.global_record_index_watermark = commit_seq;
+            s.global_record_index_watermark = s.global_record_index_watermark.max(commit_seq);
         }
         let commit_token = CommitToken {
             placement_id: None,
@@ -5438,15 +5527,14 @@ impl Runtime {
             let mut advanced = false;
             if mutation.commit_seq > s.global_record_index_watermark {
                 let global_mutation = match mutation.op {
-                    RecordIndexMutationOp::Upsert => {
-                        s.records.get(&mutation.record_id).map(|record| {
-                            global_index_mutation_for_record(
-                                record,
-                                mutation.commit_seq,
-                                GlobalIndexMutationOp::Upsert,
-                            )
-                        })
-                    }
+                    RecordIndexMutationOp::Upsert => match s.records.get(&mutation.record_id) {
+                        Some(record) => Some(global_index_mutation_for_record(
+                            record,
+                            mutation.commit_seq,
+                            GlobalIndexMutationOp::Upsert,
+                        )),
+                        None => return Ok(applied),
+                    },
                     RecordIndexMutationOp::Delete => Some(GlobalIndexMutation {
                         tenant_id: mutation.tenant_id.clone(),
                         record_id: mutation.record_id.clone(),
@@ -5478,9 +5566,7 @@ impl Runtime {
             match mutation.op {
                 RecordIndexMutationOp::Upsert => {
                     let Some(record) = s.records.get(&mutation.record_id).cloned() else {
-                        s.local_record_index_watermark = mutation.commit_seq;
-                        applied += 1;
-                        continue;
+                        return Ok(applied);
                     };
                     if record.deleted_at_ms.is_some() || record.is_expired() {
                         s.local_record_index_watermark = mutation.commit_seq;
@@ -5784,6 +5870,115 @@ fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
         return None;
     }
     Some(usage.saturating_mul(100).saturating_div(soft_limit))
+}
+
+fn resolve_policy_for_agent_in_state(
+    s: &State,
+    tenant_id: &Id,
+    agent_id: &Id,
+) -> Result<RuntimePolicy> {
+    let tenant = s
+        .tenants
+        .get(tenant_id.as_str())
+        .filter(|t| t.deleted_at_ms.is_none())
+        .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))?;
+    let agent = s
+        .agents
+        .get(agent_id.as_str())
+        .filter(|a| a.deleted_at_ms.is_none() && a.tenant_id.as_str() == tenant_id.as_str())
+        .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))?;
+    let base = RuntimePolicy::from_json(&tenant.policy);
+    let override_json = agent
+        .config
+        .get("policy")
+        .unwrap_or(&serde_json::Value::Null);
+    Ok(base.merge_override(override_json))
+}
+
+fn backpressure_for_tenant_session_in_state(
+    s: &State,
+    policy: &RuntimePolicy,
+    tenant_id: &Id,
+    session: &Session,
+) -> BackpressureReport {
+    let mut report = BackpressureReport::default();
+
+    if let Some(soft) = policy.quota.soft_max_active_sessions {
+        let active_sessions = s
+            .sessions
+            .values()
+            .filter(|sess| {
+                sess.tenant_id.as_str() == tenant_id.as_str()
+                    && sess.deleted_at_ms.is_none()
+                    && sess.status == crate::session::Status::Active
+            })
+            .count();
+        report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_agents {
+        let live_agents = s
+            .agents
+            .values()
+            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+            .count();
+        report.push_if_over("agents", live_agents as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_records {
+        let live_records = s
+            .records
+            .values()
+            .filter(|r| {
+                r.tenant_id.as_str() == tenant_id.as_str()
+                    && r.deleted_at_ms.is_none()
+                    && !r.is_expired()
+            })
+            .count();
+        report.push_if_over("records", live_records as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_artifacts {
+        let live_artifacts = s
+            .artifacts
+            .values()
+            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+            .count();
+        report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
+        let live_bytes: u64 = s
+            .artifacts
+            .values()
+            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+            .map(|a| a.bytes)
+            .sum();
+        report.push_if_over("artifact_storage", live_bytes, soft);
+    }
+    if let Some(soft) = policy.quota.soft_max_skills {
+        let live_skills = s
+            .skills
+            .values()
+            .filter(|skill| {
+                skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
+            })
+            .count();
+        report.push_if_over("skills", live_skills as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_events_per_session {
+        report.push_if_over("session_events", session.next_seq, soft);
+    }
+    if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
+        let live_bindings = s
+            .agent_skill_bindings
+            .values()
+            .filter(|binding| {
+                binding.tenant_id.as_str() == tenant_id.as_str()
+                    && binding.agent_id.as_str() == session.agent_id.as_str()
+                    && binding.deleted_at_ms.is_none()
+            })
+            .count();
+        report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
+    }
+
+    report
 }
 
 fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {

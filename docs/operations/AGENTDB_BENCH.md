@@ -18,11 +18,12 @@ git SHA, and database versions used for the run.
 ## Latest `li-dev` Results
 
 These are the current single-node local RocksDB results from `li-dev` after the
-append-path lock narrowing, MongoDB-API recent-fetch changes, and append
-group-commit profiling/fixes in this PR. They use release binaries, local
+append-path lock narrowing, MongoDB-API recent-fetch changes, append
+group-commit profiling/fixes, and metadata-only policy fast-pathing in this PR.
+They use release binaries, local
 RocksDB metadata/index storage, local filesystem content storage, 1 tenant, 1
-agent, 16-320 sessions depending on the run, 3s warmup, and 8s measured
-duration.
+agent, 16-320 sessions depending on the run, 3s warmup, and 8-10s measured
+duration depending on the sweep.
 
 | Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 | Report |
 |---|---|---:|---:|---:|---:|---:|---|
@@ -38,8 +39,17 @@ duration.
 | `agentdb-mimalloc-hotcache-append-only-sweep` | `append-only` | 12033 ops/s | n/a | 26874 ops/s | 34484 ops/s | 35249 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-append-only-sweep/runs/agentdb-mimalloc-hotcache-append-only-sweep/report.md` |
 | `agentdb-mimalloc-hotcache-append-fetch-hot-sweep` | `append-fetch-hot` | 10138 ops/s | n/a | 24702 ops/s | 30354 ops/s | 31613 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-append-fetch-hot-sweep/runs/agentdb-mimalloc-hotcache-append-fetch-hot-sweep/report.md` |
 | `agentdb-mimalloc-hotcache-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11692 ops/s | n/a | 21695 ops/s | 28290 ops/s | 25292 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-mixed-agent-loop-sweep/runs/agentdb-mimalloc-hotcache-mixed-agent-loop-sweep/report.md` |
+| `agentdb-mixedpaths-append-only-sweep` | `append-only` | 12301 ops/s | n/a | 28010 ops/s | 34684 ops/s | 36592 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-append-only-sweep/runs/agentdb-mixedpaths-append-only-sweep/report.md` |
+| `agentdb-mixedpaths-append-fetch-hot-sweep` | `append-fetch-hot` | 10938 ops/s | n/a | 25140 ops/s | 30746 ops/s | 31614 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-append-fetch-hot-sweep/runs/agentdb-mixedpaths-append-fetch-hot-sweep/report.md` |
+| `agentdb-mixedpaths-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11266 ops/s | n/a | 32935 ops/s | 40515 ops/s | 41236 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-mixed-agent-loop-sweep/runs/agentdb-mixedpaths-mixed-agent-loop-sweep/report.md` |
+| `agentdb-mixedpaths-record-write-only-sweep` | `record-write-only` | 11535 ops/s | n/a | 21602 ops/s | 28966 ops/s | 35192 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-record-write-only-sweep/runs/agentdb-mixedpaths-record-write-only-sweep/report.md` |
+| `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-artifact-only-sweep/runs/agentdb-mixedpaths-artifact-only-sweep/report.md` |
+| `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-eventsource-session-mixed-sweep/runs/agentdb-final-eventsource-session-mixed-sweep/report.md` |
+| `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-policyfast-mixed-sweep/runs/agentdb-final-policyfast-mixed-sweep/report.md` |
 | `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-append-only-fixed/runs/mongodb-append-only-fixed/report.md` |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
+| `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-final-mixed-current-shape/runs/mongodb-final-mixed-current-shape/report.md` |
+| `postgres-final-mixed-current-shape` | `mixed-agent-loop` | 449 ops/s | n/a | 2106 ops/s | 3776 ops/s | 5334 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/postgres-final-mixed-current-shape/runs/postgres-final-mixed-current-shape/report.md` |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
 from roughly 3.4k ops/s to 14.0k ops/s, and `mixed-agent-loop` at c=32 moved
@@ -62,16 +72,20 @@ profile and were reverted.
 
 Append group commit now coalesces queued append writes under contention while
 preserving read-after-write semantics: each caller still awaits the RocksDB
-batch that contains its append before returning. A fixed wait window improved
-high-concurrency throughput but hurt c=1 badly, so the implementation uses an
+batch that contains its append before returning. The implementation uses an
 adaptive fast path: direct write when there is no queue/active writer, queued
 group write when contention exists. Adaptive grouping is enabled by default and
-can be disabled with `AGENTDB_APPEND_GROUP_COMMIT=0`. With grouping enabled,
-append-fetch c=32 reaches roughly 28.0k ops/s and mixed c=16 reaches roughly
-25.5k ops/s. Mixed c=32 is still around 24.2k ops/s versus MongoDB's earlier
-25.6k ops/s, so AgentDB is not yet 2x faster on this synthetic mixed workload.
-The next bottleneck is broader HTTP JSON/serde/allocation cost and non-append
-write paths, not just RocksDB append write amplification.
+can be disabled with `AGENTDB_APPEND_GROUP_COMMIT=0`.
+
+The final mixed-path run also avoids a second state-lock acquisition for policy
+resolution, returns append-and-fetch hot tails from the append commit path,
+reuses the committed state for route backpressure headers, and relies on the
+persisted event stream to recover warm-session `next_seq` instead of writing
+the full session row on every warm append. The latest run also skips full
+policy merge/deserialization for metadata-only tenant policy JSON. On `li-dev`,
+the final same-shape `mixed-agent-loop` c=32 result is 55.8k ops/s for AgentDB,
+26.2k ops/s for MongoDB, and 5.3k ops/s for Postgres. That is about 2.13x
+MongoDB and 10.47x Postgres for this synthetic mixed agent loop.
 
 ## Questions To Answer
 
@@ -239,8 +253,12 @@ history, records, and artifacts before a measured `run` phase.
 | `append_fetch_hot` | Append a message/tool event, then fetch the latest N events from the same session. | Main agent runtime loop. Measures read-after-write in the same client/session. |
 | `long_context_resume` | Load sessions with 100, 1k, 10k, and 100k events, then fetch recent context and selected checkpoints. | Agents often resume long-running tasks. Full-history scans should not be required. |
 | `fork_branch` | Create branches from a parent session at a sequence number, append divergent events, then read parent and child context. | Agent planning, retries, and speculative execution need cheap branching. |
+| `fork_only` | Create branches from existing sessions without extra mixed operations. | Isolates branch metadata/index cost from append and fetch cost. |
 | `memory_write_search` | Write records with tags, text, optional embeddings, and optional sharding key; query both scoped and global search. | Measures local index, global index, eventual visibility, and tenant isolation. |
+| `record_write_only` | Write searchable memory records only. | Isolates record primary row, namespace index, and global-index outbox write cost. |
+| `record_search_only` | Query searchable memory records only. | Isolates local/global search index read cost without write pressure. |
 | `artifact_pointer` | Write event metadata plus artifact metadata and payload/reference records. | Agent runs frequently produce files, screenshots, traces, and tool outputs. |
+| `artifact_only` | Write artifact metadata/content references only. | Isolates artifact metadata persistence and content-engine write cost. |
 | `mixed_agent_loop` | Weighted mix of append, fetch, resume, record write, search, fork, and artifact metadata writes. | End-to-end workload that approximates a real agent service. |
 
 Recommended default mix for `mixed_agent_loop`:

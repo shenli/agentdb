@@ -158,8 +158,12 @@ enum Workload {
     AppendFetchHot,
     LongContextResume,
     ForkBranch,
+    ForkOnly,
     MemoryWriteSearch,
+    RecordWriteOnly,
+    RecordSearchOnly,
     ArtifactPointer,
+    ArtifactOnly,
     MixedAgentLoop,
 }
 
@@ -1407,7 +1411,7 @@ fn choose_operation(workload: Workload, rng: &mut StdRng) -> Operation {
         Workload::AppendOnly => Operation::AppendOnly,
         Workload::AppendFetchHot => Operation::AppendFetch,
         Workload::LongContextResume => Operation::FetchRecent,
-        Workload::ForkBranch => Operation::Fork,
+        Workload::ForkBranch | Workload::ForkOnly => Operation::Fork,
         Workload::MemoryWriteSearch => {
             if rng.gen_bool(0.5) {
                 Operation::RecordWrite
@@ -1415,7 +1419,9 @@ fn choose_operation(workload: Workload, rng: &mut StdRng) -> Operation {
                 Operation::RecordSearch
             }
         }
-        Workload::ArtifactPointer => Operation::Artifact,
+        Workload::RecordWriteOnly => Operation::RecordWrite,
+        Workload::RecordSearchOnly => Operation::RecordSearch,
+        Workload::ArtifactPointer | Workload::ArtifactOnly => Operation::Artifact,
         Workload::MixedAgentLoop => {
             let roll = rng.gen_range(0..100);
             match roll {
