@@ -106,6 +106,8 @@ ssh -L 8099:127.0.0.1:8099 li-dev
 Install the user units:
 
 ```bash
+mkdir -p ~/work
+test -d ~/work/agentdb-nightly || git clone https://github.com/shenli/agentdb.git ~/work/agentdb-nightly
 mkdir -p ~/.config/systemd/user
 cp ops/systemd/user/agentdb-local-ci-*.service ~/.config/systemd/user/
 cp ops/systemd/user/agentdb-local-ci-*.timer ~/.config/systemd/user/
@@ -115,7 +117,8 @@ systemctl --user enable --now agentdb-local-ci-nightly.timer
 ```
 
 The timer runs nightly at 02:30 with up to 20 minutes of randomized delay. It
-stores results in:
+uses the separate clean checkout at `~/work/agentdb-nightly` and stores results
+in:
 
 ```bash
 ~/agentdb-ci-runs
