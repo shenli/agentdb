@@ -55,6 +55,7 @@ use crate::tablet_state::{
 use crate::tenant::{NewTenant, Tenant};
 
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
+const PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
 
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
@@ -325,9 +326,10 @@ struct State {
     /// Keyed by artifact_id_str. Hydrated at startup from
     /// `Persist::scan_all_artifacts`; updated on every `create_artifact`.
     artifacts: BTreeMap<String, Artifact>,
-    /// Keyed by (session_id, seq) for ordered scan. Only populated in the
-    /// in-memory backend; the KV backend reads events back from storage on
-    /// demand instead of carrying a duplicate copy in memory.
+    /// Keyed by (session_id, seq) for ordered scan. In-memory runtimes keep all
+    /// events here. Persisted runtimes keep a bounded hot tail per session so
+    /// append+fetch can avoid a storage read while older reads fall back to
+    /// RocksDB.
     events: BTreeMap<(String, u64), EventEnvelope>,
     /// Maps `event_id -> (session_id_str, seq)` for in-memory `event_by_id`
     /// lookup. Only populated in the in-memory backend (the KV backend
@@ -386,6 +388,38 @@ struct State {
     /// state mutex serializes counter increments alongside record
     /// inserts.
     next_doc_seq: u64,
+}
+
+fn insert_runtime_event_cache(
+    state: &mut State,
+    persist_enabled: bool,
+    session_id: &str,
+    event: EventEnvelope,
+) {
+    let seq = event.seq;
+    state.events.insert((session_id.to_string(), seq), event);
+
+    if !persist_enabled {
+        return;
+    }
+
+    let evict_before = seq
+        .saturating_add(1)
+        .saturating_sub(PERSISTED_HOT_EVENT_CACHE_PER_SESSION);
+    if evict_before == 0 {
+        return;
+    }
+
+    let first_drop = (session_id.to_string(), 0);
+    let last_drop = (session_id.to_string(), evict_before.saturating_sub(1));
+    let stale_keys = state
+        .events
+        .range(first_drop..=last_drop)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in stale_keys {
+        state.events.remove(&key);
+    }
 }
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
@@ -4623,6 +4657,7 @@ impl Runtime {
             }
         }
 
+        let persist_enabled = self.persist.is_some();
         let mut s = self.state.lock().await;
         s.sessions
             .insert(req.session_id.as_str().to_string(), session_snapshot);
@@ -4630,12 +4665,11 @@ impl Runtime {
         // `event_by_id` secondary-index entry that the KV backend writes via
         // `append_batch`. The persisted backend keeps this in memory too so
         // same-process reads can avoid a storage lookup.
-        let key = (req.session_id.as_str().to_string(), seq);
         s.event_by_id.insert(
             envelope.event_id.as_str().to_string(),
             (envelope.session_id.as_str().to_string(), envelope.seq),
         );
-        s.events.insert(key, envelope);
+        insert_runtime_event_cache(&mut s, persist_enabled, req.session_id.as_str(), envelope);
 
         // Record the idempotency result before releasing the per-session
         // commit lock, so a same-session retry with the same key observes this
