@@ -22,7 +22,11 @@
 //! Events are NOT preloaded; `scan_events` is invoked lazily by
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
@@ -49,6 +53,227 @@ use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
 
+static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
+
+struct AppendPersistProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    batches: AtomicU64,
+    ops: AtomicU64,
+    bytes: AtomicU64,
+    build_nanos: AtomicU64,
+    write_nanos: AtomicU64,
+}
+
+impl AppendPersistProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_APPEND_PERSIST_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(now_millis()),
+            batches: AtomicU64::new(0),
+            ops: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            build_nanos: AtomicU64::new(0),
+            write_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn record(&self, op_count: usize, bytes: usize, build_nanos: u128, write_nanos: u128) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.ops.fetch_add(op_count as u64, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.build_nanos.fetch_add(
+            build_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.write_nanos.fetch_add(
+            write_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+
+        let now = now_millis();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let batches = self.batches.swap(0, Ordering::Relaxed);
+        if batches == 0 {
+            return;
+        }
+        let ops = self.ops.swap(0, Ordering::Relaxed);
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let build_nanos = self.build_nanos.swap(0, Ordering::Relaxed);
+        let write_nanos = self.write_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            batches,
+            ops,
+            bytes,
+            avg_ops = ops as f64 / batches as f64,
+            avg_bytes = bytes as f64 / batches as f64,
+            avg_build_us = build_nanos as f64 / batches as f64 / 1_000.0,
+            avg_write_us = write_nanos as f64 / batches as f64 / 1_000.0,
+            "append persist profile"
+        );
+    }
+}
+
+fn append_persist_profile() -> Option<&'static AppendPersistProfile> {
+    APPEND_PERSIST_PROFILE
+        .get_or_init(AppendPersistProfile::from_env)
+        .as_ref()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn write_ops_size(ops: &[WriteOp]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            WriteOp::Put { key, value } => key.len() + value.len(),
+            WriteOp::Delete { key } => key.len(),
+        })
+        .sum()
+}
+
+struct AppendWriteBatcher {
+    kv: Arc<dyn KvStore + Send + Sync>,
+    tx: mpsc::Sender<AppendWriteRequest>,
+    queued: Arc<AtomicU64>,
+    writer_busy: Arc<AtomicU64>,
+}
+
+struct AppendWriteRequest {
+    ops: Vec<WriteOp>,
+    done: tokio::sync::oneshot::Sender<KvResult<()>>,
+}
+
+impl AppendWriteBatcher {
+    fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
+        let _enabled = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1024);
+        Some(Arc::new(Self::new(kv, max_ops)))
+    }
+
+    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<AppendWriteRequest>();
+        let queued = Arc::new(AtomicU64::new(0));
+        let writer_busy = Arc::new(AtomicU64::new(0));
+        let _ = thread::Builder::new()
+            .name("agentdb-append-group-commit".into())
+            .spawn({
+                let kv = kv.clone();
+                let queued = queued.clone();
+                let writer_busy = writer_busy.clone();
+                move || append_group_commit_loop(kv, rx, queued, writer_busy, max_ops)
+            });
+        Self {
+            kv,
+            tx,
+            queued,
+            writer_busy,
+        }
+    }
+
+    async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        if self.queued.load(Ordering::Relaxed) == 0
+            && self
+                .writer_busy
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let result = self.kv.write_batch(ops);
+            self.writer_busy.store(0, Ordering::Release);
+            return result;
+        }
+
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(AppendWriteRequest { ops, done })
+            .map_err(|request| {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                drop(request);
+                StorageError::Other("append group commit worker stopped".into())
+            })?;
+        rx.await
+            .map_err(|_| StorageError::Other("append group commit worker dropped result".into()))?
+    }
+}
+
+fn append_group_commit_loop(
+    kv: Arc<dyn KvStore + Send + Sync>,
+    rx: mpsc::Receiver<AppendWriteRequest>,
+    queued: Arc<AtomicU64>,
+    writer_busy: Arc<AtomicU64>,
+    max_ops: usize,
+) {
+    while let Ok(first) = rx.recv() {
+        let mut requests = vec![first];
+        queued.fetch_sub(1, Ordering::Relaxed);
+        let mut op_count = requests[0].ops.len();
+
+        while op_count < max_ops {
+            match rx.try_recv() {
+                Ok(request) => {
+                    queued.fetch_sub(1, Ordering::Relaxed);
+                    op_count += request.ops.len();
+                    requests.push(request);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let mut ops = Vec::with_capacity(op_count);
+        let mut completions = Vec::with_capacity(requests.len());
+        for request in requests {
+            ops.extend(request.ops);
+            completions.push(request.done);
+        }
+
+        while writer_busy
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            thread::yield_now();
+        }
+        let result = kv.write_batch(ops);
+        writer_busy.store(0, Ordering::Release);
+        for done in completions {
+            let send_result = match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(StorageError::Other(format!(
+                    "append group commit write failed: {err}"
+                ))),
+            };
+            let _ = done.send(send_result);
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecordIndexMutationOp {
@@ -74,6 +299,7 @@ fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Opti
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
     metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    append_batcher: Option<Arc<AppendWriteBatcher>>,
 }
 
 impl Persist {
@@ -81,9 +307,11 @@ impl Persist {
         kv: Arc<dyn KvStore + Send + Sync>,
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
     ) -> Self {
+        let append_batcher = AppendWriteBatcher::from_env(kv.clone());
         Self {
             kv,
             metadata_crypto,
+            append_batcher,
         }
     }
 
@@ -374,13 +602,34 @@ impl Persist {
     /// the updated session row, the `event_by_id` secondary index row, and
     /// (optionally) the idempotency record so that on crash recovery either
     /// all of them are visible or none are.
-    pub fn append_batch(
+    pub async fn append_batch_async(
         &self,
         event: &EventEnvelope,
         session: &Session,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
-        self.write_ops(self.append_batch_ops(event, session, idem)?)
+        let Some(profile) = append_persist_profile() else {
+            let ops = self.append_batch_ops(event, session, idem)?;
+            if let Some(batcher) = &self.append_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_batch_ops(event, session, idem)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = if let Some(batcher) = &self.append_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
     }
 
     pub(crate) fn append_batch_ops(

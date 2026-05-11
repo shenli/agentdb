@@ -32,10 +32,27 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---:|---:|---:|---:|---:|
 | `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
-| `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s |
+| `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s |
+| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
+| `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s |
+| `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s |
+| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 
-The detailed reports are stored on `li-dev` under
-`/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
+The detailed reports are stored on `li-dev` under the run-specific `OUT`
+directory, usually
+`/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`
+for larger local runs.
+
+The latest AgentDB MongoDB API mixed result includes the narrower
+`agentdbFetchRecent` command for tail reads. Native HTTP now also has
+env-gated append group commit (`AGENTDB_APPEND_GROUP_COMMIT_US=1`) that
+coalesces queued RocksDB append writes under contention while keeping
+read-after-write semantics. This improves append-heavy c=32 throughput to about
+28k ops/s on `li-dev`; the mixed c=32 run is still about 24k ops/s, so the next
+performance work is HTTP JSON/serde/allocation cost, non-append write paths, and
+runtime/tablet
+concurrency, not only MongoDB wire-protocol tuning.
 
 Run the normalized Postgres event-log baseline:
 
@@ -58,6 +75,18 @@ The MongoDB baseline uses `benchmarks/mongodb/docker-compose.yml` and the
 `mongodb-event-log` backend. It stores sessions, events, records, and artifacts
 in separate collections with tenant/session/sequence indexes. It intentionally
 does not use the naive single-session-document model for the default comparison.
+
+Run AgentDB through its MongoDB-compatible listener:
+
+```bash
+PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
+```
+
+This uses the `agentdb-mongodb-api` backend. It starts AgentDB with both the
+native HTTP server and MongoDB wire listener, prepares data through MongoDB
+driver calls, and runs workloads through AgentDB's MongoDB-compatible command
+subset. Treat this as an adapter-overhead profile for AgentDB, separate from
+both `agentdb-native-rocksdb` and real `mongodb-event-log`.
 
 Prepare a dataset:
 

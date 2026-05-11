@@ -68,6 +68,7 @@ impl CommandContext {
                 "ok": 1.0,
             }),
             "agentdbAppendAndFetch" => self.agentdb_append_and_fetch(&request).await,
+            "agentdbFetchRecent" => self.agentdb_fetch_recent(&request).await,
             "agentdbFork" => self.agentdb_fork(&request).await,
             "agentdbReplay" => self.agentdb_replay(&request).await,
             "agentdbContext" => self.agentdb_context(&request).await,
@@ -323,6 +324,27 @@ impl CommandContext {
             .await?;
         Ok(doc! {
             "session": Bson::Document(json_to_document(serde_json::to_value(session).unwrap_or(Value::Null))),
+            "ok": 1.0,
+        })
+    }
+
+    async fn agentdb_fetch_recent(&self, request: &Document) -> WireResult<Document> {
+        let db = request.get_str("$db").unwrap_or("agentdb");
+        let tenant = self.ensure_tenant(db).await?;
+        let session_id = required_id(request, "session_id", IdKind::Session)?;
+        let limit = request
+            .get_i32("limit")
+            .map(|value| value.max(0) as usize)
+            .or_else(|_| request.get_i64("limit").map(|value| value.max(0) as usize))
+            .unwrap_or(20);
+        let events = self
+            .runtime
+            .fetch_recent(tenant.tenant_id, session_id, limit)
+            .await?;
+        Ok(doc! {
+            "events": Bson::Array(events.into_iter().map(|event| {
+                Bson::Document(json_to_document(serde_json::to_value(event).unwrap_or(Value::Null)))
+            }).collect()),
             "ok": 1.0,
         })
     }
@@ -685,7 +707,7 @@ impl CommandContext {
             .search_records(SearchRequest {
                 tenant_id: tenant_id.clone(),
                 namespace,
-                sharding_key: Some("mongodb-compat".to_string()),
+                sharding_key: filter.get_str("session_id").ok().map(str::to_string),
                 text,
                 embedding: None,
                 tags: get_string_array(filter, "tags").unwrap_or_default(),
@@ -1043,6 +1065,70 @@ mod tests {
         assert!(response.get_str("event_id").unwrap().starts_with("evt_"));
         assert_eq!(response.get_i64("seq").unwrap(), 0);
         assert_eq!(response.get_array("recent").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_fetch_recent_returns_tail_events() {
+        let ctx = CommandContext::new(Runtime::in_memory());
+
+        let first = ctx
+            .handle(doc! {
+                "agentdbAppendAndFetch": "events",
+                "$db": "tenant_a",
+                "session_alias": "session-a",
+                "kind": "message",
+                "payload": { "content": "one" },
+                "fetch_last_n": 1_i32,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.get_i64("seq").unwrap(), 0);
+
+        for content in ["two", "three"] {
+            ctx.handle(doc! {
+                "agentdbAppendAndFetch": "events",
+                "$db": "tenant_a",
+                "session_alias": "session-a",
+                "kind": "message",
+                "payload": { "content": content },
+                "fetch_last_n": 1_i32,
+            })
+            .await
+            .unwrap();
+        }
+
+        let session = ctx
+            .handle(doc! {
+                "find": "sessions",
+                "$db": "tenant_a",
+                "filter": { "alias": "session-a" },
+            })
+            .await
+            .unwrap();
+        let session_id = session
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .get_str("session_id")
+            .unwrap()
+            .to_string();
+
+        let response = ctx
+            .handle(doc! {
+                "agentdbFetchRecent": "events",
+                "$db": "tenant_a",
+                "session_id": session_id,
+                "limit": 2_i32,
+            })
+            .await
+            .unwrap();
+        let events = response.get_array("events").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].as_document().unwrap().get_i64("seq").unwrap(), 1);
+        assert_eq!(events[1].as_document().unwrap().get_i64("seq").unwrap(), 2);
     }
 
     #[tokio::test]
