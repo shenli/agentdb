@@ -113,6 +113,8 @@ run_args=(
 )
 
 [[ -n "${FETCH_LAST_N:-}" ]] && run_args+=(--fetch-last-n "${FETCH_LAST_N}")
+[[ -n "${SESSION_SELECTION:-}" ]] && run_args+=(--session-selection "${SESSION_SELECTION}")
+[[ -n "${ZIPF_EXPONENT:-}" ]] && run_args+=(--zipf-exponent "${ZIPF_EXPONENT}")
 [[ "${NO_RAW_JSONL:-0}" == "1" ]] && run_args+=(--no-raw-jsonl)
 [[ -n "${SEED:-}" ]] && run_args+=(--seed "${SEED}")
 

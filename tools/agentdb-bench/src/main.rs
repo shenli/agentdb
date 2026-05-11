@@ -17,6 +17,7 @@ use mongodb::options::{
     UpdateOptions,
 };
 use mongodb::{Client as MongoClient, Database as MongoDatabase, IndexModel};
+use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::{Client, StatusCode};
@@ -127,6 +128,10 @@ struct RunArgs {
     duration: String,
     #[arg(long, default_value_t = 20)]
     fetch_last_n: usize,
+    #[arg(long, value_enum, default_value_t = SessionSelection::Uniform)]
+    session_selection: SessionSelection,
+    #[arg(long, default_value_t = 1.2)]
+    zipf_exponent: f64,
     #[arg(long)]
     no_raw_jsonl: bool,
     #[arg(long, default_value_t = 43)]
@@ -165,6 +170,16 @@ enum Workload {
     ArtifactPointer,
     ArtifactOnly,
     MixedAgentLoop,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum SessionSelection {
+    Uniform,
+    Zipf,
+    #[value(name = "hotset-90-10")]
+    #[serde(rename = "hotset-90-10")]
+    Hotset9010,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1064,6 +1079,8 @@ async fn run(args: RunArgs) -> Result<()> {
             "warmup": args.warmup,
             "duration": args.duration,
             "fetch_last_n": args.fetch_last_n,
+            "session_selection": args.session_selection,
+            "zipf_exponent": args.zipf_exponent,
             "raw_jsonl": !args.no_raw_jsonl,
             "seed": args.seed
         }),
@@ -1139,6 +1156,8 @@ async fn run_cell(
         let agentdb_mongo_client = agentdb_mongo_client.clone();
         handles.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed + worker_id as u64);
+            let fixture_selector =
+                FixtureSelector::new(args.session_selection, args.zipf_exponent, fixtures.len())?;
             while Instant::now() < deadline {
                 let operation = choose_operation(args.workload, &mut rng);
                 let started_at_ms = now_ms();
@@ -1149,6 +1168,7 @@ async fn run_cell(
                     &args,
                     &config,
                     &fixtures,
+                    &fixture_selector,
                     &mut rng,
                     operation,
                     mongo_db.as_deref(),
@@ -1219,6 +1239,7 @@ async fn run_one_operation(
     args: &RunArgs,
     config: &DatasetConfig,
     fixtures: &[FlatSession],
+    fixture_selector: &FixtureSelector,
     rng: &mut StdRng,
     operation: Operation,
     mongo_db: Option<&MongoDatabase>,
@@ -1227,7 +1248,7 @@ async fn run_one_operation(
     if fixtures.is_empty() {
         return Err(anyhow!("dataset has no sessions"));
     }
-    let fixture = &fixtures[rng.gen_range(0..fixtures.len())];
+    let fixture = fixture_selector.choose(fixtures, rng);
     if args.backend == "postgres-event-log" {
         let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
         return run_one_postgres_operation(pool, args, config, fixture, rng, operation).await;
@@ -1340,6 +1361,57 @@ struct FlatSession {
     events_written: usize,
 }
 
+struct FixtureSelector {
+    distribution: Option<WeightedIndex<f64>>,
+}
+
+impl FixtureSelector {
+    fn new(selection: SessionSelection, zipf_exponent: f64, fixture_count: usize) -> Result<Self> {
+        if fixture_count == 0 {
+            return Err(anyhow!("dataset has no sessions"));
+        }
+        let distribution = match selection {
+            SessionSelection::Uniform => None,
+            SessionSelection::Zipf => {
+                if !zipf_exponent.is_finite() || zipf_exponent <= 0.0 {
+                    return Err(anyhow!("--zipf-exponent must be a positive finite number"));
+                }
+                let weights = (0..fixture_count)
+                    .map(|idx| 1.0 / ((idx + 1) as f64).powf(zipf_exponent))
+                    .collect::<Vec<_>>();
+                Some(WeightedIndex::new(weights)?)
+            }
+            SessionSelection::Hotset9010 => {
+                let hot_count = ((fixture_count as f64) * 0.1).ceil() as usize;
+                let hot_count = hot_count.clamp(1, fixture_count);
+                let cold_count = fixture_count.saturating_sub(hot_count);
+                let weights = (0..fixture_count)
+                    .map(|idx| {
+                        if cold_count == 0 {
+                            1.0
+                        } else if idx < hot_count {
+                            0.9 / hot_count as f64
+                        } else {
+                            0.1 / cold_count as f64
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Some(WeightedIndex::new(weights)?)
+            }
+        };
+        Ok(Self { distribution })
+    }
+
+    fn choose<'a>(&self, fixtures: &'a [FlatSession], rng: &mut StdRng) -> &'a FlatSession {
+        let idx = self
+            .distribution
+            .as_ref()
+            .map(|dist| dist.sample(rng))
+            .unwrap_or_else(|| rng.gen_range(0..fixtures.len()));
+        &fixtures[idx]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Operation {
     AppendOnly,
@@ -1380,6 +1452,8 @@ impl RunArgs {
             warmup: self.warmup.clone(),
             duration: self.duration.clone(),
             fetch_last_n: self.fetch_last_n,
+            session_selection: self.session_selection,
+            zipf_exponent: self.zipf_exponent,
             no_raw_jsonl: self.no_raw_jsonl,
             seed: self.seed,
         }
@@ -3297,6 +3371,16 @@ fn write_markdown_report(
         "- Artifact mode: `{:?}`\n",
         manifest.config.artifact_mode
     ));
+    if let Some(selection) = report
+        .config
+        .get("session_selection")
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("- Session selection: `{selection}`\n"));
+    }
+    if let Some(exponent) = report.config.get("zipf_exponent").and_then(Value::as_f64) {
+        out.push_str(&format!("- Zipf exponent: `{exponent}`\n"));
+    }
     out.push_str(&format!(
         "- Content-engine artifacts: `{}` artifacts, `{}` bytes\n",
         manifest.artifact_stats.content_backend_artifacts,

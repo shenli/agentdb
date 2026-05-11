@@ -4,6 +4,13 @@
 AgentDB, Postgres, and MongoDB. The primary AgentDB backend is
 `agentdb-native-rocksdb`: native HTTP API plus local RocksDB storage.
 
+Treat the current numbers as internal single-node microbenchmarks for
+agent-runtime API shape and hot-path behavior. They are not yet external
+marketing claims about general database performance: the default comparison is
+single-host, in-process-to-localhost, cache-warm, and uses AgentDB's fused
+`append-and-fetch` primitive while the Postgres/MongoDB baselines perform an
+append followed by a fetch.
+
 In this profile, RocksDB stores metadata and indexes. Artifact bytes are written
 through AgentDB's content engine, which is local filesystem in the example
 below. This avoids putting large blobs into RocksDB.
@@ -69,14 +76,25 @@ recovery, a fast path for metadata-only tenant policy JSON, lazy forwarding-body
 serialization on local routes, and larger local RocksDB write buffers/background
 jobs. On `li-dev`, `agentdb-rocks-defaults-mixed-sweep` reached 56.0k ops/s at
 c=32. The same benchmark shape reached 26.2k ops/s on MongoDB and 5.3k ops/s on
-Postgres, so this run is about 2.14x MongoDB and 10.50x Postgres for the
-synthetic mixed agent loop.
+Postgres, so this run is about 2.14x MongoDB and 10.50x Postgres for this
+specific synthetic mixed agent loop. Do not quote those ratios externally
+without also reporting matched durability settings, working-set size versus
+cache, run duration, session-selection distribution, and the fused
+append-and-fetch API shape.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.
 Use `WORKLOAD=record-write-only`, `record-search-only`, `artifact-only`, or
 `fork-only` to isolate the non-append paths that contribute to
 `mixed-agent-loop` latency.
+
+Use `SESSION_SELECTION=uniform`, `SESSION_SELECTION=zipf`, or
+`SESSION_SELECTION=hotset-90-10` to control how workers choose sessions during
+the measured run. `ZIPF_EXPONENT` defaults to `1.2` for Zipfian selection. Use
+hundreds or thousands of sessions for skewed runs; the `smoke` profile is too
+small for meaningful skew sensitivity. See
+`docs/operations/AGENTDB_BENCH.md` for the current short skew-sensitivity
+control run and caveats.
 
 Run the normalized Postgres event-log baseline:
 
@@ -137,6 +155,7 @@ cargo run -p agentdb-bench -- run \
   --out bench-out \
   --workload mixed-agent-loop \
   --concurrency 1,4,16 \
+  --session-selection zipf \
   --warmup 5s \
   --duration 30s
 ```

@@ -15,6 +15,31 @@ The benchmark must be reproducible, transparent, and conservative. Any public
 claim must include the exact schema, hardware, durability setting, workload mix,
 git SHA, and database versions used for the run.
 
+Current status: the `li-dev` numbers are credible internal microbenchmarks for
+the agent-runtime data model, but they should not be used as external
+MongoDB/Postgres performance claims yet. The current headline shape is
+single-node, same-host, cache-warm, short-duration, and API-shape aware:
+AgentDB uses its fused `append-and-fetch` primitive, while MongoDB/Postgres
+baselines perform append and fetch as separate client operations.
+
+Before publishing external ratios, close these benchmark gaps:
+
+- Derive the operation mix from real agent traces, or label it as a heuristic
+  mix and publish the rationale for each operation weight.
+- Add working-set-exceeds-cache profiles and report dataset bytes versus RAM,
+  page cache, and RocksDB block cache.
+- Run a durability matrix: relaxed/dev, durable-single, and quorum/replicated
+  settings with each backend's write concern/fsync semantics stated.
+- Run longer multi-minute cells so RocksDB compaction, Postgres checkpoint, and
+  MongoDB journal/checkpoint tails can appear in p99/max latency.
+- Repeat skewed session selection with publication-grade settings: uniform,
+  Zipfian, and `hotset-90-10` where 10% of sessions receive about 90% of
+  operations.
+- Include noisy-neighbor multi-tenant cells that report tenant-level p99, not
+  only aggregate throughput.
+- Treat current `record_search` as scalar/tag top-K, not semantic retrieval;
+  vector/semantic memory search needs separate cells.
+
 ## Latest `li-dev` Results
 
 These are the current single-node local RocksDB results from `li-dev` after the
@@ -91,9 +116,39 @@ forwarding-body serialization for local session mutations, and opens RocksDB
 with larger local write buffers/background jobs. On `li-dev`, the latest
 same-shape `mixed-agent-loop` c=32 result is 56.0k ops/s for AgentDB, 26.2k
 ops/s for MongoDB, and 5.3k ops/s for Postgres. That is about 2.14x MongoDB and
-10.50x Postgres for this synthetic mixed agent loop. A compact `event_by_id`
-pointer encoding was tested in `agentdb-compact-eventptr-*` runs and rejected
-because it regressed mixed throughput.
+10.50x Postgres for this synthetic mixed agent loop. This ratio is an internal
+single-node microbenchmark result, not an external product claim. A compact
+`event_by_id` pointer encoding was tested in `agentdb-compact-eventptr-*` runs
+and rejected because it regressed mixed throughput.
+
+### Skew Sensitivity Check
+
+The first skew-sensitivity run used `mixed-agent-loop` at c=32 with the same
+dataset shape across backends: 10 tenants, 2 agents per tenant, 50 sessions per
+agent, 3 prepared events per session, 2 records per session, 20% artifact rate,
+3s warmup, and 10s measured duration. This is a short internal control, not a
+publication-grade cell.
+
+| Session selection | AgentDB | MongoDB | Postgres | AgentDB / MongoDB | AgentDB / Postgres | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| `uniform` | 54,900 ops/s | 25,383 ops/s | 9,601 ops/s | 2.16x | 5.72x | Baseline medium fixture set. |
+| `zipf`, exponent `1.2` | 44,224 ops/s | 24,284 ops/s | 2,191 ops/s | 1.82x | 20.18x | AgentDB p99 rose to 5.6ms; Postgres p99 rose to 245ms. Repeat before quoting. |
+| `hotset-90-10` | 56,787 ops/s | 24,967 ops/s | 9,525 ops/s | 2.27x | 5.96x | Hotset spreads load across about 100 hot sessions. |
+
+This cell is useful because it falsifies the simple assumption that AgentDB's
+advantage always grows under skew. Severe Zipfian skew concentrates writes onto
+the earliest sessions in the flattened fixture list and increases per-session
+serialization pressure, so AgentDB's MongoDB ratio shrinks from 2.16x to 1.82x.
+The `hotset-90-10` result is closer to the uniform result because the hot set is
+large enough to keep many session append paths active. MongoDB was comparatively
+stable across these short skew cells, while Postgres showed a large tail-latency
+regression under Zipfian skew.
+
+The current selector applies skew across the flattened tenant-agent-session
+fixture list, so the heaviest sessions land mostly in the first tenant. That is
+acceptable for single-node storage-path sensitivity, but not for a noisy-neighbor
+claim. The noisy-neighbor benchmark should apply hot-session skew independently
+per tenant and report tenant-level throughput and p99.
 
 ## Questions To Answer
 
@@ -310,6 +365,7 @@ agentdb-bench run \
   --backend agentdb-native-rocksdb \
   --workload mixed_agent_loop \
   --concurrency 1,4,16,64 \
+  --session-selection zipf \
   --warmup 15s \
   --duration 60s \
   --out bench-out/
@@ -338,6 +394,23 @@ Dataset knobs:
 | `--artifact-mode` | `reference`, `content-backend`, or `mixed`; `content-backend` writes bytes through AgentDB's content engine, not RocksDB. |
 | `--forks-per-parent` | Number of prepared child branches per selected parent session. |
 | `--seed` | Deterministic data generation seed. |
+
+Run knobs:
+
+| Parameter | Meaning |
+|---|---|
+| `--session-selection` | `uniform`, `zipf`, or `hotset-90-10` fixture selection during the measured run. Use skewed modes for publishable comparisons. |
+| `--zipf-exponent` | Zipfian skew exponent for `--session-selection zipf`; default is `1.2`. |
+| `--fetch-last-n` | Tail size returned by append/fetch and fetch-recent operations. |
+| `--warmup` / `--duration` | Warmup and measured windows. Public comparisons should use multi-minute measured windows. |
+
+Skewed session selection is only meaningful with a sufficiently large fixture
+set. The `smoke` profile has too few sessions to exercise Zipfian or hotset
+behavior; use `default-agent-runtime` or explicit overrides with hundreds to
+thousands of sessions. Current skew is applied across the flattened
+tenant-agent-session fixture list, so multi-tenant noisy-neighbor studies need
+a later tenant-aware selector that applies hot-session skew independently per
+tenant and reports tenant-level p99.
 
 Predefined profiles should be thin wrappers around these parameters:
 
