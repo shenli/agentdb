@@ -45,14 +45,17 @@ directory, usually
 for larger local runs.
 
 The latest AgentDB MongoDB API mixed result includes the narrower
-`agentdbFetchRecent` command for tail reads. Native HTTP now also has
-env-gated append group commit (`AGENTDB_APPEND_GROUP_COMMIT_US=1`) that
-coalesces queued RocksDB append writes under contention while keeping
-read-after-write semantics. This improves append-heavy c=32 throughput to about
-28k ops/s on `li-dev`; the mixed c=32 run is still about 24k ops/s, so the next
-performance work is HTTP JSON/serde/allocation cost, non-append write paths, and
-runtime/tablet
-concurrency, not only MongoDB wire-protocol tuning.
+`agentdbFetchRecent` command for tail reads. Native HTTP now also uses adaptive
+append group commit by default; set `AGENTDB_APPEND_GROUP_COMMIT=0` to disable
+it. The group writer coalesces queued RocksDB append writes under contention
+while keeping read-after-write semantics. This improves append-heavy c=32
+throughput to about 28k ops/s on `li-dev`; the mixed c=32 run is still about
+24k ops/s, so the next performance work is HTTP JSON/serde/allocation cost,
+non-append write paths, and runtime/tablet concurrency, not only MongoDB
+wire-protocol tuning.
+
+Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
+the tail-read/context serialization included in `append-fetch-hot`.
 
 Run the normalized Postgres event-log baseline:
 

@@ -165,15 +165,16 @@ struct AppendWriteRequest {
 
 impl AppendWriteBatcher {
     fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
-        let _enabled = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)?;
+        if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT")
+            || env_zero("AGENTDB_APPEND_GROUP_COMMIT_US")
+        {
+            return None;
+        }
         let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(1024);
+            .unwrap_or(4096);
         Some(Arc::new(Self::new(kv, max_ops)))
     }
 
@@ -221,6 +222,22 @@ impl AppendWriteBatcher {
         rx.await
             .map_err(|_| StorageError::Other("append group commit worker dropped result".into()))?
     }
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "0" | "false" | "off" | "disabled")
+        })
+        .unwrap_or(false)
+}
+
+fn env_zero(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        == Some(0)
 }
 
 fn append_group_commit_loop(

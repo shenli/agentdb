@@ -58,13 +58,13 @@ preserving read-after-write semantics: each caller still awaits the RocksDB
 batch that contains its append before returning. A fixed wait window improved
 high-concurrency throughput but hurt c=1 badly, so the implementation uses an
 adaptive fast path: direct write when there is no queue/active writer, queued
-group write when contention exists. With this enabled via
-`AGENTDB_APPEND_GROUP_COMMIT_US=1`, append-fetch c=32 reaches roughly 28.0k
-ops/s and mixed c=16 reaches roughly 25.5k ops/s. Mixed c=32 is still around
-24.2k ops/s versus MongoDB's earlier 25.6k ops/s, so AgentDB is not yet 2x
-faster on this synthetic mixed workload. The next bottleneck is broader HTTP
-JSON/serde/allocation cost and non-append write paths, not just RocksDB append
-write amplification.
+group write when contention exists. Adaptive grouping is enabled by default and
+can be disabled with `AGENTDB_APPEND_GROUP_COMMIT=0`. With grouping enabled,
+append-fetch c=32 reaches roughly 28.0k ops/s and mixed c=16 reaches roughly
+25.5k ops/s. Mixed c=32 is still around 24.2k ops/s versus MongoDB's earlier
+25.6k ops/s, so AgentDB is not yet 2x faster on this synthetic mixed workload.
+The next bottleneck is broader HTTP JSON/serde/allocation cost and non-append
+write paths, not just RocksDB append write amplification.
 
 ## Questions To Answer
 
@@ -228,6 +228,7 @@ history, records, and artifacts before a measured `run` phase.
 
 | Workload | Operation Shape | Why It Matters |
 |---|---|---|
+| `append_only` | Append a message/tool event and return only the append acknowledgement. | Isolates write sequencing, durability, and index-update cost from tail-read/context serialization. |
 | `append_fetch_hot` | Append a message/tool event, then fetch the latest N events from the same session. | Main agent runtime loop. Measures read-after-write in the same client/session. |
 | `long_context_resume` | Load sessions with 100, 1k, 10k, and 100k events, then fetch recent context and selected checkpoints. | Agents often resume long-running tasks. Full-history scans should not be required. |
 | `fork_branch` | Create branches from a parent session at a sequence number, append divergent events, then read parent and child context. | Agent planning, retries, and speculative execution need cheap branching. |
