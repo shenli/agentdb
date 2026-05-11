@@ -42,15 +42,27 @@ forensics, but they should not be the first thing a benchmark reader sees.
 
 | Cell | Shape | AgentDB | MongoDB | Postgres | Ratio |
 |---|---|---:|---:|---:|---|
-| Mixed loop, uniform | c=32, short single run, local single node | 56.0k ops/s | 26.2k ops/s | 5.3k ops/s | 2.14x MongoDB, 10.50x Postgres |
-| Mixed loop, Zipf-1.2 | c=32, 3 seeds, 60s measured windows | 43.2k ops/s | 26.0k ops/s | 2.2k ops/s | 1.66x MongoDB, 19.84x Postgres |
+| Mixed loop, uniform | c=32, short single run, local single node, dev-fast | 56.0k ops/s | 26.2k ops/s | 5.3k ops/s | 2.14x MongoDB, 10.50x Postgres |
+| Mixed loop, Zipf-1.2 | c=32, 3 seeds, 60s measured windows, dev-fast | 43.2k ops/s | 26.0k ops/s | 2.2k ops/s | 1.66x MongoDB, 19.84x Postgres |
 
 Interpret these as internal single-node benchmark cells, not product claims.
 The AgentDB API uses a fused `append-and-fetch` primitive; MongoDB and Postgres
-perform append and fetch as separate client operations. Publication-quality
-numbers still need matched durability, working-set-exceeds-cache profiles,
-tenant-aware noisy-neighbor cells, and multi-minute runs across more workload
-shapes.
+perform append and fetch as separate client operations. These two rows are
+hot-path engineering cells, not matched-durability claims.
+
+The first matched durable-single sanity run tells a different story:
+
+| Cell | Shape | AgentDB | MongoDB | Postgres | Result |
+|---|---|---:|---:|---:|---|
+| Mixed loop, Zipf-1.2, durable-single | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
+
+That durable-single result uses RocksDB sync writes with safe append group
+commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is
+a single sanity cell, not a final comparison, but it shows the next performance
+work should instrument and optimize the durable append path before making any
+external performance claim. Publication-quality numbers still need repeated
+durable runs, working-set-exceeds-cache profiles, tenant-aware noisy-neighbor
+cells, and multi-minute runs across more workload shapes.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.
@@ -65,6 +77,12 @@ hundreds or thousands of sessions for skewed runs; the `smoke` profile is too
 small for meaningful skew sensitivity. See
 `docs/operations/AGENTDB_BENCH.md` for the current short skew-sensitivity
 control run and caveats.
+
+Use `DURABILITY_PROFILE=dev-fast`, `durable-single`, or `strict-fsync` to make
+durability explicit in wrapper scripts. `durable-single` enables durable local
+sync writes while preserving safe append group commit. `strict-fsync` disables
+append group commit to expose per-operation fsync cost and should be treated as
+a stress profile, not the default comparison.
 
 Use `scripts/agentdb-bench-repeat.sh` to run clean per-seed repeats and produce
 an aggregate summary:
