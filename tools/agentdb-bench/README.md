@@ -35,15 +35,23 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s |
 | `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s |
 | `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
+| `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s |
+| `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 
-The detailed reports are stored on `li-dev` under
-`/home/lishen/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`.
+The detailed reports are stored on `li-dev` under the run-specific `OUT`
+directory, usually
+`/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`
+for larger local runs.
 
 The latest AgentDB MongoDB API mixed result includes the narrower
-`agentdbFetchRecent` command for tail reads. That removes most of the previous
-adapter overhead, but the remaining high-concurrency gap versus MongoDB is still
-visible in native HTTP too; the next performance work is runtime/tablet
+`agentdbFetchRecent` command for tail reads. Native HTTP now also has
+env-gated append group commit (`AGENTDB_APPEND_GROUP_COMMIT_US=1`) that
+coalesces queued RocksDB append writes under contention while keeping
+read-after-write semantics. This improves append-heavy c=32 throughput to about
+28k ops/s on `li-dev`; the mixed c=32 run is still about 24k ops/s, so the next
+performance work is HTTP JSON/serde/allocation cost, non-append write paths, and
+runtime/tablet
 concurrency, not only MongoDB wire-protocol tuning.
 
 Run the normalized Postgres event-log baseline:

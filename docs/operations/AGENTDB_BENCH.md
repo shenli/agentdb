@@ -18,11 +18,11 @@ git SHA, and database versions used for the run.
 ## Latest `li-dev` Results
 
 These are the current single-node local RocksDB results from `li-dev` after the
-append-path lock narrowing and MongoDB-API recent-fetch changes in this PR. They
-use release binaries, local RocksDB metadata/index storage, local filesystem content storage,
-`PROFILE=default-agent-runtime`, 1 tenant, 1 agent, 320 sessions, 8 seeded
-events per session, 1 seeded record per session, `FETCH_LAST_N=8`, 3s warmup,
-and 8s measured duration.
+append-path lock narrowing, MongoDB-API recent-fetch changes, and append
+group-commit profiling/fixes in this PR. They use release binaries, local
+RocksDB metadata/index storage, local filesystem content storage, 1 tenant, 1
+agent, 16-320 sessions depending on the run, 3s warmup, and 8s measured
+duration.
 
 | Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 | Report |
 |---|---|---:|---:|---:|---:|---:|---|
@@ -30,6 +30,8 @@ and 8s measured duration.
 | `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-native-single-mixed-v2/runs/agentdb-native-single-mixed-v2/report.md` |
 | `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-append/runs/agentdb-mongodb-api-append/report.md` |
 | `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-single-mixed-v2/runs/agentdb-mongodb-api-single-mixed-v2/report.md` |
+| `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-append-sweep/runs/agentdb-adaptive-group-append-sweep/report.md` |
+| `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-mixed/runs/agentdb-adaptive-group-mixed/report.md` |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
@@ -44,16 +46,25 @@ tail-read operation. That raises the mixed workload from roughly 1.3k ops/s to
 roughly 12.5k ops/s at c=32, proving the original bad MongoDB-API result was
 partly adapter overhead.
 
-The remaining gap is not only the MongoDB wire layer. Native HTTP reaches
-roughly 17.4k ops/s at c=32 while the standalone MongoDB event-log baseline
-reaches roughly 25.6k ops/s on the same synthetic mixed workload. The likely
-AgentDB bottleneck for this local profile is the single runtime/server
-concurrency path: one in-process runtime state, session/event mutations that
-still coordinate through shared state, and one local RocksDB/log durability
-path. A quick local multi-tablet experiment did not improve this profile because
-the current runtime still rehydrates and indexes through a shared global state;
-it should become a separate cluster/tablet design task, not part of the current
-benchmark comparison PR.
+The remaining gap is not only the MongoDB wire layer. Perf and app-level timing
+showed native HTTP's persistent append path was dominated by the synchronous
+RocksDB `write_batch`: append record construction averaged roughly 4us, while
+the RocksDB write averaged roughly 140-157us before grouping. Blind RocksDB
+write-buffer tuning and a compact session-head experiment did not improve the
+profile and were reverted.
+
+Append group commit now coalesces queued append writes under contention while
+preserving read-after-write semantics: each caller still awaits the RocksDB
+batch that contains its append before returning. A fixed wait window improved
+high-concurrency throughput but hurt c=1 badly, so the implementation uses an
+adaptive fast path: direct write when there is no queue/active writer, queued
+group write when contention exists. With this enabled via
+`AGENTDB_APPEND_GROUP_COMMIT_US=1`, append-fetch c=32 reaches roughly 28.0k
+ops/s and mixed c=16 reaches roughly 25.5k ops/s. Mixed c=32 is still around
+24.2k ops/s versus MongoDB's earlier 25.6k ops/s, so AgentDB is not yet 2x
+faster on this synthetic mixed workload. The next bottleneck is broader HTTP
+JSON/serde/allocation cost and non-append write paths, not just RocksDB append
+write amplification.
 
 ## Questions To Answer
 
