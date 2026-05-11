@@ -152,7 +152,10 @@ fn write_ops_size(ops: &[WriteOp]) -> usize {
 }
 
 struct AppendWriteBatcher {
+    kv: Arc<dyn KvStore + Send + Sync>,
     tx: mpsc::Sender<AppendWriteRequest>,
+    queued: Arc<AtomicU64>,
+    writer_busy: Arc<AtomicU64>,
 }
 
 struct AppendWriteRequest {
@@ -176,17 +179,45 @@ impl AppendWriteBatcher {
 
     fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize) -> Self {
         let (tx, rx) = mpsc::channel::<AppendWriteRequest>();
+        let queued = Arc::new(AtomicU64::new(0));
+        let writer_busy = Arc::new(AtomicU64::new(0));
         let _ = thread::Builder::new()
             .name("agentdb-append-group-commit".into())
-            .spawn(move || append_group_commit_loop(kv, rx, max_ops));
-        Self { tx }
+            .spawn({
+                let kv = kv.clone();
+                let queued = queued.clone();
+                let writer_busy = writer_busy.clone();
+                move || append_group_commit_loop(kv, rx, queued, writer_busy, max_ops)
+            });
+        Self {
+            kv,
+            tx,
+            queued,
+            writer_busy,
+        }
     }
 
     async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        if self.queued.load(Ordering::Relaxed) == 0
+            && self
+                .writer_busy
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let result = self.kv.write_batch(ops);
+            self.writer_busy.store(0, Ordering::Release);
+            return result;
+        }
+
         let (done, rx) = tokio::sync::oneshot::channel();
+        self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
             .send(AppendWriteRequest { ops, done })
-            .map_err(|_| StorageError::Other("append group commit worker stopped".into()))?;
+            .map_err(|request| {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                drop(request);
+                StorageError::Other("append group commit worker stopped".into())
+            })?;
         rx.await
             .map_err(|_| StorageError::Other("append group commit worker dropped result".into()))?
     }
@@ -195,15 +226,19 @@ impl AppendWriteBatcher {
 fn append_group_commit_loop(
     kv: Arc<dyn KvStore + Send + Sync>,
     rx: mpsc::Receiver<AppendWriteRequest>,
+    queued: Arc<AtomicU64>,
+    writer_busy: Arc<AtomicU64>,
     max_ops: usize,
 ) {
     while let Ok(first) = rx.recv() {
         let mut requests = vec![first];
+        queued.fetch_sub(1, Ordering::Relaxed);
         let mut op_count = requests[0].ops.len();
 
         while op_count < max_ops {
             match rx.try_recv() {
                 Ok(request) => {
+                    queued.fetch_sub(1, Ordering::Relaxed);
                     op_count += request.ops.len();
                     requests.push(request);
                 }
@@ -219,7 +254,14 @@ fn append_group_commit_loop(
             completions.push(request.done);
         }
 
+        while writer_busy
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            thread::yield_now();
+        }
         let result = kv.write_batch(ops);
+        writer_busy.store(0, Ordering::Release);
         for done in completions {
             let send_result = match &result {
                 Ok(()) => Ok(()),
