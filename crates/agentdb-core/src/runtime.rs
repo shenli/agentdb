@@ -55,7 +55,6 @@ use crate::tablet_state::{
 use crate::tenant::{NewTenant, Tenant};
 
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
-const RUNTIME_ALL_TABLETS_CONTEXT_ID: i64 = i64::MIN;
 
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
@@ -719,9 +718,6 @@ impl RuntimeTabletRouterKvStore {
         let Some(tablet_id) = Self::current_tablet_id() else {
             return Ok(None);
         };
-        if tablet_id == RUNTIME_ALL_TABLETS_CONTEXT_ID {
-            return Ok(None);
-        }
         if self
             .tablets
             .read()
@@ -1779,18 +1775,6 @@ impl Runtime {
     }
 
     async fn rehydrate_from_persist(&self) -> Result<()> {
-        if self.tablet_router.is_some() {
-            return CURRENT_RUNTIME_TABLET_ID
-                .scope(
-                    RUNTIME_ALL_TABLETS_CONTEXT_ID,
-                    self.rehydrate_from_all_persisted_tablets(),
-                )
-                .await;
-        }
-        self.rehydrate_from_all_persisted_tablets().await
-    }
-
-    async fn rehydrate_from_all_persisted_tablets(&self) -> Result<()> {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
