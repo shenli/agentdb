@@ -18,7 +18,7 @@ COMPOSE_DIR="${ROOT}/benchmarks/postgres"
 
 if [[ -z "${PG_DSN:-}" ]]; then
   case "${DURABILITY_PROFILE}" in
-    durable-single | durable-grouped | durable-quorum)
+    durable-single | durable-grouped | durable-quorum | strict-fsync)
       PG_SYNCHRONOUS_COMMIT="${PG_SYNCHRONOUS_COMMIT:-on}"
       ;;
     dev-fast)

@@ -46,10 +46,13 @@ agentdb_server_env=()
 case "${DURABILITY_PROFILE}" in
   durable-single)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
-    agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
     ;;
   durable-grouped)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    ;;
+  strict-fsync)
+    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
     ;;
   dev-fast)
     ;;

@@ -42,13 +42,17 @@ fi
 agentdb_server_env=()
 case "${DURABILITY_PROFILE}" in
   durable-single)
-    # Match a single-node durable commit: each append batch reaches RocksDB with
-    # sync writes enabled, and adaptive append grouping is disabled.
+    # Match a single-node durable commit: every returned append has reached a
+    # synced RocksDB batch. Adaptive grouping may still coalesce concurrent
+    # callers before returning, similar to database WAL/journal group commit.
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
-    agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
     ;;
   durable-grouped)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    ;;
+  strict-fsync)
+    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
     ;;
   dev-fast)
     ;;

@@ -20,7 +20,7 @@ MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
 
 if [[ -z "${MONGO_URI:-}" ]]; then
   case "${DURABILITY_PROFILE}" in
-    durable-single | durable-grouped | durable-quorum)
+    durable-single | durable-grouped | durable-quorum | strict-fsync)
       MONGO_URI="mongodb://127.0.0.1:${MONGO_PORT}/?journal=true&w=1"
       ;;
     dev-fast)
