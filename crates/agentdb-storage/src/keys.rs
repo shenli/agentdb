@@ -25,6 +25,10 @@ pub fn session_record_key(tenant_id: &str, session_id: &str) -> String {
     format!("record/session/{tenant_id}/{session_id}")
 }
 
+pub fn session_head_key(tenant_id: &str, session_id: &str) -> String {
+    format!("record/session_head/{tenant_id}/{session_id}")
+}
+
 pub fn session_alias_key(tenant_id: &str, alias: &str) -> String {
     format!("record/session_alias/{tenant_id}/{alias}")
 }

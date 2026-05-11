@@ -992,7 +992,16 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
     for a in persist.scan_all_agents().expect("hydrate agents") {
         state.agents.insert(a.agent_id.as_str().to_string(), a);
     }
+    let mut session_heads: BTreeMap<String, crate::persist::SessionHeadRecord> = persist
+        .scan_all_session_heads()
+        .expect("hydrate session heads")
+        .into_iter()
+        .map(|(_, session_id, head)| (session_id, head))
+        .collect();
     for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
+        if let Some(head) = session_heads.remove(s.session_id.as_str()) {
+            head.apply_to_session(&mut s);
+        }
         // Reconcile next_seq against persisted events.
         let max_seq = persist
             .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())

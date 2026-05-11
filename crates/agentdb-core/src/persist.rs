@@ -28,7 +28,7 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::keys::{
     agent_alias_key, agent_record_key, agent_skill_binding_key, artifact_by_sha256_key,
     artifact_record_key, event_by_id_key, event_key, record_by_namespace_key, record_commit_key,
-    record_index_outbox_key, record_key, session_alias_key, session_record_key,
+    record_index_outbox_key, record_key, session_alias_key, session_head_key, session_record_key,
     session_segment_key, skill_record_key, skill_unique_key, tenant_alias_key, tenant_record_key,
 };
 use agentdb_storage::Error as StorageError;
@@ -43,7 +43,7 @@ use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
 use crate::segment::SessionSegment;
-use crate::session::Session;
+use crate::session::{Lifecycle, Session};
 use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
@@ -62,6 +62,35 @@ pub(crate) struct RecordIndexMutation {
     pub record_id: String,
     pub commit_seq: u64,
     pub op: RecordIndexMutationOp,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct SessionHeadRecord {
+    pub next_seq: u64,
+    pub lifecycle: Lifecycle,
+    pub warm_head_from_seq: u64,
+    pub last_active_at_ms: u64,
+    pub policy_version: u64,
+}
+
+impl SessionHeadRecord {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            next_seq: session.next_seq,
+            lifecycle: session.lifecycle,
+            warm_head_from_seq: session.warm_head_from_seq,
+            last_active_at_ms: session.last_active_at_ms,
+            policy_version: session.policy_version,
+        }
+    }
+
+    pub(crate) fn apply_to_session(self, session: &mut Session) {
+        session.next_seq = session.next_seq.max(self.next_seq);
+        session.lifecycle = self.lifecycle;
+        session.warm_head_from_seq = self.warm_head_from_seq.min(session.next_seq);
+        session.last_active_at_ms = session.last_active_at_ms.max(self.last_active_at_ms);
+        session.policy_version = session.policy_version.max(self.policy_version);
+    }
 }
 
 fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {
@@ -273,10 +302,15 @@ impl Persist {
     }
 
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
         ops.push(WriteOp::Put {
             key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
             value: serde_json::to_vec(s).expect("session serializes"),
+        });
+        ops.push(WriteOp::Put {
+            key: session_head_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(&SessionHeadRecord::from_session(s))
+                .expect("session head serializes"),
         });
         if let Some(alias) = s.alias.as_deref() {
             if !alias.is_empty() {
@@ -302,9 +336,12 @@ impl Persist {
     }
 
     pub fn delete_session(&self, s: &Session) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
         ops.push(WriteOp::Delete {
             key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
+        });
+        ops.push(WriteOp::Delete {
+            key: session_head_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
         });
         if let Some(alias) = s.alias.as_deref() {
             if !alias.is_empty() {
@@ -404,10 +441,11 @@ impl Persist {
             key: ek.into_bytes(),
             value: event_value,
         });
-        let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
         ops.push(WriteOp::Put {
-            key: sk.into_bytes(),
-            value: serde_json::to_vec(session).expect("session serializes"),
+            key: session_head_key(session.tenant_id.as_str(), session.session_id.as_str())
+                .into_bytes(),
+            value: serde_json::to_vec(&SessionHeadRecord::from_session(session))
+                .expect("session head serializes"),
         });
         // Secondary index: event_by_id -> {session_id, seq}. Lets a caller
         // look up an event by its event_id without scanning the session.
@@ -540,6 +578,23 @@ impl Persist {
             let (_k, v) = res?;
             let s: Session = serde_json::from_slice(&v).expect("session decodes");
             out.push(s);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_all_session_heads(&self) -> KvResult<Vec<(String, String, SessionHeadRecord)>> {
+        let prefix = b"record/session_head/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix =
+                std::str::from_utf8(&k[prefix.len()..]).expect("session head key suffix is utf8");
+            let mut split = suffix.splitn(2, '/');
+            let tenant_id = split.next().expect("tenant_id segment").to_string();
+            let session_id = split.next().expect("session_id segment").to_string();
+            let head: SessionHeadRecord = serde_json::from_slice(&v).expect("session head decodes");
+            out.push((tenant_id, session_id, head));
         }
         Ok(out)
     }
