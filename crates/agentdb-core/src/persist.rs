@@ -790,6 +790,57 @@ impl Persist {
         result
     }
 
+    pub async fn append_many_batch_async(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(profile) = append_persist_profile() else {
+            let ops = self.append_many_batch_ops(events, session)?;
+            if let Some(batcher) = &self.adaptive_write_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_many_batch_ops(events, session)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
+    }
+
+    fn append_many_batch_ops(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<Vec<WriteOp>> {
+        let mut ops = Vec::with_capacity(events.len() * 2 + usize::from(session.is_some()));
+        for event in events {
+            ops.extend(self.append_batch_ops(event, None, None)?);
+        }
+        if let Some(session) = session {
+            ops.push(WriteOp::Put {
+                key: session_record_key(session.tenant_id.as_str(), session.session_id.as_str())
+                    .into_bytes(),
+                value: serde_json::to_vec(session).expect("session serializes"),
+            });
+        }
+        Ok(ops)
+    }
+
     pub(crate) fn append_batch_ops(
         &self,
         event: &EventEnvelope,

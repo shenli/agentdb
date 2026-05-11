@@ -11,7 +11,7 @@
 //! together. With KV this is implemented via `KvStore::write_batch`; with
 //! in-memory it's the state mutex.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 use agentdb_index::doc_id::DocId;
 use agentdb_index::text::{InMemoryInverted, TextIndex};
@@ -61,6 +61,8 @@ pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
 const PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
 
 static APPEND_PATH_PROFILE: OnceLock<Option<AppendPathProfile>> = OnceLock::new();
+static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalesceProfile>> =
+    OnceLock::new();
 
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
@@ -89,6 +91,30 @@ struct AppendPathProfile {
     durable_write_nanos: AtomicU64,
     update_state_lock_wait_nanos: AtomicU64,
     update_state_work_nanos: AtomicU64,
+    total_nanos: AtomicU64,
+}
+
+#[derive(Default)]
+struct SessionAppendCoalesceSample {
+    jobs: usize,
+    events: usize,
+    lock_wait_nanos: u128,
+    prepare_nanos: u128,
+    durable_write_nanos: u128,
+    update_state_nanos: u128,
+    total_nanos: u128,
+}
+
+struct SessionAppendCoalesceProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    batches: AtomicU64,
+    jobs: AtomicU64,
+    events: AtomicU64,
+    lock_wait_nanos: AtomicU64,
+    prepare_nanos: AtomicU64,
+    durable_write_nanos: AtomicU64,
+    update_state_nanos: AtomicU64,
     total_nanos: AtomicU64,
 }
 
@@ -182,9 +208,86 @@ impl AppendPathProfile {
     }
 }
 
+impl SessionAppendCoalesceProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_APPEND_PATH_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(crate::now_ms()),
+            batches: AtomicU64::new(0),
+            jobs: AtomicU64::new(0),
+            events: AtomicU64::new(0),
+            lock_wait_nanos: AtomicU64::new(0),
+            prepare_nanos: AtomicU64::new(0),
+            durable_write_nanos: AtomicU64::new(0),
+            update_state_nanos: AtomicU64::new(0),
+            total_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn record(&self, sample: SessionAppendCoalesceSample) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.jobs.fetch_add(sample.jobs as u64, Ordering::Relaxed);
+        self.events
+            .fetch_add(sample.events as u64, Ordering::Relaxed);
+        add_nanos(&self.lock_wait_nanos, sample.lock_wait_nanos);
+        add_nanos(&self.prepare_nanos, sample.prepare_nanos);
+        add_nanos(&self.durable_write_nanos, sample.durable_write_nanos);
+        add_nanos(&self.update_state_nanos, sample.update_state_nanos);
+        add_nanos(&self.total_nanos, sample.total_nanos);
+
+        let now = crate::now_ms();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let batches = self.batches.swap(0, Ordering::Relaxed);
+        if batches == 0 {
+            return;
+        }
+        let jobs = self.jobs.swap(0, Ordering::Relaxed);
+        let events = self.events.swap(0, Ordering::Relaxed);
+        let lock_wait_nanos = self.lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let prepare_nanos = self.prepare_nanos.swap(0, Ordering::Relaxed);
+        let durable_write_nanos = self.durable_write_nanos.swap(0, Ordering::Relaxed);
+        let update_state_nanos = self.update_state_nanos.swap(0, Ordering::Relaxed);
+        let total_nanos = self.total_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            batches,
+            jobs,
+            events,
+            avg_jobs_per_batch = jobs as f64 / batches as f64,
+            avg_events_per_batch = events as f64 / batches as f64,
+            avg_lock_wait_us = avg_us(lock_wait_nanos, batches),
+            avg_prepare_us = avg_us(prepare_nanos, batches),
+            avg_durable_write_us = avg_us(durable_write_nanos, batches),
+            avg_update_state_us = avg_us(update_state_nanos, batches),
+            avg_total_us = avg_us(total_nanos, batches),
+            "session append coalesce profile"
+        );
+    }
+}
+
 fn append_path_profile() -> Option<&'static AppendPathProfile> {
     APPEND_PATH_PROFILE
         .get_or_init(AppendPathProfile::from_env)
+        .as_ref()
+}
+
+fn session_append_coalesce_profile() -> Option<&'static SessionAppendCoalesceProfile> {
+    SESSION_APPEND_COALESCE_PROFILE
+        .get_or_init(SessionAppendCoalesceProfile::from_env)
         .as_ref()
 }
 
@@ -194,6 +297,15 @@ fn add_nanos(counter: &AtomicU64, nanos: u128) {
 
 fn avg_us(total_nanos: u64, calls: u64) -> f64 {
     total_nanos as f64 / calls.max(1) as f64 / 1_000.0
+}
+
+fn env_flag_disabled_runtime(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "0" | "false" | "off" | "disabled")
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +775,7 @@ fn priority_rank(p: Priority) -> u8 {
 pub struct Runtime {
     state: Mutex<State>,
     session_commit_locks: StdMutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    session_append_queues: StdMutex<BTreeMap<String, Weak<SessionAppendQueue>>>,
     idem: IdempotencyStore,
     persist: Option<Persist>,
     content: Arc<dyn ContentBackend>,
@@ -685,6 +798,32 @@ pub struct Runtime {
     vector_index: StdMutex<HnswVectorIndex>,
     global_record_index: Arc<dyn GlobalRecordIndex>,
     tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
+}
+
+struct SessionAppendQueue {
+    inner: Mutex<SessionAppendQueueState>,
+}
+
+#[derive(Default)]
+struct SessionAppendQueueState {
+    running: bool,
+    jobs: VecDeque<SimpleAppendJob>,
+}
+
+struct SimpleAppendJob {
+    req: AppendRequest,
+    fetch_recent: Option<usize>,
+    context_max_bytes: Option<usize>,
+    done: oneshot::Sender<Result<AppendCommitResponse>>,
+}
+
+struct PreparedSimpleAppend {
+    tenant_id: Id,
+    envelope: EventEnvelope,
+    appended: AppendResponse,
+    policy: RuntimePolicy,
+    session_after_append: Session,
+    fetch_recent: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1543,6 +1682,7 @@ impl Runtime {
         Arc::new(Self {
             state: Mutex::new(State::default()),
             session_commit_locks: StdMutex::new(BTreeMap::new()),
+            session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1559,6 +1699,7 @@ impl Runtime {
         Arc::new(Self {
             state: Mutex::new(State::default()),
             session_commit_locks: StdMutex::new(BTreeMap::new()),
+            session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1578,6 +1719,7 @@ impl Runtime {
         Arc::new(Self {
             state: Mutex::new(State::default()),
             session_commit_locks: StdMutex::new(BTreeMap::new()),
+            session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
             persist: None,
             content: Arc::new(InMemoryContentBackend::default()),
@@ -1742,6 +1884,7 @@ impl Runtime {
         Arc::new(Self {
             state: Mutex::new(hydration.state),
             session_commit_locks: StdMutex::new(BTreeMap::new()),
+            session_append_queues: StdMutex::new(BTreeMap::new()),
             idem,
             persist: Some(persist),
             content,
@@ -1776,6 +1919,25 @@ impl Runtime {
             locks.retain(|_, lock| lock.strong_count() > 0);
         }
         lock
+    }
+
+    fn session_append_queue(&self, session_id: &Id) -> Arc<SessionAppendQueue> {
+        let mut queues = self
+            .session_append_queues
+            .lock()
+            .expect("session append queue map poisoned");
+        let key = session_id.as_str().to_string();
+        if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
+            return queue;
+        }
+        let queue = Arc::new(SessionAppendQueue {
+            inner: Mutex::new(SessionAppendQueueState::default()),
+        });
+        queues.insert(key, Arc::downgrade(&queue));
+        if queues.len() > 4096 {
+            queues.retain(|_, queue| queue.strong_count() > 0);
+        }
+        queue
     }
 
     pub fn export_tablet_snapshot_payload(&self, tablet_id: i64) -> Result<Vec<u8>> {
@@ -4515,6 +4677,381 @@ impl Runtime {
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
     ) -> Result<AppendCommitResponse> {
+        if self.simple_append_coalescing_allowed(
+            &req,
+            resolved_policy.as_ref(),
+            fetch_recent,
+            context_max_bytes,
+        ) {
+            return self
+                .append_with_simple_session_coalescing(req, fetch_recent, context_max_bytes)
+                .await;
+        }
+        self.append_with_policy_direct(req, resolved_policy, fetch_recent, context_max_bytes)
+            .await
+    }
+
+    fn simple_append_coalescing_allowed(
+        &self,
+        req: &AppendRequest,
+        resolved_policy: Option<&RuntimePolicy>,
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+    ) -> bool {
+        self.persist.is_some()
+            && resolved_policy.is_none()
+            && fetch_recent.is_some()
+            && context_max_bytes.is_some()
+            && req.idempotency_key.is_none()
+            && req.artifact_refs.is_empty()
+            && req.source_refs.is_empty()
+            && req.kind != "skill_used"
+            && !env_flag_disabled_runtime("AGENTDB_SESSION_APPEND_COALESCE")
+    }
+
+    async fn append_with_simple_session_coalescing(
+        &self,
+        req: AppendRequest,
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+    ) -> Result<AppendCommitResponse> {
+        let queue = self.session_append_queue(&req.session_id);
+        let (done, rx) = oneshot::channel();
+        let mut start_runner = false;
+        {
+            let mut state = queue.inner.lock().await;
+            state.jobs.push_back(SimpleAppendJob {
+                req,
+                fetch_recent,
+                context_max_bytes,
+                done,
+            });
+            if !state.running {
+                state.running = true;
+                start_runner = true;
+            }
+        }
+
+        if start_runner {
+            self.run_simple_append_queue(queue).await;
+        }
+
+        rx.await.map_err(|_| {
+            Error::new(
+                ErrorCode::Internal,
+                "session append coalescer dropped response",
+            )
+        })?
+    }
+
+    async fn run_simple_append_queue(&self, queue: Arc<SessionAppendQueue>) {
+        let max_batch = std::env::var("AGENTDB_SESSION_APPEND_BATCH_MAX")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        loop {
+            let mut jobs = Vec::new();
+            {
+                let mut state = queue.inner.lock().await;
+                while jobs.len() < max_batch {
+                    let Some(job) = state.jobs.pop_front() else {
+                        break;
+                    };
+                    jobs.push(job);
+                }
+                if jobs.is_empty() {
+                    state.running = false;
+                    if state.jobs.is_empty() {
+                        return;
+                    }
+                    state.running = true;
+                    continue;
+                }
+            }
+            self.process_simple_append_batch(jobs).await;
+        }
+    }
+
+    async fn process_simple_append_batch(&self, jobs: Vec<SimpleAppendJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        let coalesce_profile = session_append_coalesce_profile();
+        let total_started = coalesce_profile.map(|_| Instant::now());
+        let mut coalesce_sample = SessionAppendCoalesceSample {
+            jobs: jobs.len(),
+            ..SessionAppendCoalesceSample::default()
+        };
+        let session_id = jobs[0].req.session_id.clone();
+        let session_commit_lock = self.session_commit_lock(&session_id);
+        let lock_wait_started = coalesce_profile.map(|_| Instant::now());
+        let _session_commit_guard = session_commit_lock.lock().await;
+        if let Some(started) = lock_wait_started {
+            coalesce_sample.lock_wait_nanos = started.elapsed().as_nanos();
+        }
+
+        if let Err(err) = self.refresh_replicated_state().await {
+            for job in jobs {
+                let _ = job.done.send(Err(err.clone()));
+            }
+            return;
+        }
+
+        let mut prepared = Vec::with_capacity(jobs.len());
+        let mut final_session_snapshot: Option<Session> = None;
+        let mut persist_session_checkpoint = false;
+
+        let prepare_started = coalesce_profile.map(|_| Instant::now());
+        {
+            let s = self.state.lock().await;
+            for job in jobs {
+                let SimpleAppendJob {
+                    req,
+                    fetch_recent,
+                    context_max_bytes,
+                    done,
+                } = job;
+
+                let result = self.prepare_simple_append_under_state(
+                    &s,
+                    req,
+                    fetch_recent,
+                    context_max_bytes,
+                    final_session_snapshot.take(),
+                );
+                match result {
+                    Ok((prepared_append, session_snapshot, checkpoint)) => {
+                        persist_session_checkpoint |= checkpoint;
+                        final_session_snapshot = Some(session_snapshot);
+                        prepared.push((prepared_append, done));
+                    }
+                    Err((err, session_snapshot)) => {
+                        final_session_snapshot = session_snapshot;
+                        let _ = done.send(Err(err));
+                    }
+                }
+            }
+        }
+        if let Some(started) = prepare_started {
+            coalesce_sample.prepare_nanos = started.elapsed().as_nanos();
+        }
+
+        if prepared.is_empty() {
+            return;
+        }
+
+        let events = prepared
+            .iter()
+            .map(|(prepared, _)| prepared.envelope.clone())
+            .collect::<Vec<_>>();
+        coalesce_sample.events = events.len();
+        let session_checkpoint = persist_session_checkpoint
+            .then(|| final_session_snapshot.as_ref())
+            .flatten();
+        if let Some(p) = &self.persist {
+            let durable_write_started = coalesce_profile.map(|_| Instant::now());
+            if let Err(err) = p.append_many_batch_async(&events, session_checkpoint).await {
+                let err = internal(err);
+                for (_, done) in prepared {
+                    let _ = done.send(Err(err.clone()));
+                }
+                return;
+            }
+            if let Some(started) = durable_write_started {
+                coalesce_sample.durable_write_nanos = started.elapsed().as_nanos();
+            }
+        }
+
+        let persist_enabled = self.persist.is_some();
+        let update_started = coalesce_profile.map(|_| Instant::now());
+        let mut s = self.state.lock().await;
+        if let Some(session_snapshot) = final_session_snapshot {
+            s.sessions
+                .insert(session_id.as_str().to_string(), session_snapshot);
+        }
+        for (prepared_append, done) in prepared {
+            let envelope = prepared_append.envelope;
+            s.event_by_id.insert(
+                envelope.event_id.as_str().to_string(),
+                (envelope.session_id.as_str().to_string(), envelope.seq),
+            );
+            insert_runtime_event_cache(&mut s, persist_enabled, session_id.as_str(), envelope);
+
+            let (recent, recent_complete) = if let Some(last) = prepared_append.fetch_recent {
+                recent_for_appended_event_in_state(
+                    &s,
+                    session_id.as_str(),
+                    prepared_append.appended.seq,
+                    last,
+                )
+            } else {
+                (Vec::new(), false)
+            };
+            let backpressure = backpressure_for_tenant_session_in_state(
+                &s,
+                &prepared_append.policy,
+                &prepared_append.tenant_id,
+                &prepared_append.session_after_append,
+            );
+            let _ = done.send(Ok(AppendCommitResponse {
+                appended: prepared_append.appended,
+                recent,
+                recent_complete,
+                backpressure,
+                backpressure_complete: true,
+            }));
+        }
+        if let Some(started) = update_started {
+            coalesce_sample.update_state_nanos = started.elapsed().as_nanos();
+        }
+        if let (Some(profile), Some(started)) = (coalesce_profile, total_started) {
+            coalesce_sample.total_nanos = started.elapsed().as_nanos();
+            profile.record(coalesce_sample);
+        }
+    }
+
+    fn prepare_simple_append_under_state(
+        &self,
+        s: &State,
+        req: AppendRequest,
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+        prior_session_snapshot: Option<Session>,
+    ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Option<Session>)> {
+        let payload_len = serde_json::to_vec(&req.payload)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
+            .map_err(|err| (err, prior_session_snapshot.clone()))?;
+        if let Some(max_bytes) = context_max_bytes {
+            if let Some(max) = policy.quota.max_context_bytes {
+                if max_bytes > max {
+                    return Err((
+                        Error::new(
+                            ErrorCode::PolicyDenied,
+                            format!(
+                                "policy_version {} denies append_and_fetch: context byte request {max_bytes} exceeds quota {max}",
+                                policy.version
+                            ),
+                        ),
+                        prior_session_snapshot,
+                    ));
+                }
+            }
+        }
+        if payload_len > policy.artifact_size.max_inline_event_bytes {
+            return Err((
+                Error::new(
+                    ErrorCode::EventTooLarge,
+                    format!(
+                        "inline event payload {payload_len} bytes exceeds {} byte limit",
+                        policy.artifact_size.max_inline_event_bytes
+                    ),
+                )
+                .with_suggestion(
+                    "store the payload as an artifact and reference it via artifact_refs",
+                ),
+                prior_session_snapshot,
+            ));
+        }
+
+        let mut snapshot = match prior_session_snapshot {
+            Some(snapshot) => snapshot,
+            None => s
+                .sessions
+                .get(req.session_id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    (
+                        Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)),
+                        None,
+                    )
+                })?,
+        };
+        if snapshot.deleted_at_ms.is_some() || snapshot.tenant_id.as_str() != req.tenant_id.as_str()
+        {
+            return Err((
+                Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id)),
+                Some(snapshot),
+            ));
+        }
+        if snapshot.agent_id.as_str() != req.agent_id.as_str() {
+            return Err((
+                Error::new(ErrorCode::AgentNotFound, format!("{}", req.agent_id)),
+                Some(snapshot),
+            ));
+        }
+        if let Some(max) = policy.quota.max_events_per_session {
+            if snapshot.next_seq >= max {
+                return Err((
+                    Error::new(
+                        ErrorCode::PolicyDenied,
+                        format!(
+                            "policy_version {} denies append: session event quota {max} exhausted",
+                            policy.version
+                        ),
+                    ),
+                    Some(snapshot),
+                ));
+            }
+        }
+
+        let metadata_key = self
+            .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
+            .map_err(|err| (err, Some(snapshot.clone())))?;
+        let prior_lifecycle = snapshot.lifecycle.clone();
+        let prior_policy_version = snapshot.policy_version;
+        if snapshot.lifecycle != Lifecycle::Warm {
+            snapshot.lifecycle = Lifecycle::Warm;
+            snapshot.warm_head_from_seq = snapshot.next_seq;
+        }
+        let seq = snapshot.next_seq;
+        snapshot.next_seq += 1;
+        snapshot.last_active_at_ms = crate::now_ms();
+        snapshot.policy_version = policy.version;
+        let persist_session_checkpoint =
+            prior_lifecycle != Lifecycle::Warm || prior_policy_version != policy.version;
+
+        let envelope = EventEnvelope::create(NewEvent {
+            tenant_id: req.tenant_id.clone(),
+            agent_id: req.agent_id.clone(),
+            session_id: req.session_id.clone(),
+            seq,
+            kind: req.kind,
+            payload: req.payload,
+            artifact_refs: Vec::new(),
+            source_refs: Vec::new(),
+            idempotency_key: None,
+            policy_version: policy.version,
+            metadata_key_id: Some(metadata_key.key_id),
+            metadata_key_version: metadata_key.key_version,
+        });
+        let appended = AppendResponse {
+            event_id: envelope.event_id.clone(),
+            seq,
+        };
+        Ok((
+            PreparedSimpleAppend {
+                tenant_id: req.tenant_id,
+                envelope,
+                appended,
+                policy,
+                session_after_append: snapshot.clone(),
+                fetch_recent,
+            },
+            snapshot,
+            persist_session_checkpoint,
+        ))
+    }
+
+    async fn append_with_policy_direct(
+        &self,
+        req: AppendRequest,
+        resolved_policy: Option<RuntimePolicy>,
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+    ) -> Result<AppendCommitResponse> {
         let path_profile = append_path_profile();
         let total_started = path_profile.map(|_| Instant::now());
         let mut path_sample = AppendPathSample::default();
@@ -6150,6 +6687,35 @@ fn backpressure_for_tenant_session_in_state(
     }
 
     report
+}
+
+fn recent_for_appended_event_in_state(
+    s: &State,
+    session_id: &str,
+    appended_seq: u64,
+    last: usize,
+) -> (Vec<EventEnvelope>, bool) {
+    let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
+    let from_seq = appended_seq
+        .saturating_add(1)
+        .saturating_sub(last_seq_count);
+    let lo = (session_id.to_string(), from_seq);
+    let hi = (session_id.to_string(), appended_seq);
+    let mut recent = s
+        .events
+        .range(lo..=hi)
+        .take(last)
+        .map(|(_, event)| event.clone())
+        .collect::<Vec<_>>();
+    if recent.len() > last {
+        let drop_n = recent.len() - last;
+        recent.drain(0..drop_n);
+    }
+    let expected = usize::try_from(appended_seq.saturating_add(1).saturating_sub(from_seq))
+        .unwrap_or(usize::MAX)
+        .min(last);
+    let complete = recent.len() >= expected;
+    (recent, complete)
 }
 
 fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
