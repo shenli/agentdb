@@ -4784,8 +4784,10 @@ async fn append_event(
             .await
     })
     .await?;
-    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
-    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
+    let backpressure = s
+        .runtime
+        .backpressure_for_tenant_and_session(&tid, &sid)
+        .await?;
     Ok(with_headers(
         json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
         route_headers,
@@ -4857,8 +4859,10 @@ async fn append_and_fetch(
             .await
     })
     .await?;
-    let mut backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
-    backpressure.merge(s.runtime.backpressure_for_session(&tid, &sid).await?);
+    let backpressure = s
+        .runtime
+        .backpressure_for_tenant_and_session(&tid, &sid)
+        .await?;
     Ok(with_headers(
         json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
         route_headers,

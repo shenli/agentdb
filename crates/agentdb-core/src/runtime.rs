@@ -3221,6 +3221,110 @@ impl Runtime {
         Ok(report)
     }
 
+    pub async fn backpressure_for_tenant_and_session(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<BackpressureReport> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let session = s
+            .sessions
+            .get(session_id.as_str())
+            .filter(|sess| {
+                sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+        let policy = policy_for_tenant_in_state(&s, tenant_id);
+        let mut report = BackpressureReport::default();
+
+        if let Some(soft) = policy.quota.soft_max_active_sessions {
+            let active_sessions = s
+                .sessions
+                .values()
+                .filter(|sess| {
+                    sess.tenant_id.as_str() == tenant_id.as_str()
+                        && sess.deleted_at_ms.is_none()
+                        && sess.status == crate::session::Status::Active
+                })
+                .count();
+            report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
+        }
+        if let Some(soft) = policy.quota.soft_max_agents {
+            let live_agents = s
+                .agents
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .count();
+            report.push_if_over("agents", live_agents as u64, soft as u64);
+        }
+        if let Some(soft) = policy.quota.soft_max_records {
+            let live_records = s
+                .records
+                .values()
+                .filter(|r| {
+                    r.tenant_id.as_str() == tenant_id.as_str()
+                        && r.deleted_at_ms.is_none()
+                        && !r.is_expired()
+                })
+                .count();
+            report.push_if_over("records", live_records as u64, soft as u64);
+        }
+        if let Some(soft) = policy.quota.soft_max_artifacts {
+            let live_artifacts = s
+                .artifacts
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .count();
+            report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+        }
+        if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
+            let live_bytes: u64 = s
+                .artifacts
+                .values()
+                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+                .map(|a| a.bytes)
+                .sum();
+            report.push_if_over("artifact_storage", live_bytes, soft);
+        }
+        if let Some(soft) = policy.quota.soft_max_skills {
+            let live_skills = s
+                .skills
+                .values()
+                .filter(|skill| {
+                    skill.tenant_id.as_str() == tenant_id.as_str() && skill.deleted_at_ms.is_none()
+                })
+                .count();
+            report.push_if_over("skills", live_skills as u64, soft as u64);
+        }
+        if let Some(soft) = policy.quota.soft_max_events_per_session {
+            report.push_if_over("session_events", session.next_seq, soft);
+        }
+        if let Some(soft) = policy.quota.soft_max_skill_bindings_per_agent {
+            let live_bindings = s
+                .agent_skill_bindings
+                .values()
+                .filter(|binding| {
+                    binding.tenant_id.as_str() == tenant_id.as_str()
+                        && binding.agent_id.as_str() == session.agent_id.as_str()
+                        && binding.deleted_at_ms.is_none()
+                })
+                .count();
+            report.push_if_over("skill_bindings", live_bindings as u64, soft as u64);
+        }
+
+        Ok(report)
+    }
+
     /// Create an artifact: write the bytes to the content backend, persist
     /// the metadata, return the metadata record. Tenant must exist.
     ///
@@ -4231,6 +4335,14 @@ impl Runtime {
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<AppendResponse> {
+        self.append_with_policy(req, None).await
+    }
+
+    async fn append_with_policy(
+        &self,
+        req: AppendRequest,
+        resolved_policy: Option<RuntimePolicy>,
+    ) -> Result<AppendResponse> {
         self.refresh_replicated_state().await?;
 
         // Compose the full idempotency scope key BEFORE locking state, so we can
@@ -4248,9 +4360,13 @@ impl Runtime {
             }
         }
 
-        let policy = self
-            .resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
-            .await?;
+        let policy = match resolved_policy {
+            Some(policy) => policy,
+            None => {
+                self.resolve_policy_for_agent(&req.tenant_id, &req.agent_id)
+                    .await?
+            }
+        };
 
         // Inline payload size guard. Done after the idempotency short-circuit
         // (a retry that already committed should replay, not re-validate) but
@@ -4561,7 +4677,7 @@ impl Runtime {
                 ));
             }
         }
-        let appended = self.append(req).await?;
+        let appended = self.append_with_policy(req, Some(policy)).await?;
 
         // Fetch only the tail window needed for context. A full-session fetch
         // makes append+fetch latency grow with session length and serializes
@@ -4903,6 +5019,18 @@ impl Runtime {
             return Ok(out);
         }
         let hot_from_seq = req.from_seq.max(session.warm_head_from_seq);
+        if session.archive_manifest.is_none() && session.sealed_segments.is_empty() {
+            let expected_hot = usize::try_from(session.next_seq.saturating_sub(hot_from_seq))
+                .unwrap_or(usize::MAX)
+                .min(remaining);
+            if hot_in_memory.len() >= expected_hot {
+                out.extend(hot_in_memory.into_iter().take(remaining));
+                if out.len() > req.limit {
+                    out.truncate(req.limit);
+                }
+                return Ok(out);
+            }
+        }
         let hot = if self.persist.is_some() {
             let mut hot = self
                 .read_hot_events_from_persist(
