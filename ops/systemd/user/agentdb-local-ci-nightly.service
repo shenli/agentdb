@@ -4,8 +4,9 @@ Wants=agentdb-local-ci-dashboard.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/work/agentdb
+WorkingDirectory=%h/work/agentdb-nightly
+Environment=PATH=%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=LOCAL_CI_RUN_ROOT=%h/agentdb-ci-runs
 Environment=LOCAL_CI_NIGHTLY_CHAOS_ITERATIONS=48
 Environment=LOCAL_CI_KEEP_RUNS=30
-ExecStart=%h/work/agentdb/scripts/local-ci-nightly.sh
+ExecStart=%h/work/agentdb-nightly/scripts/local-ci-nightly.sh
