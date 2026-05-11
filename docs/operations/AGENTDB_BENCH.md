@@ -28,8 +28,8 @@ Before publishing external ratios, close these benchmark gaps:
   mix and publish the rationale for each operation weight.
 - Add working-set-exceeds-cache profiles and report dataset bytes versus RAM,
   page cache, and RocksDB block cache.
-- Expand the durability matrix: one durable-single sanity cell now exists, but
-  it needs repeats and follow-up after append-path instrumentation.
+- Expand the durability matrix: one single-node-fsync sanity cell now exists,
+  but it needs repeats and follow-up after append-path instrumentation.
 - Run longer multi-minute cells so RocksDB compaction, Postgres checkpoint, and
   MongoDB journal/checkpoint tails can appear in p99/max latency.
 - Repeat skewed session selection with publication-grade settings: uniform,
@@ -168,10 +168,36 @@ acceptable for single-node storage-path sensitivity, but not for a noisy-neighbo
 claim. The noisy-neighbor benchmark should apply hot-session skew independently
 per tenant and report tenant-level throughput and p99.
 
+### Local Single-Node WAL Check
+
+The default local developer profile is `single-node-wal`: AgentDB writes to the
+RocksDB WAL and memtable without forcing a per-request media sync. The matched
+baselines are MongoDB standalone acknowledged writes without `journal=true` and
+Postgres with `synchronous_commit=off`. This profile represents fast local
+tryout behavior, not host-crash durable media semantics.
+
+The latest `li-dev` Zipf-1.2 c=32 single-seed sanity run used 1000 sessions
+(10 tenants x 2 agents x 50 sessions), 10s warmup, and a 60s measured window.
+AgentDB uses a zero same-session coalescing wait in this profile; a 5ms wait
+was useful for fsync grouping but cut local WAL throughput to 8.4k ops/s.
+
+Results are on `li-dev` under
+`/home/lishen/work/agentdb-bench-runs/single-node-wal`.
+
+| Backend/profile | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| AgentDB `single-node-wal` | 53,302 | 0.49ms | 1.31ms | 2.11ms | 1.00x | RocksDB WAL enabled, no forced per-request media sync. |
+| MongoDB `single-node-wal` | 26,017 | 1.50ms | 2.17ms | 2.86ms | 2.05x MongoDB | Standalone acknowledged writes, no `journal=true`. |
+| Postgres `single-node-wal` | 13,114 | 0.96ms | 12.51ms | 35.80ms | 4.06x Postgres | `synchronous_commit=off`. |
+
+This is the best current local setup result and should be the first number used
+for developer out-of-box performance discussions. It is still a single seed and
+cache-warm cell; repeat it before quoting externally.
+
 ### Matched Durability Sanity Check
 
 The first matched-durability sanity cell used the same c=32 Zipf-1.2 60s shape
-as the repeated validation cell, but with explicit durable-single settings:
+as the repeated validation cell, but with explicit `single-node-fsync` settings:
 AgentDB ran RocksDB sync writes with adaptive append group commit, MongoDB used
 `journal=true&w=1`, and Postgres used `synchronous_commit=on`. This is a single
 seed (`43`) sanity run, not a publishable comparison.
@@ -181,18 +207,18 @@ Results are on `li-dev` under
 
 | Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---|
-| AgentDB `durable-single` | 256 | 858ms | 949ms | 1.00x | RocksDB sync writes plus safe append group commit. |
-| MongoDB `durable-single` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
-| Postgres `durable-single` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
+| AgentDB `single-node-fsync` | 256 | 858ms | 949ms | 1.00x | RocksDB sync writes plus safe append group commit. |
+| MongoDB `single-node-fsync` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
+| Postgres `single-node-fsync` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
 | AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
 
 This falsifies the assumption that AgentDB is already faster under matched
-local durability. The previous 1.66x MongoDB / 19.84x Postgres Zipf row remains
-useful for hot-path engineering, but it is not a durable-single claim. Under
-durable-single, AgentDB's `append_fetch` p95 was 897ms and p99 was 982ms, while
-metadata writes such as `record_write` and `fork` stayed near 53-54ms p95. That
-points at the durable append path rather than read caching as the next
-bottleneck.
+local fsync durability. The fast `single-node-wal` row remains useful for local
+developer experience, but it is not a host-crash media-sync claim. Under
+`single-node-fsync`, AgentDB's `append_fetch` p95 was 897ms and p99 was 982ms,
+while metadata writes such as `record_write` and `fork` stayed near 53-54ms
+p95. That points at the durable append path rather than read caching as the
+next bottleneck.
 
 The next PR should add append-path instrumentation before tuning: per-session
 queue/lock wait, group-commit queue wait, RocksDB sync-write time, and state
@@ -217,11 +243,11 @@ The server log then emits two low-overhead aggregate lines:
 The profiling is off by default. Wrapper scripts set `RUST_LOG=info` only when
 `APPEND_PATH_PROFILE_MS` is present so normal benchmark logs stay compact.
 
-The first profiled durable-single Zipf c=32 run on `li-dev` used:
+The first profiled `single-node-fsync` Zipf c=32 run on `li-dev` used:
 
 ```bash
 APPEND_PATH_PROFILE_MS=5000 \
-  DURABILITY_PROFILE=durable-single \
+  DURABILITY_PROFILE=single-node-fsync \
   SESSION_SELECTION=zipf \
   ZIPF_EXPONENT=1.2 \
   CONCURRENCY=32 \
@@ -233,7 +259,8 @@ APPEND_PATH_PROFILE_MS=5000 \
 Run output:
 `/home/lishen/work/agentdb-bench-runs/append-path-profile/runs/agentdb-zipf-durable-profiled-r1-s43/report.md`.
 
-The throughput/latency cell was consistent with the prior durable-single run:
+The throughput/latency cell was consistent with the prior `single-node-fsync`
+run:
 255 ops/s, p95 860ms, p99 950ms. The profile attribution changed the diagnosis:
 
 | Stage | Representative measured-period average | Interpretation |
@@ -256,8 +283,8 @@ same-session `append_and_fetch` calls batched ahead of the durable write and a
 5ms coalescing window, the same `li-dev` durable Zipf c=32 cell improved from
 255 ops/s to 622 ops/s. Tail latency also dropped from p95 860ms / p99 950ms
 to p95 137ms / p99 217ms. This is a 2.4x AgentDB improvement for the matched
-durable-single cell, but still below the prior MongoDB durable-single sanity
-cell at 884 ops/s.
+`single-node-fsync` cell, but still below the prior MongoDB
+`single-node-fsync` sanity cell at 884 ops/s.
 
 The coalescing profile showed same-session batches around 1.4 events per batch
 and adaptive KV batches around 8 requests / 24 write ops per batch. The next
@@ -317,14 +344,15 @@ Run every benchmark under at least one explicit durability profile.
 
 | Profile | AgentDB | MongoDB | Postgres | Use |
 |---|---|---|---|---|
-| `dev-fast` | Local single-node defaults | Standalone default write concern | `synchronous_commit=off` allowed | Quick laptop smoke only. |
-| `durable-single` | RocksDB sync writes with safe append group commit | Journaled acknowledged writes | `synchronous_commit=on` | Baseline fair local comparison. |
+| `single-node-wal` | RocksDB WAL plus memtable, no forced media sync per request | Standalone acknowledged writes without `journal=true` | `synchronous_commit=off` | Default local developer setup and fast-path comparison. |
+| `single-node-fsync` | RocksDB sync writes with safe append group commit | Journaled acknowledged writes | `synchronous_commit=on` | Host-crash durable single-node sanity comparison. |
 | `strict-fsync` | RocksDB sync writes with append group commit disabled | Journaled acknowledged writes | `synchronous_commit=on` | Stress cell for per-operation fsync cost; not the default comparison. |
 | `durable-quorum` | Raft quorum write ack | Replica set `writeConcern=majority`, journaled | Sync replication when configured | Real safety comparison on `li-dev` or cluster test hardware. |
 
-The default report should lead with `durable-single` until equivalent replicated
-MongoDB/Postgres clusters are part of the harness. `dev-fast` numbers are useful
-for development, but they should not be used for product claims.
+The default local report should lead with `single-node-wal` because that is how
+developers will try the product on one machine. Production safety comparisons
+should lead with `durable-quorum` once equivalent replicated MongoDB/Postgres
+clusters are part of the harness.
 
 ## Benchmark Host
 
@@ -925,7 +953,8 @@ bench-out/
   event-log schema.
 - Never combine local vector-capable Postgres and vector-limited MongoDB into a
   single "search winner" chart without calling out feature differences.
-- Always separate `dev-fast`, `durable-single`, and `durable-quorum` runs.
+- Always separate `single-node-wal`, `single-node-fsync`, and
+  `durable-quorum` runs.
 - Always publish correctness failures before latency numbers.
 - Always label AgentDB native API and AgentDB MongoDB API runs separately.
 

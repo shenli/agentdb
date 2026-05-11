@@ -308,6 +308,15 @@ fn env_flag_disabled_runtime(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_flag_enabled_runtime(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
     pub tenant_id: Id,
@@ -4753,7 +4762,13 @@ impl Runtime {
         let wait_us = std::env::var("AGENTDB_SESSION_APPEND_BATCH_WAIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(5_000);
+            .unwrap_or_else(|| {
+                if env_flag_enabled_runtime("AGENTDB_ROCKSDB_SYNC_WRITES") {
+                    5_000
+                } else {
+                    0
+                }
+            });
         loop {
             let mut jobs = Vec::new();
             {

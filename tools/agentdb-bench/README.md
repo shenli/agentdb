@@ -42,26 +42,28 @@ forensics, but they should not be the first thing a benchmark reader sees.
 
 | Cell | Shape | AgentDB | MongoDB | Postgres | Ratio |
 |---|---|---:|---:|---:|---|
-| Mixed loop, uniform | c=32, short single run, local single node, dev-fast | 56.0k ops/s | 26.2k ops/s | 5.3k ops/s | 2.14x MongoDB, 10.50x Postgres |
-| Mixed loop, Zipf-1.2 | c=32, 3 seeds, 60s measured windows, dev-fast | 43.2k ops/s | 26.0k ops/s | 2.2k ops/s | 1.66x MongoDB, 19.84x Postgres |
+| Mixed loop, Zipf-1.2, `single-node-wal` | c=32, seed 43, 60s measured window, 1000 sessions | 53.3k ops/s | 26.0k ops/s | 13.1k ops/s | 2.05x MongoDB, 4.06x Postgres |
 
 Interpret these as internal single-node benchmark cells, not product claims.
 The AgentDB API uses a fused `append-and-fetch` primitive; MongoDB and Postgres
-perform append and fetch as separate client operations. These two rows are
-hot-path engineering cells, not matched-durability claims.
+perform append and fetch as separate client operations. `single-node-wal` is
+the default local developer profile: AgentDB writes to the RocksDB WAL and
+memtable without forcing a per-request media sync, MongoDB uses standalone
+acknowledged writes without `journal=true`, and Postgres uses
+`synchronous_commit=off`.
 
-The first matched durable-single sanity run tells a different story:
+The first matched `single-node-fsync` sanity run tells a different story:
 
 | Cell | Shape | AgentDB | MongoDB | Postgres | Result |
 |---|---|---:|---:|---:|---|
-| Mixed loop, Zipf-1.2, durable-single | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
+| Mixed loop, Zipf-1.2, `single-node-fsync` | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
 
-After same-session append coalescing, the AgentDB durable-single cell improved
+After same-session append coalescing, the AgentDB `single-node-fsync` cell improved
 to 622 ops/s with p95 137ms and p99 217ms on the same `li-dev` shape. That is
 a 2.4x AgentDB improvement over the first matched durable run, but it is still
-below the MongoDB durable-single sanity cell.
+below the MongoDB `single-node-fsync` sanity cell.
 
-That durable-single result uses RocksDB sync writes with safe append group
+That `single-node-fsync` result uses RocksDB sync writes with safe append group
 commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is
 a single sanity cell, not a final comparison, but it shows the next performance
 work should instrument and optimize the durable append path before making any
@@ -83,8 +85,10 @@ small for meaningful skew sensitivity. See
 `docs/operations/AGENTDB_BENCH.md` for the current short skew-sensitivity
 control run and caveats.
 
-Use `DURABILITY_PROFILE=dev-fast`, `durable-single`, or `strict-fsync` to make
-durability explicit in wrapper scripts. `durable-single` enables durable local
+Use `DURABILITY_PROFILE=single-node-wal`, `single-node-fsync`, or
+`strict-fsync` to make durability explicit in wrapper scripts.
+`single-node-wal` is the default local setup and is optimized for developer
+tryout performance with RocksDB WAL safety. `single-node-fsync` enables local
 sync writes while preserving safe append group commit. `strict-fsync` disables
 append group commit to expose per-operation fsync cost and should be treated as
 a stress profile, not the default comparison.
