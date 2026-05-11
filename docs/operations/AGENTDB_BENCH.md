@@ -251,6 +251,20 @@ durable batch while preserving read-after-write semantics for each caller. A
 generic RocksDB tuning pass is lower priority unless a later profile shows KV
 write time dominating after same-session batching.
 
+The first same-session coalescing run validates that direction. With simple
+same-session `append_and_fetch` calls batched ahead of the durable write and a
+5ms coalescing window, the same `li-dev` durable Zipf c=32 cell improved from
+255 ops/s to 622 ops/s. Tail latency also dropped from p95 860ms / p99 950ms
+to p95 137ms / p99 217ms. This is a 2.4x AgentDB improvement for the matched
+durable-single cell, but still below the prior MongoDB durable-single sanity
+cell at 884 ops/s.
+
+The coalescing profile showed same-session batches around 1.4 events per batch
+and adaptive KV batches around 8 requests / 24 write ops per batch. The next
+remaining bottleneck is the durable write itself: coalesced batches still spent
+about 45-50ms in durable write time. Further improvement should focus on the
+durable log / fsync path and larger safe batching, not read caching.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent

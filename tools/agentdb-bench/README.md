@@ -56,6 +56,11 @@ The first matched durable-single sanity run tells a different story:
 |---|---|---:|---:|---:|---|
 | Mixed loop, Zipf-1.2, durable-single | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
 
+After same-session append coalescing, the AgentDB durable-single cell improved
+to 622 ops/s with p95 137ms and p99 217ms on the same `li-dev` shape. That is
+a 2.4x AgentDB improvement over the first matched durable run, but it is still
+below the MongoDB durable-single sanity cell.
+
 That durable-single result uses RocksDB sync writes with safe append group
 commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is
 a single sanity cell, not a final comparison, but it shows the next performance

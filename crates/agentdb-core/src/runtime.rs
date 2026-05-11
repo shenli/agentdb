@@ -4753,7 +4753,7 @@ impl Runtime {
         let wait_us = std::env::var("AGENTDB_SESSION_APPEND_BATCH_WAIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(5_000);
         loop {
             let mut jobs = Vec::new();
             {
