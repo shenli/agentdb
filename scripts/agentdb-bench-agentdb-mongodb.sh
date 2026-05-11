@@ -18,6 +18,7 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
 
 STATE_ROOT="${STATE_ROOT:-${OUT}/state/${RUN_ID}}"
 DATA_DIR="${DATA_DIR:-${STATE_ROOT}/rocksdb}"
@@ -41,7 +42,24 @@ else
   BIN_DIR="${ROOT}/target/debug"
 fi
 
-"${BIN_DIR}/agentdb" serve \
+agentdb_server_env=()
+case "${DURABILITY_PROFILE}" in
+  durable-single)
+    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
+    ;;
+  durable-grouped)
+    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+    ;;
+  dev-fast)
+    ;;
+  *)
+    echo "unknown DURABILITY_PROFILE=${DURABILITY_PROFILE}" >&2
+    exit 1
+    ;;
+esac
+
+env "${agentdb_server_env[@]}" "${BIN_DIR}/agentdb" serve \
   --bind "${BIND}" \
   --mongo-bind "${MONGO_BIND}" \
   --data-dir "${DATA_DIR}" \
@@ -78,6 +96,7 @@ prepare_args=(
   --out "${OUT}"
   --profile "${PROFILE}"
   --artifact-mode "${ARTIFACT_MODE}"
+  --durability-profile "${DURABILITY_PROFILE}"
   --storage-engine rocksdb
   --content-engine localfs
   --data-dir "${DATA_DIR}"

@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{
+    checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+};
 
 use crate::error::{Error, Result};
 use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
@@ -12,13 +14,23 @@ type KvResult = std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>;
 /// RocksDB-backed `KvStore`.
 pub struct RocksKvStore {
     db: Arc<DB>,
+    sync_writes: bool,
 }
 
 impl RocksKvStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let opts = default_rocks_options();
         let db = DB::open(&opts, path)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            sync_writes: env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES"),
+        })
+    }
+
+    fn write_options(&self) -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(self.sync_writes);
+        opts
     }
 }
 
@@ -52,12 +64,12 @@ impl KvStore for RocksKvStore {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db.put(key, value)?;
+        self.db.put_opt(key, value, &self.write_options())?;
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> Result<()> {
-        self.db.delete(key)?;
+        self.db.delete_opt(key, &self.write_options())?;
         Ok(())
     }
 
@@ -100,7 +112,7 @@ impl KvStore for RocksKvStore {
                 WriteOp::Delete { key } => batch.delete(&key),
             }
         }
-        self.db.write(batch)?;
+        self.db.write_opt(batch, &self.write_options())?;
         Ok(())
     }
 
@@ -123,6 +135,15 @@ impl KvStore for RocksKvStore {
             .map_err(|e| Error::Other(format!("rocksdb create_checkpoint: {e}")))?;
         Ok(())
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 /// Borrows from a `RocksKvStore`; caller keeps the store alive via its own reference.

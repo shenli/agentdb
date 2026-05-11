@@ -12,9 +12,25 @@ WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
 PG_PORT="${PG_PORT:-5433}"
-PG_DSN="${PG_DSN:-postgres://bench:bench@127.0.0.1:${PG_PORT}/bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/postgres"
+
+if [[ -z "${PG_DSN:-}" ]]; then
+  case "${DURABILITY_PROFILE}" in
+    durable-single | durable-grouped | durable-quorum)
+      PG_SYNCHRONOUS_COMMIT="${PG_SYNCHRONOUS_COMMIT:-on}"
+      ;;
+    dev-fast)
+      PG_SYNCHRONOUS_COMMIT="${PG_SYNCHRONOUS_COMMIT:-off}"
+      ;;
+    *)
+      echo "unknown DURABILITY_PROFILE=${DURABILITY_PROFILE}" >&2
+      exit 1
+      ;;
+  esac
+  PG_DSN="postgres://bench:bench@127.0.0.1:${PG_PORT}/bench?options=-c%20synchronous_commit%3D${PG_SYNCHRONOUS_COMMIT}"
+fi
 
 docker compose -f "${COMPOSE_DIR}/docker-compose.yml" up -d
 
@@ -48,6 +64,7 @@ prepare_args=(
   --out "${OUT}"
   --profile "${PROFILE}"
   --artifact-mode "${ARTIFACT_MODE}"
+  --durability-profile "${DURABILITY_PROFILE}"
   --storage-engine postgres-event-log
   --content-engine metadata-reference
 )

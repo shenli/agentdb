@@ -12,11 +12,26 @@ WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
 MONGO_PORT="${MONGO_PORT:-27017}"
-MONGO_URI="${MONGO_URI:-mongodb://127.0.0.1:${MONGO_PORT}}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
+
+if [[ -z "${MONGO_URI:-}" ]]; then
+  case "${DURABILITY_PROFILE}" in
+    durable-single | durable-grouped | durable-quorum)
+      MONGO_URI="mongodb://127.0.0.1:${MONGO_PORT}/?journal=true&w=1"
+      ;;
+    dev-fast)
+      MONGO_URI="mongodb://127.0.0.1:${MONGO_PORT}"
+      ;;
+    *)
+      echo "unknown DURABILITY_PROFILE=${DURABILITY_PROFILE}" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 export MONGO_PORT
 export MONGO_DATA_DIR
@@ -54,6 +69,7 @@ prepare_args=(
   --out "${OUT}"
   --profile "${PROFILE}"
   --artifact-mode "${ARTIFACT_MODE}"
+  --durability-profile "${DURABILITY_PROFILE}"
   --storage-engine mongodb-event-log
   --content-engine metadata-reference
 )
