@@ -22,7 +22,9 @@
 //! Events are NOT preloaded; `scan_events` is invoked lazily by
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelope};
 use agentdb_storage::keys::{
@@ -48,6 +50,104 @@ use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
+
+static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
+
+struct AppendPersistProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    batches: AtomicU64,
+    ops: AtomicU64,
+    bytes: AtomicU64,
+    build_nanos: AtomicU64,
+    write_nanos: AtomicU64,
+}
+
+impl AppendPersistProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_APPEND_PERSIST_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(now_millis()),
+            batches: AtomicU64::new(0),
+            ops: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            build_nanos: AtomicU64::new(0),
+            write_nanos: AtomicU64::new(0),
+        })
+    }
+
+    fn record(&self, op_count: usize, bytes: usize, build_nanos: u128, write_nanos: u128) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.ops.fetch_add(op_count as u64, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.build_nanos.fetch_add(
+            build_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.write_nanos.fetch_add(
+            write_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+
+        let now = now_millis();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let batches = self.batches.swap(0, Ordering::Relaxed);
+        if batches == 0 {
+            return;
+        }
+        let ops = self.ops.swap(0, Ordering::Relaxed);
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let build_nanos = self.build_nanos.swap(0, Ordering::Relaxed);
+        let write_nanos = self.write_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            batches,
+            ops,
+            bytes,
+            avg_ops = ops as f64 / batches as f64,
+            avg_bytes = bytes as f64 / batches as f64,
+            avg_build_us = build_nanos as f64 / batches as f64 / 1_000.0,
+            avg_write_us = write_nanos as f64 / batches as f64 / 1_000.0,
+            "append persist profile"
+        );
+    }
+}
+
+fn append_persist_profile() -> Option<&'static AppendPersistProfile> {
+    APPEND_PERSIST_PROFILE
+        .get_or_init(AppendPersistProfile::from_env)
+        .as_ref()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn write_ops_size(ops: &[WriteOp]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            WriteOp::Put { key, value } => key.len() + value.len(),
+            WriteOp::Delete { key } => key.len(),
+        })
+        .sum()
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -380,7 +480,20 @@ impl Persist {
         session: &Session,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<()> {
-        self.write_ops(self.append_batch_ops(event, session, idem)?)
+        let Some(profile) = append_persist_profile() else {
+            return self.write_ops(self.append_batch_ops(event, session, idem)?);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_batch_ops(event, session, idem)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = self.write_ops(ops);
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
     }
 
     pub(crate) fn append_batch_ops(
