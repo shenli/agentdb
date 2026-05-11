@@ -12,7 +12,7 @@ WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/mongodb"
@@ -20,10 +20,10 @@ MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
 
 if [[ -z "${MONGO_URI:-}" ]]; then
   case "${DURABILITY_PROFILE}" in
-    durable-single | durable-grouped | durable-quorum | strict-fsync)
+    single-node-fsync | durable-single | durable-grouped | durable-quorum | raft-quorum | strict-fsync)
       MONGO_URI="mongodb://127.0.0.1:${MONGO_PORT}/?journal=true&w=1"
       ;;
-    dev-fast)
+    single-node-wal | dev-fast)
       MONGO_URI="mongodb://127.0.0.1:${MONGO_PORT}"
       ;;
     *)

@@ -18,7 +18,7 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 
 STATE_ROOT="${STATE_ROOT:-${OUT}/state/${RUN_ID}}"
 DATA_DIR="${DATA_DIR:-${STATE_ROOT}/rocksdb}"
@@ -44,17 +44,14 @@ fi
 
 agentdb_server_env=()
 case "${DURABILITY_PROFILE}" in
-  durable-single)
-    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
+  single-node-wal | dev-fast)
     ;;
-  durable-grouped)
+  single-node-fsync | durable-single | durable-grouped)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
     ;;
   strict-fsync)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
     agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
-    ;;
-  dev-fast)
     ;;
   *)
     echo "unknown DURABILITY_PROFILE=${DURABILITY_PROFILE}" >&2

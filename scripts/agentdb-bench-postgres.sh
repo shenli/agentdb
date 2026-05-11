@@ -12,16 +12,16 @@ WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 PG_PORT="${PG_PORT:-5433}"
 COMPOSE_DIR="${ROOT}/benchmarks/postgres"
 
 if [[ -z "${PG_DSN:-}" ]]; then
   case "${DURABILITY_PROFILE}" in
-    durable-single | durable-grouped | durable-quorum | strict-fsync)
+    single-node-fsync | durable-single | durable-grouped | durable-quorum | raft-quorum | strict-fsync)
       PG_SYNCHRONOUS_COMMIT="${PG_SYNCHRONOUS_COMMIT:-on}"
       ;;
-    dev-fast)
+    single-node-wal | dev-fast)
       PG_SYNCHRONOUS_COMMIT="${PG_SYNCHRONOUS_COMMIT:-off}"
       ;;
     *)

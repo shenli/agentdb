@@ -15,7 +15,7 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
-DURABILITY_PROFILE="${DURABILITY_PROFILE:-durable-single}"
+DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 
 STATE_ROOT="${STATE_ROOT:-${OUT}/state/${RUN_ID}}"
 DATA_DIR="${DATA_DIR:-${STATE_ROOT}/rocksdb}"
@@ -41,20 +41,17 @@ fi
 
 agentdb_server_env=()
 case "${DURABILITY_PROFILE}" in
-  durable-single)
+  single-node-wal | dev-fast)
+    ;;
+  single-node-fsync | durable-single | durable-grouped)
     # Match a single-node durable commit: every returned append has reached a
     # synced RocksDB batch. Adaptive grouping may still coalesce concurrent
     # callers before returning, similar to database WAL/journal group commit.
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
     ;;
-  durable-grouped)
-    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
-    ;;
   strict-fsync)
     agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=1)
     agentdb_server_env+=(AGENTDB_APPEND_GROUP_COMMIT=0)
-    ;;
-  dev-fast)
     ;;
   *)
     echo "unknown DURABILITY_PROFILE=${DURABILITY_PROFILE}" >&2
