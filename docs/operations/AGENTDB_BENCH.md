@@ -28,8 +28,8 @@ Before publishing external ratios, close these benchmark gaps:
   mix and publish the rationale for each operation weight.
 - Add working-set-exceeds-cache profiles and report dataset bytes versus RAM,
   page cache, and RocksDB block cache.
-- Run a durability matrix: relaxed/dev, durable-single, and quorum/replicated
-  settings with each backend's write concern/fsync semantics stated.
+- Expand the durability matrix: one durable-single sanity cell now exists, but
+  it needs repeats and follow-up after append-path instrumentation.
 - Run longer multi-minute cells so RocksDB compaction, Postgres checkpoint, and
   MongoDB journal/checkpoint tails can appear in p99/max latency.
 - Repeat skewed session selection with publication-grade settings: uniform,
@@ -168,6 +168,38 @@ acceptable for single-node storage-path sensitivity, but not for a noisy-neighbo
 claim. The noisy-neighbor benchmark should apply hot-session skew independently
 per tenant and report tenant-level throughput and p99.
 
+### Matched Durability Sanity Check
+
+The first matched-durability sanity cell used the same c=32 Zipf-1.2 60s shape
+as the repeated validation cell, but with explicit durable-single settings:
+AgentDB ran RocksDB sync writes with adaptive append group commit, MongoDB used
+`journal=true&w=1`, and Postgres used `synchronous_commit=on`. This is a single
+seed (`43`) sanity run, not a publishable comparison.
+
+Results are on `li-dev` under
+`/home/lishen/work/agentdb-bench-runs/durable-single-zipf`.
+
+| Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
+|---|---:|---:|---:|---:|---|
+| AgentDB `durable-single` | 256 | 858ms | 949ms | 1.00x | RocksDB sync writes plus safe append group commit. |
+| MongoDB `durable-single` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
+| Postgres `durable-single` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
+| AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
+
+This falsifies the assumption that AgentDB is already faster under matched
+local durability. The previous 1.66x MongoDB / 19.84x Postgres Zipf row remains
+useful for hot-path engineering, but it is not a durable-single claim. Under
+durable-single, AgentDB's `append_fetch` p95 was 897ms and p99 was 982ms, while
+metadata writes such as `record_write` and `fork` stayed near 53-54ms p95. That
+points at the durable append path rather than read caching as the next
+bottleneck.
+
+The next PR should add append-path instrumentation before tuning: per-session
+queue/lock wait, group-commit queue wait, RocksDB sync-write time, and state
+update time. If RocksDB sync dominates, the likely fix is a more explicit
+durable log/group-commit design; if queue wait dominates, a single-writer
+per-session coalescing actor is the stronger candidate.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent
@@ -221,7 +253,8 @@ Run every benchmark under at least one explicit durability profile.
 | Profile | AgentDB | MongoDB | Postgres | Use |
 |---|---|---|---|---|
 | `dev-fast` | Local single-node defaults | Standalone default write concern | `synchronous_commit=off` allowed | Quick laptop smoke only. |
-| `durable-single` | Single node with durable local write path | Journaled acknowledged writes | `synchronous_commit=on` | Baseline fair local comparison. |
+| `durable-single` | RocksDB sync writes with safe append group commit | Journaled acknowledged writes | `synchronous_commit=on` | Baseline fair local comparison. |
+| `strict-fsync` | RocksDB sync writes with append group commit disabled | Journaled acknowledged writes | `synchronous_commit=on` | Stress cell for per-operation fsync cost; not the default comparison. |
 | `durable-quorum` | Raft quorum write ack | Replica set `writeConcern=majority`, journaled | Sync replication when configured | Real safety comparison on `li-dev` or cluster test hardware. |
 
 The default report should lead with `durable-single` until equivalent replicated
