@@ -60,7 +60,7 @@ Non-goals:
 | Backend | Purpose |
 |---|---|
 | `agentdb-native-rocksdb` | First AgentDB target: native HTTP API with local RocksDB storage. |
-| `agentdb-mongodb-api` | Optional adapter-overhead run through the MongoDB-compatible API. |
+| `agentdb-mongodb-api` | Implemented AgentDB adapter-overhead run through the MongoDB-compatible wire listener. |
 | `mongodb-session-doc` | Naive MongoDB model: one document per session with an embedded event array. |
 | `mongodb-event-log` | Implemented MongoDB baseline: sessions, events, records, and artifacts collections. |
 | `postgres-jsonb-session` | Naive Postgres model: one session row with a JSONB event array. |
@@ -161,14 +161,23 @@ Read-heavy AgentDB workloads also scale: `agentdb-isolate-fetch` reached about
 36k ops/s at 16 workers.
 
 MongoDB shows a different curve in the same local setup after adding the
-compound record-search index. It is weaker at 1-4 workers but batches/scales
-better at 8-32 workers in this synthetic local driver workload:
+compound record-search index. It is weaker at 1-4 workers but reports higher
+throughput at 16-32 workers in this synthetic local driver workload:
 
 | Run | Workload | c=1 | c=2 | c=4 | c=8 | c=16 | c=32 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `mongo-sweep-mixed` | `mixed-agent-loop` | 2971 ops/s | 1505 ops/s | 2658 ops/s | 7685 ops/s | 24874 ops/s | 25253 ops/s |
 | `agentdb-sweep-mixed` | `mixed-agent-loop` | 5082 ops/s | 3812 ops/s | 6940 ops/s | 9538 ops/s | 7727 ops/s | 7805 ops/s |
 | `agentdb-mixed-lockfix` | `mixed-agent-loop` | 6194 ops/s | n/a | 15322 ops/s | 17652 ops/s | 17063 ops/s | 16761 ops/s |
+
+Interpretation: the MongoDB c=16/c=32 result should not be summarized as an
+overall MongoDB-vs-AgentDB winner. It means the current standalone MongoDB
+event-log baseline, driven directly through the MongoDB driver, scales better
+than the current single-node/single-tablet AgentDB HTTP profile on this
+specific mixed workload at high client concurrency. AgentDB now also has an
+`agentdb-mongodb-api` profile through its own MongoDB-compatible listener, so
+future reports should show all three paths separately: AgentDB native HTTP,
+AgentDB MongoDB API, and real MongoDB event-log.
 
 The next AgentDB performance task should therefore be multi-tablet/cluster
 distribution and quorum durability profiling, not session-count tuning. For
@@ -552,10 +561,11 @@ Scale profiles should vary one dimension at a time:
 
 ### PR 2: Backend Adapters And Correctness Tests
 
-- Implement `agentdb-native`, `mongodb-session-doc`,
+- Implement `agentdb-native`, `agentdb-mongodb-api`, `mongodb-session-doc`,
   `mongodb-event-log`, `postgres-jsonb-session`, and `postgres-event-log`.
-  Initial status: `agentdb-native-rocksdb` and `postgres-event-log` are
-  implemented; MongoDB and Postgres JSONB-session remain follow-up work.
+  Initial status: `agentdb-native-rocksdb`, `agentdb-mongodb-api`,
+  `mongodb-event-log`, and `postgres-event-log` are implemented. MongoDB
+  session-doc and Postgres JSONB-session remain follow-up work.
 - Start AgentDB with local RocksDB storage for the first AgentDB profile.
 - Add adapter conformance tests for dataset prepare, append, fetch, fork,
   records, search, artifact metadata, and artifact payload/reference behavior.

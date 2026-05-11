@@ -59,6 +59,18 @@ The MongoDB baseline uses `benchmarks/mongodb/docker-compose.yml` and the
 in separate collections with tenant/session/sequence indexes. It intentionally
 does not use the naive single-session-document model for the default comparison.
 
+Run AgentDB through its MongoDB-compatible listener:
+
+```bash
+PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
+```
+
+This uses the `agentdb-mongodb-api` backend. It starts AgentDB with both the
+native HTTP server and MongoDB wire listener, prepares data through MongoDB
+driver calls, and runs workloads through AgentDB's MongoDB-compatible command
+subset. Treat this as an adapter-overhead profile for AgentDB, separate from
+both `agentdb-native-rocksdb` and real `mongodb-event-log`.
+
 Prepare a dataset:
 
 ```bash
