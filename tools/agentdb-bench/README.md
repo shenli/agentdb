@@ -96,6 +96,33 @@ small for meaningful skew sensitivity. See
 `docs/operations/AGENTDB_BENCH.md` for the current short skew-sensitivity
 control run and caveats.
 
+Use `scripts/agentdb-bench-repeat.sh` to run clean per-seed repeats and produce
+an aggregate summary:
+
+```bash
+BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+  RUN_ID=agentdb-zipf-60s \
+  PROFILE=default-agent-runtime \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=10s \
+  DURATION=60s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  REPEATS=3 \
+  SEEDS=43,44,45 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
+```
+
+The repeat script creates one run directory per seed and writes
+`bench-out/summaries/<RUN_ID>/summary.md` plus `summary.json`. Point
+`BENCH_SCRIPT` at `scripts/agentdb-bench-mongodb.sh` or
+`scripts/agentdb-bench-postgres.sh` to repeat the same cell on those backends.
+The current `li-dev` 3x/60s Zipf c=32 cell is documented in
+`docs/operations/AGENTDB_BENCH.md`; it produced a 1.66x AgentDB/MongoDB ratio
+and a 19.84x AgentDB/Postgres ratio for that internal single-node cell.
+
 Run the normalized Postgres event-log baseline:
 
 ```bash

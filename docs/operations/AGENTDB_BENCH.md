@@ -135,6 +135,24 @@ publication-grade cell.
 | `zipf`, exponent `1.2` | 44,224 ops/s | 24,284 ops/s | 2,191 ops/s | 1.82x | 20.18x | AgentDB p99 rose to 5.6ms; Postgres p99 rose to 245ms. Repeat before quoting. |
 | `hotset-90-10` | 56,787 ops/s | 24,967 ops/s | 9,525 ops/s | 2.27x | 5.96x | Hotset spreads load across about 100 hot sessions. |
 
+The repeated Zipf validation cell uses the same dataset shape and c=32, but
+with 3 seeds, 10s warmup, and 60s measured windows. The combined summary is on
+`li-dev` at
+`/home/lishen/work/agentdb-bench-runs/zipf-60s/summaries/zipf-60s-combined/summary.md`.
+
+| Backend | Repeats | ops/s mean | ops/s min | ops/s max | ops/s stddev | p95 mean | p99 mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| AgentDB native RocksDB | 3 | 43,219 | 42,980 | 43,487 | 208 | 4.426ms | 5.774ms |
+| MongoDB event log | 3 | 26,048 | 25,821 | 26,248 | 175 | 2.099ms | 2.892ms |
+| Postgres event log | 3 | 2,178 | 2,175 | 2,180 | 2 | 82.498ms | 238.775ms |
+
+The repeated 60s Zipf ratio is 1.66x MongoDB and 19.84x Postgres. This
+confirms the direction of the 10s Zipf cell, but with a lower AgentDB/MongoDB
+ratio than the short run. Treat this as a stronger internal comparison cell,
+not a publication claim: durability is still not matched across backends,
+working set still fits cache, and the selector is still flattened rather than
+tenant-aware.
+
 This cell is useful because it falsifies the simple assumption that AgentDB's
 advantage always grows under skew. Severe Zipfian skew concentrates writes onto
 the earliest sessions in the flattened fixture list and increases per-session
@@ -403,6 +421,7 @@ Run knobs:
 | `--zipf-exponent` | Zipfian skew exponent for `--session-selection zipf`; default is `1.2`. |
 | `--fetch-last-n` | Tail size returned by append/fetch and fetch-recent operations. |
 | `--warmup` / `--duration` | Warmup and measured windows. Public comparisons should use multi-minute measured windows. |
+| `scripts/agentdb-bench-repeat.sh` | Runs the selected backend wrapper once per seed with clean run IDs, then aggregates report JSON files into `bench-out/summaries/<summary-id>/summary.md`. |
 
 Skewed session selection is only meaningful with a sufficiently large fixture
 set. The `smoke` profile has too few sessions to exercise Zipfian or hotset
@@ -411,6 +430,36 @@ thousands of sessions. Current skew is applied across the flattened
 tenant-agent-session fixture list, so multi-tenant noisy-neighbor studies need
 a later tenant-aware selector that applies hot-session skew independently per
 tenant and reports tenant-level p99.
+
+Repeat-run controls should use fresh run IDs per seed instead of looping inside
+one prepared dataset. Reusing one mutated dataset lets earlier repeats change
+session heads, event counts, and cache state for later repeats. The repeat
+script preserves the existing backend wrappers and sets `RUN_ID=<base>-rN-sSEED`
+plus `SEED=SEED` for each invocation before calling
+`agentdb-bench summarize-repeats`.
+
+Example 3x Zipf validation cell:
+
+```bash
+BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+  RUN_ID=agentdb-zipf-60s \
+  PROFILE=default-agent-runtime \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=10s \
+  DURATION=60s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  REPEATS=3 \
+  SEEDS=43,44,45 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
+```
+
+Run the same command with
+`BENCH_SCRIPT=scripts/agentdb-bench-mongodb.sh` and
+`BENCH_SCRIPT=scripts/agentdb-bench-postgres.sh` before treating the Zipf row as
+a comparison cell.
 
 Predefined profiles should be thin wrappers around these parameters:
 
