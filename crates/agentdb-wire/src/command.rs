@@ -276,22 +276,28 @@ impl CommandContext {
                     .map(|value| value.max(0) as usize)
             })
             .unwrap_or(256 * 1024);
+        let session_id = session.session_id.clone();
+        let session_key = session_id.as_str().to_string();
         let response = self
             .runtime
-            .append_and_fetch(
-                AppendRequest {
-                    tenant_id: tenant.tenant_id,
-                    agent_id: session.agent_id,
-                    session_id: session.session_id,
-                    kind,
-                    payload,
-                    artifact_refs: vec![],
-                    source_refs: vec![],
-                    idempotency_key,
-                },
-                fetch_last_n,
-                max_bytes,
-            )
+            .with_local_tablet_for_key(&session_key, async {
+                self.runtime
+                    .append_and_fetch(
+                        AppendRequest {
+                            tenant_id: tenant.tenant_id,
+                            agent_id: session.agent_id,
+                            session_id,
+                            kind,
+                            payload,
+                            artifact_refs: vec![],
+                            source_refs: vec![],
+                            idempotency_key,
+                        },
+                        fetch_last_n,
+                        max_bytes,
+                    )
+                    .await
+            })
             .await?;
         Ok(doc! {
             "event_id": response.event_id.to_string(),
@@ -313,13 +319,18 @@ impl CommandContext {
             .or_else(|_| request.get_i32("at_seq").map(|value| value.max(0) as u64))
             .unwrap_or(0);
         let alias = request.get_str("alias").ok().map(str::to_string);
+        let session_key = session_id.as_str().to_string();
         let session = self
             .runtime
-            .fork_session(ForkSessionRequest {
-                tenant_id: tenant.tenant_id,
-                session_id,
-                at_seq,
-                alias,
+            .with_local_tablet_for_key(&session_key, async {
+                self.runtime
+                    .fork_session(ForkSessionRequest {
+                        tenant_id: tenant.tenant_id,
+                        session_id,
+                        at_seq,
+                        alias,
+                    })
+                    .await
             })
             .await?;
         Ok(doc! {
@@ -337,9 +348,14 @@ impl CommandContext {
             .map(|value| value.max(0) as usize)
             .or_else(|_| request.get_i64("limit").map(|value| value.max(0) as usize))
             .unwrap_or(20);
+        let session_key = session_id.as_str().to_string();
         let events = self
             .runtime
-            .fetch_recent(tenant.tenant_id, session_id, limit)
+            .with_local_tablet_for_key(&session_key, async {
+                self.runtime
+                    .fetch_recent(tenant.tenant_id, session_id, limit)
+                    .await
+            })
             .await?;
         Ok(doc! {
             "events": Bson::Array(events.into_iter().map(|event| {
@@ -569,16 +585,22 @@ impl CommandContext {
             .cloned()
             .map(crate::bsonx::bson_to_json)
             .unwrap_or_else(|| document_to_json(strip_agentdb_fields(document)));
+        let session_id = session.session_id.clone();
+        let session_key = session_id.as_str().to_string();
         self.runtime
-            .append(AppendRequest {
-                tenant_id: tenant_id.clone(),
-                agent_id: session.agent_id,
-                session_id: session.session_id,
-                kind,
-                payload,
-                artifact_refs: vec![],
-                source_refs: vec![],
-                idempotency_key,
+            .with_local_tablet_for_key(&session_key, async {
+                self.runtime
+                    .append(AppendRequest {
+                        tenant_id: tenant_id.clone(),
+                        agent_id: session.agent_id,
+                        session_id,
+                        kind,
+                        payload,
+                        artifact_refs: vec![],
+                        source_refs: vec![],
+                        idempotency_key,
+                    })
+                    .await
             })
             .await?;
         Ok(())

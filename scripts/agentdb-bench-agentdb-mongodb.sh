@@ -18,6 +18,7 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
+LOCAL_RUNTIME_TABLETS="${LOCAL_RUNTIME_TABLETS:-1}"
 
 STATE_ROOT="${STATE_ROOT:-${OUT}/state/${RUN_ID}}"
 DATA_DIR="${DATA_DIR:-${STATE_ROOT}/rocksdb}"
@@ -41,7 +42,7 @@ else
   BIN_DIR="${ROOT}/target/debug"
 fi
 
-"${BIN_DIR}/agentdb" serve \
+AGENTDB_LOCAL_RUNTIME_TABLETS="${LOCAL_RUNTIME_TABLETS}" "${BIN_DIR}/agentdb" serve \
   --bind "${BIND}" \
   --mongo-bind "${MONGO_BIND}" \
   --data-dir "${DATA_DIR}" \

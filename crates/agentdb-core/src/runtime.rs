@@ -494,6 +494,15 @@ fn priority_rank(p: Priority) -> u8 {
     }
 }
 
+fn stable_runtime_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub struct Runtime {
     state: Mutex<State>,
     session_commit_locks: StdMutex<BTreeMap<String, Weak<Mutex<()>>>>,
@@ -1593,6 +1602,27 @@ impl Runtime {
         F: Future<Output = T>,
     {
         CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future).await
+    }
+
+    pub async fn with_local_tablet_for_key<F, T>(&self, key: &str, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Some(tablet_id) = self.local_tablet_for_key(key) {
+            self.with_tablet_context(tablet_id, future).await
+        } else {
+            future.await
+        }
+    }
+
+    pub fn local_tablet_for_key(&self, key: &str) -> Option<i64> {
+        let router = self.tablet_router.as_ref()?;
+        let tablets: Vec<_> = router.tablet_ids().into_iter().collect();
+        if tablets.len() <= 1 {
+            return None;
+        }
+        let idx = (stable_runtime_hash(key) as usize) % tablets.len();
+        tablets.get(idx).copied()
     }
 
     fn session_commit_lock(&self, session_id: &Id) -> Arc<Mutex<()>> {
