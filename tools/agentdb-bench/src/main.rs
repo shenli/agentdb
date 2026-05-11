@@ -46,6 +46,8 @@ enum Commands {
     Prepare(PrepareArgs),
     /// Run a workload against a previously prepared dataset.
     Run(RunArgs),
+    /// Aggregate repeated benchmark report JSON files.
+    SummarizeRepeats(SummarizeRepeatsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -136,6 +138,16 @@ struct RunArgs {
     no_raw_jsonl: bool,
     #[arg(long, default_value_t = 43)]
     seed: u64,
+}
+
+#[derive(Args, Debug)]
+struct SummarizeRepeatsArgs {
+    #[arg(long, default_value = DEFAULT_OUT_DIR)]
+    out: PathBuf,
+    #[arg(long)]
+    summary_id: Option<String>,
+    #[arg(required = true)]
+    reports: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -253,7 +265,7 @@ struct SessionFixture {
     child_sessions: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BenchReport {
     schema_version: u32,
     run_id: String,
@@ -267,7 +279,7 @@ struct BenchReport {
     cells: Vec<CellReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CellReport {
     concurrency: usize,
     warmup_secs: f64,
@@ -279,7 +291,7 @@ struct CellReport {
     operations: Vec<OperationReport>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct LatencyReport {
     count: usize,
     p50_ms: f64,
@@ -289,7 +301,7 @@ struct LatencyReport {
     max_ms: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct OperationReport {
     operation: String,
     successful_ops: u64,
@@ -321,12 +333,94 @@ struct OperationRecord {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RepeatSummaryReport {
+    schema_version: u32,
+    summary_id: String,
+    generated_at_ms: u64,
+    inputs: Vec<RepeatInputReport>,
+    groups: Vec<RepeatGroupReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepeatInputReport {
+    path: String,
+    run_id: String,
+    backend: String,
+    workload: Workload,
+    seed: Option<u64>,
+    session_selection: Option<String>,
+    zipf_exponent: Option<f64>,
+    duration: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepeatGroupReport {
+    backend: String,
+    workload: Workload,
+    concurrency: usize,
+    session_selection: Option<String>,
+    zipf_exponent: Option<f64>,
+    repeats: usize,
+    run_ids: Vec<String>,
+    ops_per_sec: ValueStats,
+    p50_ms: ValueStats,
+    p95_ms: ValueStats,
+    p99_ms: ValueStats,
+    max_ms: ValueStats,
+    errors: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ValueStats {
+    mean: f64,
+    min: f64,
+    max: f64,
+    stddev: f64,
+}
+
+struct RepeatGroupAccumulator {
+    backend: String,
+    workload: Workload,
+    concurrency: usize,
+    session_selection: Option<String>,
+    zipf_exponent: Option<f64>,
+    run_ids: Vec<String>,
+    ops_per_sec: Vec<f64>,
+    p50_ms: Vec<f64>,
+    p95_ms: Vec<f64>,
+    p99_ms: Vec<f64>,
+    max_ms: Vec<f64>,
+    errors: u64,
+}
+
+impl RepeatGroupAccumulator {
+    fn finish(self) -> RepeatGroupReport {
+        RepeatGroupReport {
+            backend: self.backend,
+            workload: self.workload,
+            concurrency: self.concurrency,
+            session_selection: self.session_selection,
+            zipf_exponent: self.zipf_exponent,
+            repeats: self.ops_per_sec.len(),
+            run_ids: self.run_ids,
+            ops_per_sec: value_stats(&self.ops_per_sec),
+            p50_ms: value_stats(&self.p50_ms),
+            p95_ms: value_stats(&self.p95_ms),
+            p99_ms: value_stats(&self.p99_ms),
+            max_ms: value_stats(&self.max_ms),
+            errors: self.errors,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Prepare(args) => prepare(args).await,
         Commands::Run(args) => run(args).await,
+        Commands::SummarizeRepeats(args) => summarize_repeats(args),
     }
 }
 
@@ -1091,6 +1185,104 @@ async fn run(args: RunArgs) -> Result<()> {
     write_json(&report_path, &report)?;
     write_markdown_report(run_dir.join("report.md"), &manifest, &report)?;
     println!("wrote {}", report_path.display());
+    Ok(())
+}
+
+fn summarize_repeats(args: SummarizeRepeatsArgs) -> Result<()> {
+    if args.reports.is_empty() {
+        return Err(anyhow!("at least one report path is required"));
+    }
+
+    let summary_id = args
+        .summary_id
+        .clone()
+        .unwrap_or_else(|| format!("repeat-summary-{}", now_ms()));
+    let summary_dir = args.out.join("summaries").join(&summary_id);
+    create_new_run_dir(&summary_dir)?;
+
+    let mut inputs = Vec::new();
+    let mut groups: BTreeMap<String, RepeatGroupAccumulator> = BTreeMap::new();
+
+    for path in &args.reports {
+        let report: BenchReport =
+            read_json(path).with_context(|| format!("read repeat report {}", path.display()))?;
+        let session_selection = report
+            .config
+            .get("session_selection")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let zipf_exponent = report.config.get("zipf_exponent").and_then(Value::as_f64);
+        let seed = report.config.get("seed").and_then(Value::as_u64);
+        let duration = report
+            .config
+            .get("duration")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        inputs.push(RepeatInputReport {
+            path: path.display().to_string(),
+            run_id: report.run_id.clone(),
+            backend: report.backend.clone(),
+            workload: report.workload,
+            seed,
+            session_selection: session_selection.clone(),
+            zipf_exponent,
+            duration,
+        });
+
+        for cell in &report.cells {
+            let key = format!(
+                "{}|{:?}|{}|{}|{}",
+                report.backend,
+                report.workload,
+                cell.concurrency,
+                session_selection.as_deref().unwrap_or(""),
+                zipf_exponent
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(String::new)
+            );
+            let group = groups.entry(key).or_insert_with(|| RepeatGroupAccumulator {
+                backend: report.backend.clone(),
+                workload: report.workload,
+                concurrency: cell.concurrency,
+                session_selection: session_selection.clone(),
+                zipf_exponent,
+                run_ids: Vec::new(),
+                ops_per_sec: Vec::new(),
+                p50_ms: Vec::new(),
+                p95_ms: Vec::new(),
+                p99_ms: Vec::new(),
+                max_ms: Vec::new(),
+                errors: 0,
+            });
+            group.run_ids.push(report.run_id.clone());
+            group.ops_per_sec.push(cell.ops_per_sec);
+            group.p50_ms.push(cell.latency.p50_ms);
+            group.p95_ms.push(cell.latency.p95_ms);
+            group.p99_ms.push(cell.latency.p99_ms);
+            group.max_ms.push(cell.latency.max_ms);
+            group.errors += cell.errors;
+        }
+    }
+
+    let groups = groups
+        .into_values()
+        .map(RepeatGroupAccumulator::finish)
+        .collect::<Vec<_>>();
+    let summary = RepeatSummaryReport {
+        schema_version: 1,
+        summary_id: summary_id.clone(),
+        generated_at_ms: now_ms(),
+        inputs,
+        groups,
+    };
+
+    let json_path = summary_dir.join("summary.json");
+    let markdown_path = summary_dir.join("summary.md");
+    write_json(&json_path, &summary)?;
+    write_repeat_summary_markdown(&markdown_path, &summary)?;
+    println!("wrote {}", json_path.display());
+    println!("wrote {}", markdown_path.display());
     Ok(())
 }
 
@@ -3447,6 +3639,65 @@ fn write_markdown_report(
     Ok(())
 }
 
+fn write_repeat_summary_markdown(
+    path: impl AsRef<Path>,
+    summary: &RepeatSummaryReport,
+) -> Result<()> {
+    let mut out = String::new();
+    out.push_str("# AgentDB Benchmark Repeat Summary\n\n");
+    out.push_str(&format!("- Summary ID: `{}`\n", summary.summary_id));
+    out.push_str(&format!("- Inputs: `{}` reports\n", summary.inputs.len()));
+    out.push_str("\n## Inputs\n\n");
+    out.push_str("| run_id | backend | workload | seed | selection | duration | report |\n");
+    out.push_str("|---|---|---|---:|---|---|---|\n");
+    for input in &summary.inputs {
+        out.push_str(&format!(
+            "| `{}` | `{}` | `{:?}` | {} | `{}` | `{}` | `{}` |\n",
+            input.run_id,
+            input.backend,
+            input.workload,
+            input
+                .seed
+                .map(|seed| seed.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+            input.session_selection.as_deref().unwrap_or("n/a"),
+            input.duration.as_deref().unwrap_or("n/a"),
+            input.path
+        ));
+    }
+
+    out.push_str("\n## Aggregate Cells\n\n");
+    out.push_str("| backend | workload | c | selection | repeats | ops/s mean | ops/s min | ops/s max | ops/s stddev | p95 mean ms | p99 mean ms | errors |\n");
+    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for group in &summary.groups {
+        let selection = match (&group.session_selection, group.zipf_exponent) {
+            (Some(selection), Some(exponent)) if selection == "zipf" => {
+                format!("{selection}-{exponent}")
+            }
+            (Some(selection), _) => selection.clone(),
+            _ => "n/a".into(),
+        };
+        out.push_str(&format!(
+            "| `{}` | `{:?}` | {} | `{}` | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.3} | {:.3} | {} |\n",
+            group.backend,
+            group.workload,
+            group.concurrency,
+            selection,
+            group.repeats,
+            group.ops_per_sec.mean,
+            group.ops_per_sec.min,
+            group.ops_per_sec.max,
+            group.ops_per_sec.stddev,
+            group.p95_ms.mean,
+            group.p99_ms.mean,
+            group.errors
+        ));
+    }
+
+    fs::write(path, out)?;
+    Ok(())
+}
+
 fn event_payload(
     config: &DatasetConfig,
     rng: &mut StdRng,
@@ -3535,6 +3786,35 @@ fn summarize_operations(samples: &[OperationSample]) -> Vec<OperationReport> {
             }
         })
         .collect()
+}
+
+fn value_stats(values: &[f64]) -> ValueStats {
+    if values.is_empty() {
+        return ValueStats {
+            mean: 0.0,
+            min: 0.0,
+            max: 0.0,
+            stddev: 0.0,
+        };
+    }
+    let sum = values.iter().sum::<f64>();
+    let mean = sum / values.len() as f64;
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    ValueStats {
+        mean,
+        min,
+        max,
+        stddev: variance.sqrt(),
+    }
 }
 
 fn print_cell(cell: &CellReport) {
