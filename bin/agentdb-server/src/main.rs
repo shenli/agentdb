@@ -21,6 +21,9 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde::Deserialize;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
 const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";

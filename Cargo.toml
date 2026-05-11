@@ -72,3 +72,4 @@ rustls-pemfile = "2"
 # `agentdb serve --dev-tls` and integration tests.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 mongodb = { version = "2.8.2", default-features = false, features = ["tokio-runtime"] }
+mimalloc = "0.1"

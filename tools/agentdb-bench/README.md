@@ -40,6 +40,9 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | `agentdb-defaultgroup-append-only-sweep` | `append-only` | 11442 ops/s | n/a | 27082 ops/s | 32484 ops/s | 34120 ops/s |
 | `agentdb-defaultgroup-append-fetch-hot-sweep` | `append-fetch-hot` | 10103 ops/s | n/a | 23740 ops/s | 28243 ops/s | 28286 ops/s |
 | `agentdb-defaultgroup-mixed-agent-loop-sweep` | `mixed-agent-loop` | 10878 ops/s | n/a | 19719 ops/s | 24491 ops/s | 24321 ops/s |
+| `agentdb-mimalloc-hotcache-append-only-sweep` | `append-only` | 12033 ops/s | n/a | 26874 ops/s | 34484 ops/s | 35249 ops/s |
+| `agentdb-mimalloc-hotcache-append-fetch-hot-sweep` | `append-fetch-hot` | 10138 ops/s | n/a | 24702 ops/s | 30354 ops/s | 31613 ops/s |
+| `agentdb-mimalloc-hotcache-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11692 ops/s | n/a | 21695 ops/s | 28290 ops/s | 25292 ops/s |
 | `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 
