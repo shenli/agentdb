@@ -34,53 +34,23 @@ PROFILE=smoke ARTIFACT_MODE=content-backend \
 The runner builds release binaries by default. Set `BUILD_PROFILE=debug` for a
 faster development-only smoke.
 
-Latest `li-dev` AgentDB local RocksDB results captured for this PR:
+## Current Comparison Snapshot
 
-| Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 |
-|---|---|---:|---:|---:|---:|---:|
-| `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s |
-| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s |
-| `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s |
-| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s |
-| `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s |
-| `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s |
-| `agentdb-defaultgroup-append-only-sweep` | `append-only` | 11442 ops/s | n/a | 27082 ops/s | 32484 ops/s | 34120 ops/s |
-| `agentdb-defaultgroup-append-fetch-hot-sweep` | `append-fetch-hot` | 10103 ops/s | n/a | 23740 ops/s | 28243 ops/s | 28286 ops/s |
-| `agentdb-defaultgroup-mixed-agent-loop-sweep` | `mixed-agent-loop` | 10878 ops/s | n/a | 19719 ops/s | 24491 ops/s | 24321 ops/s |
-| `agentdb-mimalloc-hotcache-append-only-sweep` | `append-only` | 12033 ops/s | n/a | 26874 ops/s | 34484 ops/s | 35249 ops/s |
-| `agentdb-mimalloc-hotcache-append-fetch-hot-sweep` | `append-fetch-hot` | 10138 ops/s | n/a | 24702 ops/s | 30354 ops/s | 31613 ops/s |
-| `agentdb-mimalloc-hotcache-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11692 ops/s | n/a | 21695 ops/s | 28290 ops/s | 25292 ops/s |
-| `agentdb-mixedpaths-append-only-sweep` | `append-only` | 12301 ops/s | n/a | 28010 ops/s | 34684 ops/s | 36592 ops/s |
-| `agentdb-mixedpaths-append-fetch-hot-sweep` | `append-fetch-hot` | 10938 ops/s | n/a | 25140 ops/s | 30746 ops/s | 31614 ops/s |
-| `agentdb-mixedpaths-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11266 ops/s | n/a | 32935 ops/s | 40515 ops/s | 41236 ops/s |
-| `agentdb-mixedpaths-record-write-only-sweep` | `record-write-only` | 11535 ops/s | n/a | 21602 ops/s | 28966 ops/s | 35192 ops/s |
-| `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s |
-| `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s |
-| `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s |
-| `agentdb-rocks-defaults-append-sweep` | `append-only` | 14577 ops/s | n/a | 38514 ops/s | 44801 ops/s | 48985 ops/s |
-| `agentdb-rocks-defaults-appendfetch-sweep` | `append-fetch-hot` | 11836 ops/s | n/a | 33513 ops/s | 38569 ops/s | 41097 ops/s |
-| `agentdb-rocks-defaults-mixed-sweep` | `mixed-agent-loop` | 11819 ops/s | n/a | 40858 ops/s | 52422 ops/s | 55998 ops/s |
-| `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s |
-| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
-| `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s |
-| `postgres-final-mixed-current-shape` | `mixed-agent-loop` | 449 ops/s | n/a | 2106 ops/s | 3776 ops/s | 5334 ops/s |
+The table below keeps only the latest comparison cells. Historical tuning runs
+live in `docs/operations/AGENTDB_BENCH.md`; they are useful for engineering
+forensics, but they should not be the first thing a benchmark reader sees.
 
-The detailed reports are stored on `li-dev` under the run-specific `OUT`
-directory, usually
-`/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/<run-id>/runs/<run-id>/report.md`
-for larger local runs.
+| Cell | Shape | AgentDB | MongoDB | Postgres | Ratio |
+|---|---|---:|---:|---:|---|
+| Mixed loop, uniform | c=32, short single run, local single node | 56.0k ops/s | 26.2k ops/s | 5.3k ops/s | 2.14x MongoDB, 10.50x Postgres |
+| Mixed loop, Zipf-1.2 | c=32, 3 seeds, 60s measured windows | 43.2k ops/s | 26.0k ops/s | 2.2k ops/s | 1.66x MongoDB, 19.84x Postgres |
 
-The latest native RocksDB mixed run uses adaptive write batching, hot-tail
-append-and-fetch, route-level backpressure reuse, event-sourced session-head
-recovery, a fast path for metadata-only tenant policy JSON, lazy forwarding-body
-serialization on local routes, and larger local RocksDB write buffers/background
-jobs. On `li-dev`, `agentdb-rocks-defaults-mixed-sweep` reached 56.0k ops/s at
-c=32. The same benchmark shape reached 26.2k ops/s on MongoDB and 5.3k ops/s on
-Postgres, so this run is about 2.14x MongoDB and 10.50x Postgres for this
-specific synthetic mixed agent loop. Do not quote those ratios externally
-without also reporting matched durability settings, working-set size versus
-cache, run duration, session-selection distribution, and the fused
-append-and-fetch API shape.
+Interpret these as internal single-node benchmark cells, not product claims.
+The AgentDB API uses a fused `append-and-fetch` primitive; MongoDB and Postgres
+perform append and fetch as separate client operations. Publication-quality
+numbers still need matched durability, working-set-exceeds-cache profiles,
+tenant-aware noisy-neighbor cells, and multi-minute runs across more workload
+shapes.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.

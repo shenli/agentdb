@@ -411,23 +411,12 @@ fn insert_runtime_event_cache(
         return;
     }
 
-    let evict_before = seq
-        .saturating_add(1)
-        .saturating_sub(PERSISTED_HOT_EVENT_CACHE_PER_SESSION);
-    if evict_before == 0 {
+    if seq < PERSISTED_HOT_EVENT_CACHE_PER_SESSION {
         return;
     }
 
-    let first_drop = (session_id.to_string(), 0);
-    let last_drop = (session_id.to_string(), evict_before.saturating_sub(1));
-    let stale_keys = state
-        .events
-        .range(first_drop..=last_drop)
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
-    for key in stale_keys {
-        state.events.remove(&key);
-    }
+    let stale_seq = seq - PERSISTED_HOT_EVENT_CACHE_PER_SESSION;
+    state.events.remove(&(session_id.to_string(), stale_seq));
 }
 
 fn scoped_alias_key(tenant_id: &str, alias: &str) -> String {
@@ -5114,6 +5103,16 @@ impl Runtime {
         };
 
         let mut out = Vec::new();
+        if req.from_seq >= session.warm_head_from_seq {
+            let expected_hot = usize::try_from(session.next_seq.saturating_sub(req.from_seq))
+                .unwrap_or(usize::MAX)
+                .min(req.limit);
+            if hot_cache_covers_from(&hot_in_memory, req.from_seq, expected_hot) {
+                out.extend(hot_in_memory.into_iter().take(req.limit));
+                return Ok(out);
+            }
+        }
+
         if let Some(manifest) = &session.archive_manifest {
             let mut archived = self.read_session_archive_events(manifest).await?;
             archived.retain(|event| event.seq >= req.from_seq);
@@ -5150,7 +5149,7 @@ impl Runtime {
             let expected_hot = usize::try_from(session.next_seq.saturating_sub(hot_from_seq))
                 .unwrap_or(usize::MAX)
                 .min(remaining);
-            if hot_in_memory.len() >= expected_hot {
+            if hot_cache_covers_from(&hot_in_memory, hot_from_seq, expected_hot) {
                 out.extend(hot_in_memory.into_iter().take(remaining));
                 if out.len() > req.limit {
                     out.truncate(req.limit);
@@ -6001,6 +6000,11 @@ fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
     if keep_from > 0 {
         recent.drain(0..keep_from);
     }
+}
+
+fn hot_cache_covers_from(events: &[EventEnvelope], from_seq: u64, expected: usize) -> bool {
+    expected == 0
+        || (events.len() >= expected && events.first().is_some_and(|event| event.seq == from_seq))
 }
 
 fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) -> bool {
