@@ -50,6 +50,9 @@ Latest `li-dev` AgentDB local RocksDB results captured for this PR:
 | `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s |
 | `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s |
 | `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s |
+| `agentdb-rocks-defaults-append-sweep` | `append-only` | 14577 ops/s | n/a | 38514 ops/s | 44801 ops/s | 48985 ops/s |
+| `agentdb-rocks-defaults-appendfetch-sweep` | `append-fetch-hot` | 11836 ops/s | n/a | 33513 ops/s | 38569 ops/s | 41097 ops/s |
+| `agentdb-rocks-defaults-mixed-sweep` | `mixed-agent-loop` | 11819 ops/s | n/a | 40858 ops/s | 52422 ops/s | 55998 ops/s |
 | `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s |
 | `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s |
 | `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s |
@@ -62,11 +65,12 @@ for larger local runs.
 
 The latest native RocksDB mixed run uses adaptive write batching, hot-tail
 append-and-fetch, route-level backpressure reuse, event-sourced session-head
-recovery, and a fast path for metadata-only tenant policy JSON. On `li-dev`,
-`agentdb-final-policyfast-mixed-sweep` reached 55.8k ops/s at c=32. The same
-benchmark shape reached 26.2k ops/s on MongoDB and 5.3k ops/s on Postgres, so
-this run is about 2.13x MongoDB and 10.47x Postgres for the synthetic mixed
-agent loop.
+recovery, a fast path for metadata-only tenant policy JSON, lazy forwarding-body
+serialization on local routes, and larger local RocksDB write buffers/background
+jobs. On `li-dev`, `agentdb-rocks-defaults-mixed-sweep` reached 56.0k ops/s at
+c=32. The same benchmark shape reached 26.2k ops/s on MongoDB and 5.3k ops/s on
+Postgres, so this run is about 2.14x MongoDB and 10.50x Postgres for the
+synthetic mixed agent loop.
 
 Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
 the tail-read/context serialization included in `append-fetch-hot`.

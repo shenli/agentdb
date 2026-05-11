@@ -4627,15 +4627,14 @@ async fn transition_session_lifecycle(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let forward_body = serde_json::to_vec(&body).expect("lifecycle body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("lifecycle body must serialize")),
     )
     .await
     {
@@ -4685,15 +4684,14 @@ async fn restore_session_storage(
         IdKind::Session,
         agentdb_core::ErrorCode::SessionNotFound,
     )?;
-    let forward_body = serde_json::to_vec(&body).expect("restore body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("restore body must serialize")),
     )
     .await
     {
@@ -4746,15 +4744,14 @@ async fn append_event(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
-    let forward_body = serde_json::to_vec(&body).expect("append body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("append body must serialize")),
     )
     .await
     {
@@ -4814,15 +4811,14 @@ async fn append_and_fetch(
         IdKind::Agent,
         agentdb_core::ErrorCode::AgentNotFound,
     )?;
-    let forward_body = serde_json::to_vec(&body).expect("append-and-fetch body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("append-and-fetch body must serialize")),
     )
     .await
     {
@@ -4916,15 +4912,14 @@ async fn fork_session(
     reject_if_draining(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let forward_body = serde_json::to_vec(&body).expect("fork body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("fork body must serialize")),
     )
     .await
     {
@@ -5030,15 +5025,14 @@ async fn build_context(
 ) -> Result<Response, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
-    let forward_body = serde_json::to_vec(&body).expect("context body must serialize");
-    let route_headers = match guard_session_request(
+    let route_headers = match guard_session_request_lazy_body(
         &s,
         &tid,
         &sid,
         &original_uri,
         &headers,
         Method::POST,
-        Some(forward_body),
+        Some(|| serde_json::to_vec(&body).expect("context body must serialize")),
     )
     .await
     {
@@ -5394,6 +5388,30 @@ async fn guard_session_request(
     method: Method,
     body: Option<Vec<u8>>,
 ) -> Result<HeaderMap, Response> {
+    guard_session_request_lazy_body(
+        state,
+        tenant_id,
+        session_id,
+        original_uri,
+        headers,
+        method,
+        body.map(|body| move || body),
+    )
+    .await
+}
+
+async fn guard_session_request_lazy_body<F>(
+    state: &AppState,
+    tenant_id: &Id,
+    session_id: &Id,
+    original_uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    method: Method,
+    body: Option<F>,
+) -> Result<HeaderMap, Response>
+where
+    F: FnOnce() -> Vec<u8>,
+{
     let path_and_query = original_uri
         .path_and_query()
         .map(|path| path.as_str())
@@ -5406,7 +5424,7 @@ async fn guard_session_request(
     ) {
         RouteGuardOutcome::ServeLocal(headers) => Ok(headers),
         RouteGuardOutcome::Forward(forward) => {
-            Err(execute_forward(state, forward, method, body).await)
+            Err(execute_forward(state, forward, method, body.map(|build| build())).await)
         }
         RouteGuardOutcome::Reject(rejection) => Err(route_rejection_response(&rejection)),
     }

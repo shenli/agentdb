@@ -16,11 +16,34 @@ pub struct RocksKvStore {
 
 impl RocksKvStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let opts = default_rocks_options();
         let db = DB::open(&opts, path)?;
         Ok(Self { db: Arc::new(db) })
     }
+}
+
+fn default_rocks_options() -> Options {
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as i32)
+        .unwrap_or(4);
+    opts.increase_parallelism(parallelism);
+    opts.set_max_background_jobs(parallelism);
+
+    // AgentDB's local developer path is append-heavy with small metadata rows.
+    // Larger memtables reduce flush pressure and keep the out-of-box RocksDB
+    // profile from behaving like a tiny embedded default.
+    opts.set_write_buffer_size(128 * 1024 * 1024);
+    opts.set_max_write_buffer_number(4);
+    opts.set_min_write_buffer_number_to_merge(1);
+    opts.set_level_zero_file_num_compaction_trigger(8);
+    opts.set_level_zero_slowdown_writes_trigger(24);
+    opts.set_level_zero_stop_writes_trigger(36);
+    opts.set_bytes_per_sync(1024 * 1024);
+
+    opts
 }
 
 impl KvStore for RocksKvStore {
