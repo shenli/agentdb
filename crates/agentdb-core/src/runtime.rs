@@ -4750,6 +4750,10 @@ impl Runtime {
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(64);
+        let wait_us = std::env::var("AGENTDB_SESSION_APPEND_BATCH_WAIT_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(500);
         loop {
             let mut jobs = Vec::new();
             {
@@ -4767,6 +4771,16 @@ impl Runtime {
                     }
                     state.running = true;
                     continue;
+                }
+            }
+            if wait_us > 0 && jobs.len() < max_batch {
+                tokio::time::sleep(std::time::Duration::from_micros(wait_us)).await;
+                let mut state = queue.inner.lock().await;
+                while jobs.len() < max_batch {
+                    let Some(job) = state.jobs.pop_front() else {
+                        break;
+                    };
+                    jobs.push(job);
                 }
             }
             self.process_simple_append_batch(jobs).await;
