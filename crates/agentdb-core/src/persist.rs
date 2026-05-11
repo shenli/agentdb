@@ -21,6 +21,7 @@
 //! Events are NOT preloaded; `scan_events` is invoked lazily by
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -51,6 +52,24 @@ use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AppendLogBatch {
+    events: Vec<EventEnvelope>,
+    session: Option<Session>,
+}
+
+fn append_log_key(tenant_id: &str, session_id: &str, first_seq: u64) -> String {
+    format!("append_log/{tenant_id}/{session_id}/{first_seq:020}")
+}
+
+fn append_log_session_prefix(tenant_id: &str, session_id: &str) -> String {
+    format!("append_log/{tenant_id}/{session_id}/")
+}
+
+fn append_log_tenant_prefix(tenant_id: &str) -> String {
+    format!("append_log/{tenant_id}/")
+}
 
 static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
 static ADAPTIVE_WRITE_PROFILE: OnceLock<Option<AdaptiveWriteProfile>> = OnceLock::new();
@@ -737,6 +756,18 @@ impl Persist {
             });
             count += 1;
         }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in &batch.events {
+                ops.push(WriteOp::Delete {
+                    key: event_by_id_key(tenant_id, event.event_id.as_str()).into_bytes(),
+                });
+                count += 1;
+            }
+            ops.push(WriteOp::Delete { key: k });
+        }
         if !ops.is_empty() {
             self.kv.write_batch(ops)?;
         }
@@ -767,6 +798,42 @@ impl Persist {
                 key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),
             });
             count += 1;
+        }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            let mut kept = Vec::new();
+            let mut deleted = Vec::new();
+            for event in batch.events {
+                if event.seq < from_seq {
+                    kept.push(event);
+                } else {
+                    deleted.push(event);
+                }
+            }
+            if deleted.is_empty() {
+                continue;
+            }
+            for event in &deleted {
+                ops.push(WriteOp::Delete {
+                    key: event_by_id_key(tenant_id, event.event_id.as_str()).into_bytes(),
+                });
+            }
+            count += deleted.len();
+            ops.push(WriteOp::Delete { key: k });
+            if !kept.is_empty() {
+                let first_seq = kept[0].seq;
+                let rewritten = AppendLogBatch {
+                    events: kept,
+                    session: None,
+                };
+                let value = self.encode_append_log_batch(tenant_id, session_id, &rewritten)?;
+                ops.push(WriteOp::Put {
+                    key: append_log_key(tenant_id, session_id, first_seq).into_bytes(),
+                    value,
+                });
+            }
         }
         if !ops.is_empty() {
             self.kv.write_batch(ops)?;
@@ -840,6 +907,38 @@ impl Persist {
         result
     }
 
+    pub async fn append_many_log_async(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(profile) = append_persist_profile() else {
+            let ops = self.append_many_log_ops(events, session)?;
+            if let Some(batcher) = &self.adaptive_write_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_many_log_ops(events, session)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
+    }
+
     fn append_many_batch_ops(
         &self,
         events: &[EventEnvelope],
@@ -857,6 +956,33 @@ impl Persist {
             });
         }
         Ok(ops)
+    }
+
+    fn append_many_log_ops(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<Vec<WriteOp>> {
+        let first = events
+            .first()
+            .expect("append_many_log_ops requires non-empty events");
+        let batch = AppendLogBatch {
+            events: events.to_vec(),
+            session: session.cloned(),
+        };
+        Ok(vec![WriteOp::Put {
+            key: append_log_key(
+                first.tenant_id.as_str(),
+                first.session_id.as_str(),
+                first.seq,
+            )
+            .into_bytes(),
+            value: self.encode_append_log_batch(
+                first.tenant_id.as_str(),
+                first.session_id.as_str(),
+                &batch,
+            )?,
+        }])
     }
 
     pub(crate) fn append_batch_ops(
@@ -933,6 +1059,80 @@ impl Persist {
         Ok(Some((session_id, seq)))
     }
 
+    fn encode_append_log_batch(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        batch: &AppendLogBatch,
+    ) -> KvResult<Vec<u8>> {
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        self.encrypt_metadata(
+            &context,
+            &serde_json::to_vec(batch).expect("append log batch serializes"),
+        )
+    }
+
+    fn decode_append_log_batch(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        value: &[u8],
+    ) -> KvResult<AppendLogBatch> {
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let plaintext = self.decrypt_metadata(&context, value)?;
+        Ok(serde_json::from_slice(&plaintext).expect("append log batch decodes"))
+    }
+
+    fn append_log_session_id_from_key<'a>(tenant_id: &str, key: &'a [u8]) -> Option<&'a str> {
+        let raw = std::str::from_utf8(key).ok()?;
+        let prefix = append_log_tenant_prefix(tenant_id);
+        let rest = raw.strip_prefix(prefix.as_str())?;
+        let (session_id, _) = rest.split_once('/')?;
+        Some(session_id)
+    }
+
+    pub fn lookup_event_by_id_in_append_log(
+        &self,
+        tenant_id: &str,
+        event_id: &str,
+    ) -> KvResult<Option<(String, u64)>> {
+        let prefix = append_log_tenant_prefix(tenant_id);
+        for res in self.kv.scan_prefix(prefix.as_bytes())? {
+            let (k, v) = res?;
+            let Some(session_id) = Self::append_log_session_id_from_key(tenant_id, &k) else {
+                continue;
+            };
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                if event.event_id.as_str() == event_id {
+                    return Ok(Some((session_id.to_string(), event.seq)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn latest_append_log_session(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+    ) -> KvResult<Option<Session>> {
+        let prefix = append_log_session_prefix(tenant_id, session_id);
+        let mut latest: Option<(u64, Session)> = None;
+        for res in self.kv.scan_prefix(prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            let Some(session) = batch.session else {
+                continue;
+            };
+            let last_seq = batch.events.last().map(|event| event.seq).unwrap_or(0);
+            if latest.as_ref().map_or(true, |(seq, _)| last_seq >= *seq) {
+                latest = Some((last_seq, session));
+            }
+        }
+        Ok(latest.map(|(_, session)| session))
+    }
+
     // ----- reads -----
 
     pub fn scan_events(
@@ -942,12 +1142,12 @@ impl Persist {
         from_seq: u64,
         limit: usize,
     ) -> KvResult<Vec<EventEnvelope>> {
+        let mut merged: BTreeMap<u64, EventEnvelope> = BTreeMap::new();
         let prefix = format!("event/{tenant_id}/{session_id}/");
         let start = event_key(tenant_id, session_id, from_seq);
         let iter = self
             .kv
             .scan_prefix_from(prefix.as_bytes(), start.as_bytes())?;
-        let mut out = Vec::new();
         for res in iter {
             let (_k, v) = res?;
             let context = self.event_context_from_key(tenant_id, session_id, 0);
@@ -957,12 +1157,25 @@ impl Persist {
             if env.seq < from_seq {
                 continue;
             }
-            out.push(env);
-            if out.len() >= limit {
+            merged.insert(env.seq, env);
+            if merged.len() >= limit {
                 break;
             }
         }
-        Ok(out)
+
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                if event.seq < from_seq {
+                    continue;
+                }
+                merged.insert(event.seq, event);
+            }
+        }
+
+        Ok(merged.into_values().take(limit).collect())
     }
 
     /// Return the highest persisted event seq for `(tenant_id, session_id)`,
@@ -982,6 +1195,17 @@ impl Persist {
                 Some(m) if m >= env.seq => m,
                 _ => env.seq,
             });
+        }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                max_seq = Some(match max_seq {
+                    Some(m) if m >= event.seq => m,
+                    _ => event.seq,
+                });
+            }
         }
         Ok(max_seq)
     }

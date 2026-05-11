@@ -170,24 +170,30 @@ async fn concurrent_append_and_fetch_same_session_survives_restart() {
                 .recent
                 .iter()
                 .all(|event| event.seq <= response.seq));
-            response.seq
+            (response.seq, response.event_id)
         }));
     }
 
-    let mut seqs = Vec::new();
+    let mut appended = Vec::new();
     for task in tasks {
-        seqs.push(task.await.unwrap());
+        appended.push(task.await.unwrap());
     }
+    let mut seqs = appended.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
     seqs.sort_unstable();
     assert_eq!(seqs, (0..64).collect::<Vec<_>>());
+    let lookup_event = appended
+        .iter()
+        .find(|(seq, _)| *seq == 0)
+        .map(|(_, event_id)| event_id.clone())
+        .unwrap();
     drop(rt);
 
     let kv = open_kv(dir.path());
     let rt = Runtime::with_kv(kv, in_memory_content());
     let events = rt
         .fetch_from_seq(FetchRequest {
-            tenant_id: t.tenant_id,
-            session_id: s.session_id,
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
             from_seq: 0,
             limit: 100,
         })
@@ -198,6 +204,11 @@ async fn concurrent_append_and_fetch_same_session_survives_restart() {
         events.iter().map(|event| event.seq).collect::<Vec<_>>(),
         (0..64).collect::<Vec<_>>()
     );
+    let lookup = rt
+        .lookup_event_by_id(&t.tenant_id, &lookup_event)
+        .await
+        .unwrap();
+    assert_eq!(lookup, Some((s.session_id, 0)));
 }
 
 #[tokio::test]

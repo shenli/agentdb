@@ -1307,6 +1307,12 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
         state.agents.insert(a.agent_id.as_str().to_string(), a);
     }
     for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
+        if let Some(log_session) = persist
+            .latest_append_log_session(s.tenant_id.as_str(), s.session_id.as_str())
+            .expect("hydrate append log session")
+        {
+            s = log_session;
+        }
         // Reconcile next_seq against persisted events.
         let max_seq = persist
             .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
@@ -4880,7 +4886,12 @@ impl Runtime {
             .flatten();
         if let Some(p) = &self.persist {
             let durable_write_started = coalesce_profile.map(|_| Instant::now());
-            if let Err(err) = p.append_many_batch_async(&events, session_checkpoint).await {
+            let durable_result = if env_flag_disabled_runtime("AGENTDB_APPEND_LOG_FAST_PATH") {
+                p.append_many_batch_async(&events, session_checkpoint).await
+            } else {
+                p.append_many_log_async(&events, session_checkpoint).await
+            };
+            if let Err(err) = durable_result {
                 let err = internal(err);
                 for (_, done) in prepared {
                     let _ = done.send(Err(err.clone()));
@@ -5772,6 +5783,12 @@ impl Runtime {
             let raw = p
                 .lookup_event_by_id(tenant_id.as_str(), event_id.as_str())
                 .map_err(internal)?;
+            let raw = match raw {
+                Some(location) => Some(location),
+                None => p
+                    .lookup_event_by_id_in_append_log(tenant_id.as_str(), event_id.as_str())
+                    .map_err(internal)?,
+            };
             let Some((sid, seq)) = raw else {
                 return Ok(None);
             };
