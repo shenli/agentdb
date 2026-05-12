@@ -203,23 +203,24 @@ AgentDB ran RocksDB sync writes with adaptive append group commit, MongoDB used
 seed (`43`) sanity run, not a publishable comparison.
 
 Results are on `li-dev` under
-`/home/lishen/work/agentdb-bench-runs/durable-single-zipf`.
+`/home/lishen/work/agentdb-bench-runs/durable-single-zipf` and
+`/home/lishen/work/agentdb-bench-runs/single-node-fsync-sweep`.
 
 | Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---|
 | AgentDB `single-node-fsync`, initial | 256 | 858ms | 949ms | 0.29x MongoDB / 0.12x Postgres | RocksDB sync writes plus safe append group commit. |
-| AgentDB `single-node-fsync`, tuned | 1,318 | 57ms | 88ms | 1.49x MongoDB / 0.60x Postgres | Compact append log plus shared Persist fsync batching. |
+| AgentDB `single-node-fsync`, tuned c=32 | 1,441 | 47ms | 75ms | 1.63x MongoDB / 0.66x Postgres | Compact append log, shared Persist fsync batching, zero same-session coalescing wait. |
 | MongoDB `single-node-fsync` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
 | Postgres `single-node-fsync` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
 | AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
 
-This falsifies the assumption that AgentDB is already faster under matched
-local fsync durability. The fast `single-node-wal` row remains useful for local
-developer experience, but it is not a host-crash media-sync claim. Under
-`single-node-fsync`, AgentDB's `append_fetch` p95 was 897ms and p99 was 982ms,
-while metadata writes such as `record_write` and `fork` stayed near 53-54ms
-p95. That points at the durable append path rather than read caching as the
-next bottleneck.
+This falsifies the assumption that AgentDB automatically wins under matched
+local fsync durability just because the data model is simpler. The fast
+`single-node-wal` row remains useful for local developer experience, but it is
+not a host-crash media-sync claim. The initial profiled `single-node-fsync`
+cell showed `append_fetch` p95 at 897ms and p99 at 982ms, while metadata writes
+such as `record_write` and `fork` stayed near 53-54ms p95. That pointed at the
+durable append path rather than read caching as the bottleneck.
 
 The next PR should add append-path instrumentation before tuning: per-session
 queue/lock wait, group-commit queue wait, RocksDB sync-write time, and state
@@ -295,17 +296,27 @@ compact append-log fast path made simple append commits write one durable log
 row per coalesced batch, but by itself did not materially change throughput
 because the dominant cost was the fsync cadence, not the number of keys in each
 batch. Routing ordinary `Persist::write_ops` calls through the same adaptive
-batcher changed the result to 1,318 ops/s with p95 57ms and p99 88ms.
+batcher changed the result to 1,318 ops/s with p95 57ms and p99 88ms. Removing
+the extra same-session coalescing wait improved the c=32 60s cell again to
+1,441 ops/s with p95 47ms and p99 75ms.
 
 That safe single-node fsync profile now beats MongoDB's journaled standalone
-cell, but still trails Postgres's `synchronous_commit=on` cell. The remaining
-gap is below the runtime API layer: Postgres is still getting more useful work
-per WAL fsync than the current RocksDB-backed Persist batcher.
+cell at c=32, but still trails Postgres's `synchronous_commit=on` c=32 cell.
+The remaining gap is below the runtime API layer: Postgres is still getting
+more useful work per WAL fsync than the current RocksDB-backed Persist batcher.
+
+A high-concurrency c=256 tuning cell under the same Zipf-1.2 shape reached
+2,355 ops/s for AgentDB versus 2,127 ops/s for Postgres. That shows AgentDB can
+batch enough work to slightly exceed Postgres throughput in this fsync profile,
+but it is not a large win: AgentDB p95/p99 were 410ms/615ms versus Postgres
+228ms/386ms. The right conclusion is that the current design can approach
+Postgres's WAL group-commit efficiency, while a large durable-single-node margin
+would require a more specialized append-log/fsync path than RocksDB currently
+provides.
 
 The coalescing profile showed same-session batches around 1.4 events per batch
-and adaptive KV batches around 8 requests / 24 write ops per batch. The next
-remaining bottleneck is the durable write itself: coalesced batches still spent
-about 45-50ms in durable write time. Further improvement should focus on the
+and adaptive KV batches around 8-10 requests per batch. The next remaining
+bottleneck is the durable write itself. Further improvement should focus on the
 durable log / fsync path and larger safe batching, not read caching.
 
 ## Questions To Answer

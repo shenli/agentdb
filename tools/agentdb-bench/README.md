@@ -58,12 +58,18 @@ The first matched `single-node-fsync` sanity run tells a different story:
 |---|---|---:|---:|---:|---|
 | Mixed loop, Zipf-1.2, `single-node-fsync` | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
 
-After same-session append coalescing, a compact append-log fast path, and
-shared fsync group-commit batching for Persist writes, the AgentDB
-`single-node-fsync` cell improved to 1,318 ops/s with p95 57ms and p99 88ms on
-the same `li-dev` shape. That is a 5.1x AgentDB improvement over the first
-matched durable run. AgentDB now beats the MongoDB `single-node-fsync` sanity
-cell, but still trails the Postgres `single-node-fsync` sanity cell.
+After same-session append coalescing, a compact append-log fast path, shared
+fsync group-commit batching for Persist writes, and a zero same-session
+coalescing wait, the AgentDB `single-node-fsync` c=32 cell improved to 1,441
+ops/s with p95 47ms and p99 75ms on the same `li-dev` shape. That is a 5.6x
+AgentDB improvement over the first matched durable run. AgentDB now beats the
+MongoDB `single-node-fsync` sanity cell, but still trails the Postgres
+`single-node-fsync` sanity cell at c=32.
+
+A higher-concurrency c=256 tuning cell reached 2,355 ops/s for AgentDB versus
+2,127 ops/s for Postgres, but AgentDB's p95/p99 were worse. Treat that as
+evidence that AgentDB can batch enough work to match Postgres throughput, not
+as proof of a large fsync-mode advantage.
 
 That `single-node-fsync` result uses RocksDB sync writes with safe append group
 commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is

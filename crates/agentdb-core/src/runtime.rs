@@ -4770,7 +4770,7 @@ impl Runtime {
             .and_then(|raw| raw.parse::<u64>().ok())
             .unwrap_or_else(|| {
                 if env_flag_enabled_runtime("AGENTDB_ROCKSDB_SYNC_WRITES") {
-                    5_000
+                    0
                 } else {
                     0
                 }
