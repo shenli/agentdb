@@ -340,9 +340,7 @@ impl LoggedTabletStateMachine {
 
 impl TabletStateMachine for LoggedTabletStateMachine {
     fn commit(&self, command: TabletCommand) -> StorageResult<TabletApplyResult> {
-        let command_bytes = serde_json::to_vec(&command).map_err(|err| {
-            agentdb_storage::Error::Other(format!("encode tablet command: {err}"))
-        })?;
+        let command_bytes = encode_tablet_command(&command)?;
         let LogCommit {
             tablet_id, index, ..
         } = self.log.append(self.tablet_id, command_bytes)?;
@@ -364,7 +362,7 @@ impl TabletStateMachine for LoggedTabletStateMachine {
             .committed_entries(self.tablet_id, *applied_index, usize::MAX)?;
         let mut applied = 0;
         for entry in entries {
-            let command: TabletCommand = serde_json::from_slice(&entry.command).map_err(|err| {
+            let command = decode_tablet_command(&entry.command).map_err(|err| {
                 agentdb_storage::Error::Other(format!(
                     "decode tablet command at index {}: {err}",
                     entry.index
@@ -386,6 +384,149 @@ impl TabletStateMachine for LoggedTabletStateMachine {
 
     fn storage_stats(&self) -> StorageResult<TabletStorageStats> {
         LoggedTabletStateMachine::storage_stats(self)
+    }
+}
+
+const TABLET_COMMAND_MAGIC: &[u8; 8] = b"ADBTCM01";
+const TABLET_COMMAND_WRITE_BATCH: u8 = 1;
+const TABLET_WRITE_PUT: u8 = 1;
+const TABLET_WRITE_DELETE: u8 = 2;
+
+fn encode_tablet_command(command: &TabletCommand) -> StorageResult<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(TABLET_COMMAND_MAGIC);
+    match command {
+        TabletCommand::WriteBatch { ops } => {
+            out.push(TABLET_COMMAND_WRITE_BATCH);
+            write_u64(&mut out, ops.len() as u64);
+            for op in ops {
+                match op {
+                    TabletWriteOp::Put { key, value } => {
+                        out.push(TABLET_WRITE_PUT);
+                        write_bytes(&mut out, key);
+                        write_bytes(&mut out, value);
+                    }
+                    TabletWriteOp::Delete { key } => {
+                        out.push(TABLET_WRITE_DELETE);
+                        write_bytes(&mut out, key);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_tablet_command(bytes: &[u8]) -> StorageResult<TabletCommand> {
+    let mut cursor = TabletCommandCursor::new(bytes);
+    cursor.expect_magic(TABLET_COMMAND_MAGIC)?;
+    let command_kind = cursor.read_u8()?;
+    let command = match command_kind {
+        TABLET_COMMAND_WRITE_BATCH => {
+            let op_count = usize::try_from(cursor.read_u64()?).map_err(|_| {
+                agentdb_storage::Error::Other("tablet command op count too large".into())
+            })?;
+            let mut ops = Vec::with_capacity(op_count.min(1024));
+            for _ in 0..op_count {
+                let op_kind = cursor.read_u8()?;
+                let key = cursor.read_bytes()?.to_vec();
+                let op = match op_kind {
+                    TABLET_WRITE_PUT => {
+                        let value = cursor.read_bytes()?.to_vec();
+                        TabletWriteOp::Put { key, value }
+                    }
+                    TABLET_WRITE_DELETE => TabletWriteOp::Delete { key },
+                    other => {
+                        return Err(agentdb_storage::Error::Other(format!(
+                            "unknown tablet write op kind {other}"
+                        )));
+                    }
+                };
+                ops.push(op);
+            }
+            TabletCommand::WriteBatch { ops }
+        }
+        other => {
+            return Err(agentdb_storage::Error::Other(format!(
+                "unknown tablet command kind {other}"
+            )));
+        }
+    };
+    cursor.expect_eof()?;
+    Ok(command)
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+struct TabletCommandCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> TabletCommandCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn expect_magic(&mut self, magic: &[u8]) -> StorageResult<()> {
+        let found = self.read_exact(magic.len())?;
+        if found != magic {
+            return Err(agentdb_storage::Error::Other(
+                "invalid tablet command magic".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn expect_eof(&self) -> StorageResult<()> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(agentdb_storage::Error::Other(
+                "trailing bytes in tablet command".into(),
+            ))
+        }
+    }
+
+    fn read_u8(&mut self) -> StorageResult<u8> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u64(&mut self) -> StorageResult<u64> {
+        let raw = self.read_exact(8)?;
+        let raw: [u8; 8] = raw
+            .try_into()
+            .map_err(|_| agentdb_storage::Error::Other("invalid u64 length".into()))?;
+        Ok(u64::from_be_bytes(raw))
+    }
+
+    fn read_bytes(&mut self) -> StorageResult<&'a [u8]> {
+        let len = self.read_u64()?;
+        let len = usize::try_from(len).map_err(|_| {
+            agentdb_storage::Error::Other("tablet command byte field too large".into())
+        })?;
+        self.read_exact(len)
+    }
+
+    fn read_exact(&mut self, len: usize) -> StorageResult<&'a [u8]> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            agentdb_storage::Error::Other("tablet command offset overflow".into())
+        })?;
+        if end > self.bytes.len() {
+            return Err(agentdb_storage::Error::Other(
+                "truncated tablet command".into(),
+            ));
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
     }
 }
 
@@ -691,7 +832,7 @@ mod tests {
                 value: b"v".to_vec(),
             }],
         };
-        log.append(7, serde_json::to_vec(&command).unwrap())
+        log.append(7, encode_tablet_command(&command).unwrap())
             .unwrap();
 
         let machine = LoggedTabletStateMachine::new(7, log, store).unwrap();
@@ -716,7 +857,7 @@ mod tests {
                 value: b"v".to_vec(),
             }],
         };
-        log.append(7, serde_json::to_vec(&command).unwrap())
+        log.append(7, encode_tablet_command(&command).unwrap())
             .unwrap();
 
         let first = LoggedTabletStateMachine::new(7, log.clone(), store).unwrap();
