@@ -6826,6 +6826,13 @@ fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
         recent.clear();
         return;
     }
+    let upper_bound = recent.iter().try_fold(0usize, |used, event| {
+        used.checked_add(event_json_size_upper_bound(event))
+    });
+    if upper_bound.is_some_and(|bytes| bytes <= max_bytes) {
+        return;
+    }
+
     let mut used = 0usize;
     let mut keep_from = recent.len();
     for (idx, event) in recent.iter().enumerate().rev() {
@@ -6841,6 +6848,186 @@ fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
     if keep_from > 0 {
         recent.drain(0..keep_from);
     }
+}
+
+fn event_json_size_upper_bound(event: &EventEnvelope) -> usize {
+    // This intentionally overestimates. It is only used to prove that a recent
+    // context is under budget and can skip the exact serialization pass.
+    let mut total = 2usize; // object braces
+    total = add_json_field_upper_bound(
+        total,
+        "tenant_id",
+        json_str_upper_bound(event.tenant_id.as_str()),
+    );
+    total = add_json_field_upper_bound(
+        total,
+        "agent_id",
+        json_str_upper_bound(event.agent_id.as_str()),
+    );
+    total = add_json_field_upper_bound(
+        total,
+        "session_id",
+        json_str_upper_bound(event.session_id.as_str()),
+    );
+    total = add_json_field_upper_bound(
+        total,
+        "event_id",
+        json_str_upper_bound(event.event_id.as_str()),
+    );
+    total = add_json_field_upper_bound(total, "seq", 20);
+    total = add_json_field_upper_bound(total, "created_at_ms", 20);
+    total = add_json_field_upper_bound(total, "kind", json_str_upper_bound(event.kind.as_str()));
+    total = add_json_field_upper_bound(
+        total,
+        "runtime_version",
+        json_str_upper_bound(event.runtime_version.as_str()),
+    );
+    total = add_json_field_upper_bound(total, "payload", json_value_upper_bound(&event.payload));
+    total = add_json_field_upper_bound(
+        total,
+        "artifact_refs",
+        json_array_upper_bound(
+            event
+                .artifact_refs
+                .iter()
+                .map(artifact_ref_json_upper_bound),
+        ),
+    );
+    total = add_json_field_upper_bound(
+        total,
+        "source_refs",
+        json_array_upper_bound(event.source_refs.iter().map(source_ref_json_upper_bound)),
+    );
+    if let Some(idempotency_key) = event.idempotency_key.as_deref() {
+        total = add_json_field_upper_bound(
+            total,
+            "idempotency_key",
+            json_str_upper_bound(idempotency_key),
+        );
+    }
+    total = add_json_field_upper_bound(total, "policy_version", 20);
+    if let Some(key_id) = event.metadata_key_id.as_deref() {
+        total = add_json_field_upper_bound(total, "metadata_key_id", json_str_upper_bound(key_id));
+    }
+    if let Some(key_version) = event.metadata_key_version.as_deref() {
+        total = add_json_field_upper_bound(
+            total,
+            "metadata_key_version",
+            json_str_upper_bound(key_version),
+        );
+    }
+    total = add_json_field_upper_bound(
+        total,
+        "deleted_at_ms",
+        event.deleted_at_ms.map(|_| 20).unwrap_or(4),
+    );
+    total
+}
+
+fn add_json_field_upper_bound(current: usize, field: &str, value_size: usize) -> usize {
+    current
+        .saturating_add(1) // comma or harmless overestimate for first field
+        .saturating_add(json_str_upper_bound(field))
+        .saturating_add(1) // colon
+        .saturating_add(value_size)
+}
+
+fn artifact_ref_json_upper_bound(reference: &ArtifactRef) -> usize {
+    let mut total = 2usize;
+    total = add_json_field_upper_bound(
+        total,
+        "artifact_id",
+        json_str_upper_bound(reference.artifact_id.as_str()),
+    );
+    if let Some(content_type) = reference.content_type.as_deref() {
+        total =
+            add_json_field_upper_bound(total, "content_type", json_str_upper_bound(content_type));
+    }
+    if reference.bytes.is_some() {
+        total = add_json_field_upper_bound(total, "bytes", 20);
+    }
+    if let Some(sha256) = reference.sha256.as_deref() {
+        total = add_json_field_upper_bound(total, "sha256", json_str_upper_bound(sha256));
+    }
+    total
+}
+
+fn source_ref_json_upper_bound(reference: &SourceRef) -> usize {
+    let mut total = 2usize;
+    if let Some(session_id) = reference.session_id.as_ref() {
+        total = add_json_field_upper_bound(
+            total,
+            "session_id",
+            json_str_upper_bound(session_id.as_str()),
+        );
+    }
+    if reference.seq.is_some() {
+        total = add_json_field_upper_bound(total, "seq", 20);
+    }
+    if let Some(event_id) = reference.event_id.as_ref() {
+        total =
+            add_json_field_upper_bound(total, "event_id", json_str_upper_bound(event_id.as_str()));
+    }
+    if let Some(artifact_id) = reference.artifact_id.as_ref() {
+        total = add_json_field_upper_bound(
+            total,
+            "artifact_id",
+            json_str_upper_bound(artifact_id.as_str()),
+        );
+    }
+    if let Some(record_id) = reference.record_id.as_ref() {
+        total = add_json_field_upper_bound(
+            total,
+            "record_id",
+            json_str_upper_bound(record_id.as_str()),
+        );
+    }
+    if let Some(skill_id) = reference.skill_id.as_ref() {
+        total =
+            add_json_field_upper_bound(total, "skill_id", json_str_upper_bound(skill_id.as_str()));
+    }
+    total
+}
+
+fn json_array_upper_bound(items: impl IntoIterator<Item = usize>) -> usize {
+    let mut total = 2usize;
+    for item in items {
+        total = total.saturating_add(1).saturating_add(item);
+    }
+    total
+}
+
+fn json_value_upper_bound(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(value) => {
+            if *value {
+                4
+            } else {
+                5
+            }
+        }
+        serde_json::Value::Number(number) => number.to_string().len(),
+        serde_json::Value::String(value) => json_str_upper_bound(value),
+        serde_json::Value::Array(values) => {
+            json_array_upper_bound(values.iter().map(json_value_upper_bound))
+        }
+        serde_json::Value::Object(values) => {
+            let mut total = 2usize;
+            for (key, value) in values {
+                total = total
+                    .saturating_add(1)
+                    .saturating_add(json_str_upper_bound(key))
+                    .saturating_add(1)
+                    .saturating_add(json_value_upper_bound(value));
+            }
+            total
+        }
+    }
+}
+
+fn json_str_upper_bound(value: &str) -> usize {
+    value.len().saturating_mul(6).saturating_add(2)
 }
 
 fn hot_cache_covers_from(events: &[EventEnvelope], from_seq: u64, expected: usize) -> bool {
