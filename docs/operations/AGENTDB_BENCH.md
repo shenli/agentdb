@@ -237,6 +237,24 @@ serialization and deserialization, RocksDB scans/seeks, LZ4 compression, and
 ID parsing. The old dominant tablet-command JSON encode/decode and global-index
 full scan are no longer the top bottlenecks.
 
+The before/after size and throughput impact of the compact tablet-log work is
+measurable on the same `working-set-exceeds-cache` shape:
+
+| AgentDB state | State size | Throughput | p95 | p99 | Notes |
+|---|---:|---:|---:|---:|---|
+| Before compact tablet log | 31.65 GiB | 19,545 ops/s | 5.18ms | 9.47ms | JSON-encoded tablet commands plus earlier working-set fixes. |
+| After compact tablet log and scoped global index | 24.06 GiB | 37,234 ops/s | 1.66ms | 2.35ms | Binary tablet commands and scoped global-index lookup. |
+
+That is a 7.59 GiB footprint reduction, or 24.0% smaller state, and a 1.90x
+throughput increase on this workload. Interpreting throughput as a saturated
+server proxy, CPU/work per operation dropped by roughly 47.5%. The tablet-log
+codec itself is more compact than the directory-level reduction suggests:
+representative single-put tablet commands with a 96-byte key and 1-8 KiB value
+encode to about 33-34% of the old JSON command size, because JSON represented
+`Vec<u8>` as decimal byte arrays. The full state reduction is smaller because
+RocksDB data files, indexes, compression, and non-log records also contribute to
+the directory size.
+
 The compact tablet log also helps `single-node-fsync`, but the gain is bounded
 by media-sync latency. A comparable c=32, `fetch_last_n=2` steady-state check
 improved from the previous 1,441 ops/s, p99 75.0ms to 1,545 ops/s, p99 70.3ms.
