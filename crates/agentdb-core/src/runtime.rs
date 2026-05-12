@@ -100,9 +100,11 @@ struct SessionAppendCoalesceSample {
     jobs: usize,
     events: usize,
     lock_wait_nanos: u128,
-    prepare_nanos: u128,
+    prepare_lock_wait_nanos: u128,
+    prepare_work_nanos: u128,
     durable_write_nanos: u128,
-    update_state_nanos: u128,
+    update_state_lock_wait_nanos: u128,
+    update_state_work_nanos: u128,
     total_nanos: u128,
 }
 
@@ -113,9 +115,11 @@ struct SessionAppendCoalesceProfile {
     jobs: AtomicU64,
     events: AtomicU64,
     lock_wait_nanos: AtomicU64,
-    prepare_nanos: AtomicU64,
+    prepare_lock_wait_nanos: AtomicU64,
+    prepare_work_nanos: AtomicU64,
     durable_write_nanos: AtomicU64,
-    update_state_nanos: AtomicU64,
+    update_state_lock_wait_nanos: AtomicU64,
+    update_state_work_nanos: AtomicU64,
     total_nanos: AtomicU64,
 }
 
@@ -222,9 +226,11 @@ impl SessionAppendCoalesceProfile {
             jobs: AtomicU64::new(0),
             events: AtomicU64::new(0),
             lock_wait_nanos: AtomicU64::new(0),
-            prepare_nanos: AtomicU64::new(0),
+            prepare_lock_wait_nanos: AtomicU64::new(0),
+            prepare_work_nanos: AtomicU64::new(0),
             durable_write_nanos: AtomicU64::new(0),
-            update_state_nanos: AtomicU64::new(0),
+            update_state_lock_wait_nanos: AtomicU64::new(0),
+            update_state_work_nanos: AtomicU64::new(0),
             total_nanos: AtomicU64::new(0),
         })
     }
@@ -235,9 +241,20 @@ impl SessionAppendCoalesceProfile {
         self.events
             .fetch_add(sample.events as u64, Ordering::Relaxed);
         add_nanos(&self.lock_wait_nanos, sample.lock_wait_nanos);
-        add_nanos(&self.prepare_nanos, sample.prepare_nanos);
+        add_nanos(
+            &self.prepare_lock_wait_nanos,
+            sample.prepare_lock_wait_nanos,
+        );
+        add_nanos(&self.prepare_work_nanos, sample.prepare_work_nanos);
         add_nanos(&self.durable_write_nanos, sample.durable_write_nanos);
-        add_nanos(&self.update_state_nanos, sample.update_state_nanos);
+        add_nanos(
+            &self.update_state_lock_wait_nanos,
+            sample.update_state_lock_wait_nanos,
+        );
+        add_nanos(
+            &self.update_state_work_nanos,
+            sample.update_state_work_nanos,
+        );
         add_nanos(&self.total_nanos, sample.total_nanos);
 
         let now = crate::now_ms();
@@ -260,9 +277,12 @@ impl SessionAppendCoalesceProfile {
         let jobs = self.jobs.swap(0, Ordering::Relaxed);
         let events = self.events.swap(0, Ordering::Relaxed);
         let lock_wait_nanos = self.lock_wait_nanos.swap(0, Ordering::Relaxed);
-        let prepare_nanos = self.prepare_nanos.swap(0, Ordering::Relaxed);
+        let prepare_lock_wait_nanos = self.prepare_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let prepare_work_nanos = self.prepare_work_nanos.swap(0, Ordering::Relaxed);
         let durable_write_nanos = self.durable_write_nanos.swap(0, Ordering::Relaxed);
-        let update_state_nanos = self.update_state_nanos.swap(0, Ordering::Relaxed);
+        let update_state_lock_wait_nanos =
+            self.update_state_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let update_state_work_nanos = self.update_state_work_nanos.swap(0, Ordering::Relaxed);
         let total_nanos = self.total_nanos.swap(0, Ordering::Relaxed);
         tracing::info!(
             batches,
@@ -271,9 +291,11 @@ impl SessionAppendCoalesceProfile {
             avg_jobs_per_batch = jobs as f64 / batches as f64,
             avg_events_per_batch = events as f64 / batches as f64,
             avg_lock_wait_us = avg_us(lock_wait_nanos, batches),
-            avg_prepare_us = avg_us(prepare_nanos, batches),
+            avg_prepare_lock_wait_us = avg_us(prepare_lock_wait_nanos, batches),
+            avg_prepare_work_us = avg_us(prepare_work_nanos, batches),
             avg_durable_write_us = avg_us(durable_write_nanos, batches),
-            avg_update_state_us = avg_us(update_state_nanos, batches),
+            avg_update_state_lock_wait_us = avg_us(update_state_lock_wait_nanos, batches),
+            avg_update_state_work_us = avg_us(update_state_work_nanos, batches),
             avg_total_us = avg_us(total_nanos, batches),
             "session append coalesce profile"
         );
@@ -4849,9 +4871,13 @@ impl Runtime {
         let mut final_session_snapshot: Option<Session> = None;
         let mut persist_session_checkpoint = false;
 
-        let prepare_started = coalesce_profile.map(|_| Instant::now());
+        let prepare_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         {
             let s = self.state.lock().await;
+            if let Some(started) = prepare_lock_wait_started {
+                coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
+            }
+            let prepare_work_started = coalesce_profile.map(|_| Instant::now());
             let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
             let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
             for job in jobs {
@@ -4883,9 +4909,9 @@ impl Runtime {
                     }
                 }
             }
-        }
-        if let Some(started) = prepare_started {
-            coalesce_sample.prepare_nanos = started.elapsed().as_nanos();
+            if let Some(started) = prepare_work_started {
+                coalesce_sample.prepare_work_nanos = started.elapsed().as_nanos();
+            }
         }
 
         if prepared.is_empty() {
@@ -4927,8 +4953,12 @@ impl Runtime {
         drop(event_refs);
 
         let persist_enabled = self.persist.is_some();
-        let update_started = coalesce_profile.map(|_| Instant::now());
+        let update_state_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         let mut s = self.state.lock().await;
+        if let Some(started) = update_state_lock_wait_started {
+            coalesce_sample.update_state_lock_wait_nanos = started.elapsed().as_nanos();
+        }
+        let update_state_work_started = coalesce_profile.map(|_| Instant::now());
         if let Some(session_snapshot) = final_session_snapshot {
             s.sessions
                 .insert(session_id.as_str().to_string(), session_snapshot);
@@ -4967,8 +4997,8 @@ impl Runtime {
                 backpressure_complete: true,
             }));
         }
-        if let Some(started) = update_started {
-            coalesce_sample.update_state_nanos = started.elapsed().as_nanos();
+        if let Some(started) = update_state_work_started {
+            coalesce_sample.update_state_work_nanos = started.elapsed().as_nanos();
         }
         if let (Some(profile), Some(started)) = (coalesce_profile, total_started) {
             coalesce_sample.total_nanos = started.elapsed().as_nanos();
