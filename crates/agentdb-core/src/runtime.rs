@@ -5970,7 +5970,7 @@ impl Runtime {
             return Ok(Vec::new());
         }
         self.refresh_replicated_state().await?;
-        let from_seq = {
+        let (session, from_seq, hot_in_memory) = {
             let s = self.state.lock().await;
             let tenant_live = s
                 .tenants
@@ -5993,15 +5993,57 @@ impl Runtime {
                 ));
             }
             let limit = u64::try_from(limit).unwrap_or(u64::MAX);
-            session.next_seq.saturating_sub(limit)
+            let from_seq = session.next_seq.saturating_sub(limit);
+            let lo = (
+                session_id.as_str().to_string(),
+                from_seq.max(session.warm_head_from_seq),
+            );
+            let hi = (session_id.as_str().to_string(), u64::MAX);
+            let hot = s
+                .events
+                .range(lo..=hi)
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>();
+            (session.clone(), from_seq, hot)
         };
-        self.fetch_from_seq(FetchRequest {
-            tenant_id,
-            session_id,
-            from_seq,
-            limit,
-        })
-        .await
+
+        if from_seq >= session.warm_head_from_seq {
+            let expected_hot = usize::try_from(session.next_seq.saturating_sub(from_seq))
+                .unwrap_or(usize::MAX)
+                .min(limit);
+            if hot_cache_covers_from(&hot_in_memory, from_seq, expected_hot) {
+                return Ok(hot_in_memory.into_iter().take(limit).collect());
+            }
+        }
+
+        if self.persist.is_some() {
+            let hot_from_seq = from_seq.max(session.warm_head_from_seq);
+            let mut hot = self
+                .read_hot_events_from_persist(&tenant_id, &session_id, hot_from_seq, limit)
+                .await?;
+            // Prefer in-memory writes that may not yet have been flushed into
+            // the persisted hot scan result, but avoid duplicate sequence
+            // numbers if both sources contain the same tail event.
+            for event in hot_in_memory {
+                if !hot.iter().any(|existing| existing.seq == event.seq) {
+                    hot.push(event);
+                }
+            }
+            hot.sort_by_key(|event| event.seq);
+            if hot.len() > limit {
+                let drop_n = hot.len() - limit;
+                hot.drain(0..drop_n);
+            }
+            Ok(hot)
+        } else {
+            let mut hot = hot_in_memory;
+            if hot.len() > limit {
+                let drop_n = hot.len() - limit;
+                hot.drain(0..drop_n);
+            }
+            Ok(hot)
+        }
     }
 }
 
