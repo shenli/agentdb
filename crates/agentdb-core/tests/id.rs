@@ -23,6 +23,22 @@ fn parse_rejects_wrong_prefix() {
 }
 
 #[test]
+fn parse_rejects_malformed_uuid_body() {
+    for raw in [
+        "ten_018f4a7e-4b8a-7000-8000-00000000000",
+        "ten_018f4a7e-4b8a-7000-8000-0000000000000",
+        "ten_018f4a7e_4b8a-7000-8000-000000000000",
+        "ten_018f4a7e-4b8a-7000-8000-00000000000z",
+    ] {
+        let err = Id::parse(raw).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid uuid body"),
+            "expected bad uuid body for {raw}, got {err}"
+        );
+    }
+}
+
+#[test]
 fn parse_rejects_wrong_kind() {
     let id = Id::new(IdKind::Tenant);
     let err = Id::parse_kind(id.as_str(), IdKind::Session).unwrap_err();
