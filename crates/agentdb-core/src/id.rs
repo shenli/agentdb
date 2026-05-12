@@ -1,5 +1,4 @@
 use std::fmt;
-use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -58,8 +57,8 @@ pub enum IdError {
     MissingSeparator,
     #[error("unknown prefix '{0}'")]
     UnknownPrefix(String),
-    #[error("invalid uuid body: {0}")]
-    BadBody(#[from] uuid::Error),
+    #[error("invalid uuid body")]
+    BadBody,
     #[error("expected {expected:?} but got {got:?}")]
     KindMismatch { expected: IdKind, got: IdKind },
 }
@@ -75,7 +74,9 @@ impl Id {
         let (prefix, body) = s.split_once('_').ok_or(IdError::MissingSeparator)?;
         let kind = IdKind::from_prefix(prefix)
             .ok_or_else(|| IdError::UnknownPrefix(prefix.to_string()))?;
-        Uuid::from_str(body)?;
+        if !is_canonical_uuid_body(body) {
+            return Err(IdError::BadBody);
+        }
         Ok(Self {
             kind,
             inner: s.to_string(),
@@ -99,6 +100,27 @@ impl Id {
     pub fn as_str(&self) -> &str {
         &self.inner
     }
+}
+
+fn is_canonical_uuid_body(body: &str) -> bool {
+    if body.len() != 36 {
+        return false;
+    }
+    for (idx, byte) in body.bytes().enumerate() {
+        match idx {
+            8 | 13 | 18 | 23 => {
+                if byte != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 impl fmt::Display for Id {

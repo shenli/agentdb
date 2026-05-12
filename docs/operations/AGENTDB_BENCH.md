@@ -261,6 +261,12 @@ improved from the previous 1,441 ops/s, p99 75.0ms to 1,545 ops/s, p99 70.3ms.
 That is useful, but not a step-change because the device flush remains on the
 critical path.
 
+The follow-up context-sizing fast path was intentionally minor. On a 1000
+session, 100 prepared events/session, 20 records/session, 4 KiB payload,
+Zipf-1.2, c=32, 60s cell with `FETCH_LAST_N=20`, it moved AgentDB from
+42,468 ops/s to 43,226 ops/s (+1.8%) and p99 from 2.07ms to 2.04ms. Keep it as
+a cleanup, not a headline result.
+
 ### Matched Durability Sanity Check
 
 The first matched-durability sanity cell used the same c=32 Zipf-1.2 60s shape
