@@ -16,7 +16,14 @@ CONCURRENCY="${CONCURRENCY:-1,4}"
 WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
-MIN_FREE_GB="${MIN_FREE_GB:-5}"
+MIN_FREE_GB="${MIN_FREE_GB:-}"
+if [[ -z "${MIN_FREE_GB}" ]]; then
+  if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+    MIN_FREE_GB=80
+  else
+    MIN_FREE_GB=5
+  fi
+fi
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 
@@ -32,6 +39,9 @@ min_free_kb="$((MIN_FREE_GB * 1024 * 1024))"
 if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
   echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
   exit 1
+fi
+if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+  ulimit -n "${AGENTDB_BENCH_NOFILE:-65535}" 2>/dev/null || true
 fi
 
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
@@ -61,6 +71,9 @@ esac
 if [[ -n "${APPEND_PATH_PROFILE_MS:-}" ]]; then
   agentdb_server_env+=(AGENTDB_APPEND_PATH_PROFILE_MS="${APPEND_PATH_PROFILE_MS}")
   agentdb_server_env+=(RUST_LOG="${RUST_LOG:-info}")
+fi
+if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+  agentdb_server_env+=(AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION="${AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION:-64}")
 fi
 
 env "${agentdb_server_env[@]}" "${BIN_DIR}/agentdb" serve \

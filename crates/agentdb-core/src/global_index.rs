@@ -95,6 +95,7 @@ pub struct InMemoryGlobalRecordIndex {
 #[derive(Debug, Default)]
 struct InMemoryGlobalRecordIndexState {
     records: BTreeMap<String, GlobalIndexEntry>,
+    scope_records: BTreeMap<(String, Vec<String>), BTreeSet<String>>,
     tenant_watermark: BTreeMap<String, u64>,
 }
 
@@ -125,20 +126,28 @@ impl GlobalRecordIndex for InMemoryGlobalRecordIndex {
 
         match mutation.op {
             GlobalIndexMutationOp::Upsert => {
-                inner.records.insert(
-                    mutation.record_id.clone(),
-                    GlobalIndexEntry {
-                        tenant_id: mutation.tenant_id,
-                        record_id: mutation.record_id,
-                        namespace: mutation.namespace,
-                        placement_id: mutation.placement_id,
-                        commit_seq: mutation.commit_seq,
-                        terms: normalized_terms(mutation.terms),
-                    },
-                );
+                if let Some(old) = inner.records.remove(&mutation.record_id) {
+                    remove_scope_record(&mut inner, &old);
+                }
+                let entry = GlobalIndexEntry {
+                    tenant_id: mutation.tenant_id,
+                    record_id: mutation.record_id,
+                    namespace: mutation.namespace,
+                    placement_id: mutation.placement_id,
+                    commit_seq: mutation.commit_seq,
+                    terms: normalized_terms(mutation.terms),
+                };
+                inner
+                    .scope_records
+                    .entry((entry.tenant_id.clone(), entry.namespace.clone()))
+                    .or_default()
+                    .insert(entry.record_id.clone());
+                inner.records.insert(entry.record_id.clone(), entry);
             }
             GlobalIndexMutationOp::Delete => {
-                inner.records.remove(&mutation.record_id);
+                if let Some(old) = inner.records.remove(&mutation.record_id) {
+                    remove_scope_record(&mut inner, &old);
+                }
             }
         }
         Ok(())
@@ -151,13 +160,24 @@ impl GlobalRecordIndex for InMemoryGlobalRecordIndex {
         let limit = query.limit.max(1);
         let mut hits = Vec::with_capacity(limit.min(32));
 
-        for entry in inner.records.values() {
+        let scope_key = (query.tenant_id.clone(), query.namespace.clone());
+        let Some(record_ids) = inner.scope_records.get(&scope_key) else {
+            return Ok(GlobalIndexSearchResult {
+                hits,
+                watermark,
+                stale: query
+                    .min_visible_commit_seq
+                    .is_some_and(|seq| seq > watermark),
+            });
+        };
+
+        for record_id in record_ids {
             if hits.len() >= limit {
                 break;
             }
-            if entry.tenant_id != query.tenant_id || entry.namespace != query.namespace {
+            let Some(entry) = inner.records.get(record_id) else {
                 continue;
-            }
+            };
             if !required_terms.is_subset(&entry.terms) {
                 continue;
             }
@@ -180,6 +200,16 @@ impl GlobalRecordIndex for InMemoryGlobalRecordIndex {
     fn watermark(&self, tenant_id: &str) -> Result<u64> {
         let inner = self.inner.lock().expect("global record index lock");
         Ok(*inner.tenant_watermark.get(tenant_id).unwrap_or(&0))
+    }
+}
+
+fn remove_scope_record(inner: &mut InMemoryGlobalRecordIndexState, entry: &GlobalIndexEntry) {
+    let scope_key = (entry.tenant_id.clone(), entry.namespace.clone());
+    if let Some(record_ids) = inner.scope_records.get_mut(&scope_key) {
+        record_ids.remove(&entry.record_id);
+        if record_ids.is_empty() {
+            inner.scope_records.remove(&scope_key);
+        }
     }
 }
 

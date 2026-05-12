@@ -26,8 +26,9 @@ Before publishing external ratios, close these benchmark gaps:
 
 - Derive the operation mix from real agent traces, or label it as a heuristic
   mix and publish the rationale for each operation weight.
-- Add working-set-exceeds-cache profiles and report dataset bytes versus RAM,
-  page cache, and RocksDB block cache.
+- Run the implemented `working-set-exceeds-cache` profile and report dataset
+  bytes versus RAM, page cache, RocksDB block cache, MongoDB WiredTiger cache,
+  and Postgres shared buffers.
 - Expand the durability matrix: one single-node-fsync sanity cell now exists,
   but it needs repeats and follow-up after append-path instrumentation.
 - Run longer multi-minute cells so RocksDB compaction, Postgres checkpoint, and
@@ -193,6 +194,72 @@ Results are on `li-dev` under
 This is the best current local setup result and should be the first number used
 for developer out-of-box performance discussions. It is still a single seed and
 cache-warm cell; repeat it before quoting externally.
+
+### Working-Set Cache-Pressure Check
+
+The first `working-set-exceeds-cache` cell uses the same mixed-agent-loop,
+Zipf-1.2, c=32 shape, but prepares a larger dataset: 25 tenants x 4 agents x
+40 sessions, 500 prepared events per session, 100 records per session, and 4
+KiB event payloads. The report estimates 8.2 GB of event payload before
+database/index overhead and about 42.0 GB of external artifact references. This
+cell is intended to expose storage footprint, cache pressure, and longer
+compaction/checkpoint behavior that the cache-warm 1000-session cell hides.
+
+Results are on `li-dev` under
+`/home/lishen/work/agentdb-bench-runs/working-set-cache`.
+
+| Backend/profile | State size | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| AgentDB `single-node-wal` | 24 GB | 37,234 | 0.74ms | 1.66ms | 2.35ms | 1.00x | Compact binary tablet log, scoped global-index lookup, RocksDB LZ4 compression, bounded persisted hot-tail cache. |
+| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 1.56x MongoDB | Normalized event-log collections. |
+| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 6.18x Postgres | `record_search` dominates tail latency. |
+
+This cell forced several AgentDB fixes before it could complete and then beat
+MongoDB:
+
+- The persistent runtime no longer retains every `event_id` in the in-memory
+  map; persisted lookups use the durable secondary index instead.
+- `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` bounds the per-session
+  in-memory hot tail. The AgentDB wrappers default it to 64 for this profile.
+- RocksDB now defaults to LZ4 compression and a bounded open-file cache. This
+  reduced the AgentDB state from a disk-filling run to 32 GB for the resized
+  profile.
+- The tablet write log now uses a compact binary command encoding instead of
+  serializing `Vec<u8>` write batches as JSON arrays and immediately decoding
+  them on apply. That removed a large write-path CPU and log-size tax.
+- The in-memory global record index now has a `(tenant, namespace)` scope index,
+  so tag-only global record searches do not scan unrelated records.
+
+The post-fix result is the first working-set cell where AgentDB beats both
+MongoDB and Postgres. A low-overhead `perf` sample after the fix shows the
+remaining CPU spread across memory copies/allocation, JSON request/response
+serialization and deserialization, RocksDB scans/seeks, LZ4 compression, and
+ID parsing. The old dominant tablet-command JSON encode/decode and global-index
+full scan are no longer the top bottlenecks.
+
+The before/after size and throughput impact of the compact tablet-log work is
+measurable on the same `working-set-exceeds-cache` shape:
+
+| AgentDB state | State size | Throughput | p95 | p99 | Notes |
+|---|---:|---:|---:|---:|---|
+| Before compact tablet log | 31.65 GiB | 19,545 ops/s | 5.18ms | 9.47ms | JSON-encoded tablet commands plus earlier working-set fixes. |
+| After compact tablet log and scoped global index | 24.06 GiB | 37,234 ops/s | 1.66ms | 2.35ms | Binary tablet commands and scoped global-index lookup. |
+
+That is a 7.59 GiB footprint reduction, or 24.0% smaller state, and a 1.90x
+throughput increase on this workload. Interpreting throughput as a saturated
+server proxy, CPU/work per operation dropped by roughly 47.5%. The tablet-log
+codec itself is more compact than the directory-level reduction suggests:
+representative single-put tablet commands with a 96-byte key and 1-8 KiB value
+encode to about 33-34% of the old JSON command size, because JSON represented
+`Vec<u8>` as decimal byte arrays. The full state reduction is smaller because
+RocksDB data files, indexes, compression, and non-log records also contribute to
+the directory size.
+
+The compact tablet log also helps `single-node-fsync`, but the gain is bounded
+by media-sync latency. A comparable c=32, `fetch_last_n=2` steady-state check
+improved from the previous 1,441 ops/s, p99 75.0ms to 1,545 ops/s, p99 70.3ms.
+That is useful, but not a step-change because the device flush remains on the
+critical path.
 
 ### Matched Durability Sanity Check
 
@@ -620,6 +687,7 @@ Predefined profiles should be thin wrappers around these parameters:
 |---|---|
 | `smoke` | Small, fast dataset for local correctness checks. |
 | `default-agent-runtime` | Balanced chat history, memory, fork, and artifact dataset. |
+| `working-set-exceeds-cache` | Large logical history and memory dataset for cache-pressure validation. Reports total sessions/events/records and estimated event payload bytes. |
 | `long-context` | Deep session history with fewer tenants. |
 | `artifact-heavy` | High artifact rate and larger payload/reference metadata. |
 | `memory-heavy` | More records per session and more global search pressure. |

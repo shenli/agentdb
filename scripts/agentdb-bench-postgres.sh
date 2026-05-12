@@ -13,8 +13,24 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
+MIN_FREE_GB="${MIN_FREE_GB:-}"
+if [[ -z "${MIN_FREE_GB}" ]]; then
+  if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+    MIN_FREE_GB=80
+  else
+    MIN_FREE_GB=5
+  fi
+fi
 PG_PORT="${PG_PORT:-5433}"
 COMPOSE_DIR="${ROOT}/benchmarks/postgres"
+
+mkdir -p "${OUT}"
+free_kb="$(df -Pk "${OUT}" | awk 'NR == 2 {print $4}')"
+min_free_kb="$((MIN_FREE_GB * 1024 * 1024))"
+if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
+  echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
+  exit 1
+fi
 
 if [[ -z "${PG_DSN:-}" ]]; then
   case "${DURABILITY_PROFILE}" in

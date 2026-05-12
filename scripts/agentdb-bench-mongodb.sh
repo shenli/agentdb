@@ -13,10 +13,26 @@ DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
+MIN_FREE_GB="${MIN_FREE_GB:-}"
+if [[ -z "${MIN_FREE_GB}" ]]; then
+  if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+    MIN_FREE_GB=80
+  else
+    MIN_FREE_GB=5
+  fi
+fi
 MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/benchmarks/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
+
+mkdir -p "${OUT}"
+free_kb="$(df -Pk "${OUT}" | awk 'NR == 2 {print $4}')"
+min_free_kb="$((MIN_FREE_GB * 1024 * 1024))"
+if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
+  echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
+  exit 1
+fi
 
 if [[ -z "${MONGO_URI:-}" ]]; then
   case "${DURABILITY_PROFILE}" in

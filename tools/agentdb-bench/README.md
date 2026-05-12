@@ -21,6 +21,9 @@ The current best summary is:
   `single-node-wal` profile.
 - For matched single-node media-sync durability, AgentDB has improved a lot and
   beats MongoDB at c=32, but Postgres remains a strong baseline.
+- For the larger working-set profile, AgentDB now beats both MongoDB and
+  Postgres after replacing JSON tablet-log encoding with a compact binary
+  command format and avoiding full global-index scans.
 - At very high concurrency, AgentDB can slightly exceed Postgres throughput in
   `single-node-fsync`, but with worse p95/p99 latency. That is not a large win.
 
@@ -65,10 +68,19 @@ The workload is intentionally agent-runtime shaped:
   up, but still small enough to keep the current comparison focused on the
   single-node hot path. It is not a working-set-exceeds-cache benchmark.
 
+For cache-pressure validation, use `PROFILE=working-set-exceeds-cache` instead
+of the latest-comparison shape. That preset prepares a much larger logical
+history: 4,000 sessions, 2 million prepared events, 400,000 prepared records,
+and about 8 GiB of event payload before database/index overhead. The generated
+`report.md` prints total sessions, total events, total records, and estimated
+event payload bytes. Compare that estimate with host RAM, database cache
+settings, and observed disk usage before claiming the run truly exceeds cache.
+
 | Profile | Concurrency | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---:|---|
 | `single-node-wal` | 32 | 53.9k ops/s, p99 2.08ms | 26.0k ops/s, p99 2.86ms | 13.1k ops/s, p99 35.8ms | Best local developer story: AgentDB is 2.07x MongoDB and 4.11x Postgres. |
-| `single-node-fsync` | 32 | 1,441 ops/s, p99 75ms | 884 ops/s, p99 65ms | 2,182 ops/s, p99 238ms | AgentDB beats MongoDB throughput, but trails Postgres throughput. |
+| `working-set-exceeds-cache`, `single-node-wal`, 300s | 32 | 37.2k ops/s, p99 2.35ms | 23.8k ops/s, p99 2.22ms | 6.0k ops/s, p99 114ms | AgentDB is 1.56x MongoDB and 6.18x Postgres on the larger cache-pressure cell. |
+| `single-node-fsync` | 32 | 1,545 ops/s, p99 70ms | 884 ops/s, p99 65ms | 2,182 ops/s, p99 238ms | Compact tablet log improves AgentDB, but forced media sync remains the ceiling. |
 | `single-node-fsync` tuning cell | 256 | 2,355 ops/s, p99 615ms | not rerun | 2,127 ops/s, p99 386ms | AgentDB slightly beats Postgres throughput, but has worse tail latency. |
 
 Use this interpretation:
@@ -78,6 +90,9 @@ Use this interpretation:
 - If the question is "Does AgentDB beat mature databases under forced local
   fsync?", the honest answer is mixed. It beats MongoDB in the current c=32 cell,
   but Postgres is still highly competitive.
+- If the question is "Does the local WAL advantage survive cache pressure?",
+  the current answer is yes for throughput. MongoDB still has slightly tighter
+  p99 in this single run, so repeat before using the row externally.
 - If the question is "Why not a huge Postgres win yet?", the bottleneck is not
   query flexibility or read caching. It is durable WAL/fsync batching. A larger
   margin likely requires a more specialized durable append-log path than the
@@ -179,7 +194,7 @@ for all backends.
 
 | Knob | Common Values | Use |
 |---|---|---|
-| `PROFILE` | `smoke`, `default-agent-runtime` | Dataset size preset. Use `smoke` only for correctness checks. |
+| `PROFILE` | `smoke`, `default-agent-runtime`, `working-set-exceeds-cache` | Dataset size preset. Use `smoke` only for correctness checks. |
 | `WORKLOAD` | `mixed-agent-loop`, `append-only`, `append-fetch-hot`, `record-write-only`, `record-search-only`, `artifact-only`, `fork-only` | Choose the agent-runtime path to measure. |
 | `CONCURRENCY` | `32`, `1,4,16,32`, `256` | Client worker count. Use the same value across backends. |
 | `DURABILITY_PROFILE` | `single-node-wal`, `single-node-fsync`, `strict-fsync` | Controls durability semantics. Do not mix profiles in one comparison. |
@@ -187,6 +202,10 @@ for all backends.
 | `ZIPF_EXPONENT` | `1.2` | Skew strength for `SESSION_SELECTION=zipf`. |
 | `ARTIFACT_MODE` | `reference`, `content-backend`, `mixed` | Controls whether artifact bytes are stored through the content engine. |
 | `NO_RAW_JSONL` | `1` | Avoids large per-operation logs in bigger runs. |
+| `MIN_FREE_GB` | `5`, `80` | Minimum free disk guard used by wrapper scripts. Defaults to `80` for `working-set-exceeds-cache`. |
+| `AGENTDB_BENCH_NOFILE` | `65535` | File descriptor limit requested by AgentDB wrappers for `working-set-exceeds-cache`. |
+| `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` | `64`, `2048` | AgentDB persisted hot-tail event cache per session. AgentDB wrappers default this to `64` for `working-set-exceeds-cache`. |
+| `AGENTDB_ROCKSDB_COMPRESSION` | `lz4`, `none`, `snappy`, `lz4hc` | RocksDB compression used by AgentDB. Defaults to `lz4` to reduce working-set storage and compaction IO. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
 
 `strict-fsync` disables append group commit and is mostly a stress profile. It
@@ -211,6 +230,36 @@ PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
 
 Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
 the same thing as real MongoDB.
+
+## Working-Set-Exceeds-Cache Cell
+
+Use this cell to test whether the comparison survives beyond a cache-warm hot
+set. It is intentionally heavier than the latest-comparison row and should be
+run on `li-dev` or another machine with enough disk space:
+
+```bash
+BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+  RUN_ID=agentdb-working-set-wal \
+  PROFILE=working-set-exceeds-cache \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=30s \
+  DURATION=300s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  DURABILITY_PROFILE=single-node-wal \
+  MIN_FREE_GB=80 \
+  REPEATS=1 \
+  SEEDS=43 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
+```
+
+Run the same cell with `scripts/agentdb-bench-mongodb.sh` and
+`scripts/agentdb-bench-postgres.sh` before drawing a comparison. If the prepared
+dataset plus database/index overhead still fits in RAM and database cache on
+the test host, increase `TENANTS`, `SESSIONS_PER_AGENT`, `EVENTS_PER_SESSION`,
+or `PAYLOAD_BYTES` explicitly and record those overrides in the report.
 
 ## Manual Prepare And Run
 
