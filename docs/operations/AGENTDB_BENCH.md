@@ -208,7 +208,7 @@ Results are on `li-dev` under
 | Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---|
 | AgentDB `single-node-fsync`, initial | 256 | 858ms | 949ms | 0.29x MongoDB / 0.12x Postgres | RocksDB sync writes plus safe append group commit. |
-| AgentDB `single-node-fsync`, tuned | 648 | 122ms | 190ms | 0.73x MongoDB / 0.30x Postgres | Same-session coalescing plus fsync group-commit tuning. |
+| AgentDB `single-node-fsync`, tuned | 1,318 | 57ms | 88ms | 1.49x MongoDB / 0.60x Postgres | Compact append log plus shared Persist fsync batching. |
 | MongoDB `single-node-fsync` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
 | Postgres `single-node-fsync` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
 | AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
@@ -290,9 +290,17 @@ to p95 137ms / p99 217ms. This is a 2.4x AgentDB improvement for the matched
 The follow-up fsync group-commit tuning sends sync-write requests through the
 batch worker instead of letting the first writer bypass batching. With the
 default 1ms lower group-commit wait and 5ms same-session coalescing wait, the
-same 60s cell reached 648 ops/s with p95 122ms and p99 190ms. That improves
-tail latency, but still does not beat MongoDB or Postgres in the safe
-single-node fsync profile.
+same 60s cell reached 648 ops/s with p95 122ms and p99 190ms. Adding the
+compact append-log fast path made simple append commits write one durable log
+row per coalesced batch, but by itself did not materially change throughput
+because the dominant cost was the fsync cadence, not the number of keys in each
+batch. Routing ordinary `Persist::write_ops` calls through the same adaptive
+batcher changed the result to 1,318 ops/s with p95 57ms and p99 88ms.
+
+That safe single-node fsync profile now beats MongoDB's journaled standalone
+cell, but still trails Postgres's `synchronous_commit=on` cell. The remaining
+gap is below the runtime API layer: Postgres is still getting more useful work
+per WAL fsync than the current RocksDB-backed Persist batcher.
 
 The coalescing profile showed same-session batches around 1.4 events per batch
 and adaptive KV batches around 8 requests / 24 write ops per batch. The next
