@@ -44,6 +44,27 @@ All rows below use the mixed agent loop with Zipf-1.2 session selection, seed
 on `li-dev`; see `docs/operations/AGENTDB_BENCH.md` for historical tuning
 details and run paths.
 
+The workload is intentionally agent-runtime shaped:
+
+- `mixed-agent-loop` models a service running tool-using agents, not a generic
+  key-value or OLTP benchmark. Each measured operation is one runtime action:
+  append the next event and read context, fetch recent context, write/search
+  memory records, fork a session, or attach artifact metadata.
+- The current operation mix is 50% append-and-fetch, 25% fetch recent context,
+  8% record write, 7% record search, 7% fork, and 3% artifact. That emphasizes
+  the hot path of an agent step: log the model/tool result, immediately recover
+  the tail needed for the next step, occasionally update memory, branch, or
+  attach generated files.
+- The dataset has many sessions rather than one global stream because agent
+  systems are naturally session-scoped. A session is the unit for ordered event
+  history, read-after-write semantics, replay, fork, and debugging.
+- Zipf-1.2 session selection means some sessions are much hotter than others.
+  That matches real agent services where active conversations or long-running
+  tasks receive repeated writes while most sessions are idle or cold.
+- The 1000-session shape is large enough for skew and batching behavior to show
+  up, but still small enough to keep the current comparison focused on the
+  single-node hot path. It is not a working-set-exceeds-cache benchmark.
+
 | Profile | Concurrency | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---:|---|
 | `single-node-wal` | 32 | 53.9k ops/s, p99 2.08ms | 26.0k ops/s, p99 2.86ms | 13.1k ops/s, p99 35.8ms | Best local developer story: AgentDB is 2.07x MongoDB and 4.11x Postgres. |
