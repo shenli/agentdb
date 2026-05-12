@@ -58,7 +58,8 @@ use crate::tablet_state::{
 use crate::tenant::{NewTenant, Tenant};
 
 pub const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
-const PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
+const DEFAULT_PERSISTED_HOT_EVENT_CACHE_PER_SESSION: u64 = 2_048;
+static PERSISTED_HOT_EVENT_CACHE_PER_SESSION: OnceLock<u64> = OnceLock::new();
 
 static APPEND_PATH_PROFILE: OnceLock<Option<AppendPathProfile>> = OnceLock::new();
 static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalesceProfile>> =
@@ -667,11 +668,22 @@ fn insert_runtime_event_cache(
         return;
     }
 
-    if seq < PERSISTED_HOT_EVENT_CACHE_PER_SESSION {
+    let hot_event_cache_per_session = *PERSISTED_HOT_EVENT_CACHE_PER_SESSION.get_or_init(|| {
+        std::env::var("AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PERSISTED_HOT_EVENT_CACHE_PER_SESSION)
+    });
+    if hot_event_cache_per_session == 0 {
+        state.events.remove(&(session_id.to_string(), seq));
         return;
     }
 
-    let stale_seq = seq - PERSISTED_HOT_EVENT_CACHE_PER_SESSION;
+    if seq < hot_event_cache_per_session {
+        return;
+    }
+
+    let stale_seq = seq - hot_event_cache_per_session;
     state.events.remove(&(session_id.to_string(), stale_seq));
 }
 
@@ -4912,10 +4924,12 @@ impl Runtime {
         }
         for (prepared_append, done) in prepared {
             let envelope = prepared_append.envelope;
-            s.event_by_id.insert(
-                envelope.event_id.as_str().to_string(),
-                (envelope.session_id.as_str().to_string(), envelope.seq),
-            );
+            if !persist_enabled {
+                s.event_by_id.insert(
+                    envelope.event_id.as_str().to_string(),
+                    (envelope.session_id.as_str().to_string(), envelope.seq),
+                );
+            }
             insert_runtime_event_cache(&mut s, persist_enabled, session_id.as_str(), envelope);
 
             let (recent, recent_complete) = if let Some(last) = prepared_append.fetch_recent {
@@ -5432,14 +5446,15 @@ impl Runtime {
         let update_state_work_started = path_profile.map(|_| Instant::now());
         s.sessions
             .insert(req.session_id.as_str().to_string(), session_snapshot);
-        // In-memory backend: keep the events map populated, and mirror the
-        // `event_by_id` secondary-index entry that the KV backend writes via
-        // `append_batch`. The persisted backend keeps this in memory too so
-        // same-process reads can avoid a storage lookup.
-        s.event_by_id.insert(
-            envelope.event_id.as_str().to_string(),
-            (envelope.session_id.as_str().to_string(), envelope.seq),
-        );
+        // In-memory backend: keep the `event_by_id` map populated. The
+        // persisted backend resolves event IDs through the durable secondary
+        // index to avoid unbounded in-process growth on large histories.
+        if !persist_enabled {
+            s.event_by_id.insert(
+                envelope.event_id.as_str().to_string(),
+                (envelope.session_id.as_str().to_string(), envelope.seq),
+            );
+        }
         insert_runtime_event_cache(&mut s, persist_enabled, req.session_id.as_str(), envelope);
 
         let (recent, recent_complete) = if let Some(last) = fetch_recent {
