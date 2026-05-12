@@ -4959,6 +4959,7 @@ impl Runtime {
             coalesce_sample.update_state_lock_wait_nanos = started.elapsed().as_nanos();
         }
         let update_state_work_started = coalesce_profile.map(|_| Instant::now());
+        let mut completions = Vec::with_capacity(prepared.len());
         if let Some(session_snapshot) = final_session_snapshot {
             s.sessions
                 .insert(session_id.as_str().to_string(), session_snapshot);
@@ -4989,16 +4990,23 @@ impl Runtime {
                 &prepared_append.tenant_id,
                 &prepared_append.session_after_append,
             );
-            let _ = done.send(Ok(AppendCommitResponse {
-                appended: prepared_append.appended,
-                recent,
-                recent_complete,
-                backpressure,
-                backpressure_complete: true,
-            }));
+            completions.push((
+                done,
+                AppendCommitResponse {
+                    appended: prepared_append.appended,
+                    recent,
+                    recent_complete,
+                    backpressure,
+                    backpressure_complete: true,
+                },
+            ));
         }
         if let Some(started) = update_state_work_started {
             coalesce_sample.update_state_work_nanos = started.elapsed().as_nanos();
+        }
+        drop(s);
+        for (done, response) in completions {
+            let _ = done.send(Ok(response));
         }
         if let (Some(profile), Some(started)) = (coalesce_profile, total_started) {
             coalesce_sample.total_nanos = started.elapsed().as_nanos();
