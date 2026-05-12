@@ -4852,6 +4852,8 @@ impl Runtime {
         let prepare_started = coalesce_profile.map(|_| Instant::now());
         {
             let s = self.state.lock().await;
+            let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
+            let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
             for job in jobs {
                 let SimpleAppendJob {
                     req,
@@ -4866,6 +4868,8 @@ impl Runtime {
                     fetch_recent,
                     context_max_bytes,
                     final_session_snapshot.take(),
+                    &mut policy_cache,
+                    &mut metadata_key_cache,
                 );
                 match result {
                     Ok((prepared_append, session_snapshot, checkpoint)) => {
@@ -4979,12 +4983,25 @@ impl Runtime {
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
         prior_session_snapshot: Option<Session>,
+        policy_cache: &mut BTreeMap<(String, String), RuntimePolicy>,
+        metadata_key_cache: &mut BTreeMap<String, KeyResolution>,
     ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Option<Session>)> {
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
-            .map_err(|err| (err, prior_session_snapshot.clone()))?;
+        let policy_cache_key = (
+            req.tenant_id.as_str().to_string(),
+            req.agent_id.as_str().to_string(),
+        );
+        let policy = match policy_cache.get(&policy_cache_key) {
+            Some(policy) => policy.clone(),
+            None => {
+                let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
+                    .map_err(|err| (err, prior_session_snapshot.clone()))?;
+                policy_cache.insert(policy_cache_key, policy.clone());
+                policy
+            }
+        };
         if let Some(max_bytes) = context_max_bytes {
             if let Some(max) = policy.quota.max_context_bytes {
                 if max_bytes > max {
@@ -5058,9 +5075,16 @@ impl Runtime {
             }
         }
 
-        let metadata_key = self
-            .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
-            .map_err(|err| (err, Some(snapshot.clone())))?;
+        let metadata_key = match metadata_key_cache.get(req.tenant_id.as_str()) {
+            Some(key) => key.clone(),
+            None => {
+                let key = self
+                    .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
+                    .map_err(|err| (err, Some(snapshot.clone())))?;
+                metadata_key_cache.insert(req.tenant_id.as_str().to_string(), key.clone());
+                key
+            }
+        };
         let prior_lifecycle = snapshot.lifecycle.clone();
         let prior_policy_version = snapshot.policy_version;
         if snapshot.lifecycle != Lifecycle::Warm {
