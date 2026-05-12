@@ -65,6 +65,14 @@ The workload is intentionally agent-runtime shaped:
   up, but still small enough to keep the current comparison focused on the
   single-node hot path. It is not a working-set-exceeds-cache benchmark.
 
+For cache-pressure validation, use `PROFILE=working-set-exceeds-cache` instead
+of the latest-comparison shape. That preset prepares a much larger logical
+history: 4,000 sessions, 8 million prepared events, 400,000 prepared records,
+and about 32 GiB of event payload before database/index overhead. The generated
+`report.md` prints total sessions, total events, total records, and estimated
+event payload bytes. Compare that estimate with host RAM, database cache
+settings, and observed disk usage before claiming the run truly exceeds cache.
+
 | Profile | Concurrency | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---:|---|
 | `single-node-wal` | 32 | 53.9k ops/s, p99 2.08ms | 26.0k ops/s, p99 2.86ms | 13.1k ops/s, p99 35.8ms | Best local developer story: AgentDB is 2.07x MongoDB and 4.11x Postgres. |
@@ -179,7 +187,7 @@ for all backends.
 
 | Knob | Common Values | Use |
 |---|---|---|
-| `PROFILE` | `smoke`, `default-agent-runtime` | Dataset size preset. Use `smoke` only for correctness checks. |
+| `PROFILE` | `smoke`, `default-agent-runtime`, `working-set-exceeds-cache` | Dataset size preset. Use `smoke` only for correctness checks. |
 | `WORKLOAD` | `mixed-agent-loop`, `append-only`, `append-fetch-hot`, `record-write-only`, `record-search-only`, `artifact-only`, `fork-only` | Choose the agent-runtime path to measure. |
 | `CONCURRENCY` | `32`, `1,4,16,32`, `256` | Client worker count. Use the same value across backends. |
 | `DURABILITY_PROFILE` | `single-node-wal`, `single-node-fsync`, `strict-fsync` | Controls durability semantics. Do not mix profiles in one comparison. |
@@ -187,6 +195,7 @@ for all backends.
 | `ZIPF_EXPONENT` | `1.2` | Skew strength for `SESSION_SELECTION=zipf`. |
 | `ARTIFACT_MODE` | `reference`, `content-backend`, `mixed` | Controls whether artifact bytes are stored through the content engine. |
 | `NO_RAW_JSONL` | `1` | Avoids large per-operation logs in bigger runs. |
+| `MIN_FREE_GB` | `5`, `80` | Minimum free disk guard used by wrapper scripts. Defaults to `80` for `working-set-exceeds-cache`. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
 
 `strict-fsync` disables append group commit and is mostly a stress profile. It
@@ -211,6 +220,36 @@ PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
 
 Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
 the same thing as real MongoDB.
+
+## Working-Set-Exceeds-Cache Cell
+
+Use this cell to test whether the comparison survives beyond a cache-warm hot
+set. It is intentionally heavier than the latest-comparison row and should be
+run on `li-dev` or another machine with enough disk space:
+
+```bash
+BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+  RUN_ID=agentdb-working-set-wal \
+  PROFILE=working-set-exceeds-cache \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=30s \
+  DURATION=300s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  DURABILITY_PROFILE=single-node-wal \
+  MIN_FREE_GB=80 \
+  REPEATS=1 \
+  SEEDS=43 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
+```
+
+Run the same cell with `scripts/agentdb-bench-mongodb.sh` and
+`scripts/agentdb-bench-postgres.sh` before drawing a comparison. If the prepared
+dataset still fits in RAM and database cache on the test host, increase
+`TENANTS`, `SESSIONS_PER_AGENT`, `EVENTS_PER_SESSION`, or `PAYLOAD_BYTES`
+explicitly and record those overrides in the report.
 
 ## Manual Prepare And Run
 

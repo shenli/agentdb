@@ -154,6 +154,7 @@ struct SummarizeRepeatsArgs {
 enum Profile {
     Smoke,
     DefaultAgentRuntime,
+    WorkingSetExceedsCache,
     LongContext,
     ArtifactHeavy,
     MemoryHeavy,
@@ -1653,6 +1654,27 @@ impl RunArgs {
 }
 
 impl DatasetConfig {
+    fn total_sessions(&self) -> u64 {
+        (self.tenants as u64)
+            .saturating_mul(self.agents_per_tenant as u64)
+            .saturating_mul(self.sessions_per_agent as u64)
+    }
+
+    fn total_events(&self) -> u64 {
+        self.total_sessions()
+            .saturating_mul(self.events_per_session as u64)
+    }
+
+    fn total_records(&self) -> u64 {
+        self.total_sessions()
+            .saturating_mul(self.records_per_session as u64)
+    }
+
+    fn estimated_event_payload_bytes(&self) -> u64 {
+        self.total_events()
+            .saturating_mul(self.payload_bytes as u64)
+    }
+
     fn small_runtime(seed: u64) -> Self {
         Self {
             profile: "runtime".into(),
@@ -3370,6 +3392,21 @@ fn dataset_config(args: &PrepareArgs) -> DatasetConfig {
             forks_per_parent: 1,
             seed: args.seed,
         },
+        Profile::WorkingSetExceedsCache => DatasetConfig {
+            profile: "working-set-exceeds-cache".into(),
+            tenants: 25,
+            agents_per_tenant: 4,
+            sessions_per_agent: 40,
+            events_per_session: 2_000,
+            records_per_session: 100,
+            payload_bytes: 4096,
+            artifact_rate: 0.02,
+            artifact_small_bytes: 4096,
+            artifact_large_bytes: 1024 * 1024,
+            artifact_mode: ArtifactMode::Reference,
+            forks_per_parent: 1,
+            seed: args.seed,
+        },
         Profile::LongContext => DatasetConfig {
             profile: "long-context".into(),
             tenants: 4,
@@ -3558,6 +3595,22 @@ fn write_markdown_report(
     out.push_str(&format!(
         "- Events per session: `{}`\n",
         manifest.config.events_per_session
+    ));
+    out.push_str(&format!(
+        "- Total sessions: `{}`\n",
+        manifest.config.total_sessions()
+    ));
+    out.push_str(&format!(
+        "- Total prepared events: `{}`\n",
+        manifest.config.total_events()
+    ));
+    out.push_str(&format!(
+        "- Total prepared records: `{}`\n",
+        manifest.config.total_records()
+    ));
+    out.push_str(&format!(
+        "- Estimated prepared event payload bytes: `{}`\n",
+        manifest.config.estimated_event_payload_bytes()
     ));
     out.push_str(&format!(
         "- Artifact mode: `{:?}`\n",

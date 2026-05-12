@@ -13,7 +13,14 @@ CONCURRENCY="${CONCURRENCY:-1,4}"
 WARMUP="${WARMUP:-5s}"
 DURATION="${DURATION:-15s}"
 ARTIFACT_MODE="${ARTIFACT_MODE:-reference}"
-MIN_FREE_GB="${MIN_FREE_GB:-5}"
+MIN_FREE_GB="${MIN_FREE_GB:-}"
+if [[ -z "${MIN_FREE_GB}" ]]; then
+  if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+    MIN_FREE_GB=80
+  else
+    MIN_FREE_GB=5
+  fi
+fi
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 DURABILITY_PROFILE="${DURABILITY_PROFILE:-single-node-wal}"
 

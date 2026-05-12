@@ -26,8 +26,9 @@ Before publishing external ratios, close these benchmark gaps:
 
 - Derive the operation mix from real agent traces, or label it as a heuristic
   mix and publish the rationale for each operation weight.
-- Add working-set-exceeds-cache profiles and report dataset bytes versus RAM,
-  page cache, and RocksDB block cache.
+- Run the implemented `working-set-exceeds-cache` profile and report dataset
+  bytes versus RAM, page cache, RocksDB block cache, MongoDB WiredTiger cache,
+  and Postgres shared buffers.
 - Expand the durability matrix: one single-node-fsync sanity cell now exists,
   but it needs repeats and follow-up after append-path instrumentation.
 - Run longer multi-minute cells so RocksDB compaction, Postgres checkpoint, and
@@ -620,6 +621,7 @@ Predefined profiles should be thin wrappers around these parameters:
 |---|---|
 | `smoke` | Small, fast dataset for local correctness checks. |
 | `default-agent-runtime` | Balanced chat history, memory, fork, and artifact dataset. |
+| `working-set-exceeds-cache` | Large logical history and memory dataset for cache-pressure validation. Reports total sessions/events/records and estimated event payload bytes. |
 | `long-context` | Deep session history with fewer tenants. |
 | `artifact-heavy` | High artifact rate and larger payload/reference metadata. |
 | `memory-heavy` | More records per session and more global search pressure. |
