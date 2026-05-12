@@ -283,6 +283,7 @@ Results are on `li-dev` under
 |---|---:|---:|---:|---:|---|
 | AgentDB `single-node-fsync`, initial | 256 | 858ms | 949ms | 0.29x MongoDB / 0.12x Postgres | RocksDB sync writes plus safe append group commit. |
 | AgentDB `single-node-fsync`, tuned c=32 | 1,441 | 47ms | 75ms | 1.63x MongoDB / 0.66x Postgres | Compact append log, shared Persist fsync batching, zero same-session coalescing wait. |
+| AgentDB `single-node-fsync`, group wait 2ms c=32 | 1,472 | 48ms | 76ms | not rerun | Safer default fsync group-commit window; improves throughput over the previous 1ms default on the smaller 4x2x25-session tuning cell. |
 | MongoDB `single-node-fsync` | 884 | 61ms | 65ms | 0.29x MongoDB | Journaled acknowledged writes. |
 | Postgres `single-node-fsync` | 2,182 | 83ms | 238ms | 0.12x Postgres | `synchronous_commit=on`. |
 | AgentDB `strict-fsync` | 124 | 830ms | 1,052ms | stress only | RocksDB sync writes with append group commit disabled. |
@@ -295,11 +296,30 @@ cell showed `append_fetch` p95 at 897ms and p99 at 982ms, while metadata writes
 such as `record_write` and `fork` stayed near 53-54ms p95. That pointed at the
 durable append path rather than read caching as the bottleneck.
 
-The next PR should add append-path instrumentation before tuning: per-session
-queue/lock wait, group-commit queue wait, RocksDB sync-write time, and state
-update time. If RocksDB sync dominates, the likely fix is a more explicit
-durable log/group-commit design; if queue wait dominates, a single-writer
-per-session coalescing actor is the stronger candidate.
+Follow-up fsync group-commit tuning on `li-dev` used a smaller c=32 Zipf-1.2
+cell (4 tenants, 2 agents/tenant, 25 sessions/agent, 50 prepared
+events/session, 10 records/session, 2 KiB payload, 15s measured window) to
+sweep `AGENTDB_APPEND_GROUP_COMMIT_US`:
+
+| Wait window | ops/s | p95 | p99 | Notes |
+|---:|---:|---:|---:|---|
+| 0us | 1,082 | 77ms | 117ms | Too little safe batching. |
+| 250us | 1,097 | 71ms | 117ms | Slight throughput gain only. |
+| 500us | 1,116 | 70ms | 111ms | Better, still below the default. |
+| 1000us | 1,179 | 61ms | 97ms | Previous default. |
+| 2000us | 1,472 | 48ms | 76ms | Best latency/throughput balance in this sweep. |
+| 4000us | 1,509 | 54ms | 86ms | Slightly higher throughput, worse p99. |
+| 8000us | 1,237 | 66ms | 105ms | Over-batched; regresses. |
+
+Based on that sweep, AgentDB's default `single-node-fsync` append group-commit
+window is 2ms. Operators can still override it with
+`AGENTDB_APPEND_GROUP_COMMIT_US`.
+
+Append-path instrumentation should stay in the workflow before further durable
+write tuning: per-session queue/lock wait, group-commit queue wait, RocksDB
+sync-write time, and state update time. If RocksDB sync dominates, the likely
+fix is a more explicit durable log/group-commit design; if queue wait dominates,
+a single-writer per-session coalescing actor is the stronger candidate.
 
 Enable append-path profiling for AgentDB native or AgentDB MongoDB-API wrapper
 runs with:

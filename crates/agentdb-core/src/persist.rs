@@ -331,7 +331,9 @@ impl AdaptiveWriteBatcher {
         let wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or_else(|| if sync_writes { 1_000 } else { 0 });
+            // In single-node fsync mode, a short wait window materially
+            // improves safe batching without the p99 hit of larger windows.
+            .unwrap_or_else(|| if sync_writes { 2_000 } else { 0 });
         Some(Arc::new(Self::new(
             kv,
             max_ops,
