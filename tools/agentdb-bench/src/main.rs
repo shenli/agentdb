@@ -98,7 +98,7 @@ struct PrepareArgs {
     data_dir: Option<PathBuf>,
     #[arg(long)]
     content_dir: Option<PathBuf>,
-    #[arg(long, default_value = "durable-single")]
+    #[arg(long, default_value = "single-node-wal")]
     durability_profile: String,
     #[arg(long, default_value_t = 42)]
     seed: u64,

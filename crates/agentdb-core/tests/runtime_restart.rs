@@ -113,6 +113,105 @@ async fn events_and_next_seq_survive_restart() {
 }
 
 #[tokio::test]
+async fn concurrent_append_and_fetch_same_session_survives_restart() {
+    let dir = TempDir::new().unwrap();
+
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "coalesce".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for i in 0..64 {
+        let rt = rt.clone();
+        let tenant_id = t.tenant_id.clone();
+        let agent_id = a.agent_id.clone();
+        let session_id = s.session_id.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = rt
+                .append_and_fetch(
+                    AppendRequest {
+                        tenant_id,
+                        agent_id,
+                        session_id,
+                        kind: "message".into(),
+                        payload: serde_json::json!({ "i": i }),
+                        artifact_refs: Vec::new(),
+                        source_refs: Vec::new(),
+                        idempotency_key: None,
+                    },
+                    8,
+                    64 * 1024,
+                )
+                .await
+                .unwrap();
+            assert!(response
+                .recent
+                .iter()
+                .all(|event| event.seq <= response.seq));
+            (response.seq, response.event_id)
+        }));
+    }
+
+    let mut appended = Vec::new();
+    for task in tasks {
+        appended.push(task.await.unwrap());
+    }
+    let mut seqs = appended.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
+    seqs.sort_unstable();
+    assert_eq!(seqs, (0..64).collect::<Vec<_>>());
+    let lookup_event = appended
+        .iter()
+        .find(|(seq, _)| *seq == 0)
+        .map(|(_, event_id)| event_id.clone())
+        .unwrap();
+    drop(rt);
+
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 64);
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        (0..64).collect::<Vec<_>>()
+    );
+    let lookup = rt
+        .lookup_event_by_id(&t.tenant_id, &lookup_event)
+        .await
+        .unwrap();
+    assert_eq!(lookup, Some((s.session_id, 0)));
+}
+
+#[tokio::test]
 async fn idempotency_records_survive_restart() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());

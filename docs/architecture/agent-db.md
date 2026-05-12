@@ -184,6 +184,15 @@ This concentration is a design opportunity. AgentDB does not need to be a
 general-purpose query optimizer to be useful. It needs to make the agent runtime
 paths reliable and ergonomic.
 
+This does not mean AgentDB automatically beats mature databases on every
+storage benchmark. In a safe single-node `fsync` profile, Postgres is a strong
+baseline because its WAL group commit is highly optimized. AgentDB's narrower
+runtime semantics create an opportunity to win, but only if the implementation
+uses them to reduce the acknowledged write path: append a compact durable log,
+batch many sessions into each flush, serve read-after-write from committed
+runtime state, and materialize secondary/session/index rows outside the critical
+ack path where possible.
+
 Record search follows the same distinction agent applications usually make in
 practice. If the caller knows the owner or placement key, a local index can
 serve fast, read-after-write filtering for that scope. If the caller is doing

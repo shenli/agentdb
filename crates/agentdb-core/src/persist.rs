@@ -21,6 +21,7 @@
 //! Events are NOT preloaded; `scan_events` is invoked lazily by
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -51,6 +52,24 @@ use crate::skill::{AgentSkillBinding, Skill};
 use crate::tenant::Tenant;
 
 type SkillUniqueRecord = ((String, String, String), String);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AppendLogBatch {
+    events: Vec<EventEnvelope>,
+    session: Option<Session>,
+}
+
+fn append_log_key(tenant_id: &str, session_id: &str, first_seq: u64) -> String {
+    format!("append_log/{tenant_id}/{session_id}/{first_seq:020}")
+}
+
+fn append_log_session_prefix(tenant_id: &str, session_id: &str) -> String {
+    format!("append_log/{tenant_id}/{session_id}/")
+}
+
+fn append_log_tenant_prefix(tenant_id: &str) -> String {
+    format!("append_log/{tenant_id}/")
+}
 
 static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
 static ADAPTIVE_WRITE_PROFILE: OnceLock<Option<AdaptiveWriteProfile>> = OnceLock::new();
@@ -156,12 +175,37 @@ struct AdaptiveWriteBatcher {
     tx: mpsc::Sender<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
+    direct_fast_path: bool,
 }
 
 struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
     enqueued_at: Instant,
-    done: tokio::sync::oneshot::Sender<KvResult<()>>,
+    done: AdaptiveWriteCompletion,
+}
+
+enum AdaptiveWriteCompletion {
+    Async(tokio::sync::oneshot::Sender<KvResult<()>>),
+    Blocking(mpsc::Sender<KvResult<()>>),
+}
+
+impl AdaptiveWriteCompletion {
+    fn send(self, result: &KvResult<()>) {
+        let send_result = match result {
+            Ok(()) => Ok(()),
+            Err(err) => Err(StorageError::Other(format!(
+                "adaptive write batch failed: {err}"
+            ))),
+        };
+        match self {
+            AdaptiveWriteCompletion::Async(done) => {
+                let _ = done.send(send_result);
+            }
+            AdaptiveWriteCompletion::Blocking(done) => {
+                let _ = done.send(send_result);
+            }
+        }
+    }
 }
 
 struct AdaptiveWriteProfile {
@@ -269,11 +313,10 @@ fn adaptive_write_profile() -> Option<&'static AdaptiveWriteProfile> {
 
 impl AdaptiveWriteBatcher {
     fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
-        if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT")
-            || env_zero("AGENTDB_APPEND_GROUP_COMMIT_US")
-        {
+        if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT") {
             return None;
         }
+        let sync_writes = env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES");
         let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -282,12 +325,21 @@ impl AdaptiveWriteBatcher {
         let wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(0);
-        Some(Arc::new(Self::new(kv, max_ops, wait_us)))
+            .unwrap_or_else(|| if sync_writes { 1_000 } else { 0 });
+        Some(Arc::new(Self::new(
+            kv,
+            max_ops,
+            wait_us,
+            !sync_writes && wait_us == 0,
+        )))
     }
 
-    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize, wait_us: u64) -> Self {
+    fn new(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        max_ops: usize,
+        wait_us: u64,
+        direct_fast_path: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<AdaptiveWriteRequest>();
         let queued = Arc::new(AtomicU64::new(0));
         let writer_busy = Arc::new(AtomicU64::new(0));
@@ -304,11 +356,13 @@ impl AdaptiveWriteBatcher {
             tx,
             queued,
             writer_busy,
+            direct_fast_path,
         }
     }
 
     async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        if self.queued.load(Ordering::Relaxed) == 0
+        if self.direct_fast_path
+            && self.queued.load(Ordering::Relaxed) == 0
             && self
                 .writer_busy
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -331,7 +385,7 @@ impl AdaptiveWriteBatcher {
             .send(AdaptiveWriteRequest {
                 ops,
                 enqueued_at: Instant::now(),
-                done,
+                done: AdaptiveWriteCompletion::Async(done),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -339,6 +393,42 @@ impl AdaptiveWriteBatcher {
                 StorageError::Other("adaptive write worker stopped".into())
             })?;
         rx.await
+            .map_err(|_| StorageError::Other("adaptive write worker dropped result".into()))?
+    }
+
+    fn submit_blocking(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        if self.direct_fast_path
+            && self.queued.load(Ordering::Relaxed) == 0
+            && self
+                .writer_busy
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let op_count = ops.len();
+            let write_started = Instant::now();
+            let result = self.kv.write_batch(ops);
+            let write_nanos = write_started.elapsed().as_nanos();
+            self.writer_busy.store(0, Ordering::Release);
+            if let Some(profile) = adaptive_write_profile() {
+                profile.record_direct(op_count, write_nanos);
+            }
+            return result;
+        }
+
+        let (done, rx) = mpsc::channel();
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(AdaptiveWriteRequest {
+                ops,
+                enqueued_at: Instant::now(),
+                done: AdaptiveWriteCompletion::Blocking(done),
+            })
+            .map_err(|request| {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                drop(request);
+                StorageError::Other("adaptive write worker stopped".into())
+            })?;
+        rx.recv()
             .map_err(|_| StorageError::Other("adaptive write worker dropped result".into()))?
     }
 }
@@ -352,11 +442,13 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_zero(name: &str) -> bool {
+fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        == Some(0)
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
+        })
+        .unwrap_or(false)
 }
 
 fn adaptive_write_loop(
@@ -371,7 +463,7 @@ fn adaptive_write_loop(
         let mut requests = vec![first];
         queued.fetch_sub(1, Ordering::Relaxed);
         let mut op_count = requests[0].ops.len();
-        if wait_us > 0 && queued.load(Ordering::Relaxed) > 0 {
+        if wait_us > 0 {
             thread::sleep(Duration::from_micros(wait_us));
         }
 
@@ -414,13 +506,7 @@ fn adaptive_write_loop(
             profile.record_grouped(request_count, op_count, queue_nanos, write_nanos);
         }
         for done in completions {
-            let send_result = match &result {
-                Ok(()) => Ok(()),
-                Err(err) => Err(StorageError::Other(format!(
-                    "adaptive write batch failed: {err}"
-                ))),
-            };
-            let _ = done.send(send_result);
+            done.send(&result);
         }
     }
 }
@@ -568,7 +654,7 @@ impl Persist {
                 value: t.tenant_id.as_str().as_bytes().to_vec(),
             });
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_tenant(&self, t: &Tenant) -> KvResult<()> {
@@ -581,7 +667,7 @@ impl Persist {
                 key: tenant_alias_key(&t.external_key).into_bytes(),
             });
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_agent(&self, a: &Agent) -> KvResult<()> {
@@ -598,7 +684,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_agent(&self, a: &Agent) -> KvResult<()> {
@@ -613,7 +699,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     /// Atomically write an artifact's primary record AND the
@@ -655,7 +741,7 @@ impl Persist {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
@@ -672,11 +758,11 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_session_segment(&self, segment: &SessionSegment) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Put {
+        self.write_ops(vec![WriteOp::Put {
             key: session_segment_key(
                 segment.tenant_id.as_str(),
                 segment.session_id.as_str(),
@@ -699,7 +785,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_session_events(&self, tenant_id: &str, session_id: &str) -> KvResult<usize> {
@@ -719,8 +805,20 @@ impl Persist {
             });
             count += 1;
         }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in &batch.events {
+                ops.push(WriteOp::Delete {
+                    key: event_by_id_key(tenant_id, event.event_id.as_str()).into_bytes(),
+                });
+                count += 1;
+            }
+            ops.push(WriteOp::Delete { key: k });
+        }
         if !ops.is_empty() {
-            self.kv.write_batch(ops)?;
+            self.write_ops(ops)?;
         }
         Ok(count)
     }
@@ -750,8 +848,44 @@ impl Persist {
             });
             count += 1;
         }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            let mut kept = Vec::new();
+            let mut deleted = Vec::new();
+            for event in batch.events {
+                if event.seq < from_seq {
+                    kept.push(event);
+                } else {
+                    deleted.push(event);
+                }
+            }
+            if deleted.is_empty() {
+                continue;
+            }
+            for event in &deleted {
+                ops.push(WriteOp::Delete {
+                    key: event_by_id_key(tenant_id, event.event_id.as_str()).into_bytes(),
+                });
+            }
+            count += deleted.len();
+            ops.push(WriteOp::Delete { key: k });
+            if !kept.is_empty() {
+                let first_seq = kept[0].seq;
+                let rewritten = AppendLogBatch {
+                    events: kept,
+                    session: None,
+                };
+                let value = self.encode_append_log_batch(tenant_id, session_id, &rewritten)?;
+                ops.push(WriteOp::Put {
+                    key: append_log_key(tenant_id, session_id, first_seq).into_bytes(),
+                    value,
+                });
+            }
+        }
         if !ops.is_empty() {
-            self.kv.write_batch(ops)?;
+            self.write_ops(ops)?;
         }
         Ok(count)
     }
@@ -788,6 +922,116 @@ impl Persist {
         let write_nanos = write_started.elapsed().as_nanos();
         profile.record(op_count, bytes, build_nanos, write_nanos);
         result
+    }
+
+    pub async fn append_many_batch_async(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(profile) = append_persist_profile() else {
+            let ops = self.append_many_batch_ops(events, session)?;
+            if let Some(batcher) = &self.adaptive_write_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_many_batch_ops(events, session)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
+    }
+
+    pub async fn append_many_log_async(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let Some(profile) = append_persist_profile() else {
+            let ops = self.append_many_log_ops(events, session)?;
+            if let Some(batcher) = &self.adaptive_write_batcher {
+                return batcher.submit(ops).await;
+            }
+            return self.write_ops(ops);
+        };
+
+        let build_started = Instant::now();
+        let ops = self.append_many_log_ops(events, session)?;
+        let build_nanos = build_started.elapsed().as_nanos();
+        let op_count = ops.len();
+        let bytes = write_ops_size(&ops);
+        let write_started = Instant::now();
+        let result = if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit(ops).await
+        } else {
+            self.write_ops(ops)
+        };
+        let write_nanos = write_started.elapsed().as_nanos();
+        profile.record(op_count, bytes, build_nanos, write_nanos);
+        result
+    }
+
+    fn append_many_batch_ops(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<Vec<WriteOp>> {
+        let mut ops = Vec::with_capacity(events.len() * 2 + usize::from(session.is_some()));
+        for event in events {
+            ops.extend(self.append_batch_ops(event, None, None)?);
+        }
+        if let Some(session) = session {
+            ops.push(WriteOp::Put {
+                key: session_record_key(session.tenant_id.as_str(), session.session_id.as_str())
+                    .into_bytes(),
+                value: serde_json::to_vec(session).expect("session serializes"),
+            });
+        }
+        Ok(ops)
+    }
+
+    fn append_many_log_ops(
+        &self,
+        events: &[EventEnvelope],
+        session: Option<&Session>,
+    ) -> KvResult<Vec<WriteOp>> {
+        let first = events
+            .first()
+            .expect("append_many_log_ops requires non-empty events");
+        let batch = AppendLogBatch {
+            events: events.to_vec(),
+            session: session.cloned(),
+        };
+        Ok(vec![WriteOp::Put {
+            key: append_log_key(
+                first.tenant_id.as_str(),
+                first.session_id.as_str(),
+                first.seq,
+            )
+            .into_bytes(),
+            value: self.encode_append_log_batch(
+                first.tenant_id.as_str(),
+                first.session_id.as_str(),
+                &batch,
+            )?,
+        }])
     }
 
     pub(crate) fn append_batch_ops(
@@ -864,6 +1108,80 @@ impl Persist {
         Ok(Some((session_id, seq)))
     }
 
+    fn encode_append_log_batch(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        batch: &AppendLogBatch,
+    ) -> KvResult<Vec<u8>> {
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        self.encrypt_metadata(
+            &context,
+            &serde_json::to_vec(batch).expect("append log batch serializes"),
+        )
+    }
+
+    fn decode_append_log_batch(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        value: &[u8],
+    ) -> KvResult<AppendLogBatch> {
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let plaintext = self.decrypt_metadata(&context, value)?;
+        Ok(serde_json::from_slice(&plaintext).expect("append log batch decodes"))
+    }
+
+    fn append_log_session_id_from_key<'a>(tenant_id: &str, key: &'a [u8]) -> Option<&'a str> {
+        let raw = std::str::from_utf8(key).ok()?;
+        let prefix = append_log_tenant_prefix(tenant_id);
+        let rest = raw.strip_prefix(prefix.as_str())?;
+        let (session_id, _) = rest.split_once('/')?;
+        Some(session_id)
+    }
+
+    pub fn lookup_event_by_id_in_append_log(
+        &self,
+        tenant_id: &str,
+        event_id: &str,
+    ) -> KvResult<Option<(String, u64)>> {
+        let prefix = append_log_tenant_prefix(tenant_id);
+        for res in self.kv.scan_prefix(prefix.as_bytes())? {
+            let (k, v) = res?;
+            let Some(session_id) = Self::append_log_session_id_from_key(tenant_id, &k) else {
+                continue;
+            };
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                if event.event_id.as_str() == event_id {
+                    return Ok(Some((session_id.to_string(), event.seq)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn latest_append_log_session(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+    ) -> KvResult<Option<Session>> {
+        let prefix = append_log_session_prefix(tenant_id, session_id);
+        let mut latest: Option<(u64, Session)> = None;
+        for res in self.kv.scan_prefix(prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            let Some(session) = batch.session else {
+                continue;
+            };
+            let last_seq = batch.events.last().map(|event| event.seq).unwrap_or(0);
+            if latest.as_ref().map_or(true, |(seq, _)| last_seq >= *seq) {
+                latest = Some((last_seq, session));
+            }
+        }
+        Ok(latest.map(|(_, session)| session))
+    }
+
     // ----- reads -----
 
     pub fn scan_events(
@@ -873,12 +1191,12 @@ impl Persist {
         from_seq: u64,
         limit: usize,
     ) -> KvResult<Vec<EventEnvelope>> {
+        let mut merged: BTreeMap<u64, EventEnvelope> = BTreeMap::new();
         let prefix = format!("event/{tenant_id}/{session_id}/");
         let start = event_key(tenant_id, session_id, from_seq);
         let iter = self
             .kv
             .scan_prefix_from(prefix.as_bytes(), start.as_bytes())?;
-        let mut out = Vec::new();
         for res in iter {
             let (_k, v) = res?;
             let context = self.event_context_from_key(tenant_id, session_id, 0);
@@ -888,12 +1206,25 @@ impl Persist {
             if env.seq < from_seq {
                 continue;
             }
-            out.push(env);
-            if out.len() >= limit {
+            merged.insert(env.seq, env);
+            if merged.len() >= limit {
                 break;
             }
         }
-        Ok(out)
+
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                if event.seq < from_seq {
+                    continue;
+                }
+                merged.insert(event.seq, event);
+            }
+        }
+
+        Ok(merged.into_values().take(limit).collect())
     }
 
     /// Return the highest persisted event seq for `(tenant_id, session_id)`,
@@ -913,6 +1244,17 @@ impl Persist {
                 Some(m) if m >= env.seq => m,
                 _ => env.seq,
             });
+        }
+        let log_prefix = append_log_session_prefix(tenant_id, session_id);
+        for res in self.kv.scan_prefix(log_prefix.as_bytes())? {
+            let (_k, v) = res?;
+            let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
+            for event in batch.events {
+                max_seq = Some(match max_seq {
+                    Some(m) if m >= event.seq => m,
+                    _ => event.seq,
+                });
+            }
         }
         Ok(max_seq)
     }
@@ -1131,7 +1473,11 @@ impl Persist {
     }
 
     pub(crate) fn write_ops(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        self.kv.write_batch(ops)
+        if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit_blocking(ops)
+        } else {
+            self.kv.write_batch(ops)
+        }
     }
 
     pub(crate) async fn write_ops_async(&self, ops: Vec<WriteOp>) -> KvResult<()> {
@@ -1156,7 +1502,7 @@ impl Persist {
                 .into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     /// Atomic write of a V2.3 skill record plus its
@@ -1174,7 +1520,7 @@ impl Persist {
                 value: skill.skill_id.as_str().as_bytes().to_vec(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_skill(&self, skill: &Skill) -> KvResult<()> {
@@ -1188,7 +1534,7 @@ impl Persist {
                     .into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
@@ -1201,11 +1547,11 @@ impl Persist {
             .into_bytes(),
             value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
         }];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Delete {
+        self.write_ops(vec![WriteOp::Delete {
             key: agent_skill_binding_key(
                 binding.tenant_id.as_str(),
                 binding.agent_id.as_str(),
@@ -1216,14 +1562,14 @@ impl Persist {
     }
 
     pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Put {
+        self.write_ops(vec![WriteOp::Put {
             key: format!("record/idempotency/{full_key}").into_bytes(),
             value: serde_json::to_vec(rec).expect("idempotency record serializes"),
         }])
     }
 
     pub fn delete_idempotency(&self, full_key: &str) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Delete {
+        self.write_ops(vec![WriteOp::Delete {
             key: format!("record/idempotency/{full_key}").into_bytes(),
         }])
     }
