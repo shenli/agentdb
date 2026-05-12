@@ -54,6 +54,11 @@ fn default_rocks_options() -> Options {
     opts.set_level_zero_slowdown_writes_trigger(24);
     opts.set_level_zero_stop_writes_trigger(36);
     opts.set_bytes_per_sync(1024 * 1024);
+    let max_open_files = std::env::var("AGENTDB_ROCKSDB_MAX_OPEN_FILES")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .unwrap_or(512);
+    opts.set_max_open_files(max_open_files);
 
     opts
 }

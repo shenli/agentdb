@@ -196,6 +196,7 @@ for all backends.
 | `ARTIFACT_MODE` | `reference`, `content-backend`, `mixed` | Controls whether artifact bytes are stored through the content engine. |
 | `NO_RAW_JSONL` | `1` | Avoids large per-operation logs in bigger runs. |
 | `MIN_FREE_GB` | `5`, `80` | Minimum free disk guard used by wrapper scripts. Defaults to `80` for `working-set-exceeds-cache`. |
+| `AGENTDB_BENCH_NOFILE` | `65535` | File descriptor limit requested by AgentDB wrappers for `working-set-exceeds-cache`. |
 | `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` | `64`, `2048` | AgentDB persisted hot-tail event cache per session. AgentDB wrappers default this to `64` for `working-set-exceeds-cache`. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
 

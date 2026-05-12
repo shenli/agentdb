@@ -37,6 +37,9 @@ if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
   echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
   exit 1
 fi
+if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
+  ulimit -n "${AGENTDB_BENCH_NOFILE:-65535}" 2>/dev/null || true
+fi
 
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
   cargo build --release -p agentdb-server -p agentdb-bench
