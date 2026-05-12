@@ -59,6 +59,12 @@ struct AppendLogBatch {
     session: Option<Session>,
 }
 
+#[derive(serde::Serialize)]
+struct AppendLogBatchRefs<'a> {
+    events: &'a [&'a EventEnvelope],
+    session: Option<&'a Session>,
+}
+
 fn append_log_key(tenant_id: &str, session_id: &str, first_seq: u64) -> String {
     format!("append_log/{tenant_id}/{session_id}/{first_seq:020}")
 }
@@ -956,16 +962,16 @@ impl Persist {
         result
     }
 
-    pub async fn append_many_log_async(
+    pub async fn append_many_log_refs_async(
         &self,
-        events: &[EventEnvelope],
+        events: &[&EventEnvelope],
         session: Option<&Session>,
     ) -> KvResult<()> {
         if events.is_empty() {
             return Ok(());
         }
         let Some(profile) = append_persist_profile() else {
-            let ops = self.append_many_log_ops(events, session)?;
+            let ops = self.append_many_log_ref_ops(events, session)?;
             if let Some(batcher) = &self.adaptive_write_batcher {
                 return batcher.submit(ops).await;
             }
@@ -973,7 +979,7 @@ impl Persist {
         };
 
         let build_started = Instant::now();
-        let ops = self.append_many_log_ops(events, session)?;
+        let ops = self.append_many_log_ref_ops(events, session)?;
         let build_nanos = build_started.elapsed().as_nanos();
         let op_count = ops.len();
         let bytes = write_ops_size(&ops);
@@ -1007,18 +1013,15 @@ impl Persist {
         Ok(ops)
     }
 
-    fn append_many_log_ops(
+    fn append_many_log_ref_ops(
         &self,
-        events: &[EventEnvelope],
+        events: &[&EventEnvelope],
         session: Option<&Session>,
     ) -> KvResult<Vec<WriteOp>> {
         let first = events
             .first()
-            .expect("append_many_log_ops requires non-empty events");
-        let batch = AppendLogBatch {
-            events: events.to_vec(),
-            session: session.cloned(),
-        };
+            .expect("append_many_log_ref_ops requires non-empty events");
+        let batch = AppendLogBatchRefs { events, session };
         Ok(vec![WriteOp::Put {
             key: append_log_key(
                 first.tenant_id.as_str(),
@@ -1026,7 +1029,7 @@ impl Persist {
                 first.seq,
             )
             .into_bytes(),
-            value: self.encode_append_log_batch(
+            value: self.encode_append_log_batch_refs(
                 first.tenant_id.as_str(),
                 first.session_id.as_str(),
                 &batch,
@@ -1113,6 +1116,19 @@ impl Persist {
         tenant_id: &str,
         session_id: &str,
         batch: &AppendLogBatch,
+    ) -> KvResult<Vec<u8>> {
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        self.encrypt_metadata(
+            &context,
+            &serde_json::to_vec(batch).expect("append log batch serializes"),
+        )
+    }
+
+    fn encode_append_log_batch_refs(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        batch: &AppendLogBatchRefs<'_>,
     ) -> KvResult<Vec<u8>> {
         let context = self.event_context_from_key(tenant_id, session_id, 0);
         self.encrypt_metadata(

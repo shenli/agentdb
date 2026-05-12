@@ -100,9 +100,11 @@ struct SessionAppendCoalesceSample {
     jobs: usize,
     events: usize,
     lock_wait_nanos: u128,
-    prepare_nanos: u128,
+    prepare_lock_wait_nanos: u128,
+    prepare_work_nanos: u128,
     durable_write_nanos: u128,
-    update_state_nanos: u128,
+    update_state_lock_wait_nanos: u128,
+    update_state_work_nanos: u128,
     total_nanos: u128,
 }
 
@@ -113,9 +115,11 @@ struct SessionAppendCoalesceProfile {
     jobs: AtomicU64,
     events: AtomicU64,
     lock_wait_nanos: AtomicU64,
-    prepare_nanos: AtomicU64,
+    prepare_lock_wait_nanos: AtomicU64,
+    prepare_work_nanos: AtomicU64,
     durable_write_nanos: AtomicU64,
-    update_state_nanos: AtomicU64,
+    update_state_lock_wait_nanos: AtomicU64,
+    update_state_work_nanos: AtomicU64,
     total_nanos: AtomicU64,
 }
 
@@ -222,9 +226,11 @@ impl SessionAppendCoalesceProfile {
             jobs: AtomicU64::new(0),
             events: AtomicU64::new(0),
             lock_wait_nanos: AtomicU64::new(0),
-            prepare_nanos: AtomicU64::new(0),
+            prepare_lock_wait_nanos: AtomicU64::new(0),
+            prepare_work_nanos: AtomicU64::new(0),
             durable_write_nanos: AtomicU64::new(0),
-            update_state_nanos: AtomicU64::new(0),
+            update_state_lock_wait_nanos: AtomicU64::new(0),
+            update_state_work_nanos: AtomicU64::new(0),
             total_nanos: AtomicU64::new(0),
         })
     }
@@ -235,9 +241,20 @@ impl SessionAppendCoalesceProfile {
         self.events
             .fetch_add(sample.events as u64, Ordering::Relaxed);
         add_nanos(&self.lock_wait_nanos, sample.lock_wait_nanos);
-        add_nanos(&self.prepare_nanos, sample.prepare_nanos);
+        add_nanos(
+            &self.prepare_lock_wait_nanos,
+            sample.prepare_lock_wait_nanos,
+        );
+        add_nanos(&self.prepare_work_nanos, sample.prepare_work_nanos);
         add_nanos(&self.durable_write_nanos, sample.durable_write_nanos);
-        add_nanos(&self.update_state_nanos, sample.update_state_nanos);
+        add_nanos(
+            &self.update_state_lock_wait_nanos,
+            sample.update_state_lock_wait_nanos,
+        );
+        add_nanos(
+            &self.update_state_work_nanos,
+            sample.update_state_work_nanos,
+        );
         add_nanos(&self.total_nanos, sample.total_nanos);
 
         let now = crate::now_ms();
@@ -260,9 +277,12 @@ impl SessionAppendCoalesceProfile {
         let jobs = self.jobs.swap(0, Ordering::Relaxed);
         let events = self.events.swap(0, Ordering::Relaxed);
         let lock_wait_nanos = self.lock_wait_nanos.swap(0, Ordering::Relaxed);
-        let prepare_nanos = self.prepare_nanos.swap(0, Ordering::Relaxed);
+        let prepare_lock_wait_nanos = self.prepare_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let prepare_work_nanos = self.prepare_work_nanos.swap(0, Ordering::Relaxed);
         let durable_write_nanos = self.durable_write_nanos.swap(0, Ordering::Relaxed);
-        let update_state_nanos = self.update_state_nanos.swap(0, Ordering::Relaxed);
+        let update_state_lock_wait_nanos =
+            self.update_state_lock_wait_nanos.swap(0, Ordering::Relaxed);
+        let update_state_work_nanos = self.update_state_work_nanos.swap(0, Ordering::Relaxed);
         let total_nanos = self.total_nanos.swap(0, Ordering::Relaxed);
         tracing::info!(
             batches,
@@ -271,9 +291,11 @@ impl SessionAppendCoalesceProfile {
             avg_jobs_per_batch = jobs as f64 / batches as f64,
             avg_events_per_batch = events as f64 / batches as f64,
             avg_lock_wait_us = avg_us(lock_wait_nanos, batches),
-            avg_prepare_us = avg_us(prepare_nanos, batches),
+            avg_prepare_lock_wait_us = avg_us(prepare_lock_wait_nanos, batches),
+            avg_prepare_work_us = avg_us(prepare_work_nanos, batches),
             avg_durable_write_us = avg_us(durable_write_nanos, batches),
-            avg_update_state_us = avg_us(update_state_nanos, batches),
+            avg_update_state_lock_wait_us = avg_us(update_state_lock_wait_nanos, batches),
+            avg_update_state_work_us = avg_us(update_state_work_nanos, batches),
             avg_total_us = avg_us(total_nanos, batches),
             "session append coalesce profile"
         );
@@ -4849,9 +4871,15 @@ impl Runtime {
         let mut final_session_snapshot: Option<Session> = None;
         let mut persist_session_checkpoint = false;
 
-        let prepare_started = coalesce_profile.map(|_| Instant::now());
+        let prepare_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         {
             let s = self.state.lock().await;
+            if let Some(started) = prepare_lock_wait_started {
+                coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
+            }
+            let prepare_work_started = coalesce_profile.map(|_| Instant::now());
+            let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
+            let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
             for job in jobs {
                 let SimpleAppendJob {
                     req,
@@ -4866,6 +4894,8 @@ impl Runtime {
                     fetch_recent,
                     context_max_bytes,
                     final_session_snapshot.take(),
+                    &mut policy_cache,
+                    &mut metadata_key_cache,
                 );
                 match result {
                     Ok((prepared_append, session_snapshot, checkpoint)) => {
@@ -4879,31 +4909,37 @@ impl Runtime {
                     }
                 }
             }
-        }
-        if let Some(started) = prepare_started {
-            coalesce_sample.prepare_nanos = started.elapsed().as_nanos();
+            if let Some(started) = prepare_work_started {
+                coalesce_sample.prepare_work_nanos = started.elapsed().as_nanos();
+            }
         }
 
         if prepared.is_empty() {
             return;
         }
 
-        let events = prepared
+        let event_refs = prepared
             .iter()
-            .map(|(prepared, _)| prepared.envelope.clone())
+            .map(|(prepared, _)| &prepared.envelope)
             .collect::<Vec<_>>();
-        coalesce_sample.events = events.len();
+        coalesce_sample.events = event_refs.len();
         let session_checkpoint = persist_session_checkpoint
             .then(|| final_session_snapshot.as_ref())
             .flatten();
         if let Some(p) = &self.persist {
             let durable_write_started = coalesce_profile.map(|_| Instant::now());
             let durable_result = if env_flag_disabled_runtime("AGENTDB_APPEND_LOG_FAST_PATH") {
+                let events = event_refs
+                    .iter()
+                    .map(|event| (*event).clone())
+                    .collect::<Vec<_>>();
                 p.append_many_batch_async(&events, session_checkpoint).await
             } else {
-                p.append_many_log_async(&events, session_checkpoint).await
+                p.append_many_log_refs_async(&event_refs, session_checkpoint)
+                    .await
             };
             if let Err(err) = durable_result {
+                drop(event_refs);
                 let err = internal(err);
                 for (_, done) in prepared {
                     let _ = done.send(Err(err.clone()));
@@ -4914,10 +4950,16 @@ impl Runtime {
                 coalesce_sample.durable_write_nanos = started.elapsed().as_nanos();
             }
         }
+        drop(event_refs);
 
         let persist_enabled = self.persist.is_some();
-        let update_started = coalesce_profile.map(|_| Instant::now());
+        let update_state_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         let mut s = self.state.lock().await;
+        if let Some(started) = update_state_lock_wait_started {
+            coalesce_sample.update_state_lock_wait_nanos = started.elapsed().as_nanos();
+        }
+        let update_state_work_started = coalesce_profile.map(|_| Instant::now());
+        let mut completions = Vec::with_capacity(prepared.len());
         if let Some(session_snapshot) = final_session_snapshot {
             s.sessions
                 .insert(session_id.as_str().to_string(), session_snapshot);
@@ -4948,16 +4990,23 @@ impl Runtime {
                 &prepared_append.tenant_id,
                 &prepared_append.session_after_append,
             );
-            let _ = done.send(Ok(AppendCommitResponse {
-                appended: prepared_append.appended,
-                recent,
-                recent_complete,
-                backpressure,
-                backpressure_complete: true,
-            }));
+            completions.push((
+                done,
+                AppendCommitResponse {
+                    appended: prepared_append.appended,
+                    recent,
+                    recent_complete,
+                    backpressure,
+                    backpressure_complete: true,
+                },
+            ));
         }
-        if let Some(started) = update_started {
-            coalesce_sample.update_state_nanos = started.elapsed().as_nanos();
+        if let Some(started) = update_state_work_started {
+            coalesce_sample.update_state_work_nanos = started.elapsed().as_nanos();
+        }
+        drop(s);
+        for (done, response) in completions {
+            let _ = done.send(Ok(response));
         }
         if let (Some(profile), Some(started)) = (coalesce_profile, total_started) {
             coalesce_sample.total_nanos = started.elapsed().as_nanos();
@@ -4972,12 +5021,25 @@ impl Runtime {
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
         prior_session_snapshot: Option<Session>,
+        policy_cache: &mut BTreeMap<(String, String), RuntimePolicy>,
+        metadata_key_cache: &mut BTreeMap<String, KeyResolution>,
     ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Option<Session>)> {
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
-        let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
-            .map_err(|err| (err, prior_session_snapshot.clone()))?;
+        let policy_cache_key = (
+            req.tenant_id.as_str().to_string(),
+            req.agent_id.as_str().to_string(),
+        );
+        let policy = match policy_cache.get(&policy_cache_key) {
+            Some(policy) => policy.clone(),
+            None => {
+                let policy = resolve_policy_for_agent_in_state(s, &req.tenant_id, &req.agent_id)
+                    .map_err(|err| (err, prior_session_snapshot.clone()))?;
+                policy_cache.insert(policy_cache_key, policy.clone());
+                policy
+            }
+        };
         if let Some(max_bytes) = context_max_bytes {
             if let Some(max) = policy.quota.max_context_bytes {
                 if max_bytes > max {
@@ -5051,9 +5113,16 @@ impl Runtime {
             }
         }
 
-        let metadata_key = self
-            .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
-            .map_err(|err| (err, Some(snapshot.clone())))?;
+        let metadata_key = match metadata_key_cache.get(req.tenant_id.as_str()) {
+            Some(key) => key.clone(),
+            None => {
+                let key = self
+                    .resolve_key(&req.tenant_id, KeyOperation::MetadataWrite)
+                    .map_err(|err| (err, Some(snapshot.clone())))?;
+                metadata_key_cache.insert(req.tenant_id.as_str().to_string(), key.clone());
+                key
+            }
+        };
         let prior_lifecycle = snapshot.lifecycle.clone();
         let prior_policy_version = snapshot.policy_version;
         if snapshot.lifecycle != Lifecycle::Warm {
