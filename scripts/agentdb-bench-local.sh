@@ -76,11 +76,19 @@ if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
   agentdb_server_env+=(AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION="${AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION:-64}")
 fi
 
-env "${agentdb_server_env[@]}" "${BIN_DIR}/agentdb" serve \
-  --bind "${BIND}" \
-  --data-dir "${DATA_DIR}" \
-  --content-dir "${CONTENT_DIR}" \
-  >"${LOG_DIR}/agentdb-server.log" 2>&1 &
+if ((${#agentdb_server_env[@]})); then
+  env "${agentdb_server_env[@]}" "${BIN_DIR}/agentdb" serve \
+    --bind "${BIND}" \
+    --data-dir "${DATA_DIR}" \
+    --content-dir "${CONTENT_DIR}" \
+    >"${LOG_DIR}/agentdb-server.log" 2>&1 &
+else
+  "${BIN_DIR}/agentdb" serve \
+    --bind "${BIND}" \
+    --data-dir "${DATA_DIR}" \
+    --content-dir "${CONTENT_DIR}" \
+    >"${LOG_DIR}/agentdb-server.log" 2>&1 &
+fi
 server_pid="$!"
 
 cleanup() {
