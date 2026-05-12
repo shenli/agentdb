@@ -210,9 +210,9 @@ Results are on `li-dev` under
 
 | Backend/profile | State size | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---:|---:|---|
-| AgentDB `single-node-wal` | 24 GB | 36,261 | 0.75ms | 1.71ms | 2.55ms | 1.00x | Compact binary tablet log, scoped global-index lookup, RocksDB LZ4 compression, bounded persisted hot-tail cache. |
-| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 1.52x MongoDB | Normalized event-log collections. |
-| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 6.01x Postgres | `record_search` dominates tail latency. |
+| AgentDB `single-node-wal` | 24 GB | 37,234 | 0.74ms | 1.66ms | 2.35ms | 1.00x | Compact binary tablet log, scoped global-index lookup, RocksDB LZ4 compression, bounded persisted hot-tail cache. |
+| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 1.56x MongoDB | Normalized event-log collections. |
+| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 6.18x Postgres | `record_search` dominates tail latency. |
 
 This cell forced several AgentDB fixes before it could complete and then beat
 MongoDB:
@@ -236,6 +236,12 @@ remaining CPU spread across memory copies/allocation, JSON request/response
 serialization and deserialization, RocksDB scans/seeks, LZ4 compression, and
 ID parsing. The old dominant tablet-command JSON encode/decode and global-index
 full scan are no longer the top bottlenecks.
+
+The compact tablet log also helps `single-node-fsync`, but the gain is bounded
+by media-sync latency. A comparable c=32, `fetch_last_n=2` steady-state check
+improved from the previous 1,441 ops/s, p99 75.0ms to 1,545 ops/s, p99 70.3ms.
+That is useful, but not a step-change because the device flush remains on the
+critical path.
 
 ### Matched Durability Sanity Check
 
