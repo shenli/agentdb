@@ -1,21 +1,84 @@
 # agentdb-bench
 
-`agentdb-bench` prepares and runs synthetic agent-runtime workloads against
-AgentDB, Postgres, and MongoDB. The primary AgentDB backend is
-`agentdb-native-rocksdb`: native HTTP API plus local RocksDB storage.
+`agentdb-bench` is the repo-local benchmark suite for synthetic agent-runtime
+workloads. It can prepare the same tenant/agent/session/event/record/artifact
+dataset and run it against:
 
-Treat the current numbers as internal single-node microbenchmarks for
-agent-runtime API shape and hot-path behavior. They are not yet external
-marketing claims about general database performance: the default comparison is
-single-host, in-process-to-localhost, cache-warm, and uses AgentDB's fused
-`append-and-fetch` primitive while the Postgres/MongoDB baselines perform an
-append followed by a fetch.
+- `agentdb-native-rocksdb`: AgentDB native HTTP API with local RocksDB storage.
+- `agentdb-mongodb-api`: AgentDB through its MongoDB-compatible listener.
+- `mongodb-event-log`: MongoDB with normalized event-log collections.
+- `postgres-event-log`: Postgres with normalized event-log tables.
 
-In this profile, RocksDB stores metadata and indexes. Artifact bytes are written
-through AgentDB's content engine, which is local filesystem in the example
-below. This avoids putting large blobs into RocksDB.
+The benchmark is meant for engineering decisions. Treat the numbers below as
+internal single-node, cache-warm, localhost microbenchmarks, not external
+product claims.
 
-Start a local persistent AgentDB server:
+## Current Read
+
+The current best summary is:
+
+- For local developer tryout, AgentDB is clearly faster in the default
+  `single-node-wal` profile.
+- For matched single-node media-sync durability, AgentDB has improved a lot and
+  beats MongoDB at c=32, but Postgres remains a strong baseline.
+- At very high concurrency, AgentDB can slightly exceed Postgres throughput in
+  `single-node-fsync`, but with worse p95/p99 latency. That is not a large win.
+
+Why the split matters:
+
+- `single-node-wal` means writes reach the database WAL/memtable but do not
+  force a media sync for every acknowledged operation. This is the default local
+  developer profile and matches how replicated production should usually think:
+  each node writes its local WAL and durability comes from Raft quorum.
+- `single-node-fsync` means the single node forces local media sync durability.
+  This is useful as a safety sanity check, but it is also where Postgres WAL
+  group commit is extremely optimized.
+- AgentDB uses a fused `append-and-fetch` API. MongoDB and Postgres baselines
+  perform append and fetch as separate client operations. That is a real API
+  advantage, but it is not a pure storage-engine comparison.
+
+## Latest Comparison
+
+All rows below use the mixed agent loop with Zipf-1.2 session selection, seed
+43, 1000 sessions, and a 60s measured window unless noted. Results were captured
+on `li-dev`; see `docs/operations/AGENTDB_BENCH.md` for historical tuning
+details and run paths.
+
+| Profile | Concurrency | AgentDB | MongoDB | Postgres | What It Means |
+|---|---:|---:|---:|---:|---|
+| `single-node-wal` | 32 | 53.9k ops/s, p99 2.08ms | 26.0k ops/s, p99 2.86ms | 13.1k ops/s, p99 35.8ms | Best local developer story: AgentDB is 2.07x MongoDB and 4.11x Postgres. |
+| `single-node-fsync` | 32 | 1,441 ops/s, p99 75ms | 884 ops/s, p99 65ms | 2,182 ops/s, p99 238ms | AgentDB beats MongoDB throughput, but trails Postgres throughput. |
+| `single-node-fsync` tuning cell | 256 | 2,355 ops/s, p99 615ms | not rerun | 2,127 ops/s, p99 386ms | AgentDB slightly beats Postgres throughput, but has worse tail latency. |
+
+Use this interpretation:
+
+- If the question is "Is AgentDB fast out of the box for a local agent runtime?",
+  use the `single-node-wal` row.
+- If the question is "Does AgentDB beat mature databases under forced local
+  fsync?", the honest answer is mixed. It beats MongoDB in the current c=32 cell,
+  but Postgres is still highly competitive.
+- If the question is "Why not a huge Postgres win yet?", the bottleneck is not
+  query flexibility or read caching. It is durable WAL/fsync batching. A larger
+  margin likely requires a more specialized durable append-log path than the
+  current RocksDB sync-write path.
+
+## Run A Smoke Test
+
+Run the full local AgentDB RocksDB/content-engine smoke:
+
+```bash
+PROFILE=smoke ARTIFACT_MODE=content-backend \
+  scripts/agentdb-bench-local.sh
+```
+
+The wrapper builds release binaries by default. Use `BUILD_PROFILE=debug` for
+faster development-only smoke runs:
+
+```bash
+BUILD_PROFILE=debug PROFILE=smoke scripts/agentdb-bench-local.sh
+```
+
+To start AgentDB manually instead:
 
 ```bash
 cargo run -p agentdb-server -- serve \
@@ -24,93 +87,17 @@ cargo run -p agentdb-server -- serve \
   --content-dir /tmp/agentdb-bench-content
 ```
 
-Or run the full local RocksDB/content-engine smoke in one command:
+Artifact bytes go through AgentDB's content engine. In the local example that
+is the filesystem, not RocksDB, because RocksDB is not the right place for large
+blobs.
 
-```bash
-PROFILE=smoke ARTIFACT_MODE=content-backend \
-  scripts/agentdb-bench-local.sh
-```
+## Run The Main Comparison
 
-The runner builds release binaries by default. Set `BUILD_PROFILE=debug` for a
-faster development-only smoke.
-
-## Current Comparison Snapshot
-
-The table below keeps only the latest comparison cells. Historical tuning runs
-live in `docs/operations/AGENTDB_BENCH.md`; they are useful for engineering
-forensics, but they should not be the first thing a benchmark reader sees.
-
-| Cell | Shape | AgentDB | MongoDB | Postgres | Ratio |
-|---|---|---:|---:|---:|---|
-| Mixed loop, Zipf-1.2, `single-node-wal` | c=32, seed 43, 60s measured window, 1000 sessions | 53.9k ops/s | 26.0k ops/s | 13.1k ops/s | 2.07x MongoDB, 4.11x Postgres |
-
-Interpret these as internal single-node benchmark cells, not product claims.
-The AgentDB API uses a fused `append-and-fetch` primitive; MongoDB and Postgres
-perform append and fetch as separate client operations. `single-node-wal` is
-the default local developer profile: AgentDB writes to the RocksDB WAL and
-memtable without forcing a per-request media sync, MongoDB uses standalone
-acknowledged writes without `journal=true`, and Postgres uses
-`synchronous_commit=off`.
-
-The first matched `single-node-fsync` sanity run tells a different story:
-
-| Cell | Shape | AgentDB | MongoDB | Postgres | Result |
-|---|---|---:|---:|---:|---|
-| Mixed loop, Zipf-1.2, `single-node-fsync` | c=32, seed 43, 60s measured window | 256 ops/s | 884 ops/s | 2,182 ops/s | AgentDB is 0.29x MongoDB and 0.12x Postgres |
-
-After same-session append coalescing, a compact append-log fast path, shared
-fsync group-commit batching for Persist writes, and a zero same-session
-coalescing wait, the AgentDB `single-node-fsync` c=32 cell improved to 1,441
-ops/s with p95 47ms and p99 75ms on the same `li-dev` shape. That is a 5.6x
-AgentDB improvement over the first matched durable run. AgentDB now beats the
-MongoDB `single-node-fsync` sanity cell, but still trails the Postgres
-`single-node-fsync` sanity cell at c=32.
-
-A higher-concurrency c=256 tuning cell reached 2,355 ops/s for AgentDB versus
-2,127 ops/s for Postgres, but AgentDB's p95/p99 were worse. Treat that as
-evidence that AgentDB can batch enough work to match Postgres throughput, not
-as proof of a large fsync-mode advantage.
-
-That `single-node-fsync` result uses RocksDB sync writes with safe append group
-commit, MongoDB `journal=true&w=1`, and Postgres `synchronous_commit=on`. It is
-a single sanity cell, not a final comparison. Publication-quality numbers still
-need repeated durable runs, working-set-exceeds-cache profiles,
-tenant-aware noisy-neighbor cells, and multi-minute runs across more workload
-shapes.
-
-Use `WORKLOAD=append-only` to isolate append acknowledgement throughput without
-the tail-read/context serialization included in `append-fetch-hot`.
-Use `WORKLOAD=record-write-only`, `record-search-only`, `artifact-only`, or
-`fork-only` to isolate the non-append paths that contribute to
-`mixed-agent-loop` latency.
-
-Use `SESSION_SELECTION=uniform`, `SESSION_SELECTION=zipf`, or
-`SESSION_SELECTION=hotset-90-10` to control how workers choose sessions during
-the measured run. `ZIPF_EXPONENT` defaults to `1.2` for Zipfian selection. Use
-hundreds or thousands of sessions for skewed runs; the `smoke` profile is too
-small for meaningful skew sensitivity. See
-`docs/operations/AGENTDB_BENCH.md` for the current short skew-sensitivity
-control run and caveats.
-
-Use `DURABILITY_PROFILE=single-node-wal`, `single-node-fsync`, or
-`strict-fsync` to make durability explicit in wrapper scripts.
-`single-node-wal` is the default local setup and is optimized for developer
-tryout performance with RocksDB WAL safety. `single-node-fsync` enables local
-sync writes while preserving safe append group commit. `strict-fsync` disables
-append group commit to expose per-operation fsync cost and should be treated as
-a stress profile, not the default comparison.
-
-Use `APPEND_PATH_PROFILE_MS=5000` with the AgentDB wrapper scripts to emit
-server-side append-stage profiles into the run log. This is the right first
-step before tuning durable writes because it separates session lock wait,
-state-lock work, group-commit queue wait, and RocksDB write time.
-
-Use `scripts/agentdb-bench-repeat.sh` to run clean per-seed repeats and produce
-an aggregate summary:
+AgentDB native:
 
 ```bash
 BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
-  RUN_ID=agentdb-zipf-60s \
+  RUN_ID=agentdb-zipf-wal \
   PROFILE=default-agent-runtime \
   WORKLOAD=mixed-agent-loop \
   CONCURRENCY=32 \
@@ -118,53 +105,93 @@ BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
   DURATION=60s \
   SESSION_SELECTION=zipf \
   ZIPF_EXPONENT=1.2 \
+  DURABILITY_PROFILE=single-node-wal \
   REPEATS=3 \
   SEEDS=43,44,45 \
   NO_RAW_JSONL=1 \
   scripts/agentdb-bench-repeat.sh
 ```
 
-The repeat script creates one run directory per seed and writes
-`bench-out/summaries/<RUN_ID>/summary.md` plus `summary.json`. Point
-`BENCH_SCRIPT` at `scripts/agentdb-bench-mongodb.sh` or
-`scripts/agentdb-bench-postgres.sh` to repeat the same cell on those backends.
-The current `li-dev` 3x/60s Zipf c=32 cell is documented in
-`docs/operations/AGENTDB_BENCH.md`; it produced a 1.66x AgentDB/MongoDB ratio
-and a 19.84x AgentDB/Postgres ratio for that internal single-node cell.
-
-Run the normalized Postgres event-log baseline:
+MongoDB:
 
 ```bash
-PROFILE=smoke scripts/agentdb-bench-postgres.sh
+BENCH_SCRIPT=scripts/agentdb-bench-mongodb.sh \
+  RUN_ID=mongodb-zipf-wal \
+  PROFILE=default-agent-runtime \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=10s \
+  DURATION=60s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  DURABILITY_PROFILE=single-node-wal \
+  REPEATS=3 \
+  SEEDS=43,44,45 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
 ```
 
-The Postgres baseline uses `benchmarks/postgres/docker-compose.yml` and
-`benchmarks/postgres/event_log.sql`. It stores normalized session/event rows and
-artifact metadata references. It does not put large artifact bytes into a JSONB
-session row.
-
-Run the normalized MongoDB event-log baseline:
+Postgres:
 
 ```bash
-PROFILE=smoke scripts/agentdb-bench-mongodb.sh
+BENCH_SCRIPT=scripts/agentdb-bench-postgres.sh \
+  RUN_ID=postgres-zipf-wal \
+  PROFILE=default-agent-runtime \
+  WORKLOAD=mixed-agent-loop \
+  CONCURRENCY=32 \
+  WARMUP=10s \
+  DURATION=60s \
+  SESSION_SELECTION=zipf \
+  ZIPF_EXPONENT=1.2 \
+  DURABILITY_PROFILE=single-node-wal \
+  REPEATS=3 \
+  SEEDS=43,44,45 \
+  NO_RAW_JSONL=1 \
+  scripts/agentdb-bench-repeat.sh
 ```
 
-The MongoDB baseline uses `benchmarks/mongodb/docker-compose.yml` and the
-`mongodb-event-log` backend. It stores sessions, events, records, and artifacts
-in separate collections with tenant/session/sequence indexes. It intentionally
-does not use the naive single-session-document model for the default comparison.
+For the matched local fsync sanity check, change
+`DURABILITY_PROFILE=single-node-wal` to `DURABILITY_PROFILE=single-node-fsync`
+for all backends.
 
-Run AgentDB through its MongoDB-compatible listener:
+## Key Knobs
+
+| Knob | Common Values | Use |
+|---|---|---|
+| `PROFILE` | `smoke`, `default-agent-runtime` | Dataset size preset. Use `smoke` only for correctness checks. |
+| `WORKLOAD` | `mixed-agent-loop`, `append-only`, `append-fetch-hot`, `record-write-only`, `record-search-only`, `artifact-only`, `fork-only` | Choose the agent-runtime path to measure. |
+| `CONCURRENCY` | `32`, `1,4,16,32`, `256` | Client worker count. Use the same value across backends. |
+| `DURABILITY_PROFILE` | `single-node-wal`, `single-node-fsync`, `strict-fsync` | Controls durability semantics. Do not mix profiles in one comparison. |
+| `SESSION_SELECTION` | `uniform`, `zipf`, `hotset-90-10` | Controls session hotness. Use hundreds or thousands of sessions for skew. |
+| `ZIPF_EXPONENT` | `1.2` | Skew strength for `SESSION_SELECTION=zipf`. |
+| `ARTIFACT_MODE` | `reference`, `content-backend`, `mixed` | Controls whether artifact bytes are stored through the content engine. |
+| `NO_RAW_JSONL` | `1` | Avoids large per-operation logs in bigger runs. |
+| `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
+
+`strict-fsync` disables append group commit and is mostly a stress profile. It
+should not be the default comparison row.
+
+## Backend Shapes
+
+The default MongoDB and Postgres baselines are intentionally not strawman
+single-document designs:
+
+- MongoDB uses separate `sessions`, `events`, `records`, and `artifacts`
+  collections with tenant/session/sequence indexes.
+- Postgres uses normalized session/event/record/artifact tables.
+- Large artifact bytes are not stored inside MongoDB documents or Postgres JSONB
+  session rows for the default comparison.
+
+AgentDB's MongoDB-compatible listener is measured separately:
 
 ```bash
 PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
 ```
 
-This uses the `agentdb-mongodb-api` backend. It starts AgentDB with both the
-native HTTP server and MongoDB wire listener, prepares data through MongoDB
-driver calls, and runs workloads through AgentDB's MongoDB-compatible command
-subset. Treat this as an adapter-overhead profile for AgentDB, separate from
-both `agentdb-native-rocksdb` and real `mongodb-event-log`.
+Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
+the same thing as real MongoDB.
+
+## Manual Prepare And Run
 
 Prepare a dataset:
 
@@ -196,36 +223,31 @@ cargo run -p agentdb-bench -- run \
   --duration 30s
 ```
 
-For MongoDB directly:
+## Outputs
 
-```bash
-cargo run -p agentdb-bench -- prepare \
-  --backend mongodb-event-log \
-  --mongo-uri mongodb://127.0.0.1:27017 \
-  --mongo-db agentdb_bench \
-  --run-id smoke-mongo \
-  --out bench-out \
-  --profile smoke
+Each run writes files under `bench-out/runs/<run-id>/`:
 
-cargo run -p agentdb-bench -- run \
-  --backend mongodb-event-log \
-  --mongo-uri mongodb://127.0.0.1:27017 \
-  --mongo-db agentdb_bench \
-  --run-id smoke-mongo \
-  --out bench-out \
-  --workload mixed-agent-loop
-```
+- `dataset.json`: prepared tenant/agent/session IDs.
+- `host-manifest.json`: hardware and OS information.
+- `software-manifest.json`: toolchain and runtime versions.
+- `database-config.json`: storage/content engine configuration.
+- `raw.jsonl`: per-operation latency records, unless `NO_RAW_JSONL=1`.
+- `report-*.json`: machine-readable latency summaries.
+- `report.md`: human-readable aggregate and per-operation report.
 
-Outputs are written under `bench-out/runs/<run-id>/`:
+`scripts/agentdb-bench-repeat.sh` also writes aggregate summaries under
+`bench-out/summaries/<RUN_ID>/summary.md` and `summary.json`.
 
-- `dataset.json` records prepared tenant/agent/session IDs.
-- `host-manifest.json` records hardware and OS information.
-- `software-manifest.json` records toolchain and runtime versions.
-- `database-config.json` records storage/content engine configuration.
-- `raw.jsonl` records each measured operation by operation type, latency,
-  success/failure, and worker ID. Set `NO_RAW_JSONL=1` when using
-  `scripts/agentdb-bench-local.sh` if raw operation output is too expensive for
-  a large run.
-- `report-*.json` contains machine-readable latency summaries.
-- `report.md` contains a compact human-readable report with aggregate and
-  per-operation latency tables.
+## Publication Rules
+
+Before quoting numbers outside the repo:
+
+- Repeat runs with multiple seeds and report variance.
+- Use at least 60s measured windows; use longer windows for compaction and
+  checkpoint behavior.
+- Keep durability profiles matched across all backends.
+- Say when AgentDB's fused `append-and-fetch` API is part of the advantage.
+- Add working-set-exceeds-cache and tenant-aware noisy-neighbor cells for
+  broader claims.
+- Keep historical tuning data in `docs/operations/AGENTDB_BENCH.md`, not in
+  this README.
