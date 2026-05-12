@@ -210,11 +210,12 @@ Results are on `li-dev` under
 
 | Backend/profile | State size | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---:|---:|---|
-| AgentDB `single-node-wal` | 32 GB | 19,163 | 1.07ms | 5.22ms | 9.48ms | 1.00x | RocksDB LZ4 compression, bounded persisted hot-tail cache. |
-| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 0.81x MongoDB | Normalized event-log collections. |
-| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 3.18x Postgres | `record_search` dominates tail latency. |
+| AgentDB `single-node-wal` | 24 GB | 36,261 | 0.75ms | 1.71ms | 2.55ms | 1.00x | Compact binary tablet log, scoped global-index lookup, RocksDB LZ4 compression, bounded persisted hot-tail cache. |
+| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 1.52x MongoDB | Normalized event-log collections. |
+| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 6.01x Postgres | `record_search` dominates tail latency. |
 
-This cell forced two AgentDB fixes before it could complete:
+This cell forced several AgentDB fixes before it could complete and then beat
+MongoDB:
 
 - The persistent runtime no longer retains every `event_id` in the in-memory
   map; persisted lookups use the durable secondary index instead.
@@ -223,15 +224,18 @@ This cell forced two AgentDB fixes before it could complete:
 - RocksDB now defaults to LZ4 compression and a bounded open-file cache. This
   reduced the AgentDB state from a disk-filling run to 32 GB for the resized
   profile.
+- The tablet write log now uses a compact binary command encoding instead of
+  serializing `Vec<u8>` write batches as JSON arrays and immediately decoding
+  them on apply. That removed a large write-path CPU and log-size tax.
+- The in-memory global record index now has a `(tenant, namespace)` scope index,
+  so tag-only global record searches do not scan unrelated records.
 
-The result is still not good enough against MongoDB. A diagnostic append-path
-run showed storage writes averaging roughly 0.25-0.35ms, while global runtime
-state lock/update work and lock waits account for a comparable or larger share
-of append latency. A 100us same-session coalescing window did not help
-throughput (`18,871 ops/s`, p99 9.41ms), so the next optimization should split
-hot session/event state away from the global runtime mutex or introduce
-per-session hot-tail state that append/fetch paths can update without global
-contention.
+The post-fix result is the first working-set cell where AgentDB beats both
+MongoDB and Postgres. A low-overhead `perf` sample after the fix shows the
+remaining CPU spread across memory copies/allocation, JSON request/response
+serialization and deserialization, RocksDB scans/seeks, LZ4 compression, and
+ID parsing. The old dominant tablet-command JSON encode/decode and global-index
+full scan are no longer the top bottlenecks.
 
 ### Matched Durability Sanity Check
 

@@ -21,6 +21,9 @@ The current best summary is:
   `single-node-wal` profile.
 - For matched single-node media-sync durability, AgentDB has improved a lot and
   beats MongoDB at c=32, but Postgres remains a strong baseline.
+- For the larger working-set profile, AgentDB now beats both MongoDB and
+  Postgres after replacing JSON tablet-log encoding with a compact binary
+  command format and avoiding full global-index scans.
 - At very high concurrency, AgentDB can slightly exceed Postgres throughput in
   `single-node-fsync`, but with worse p95/p99 latency. That is not a large win.
 
@@ -76,7 +79,7 @@ settings, and observed disk usage before claiming the run truly exceeds cache.
 | Profile | Concurrency | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---:|---|
 | `single-node-wal` | 32 | 53.9k ops/s, p99 2.08ms | 26.0k ops/s, p99 2.86ms | 13.1k ops/s, p99 35.8ms | Best local developer story: AgentDB is 2.07x MongoDB and 4.11x Postgres. |
-| `working-set-exceeds-cache`, `single-node-wal` | 32 | 19.2k ops/s, p99 9.48ms | 23.8k ops/s, p99 2.22ms | 6.0k ops/s, p99 114ms | AgentDB is 3.18x Postgres but 0.81x MongoDB; runtime state/cache work is the next bottleneck. |
+| `working-set-exceeds-cache`, `single-node-wal`, 300s | 32 | 36.3k ops/s, p99 2.55ms | 23.8k ops/s, p99 2.22ms | 6.0k ops/s, p99 114ms | AgentDB is 1.52x MongoDB and 6.01x Postgres on the larger cache-pressure cell. |
 | `single-node-fsync` | 32 | 1,441 ops/s, p99 75ms | 884 ops/s, p99 65ms | 2,182 ops/s, p99 238ms | AgentDB beats MongoDB throughput, but trails Postgres throughput. |
 | `single-node-fsync` tuning cell | 256 | 2,355 ops/s, p99 615ms | not rerun | 2,127 ops/s, p99 386ms | AgentDB slightly beats Postgres throughput, but has worse tail latency. |
 
@@ -88,8 +91,8 @@ Use this interpretation:
   fsync?", the honest answer is mixed. It beats MongoDB in the current c=32 cell,
   but Postgres is still highly competitive.
 - If the question is "Does the local WAL advantage survive cache pressure?",
-  the answer is also mixed. AgentDB still beats Postgres, but MongoDB currently
-  wins the working-set WAL cell with tighter tail latency.
+  the current answer is yes for throughput. MongoDB still has slightly tighter
+  p99 in this single run, so repeat before using the row externally.
 - If the question is "Why not a huge Postgres win yet?", the bottleneck is not
   query flexibility or read caching. It is durable WAL/fsync batching. A larger
   margin likely requires a more specialized durable append-log path than the
