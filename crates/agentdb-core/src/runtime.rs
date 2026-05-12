@@ -4888,22 +4888,28 @@ impl Runtime {
             return;
         }
 
-        let events = prepared
+        let event_refs = prepared
             .iter()
-            .map(|(prepared, _)| prepared.envelope.clone())
+            .map(|(prepared, _)| &prepared.envelope)
             .collect::<Vec<_>>();
-        coalesce_sample.events = events.len();
+        coalesce_sample.events = event_refs.len();
         let session_checkpoint = persist_session_checkpoint
             .then(|| final_session_snapshot.as_ref())
             .flatten();
         if let Some(p) = &self.persist {
             let durable_write_started = coalesce_profile.map(|_| Instant::now());
             let durable_result = if env_flag_disabled_runtime("AGENTDB_APPEND_LOG_FAST_PATH") {
+                let events = event_refs
+                    .iter()
+                    .map(|event| (*event).clone())
+                    .collect::<Vec<_>>();
                 p.append_many_batch_async(&events, session_checkpoint).await
             } else {
-                p.append_many_log_async(&events, session_checkpoint).await
+                p.append_many_log_refs_async(&event_refs, session_checkpoint)
+                    .await
             };
             if let Err(err) = durable_result {
+                drop(event_refs);
                 let err = internal(err);
                 for (_, done) in prepared {
                     let _ = done.send(Err(err.clone()));
@@ -4914,6 +4920,7 @@ impl Runtime {
                 coalesce_sample.durable_write_nanos = started.elapsed().as_nanos();
             }
         }
+        drop(event_refs);
 
         let persist_enabled = self.persist.is_some();
         let update_started = coalesce_profile.map(|_| Instant::now());
