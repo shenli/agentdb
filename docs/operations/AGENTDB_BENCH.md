@@ -195,6 +195,44 @@ This is the best current local setup result and should be the first number used
 for developer out-of-box performance discussions. It is still a single seed and
 cache-warm cell; repeat it before quoting externally.
 
+### Working-Set Cache-Pressure Check
+
+The first `working-set-exceeds-cache` cell uses the same mixed-agent-loop,
+Zipf-1.2, c=32 shape, but prepares a larger dataset: 25 tenants x 4 agents x
+40 sessions, 500 prepared events per session, 100 records per session, and 4
+KiB event payloads. The report estimates 8.2 GB of event payload before
+database/index overhead and about 42.0 GB of external artifact references. This
+cell is intended to expose storage footprint, cache pressure, and longer
+compaction/checkpoint behavior that the cache-warm 1000-session cell hides.
+
+Results are on `li-dev` under
+`/home/lishen/work/agentdb-bench-runs/working-set-cache`.
+
+| Backend/profile | State size | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| AgentDB `single-node-wal` | 32 GB | 19,163 | 1.07ms | 5.22ms | 9.48ms | 1.00x | RocksDB LZ4 compression, bounded persisted hot-tail cache. |
+| MongoDB `single-node-wal` | 11 GB | 23,798 | 1.67ms | 2.09ms | 2.22ms | 0.81x MongoDB | Normalized event-log collections. |
+| Postgres `single-node-wal` | not captured | 6,028 | 0.80ms | 30.32ms | 114.35ms | 3.18x Postgres | `record_search` dominates tail latency. |
+
+This cell forced two AgentDB fixes before it could complete:
+
+- The persistent runtime no longer retains every `event_id` in the in-memory
+  map; persisted lookups use the durable secondary index instead.
+- `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` bounds the per-session
+  in-memory hot tail. The AgentDB wrappers default it to 64 for this profile.
+- RocksDB now defaults to LZ4 compression and a bounded open-file cache. This
+  reduced the AgentDB state from a disk-filling run to 32 GB for the resized
+  profile.
+
+The result is still not good enough against MongoDB. A diagnostic append-path
+run showed storage writes averaging roughly 0.25-0.35ms, while global runtime
+state lock/update work and lock waits account for a comparable or larger share
+of append latency. A 100us same-session coalescing window did not help
+throughput (`18,871 ops/s`, p99 9.41ms), so the next optimization should split
+hot session/event state away from the global runtime mutex or introduce
+per-session hot-tail state that append/fetch paths can update without global
+contention.
+
 ### Matched Durability Sanity Check
 
 The first matched-durability sanity cell used the same c=32 Zipf-1.2 60s shape
