@@ -198,6 +198,7 @@ for all backends.
 | `MIN_FREE_GB` | `5`, `80` | Minimum free disk guard used by wrapper scripts. Defaults to `80` for `working-set-exceeds-cache`. |
 | `AGENTDB_BENCH_NOFILE` | `65535` | File descriptor limit requested by AgentDB wrappers for `working-set-exceeds-cache`. |
 | `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` | `64`, `2048` | AgentDB persisted hot-tail event cache per session. AgentDB wrappers default this to `64` for `working-set-exceeds-cache`. |
+| `AGENTDB_ROCKSDB_COMPRESSION` | `lz4`, `none`, `snappy`, `lz4hc` | RocksDB compression used by AgentDB. Defaults to `lz4` to reduce working-set storage and compaction IO. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
 
 `strict-fsync` disables append group commit and is mostly a stress profile. It

@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rocksdb::{
-    checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+    checkpoint::Checkpoint, DBCompressionType, Direction, IteratorMode, Options, WriteBatch,
+    WriteOptions, DB,
 };
 
 use crate::error::{Error, Result};
@@ -54,6 +55,21 @@ fn default_rocks_options() -> Options {
     opts.set_level_zero_slowdown_writes_trigger(24);
     opts.set_level_zero_stop_writes_trigger(36);
     opts.set_bytes_per_sync(1024 * 1024);
+    let compression = match std::env::var("AGENTDB_ROCKSDB_COMPRESSION")
+        .unwrap_or_else(|_| "lz4".to_string())
+        .as_str()
+    {
+        "none" => DBCompressionType::None,
+        "lz4" => DBCompressionType::Lz4,
+        "lz4hc" => DBCompressionType::Lz4hc,
+        "snappy" => DBCompressionType::Snappy,
+        other => {
+            eprintln!("unknown AGENTDB_ROCKSDB_COMPRESSION={other}; falling back to lz4");
+            DBCompressionType::Lz4
+        }
+    };
+    opts.set_compression_type(compression);
+    opts.set_bottommost_compression_type(compression);
     let max_open_files = std::env::var("AGENTDB_ROCKSDB_MAX_OPEN_FILES")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
