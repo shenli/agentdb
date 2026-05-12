@@ -175,7 +175,7 @@ struct AdaptiveWriteBatcher {
     tx: mpsc::Sender<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
-    wait_us: u64,
+    direct_fast_path: bool,
 }
 
 struct AdaptiveWriteRequest {
@@ -313,11 +313,10 @@ fn adaptive_write_profile() -> Option<&'static AdaptiveWriteProfile> {
 
 impl AdaptiveWriteBatcher {
     fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
-        if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT")
-            || env_zero("AGENTDB_APPEND_GROUP_COMMIT_US")
-        {
+        if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT") {
             return None;
         }
+        let sync_writes = env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES");
         let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -326,18 +325,21 @@ impl AdaptiveWriteBatcher {
         let wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| {
-                if env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES") {
-                    1_000
-                } else {
-                    0
-                }
-            });
-        Some(Arc::new(Self::new(kv, max_ops, wait_us)))
+            .unwrap_or_else(|| if sync_writes { 1_000 } else { 0 });
+        Some(Arc::new(Self::new(
+            kv,
+            max_ops,
+            wait_us,
+            !sync_writes && wait_us == 0,
+        )))
     }
 
-    fn new(kv: Arc<dyn KvStore + Send + Sync>, max_ops: usize, wait_us: u64) -> Self {
+    fn new(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        max_ops: usize,
+        wait_us: u64,
+        direct_fast_path: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<AdaptiveWriteRequest>();
         let queued = Arc::new(AtomicU64::new(0));
         let writer_busy = Arc::new(AtomicU64::new(0));
@@ -354,12 +356,12 @@ impl AdaptiveWriteBatcher {
             tx,
             queued,
             writer_busy,
-            wait_us,
+            direct_fast_path,
         }
     }
 
     async fn submit(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        if self.wait_us == 0
+        if self.direct_fast_path
             && self.queued.load(Ordering::Relaxed) == 0
             && self
                 .writer_busy
@@ -395,7 +397,7 @@ impl AdaptiveWriteBatcher {
     }
 
     fn submit_blocking(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        if self.wait_us == 0
+        if self.direct_fast_path
             && self.queued.load(Ordering::Relaxed) == 0
             && self
                 .writer_busy
@@ -447,13 +449,6 @@ fn env_flag_enabled(name: &str) -> bool {
             matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
         })
         .unwrap_or(false)
-}
-
-fn env_zero(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        == Some(0)
 }
 
 fn adaptive_write_loop(
