@@ -181,7 +181,31 @@ struct AdaptiveWriteBatcher {
 struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
     enqueued_at: Instant,
-    done: tokio::sync::oneshot::Sender<KvResult<()>>,
+    done: AdaptiveWriteCompletion,
+}
+
+enum AdaptiveWriteCompletion {
+    Async(tokio::sync::oneshot::Sender<KvResult<()>>),
+    Blocking(mpsc::Sender<KvResult<()>>),
+}
+
+impl AdaptiveWriteCompletion {
+    fn send(self, result: &KvResult<()>) {
+        let send_result = match result {
+            Ok(()) => Ok(()),
+            Err(err) => Err(StorageError::Other(format!(
+                "adaptive write batch failed: {err}"
+            ))),
+        };
+        match self {
+            AdaptiveWriteCompletion::Async(done) => {
+                let _ = done.send(send_result);
+            }
+            AdaptiveWriteCompletion::Blocking(done) => {
+                let _ = done.send(send_result);
+            }
+        }
+    }
 }
 
 struct AdaptiveWriteProfile {
@@ -359,7 +383,7 @@ impl AdaptiveWriteBatcher {
             .send(AdaptiveWriteRequest {
                 ops,
                 enqueued_at: Instant::now(),
-                done,
+                done: AdaptiveWriteCompletion::Async(done),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -367,6 +391,42 @@ impl AdaptiveWriteBatcher {
                 StorageError::Other("adaptive write worker stopped".into())
             })?;
         rx.await
+            .map_err(|_| StorageError::Other("adaptive write worker dropped result".into()))?
+    }
+
+    fn submit_blocking(&self, ops: Vec<WriteOp>) -> KvResult<()> {
+        if self.wait_us == 0
+            && self.queued.load(Ordering::Relaxed) == 0
+            && self
+                .writer_busy
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let op_count = ops.len();
+            let write_started = Instant::now();
+            let result = self.kv.write_batch(ops);
+            let write_nanos = write_started.elapsed().as_nanos();
+            self.writer_busy.store(0, Ordering::Release);
+            if let Some(profile) = adaptive_write_profile() {
+                profile.record_direct(op_count, write_nanos);
+            }
+            return result;
+        }
+
+        let (done, rx) = mpsc::channel();
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(AdaptiveWriteRequest {
+                ops,
+                enqueued_at: Instant::now(),
+                done: AdaptiveWriteCompletion::Blocking(done),
+            })
+            .map_err(|request| {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                drop(request);
+                StorageError::Other("adaptive write worker stopped".into())
+            })?;
+        rx.recv()
             .map_err(|_| StorageError::Other("adaptive write worker dropped result".into()))?
     }
 }
@@ -451,13 +511,7 @@ fn adaptive_write_loop(
             profile.record_grouped(request_count, op_count, queue_nanos, write_nanos);
         }
         for done in completions {
-            let send_result = match &result {
-                Ok(()) => Ok(()),
-                Err(err) => Err(StorageError::Other(format!(
-                    "adaptive write batch failed: {err}"
-                ))),
-            };
-            let _ = done.send(send_result);
+            done.send(&result);
         }
     }
 }
@@ -605,7 +659,7 @@ impl Persist {
                 value: t.tenant_id.as_str().as_bytes().to_vec(),
             });
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_tenant(&self, t: &Tenant) -> KvResult<()> {
@@ -618,7 +672,7 @@ impl Persist {
                 key: tenant_alias_key(&t.external_key).into_bytes(),
             });
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_agent(&self, a: &Agent) -> KvResult<()> {
@@ -635,7 +689,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_agent(&self, a: &Agent) -> KvResult<()> {
@@ -650,7 +704,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     /// Atomically write an artifact's primary record AND the
@@ -692,7 +746,7 @@ impl Persist {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
@@ -709,11 +763,11 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_session_segment(&self, segment: &SessionSegment) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Put {
+        self.write_ops(vec![WriteOp::Put {
             key: session_segment_key(
                 segment.tenant_id.as_str(),
                 segment.session_id.as_str(),
@@ -736,7 +790,7 @@ impl Persist {
                 });
             }
         }
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_session_events(&self, tenant_id: &str, session_id: &str) -> KvResult<usize> {
@@ -769,7 +823,7 @@ impl Persist {
             ops.push(WriteOp::Delete { key: k });
         }
         if !ops.is_empty() {
-            self.kv.write_batch(ops)?;
+            self.write_ops(ops)?;
         }
         Ok(count)
     }
@@ -836,7 +890,7 @@ impl Persist {
             }
         }
         if !ops.is_empty() {
-            self.kv.write_batch(ops)?;
+            self.write_ops(ops)?;
         }
         Ok(count)
     }
@@ -1424,7 +1478,11 @@ impl Persist {
     }
 
     pub(crate) fn write_ops(&self, ops: Vec<WriteOp>) -> KvResult<()> {
-        self.kv.write_batch(ops)
+        if let Some(batcher) = &self.adaptive_write_batcher {
+            batcher.submit_blocking(ops)
+        } else {
+            self.kv.write_batch(ops)
+        }
     }
 
     pub(crate) async fn write_ops_async(&self, ops: Vec<WriteOp>) -> KvResult<()> {
@@ -1449,7 +1507,7 @@ impl Persist {
                 .into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     /// Atomic write of a V2.3 skill record plus its
@@ -1467,7 +1525,7 @@ impl Persist {
                 value: skill.skill_id.as_str().as_bytes().to_vec(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_skill(&self, skill: &Skill) -> KvResult<()> {
@@ -1481,7 +1539,7 @@ impl Persist {
                     .into_bytes(),
             },
         ];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
@@ -1494,11 +1552,11 @@ impl Persist {
             .into_bytes(),
             value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
         }];
-        self.kv.write_batch(ops)
+        self.write_ops(ops)
     }
 
     pub fn delete_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Delete {
+        self.write_ops(vec![WriteOp::Delete {
             key: agent_skill_binding_key(
                 binding.tenant_id.as_str(),
                 binding.agent_id.as_str(),
@@ -1509,14 +1567,14 @@ impl Persist {
     }
 
     pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Put {
+        self.write_ops(vec![WriteOp::Put {
             key: format!("record/idempotency/{full_key}").into_bytes(),
             value: serde_json::to_vec(rec).expect("idempotency record serializes"),
         }])
     }
 
     pub fn delete_idempotency(&self, full_key: &str) -> KvResult<()> {
-        self.kv.write_batch(vec![WriteOp::Delete {
+        self.write_ops(vec![WriteOp::Delete {
             key: format!("record/idempotency/{full_key}").into_bytes(),
         }])
     }
