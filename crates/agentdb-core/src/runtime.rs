@@ -4918,80 +4918,27 @@ impl Runtime {
         let persist_enabled = self.persist.is_some();
         let update_started = coalesce_profile.map(|_| Instant::now());
         let mut s = self.state.lock().await;
-        let max_fetch_recent = prepared
-            .iter()
-            .filter_map(|(prepared_append, _)| prepared_append.fetch_recent)
-            .max();
-        let mut batch_recent_tail = max_fetch_recent.map(|max_recent| {
-            let first_seq = prepared
-                .first()
-                .map(|(prepared_append, _)| prepared_append.appended.seq)
-                .unwrap_or(0);
-            if max_recent == 0 || first_seq == 0 {
-                Vec::new()
-            } else {
-                let max_recent_count = u64::try_from(max_recent).unwrap_or(u64::MAX);
-                let from_seq = first_seq.saturating_sub(max_recent_count.saturating_sub(1));
-                let lo = (session_id.as_str().to_string(), from_seq);
-                let hi = (session_id.as_str().to_string(), first_seq.saturating_sub(1));
-                s.events
-                    .range(lo..=hi)
-                    .map(|(_, event)| event.clone())
-                    .collect::<Vec<_>>()
-            }
-        });
-        let mut completions = Vec::with_capacity(prepared.len());
         if let Some(session_snapshot) = final_session_snapshot {
             s.sessions
                 .insert(session_id.as_str().to_string(), session_snapshot);
         }
         for (prepared_append, done) in prepared {
-            let envelope = prepared_append.envelope.clone();
+            let envelope = prepared_append.envelope;
             if !persist_enabled {
                 s.event_by_id.insert(
                     envelope.event_id.as_str().to_string(),
                     (envelope.session_id.as_str().to_string(), envelope.seq),
                 );
             }
-            insert_runtime_event_cache(
-                &mut s,
-                persist_enabled,
-                session_id.as_str(),
-                prepared_append.envelope,
-            );
+            insert_runtime_event_cache(&mut s, persist_enabled, session_id.as_str(), envelope);
 
-            let (recent, recent_complete) = if let (Some(last), Some(tail)) =
-                (prepared_append.fetch_recent, batch_recent_tail.as_mut())
-            {
-                tail.push(envelope);
-                if let Some(max_recent) = max_fetch_recent {
-                    if tail.len() > max_recent {
-                        let drop_n = tail.len() - max_recent;
-                        tail.drain(0..drop_n);
-                    }
-                }
-                let recent = if tail.len() > last {
-                    tail[tail.len() - last..].to_vec()
-                } else {
-                    tail.clone()
-                };
-                let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
-                let from_seq = prepared_append
-                    .appended
-                    .seq
-                    .saturating_add(1)
-                    .saturating_sub(last_seq_count);
-                let expected = usize::try_from(
-                    prepared_append
-                        .appended
-                        .seq
-                        .saturating_add(1)
-                        .saturating_sub(from_seq),
+            let (recent, recent_complete) = if let Some(last) = prepared_append.fetch_recent {
+                recent_for_appended_event_in_state(
+                    &s,
+                    session_id.as_str(),
+                    prepared_append.appended.seq,
+                    last,
                 )
-                .unwrap_or(usize::MAX)
-                .min(last);
-                let complete = recent.len() >= expected;
-                (recent, complete)
             } else {
                 (Vec::new(), false)
             };
@@ -5001,23 +4948,16 @@ impl Runtime {
                 &prepared_append.tenant_id,
                 &prepared_append.session_after_append,
             );
-            completions.push((
-                done,
-                AppendCommitResponse {
-                    appended: prepared_append.appended,
-                    recent,
-                    recent_complete,
-                    backpressure,
-                    backpressure_complete: true,
-                },
-            ));
+            let _ = done.send(Ok(AppendCommitResponse {
+                appended: prepared_append.appended,
+                recent,
+                recent_complete,
+                backpressure,
+                backpressure_complete: true,
+            }));
         }
         if let Some(started) = update_started {
             coalesce_sample.update_state_nanos = started.elapsed().as_nanos();
-        }
-        drop(s);
-        for (done, response) in completions {
-            let _ = done.send(Ok(response));
         }
         if let (Some(profile), Some(started)) = (coalesce_profile, total_started) {
             coalesce_sample.total_nanos = started.elapsed().as_nanos();
@@ -6808,6 +6748,35 @@ fn backpressure_for_tenant_session_in_state(
     }
 
     report
+}
+
+fn recent_for_appended_event_in_state(
+    s: &State,
+    session_id: &str,
+    appended_seq: u64,
+    last: usize,
+) -> (Vec<EventEnvelope>, bool) {
+    let last_seq_count = u64::try_from(last).unwrap_or(u64::MAX);
+    let from_seq = appended_seq
+        .saturating_add(1)
+        .saturating_sub(last_seq_count);
+    let lo = (session_id.to_string(), from_seq);
+    let hi = (session_id.to_string(), appended_seq);
+    let mut recent = s
+        .events
+        .range(lo..=hi)
+        .take(last)
+        .map(|(_, event)| event.clone())
+        .collect::<Vec<_>>();
+    if recent.len() > last {
+        let drop_n = recent.len() - last;
+        recent.drain(0..drop_n);
+    }
+    let expected = usize::try_from(appended_seq.saturating_add(1).saturating_sub(from_seq))
+        .unwrap_or(usize::MAX)
+        .min(last);
+    let complete = recent.len() >= expected;
+    (recent, complete)
 }
 
 fn trim_recent_to_budget(recent: &mut Vec<EventEnvelope>, max_bytes: usize) {
