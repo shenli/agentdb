@@ -1335,6 +1335,7 @@ async fn run_cell(
     let deadline = Instant::now() + duration;
     let fixtures = Arc::new(flatten_fixtures(manifest)?);
     let config = Arc::new(manifest.config.clone());
+    let run_invocation_nonce = now_ms();
     let mut handles = Vec::new();
 
     for worker_id in 0..concurrency {
@@ -1348,6 +1349,7 @@ async fn run_cell(
         let mongo_db = mongo_db.clone();
         let agentdb_mongo_client = agentdb_mongo_client.clone();
         handles.push(tokio::spawn(async move {
+            let fork_alias_prefix = format!("{run_invocation_nonce}-{worker_id}");
             let mut rng = StdRng::seed_from_u64(seed + worker_id as u64);
             let fixture_selector =
                 FixtureSelector::new(args.session_selection, args.zipf_exponent, fixtures.len())?;
@@ -1362,6 +1364,7 @@ async fn run_cell(
                     &config,
                     &fixtures,
                     &fixture_selector,
+                    &fork_alias_prefix,
                     &mut rng,
                     operation,
                     mongo_db.as_deref(),
@@ -1433,6 +1436,7 @@ async fn run_one_operation(
     config: &DatasetConfig,
     fixtures: &[FlatSession],
     fixture_selector: &FixtureSelector,
+    fork_alias_prefix: &str,
     rng: &mut StdRng,
     operation: Operation,
     mongo_db: Option<&MongoDatabase>,
@@ -1444,17 +1448,43 @@ async fn run_one_operation(
     let fixture = fixture_selector.choose(fixtures, rng);
     if args.backend == "postgres-event-log" {
         let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
-        return run_one_postgres_operation(pool, args, config, fixture, rng, operation).await;
+        return run_one_postgres_operation(
+            pool,
+            args,
+            config,
+            fixture,
+            fork_alias_prefix,
+            rng,
+            operation,
+        )
+        .await;
     }
     if args.backend == "mongodb-event-log" {
         let db = mongo_db.ok_or_else(|| anyhow!("mongodb backend missing database"))?;
-        return run_one_mongodb_operation(db, args, config, fixture, rng, operation).await;
+        return run_one_mongodb_operation(
+            db,
+            args,
+            config,
+            fixture,
+            fork_alias_prefix,
+            rng,
+            operation,
+        )
+        .await;
     }
     if args.backend == "agentdb-mongodb-api" {
         let mongo = agentdb_mongo_client
             .ok_or_else(|| anyhow!("agentdb mongodb-api backend missing client"))?;
-        return run_one_agentdb_mongodb_operation(mongo, args, config, fixture, rng, operation)
-            .await;
+        return run_one_agentdb_mongodb_operation(
+            mongo,
+            args,
+            config,
+            fixture,
+            fork_alias_prefix,
+            rng,
+            operation,
+        )
+        .await;
     }
     match operation {
         Operation::AppendOnly => append_event(
@@ -1524,7 +1554,10 @@ async fn run_one_operation(
         .await
         .map(|_| ()),
         Operation::Fork => {
-            let alias = format!("bench-runtime-fork-{}", rng.gen::<u64>());
+            let alias = format!(
+                "bench-runtime-fork-{fork_alias_prefix}-{}",
+                rng.gen::<u64>()
+            );
             post_json(
                 client,
                 &args.base_url,
@@ -2018,6 +2051,7 @@ async fn run_one_postgres_operation(
     args: &RunArgs,
     config: &DatasetConfig,
     fixture: &FlatSession,
+    fork_alias_prefix: &str,
     rng: &mut StdRng,
     operation: Operation,
 ) -> Result<()> {
@@ -2088,7 +2122,11 @@ async fn run_one_postgres_operation(
             Ok(())
         }
         Operation::Fork => {
-            let child_id = format!("{}-runtime-fork-{}", fixture.session_id, rng.gen::<u64>());
+            let child_id = format!(
+                "{}-runtime-fork-{fork_alias_prefix}-{}",
+                fixture.session_id,
+                rng.gen::<u64>()
+            );
             pg_create_session(
                 pool,
                 &args.run_id,
@@ -2947,6 +2985,7 @@ async fn run_one_mongodb_operation(
     args: &RunArgs,
     config: &DatasetConfig,
     fixture: &FlatSession,
+    fork_alias_prefix: &str,
     rng: &mut StdRng,
     operation: Operation,
 ) -> Result<()> {
@@ -3019,7 +3058,11 @@ async fn run_one_mongodb_operation(
             Ok(())
         }
         Operation::Fork => {
-            let child_id = format!("{}-runtime-fork-{}", fixture.session_id, rng.gen::<u64>());
+            let child_id = format!(
+                "{}-runtime-fork-{fork_alias_prefix}-{}",
+                fixture.session_id,
+                rng.gen::<u64>()
+            );
             mongo_create_session(
                 db,
                 &args.run_id,
@@ -3187,6 +3230,7 @@ async fn run_one_agentdb_mongodb_operation(
     args: &RunArgs,
     config: &DatasetConfig,
     fixture: &FlatSession,
+    fork_alias_prefix: &str,
     rng: &mut StdRng,
     operation: Operation,
 ) -> Result<()> {
@@ -3258,7 +3302,11 @@ async fn run_one_agentdb_mongodb_operation(
             Ok(())
         }
         Operation::Fork => {
-            let alias = format!("{}-runtime-fork-{}", fixture.session_id, rng.gen::<u64>());
+            let alias = format!(
+                "{}-runtime-fork-{fork_alias_prefix}-{}",
+                fixture.session_id,
+                rng.gen::<u64>()
+            );
             agentdb_mongo_fork_session(
                 &db,
                 &fixture.session_id,
