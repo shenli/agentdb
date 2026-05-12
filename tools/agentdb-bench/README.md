@@ -67,8 +67,8 @@ The workload is intentionally agent-runtime shaped:
 
 For cache-pressure validation, use `PROFILE=working-set-exceeds-cache` instead
 of the latest-comparison shape. That preset prepares a much larger logical
-history: 4,000 sessions, 4 million prepared events, 400,000 prepared records,
-and about 32 GiB of event payload before database/index overhead. The generated
+history: 4,000 sessions, 2 million prepared events, 400,000 prepared records,
+and about 8 GiB of event payload before database/index overhead. The generated
 `report.md` prints total sessions, total events, total records, and estimated
 event payload bytes. Compare that estimate with host RAM, database cache
 settings, and observed disk usage before claiming the run truly exceeds cache.
@@ -249,9 +249,9 @@ BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
 
 Run the same cell with `scripts/agentdb-bench-mongodb.sh` and
 `scripts/agentdb-bench-postgres.sh` before drawing a comparison. If the prepared
-dataset still fits in RAM and database cache on the test host, increase
-`TENANTS`, `SESSIONS_PER_AGENT`, `EVENTS_PER_SESSION`, or `PAYLOAD_BYTES`
-explicitly and record those overrides in the report.
+dataset plus database/index overhead still fits in RAM and database cache on
+the test host, increase `TENANTS`, `SESSIONS_PER_AGENT`, `EVENTS_PER_SESSION`,
+or `PAYLOAD_BYTES` explicitly and record those overrides in the report.
 
 ## Manual Prepare And Run
 
