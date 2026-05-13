@@ -120,21 +120,9 @@ Current long-run result on this benchmark configuration:
 | `append-only` | Ordered event appends without tail reads | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms |
 | `append-fetch-hot` | Fused append plus hot-tail read, the common agent step path | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms |
 
-Speedup versus each baseline:
+Throughput speedup versus each baseline:
 
-```text
-mixed-agent-loop
-  vs MongoDB   | ###             1.59x
-  vs Postgres  | ##############  7.13x
-
-append-only
-  vs MongoDB   | ########        4.03x
-  vs Postgres  | ###########     5.58x
-
-append-fetch-hot
-  vs MongoDB   | ####            2.04x
-  vs Postgres  | ###             1.62x
-```
+![AgentDB benchmark speedup chart](docs/assets/agentdb-benchmark-speedup.png)
 
 How to read this:
 
