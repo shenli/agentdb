@@ -4747,10 +4747,13 @@ impl Runtime {
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
     ) -> bool {
+        let supported_response_shape = matches!(
+            (fetch_recent, context_max_bytes),
+            (None, None) | (Some(_), Some(_))
+        );
         self.persist.is_some()
             && resolved_policy.is_none()
-            && fetch_recent.is_some()
-            && context_max_bytes.is_some()
+            && supported_response_shape
             && req.idempotency_key.is_none()
             && req.artifact_refs.is_empty()
             && req.source_refs.is_empty()
