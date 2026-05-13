@@ -10,11 +10,11 @@ and durable runtime state.
 cargo run -p agentdb-server -- dev
 
 # 2. Run from the repo checkout (another terminal)
-python examples/agents/python/quickstart.py
+python3 examples/agents/python/quickstart.py
 
 # Optional: install the SDK if you want the package in your env
 pip install -e clients/python
-python examples/agents/python/quickstart.py
+python3 examples/agents/python/quickstart.py
 ```
 
 You should see three turns of output, each showing the rolling working memory
@@ -24,7 +24,7 @@ grow by one event, then a fork that inherits the parent's events at fork time.
 
 ```bash
 cargo run -p agentdb-server -- dev
-python examples/agents/python/openai_agents_quickstart.py
+python3 examples/agents/python/openai_agents_quickstart.py
 ```
 
 The default run does not require an OpenAI API key; it exercises the OpenAI
@@ -34,18 +34,18 @@ session items. To run a live Agents SDK call:
 ```bash
 pip install openai-agents
 OPENAI_API_KEY=... AGENTDB_OPENAI_LIVE=1 \
-  python examples/agents/python/openai_agents_quickstart.py
+  python3 examples/agents/python/openai_agents_quickstart.py
 ```
 
 ## Session-first runtime demo
 
 ```bash
 cargo run -p agentdb-server -- serve --dev
-python examples/agents/python/session_first_demo.py
+python3 examples/agents/python/session_first_demo.py
 
 # Optional: install the SDK into your environment instead
 pip install -e clients/python
-python examples/agents/python/session_first_demo.py
+python3 examples/agents/python/session_first_demo.py
 ```
 
 This demo treats AgentDB as the runtime database for an agent harness. It
@@ -57,7 +57,7 @@ ordered session timeline.
 
 ```bash
 cargo run -p agentdb-server -- serve --dev
-python examples/agents/python/session_tiering_demo.py
+python3 examples/agents/python/session_tiering_demo.py
 ```
 
 This demo shows the first tiered-storage slice for developers:
@@ -73,7 +73,7 @@ This demo shows the first tiered-storage slice for developers:
 
 ```bash
 cargo run -p agentdb-server -- serve --config config/agentdb.toml
-python examples/agents/python/ticket_agent_tiered_demo.py
+python3 examples/agents/python/ticket_agent_tiered_demo.py
 ```
 
 This is the best end-to-end demo app for a SlateDB + object-store deployment:
@@ -132,10 +132,10 @@ The smoke script runs:
 
 ```bash
 # Talk to a non-local server
-AGENTDB_URL=http://prod.example.com:7878 python quickstart.py
+AGENTDB_URL=http://prod.example.com:7878 python3 quickstart.py
 
 # Use a different tenant (dev mode only — auth-mode derives it)
-AGENTDB_TENANT=t-myapp python quickstart.py
+AGENTDB_TENANT=t-myapp python3 quickstart.py
 ```
 
 ## Next steps
