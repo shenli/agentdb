@@ -13,6 +13,15 @@ The benchmark is meant for engineering decisions. Treat the numbers below as
 internal single-node, cache-warm, localhost microbenchmarks, not external
 product claims.
 
+## Repository Layout
+
+- `tools/agentdb-bench` contains the Rust benchmark CLI that prepares datasets,
+  runs workloads, and writes reports.
+- `scripts/agentdb-bench-*.sh` are wrapper scripts for common local runs.
+- `benchmarks/` contains baseline infrastructure and fixtures, not a separate
+  runner. For example, it holds Docker Compose files for MongoDB/Postgres and
+  SQL schema used by the baseline backends.
+
 ## Current Read
 
 The current best summary is:
