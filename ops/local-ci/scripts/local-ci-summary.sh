@@ -7,7 +7,7 @@ QUIET=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/local-ci-summary.sh [OPTIONS]
+Usage: ops/local-ci/scripts/local-ci-summary.sh [OPTIONS]
 
 Builds and prints a local CI summary across recent runs.
 

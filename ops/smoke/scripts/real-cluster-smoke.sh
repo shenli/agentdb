@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 if [[ -z "${AGENTDB_META_URL:-}" ]]; then
   echo "AGENTDB_META_URL is required, for example postgres://agentdb:agentdb@127.0.0.1:5432/agentdb_smoke" >&2

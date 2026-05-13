@@ -17,7 +17,7 @@ product claims.
 
 - `tools/agentdb-bench` contains the Rust benchmark CLI that prepares datasets,
   runs workloads, and writes reports.
-- `scripts/agentdb-bench-*.sh` are wrapper scripts for common local runs.
+- `tools/agentdb-bench/scripts/agentdb-bench-*.sh` are wrapper scripts for common local runs.
 - `tools/agentdb-bench/baselines/` contains baseline infrastructure and
   fixtures, not a separate runner. For example, it holds Docker Compose files
   for MongoDB/Postgres and SQL schema used by the baseline backends.
@@ -154,14 +154,14 @@ Run the full local AgentDB RocksDB/content-engine smoke:
 
 ```bash
 PROFILE=smoke ARTIFACT_MODE=content-backend \
-  scripts/agentdb-bench-local.sh
+  tools/agentdb-bench/scripts/agentdb-bench-local.sh
 ```
 
 The wrapper builds release binaries by default. Use `BUILD_PROFILE=debug` for
 faster development-only smoke runs:
 
 ```bash
-BUILD_PROFILE=debug PROFILE=smoke scripts/agentdb-bench-local.sh
+BUILD_PROFILE=debug PROFILE=smoke tools/agentdb-bench/scripts/agentdb-bench-local.sh
 ```
 
 To start AgentDB manually instead:
@@ -200,7 +200,7 @@ MATRIX_ID=value-wal-$(date +%Y%m%d) \
   ZIPF_EXPONENT=1.2 \
   FETCH_LAST_N=20 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-value-matrix.sh
+  tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh
 ```
 
 This writes a Markdown matrix under `bench-out/matrix/`. Use it for internal
@@ -215,18 +215,18 @@ For a long-run validation of the same value-prop matrix, use:
 ```bash
 MATRIX_ID=my-longrun-value \
   OUT=/path/with/enough/free/space \
-  scripts/agentdb-bench-longrun-value-matrix.sh
+  tools/agentdb-bench/scripts/agentdb-bench-longrun-value-matrix.sh
 ```
 
 The long-run wrapper defaults to `REPEATS=3`, seeds `43,44,45`, `WARMUP=30s`,
 `DURATION=10m`, the bounded 1000-session shape above, c=32, Zipf-1.2, and
 `single-node-wal`. Use it before making external performance claims; use
-`scripts/agentdb-bench-value-matrix.sh` for faster one-off engineering checks.
+`tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh` for faster one-off engineering checks.
 
 To inspect a running or completed matrix, use:
 
 ```bash
-scripts/agentdb-bench-status.sh \
+tools/agentdb-bench/scripts/agentdb-bench-status.sh \
   --out /path/with/enough/free/space \
   --matrix-id my-longrun-value
 ```
@@ -238,7 +238,7 @@ To generate a comparison-ready Markdown summary from completed repeat summaries,
 use:
 
 ```bash
-scripts/agentdb-bench-finalize-matrix.sh \
+tools/agentdb-bench/scripts/agentdb-bench-finalize-matrix.sh \
   --out /path/with/enough/free/space \
   --matrix-id my-longrun-value
 ```
@@ -253,7 +253,7 @@ Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
 first:
 
 ```bash
-scripts/agentdb-bench-prune.sh \
+tools/agentdb-bench/scripts/agentdb-bench-prune.sh \
   --root /path/with/enough/free/space \
   --keep 30 \
   --target-free-gb 120
@@ -273,7 +273,7 @@ paths at the end.
 AgentDB native:
 
 ```bash
-BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-local.sh \
   RUN_ID=agentdb-zipf-wal \
   PROFILE=default-agent-runtime \
   WORKLOAD=mixed-agent-loop \
@@ -286,13 +286,13 @@ BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
   REPEATS=3 \
   SEEDS=43,44,45 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-repeat.sh
+  tools/agentdb-bench/scripts/agentdb-bench-repeat.sh
 ```
 
 MongoDB:
 
 ```bash
-BENCH_SCRIPT=scripts/agentdb-bench-mongodb.sh \
+BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-mongodb.sh \
   RUN_ID=mongodb-zipf-wal \
   PROFILE=default-agent-runtime \
   WORKLOAD=mixed-agent-loop \
@@ -305,13 +305,13 @@ BENCH_SCRIPT=scripts/agentdb-bench-mongodb.sh \
   REPEATS=3 \
   SEEDS=43,44,45 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-repeat.sh
+  tools/agentdb-bench/scripts/agentdb-bench-repeat.sh
 ```
 
 Postgres:
 
 ```bash
-BENCH_SCRIPT=scripts/agentdb-bench-postgres.sh \
+BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-postgres.sh \
   RUN_ID=postgres-zipf-wal \
   PROFILE=default-agent-runtime \
   WORKLOAD=mixed-agent-loop \
@@ -324,7 +324,7 @@ BENCH_SCRIPT=scripts/agentdb-bench-postgres.sh \
   REPEATS=3 \
   SEEDS=43,44,45 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-repeat.sh
+  tools/agentdb-bench/scripts/agentdb-bench-repeat.sh
 ```
 
 For the matched local fsync sanity check, change
@@ -369,7 +369,7 @@ single-document designs:
 AgentDB's MongoDB-compatible listener is measured separately:
 
 ```bash
-PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
+PROFILE=smoke tools/agentdb-bench/scripts/agentdb-bench-agentdb-mongodb.sh
 ```
 
 Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
@@ -410,7 +410,7 @@ set. It is intentionally heavier than the latest-comparison row and should be
 run on a machine with enough disk space:
 
 ```bash
-BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-local.sh \
   RUN_ID=agentdb-working-set-wal \
   PROFILE=working-set-exceeds-cache \
   WORKLOAD=mixed-agent-loop \
@@ -424,11 +424,11 @@ BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
   REPEATS=1 \
   SEEDS=43 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-repeat.sh
+  tools/agentdb-bench/scripts/agentdb-bench-repeat.sh
 ```
 
-Run the same cell with `scripts/agentdb-bench-mongodb.sh` and
-`scripts/agentdb-bench-postgres.sh` before drawing a comparison. If the prepared
+Run the same cell with `tools/agentdb-bench/scripts/agentdb-bench-mongodb.sh` and
+`tools/agentdb-bench/scripts/agentdb-bench-postgres.sh` before drawing a comparison. If the prepared
 dataset plus database/index overhead still fits in RAM and database cache on
 the test host, increase `TENANTS`, `SESSIONS_PER_AGENT`, `EVENTS_PER_SESSION`,
 or `PAYLOAD_BYTES` explicitly and record those overrides in the report.
@@ -477,7 +477,7 @@ Each run writes files under `bench-out/runs/<run-id>/`:
 - `report-*.json`: machine-readable latency summaries.
 - `report.md`: human-readable aggregate and per-operation report.
 
-`scripts/agentdb-bench-repeat.sh` also writes aggregate summaries under
+`tools/agentdb-bench/scripts/agentdb-bench-repeat.sh` also writes aggregate summaries under
 `bench-out/summaries/<RUN_ID>/summary.md` and `summary.json`.
 
 ## Publication Rules

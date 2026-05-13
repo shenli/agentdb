@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT="${OUT:-${ROOT}/bench-out}"
 MATRIX_ID="${MATRIX_ID:-}"
 TAIL_LINES="${TAIL_LINES:-25}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/agentdb-bench-status.sh [OPTIONS]
+Usage: tools/agentdb-bench/scripts/agentdb-bench-status.sh [OPTIONS]
 
 Shows progress for an AgentDB benchmark matrix output directory.
 
@@ -19,8 +19,8 @@ Options:
   --help             Show this help.
 
 Examples:
-  scripts/agentdb-bench-status.sh --out bench-out --matrix-id benchmark-matrix-1
-  OUT=bench-out MATRIX_ID=benchmark-matrix-1 scripts/agentdb-bench-status.sh
+  tools/agentdb-bench/scripts/agentdb-bench-status.sh --out bench-out --matrix-id benchmark-matrix-1
+  OUT=bench-out MATRIX_ID=benchmark-matrix-1 tools/agentdb-bench/scripts/agentdb-bench-status.sh
 EOF
 }
 

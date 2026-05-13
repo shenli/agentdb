@@ -1549,7 +1549,7 @@ async fn print_dev_bootstrap(
             .unwrap_or_else(|| "<disabled>".into())
     );
     println!("  doctor:    agentdb doctor --dev --dev-tools");
-    println!("  local CI:  scripts/local-ci-status.sh --logs");
+    println!("  local CI:  ops/local-ci/scripts/local-ci-status.sh --logs");
     Ok(())
 }
 
@@ -1813,7 +1813,7 @@ fn check_local_ci_dashboard() {
     ) {
         Ok(_) => println!("  ok: local CI dashboard is reachable at http://127.0.0.1:8099"),
         Err(_) => println!(
-            "  note: local CI dashboard is not running; start scripts/local-ci-serve.sh if needed"
+            "  note: local CI dashboard is not running; start ops/local-ci/scripts/local-ci-serve.sh if needed"
         ),
     }
 }

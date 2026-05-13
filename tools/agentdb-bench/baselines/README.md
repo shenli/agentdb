@@ -10,5 +10,5 @@ by benchmark tools:
   an external corpus.
 
 The executable benchmark harness lives in `tools/agentdb-bench`. The wrapper
-scripts under `scripts/agentdb-bench-*.sh` wire that harness to the baseline
+scripts under `tools/agentdb-bench/scripts/agentdb-bench-*.sh` wire that harness to the baseline
 infrastructure here.

@@ -6,7 +6,7 @@
 # delivers all events (plus the `subscribed` control frame).
 #
 # Run with:
-#   bash scripts/smoke-pubsub.sh
+#   bash ops/smoke/scripts/smoke-pubsub.sh
 #
 # Cold builds take a few minutes. Subsequent runs reuse the
 # cargo cache and finish in seconds.

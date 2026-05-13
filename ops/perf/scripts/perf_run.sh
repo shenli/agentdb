@@ -2,7 +2,7 @@
 # Perf harness: start agentdb-server + Go workload, sample admin API
 # every second for DURATION seconds, write a CSV.
 #
-# Usage: scripts/perf_run.sh <label> <duration_sec>
+# Usage: ops/perf/scripts/perf_run.sh <label> <duration_sec>
 #
 # Env vars that influence tuning:
 #   AGENTDB_T_COLD_SECS (default 60) — tier demotion threshold

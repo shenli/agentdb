@@ -8,7 +8,7 @@ Environment=PATH=%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=LOCAL_CI_RUN_ROOT=%h/agentdb-ci-runs
 Environment=LOCAL_CI_DASHBOARD_HOST=127.0.0.1
 Environment=LOCAL_CI_DASHBOARD_PORT=8099
-ExecStart=%h/work/agentdb-nightly/scripts/local-ci-serve.sh
+ExecStart=%h/work/agentdb-nightly/ops/local-ci/scripts/local-ci-serve.sh
 Restart=on-failure
 RestartSec=5s
 

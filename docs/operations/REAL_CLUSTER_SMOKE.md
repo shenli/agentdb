@@ -9,7 +9,7 @@ procedure.
 The easiest local path is the Compose-backed wrapper:
 
 ```bash
-scripts/real-cluster-smoke-compose.sh
+ops/smoke/scripts/real-cluster-smoke-compose.sh
 ```
 
 This starts Postgres and MinIO, creates the bucket, builds the local AgentDB
@@ -21,16 +21,16 @@ Useful options:
 
 ```bash
 # Include the owner-kill failover probe.
-scripts/real-cluster-smoke-compose.sh --failover
+ops/smoke/scripts/real-cluster-smoke-compose.sh --failover
 
 # Include bounded random kill/restart chaos.
-scripts/real-cluster-smoke-compose.sh --chaos --chaos-iterations 48
+ops/smoke/scripts/real-cluster-smoke-compose.sh --chaos --chaos-iterations 48
 
 # Leave Postgres and MinIO running after the smoke finishes.
-AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1 scripts/real-cluster-smoke-compose.sh
+AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1 ops/smoke/scripts/real-cluster-smoke-compose.sh
 
 # Leave AgentDB server processes running for manual inspection.
-scripts/real-cluster-smoke-compose.sh --keep-running
+ops/smoke/scripts/real-cluster-smoke-compose.sh --keep-running
 ```
 
 `--keep-running` also keeps the Compose dependency containers up. Without
@@ -50,7 +50,7 @@ Override them with:
 AGENTDB_CLUSTER_SMOKE_POSTGRES_PORT=55433 \
 AGENTDB_CLUSTER_SMOKE_MINIO_PORT=19010 \
 AGENTDB_CLUSTER_SMOKE_MINIO_CONSOLE_PORT=19011 \
-scripts/real-cluster-smoke-compose.sh
+ops/smoke/scripts/real-cluster-smoke-compose.sh
 ```
 
 The wrapper intentionally runs only Postgres and MinIO in containers. AgentDB
@@ -96,7 +96,7 @@ export AGENTDB_S3_BUCKET=agentdb-smoke
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin
 
-scripts/real-cluster-smoke.sh
+ops/smoke/scripts/real-cluster-smoke.sh
 ```
 
 The script builds `agentdb-server` and `agentdb-cluster-smoke`, clears cluster
@@ -108,7 +108,7 @@ and prints health, scheduler, and Raft summaries.
 To leave the servers running for manual inspection:
 
 ```bash
-scripts/real-cluster-smoke.sh --keep-running --keep-work-dir
+ops/smoke/scripts/real-cluster-smoke.sh --keep-running --keep-work-dir
 ```
 
 Then inspect:
@@ -122,7 +122,7 @@ AGENTDB_URL=http://127.0.0.1:30102 target/debug/agentdbctl tablets list
 ## Optional Failover Probe
 
 ```bash
-scripts/real-cluster-smoke.sh --failover --keep-work-dir
+ops/smoke/scripts/real-cluster-smoke.sh --failover --keep-work-dir
 ```
 
 The failover probe kills the initial owner process, waits for the scheduler to
@@ -133,7 +133,7 @@ and rebalance path.
 ## Optional Chaos Probe
 
 ```bash
-scripts/real-cluster-smoke.sh --chaos --chaos-iterations 48 --keep-work-dir
+ops/smoke/scripts/real-cluster-smoke.sh --chaos --chaos-iterations 48 --keep-work-dir
 ```
 
 The chaos probe is intended for nightly stability testing. It keeps the cluster
@@ -142,7 +142,7 @@ while the node is down and again after it rejoins. A deterministic run can be
 replayed with:
 
 ```bash
-scripts/real-cluster-smoke.sh --chaos --chaos-seed 12345
+ops/smoke/scripts/real-cluster-smoke.sh --chaos --chaos-seed 12345
 ```
 
 This is not a full network-partition test yet. It targets the most common local
@@ -151,7 +151,7 @@ replica catch-up after missed writes.
 
 ## Generated Files
 
-The low-level `scripts/real-cluster-smoke.sh` removes the work directory after a
+The low-level `ops/smoke/scripts/real-cluster-smoke.sh` removes the work directory after a
 successful run unless `--keep-work-dir` is passed. The Compose wrapper always
 passes `--keep-work-dir` and stores dependency diagnostics there too.
 

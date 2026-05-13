@@ -8,7 +8,7 @@ SHOW_SUMMARY=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/local-ci-status.sh [OPTIONS]
+Usage: ops/local-ci/scripts/local-ci-status.sh [OPTIONS]
 
 Shows the most recent local CI run status.
 

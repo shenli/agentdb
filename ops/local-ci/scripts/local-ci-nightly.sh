@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 RUN_ROOT="${LOCAL_CI_RUN_ROOT:-$HOME/agentdb-ci-runs}"
 CHAOS_ITERATIONS="${LOCAL_CI_NIGHTLY_CHAOS_ITERATIONS:-48}"
@@ -9,7 +9,7 @@ SKIP_PULL="${LOCAL_CI_SKIP_PULL:-0}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/local-ci-nightly.sh [OPTIONS]
+Usage: ops/local-ci/scripts/local-ci-nightly.sh [OPTIONS]
 
 Runs the nightly local CI profile: cargo, SDKs, failover smoke, and bounded
 random cluster chaos.
@@ -62,4 +62,4 @@ if [[ "$SKIP_PULL" != "1" ]]; then
 fi
 
 export LOCAL_CI_RUN_ROOT="$RUN_ROOT"
-exec scripts/local-ci.sh --chaos --chaos-iterations "$CHAOS_ITERATIONS"
+exec ops/local-ci/scripts/local-ci.sh --chaos --chaos-iterations "$CHAOS_ITERATIONS"

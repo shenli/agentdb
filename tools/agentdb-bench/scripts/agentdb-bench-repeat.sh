@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
-BENCH_SCRIPT="${BENCH_SCRIPT:-${ROOT}/scripts/agentdb-bench-local.sh}"
+BENCH_SCRIPT="${BENCH_SCRIPT:-${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-local.sh}"
 if [[ "${BENCH_SCRIPT}" != /* ]]; then
   BENCH_SCRIPT="${ROOT}/${BENCH_SCRIPT}"
 fi

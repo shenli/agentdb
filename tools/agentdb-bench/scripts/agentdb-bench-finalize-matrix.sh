@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT="${OUT:-${ROOT}/bench-out}"
 MATRIX_ID="${MATRIX_ID:-}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-agentdb-native-rocksdb}"
@@ -9,7 +9,7 @@ TAIL_LINES="${TAIL_LINES:-0}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/agentdb-bench-finalize-matrix.sh [OPTIONS]
+Usage: tools/agentdb-bench/scripts/agentdb-bench-finalize-matrix.sh [OPTIONS]
 
 Builds a comparison-ready Markdown summary from repeat summary JSON files.
 The command is safe to run while a matrix is still in progress; incomplete
@@ -26,7 +26,7 @@ Output:
   Writes OUT/matrix/<matrix-id>-final.md and prints the path.
 
 Examples:
-  scripts/agentdb-bench-finalize-matrix.sh --out bench-out --matrix-id benchmark-matrix-1
+  tools/agentdb-bench/scripts/agentdb-bench-finalize-matrix.sh --out bench-out --matrix-id benchmark-matrix-1
 EOF
 }
 

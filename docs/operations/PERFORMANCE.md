@@ -266,11 +266,11 @@ cd workload && go build -o agentdb-workload ./cmd/agentdb-workload
 cd ..
 
 # Throughput suite (c=1,4,16,64, 15 s each)
-DURATION=15 bash scripts/perf_suite.sh
+DURATION=15 bash ops/perf/scripts/perf_suite.sh
 
 # Lifecycle run with the Go persona workload (aggressive tiering)
 AGENTDB_T_COLD_SECS=3 AGENTDB_TICK_SECS=1 \
-    bash scripts/perf_run.sh persona_lifecycle 90
+    bash ops/perf/scripts/perf_run.sh persona_lifecycle 90
 ```
 
 Outputs land in `perf-out/`:

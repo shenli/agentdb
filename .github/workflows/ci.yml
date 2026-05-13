@@ -2,7 +2,7 @@
 # cost control; the default pre-merge validation path is the
 # local runner:
 #
-#   scripts/local-ci.sh
+#   ops/local-ci/scripts/local-ci.sh
 #
 # Keep this workflow as an on-demand cloud fallback when a PR
 # needs GitHub-hosted verification.

@@ -10,7 +10,7 @@ EXCLUDE_NAMES=(logs matrix runs summaries)
 
 usage() {
   cat <<'EOF'
-Usage: scripts/agentdb-bench-prune.sh [OPTIONS]
+Usage: tools/agentdb-bench/scripts/agentdb-bench-prune.sh [OPTIONS]
 
 Prunes benchmark output directories under a root. The script only considers
 direct child directories of --root and defaults to dry-run mode.
@@ -28,8 +28,8 @@ Options:
   --help                 Show this help.
 
 Examples:
-  scripts/agentdb-bench-prune.sh --root bench-out --keep 30
-  scripts/agentdb-bench-prune.sh --root bench-out --keep 30 --target-free-gb 120 --delete
+  tools/agentdb-bench/scripts/agentdb-bench-prune.sh --root bench-out --keep 30
+  tools/agentdb-bench/scripts/agentdb-bench-prune.sh --root bench-out --keep 30 --target-free-gb 120 --delete
 EOF
 }
 
