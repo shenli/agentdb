@@ -2,7 +2,7 @@
   "name": "agentdb",
   "version": "2.0.0",
   "description": "TypeScript / Node client for AgentDB — agent-native operational database",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "homepage": "https://github.com/shenli/agentdb",
   "repository": {
     "type": "git",

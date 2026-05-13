@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OpenAI Agents SDK session adapter for AgentDB"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "AgentDB contributors" }]
 dependencies = [
     "agentdb[async]>=2.0.0",

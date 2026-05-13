@@ -1,7 +1,7 @@
 # Local CI
 
 GitHub CI is manual-only to control cost. The default validation path is a local
-CI runner, usually on `li-dev`, backed by `scripts/local-ci.sh`.
+CI runner backed by `scripts/local-ci.sh`.
 
 ## Run Profiles
 
@@ -98,10 +98,10 @@ currently running report.
 On a remote dev box, use SSH forwarding:
 
 ```bash
-ssh -L 8099:127.0.0.1:8099 li-dev
+ssh -L 8099:127.0.0.1:8099 <host>
 ```
 
-## li-dev Systemd User Timer
+## Systemd User Timer
 
 Install the user units:
 

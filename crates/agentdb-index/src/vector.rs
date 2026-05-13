@@ -1,8 +1,7 @@
 //! HNSW-backed vector index.
 //!
-//! Backend: `hnsw_rs` 0.3 (swapped from `instant-distance` in M16 to get
-//! incremental insert + file-based snapshot). See
-//! `docs/superpowers/notes/2026-04-22-hnsw-backend-spike.md`.
+//! Backend: `hnsw_rs` 0.3, used for incremental insert and file-based snapshot
+//! support. See `docs/operations/PERFORMANCE.md` for benchmark notes.
 //!
 //! One `Hnsw` per path, built incrementally as `insert()` is called —
 //! no rebuild on query. A small-N bypass keeps tiny-dataset tests
