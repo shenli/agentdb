@@ -3,7 +3,7 @@
 Operator playbooks for each error code an AgentDB server can surface.
 Every `ErrorResponse` emitted by the REST API carries a `doc_url`
 field pointing to one of these files (see
-[`crates/agentdb-api/src/error.rs`](../../crates/agentdb-api/src/error.rs)'s
+[`crates/agentdb-api/src/errors.rs`](../../crates/agentdb-api/src/errors.rs)'s
 `doc_url_for`).
 
 ## Structure
@@ -58,6 +58,6 @@ subscribe time:
 | `session_not_in_jwt` | HTTP 403 | [session_not_in_jwt.md](./session_not_in_jwt.md) |
 
 When a new `ErrorCode` variant is added to
-[`crates/agentdb-api/src/error.rs`](../../crates/agentdb-api/src/error.rs),
+[`crates/agentdb-api/src/errors.rs`](../../crates/agentdb-api/src/errors.rs),
 add a corresponding runbook here and update `doc_url_for` to return
 `Some(...)`.
