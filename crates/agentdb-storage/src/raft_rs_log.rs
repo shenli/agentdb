@@ -1142,11 +1142,29 @@ struct RaftEngineReplay {
 }
 
 fn open_engine(path: &Path) -> Result<RaftEngine> {
-    let config = RaftEngineConfig {
-        dir: path.to_string_lossy().into_owned(),
-        ..Default::default()
-    };
-    RaftEngine::open(config).map_err(map_raft_engine_error)
+    let dir = path.to_string_lossy().into_owned();
+    let mut last_error = None;
+    for attempt in 0..20 {
+        let config = RaftEngineConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        match RaftEngine::open(config) {
+            Ok(engine) => return Ok(engine),
+            Err(err) if raft_engine_lock_error(&err) => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(5 * (attempt + 1)));
+            }
+            Err(err) => return Err(map_raft_engine_error(err)),
+        }
+    }
+    Err(map_raft_engine_error(
+        last_error.expect("raft-engine open retry loop records lock errors"),
+    ))
+}
+
+fn raft_engine_lock_error(err: &raft_engine::Error) -> bool {
+    err.to_string().contains("Failed to lock file")
 }
 
 fn replay_raft_engine_to_storage(
