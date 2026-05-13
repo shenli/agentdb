@@ -204,6 +204,24 @@ The long-run wrapper defaults to `REPEATS=3`, seeds `43,44,45`, `WARMUP=30s`,
 `single-node-wal`. Use it before making external performance claims; use
 `scripts/agentdb-bench-value-matrix.sh` for faster one-off engineering checks.
 
+Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
+first:
+
+```bash
+scripts/agentdb-bench-prune.sh \
+  --root /home/lishen/work/agentdb-bench-runs \
+  --keep 30 \
+  --target-free-gb 120
+```
+
+If the dry-run plan is correct, add `--delete`. The prune script only considers
+direct child directories under `--root`, keeps the newest `--keep` directories,
+and refuses unsafe roots such as `/` and `$HOME`. If old MongoDB or Postgres
+Docker data is root-owned, add `--sudo` to the dry-run and delete commands so
+the script can size and remove those directories with passwordless sudo. Root
+metadata directories named `logs`, `summaries`, and `matrix` are excluded by
+default; add repeated `--exclude NAME` flags for other non-run directories.
+
 AgentDB native:
 
 ```bash

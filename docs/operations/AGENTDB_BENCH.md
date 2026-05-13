@@ -1066,7 +1066,9 @@ Scale profiles should vary one dimension at a time:
 - Keep benchmark data outside the repo, for example under
   `/home/lishen/agentdb-bench-runs/`.
 - Capture machine metadata, DB logs, AgentDB logs, and benchmark reports.
-- Add a disk-space guard and retention cleanup for old benchmark runs.
+- Add a disk-space guard and retention cleanup for old benchmark runs. Current
+  scripts include `scripts/agentdb-bench-prune.sh` for dry-run-first pruning of
+  direct child run directories.
 - Wire a nightly or manually triggered run separately from the existing
   stability test so long benchmark runs do not block correctness CI.
 
