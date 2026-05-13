@@ -35,12 +35,14 @@ if [[ -z "${PG_PORT:-}" ]]; then
   PG_PORT="$(choose_free_port)"
 fi
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
+PG_DATA_DIR="${PG_DATA_DIR:-${OUT}/state/${RUN_ID}/pg-data}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-postgres-${RUN_ID}}"
 PG_READY_ATTEMPTS="${PG_READY_ATTEMPTS:-300}"
 PG_READY_SLEEP="${PG_READY_SLEEP:-0.5}"
 
 compose() {
   PG_PORT="${PG_PORT}" \
+    PG_DATA_DIR="${PG_DATA_DIR}" \
     docker compose -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_DIR}/docker-compose.yml" "$@"
 }
 
@@ -56,6 +58,8 @@ if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
   echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
   exit 1
 fi
+
+mkdir -p "${PG_DATA_DIR}"
 
 if [[ -z "${PG_DSN:-}" ]]; then
   case "${DURABILITY_PROFILE}" in

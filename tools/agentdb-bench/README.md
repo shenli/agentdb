@@ -357,9 +357,19 @@ Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
 the same thing as real MongoDB.
 
 The MongoDB and Postgres baseline wrappers use per-run Docker Compose project
-names and tear containers down on exit. MongoDB data is bind-mounted under the
-benchmark output root and the container runs as the host `MONGO_UID:MONGO_GID`
-by default, so new benchmark data remains removable by the benchmark user.
+names and tear containers down on exit. Baseline database files are
+bind-mounted under the benchmark output root instead of Docker's default volume
+directory:
+
+- MongoDB: `${OUT}/state/${RUN_ID}/mongo-data`
+- Postgres: `${OUT}/state/${RUN_ID}/pg-data`
+
+This keeps long runs on the filesystem selected by `OUT` and avoids filling the
+host root filesystem with Docker volumes. MongoDB runs as the host
+`MONGO_UID:MONGO_GID` by default, so new MongoDB data remains removable by the
+benchmark user. Postgres data may be owned by the container user; use the prune
+helper with `--sudo` when needed.
+
 Unless `MONGO_PORT` or `PG_PORT` is set, the wrappers choose a free localhost
 port at runtime so they do not conflict with existing development containers.
 The baseline containers publish those ports on `127.0.0.1` only.
