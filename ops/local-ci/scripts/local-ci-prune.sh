@@ -7,7 +7,7 @@ DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/local-ci-prune.sh [OPTIONS]
+Usage: ops/local-ci/scripts/local-ci-prune.sh [OPTIONS]
 
 Deletes old local CI run directories, keeping the newest N runs.
 

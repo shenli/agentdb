@@ -302,8 +302,8 @@ Enable append/API profiling for AgentDB native or AgentDB MongoDB-API wrapper
 runs with:
 
 ```bash
-APPEND_PATH_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
-AGENTDB_API_JSON_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
+APPEND_PATH_PROFILE_MS=5000 tools/agentdb-bench/scripts/agentdb-bench-local.sh
+AGENTDB_API_JSON_PROFILE_MS=5000 tools/agentdb-bench/scripts/agentdb-bench-local.sh
 ```
 
 The server log then emits low-overhead aggregate lines:
@@ -328,7 +328,7 @@ APPEND_PATH_PROFILE_MS=5000 \
   CONCURRENCY=32 \
   WARMUP=10s \
   DURATION=60s \
-  scripts/agentdb-bench-local.sh
+  tools/agentdb-bench/scripts/agentdb-bench-local.sh
 ```
 
 The throughput/latency cell was consistent with the prior `single-node-fsync`
@@ -403,7 +403,7 @@ ZIPF_EXPONENT=1.2 \
 CONCURRENCY=32 \
 WARMUP=2s \
 DURATION=8s \
-scripts/agentdb-bench-local.sh
+tools/agentdb-bench/scripts/agentdb-bench-local.sh
 ```
 
 This local profiled run reached 30.5k ops/s with p99 5.6ms. The absolute
@@ -686,7 +686,7 @@ Run knobs:
 | `--zipf-exponent` | Zipfian skew exponent for `--session-selection zipf`; default is `1.2`. |
 | `--fetch-last-n` | Tail size returned by append/fetch and fetch-recent operations. |
 | `--warmup` / `--duration` | Warmup and measured windows. Public comparisons should use multi-minute measured windows. |
-| `scripts/agentdb-bench-repeat.sh` | Runs the selected backend wrapper once per seed with clean run IDs, then aggregates report JSON files into `bench-out/summaries/<summary-id>/summary.md`. |
+| `tools/agentdb-bench/scripts/agentdb-bench-repeat.sh` | Runs the selected backend wrapper once per seed with clean run IDs, then aggregates report JSON files into `bench-out/summaries/<summary-id>/summary.md`. |
 
 Skewed session selection is only meaningful with a sufficiently large fixture
 set. The `smoke` profile has too few sessions to exercise Zipfian or hotset
@@ -706,7 +706,7 @@ plus `SEED=SEED` for each invocation before calling
 Example 3x Zipf validation cell:
 
 ```bash
-BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
+BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-local.sh \
   RUN_ID=agentdb-zipf-60s \
   PROFILE=default-agent-runtime \
   WORKLOAD=mixed-agent-loop \
@@ -718,12 +718,12 @@ BENCH_SCRIPT=scripts/agentdb-bench-local.sh \
   REPEATS=3 \
   SEEDS=43,44,45 \
   NO_RAW_JSONL=1 \
-  scripts/agentdb-bench-repeat.sh
+  tools/agentdb-bench/scripts/agentdb-bench-repeat.sh
 ```
 
 Run the same command with
-`BENCH_SCRIPT=scripts/agentdb-bench-mongodb.sh` and
-`BENCH_SCRIPT=scripts/agentdb-bench-postgres.sh` before treating the Zipf row as
+`BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-mongodb.sh` and
+`BENCH_SCRIPT=tools/agentdb-bench/scripts/agentdb-bench-postgres.sh` before treating the Zipf row as
 a comparison cell.
 
 Predefined profiles should be thin wrappers around these parameters:
@@ -817,7 +817,7 @@ db.records.createIndex({ tenant_id: 1, text: "text" })
 Repo-local runner:
 
 ```bash
-PROFILE=smoke scripts/agentdb-bench-mongodb.sh
+PROFILE=smoke tools/agentdb-bench/scripts/agentdb-bench-mongodb.sh
 ```
 
 The implemented runner accepts the same dataset knobs as the AgentDB/Postgres
@@ -1010,10 +1010,11 @@ Scale profiles should vary one dimension at a time:
   native artifact metadata.
 - Add Docker Compose files for local Postgres and MongoDB.
 - Add schema files for the MongoDB and Postgres profiles above.
-- Add `scripts/agentdb-bench.sh` to build AgentDB, start databases, run a smoke
-  matrix, and write `bench-out/`. Initial status: local AgentDB-only runner is
-  implemented as `scripts/agentdb-bench-local.sh`; MongoDB/Postgres orchestration
-  is still follow-up work.
+- Add benchmark wrapper scripts under `tools/agentdb-bench/scripts/` to build
+  AgentDB, start databases, run smoke matrices, and write `bench-out/`.
+  Initial status: local AgentDB-only runner is implemented as
+  `tools/agentdb-bench/scripts/agentdb-bench-local.sh`; MongoDB/Postgres
+  orchestration is still follow-up work.
 
 ### PR 2: Backend Adapters And Correctness Tests
 
@@ -1041,7 +1042,7 @@ Scale profiles should vary one dimension at a time:
   directory.
 - Capture machine metadata, DB logs, AgentDB logs, and benchmark reports.
 - Add a disk-space guard and retention cleanup for old benchmark runs. Current
-  scripts include `scripts/agentdb-bench-prune.sh` for dry-run-first pruning of
+  scripts include `tools/agentdb-bench/scripts/agentdb-bench-prune.sh` for dry-run-first pruning of
   direct child run directories.
 - Wire a nightly or manually triggered run separately from the existing
   stability test so long benchmark runs do not block correctness CI.

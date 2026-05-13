@@ -95,8 +95,8 @@ The repo also includes AWS deployment scaffolding for a real SlateDB + S3 run:
 terraform -chdir=infra/aws/terraform init
 terraform -chdir=infra/aws/terraform apply
 
-scripts/aws/deploy-demo.sh <ec2-public-ip>
-scripts/aws/run-tiered-storage-smoke.sh http://<ec2-public-ip>:7878
+infra/aws/scripts/deploy-demo.sh <ec2-public-ip>
+infra/aws/scripts/run-tiered-storage-smoke.sh http://<ec2-public-ip>:7878
 ```
 
 Terraform provisions:

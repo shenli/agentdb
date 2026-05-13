@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 RUN_ID="${RUN_ID:-mongo-$(date +%Y%m%d-%H%M%S)}"
 OUT="${OUT:-${ROOT}/bench-out}"

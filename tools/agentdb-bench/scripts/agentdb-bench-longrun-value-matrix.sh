@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 # Publication-candidate defaults for the local single-node value proposition.
 # Override any variable at the call site for smoke runs or heavier cells.
@@ -37,4 +37,4 @@ echo "  warmup=${WARMUP} duration=${DURATION} concurrency=${CONCURRENCY}"
 echo "  shape=${TENANTS} tenants x ${AGENTS_PER_TENANT} agents x ${SESSIONS_PER_AGENT} sessions"
 echo "  output=${OUT:-${ROOT}/bench-out}"
 
-"${ROOT}/scripts/agentdb-bench-value-matrix.sh"
+"${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh"

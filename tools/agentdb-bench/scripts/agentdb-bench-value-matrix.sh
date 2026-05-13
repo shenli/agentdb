@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 MATRIX_ID="${MATRIX_ID:-value-matrix-$(date +%Y%m%d-%H%M%S)}"
 OUT="${OUT:-${ROOT}/bench-out}"
@@ -31,16 +31,16 @@ IFS=',' read -r -a workload_values <<<"${WORKLOADS}"
 script_for_backend() {
   case "$1" in
     agentdb | agentdb-native-rocksdb)
-      printf '%s\n' "${ROOT}/scripts/agentdb-bench-local.sh"
+      printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-local.sh"
       ;;
     mongodb | mongodb-event-log)
-      printf '%s\n' "${ROOT}/scripts/agentdb-bench-mongodb.sh"
+      printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-mongodb.sh"
       ;;
     postgres | postgres-event-log)
-      printf '%s\n' "${ROOT}/scripts/agentdb-bench-postgres.sh"
+      printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-postgres.sh"
       ;;
     agentdb-mongodb | agentdb-mongodb-api)
-      printf '%s\n' "${ROOT}/scripts/agentdb-bench-agentdb-mongodb.sh"
+      printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-agentdb-mongodb.sh"
       ;;
     *)
       echo "unknown backend: $1" >&2
@@ -149,7 +149,7 @@ for backend in "${backend_values[@]}"; do
         ARTIFACT_SMALL_BYTES="${ARTIFACT_SMALL_BYTES:-}" \
         ARTIFACT_LARGE_BYTES="${ARTIFACT_LARGE_BYTES:-}" \
         FORKS_PER_PARENT="${FORKS_PER_PARENT:-}" \
-        "${ROOT}/scripts/agentdb-bench-repeat.sh"
+        "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-repeat.sh"
       echo "| \`${backend}\` | \`${workload}\` | see summary | see summary | see summary | see summary | [summary](${OUT}/summaries/${run_id}/summary.md) |" >>"${summary}"
     else
       RUN_ID="${run_id}" \

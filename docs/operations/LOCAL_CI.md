@@ -1,14 +1,14 @@
 # Local CI
 
 GitHub CI is manual-only to control cost. The default validation path is a local
-CI runner backed by `scripts/local-ci.sh`.
+CI runner backed by `ops/local-ci/scripts/local-ci.sh`.
 
 ## Run Profiles
 
 Full local CI:
 
 ```bash
-scripts/local-ci.sh
+ops/local-ci/scripts/local-ci.sh
 ```
 
 This runs formatting, clippy, all Rust tests, Python and TypeScript SDK tests,
@@ -17,19 +17,19 @@ and the Compose-backed real-cluster failover smoke.
 Fast Rust-only validation:
 
 ```bash
-scripts/local-ci.sh --cargo-only
+ops/local-ci/scripts/local-ci.sh --cargo-only
 ```
 
 Cluster-only validation:
 
 ```bash
-scripts/local-ci.sh --cluster-only
+ops/local-ci/scripts/local-ci.sh --cluster-only
 ```
 
 Nightly stability validation:
 
 ```bash
-scripts/local-ci-nightly.sh
+ops/local-ci/scripts/local-ci-nightly.sh
 ```
 
 The nightly profile runs the full local CI plus bounded random cluster chaos:
@@ -40,8 +40,8 @@ follower loss/rejoin, restart recovery, and catch-up.
 Useful chaos options:
 
 ```bash
-scripts/local-ci.sh --cluster-only --chaos --chaos-iterations 48
-scripts/local-ci.sh --cluster-only --chaos --chaos-seed 12345
+ops/local-ci/scripts/local-ci.sh --cluster-only --chaos --chaos-iterations 48
+ops/local-ci/scripts/local-ci.sh --cluster-only --chaos --chaos-seed 12345
 ```
 
 ## Results
@@ -71,19 +71,19 @@ The run root also contains:
 Check the last completed run:
 
 ```bash
-scripts/local-ci-status.sh --logs
+ops/local-ci/scripts/local-ci-status.sh --logs
 ```
 
 Check the stability summary:
 
 ```bash
-scripts/local-ci-status.sh --summary
+ops/local-ci/scripts/local-ci-status.sh --summary
 ```
 
 Serve the dashboard:
 
 ```bash
-scripts/local-ci-serve.sh
+ops/local-ci/scripts/local-ci-serve.sh
 ```
 
 Then open:
@@ -109,8 +109,8 @@ Install the user units:
 mkdir -p ~/work
 test -d ~/work/agentdb-nightly || git clone https://github.com/shenli/agentdb.git ~/work/agentdb-nightly
 mkdir -p ~/.config/systemd/user
-cp ops/systemd/user/agentdb-local-ci-*.service ~/.config/systemd/user/
-cp ops/systemd/user/agentdb-local-ci-*.timer ~/.config/systemd/user/
+cp ops/local-ci/systemd/user/agentdb-local-ci-*.service ~/.config/systemd/user/
+cp ops/local-ci/systemd/user/agentdb-local-ci-*.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now agentdb-local-ci-dashboard.service
 systemctl --user enable --now agentdb-local-ci-nightly.timer
@@ -129,8 +129,8 @@ Inspect status:
 ```bash
 systemctl --user status agentdb-local-ci-nightly.service
 systemctl --user list-timers agentdb-local-ci-nightly.timer
-scripts/local-ci-status.sh --root ~/agentdb-ci-runs --logs
-scripts/local-ci-status.sh --root ~/agentdb-ci-runs --summary
+ops/local-ci/scripts/local-ci-status.sh --root ~/agentdb-ci-runs --logs
+ops/local-ci/scripts/local-ci-status.sh --root ~/agentdb-ci-runs --summary
 ```
 
 Run immediately:
@@ -141,22 +141,22 @@ systemctl --user start agentdb-local-ci-nightly.service
 
 ## Retention
 
-`scripts/local-ci.sh` prunes old run directories after each run. The default is
+`ops/local-ci/scripts/local-ci.sh` prunes old run directories after each run. The default is
 to keep the newest 30 runs. Override it with:
 
 ```bash
-LOCAL_CI_KEEP_RUNS=60 scripts/local-ci-nightly.sh
+LOCAL_CI_KEEP_RUNS=60 ops/local-ci/scripts/local-ci-nightly.sh
 ```
 
 Manual cleanup:
 
 ```bash
-scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30 --dry-run
-scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30
+ops/local-ci/scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30 --dry-run
+ops/local-ci/scripts/local-ci-prune.sh --root ~/agentdb-ci-runs --keep 30
 ```
 
 ## Dirty Working Trees
 
-`scripts/local-ci-nightly.sh` runs `git pull --ff-only` before testing and
+`ops/local-ci/scripts/local-ci-nightly.sh` runs `git pull --ff-only` before testing and
 refuses to pull if the checkout is dirty. Use a clean checkout for scheduled CI.
-For one-off testing against local changes, run `scripts/local-ci.sh` directly.
+For one-off testing against local changes, run `ops/local-ci/scripts/local-ci.sh` directly.

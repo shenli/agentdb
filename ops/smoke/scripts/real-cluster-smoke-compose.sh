@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 COMPOSE_FILE="$ROOT/examples/cluster-smoke/docker-compose.yml"
 WORK_DIR="${AGENTDB_CLUSTER_SMOKE_WORK_DIR:-/tmp/agentdb-cluster-smoke}"
 POSTGRES_USER="${AGENTDB_CLUSTER_SMOKE_POSTGRES_USER:-agentdb}"
@@ -87,7 +87,7 @@ if [[ "$KEEP_RUNNING" == "1" ]]; then
   echo "Keeping dependency containers because --keep-running was passed."
 fi
 
-scripts/real-cluster-smoke.sh --keep-work-dir "$@"
+ops/smoke/scripts/real-cluster-smoke.sh --keep-work-dir "$@"
 
 collect_diagnostics
 echo "real cluster smoke passed; diagnostics kept under $WORK_DIR"

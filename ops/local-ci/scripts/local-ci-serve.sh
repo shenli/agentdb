@@ -7,7 +7,7 @@ PORT="${LOCAL_CI_DASHBOARD_PORT:-8099}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/local-ci-serve.sh [OPTIONS]
+Usage: ops/local-ci/scripts/local-ci-serve.sh [OPTIONS]
 
 Serves the static local CI dashboard.
 

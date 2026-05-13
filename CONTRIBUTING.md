@@ -34,7 +34,7 @@ scripts/license-check.sh
 For a fuller local CI-style run:
 
 ```bash
-scripts/local-ci.sh
+ops/local-ci/scripts/local-ci.sh
 ```
 
 ## Pull Requests

@@ -152,7 +152,7 @@ OUT=/tmp/agentdb-bench \
   DURATION=10s \
   WARMUP=2s \
   REPEATS=1 \
-  scripts/agentdb-bench-value-matrix.sh
+  tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh
 ```
 
 Run the full long-run comparison on a machine with enough disk:
@@ -160,7 +160,7 @@ Run the full long-run comparison on a machine with enough disk:
 ```bash
 OUT=/path/with/free-space \
   MATRIX_ID=local-longrun-value \
-  scripts/agentdb-bench-longrun-value-matrix.sh
+  tools/agentdb-bench/scripts/agentdb-bench-longrun-value-matrix.sh
 ```
 
 For the benchmark tool, schema details, hardware/software notes, and caveats,
@@ -436,6 +436,10 @@ adapters/vercel-ai-sdk-agentdb-template
 config/agentdb.toml            Example server config
 docs/                          Architecture, operation, design, and runbooks
 examples/                      Usage examples
+infra/                         Cloud provisioning and deployment assets
+ops/                           Operational scripts, local CI, smoke tests, and systemd units
+scripts/                       Small repo-level entrypoints, install, and license checks
+tools/                         Developer/operator tools such as agentdb-bench
 workload/                      Load-generation and benchmark helpers
 ```
 

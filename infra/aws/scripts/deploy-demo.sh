@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <server-host> [ssh-user]" >&2
   exit 1
@@ -10,7 +12,9 @@ SERVER_HOST="$1"
 SSH_USER="${2:-ec2-user}"
 SSH_TARGET="${SSH_USER}@${SERVER_HOST}"
 
-scripts/aws/bootstrap-agentdb.sh "${SERVER_HOST}" "${SSH_USER}"
+cd "$ROOT"
+
+infra/aws/scripts/bootstrap-agentdb.sh "${SERVER_HOST}" "${SSH_USER}"
 
 echo "==> syncing repo to ${SSH_TARGET}"
 rsync -az --delete \
@@ -37,4 +41,4 @@ for _ in $(seq 1 30); do
 done
 
 echo "==> running smoke flow"
-scripts/aws/run-tiered-storage-smoke.sh "http://${SERVER_HOST}:7878"
+infra/aws/scripts/run-tiered-storage-smoke.sh "http://${SERVER_HOST}:7878"

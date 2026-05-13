@@ -35,6 +35,11 @@ public docs path.
 - [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
   codes and `doc_url` links
 
+Operational assets live outside `docs/`: cloud provisioning is under
+`infra/`, local CI and smoke/perf operations are under `ops/`, benchmark tooling
+is under `tools/agentdb-bench/`, and top-level `scripts/` is reserved for
+small repo-wide entrypoints.
+
 ## Cluster Work
 
 - [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
