@@ -477,3 +477,5 @@ commands, and pull-request expectations. Please report security issues through
 ## License
 
 AgentDB is licensed under the [MIT License](LICENSE).
+Third-party dependencies keep their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for release compliance notes.

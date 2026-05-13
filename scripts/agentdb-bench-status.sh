@@ -19,8 +19,8 @@ Options:
   --help             Show this help.
 
 Examples:
-  scripts/agentdb-bench-status.sh --out /home/lishen/work/agentdb-bench-runs --matrix-id longrun-value-wal-20260513-1
-  OUT=/home/lishen/work/agentdb-bench-runs MATRIX_ID=longrun-value-wal-20260513-1 scripts/agentdb-bench-status.sh
+  scripts/agentdb-bench-status.sh --out bench-out --matrix-id benchmark-matrix-1
+  OUT=bench-out MATRIX_ID=benchmark-matrix-1 scripts/agentdb-bench-status.sh
 EOF
 }
 

@@ -64,4 +64,6 @@ public docs path.
   - redesign for real hot/cold/archive session storage
 - [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
   - optimization plan for large artifact blobs and content backends
+- [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license
+  and release notice guidance
 - [roadmap.md](roadmap.md) - milestone direction and open work

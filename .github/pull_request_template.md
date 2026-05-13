@@ -8,6 +8,7 @@ What changed and why?
 - [ ] `cargo clippy --workspace --tests -- -D warnings`
 - [ ] `cargo test --workspace --locked`
 - [ ] SDK or adapter tests, if relevant
+- [ ] `scripts/license-check.sh`, if package metadata or dependencies changed
 - [ ] Docs updated, if public behavior changed
 
 ## Notes
