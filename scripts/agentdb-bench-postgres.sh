@@ -22,7 +22,7 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
   fi
 fi
 PG_PORT="${PG_PORT:-5433}"
-COMPOSE_DIR="${ROOT}/benchmarks/postgres"
+COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
 
 mkdir -p "${OUT}"
 free_kb="$(df -Pk "${OUT}" | awk 'NR == 2 {print $4}')"

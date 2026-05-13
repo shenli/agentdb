@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build benchmarks/fixtures/{corpus,queries}.jsonl.
+"""Build tools/agentdb-bench/baselines/fixtures/{corpus,queries}.jsonl.
 
 Pulls ~10k short docs from a Hugging Face dataset, embeds each with
 sentence-transformers/all-MiniLM-L6-v2 (384 dims, cosine-normal),

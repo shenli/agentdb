@@ -27,7 +27,7 @@ the Hugging Face cache.
 - `--model` any sentence-transformers model; the `embedding` dim must
   match AgentDB's configured dim (currently 384). If you pick a
   different-dim model, also change the Postgres schemas
-  (`benchmarks/postgres/tuned.sql`) and AgentDB's index config.
+  (`tools/agentdb-bench/baselines/postgres/tuned.sql`) and AgentDB's index config.
 - `--seed` RNG seed (default `20260420`). **Changing the seed makes
   the regenerated corpus's doc ids drift from the committed
   `queries.jsonl` — regenerate `queries.jsonl` too if you do this.**

@@ -18,9 +18,9 @@ product claims.
 - `tools/agentdb-bench` contains the Rust benchmark CLI that prepares datasets,
   runs workloads, and writes reports.
 - `scripts/agentdb-bench-*.sh` are wrapper scripts for common local runs.
-- `benchmarks/` contains baseline infrastructure and fixtures, not a separate
-  runner. For example, it holds Docker Compose files for MongoDB/Postgres and
-  SQL schema used by the baseline backends.
+- `tools/agentdb-bench/baselines/` contains baseline infrastructure and
+  fixtures, not a separate runner. For example, it holds Docker Compose files
+  for MongoDB/Postgres and SQL schema used by the baseline backends.
 
 ## Current Read
 
