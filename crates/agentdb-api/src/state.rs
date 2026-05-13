@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     Arc, OnceLock,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentdb_core::Runtime;
 use agentdb_meta::MetaStore;
@@ -14,6 +15,74 @@ use agentdb_storage::{AsyncMirrorContentBackend, RaftRsSnapshotTransfer, RaftRsW
 
 use crate::raft_ingress::RaftRsGroupRegistry;
 use crate::routing_http::RouteRuntime;
+
+#[derive(Debug)]
+pub struct ApiJsonResponseProfile {
+    interval_ms: u64,
+    last_log_ms: AtomicU64,
+    responses: AtomicU64,
+    bytes: AtomicU64,
+    serialize_nanos: AtomicU64,
+}
+
+impl ApiJsonResponseProfile {
+    fn from_env() -> Option<Self> {
+        let interval_ms = std::env::var("AGENTDB_API_JSON_PROFILE_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)?;
+        Some(Self {
+            interval_ms,
+            last_log_ms: AtomicU64::new(now_ms()),
+            responses: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            serialize_nanos: AtomicU64::new(0),
+        })
+    }
+
+    pub fn record(&self, bytes: usize, serialize_nanos: u128) {
+        self.responses.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.serialize_nanos.fetch_add(
+            serialize_nanos.min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+
+        let now = now_ms();
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.interval_ms {
+            return;
+        }
+        if self
+            .last_log_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let responses = self.responses.swap(0, Ordering::Relaxed);
+        if responses == 0 {
+            return;
+        }
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let serialize_nanos = self.serialize_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            responses,
+            bytes,
+            avg_bytes = bytes as f64 / responses as f64,
+            avg_serialize_us = serialize_nanos as f64 / responses as f64 / 1_000.0,
+            "api json response profile"
+        );
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
 
 pub trait RaftRsIngress: Send + Sync {
     fn step_wire_message(&self, message: RaftRsWireMessage) -> agentdb_storage::Result<()>;
@@ -217,6 +286,7 @@ pub struct AppState {
     pub content_mirror: Option<Arc<AsyncMirrorContentBackend>>,
     pub proxy: reqwest::Client,
     pub proxy_policy: ProxyPolicy,
+    pub api_json_response_profile: Option<Arc<ApiJsonResponseProfile>>,
 }
 
 impl AppState {
@@ -234,6 +304,7 @@ impl AppState {
             content_mirror: None,
             proxy: reqwest::Client::new(),
             proxy_policy: ProxyPolicy::default(),
+            api_json_response_profile: ApiJsonResponseProfile::from_env().map(Arc::new),
         }
     }
 

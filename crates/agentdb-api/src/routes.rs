@@ -14,11 +14,11 @@ use std::{
     future::Future,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, Path, Query, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -4482,7 +4482,7 @@ async fn create_session(
     record_session_locator(&s, &tid, &sess.session_id, &route_headers).await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     Ok(with_headers(
-        json_with_backpressure(StatusCode::CREATED, Json(sess), backpressure),
+        json_with_backpressure(&s, StatusCode::CREATED, Json(sess), backpressure),
         route_headers,
     ))
 }
@@ -4783,7 +4783,7 @@ async fn append_event(
         })
         .await?;
     Ok(with_headers(
-        json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
+        json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
     ))
 }
@@ -4854,7 +4854,7 @@ async fn append_and_fetch(
         })
         .await?;
     Ok(with_headers(
-        json_with_backpressure(StatusCode::OK, Json(resp), backpressure),
+        json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
     ))
 }
@@ -5155,6 +5155,7 @@ async fn create_artifact(
         .await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
     Ok(json_with_backpressure(
+        &s,
         StatusCode::CREATED,
         Json(art),
         backpressure,
@@ -5234,11 +5235,35 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 }
 
 fn json_with_backpressure<T: serde::Serialize>(
+    state: &AppState,
     status: StatusCode,
     body: Json<T>,
     backpressure: agentdb_core::BackpressureReport,
 ) -> Response {
-    let mut resp = (status, body).into_response();
+    let mut resp = if let Some(profile) = state.api_json_response_profile.as_deref() {
+        let started = Instant::now();
+        let bytes = match serde_json::to_vec(&body.0) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to serialize json response");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    Body::from("failed to serialize json response"),
+                )
+                    .into_response();
+            }
+        };
+        profile.record(bytes.len(), started.elapsed().as_nanos());
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/json")],
+            Bytes::from(bytes),
+        )
+            .into_response()
+    } else {
+        (status, body).into_response()
+    };
     if let Some(value) = backpressure.header_value() {
         if let Ok(value) = HeaderValue::from_str(&value) {
             resp.headers_mut().insert(BACKPRESSURE_HEADER, value);
@@ -5563,7 +5588,8 @@ async fn create_record(
         })
         .await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
-    let mut resp = json_with_backpressure(StatusCode::CREATED, Json(written.record), backpressure);
+    let mut resp =
+        json_with_backpressure(&s, StatusCode::CREATED, Json(written.record), backpressure);
     if let Ok(value) = HeaderValue::from_str(&written.commit_token.seq.to_string()) {
         resp.headers_mut().insert(RECORD_COMMIT_SEQ_HEADER, value);
     }
