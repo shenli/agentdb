@@ -204,6 +204,17 @@ The long-run wrapper defaults to `REPEATS=3`, seeds `43,44,45`, `WARMUP=30s`,
 `single-node-wal`. Use it before making external performance claims; use
 `scripts/agentdb-bench-value-matrix.sh` for faster one-off engineering checks.
 
+To inspect a running or completed matrix, use:
+
+```bash
+scripts/agentdb-bench-status.sh \
+  --out /home/lishen/work/agentdb-bench-runs \
+  --matrix-id longrun-value-wal-20260513-1
+```
+
+The status helper prints disk headroom, matching active processes, completed
+repeat summaries, completed run-report count, and the tail of the matrix log.
+
 Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
 first:
 
