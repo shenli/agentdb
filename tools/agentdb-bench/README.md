@@ -19,6 +19,9 @@ The current best summary is:
 
 - For local developer tryout, AgentDB is clearly faster in the default
   `single-node-wal` profile.
+- On the core bounded matrix, AgentDB leads throughput on `mixed-agent-loop`,
+  `append-only`, and `append-fetch-hot`. Simple append-only now uses the
+  same-session append coalescer, which removed the previous Zipfian p99 tail.
 - For matched single-node media-sync durability, AgentDB has improved a lot and
   beats MongoDB at c=32, but Postgres remains a strong baseline.
 - For the larger working-set profile, AgentDB now beats both MongoDB and
@@ -82,6 +85,25 @@ settings, and observed disk usage before claiming the run truly exceeds cache.
 | `working-set-exceeds-cache`, `single-node-wal`, 300s | 32 | 37.2k ops/s, p99 2.35ms | 23.8k ops/s, p99 2.22ms | 6.0k ops/s, p99 114ms | AgentDB is 1.56x MongoDB and 6.18x Postgres on the larger cache-pressure cell. |
 | `single-node-fsync` | 32 | 1,545 ops/s, p99 70ms | 884 ops/s, p99 65ms | 2,182 ops/s, p99 238ms | Compact tablet log improves AgentDB, but forced media sync remains the ceiling. |
 | `single-node-fsync` tuning cell | 256 | 2,355 ops/s, p99 615ms | not rerun | 2,127 ops/s, p99 386ms | AgentDB slightly beats Postgres throughput, but has worse tail latency. |
+
+### Bounded Core Workload Matrix
+
+This 30s `li-dev` matrix uses the bounded latest-comparison shape: 10 tenants,
+2 agents per tenant, 50 sessions per agent, 50 prepared events per session, 10
+records per session, 2 KiB event payloads, c=32, Zipf-1.2, and
+`single-node-wal`. It is a fast engineering check, not a publication-grade
+repeat set.
+
+| Workload | AgentDB | MongoDB | Postgres | What It Means |
+|---|---:|---:|---:|---|
+| `mixed-agent-loop` | 44,393 ops/s, p99 2.03ms | 24,644 ops/s, p99 2.27ms | 20,298 ops/s, p99 17.39ms | AgentDB is 1.80x MongoDB and 2.19x Postgres on the full agent loop. |
+| `append-only` | 79,781 ops/s, p99 1.15ms | 15,384 ops/s, p99 4.98ms | 9,897 ops/s, p99 37.82ms | Simple append-only benefits from same-session coalescing under Zipfian hot sessions. |
+| `append-fetch-hot` | 38,481 ops/s, p99 2.28ms | 16,959 ops/s, p99 2.83ms | 22,539 ops/s, p99 12.45ms | AgentDB's fused append+tail-read path remains the strongest API-shape win. |
+
+The previous append-only cell was 23,878 ops/s with p99 8.71ms. Routing simple
+append-only requests through the same-session coalescer moved the same cell to
+79,781 ops/s with p99 1.15ms, while the mixed-agent-loop and append-fetch-hot
+checks stayed flat.
 
 Use this interpretation:
 
