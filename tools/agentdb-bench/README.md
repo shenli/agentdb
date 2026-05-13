@@ -216,7 +216,9 @@ scripts/agentdb-bench-prune.sh \
 
 If the dry-run plan is correct, add `--delete`. The prune script only considers
 direct child directories under `--root`, keeps the newest `--keep` directories,
-and refuses unsafe roots such as `/` and `$HOME`.
+and refuses unsafe roots such as `/` and `$HOME`. If old MongoDB or Postgres
+Docker data is root-owned, add `--sudo` to the dry-run and delete commands so
+the script can size and remove those directories with passwordless sudo.
 
 AgentDB native:
 

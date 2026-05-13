@@ -5,6 +5,7 @@ ROOT_DIR="${AGENTDB_BENCH_PRUNE_ROOT:-bench-out}"
 KEEP="${AGENTDB_BENCH_PRUNE_KEEP:-20}"
 TARGET_FREE_GB="${AGENTDB_BENCH_PRUNE_TARGET_FREE_GB:-0}"
 DELETE=0
+USE_SUDO=0
 
 usage() {
   cat <<'EOF'
@@ -20,6 +21,7 @@ Options:
                          Default: AGENTDB_BENCH_PRUNE_TARGET_FREE_GB or 0, disabled.
   --delete               Actually delete selected directories. Without this, prints a dry-run plan.
   --dry-run              Explicit dry-run mode.
+  --sudo                 Use passwordless sudo for sizing and deletion. Useful for Docker-owned DB data.
   --help                 Show this help.
 
 Examples:
@@ -51,6 +53,9 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DELETE=0
       ;;
+    --sudo)
+      USE_SUDO=1
+      ;;
     --help|-h)
       usage
       exit 0
@@ -80,6 +85,10 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required for portable directory mtime sorting" >&2
   exit 2
 fi
+if ((USE_SUDO == 1)) && ! sudo -n true >/dev/null 2>&1; then
+  echo "--sudo requires passwordless sudo for this shell" >&2
+  exit 2
+fi
 
 root_abs="$(cd "${ROOT_DIR}" && pwd -P)"
 if [[ "${root_abs}" == "/" || "${root_abs}" == "${HOME}" ]]; then
@@ -91,8 +100,33 @@ free_kb() {
   df -Pk "${root_abs}" | awk 'NR == 2 {print $4}'
 }
 
+du_kb() {
+  if ((USE_SUDO == 1)); then
+    sudo -n du -sk -- "$1" 2>/dev/null | awk '{print $1}'
+  else
+    du -sk -- "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+du_human() {
+  if ((USE_SUDO == 1)); then
+    sudo -n du -sh -- "$1" 2>/dev/null | awk '{print $1}'
+  else
+    du -sh -- "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+delete_path() {
+  if ((USE_SUDO == 1)); then
+    sudo -n rm -rf -- "$1"
+  else
+    rm -rf -- "$1"
+  fi
+}
+
 target_free_kb="$((TARGET_FREE_GB * 1024 * 1024))"
 current_free_kb="$(free_kb)"
+size_errors=0
 
 entries=()
 while IFS= read -r line; do
@@ -147,7 +181,12 @@ fi
 
 projected_free_kb="${current_free_kb}"
 for path in "${delete_paths[@]}"; do
-  size_kb="$(du -sk -- "${path}" | awk '{print $1}')"
+  size_kb="$(du_kb "${path}")"
+  if [[ -z "${size_kb}" ]]; then
+    echo "warning: cannot size ${path}; rerun with --sudo if it contains root-owned Docker data" >&2
+    size_kb=0
+    size_errors=1
+  fi
   projected_free_kb="$((projected_free_kb + size_kb))"
 done
 
@@ -162,7 +201,12 @@ if ((target_free_kb > 0 && projected_free_kb < target_free_kb)); then
       break
     fi
     delete_paths+=("${path}")
-    size_kb="$(du -sk -- "${path}" | awk '{print $1}')"
+    size_kb="$(du_kb "${path}")"
+    if [[ -z "${size_kb}" ]]; then
+      echo "warning: cannot size ${path}; rerun with --sudo if it contains root-owned Docker data" >&2
+      size_kb=0
+      size_errors=1
+    fi
     projected_free_kb="$((projected_free_kb + size_kb))"
     if ((projected_free_kb >= target_free_kb)); then
       break
@@ -179,6 +223,12 @@ echo "benchmark prune mode=${mode}"
 echo "root=${root_abs}"
 echo "children=${total} keep=${KEEP}"
 echo "current_free_gb=$((current_free_kb / 1024 / 1024)) target_free_gb=${TARGET_FREE_GB} projected_free_gb=$((projected_free_kb / 1024 / 1024))"
+if ((USE_SUDO == 1)); then
+  echo "sudo=enabled"
+fi
+if ((size_errors == 1)); then
+  echo "warning: projected free space is a lower bound because some directories could not be sized" >&2
+fi
 
 if ((${#delete_paths[@]} == 0)); then
   echo "nothing to prune"
@@ -186,9 +236,10 @@ if ((${#delete_paths[@]} == 0)); then
 fi
 
 for path in "${delete_paths[@]}"; do
-  size="$(du -sh -- "${path}" | awk '{print $1}')"
+  size="$(du_human "${path}")"
+  [[ -n "${size}" ]] || size="unknown-size"
   if ((DELETE == 1)); then
-    rm -rf -- "${path}"
+    delete_path "${path}"
     echo "deleted ${size} ${path}"
   else
     echo "would delete ${size} ${path}"
