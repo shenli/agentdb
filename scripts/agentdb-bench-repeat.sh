@@ -56,9 +56,9 @@ for idx in $(seq 1 "${REPEATS}"); do
 done
 
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
-  bin_dir="${ROOT}/target/release"
+  bin_dir="${CARGO_TARGET_DIR:-${ROOT}/target}/release"
 else
-  bin_dir="${ROOT}/target/debug"
+  bin_dir="${CARGO_TARGET_DIR:-${ROOT}/target}/debug"
 fi
 
 "${bin_dir}/agentdb-bench" summarize-repeats \

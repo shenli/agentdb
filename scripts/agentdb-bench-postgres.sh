@@ -77,10 +77,10 @@ fi
 
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
   cargo build --release -p agentdb-bench
-  BIN_DIR="${ROOT}/target/release"
+  BIN_DIR="${CARGO_TARGET_DIR:-${ROOT}/target}/release"
 else
   cargo build -p agentdb-bench
-  BIN_DIR="${ROOT}/target/debug"
+  BIN_DIR="${CARGO_TARGET_DIR:-${ROOT}/target}/debug"
 fi
 
 prepare_args=(
