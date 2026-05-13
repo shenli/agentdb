@@ -139,6 +139,16 @@ for backend in "${backend_values[@]}"; do
         FETCH_LAST_N="${FETCH_LAST_N}" \
         NO_RAW_JSONL="${NO_RAW_JSONL}" \
         ARTIFACT_MODE="${ARTIFACT_MODE}" \
+        TENANTS="${TENANTS:-}" \
+        AGENTS_PER_TENANT="${AGENTS_PER_TENANT:-}" \
+        SESSIONS_PER_AGENT="${SESSIONS_PER_AGENT:-}" \
+        EVENTS_PER_SESSION="${EVENTS_PER_SESSION:-}" \
+        RECORDS_PER_SESSION="${RECORDS_PER_SESSION:-}" \
+        PAYLOAD_BYTES="${PAYLOAD_BYTES:-}" \
+        ARTIFACT_RATE="${ARTIFACT_RATE:-}" \
+        ARTIFACT_SMALL_BYTES="${ARTIFACT_SMALL_BYTES:-}" \
+        ARTIFACT_LARGE_BYTES="${ARTIFACT_LARGE_BYTES:-}" \
+        FORKS_PER_PARENT="${FORKS_PER_PARENT:-}" \
         "${ROOT}/scripts/agentdb-bench-repeat.sh"
       echo "| \`${backend}\` | \`${workload}\` | see summary | see summary | see summary | see summary | [summary](${OUT}/summaries/${run_id}/summary.md) |" >>"${summary}"
     else
