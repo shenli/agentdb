@@ -415,6 +415,48 @@ and adaptive KV batches around 8-10 requests per batch. The next remaining
 bottleneck is the durable write itself. Further improvement should focus on the
 durable log / fsync path and larger safe batching, not read caching.
 
+### Local WAL profile follow-up
+
+After the API JSON profiling hook landed, a local `single-node-wal`
+`mixed-agent-loop` run was used to identify the next non-fsync bottleneck:
+
+```bash
+APPEND_PATH_PROFILE_MS=1000 \
+AGENTDB_API_JSON_PROFILE_MS=1000 \
+DURABILITY_PROFILE=single-node-wal \
+SESSION_SELECTION=zipf \
+ZIPF_EXPONENT=1.2 \
+CONCURRENCY=32 \
+WARMUP=2s \
+DURATION=8s \
+scripts/agentdb-bench-local.sh
+```
+
+This local profiled run reached 30.5k ops/s with p99 5.6ms. The absolute
+throughput is lower than an unprofiled run because every response is explicitly
+serialized for measurement, but the stage attribution is useful:
+
+| Stage | Representative measured-period average | Interpretation |
+|---|---:|---|
+| API JSON response serialization | 9-12us for ~11KB responses | Not the dominant bottleneck for the current hot loop. |
+| Adaptive KV write | 25-42us | WAL-mode storage writes are small relative to state contention. |
+| Simple append durable write | 55-130us | Noticeable, but usually below state-lock wait. |
+| Simple append prepare state-lock wait | 220-280us | Major contention point. |
+| Simple append update state-lock wait | 210-277us | Major contention point. |
+
+Two tempting local-WAL tuning knobs were checked and rejected:
+
+| Experiment | Result | Decision |
+|---|---|---|
+| `AGENTDB_SESSION_APPEND_BATCH_WAIT_US` sweep at 0/100/250/500us | 250us produced a noisy throughput bump in one 5s cell, but p99 worsened; 100us and 500us regressed. | Do not change the default. A fixed wait window is too workload-sensitive. |
+| Holding the global state lock through the short WAL durable write | Regressed to 31.3k ops/s at c=32 in the same local shape. | Do not pursue. Removing one lock acquisition is not enough to offset blocking unrelated sessions. |
+
+The local-WAL bottleneck is therefore the global `State` mutex around hot
+session/event state, not JSON serialization or a simple wait-window setting.
+The next meaningful implementation should split the hot append state away from
+the global metadata/index state, or shard hot session state by session/tablet so
+unrelated sessions do not contend on one mutex during append+fetch.
+
 ## Questions To Answer
 
 1. How fast is the hot agent loop: append one event, then read enough recent

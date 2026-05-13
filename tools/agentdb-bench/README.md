@@ -207,6 +207,7 @@ for all backends.
 | `AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION` | `64`, `2048` | AgentDB persisted hot-tail event cache per session. AgentDB wrappers default this to `64` for `working-set-exceeds-cache`. |
 | `AGENTDB_ROCKSDB_COMPRESSION` | `lz4`, `none`, `snappy`, `lz4hc` | RocksDB compression used by AgentDB. Defaults to `lz4` to reduce working-set storage and compaction IO. |
 | `AGENTDB_APPEND_GROUP_COMMIT_US` | `0`, `1000`, `2000`, `4000` | AgentDB append group-commit wait window. The single-node fsync default is `2000`; WAL mode defaults to `0`. |
+| `AGENTDB_SESSION_APPEND_BATCH_WAIT_US` | `0`, `250`, `1000` | Experimental same-session append coalescing wait. Keep at `0` unless a profile proves p99 still improves. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
 | `AGENTDB_API_JSON_PROFILE_MS` | `5000` | Enables AgentDB JSON response serialization profiling in logs. |
 
