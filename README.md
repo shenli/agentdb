@@ -32,6 +32,9 @@ to rebuild session semantics on top of a generic database.
 - **Object-store based storage engine** — scale retained history and keep costs
   predictable by separating hot session metadata from cold events, large
   artifacts, and derived state
+- **Agent-runtime performance and cost efficiency** — optimized append,
+  append-and-fetch, hot-tail reads, and bounded local storage paths reduce the
+  infrastructure needed for common agent session workloads
 - **Compatibility where it helps** — native HTTP/SDK APIs remain canonical,
   while the optional MongoDB listener lets existing drivers and tools inspect
   and write AgentDB runtime collections
@@ -86,6 +89,31 @@ are:
 - TypeScript SDK in `clients/typescript`
 - Framework adapters and templates in `adapters/`
 - Session dashboard mounted at `/dashboard`
+
+## Performance Snapshot
+
+AgentDB is optimized for agent-runtime state, not generic OLTP. The repo-local
+benchmark suite compares AgentDB with normalized MongoDB and Postgres event-log
+schemas on workloads shaped like tool-using agents: append ordered session
+events, immediately read recent context, write/search memory records, fork
+sessions, and attach artifact metadata.
+
+On the current `li-dev` long-run validation matrix
+(`single-node-wal`, c=32, Zipf-1.2 session skew, 1000 sessions, 30s warmup,
+10m measured window, 3 repeats), the valid rows show:
+
+| Workload | AgentDB | MongoDB | Postgres | Result |
+|---|---:|---:|---:|---|
+| `mixed-agent-loop` | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms | 1.59x MongoDB, 7.13x Postgres |
+| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | rerun in progress | 4.03x MongoDB; Postgres rerun pending |
+| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | rerun in progress | 2.04x MongoDB; Postgres rerun pending |
+
+These are internal single-node benchmark results, not managed-service claims.
+The benchmark intentionally calls out API-shape advantages such as AgentDB's
+fused `append-and-fetch` primitive, durability profiles, cache-pressure cells,
+and invalid rows. See [tools/agentdb-bench](tools/agentdb-bench/README.md) to
+run the benchmark and [docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md)
+for methodology, caveats, and historical tuning notes.
 
 ## Quick Start
 
