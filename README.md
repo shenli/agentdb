@@ -170,7 +170,7 @@ and tuning history, see
 
 ## Quick Start
 
-Run an in-memory development server:
+Run an in-memory development server in one terminal:
 
 ```bash
 cargo run -p agentdb-server -- dev
@@ -198,11 +198,27 @@ http://127.0.0.1:7878/dashboard/
 `127.0.0.1:7879`, creates a `dev` workspace with a demo agent/session, and
 prints copy-paste commands for SDK examples, diagnostics, and local CI status.
 
-Check the full local developer environment:
+In another terminal, install the local Python SDK and run the session quickstart:
+
+```bash
+pip install -e clients/python
+AGENTDB_URL=http://127.0.0.1:7878 python3 examples/agents/python/quickstart.py
+```
+
+That quickstart appends three agent events, reads the recent session tail after
+each append, then forks the session into an alternate timeline.
+
+Optional: check the full local developer environment:
 
 ```bash
 cargo run -p agentdb-server -- doctor --dev --dev-tools
 ```
+
+`doctor --dev-tools` checks optional tooling too. Missing Docker or libclang is
+only a blocker if you plan to run compose-backed cluster smoke tests or rebuild
+RocksDB bindings locally.
+
+For a shorter walkthrough, see [docs/quickstart.md](docs/quickstart.md).
 
 ### MongoDB Client Compatibility
 
@@ -402,7 +418,7 @@ cargo run -p agentdb-server -- dev
 Run the adapter quickstart without an OpenAI API key:
 
 ```bash
-python examples/agents/python/openai_agents_quickstart.py
+python3 examples/agents/python/openai_agents_quickstart.py
 ```
 
 That exercises the OpenAI Agents SDK session protocol over AgentDB. To run a
@@ -411,7 +427,7 @@ live SDK call:
 ```bash
 pip install openai-agents
 OPENAI_API_KEY=... AGENTDB_OPENAI_LIVE=1 \
-  python examples/agents/python/openai_agents_quickstart.py
+  python3 examples/agents/python/openai_agents_quickstart.py
 ```
 
 ## Workspace Layout

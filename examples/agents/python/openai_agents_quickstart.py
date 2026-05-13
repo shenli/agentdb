@@ -3,14 +3,14 @@
 Run locally without an OpenAI API key:
 
     cargo run -p agentdb-server -- dev
-    python examples/agents/python/openai_agents_quickstart.py
+    python3 examples/agents/python/openai_agents_quickstart.py
 
 That default path exercises the OpenAI Agents SDK session protocol over
 AgentDB. To run a live Agents SDK call, install the OpenAI Agents SDK, set
 `OPENAI_API_KEY`, and opt in:
 
     pip install openai-agents
-    AGENTDB_OPENAI_LIVE=1 python examples/agents/python/openai_agents_quickstart.py
+    AGENTDB_OPENAI_LIVE=1 python3 examples/agents/python/openai_agents_quickstart.py
 """
 
 from __future__ import annotations

@@ -12,7 +12,7 @@ This example shows the first tiered-storage slice in a developer-friendly way:
 Run me:
 
     cargo run -p agentdb-server -- serve --dev
-    python examples/agents/python/session_tiering_demo.py
+    python3 examples/agents/python/session_tiering_demo.py
 """
 
 from __future__ import annotations

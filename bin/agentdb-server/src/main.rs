@@ -1538,7 +1538,7 @@ async fn print_dev_bootstrap(
         bootstrap.session, session.session_id
     );
     println!(
-        "  python:    AGENTDB_URL=http://{} AGENTDB_WORKSPACE={} python examples/agents/python/openai_agents_quickstart.py",
+        "  python:    AGENTDB_URL=http://{} AGENTDB_WORKSPACE={} python3 examples/agents/python/openai_agents_quickstart.py",
         config.bind, bootstrap.workspace
     );
     println!(

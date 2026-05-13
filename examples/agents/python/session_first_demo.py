@@ -14,7 +14,7 @@ Run me:
 
     # In another:
     pip install -e clients/python
-    python examples/agents/python/session_first_demo.py
+    python3 examples/agents/python/session_first_demo.py
 """
 
 from __future__ import annotations

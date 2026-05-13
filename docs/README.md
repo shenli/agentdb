@@ -6,6 +6,8 @@ public docs path.
 
 ## Start Here
 
+- [quickstart.md](quickstart.md) - shortest path from checkout to a stored and
+  replayable agent session
 - [architecture/agent-db.md](architecture/agent-db.md) - product thesis,
   workload requirements, positioning, and systems rationale
 - [architecture/DESIGN.md](architecture/DESIGN.md) - durable design commitments,

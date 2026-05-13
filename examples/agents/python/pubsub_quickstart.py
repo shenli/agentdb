@@ -11,7 +11,7 @@ Run (in two terminals):
 
     # Terminal 2
     pip install -e clients/python
-    python examples/agents/python/pubsub_quickstart.py
+    python3 examples/agents/python/pubsub_quickstart.py
 
 Expected output:
 

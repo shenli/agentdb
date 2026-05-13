@@ -51,7 +51,7 @@ From a repo checkout, the fastest local smoke is:
 
 ```bash
 cargo run -p agentdb-server -- dev
-python examples/agents/python/openai_agents_quickstart.py
+python3 examples/agents/python/openai_agents_quickstart.py
 ```
 
 The quickstart defaults to a protocol-only run that does not require an OpenAI

@@ -35,7 +35,7 @@ open http://localhost:7878/dashboard
 ```bash
 # Python SDK — recommended for application code
 pip install -e clients/python
-python examples/agents/python/quickstart.py
+python3 examples/agents/python/quickstart.py
 ```
 
 ## Tear down

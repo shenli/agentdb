@@ -19,7 +19,7 @@ Run me:
 
     # In another:
     pip install -e clients/python
-    python examples/agents/python/quickstart.py
+    python3 examples/agents/python/quickstart.py
 
 Expected output: three turns printed, each showing the working
 memory growing by one event. Then a fork that branches off the

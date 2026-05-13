@@ -13,7 +13,7 @@ Run me:
 
     # In another:
     pip install 'agentdb[async]'
-    python examples/agents/python/async_quickstart.py
+    python3 examples/agents/python/async_quickstart.py
 """
 
 from __future__ import annotations
