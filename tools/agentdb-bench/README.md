@@ -121,21 +121,24 @@ matrix above. The current long-run value matrix uses the same bounded
 1000-session shape, c=32, Zipf-1.2, `single-node-wal`, 30s warmup, 10m measured
 window, and 3 repeats.
 
-Matrix `longrun-value-wal-20260513-1` currently has these valid aggregate rows:
+Matrix `longrun-value-wal-20260513-1` has the AgentDB, MongoDB, and
+Postgres `mixed-agent-loop` rows. The Postgres `append-only` and
+`append-fetch-hot` rows below come from the repaired
+`longrun-value-wal-20260513-pg-rerun` matrix, because the original Postgres
+append rows hit a host disk limit in Docker's default root-filesystem volume.
 
 | Workload | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---|
 | `mixed-agent-loop` | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms | AgentDB is 1.59x MongoDB and 7.13x Postgres on the full agent loop. |
-| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | rerun in progress | AgentDB is 4.03x MongoDB; the old Postgres long-run cell is invalid. |
-| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | rerun in progress | AgentDB is 2.04x MongoDB; the old Postgres long-run cell is invalid. |
+| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms | AgentDB is 4.03x MongoDB and 5.58x Postgres on pure appends. |
+| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms | AgentDB is 2.04x MongoDB and 1.62x Postgres on fused append plus hot-tail reads. |
 
 The old Postgres long-run `append-only` and `append-fetch-hot` cells are not
 quoteable: their first captured error was `No space left on device` while
 Postgres extended a data file in Docker's default root-filesystem volume. PR
 `#259` moves Postgres data under `${OUT}/state/${RUN_ID}/pg-data` and makes
 future benchmark runs fail on measured operation errors. The repaired Postgres
-rerun is `longrun-value-wal-20260513-pg-rerun`; update this table only after all
-repeats complete cleanly.
+rerun completed 6/6 reports with `errors=0`.
 
 Use this interpretation:
 

@@ -105,15 +105,18 @@ On the current `li-dev` long-run validation matrix
 | Workload | AgentDB | MongoDB | Postgres | Result |
 |---|---:|---:|---:|---|
 | `mixed-agent-loop` | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms | 1.59x MongoDB, 7.13x Postgres |
-| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | rerun in progress | 4.03x MongoDB; Postgres rerun pending |
-| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | rerun in progress | 2.04x MongoDB; Postgres rerun pending |
+| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms | 4.03x MongoDB, 5.58x Postgres |
+| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms | 2.04x MongoDB, 1.62x Postgres |
 
 These are internal single-node benchmark results, not managed-service claims.
 The benchmark intentionally calls out API-shape advantages such as AgentDB's
 fused `append-and-fetch` primitive, durability profiles, cache-pressure cells,
-and invalid rows. See [tools/agentdb-bench](tools/agentdb-bench/README.md) to
-run the benchmark and [docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md)
-for methodology, caveats, and historical tuning notes.
+and invalid rows. The Postgres append rows above come from the repaired
+`longrun-value-wal-20260513-pg-rerun` matrix after the original Docker-volume
+run hit a host disk limit. See
+[tools/agentdb-bench](tools/agentdb-bench/README.md) to run the benchmark and
+[docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md) for
+methodology, caveats, and historical tuning notes.
 
 ## Quick Start
 
