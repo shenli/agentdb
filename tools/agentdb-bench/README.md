@@ -191,6 +191,19 @@ summaries. Keep the explicit dataset dimensions unless the host has enough disk
 for the full `default-agent-runtime` preset; the preset itself prepares a much
 larger corpus than the curated latest-comparison shape.
 
+For a long-run validation of the same value-prop matrix, use:
+
+```bash
+MATRIX_ID=longrun-value-wal-$(date +%Y%m%d) \
+  OUT=/path/with/enough/free/space \
+  scripts/agentdb-bench-longrun-value-matrix.sh
+```
+
+The long-run wrapper defaults to `REPEATS=3`, seeds `43,44,45`, `WARMUP=30s`,
+`DURATION=10m`, the bounded 1000-session shape above, c=32, Zipf-1.2, and
+`single-node-wal`. Use it before making external performance claims; use
+`scripts/agentdb-bench-value-matrix.sh` for faster one-off engineering checks.
+
 AgentDB native:
 
 ```bash
