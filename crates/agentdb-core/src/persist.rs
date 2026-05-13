@@ -334,10 +334,17 @@ impl AdaptiveWriteBatcher {
             // In single-node fsync mode, a short wait window materially
             // improves safe batching without the p99 hit of larger windows.
             .unwrap_or_else(|| if sync_writes { 2_000 } else { 0 });
+        let backlog_wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            // Preserve the direct fast path for isolated writes, but let the
+            // writer coalesce briefly once a backlog already exists.
+            .unwrap_or_else(|| if sync_writes { 0 } else { 5 });
         Some(Arc::new(Self::new(
             kv,
             max_ops,
             wait_us,
+            backlog_wait_us,
             !sync_writes && wait_us == 0,
         )))
     }
@@ -346,6 +353,7 @@ impl AdaptiveWriteBatcher {
         kv: Arc<dyn KvStore + Send + Sync>,
         max_ops: usize,
         wait_us: u64,
+        backlog_wait_us: u64,
         direct_fast_path: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AdaptiveWriteRequest>();
@@ -357,7 +365,17 @@ impl AdaptiveWriteBatcher {
                 let kv = kv.clone();
                 let queued = queued.clone();
                 let writer_busy = writer_busy.clone();
-                move || adaptive_write_loop(kv, rx, queued, writer_busy, max_ops, wait_us)
+                move || {
+                    adaptive_write_loop(
+                        kv,
+                        rx,
+                        queued,
+                        writer_busy,
+                        max_ops,
+                        wait_us,
+                        backlog_wait_us,
+                    )
+                }
             });
         Self {
             kv,
@@ -466,6 +484,7 @@ fn adaptive_write_loop(
     writer_busy: Arc<AtomicU64>,
     max_ops: usize,
     wait_us: u64,
+    backlog_wait_us: u64,
 ) {
     while let Ok(first) = rx.recv() {
         let mut requests = vec![first];
@@ -473,6 +492,8 @@ fn adaptive_write_loop(
         let mut op_count = requests[0].ops.len();
         if wait_us > 0 {
             thread::sleep(Duration::from_micros(wait_us));
+        } else if backlog_wait_us > 0 && queued.load(Ordering::Relaxed) > 0 {
+            thread::sleep(Duration::from_micros(backlog_wait_us));
         }
 
         while op_count < max_ops {
