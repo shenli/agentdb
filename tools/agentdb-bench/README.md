@@ -56,8 +56,8 @@ Why the split matters:
 
 All rows below use the mixed agent loop with Zipf-1.2 session selection, seed
 43, 1000 sessions, and a 60s measured window unless noted. Results were captured
-on `li-dev`; see `docs/operations/AGENTDB_BENCH.md` for historical tuning
-details and run paths.
+on a dedicated benchmark host; see `docs/operations/AGENTDB_BENCH.md` for
+historical tuning details and reproduction guidance.
 
 The workload is intentionally agent-runtime shaped:
 
@@ -97,11 +97,10 @@ settings, and observed disk usage before claiming the run truly exceeds cache.
 
 ### Bounded Core Workload Matrix
 
-This 30s `li-dev` matrix uses the bounded latest-comparison shape: 10 tenants,
-2 agents per tenant, 50 sessions per agent, 50 prepared events per session, 10
-records per session, 2 KiB event payloads, c=32, Zipf-1.2, and
-`single-node-wal`. It is a fast engineering check, not a publication-grade
-repeat set.
+This 30s matrix uses the bounded latest-comparison shape: 10 tenants, 2 agents
+per tenant, 50 sessions per agent, 50 prepared events per session, 10 records
+per session, 2 KiB event payloads, c=32, Zipf-1.2, and `single-node-wal`. It is
+a fast engineering check, not a publication-grade repeat set.
 
 | Workload | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---|
@@ -121,11 +120,8 @@ matrix above. The current long-run value matrix uses the same bounded
 1000-session shape, c=32, Zipf-1.2, `single-node-wal`, 30s warmup, 10m measured
 window, and 3 repeats.
 
-Matrix `longrun-value-wal-20260513-1` has the AgentDB, MongoDB, and
-Postgres `mixed-agent-loop` rows. The Postgres `append-only` and
-`append-fetch-hot` rows below come from the repaired
-`longrun-value-wal-20260513-pg-rerun` matrix, because the original Postgres
-append rows hit a host disk limit in Docker's default root-filesystem volume.
+The rows below come from completed long-run summaries using the same workload
+shape. Invalid rows from earlier failed infrastructure runs are excluded.
 
 | Workload | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---|
@@ -133,12 +129,9 @@ append rows hit a host disk limit in Docker's default root-filesystem volume.
 | `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms | AgentDB is 4.03x MongoDB and 5.58x Postgres on pure appends. |
 | `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms | AgentDB is 2.04x MongoDB and 1.62x Postgres on fused append plus hot-tail reads. |
 
-The old Postgres long-run `append-only` and `append-fetch-hot` cells are not
-quoteable: their first captured error was `No space left on device` while
-Postgres extended a data file in Docker's default root-filesystem volume. PR
-`#259` moves Postgres data under `${OUT}/state/${RUN_ID}/pg-data` and makes
-future benchmark runs fail on measured operation errors. The repaired Postgres
-rerun completed 6/6 reports with `errors=0`.
+Rows with measured operation errors are not quoteable. The wrapper scripts now
+store baseline database files under `${OUT}/state/${RUN_ID}/...` and
+`agentdb-bench run` fails by default when a measured cell reports errors.
 
 Use this interpretation:
 
@@ -220,7 +213,7 @@ larger corpus than the curated latest-comparison shape.
 For a long-run validation of the same value-prop matrix, use:
 
 ```bash
-MATRIX_ID=longrun-value-wal-$(date +%Y%m%d) \
+MATRIX_ID=my-longrun-value \
   OUT=/path/with/enough/free/space \
   scripts/agentdb-bench-longrun-value-matrix.sh
 ```
@@ -234,8 +227,8 @@ To inspect a running or completed matrix, use:
 
 ```bash
 scripts/agentdb-bench-status.sh \
-  --out /home/lishen/work/agentdb-bench-runs \
-  --matrix-id longrun-value-wal-20260513-1
+  --out /path/with/enough/free/space \
+  --matrix-id my-longrun-value
 ```
 
 The status helper prints disk headroom, matching active processes, completed
@@ -246,8 +239,8 @@ use:
 
 ```bash
 scripts/agentdb-bench-finalize-matrix.sh \
-  --out /home/lishen/work/agentdb-bench-runs \
-  --matrix-id longrun-value-wal-20260513-1
+  --out /path/with/enough/free/space \
+  --matrix-id my-longrun-value
 ```
 
 The finalizer writes `OUT/matrix/<matrix-id>-final.md`. It is safe to run while
@@ -261,7 +254,7 @@ first:
 
 ```bash
 scripts/agentdb-bench-prune.sh \
-  --root /home/lishen/work/agentdb-bench-runs \
+  --root /path/with/enough/free/space \
   --keep 30 \
   --target-free-gb 120
 ```
@@ -414,7 +407,7 @@ report is more important than wrapper exit status.
 
 Use this cell to test whether the comparison survives beyond a cache-warm hot
 set. It is intentionally heavier than the latest-comparison row and should be
-run on `li-dev` or another machine with enough disk space:
+run on a machine with enough disk space:
 
 ```bash
 BENCH_SCRIPT=scripts/agentdb-bench-local.sh \

@@ -105,7 +105,14 @@ The core workload is:
 - Occasionally write/search memory records, fork a session, or attach artifact
   metadata.
 
-Current long-run result on `li-dev`:
+Current long-run result on this benchmark configuration:
+
+- Host: Ubuntu 22.04, Linux 6.8, x86_64.
+- CPU/RAM: Intel Core i7-14700KF, 20 cores / 28 hardware threads, 31 GiB RAM.
+- Storage/runtime: local NVMe filesystem, AgentDB with RocksDB, MongoDB and
+  Postgres in Docker.
+- Workload profile: `single-node-wal`, 1000 sessions, Zipf-1.2 session skew,
+  concurrency 32, 30s warmup, 10m measured windows, 3 repeats.
 
 | Workload | What It Measures | AgentDB | MongoDB | Postgres |
 |---|---|---:|---:|---:|
@@ -113,11 +120,21 @@ Current long-run result on `li-dev`:
 | `append-only` | Ordered event appends without tail reads | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms |
 | `append-fetch-hot` | Fused append plus hot-tail read, the common agent step path | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms |
 
-Ratios from those rows:
+Speedup versus each baseline:
 
-- `mixed-agent-loop`: AgentDB is 1.59x MongoDB and 7.13x Postgres.
-- `append-only`: AgentDB is 4.03x MongoDB and 5.58x Postgres.
-- `append-fetch-hot`: AgentDB is 2.04x MongoDB and 1.62x Postgres.
+```text
+mixed-agent-loop
+  vs MongoDB   | ###             1.59x
+  vs Postgres  | ##############  7.13x
+
+append-only
+  vs MongoDB   | ########        4.03x
+  vs Postgres  | ###########     5.58x
+
+append-fetch-hot
+  vs MongoDB   | ####            2.04x
+  vs Postgres  | ###             1.62x
+```
 
 How to read this:
 
