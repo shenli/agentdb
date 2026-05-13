@@ -85,7 +85,7 @@ honors it before retrying.
 ## Prevent
 
 - Set `max_qps` and `max_tenant_qps` defaults based on observed p99
-  load from the benchmark workload (see `benchmarks/`), not
+  load from the benchmark workload (see `tools/agentdb-bench/baselines/`), not
   guesses. A too-low default turns normal spikes into incidents.
 - Monitor `quota_hits` as a rate metric. Sustained non-zero values
   mean either the quotas need raising or traffic patterns need

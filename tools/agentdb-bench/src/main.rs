@@ -2192,7 +2192,7 @@ async fn connect_postgres(dsn: &str) -> Result<PgPool> {
 }
 
 async fn init_postgres_event_log_schema(pool: &PgPool) -> Result<()> {
-    let schema = include_str!("../../../benchmarks/postgres/event_log.sql");
+    let schema = include_str!("../baselines/postgres/event_log.sql");
     for statement in schema.split(';') {
         let statement = statement.trim();
         if !statement.is_empty() {

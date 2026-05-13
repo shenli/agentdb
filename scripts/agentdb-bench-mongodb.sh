@@ -23,7 +23,7 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
 fi
 MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
-COMPOSE_DIR="${ROOT}/benchmarks/mongodb"
+COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
 
 mkdir -p "${OUT}"
