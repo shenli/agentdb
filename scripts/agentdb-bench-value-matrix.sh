@@ -63,6 +63,16 @@ extract_report_value() {
   printf 'n/a'
 }
 
+format_number() {
+  local value="$1"
+  local decimals="$2"
+  if [[ "${value}" == "n/a" || -z "${value}" || "${value}" == "null" ]]; then
+    printf 'n/a'
+    return
+  fi
+  awk -v value="${value}" -v decimals="${decimals}" 'BEGIN { printf "%.*f", decimals, value }'
+}
+
 find_single_report() {
   local run_id="$1"
   local report_count=0
@@ -150,9 +160,9 @@ for backend in "${backend_values[@]}"; do
 
       report="$(find_single_report "${run_id}")"
       if [[ -n "${report}" ]]; then
-        ops="$(extract_report_value "${report}" '.cells[0].ops_per_sec')"
-        p95="$(extract_report_value "${report}" '.cells[0].latency.p95_ms')"
-        p99="$(extract_report_value "${report}" '.cells[0].latency.p99_ms')"
+        ops="$(format_number "$(extract_report_value "${report}" '.cells[0].ops_per_sec')" 0)"
+        p95="$(format_number "$(extract_report_value "${report}" '.cells[0].latency.p95_ms')" 3)"
+        p99="$(format_number "$(extract_report_value "${report}" '.cells[0].latency.p99_ms')" 3)"
         errors="$(extract_report_value "${report}" '.cells[0].errors')"
         echo "| \`${backend}\` | \`${workload}\` | ${ops} | ${p95}ms | ${p99}ms | ${errors} | [json](${report}) |" >>"${summary}"
       else
