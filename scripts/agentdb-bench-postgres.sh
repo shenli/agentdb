@@ -36,6 +36,8 @@ if [[ -z "${PG_PORT:-}" ]]; then
 fi
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-postgres-${RUN_ID}}"
+PG_READY_ATTEMPTS="${PG_READY_ATTEMPTS:-300}"
+PG_READY_SLEEP="${PG_READY_SLEEP:-0.5}"
 
 compose() {
   PG_PORT="${PG_PORT}" \
@@ -73,17 +75,19 @@ fi
 
 compose up -d
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${PG_READY_ATTEMPTS}"); do
   if compose exec -T postgres \
     pg_isready -U bench -d bench >/dev/null 2>&1; then
     break
   fi
-  sleep 0.2
+  sleep "${PG_READY_SLEEP}"
 done
 
 if ! compose exec -T postgres \
   pg_isready -U bench -d bench >/dev/null 2>&1; then
   echo "Postgres did not become ready" >&2
+  compose ps >&2 || true
+  compose logs --no-color --tail=120 postgres >&2 || true
   exit 1
 fi
 

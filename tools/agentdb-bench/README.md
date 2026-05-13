@@ -361,6 +361,10 @@ by default, so new benchmark data remains removable by the benchmark user.
 Unless `MONGO_PORT` or `PG_PORT` is set, the wrappers choose a free localhost
 port at runtime so they do not conflict with existing development containers.
 The baseline containers publish those ports on `127.0.0.1` only.
+Readiness waits default to 150 seconds and can be tuned with
+`MONGO_READY_ATTEMPTS`/`MONGO_READY_SLEEP` and
+`PG_READY_ATTEMPTS`/`PG_READY_SLEEP`; failed readiness prints Compose status and
+recent container logs before teardown.
 When testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an
 existing Cargo target directory without breaking the wrapper binary lookup.
 
