@@ -23,6 +23,17 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
 fi
 PG_PORT="${PG_PORT:-5433}"
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-postgres-${RUN_ID}}"
+
+compose() {
+  PG_PORT="${PG_PORT}" \
+    docker compose -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_DIR}/docker-compose.yml" "$@"
+}
+
+cleanup() {
+  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 mkdir -p "${OUT}"
 free_kb="$(df -Pk "${OUT}" | awk 'NR == 2 {print $4}')"
@@ -48,17 +59,17 @@ if [[ -z "${PG_DSN:-}" ]]; then
   PG_DSN="postgres://bench:bench@127.0.0.1:${PG_PORT}/bench?options=-c%20synchronous_commit%3D${PG_SYNCHRONOUS_COMMIT}"
 fi
 
-docker compose -f "${COMPOSE_DIR}/docker-compose.yml" up -d
+compose up -d
 
 for _ in $(seq 1 100); do
-  if docker compose -f "${COMPOSE_DIR}/docker-compose.yml" exec -T postgres \
+  if compose exec -T postgres \
     pg_isready -U bench -d bench >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
 done
 
-if ! docker compose -f "${COMPOSE_DIR}/docker-compose.yml" exec -T postgres \
+if ! compose exec -T postgres \
   pg_isready -U bench -d bench >/dev/null 2>&1; then
   echo "Postgres did not become ready" >&2
   exit 1

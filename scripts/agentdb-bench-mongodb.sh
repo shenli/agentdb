@@ -25,6 +25,22 @@ MONGO_PORT="${MONGO_PORT:-27017}"
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-mongo-${RUN_ID}}"
+MONGO_UID="${MONGO_UID:-$(id -u)}"
+MONGO_GID="${MONGO_GID:-$(id -g)}"
+
+compose() {
+  MONGO_PORT="${MONGO_PORT}" \
+    MONGO_DATA_DIR="${MONGO_DATA_DIR}" \
+    MONGO_UID="${MONGO_UID}" \
+    MONGO_GID="${MONGO_GID}" \
+    docker compose -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_DIR}/docker-compose.yml" "$@"
+}
+
+cleanup() {
+  compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 mkdir -p "${OUT}"
 free_kb="$(df -Pk "${OUT}" | awk 'NR == 2 {print $4}')"
@@ -49,20 +65,18 @@ if [[ -z "${MONGO_URI:-}" ]]; then
   esac
 fi
 
-export MONGO_PORT
-export MONGO_DATA_DIR
 mkdir -p "${MONGO_DATA_DIR}"
-docker compose -f "${COMPOSE_DIR}/docker-compose.yml" up -d
+compose up -d
 
 for _ in $(seq 1 100); do
-  if docker compose -f "${COMPOSE_DIR}/docker-compose.yml" exec -T mongo \
+  if compose exec -T mongo \
     mongosh --quiet --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
 done
 
-if ! docker compose -f "${COMPOSE_DIR}/docker-compose.yml" exec -T mongo \
+if ! compose exec -T mongo \
   mongosh --quiet --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then
   echo "MongoDB did not become ready" >&2
   exit 1
