@@ -6,7 +6,7 @@ KEEP="${AGENTDB_BENCH_PRUNE_KEEP:-20}"
 TARGET_FREE_GB="${AGENTDB_BENCH_PRUNE_TARGET_FREE_GB:-0}"
 DELETE=0
 USE_SUDO=0
-EXCLUDE_NAMES=(logs summaries matrix)
+EXCLUDE_NAMES=(logs matrix runs summaries)
 
 usage() {
   cat <<'EOF'
@@ -24,7 +24,7 @@ Options:
   --dry-run              Explicit dry-run mode.
   --sudo                 Use passwordless sudo for sizing and deletion. Useful for Docker-owned DB data.
   --exclude NAME         Exclude a direct child directory name. Can be repeated.
-                         Defaults: logs, summaries, matrix.
+                         Defaults: logs, matrix, runs, summaries.
   --help                 Show this help.
 
 Examples:
@@ -248,13 +248,24 @@ if ((${#delete_paths[@]} == 0)); then
   exit 0
 fi
 
+failed_deletes=()
 for path in "${delete_paths[@]}"; do
   size="$(du_human "${path}")"
   [[ -n "${size}" ]] || size="unknown-size"
   if ((DELETE == 1)); then
-    delete_path "${path}"
-    echo "deleted ${size} ${path}"
+    if delete_path "${path}"; then
+      echo "deleted ${size} ${path}"
+    else
+      failed_deletes+=("${path}")
+      echo "failed ${size} ${path}" >&2
+    fi
   else
     echo "would delete ${size} ${path}"
   fi
 done
+
+if ((DELETE == 1 && ${#failed_deletes[@]} > 0)); then
+  echo "failed_deletes=${#failed_deletes[@]}" >&2
+  echo "Some directories were not deleted. If they contain Docker-owned database data, rerun with --sudo after enabling passwordless sudo for this command." >&2
+  exit 1
+fi
