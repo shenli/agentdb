@@ -162,12 +162,13 @@ fi
   if [[ ! -s "${tmp_rows}" ]]; then
     echo "No repeat summaries found yet."
   else
-    echo "| Backend | Workload | c | Selection | Repeats | ops/s mean | ops/s min-max | ops/s stddev | p95 mean | p99 mean | Errors |"
-    echo "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+    echo "| Backend | Workload | c | Selection | Repeats | ops/s mean | ops/s min-max | ops/s stddev | p95 mean | p99 mean | Errors | Valid |"
+    echo "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"
     sort -t $'\t' -k2,2 -k1,1 "${tmp_rows}" | awk -F '\t' '
       {
-        printf "| `%s` | `%s` | %s | `%s` | %s | %0.2f | %0.2f-%0.2f | %0.2f | %0.3fms | %0.3fms | %s |\n",
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+        valid = ($12 == 0 ? "yes" : "no")
+        printf "| `%s` | `%s` | %s | `%s` | %s | %0.2f | %0.2f-%0.2f | %0.2f | %0.3fms | %0.3fms | %s | %s |\n",
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, valid
       }
     '
   fi
@@ -184,12 +185,14 @@ fi
       {
         key=$2
         backend[key, $1]=$6
+        errors[key, $1]=$12
         workloads[key]=1
       }
       END {
         for (workload in workloads) {
           base=backend[workload, baseline]
-          if (base == "" || base == 0) {
+          base_errors=errors[workload, baseline]
+          if (base == "" || base == 0 || base_errors != 0) {
             continue
           }
           for (pair in backend) {
@@ -200,7 +203,8 @@ fi
               continue
             }
             other=backend[workload, other_backend]
-            if (other == "" || other == 0) {
+            other_errors=errors[workload, other_backend]
+            if (other == "" || other == 0 || other_errors != 0) {
               continue
             }
             printf "| `%s` | `%s` / `%s` | %0.2fx | %0.2f | %0.2f |\n",

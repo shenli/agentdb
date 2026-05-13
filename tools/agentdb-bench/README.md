@@ -227,6 +227,8 @@ scripts/agentdb-bench-finalize-matrix.sh \
 The finalizer writes `OUT/matrix/<matrix-id>-final.md`. It is safe to run while
 a matrix is still active: completed cells are included, missing cells remain
 absent, and active matching processes are recorded in the generated summary.
+Rows with nonzero operation errors are marked invalid and excluded from ratio
+calculations.
 
 Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
 first:
@@ -367,6 +369,10 @@ Readiness waits default to 150 seconds and can be tuned with
 recent container logs before teardown.
 When testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an
 existing Cargo target directory without breaking the wrapper binary lookup.
+
+`agentdb-bench run` fails by default when measured operations report errors.
+Use `--allow-errors` only for debugging a broken cell where keeping the partial
+report is more important than wrapper exit status.
 
 ## Working-Set-Exceeds-Cache Cell
 

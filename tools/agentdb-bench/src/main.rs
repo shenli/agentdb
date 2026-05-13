@@ -136,6 +136,8 @@ struct RunArgs {
     zipf_exponent: f64,
     #[arg(long)]
     no_raw_jsonl: bool,
+    #[arg(long)]
+    allow_errors: bool,
     #[arg(long, default_value_t = 43)]
     seed: u64,
 }
@@ -1186,6 +1188,13 @@ async fn run(args: RunArgs) -> Result<()> {
     write_json(&report_path, &report)?;
     write_markdown_report(run_dir.join("report.md"), &manifest, &report)?;
     println!("wrote {}", report_path.display());
+    let total_errors = report.cells.iter().map(|cell| cell.errors).sum::<u64>();
+    if total_errors > 0 && !args.allow_errors {
+        return Err(anyhow!(
+            "benchmark completed with {total_errors} operation errors; report written to {}",
+            report_path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -1681,6 +1690,7 @@ impl RunArgs {
             session_selection: self.session_selection,
             zipf_exponent: self.zipf_exponent,
             no_raw_jsonl: self.no_raw_jsonl,
+            allow_errors: self.allow_errors,
             seed: self.seed,
         }
     }
