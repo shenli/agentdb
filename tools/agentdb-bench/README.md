@@ -218,7 +218,9 @@ If the dry-run plan is correct, add `--delete`. The prune script only considers
 direct child directories under `--root`, keeps the newest `--keep` directories,
 and refuses unsafe roots such as `/` and `$HOME`. If old MongoDB or Postgres
 Docker data is root-owned, add `--sudo` to the dry-run and delete commands so
-the script can size and remove those directories with passwordless sudo.
+the script can size and remove those directories with passwordless sudo. Root
+metadata directories named `logs`, `summaries`, and `matrix` are excluded by
+default; add repeated `--exclude NAME` flags for other non-run directories.
 
 AgentDB native:
 

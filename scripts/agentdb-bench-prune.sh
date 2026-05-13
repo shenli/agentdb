@@ -6,6 +6,7 @@ KEEP="${AGENTDB_BENCH_PRUNE_KEEP:-20}"
 TARGET_FREE_GB="${AGENTDB_BENCH_PRUNE_TARGET_FREE_GB:-0}"
 DELETE=0
 USE_SUDO=0
+EXCLUDE_NAMES=(logs summaries matrix)
 
 usage() {
   cat <<'EOF'
@@ -22,6 +23,8 @@ Options:
   --delete               Actually delete selected directories. Without this, prints a dry-run plan.
   --dry-run              Explicit dry-run mode.
   --sudo                 Use passwordless sudo for sizing and deletion. Useful for Docker-owned DB data.
+  --exclude NAME         Exclude a direct child directory name. Can be repeated.
+                         Defaults: logs, summaries, matrix.
   --help                 Show this help.
 
 Examples:
@@ -55,6 +58,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sudo)
       USE_SUDO=1
+      ;;
+    --exclude)
+      shift
+      exclude_name="${1:-}"
+      [[ -n "${exclude_name}" ]] || { echo "--exclude requires a value" >&2; exit 2; }
+      EXCLUDE_NAMES+=("${exclude_name}")
       ;;
     --help|-h)
       usage
@@ -131,15 +140,18 @@ size_errors=0
 entries=()
 while IFS= read -r line; do
   entries+=("${line}")
-done < <(python3 - "${root_abs}" <<'PY'
+done < <(python3 - "${root_abs}" "${EXCLUDE_NAMES[@]}" <<'PY'
 import os
 import sys
 
 root = sys.argv[1]
+excluded = set(sys.argv[2:])
 entries = []
 with os.scandir(root) as it:
     for entry in it:
         try:
+            if entry.name in excluded:
+                continue
             if not entry.is_dir(follow_symlinks=False):
                 continue
             stat = entry.stat(follow_symlinks=False)
@@ -222,6 +234,7 @@ fi
 echo "benchmark prune mode=${mode}"
 echo "root=${root_abs}"
 echo "children=${total} keep=${KEEP}"
+echo "excluded_names=${EXCLUDE_NAMES[*]}"
 echo "current_free_gb=$((current_free_kb / 1024 / 1024)) target_free_gb=${TARGET_FREE_GB} projected_free_gb=$((projected_free_kb / 1024 / 1024))"
 if ((USE_SUDO == 1)); then
   echo "sudo=enabled"
