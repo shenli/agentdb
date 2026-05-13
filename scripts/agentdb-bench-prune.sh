@@ -102,17 +102,17 @@ free_kb() {
 
 du_kb() {
   if ((USE_SUDO == 1)); then
-    sudo -n du -sk -- "$1" 2>/dev/null | awk '{print $1}'
+    { sudo -n du -sk -- "$1" 2>/dev/null || true; } | awk 'NR == 1 {print $1}'
   else
-    du -sk -- "$1" 2>/dev/null | awk '{print $1}'
+    { du -sk -- "$1" 2>/dev/null || true; } | awk 'NR == 1 {print $1}'
   fi
 }
 
 du_human() {
   if ((USE_SUDO == 1)); then
-    sudo -n du -sh -- "$1" 2>/dev/null | awk '{print $1}'
+    { sudo -n du -sh -- "$1" 2>/dev/null || true; } | awk 'NR == 1 {print $1}'
   else
-    du -sh -- "$1" 2>/dev/null | awk '{print $1}'
+    { du -sh -- "$1" 2>/dev/null || true; } | awk 'NR == 1 {print $1}'
   fi
 }
 
