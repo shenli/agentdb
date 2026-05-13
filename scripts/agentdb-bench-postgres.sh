@@ -21,12 +21,28 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
     MIN_FREE_GB=5
   fi
 fi
-PG_PORT="${PG_PORT:-5433}"
+choose_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+if [[ -z "${PG_PORT:-}" ]]; then
+  PG_PORT="$(choose_free_port)"
+fi
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
+PG_DATA_DIR="${PG_DATA_DIR:-${OUT}/state/${RUN_ID}/pg-data}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-postgres-${RUN_ID}}"
+PG_READY_ATTEMPTS="${PG_READY_ATTEMPTS:-300}"
+PG_READY_SLEEP="${PG_READY_SLEEP:-0.5}"
 
 compose() {
   PG_PORT="${PG_PORT}" \
+    PG_DATA_DIR="${PG_DATA_DIR}" \
     docker compose -p "${COMPOSE_PROJECT_NAME}" -f "${COMPOSE_DIR}/docker-compose.yml" "$@"
 }
 
@@ -42,6 +58,8 @@ if [[ "${free_kb}" -lt "${min_free_kb}" ]]; then
   echo "not enough free disk for benchmark: have $((free_kb / 1024 / 1024)) GiB, need ${MIN_FREE_GB} GiB" >&2
   exit 1
 fi
+
+mkdir -p "${PG_DATA_DIR}"
 
 if [[ -z "${PG_DSN:-}" ]]; then
   case "${DURABILITY_PROFILE}" in
@@ -61,17 +79,19 @@ fi
 
 compose up -d
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${PG_READY_ATTEMPTS}"); do
   if compose exec -T postgres \
     pg_isready -U bench -d bench >/dev/null 2>&1; then
     break
   fi
-  sleep 0.2
+  sleep "${PG_READY_SLEEP}"
 done
 
 if ! compose exec -T postgres \
   pg_isready -U bench -d bench >/dev/null 2>&1; then
   echo "Postgres did not become ready" >&2
+  compose ps >&2 || true
+  compose logs --no-color --tail=120 postgres >&2 || true
   exit 1
 fi
 

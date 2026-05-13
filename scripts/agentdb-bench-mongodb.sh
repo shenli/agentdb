@@ -21,13 +21,27 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
     MIN_FREE_GB=5
   fi
 fi
-MONGO_PORT="${MONGO_PORT:-27017}"
+choose_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+if [[ -z "${MONGO_PORT:-}" ]]; then
+  MONGO_PORT="$(choose_free_port)"
+fi
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-mongo-${RUN_ID}}"
 MONGO_UID="${MONGO_UID:-$(id -u)}"
 MONGO_GID="${MONGO_GID:-$(id -g)}"
+MONGO_READY_ATTEMPTS="${MONGO_READY_ATTEMPTS:-300}"
+MONGO_READY_SLEEP="${MONGO_READY_SLEEP:-0.5}"
 
 compose() {
   MONGO_PORT="${MONGO_PORT}" \
@@ -68,17 +82,19 @@ fi
 mkdir -p "${MONGO_DATA_DIR}"
 compose up -d
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "${MONGO_READY_ATTEMPTS}"); do
   if compose exec -T mongo \
     mongosh --quiet --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then
     break
   fi
-  sleep 0.2
+  sleep "${MONGO_READY_SLEEP}"
 done
 
 if ! compose exec -T mongo \
   mongosh --quiet --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then
   echo "MongoDB did not become ready" >&2
+  compose ps >&2 || true
+  compose logs --no-color --tail=120 mongo >&2 || true
   exit 1
 fi
 

@@ -56,8 +56,8 @@ Why the split matters:
 
 All rows below use the mixed agent loop with Zipf-1.2 session selection, seed
 43, 1000 sessions, and a 60s measured window unless noted. Results were captured
-on `li-dev`; see `docs/operations/AGENTDB_BENCH.md` for historical tuning
-details and run paths.
+on a dedicated benchmark host; see `docs/operations/AGENTDB_BENCH.md` for
+historical tuning details and reproduction guidance.
 
 The workload is intentionally agent-runtime shaped:
 
@@ -97,11 +97,10 @@ settings, and observed disk usage before claiming the run truly exceeds cache.
 
 ### Bounded Core Workload Matrix
 
-This 30s `li-dev` matrix uses the bounded latest-comparison shape: 10 tenants,
-2 agents per tenant, 50 sessions per agent, 50 prepared events per session, 10
-records per session, 2 KiB event payloads, c=32, Zipf-1.2, and
-`single-node-wal`. It is a fast engineering check, not a publication-grade
-repeat set.
+This 30s matrix uses the bounded latest-comparison shape: 10 tenants, 2 agents
+per tenant, 50 sessions per agent, 50 prepared events per session, 10 records
+per session, 2 KiB event payloads, c=32, Zipf-1.2, and `single-node-wal`. It is
+a fast engineering check, not a publication-grade repeat set.
 
 | Workload | AgentDB | MongoDB | Postgres | What It Means |
 |---|---:|---:|---:|---|
@@ -113,6 +112,26 @@ The previous append-only cell was 23,878 ops/s with p99 8.71ms. Routing simple
 append-only requests through the same-session coalescer moved the same cell to
 79,781 ops/s with p99 1.15ms, while the mixed-agent-loop and append-fetch-hot
 checks stayed flat.
+
+### Long-Run Validation Status
+
+For comparison claims, prefer the long-run matrix over the fast engineering
+matrix above. The current long-run value matrix uses the same bounded
+1000-session shape, c=32, Zipf-1.2, `single-node-wal`, 30s warmup, 10m measured
+window, and 3 repeats.
+
+The rows below come from completed long-run summaries using the same workload
+shape. Invalid rows from earlier failed infrastructure runs are excluded.
+
+| Workload | AgentDB | MongoDB | Postgres | What It Means |
+|---|---:|---:|---:|---|
+| `mixed-agent-loop` | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms | AgentDB is 1.59x MongoDB and 7.13x Postgres on the full agent loop. |
+| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms | AgentDB is 4.03x MongoDB and 5.58x Postgres on pure appends. |
+| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms | AgentDB is 2.04x MongoDB and 1.62x Postgres on fused append plus hot-tail reads. |
+
+Rows with measured operation errors are not quoteable. The wrapper scripts now
+store baseline database files under `${OUT}/state/${RUN_ID}/...` and
+`agentdb-bench run` fails by default when a measured cell reports errors.
 
 Use this interpretation:
 
@@ -194,7 +213,7 @@ larger corpus than the curated latest-comparison shape.
 For a long-run validation of the same value-prop matrix, use:
 
 ```bash
-MATRIX_ID=longrun-value-wal-$(date +%Y%m%d) \
+MATRIX_ID=my-longrun-value \
   OUT=/path/with/enough/free/space \
   scripts/agentdb-bench-longrun-value-matrix.sh
 ```
@@ -208,19 +227,34 @@ To inspect a running or completed matrix, use:
 
 ```bash
 scripts/agentdb-bench-status.sh \
-  --out /home/lishen/work/agentdb-bench-runs \
-  --matrix-id longrun-value-wal-20260513-1
+  --out /path/with/enough/free/space \
+  --matrix-id my-longrun-value
 ```
 
 The status helper prints disk headroom, matching active processes, completed
 repeat summaries, completed run-report count, and the tail of the matrix log.
+
+To generate a comparison-ready Markdown summary from completed repeat summaries,
+use:
+
+```bash
+scripts/agentdb-bench-finalize-matrix.sh \
+  --out /path/with/enough/free/space \
+  --matrix-id my-longrun-value
+```
+
+The finalizer writes `OUT/matrix/<matrix-id>-final.md`. It is safe to run while
+a matrix is still active: completed cells are included, missing cells remain
+absent, and active matching processes are recorded in the generated summary.
+Rows with nonzero operation errors are marked invalid and excluded from ratio
+calculations.
 
 Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
 first:
 
 ```bash
 scripts/agentdb-bench-prune.sh \
-  --root /home/lishen/work/agentdb-bench-runs \
+  --root /path/with/enough/free/space \
   --keep 30 \
   --target-free-gb 120
 ```
@@ -342,17 +376,38 @@ Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
 the same thing as real MongoDB.
 
 The MongoDB and Postgres baseline wrappers use per-run Docker Compose project
-names and tear containers down on exit. MongoDB data is bind-mounted under the
-benchmark output root and the container runs as the host `MONGO_UID:MONGO_GID`
-by default, so new benchmark data remains removable by the benchmark user. When
-testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an existing
-Cargo target directory without breaking the wrapper binary lookup.
+names and tear containers down on exit. Baseline database files are
+bind-mounted under the benchmark output root instead of Docker's default volume
+directory:
+
+- MongoDB: `${OUT}/state/${RUN_ID}/mongo-data`
+- Postgres: `${OUT}/state/${RUN_ID}/pg-data`
+
+This keeps long runs on the filesystem selected by `OUT` and avoids filling the
+host root filesystem with Docker volumes. MongoDB runs as the host
+`MONGO_UID:MONGO_GID` by default, so new MongoDB data remains removable by the
+benchmark user. Postgres data may be owned by the container user; use the prune
+helper with `--sudo` when needed.
+
+Unless `MONGO_PORT` or `PG_PORT` is set, the wrappers choose a free localhost
+port at runtime so they do not conflict with existing development containers.
+The baseline containers publish those ports on `127.0.0.1` only.
+Readiness waits default to 150 seconds and can be tuned with
+`MONGO_READY_ATTEMPTS`/`MONGO_READY_SLEEP` and
+`PG_READY_ATTEMPTS`/`PG_READY_SLEEP`; failed readiness prints Compose status and
+recent container logs before teardown.
+When testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an
+existing Cargo target directory without breaking the wrapper binary lookup.
+
+`agentdb-bench run` fails by default when measured operations report errors.
+Use `--allow-errors` only for debugging a broken cell where keeping the partial
+report is more important than wrapper exit status.
 
 ## Working-Set-Exceeds-Cache Cell
 
 Use this cell to test whether the comparison survives beyond a cache-warm hot
 set. It is intentionally heavier than the latest-comparison row and should be
-run on `li-dev` or another machine with enough disk space:
+run on a machine with enough disk space:
 
 ```bash
 BENCH_SCRIPT=scripts/agentdb-bench-local.sh \

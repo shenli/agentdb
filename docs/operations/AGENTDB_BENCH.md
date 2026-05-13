@@ -15,8 +15,8 @@ The benchmark must be reproducible, transparent, and conservative. Any public
 claim must include the exact schema, hardware, durability setting, workload mix,
 git SHA, and database versions used for the run.
 
-Current status: the `li-dev` numbers are credible internal microbenchmarks for
-the agent-runtime data model, but they should not be used as external
+Current status: the dedicated-host numbers are credible internal microbenchmarks
+for the agent-runtime data model, but they should not be used as external
 MongoDB/Postgres performance claims yet. The current headline shape is
 single-node, same-host, cache-warm, short-duration, and API-shape aware:
 AgentDB uses its fused `append-and-fetch` primitive, while MongoDB/Postgres
@@ -41,9 +41,10 @@ Before publishing external ratios, close these benchmark gaps:
 - Treat current `record_search` as scalar/tag top-K, not semantic retrieval;
   vector/semantic memory search needs separate cells.
 
-## Latest `li-dev` Results
+## Latest Dedicated-Host Results
 
-These are the current single-node local RocksDB results from `li-dev` after the
+These are the current single-node local RocksDB results from a dedicated
+benchmark host after the
 append-path lock narrowing, MongoDB-API recent-fetch changes, append
 group-commit profiling/fixes, metadata-only policy fast-pathing, local-route
 forwarding-body laziness, and local RocksDB default tuning. They use release
@@ -52,34 +53,15 @@ RocksDB metadata/index storage, local filesystem content storage, 1 tenant, 1
 agent, 16-320 sessions depending on the run, 3s warmup, and 8-10s measured
 duration depending on the sweep.
 
-| Run | Workload | c=1 | c=4 | c=8 | c=16 | c=32 | Report |
-|---|---|---:|---:|---:|---:|---:|---|
-| `agentdb-append-lockfix` | `append-fetch-hot` | 5634 ops/s | 10431 ops/s | 13515 ops/s | 13377 ops/s | 13961 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-append-lockfix/runs/agentdb-append-lockfix/report.md` |
-| `agentdb-native-single-mixed-v2` | `mixed-agent-loop` | 6268 ops/s | 13960 ops/s | 17204 ops/s | 17706 ops/s | 17429 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-native-single-mixed-v2/runs/agentdb-native-single-mixed-v2/report.md` |
-| `agentdb-mongodb-api-append` | `append-fetch-hot` | 5363 ops/s | 6586 ops/s | 14118 ops/s | 12028 ops/s | 11937 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-append/runs/agentdb-mongodb-api-append/report.md` |
-| `agentdb-mongodb-api-single-mixed-v2` | `mixed-agent-loop` | 4505 ops/s | 6058 ops/s | 15041 ops/s | 12651 ops/s | 12467 ops/s | `/home/lishen/agentdb-bench-runs/agentdb-mongodb-api-single-mixed-v2/runs/agentdb-mongodb-api-single-mixed-v2/report.md` |
-| `agentdb-adaptive-group-append-sweep` | `append-fetch-hot` | 9459 ops/s | n/a | 23467 ops/s | 27354 ops/s | 28035 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-append-sweep/runs/agentdb-adaptive-group-append-sweep/report.md` |
-| `agentdb-adaptive-group-mixed` | `mixed-agent-loop` | 9766 ops/s | n/a | 19143 ops/s | 25492 ops/s | 24242 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-adaptive-group-mixed/runs/agentdb-adaptive-group-mixed/report.md` |
-| `agentdb-defaultgroup-append-only-sweep` | `append-only` | 11442 ops/s | n/a | 27082 ops/s | 32484 ops/s | 34120 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-append-only-sweep/runs/agentdb-defaultgroup-append-only-sweep/report.md` |
-| `agentdb-defaultgroup-append-fetch-hot-sweep` | `append-fetch-hot` | 10103 ops/s | n/a | 23740 ops/s | 28243 ops/s | 28286 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-append-fetch-hot-sweep/runs/agentdb-defaultgroup-append-fetch-hot-sweep/report.md` |
-| `agentdb-defaultgroup-mixed-agent-loop-sweep` | `mixed-agent-loop` | 10878 ops/s | n/a | 19719 ops/s | 24491 ops/s | 24321 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-defaultgroup-mixed-agent-loop-sweep/runs/agentdb-defaultgroup-mixed-agent-loop-sweep/report.md` |
-| `agentdb-mimalloc-hotcache-append-only-sweep` | `append-only` | 12033 ops/s | n/a | 26874 ops/s | 34484 ops/s | 35249 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-append-only-sweep/runs/agentdb-mimalloc-hotcache-append-only-sweep/report.md` |
-| `agentdb-mimalloc-hotcache-append-fetch-hot-sweep` | `append-fetch-hot` | 10138 ops/s | n/a | 24702 ops/s | 30354 ops/s | 31613 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-append-fetch-hot-sweep/runs/agentdb-mimalloc-hotcache-append-fetch-hot-sweep/report.md` |
-| `agentdb-mimalloc-hotcache-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11692 ops/s | n/a | 21695 ops/s | 28290 ops/s | 25292 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mimalloc-hotcache-mixed-agent-loop-sweep/runs/agentdb-mimalloc-hotcache-mixed-agent-loop-sweep/report.md` |
-| `agentdb-mixedpaths-append-only-sweep` | `append-only` | 12301 ops/s | n/a | 28010 ops/s | 34684 ops/s | 36592 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-append-only-sweep/runs/agentdb-mixedpaths-append-only-sweep/report.md` |
-| `agentdb-mixedpaths-append-fetch-hot-sweep` | `append-fetch-hot` | 10938 ops/s | n/a | 25140 ops/s | 30746 ops/s | 31614 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-append-fetch-hot-sweep/runs/agentdb-mixedpaths-append-fetch-hot-sweep/report.md` |
-| `agentdb-mixedpaths-mixed-agent-loop-sweep` | `mixed-agent-loop` | 11266 ops/s | n/a | 32935 ops/s | 40515 ops/s | 41236 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-mixed-agent-loop-sweep/runs/agentdb-mixedpaths-mixed-agent-loop-sweep/report.md` |
-| `agentdb-mixedpaths-record-write-only-sweep` | `record-write-only` | 11535 ops/s | n/a | 21602 ops/s | 28966 ops/s | 35192 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-record-write-only-sweep/runs/agentdb-mixedpaths-record-write-only-sweep/report.md` |
-| `agentdb-mixedpaths-artifact-only-sweep` | `artifact-only` | 11534 ops/s | n/a | 26054 ops/s | 32596 ops/s | 34523 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-mixedpaths-artifact-only-sweep/runs/agentdb-mixedpaths-artifact-only-sweep/report.md` |
-| `agentdb-final-eventsource-session-mixed-sweep` | `mixed-agent-loop` | 10812 ops/s | n/a | 39396 ops/s | 49686 ops/s | 52920 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-eventsource-session-mixed-sweep/runs/agentdb-final-eventsource-session-mixed-sweep/report.md` |
-| `agentdb-final-policyfast-mixed-sweep` | `mixed-agent-loop` | 11714 ops/s | n/a | 39964 ops/s | 52085 ops/s | 55834 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-final-policyfast-mixed-sweep/runs/agentdb-final-policyfast-mixed-sweep/report.md` |
-| `agentdb-rocks-defaults-append-sweep` | `append-only` | 14577 ops/s | n/a | 38514 ops/s | 44801 ops/s | 48985 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-append-sweep/runs/agentdb-rocks-defaults-append-sweep/report.md` |
-| `agentdb-rocks-defaults-appendfetch-sweep` | `append-fetch-hot` | 11836 ops/s | n/a | 33513 ops/s | 38569 ops/s | 41097 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-appendfetch-sweep/runs/agentdb-rocks-defaults-appendfetch-sweep/report.md` |
-| `agentdb-rocks-defaults-mixed-sweep` | `mixed-agent-loop` | 11819 ops/s | n/a | 40858 ops/s | 52422 ops/s | 55998 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/agentdb-rocks-defaults-mixed-sweep/runs/agentdb-rocks-defaults-mixed-sweep/report.md` |
-| `mongodb-append-only-fixed` | `append-only` | 5303 ops/s | n/a | 6173 ops/s | 20477 ops/s | 19553 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-append-only-fixed/runs/mongodb-append-only-fixed/report.md` |
-| `mongodb-mixed-same-shape` | `mixed-agent-loop` | 3526 ops/s | 2808 ops/s | 4846 ops/s | 24217 ops/s | 25603 ops/s | `/home/lishen/agentdb-bench-runs/mongodb-mixed-same-shape/runs/mongodb-mixed-same-shape/report.md` |
-| `mongodb-final-mixed-current-shape` | `mixed-agent-loop` | 3867 ops/s | n/a | 6357 ops/s | 25460 ops/s | 26186 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/mongodb-final-mixed-current-shape/runs/mongodb-final-mixed-current-shape/report.md` |
-| `postgres-final-mixed-current-shape` | `mixed-agent-loop` | 449 ops/s | n/a | 2106 ops/s | 3776 ops/s | 5334 ops/s | `/media/54943193-d308-4802-b135-7293aec29a1b/agentdb-bench-runs/postgres-final-mixed-current-shape/runs/postgres-final-mixed-current-shape/report.md` |
+| Stage | Representative result | Notes |
+|---|---:|---|
+| Initial AgentDB append-fetch hot path | 3.4k ops/s at c=32 | Pre-lock-narrowing baseline. |
+| Post lock narrowing / append-path fixes | 14.0k ops/s at c=32 | First major append-fetch improvement. |
+| Mixed-path/state-lock cleanup | 41.2k ops/s at c=32 | Reduced duplicate state-lock and route serialization work. |
+| Event-source/session fast path | 52.9k ops/s at c=32 | Avoided warm-session full-row writes. |
+| Policy fast path and RocksDB defaults | 56.0k ops/s at c=32 | Current short-run mixed-agent-loop peak in this history. |
+| MongoDB normalized event-log baseline | 26.2k ops/s at c=32 | Same synthetic mixed-agent-loop shape. |
+| Postgres normalized event-log baseline | 5.3k ops/s at c=32 | Same synthetic mixed-agent-loop shape. |
 
 Compared with the pre-fix local RocksDB runs, `append-fetch-hot` at c=32 moved
 from roughly 3.4k ops/s to 14.0k ops/s, and `mixed-agent-loop` at c=32 moved
@@ -114,7 +96,8 @@ persisted event stream to recover warm-session `next_seq` instead of writing
 the full session row on every warm append. The latest run also skips full
 policy merge/deserialization for metadata-only tenant policy JSON, avoids eager
 forwarding-body serialization for local session mutations, and opens RocksDB
-with larger local write buffers/background jobs. On `li-dev`, the latest
+with larger local write buffers/background jobs. On the dedicated benchmark host,
+the latest
 same-shape `mixed-agent-loop` c=32 result is 56.0k ops/s for AgentDB, 26.2k
 ops/s for MongoDB, and 5.3k ops/s for Postgres. That is about 2.14x MongoDB and
 10.50x Postgres for this synthetic mixed agent loop. This ratio is an internal
@@ -137,9 +120,7 @@ publication-grade cell.
 | `hotset-90-10` | 56,787 ops/s | 24,967 ops/s | 9,525 ops/s | 2.27x | 5.96x | Hotset spreads load across about 100 hot sessions. |
 
 The repeated Zipf validation cell uses the same dataset shape and c=32, but
-with 3 seeds, 10s warmup, and 60s measured windows. The combined summary is on
-`li-dev` at
-`/home/lishen/work/agentdb-bench-runs/zipf-60s/summaries/zipf-60s-combined/summary.md`.
+with 3 seeds, 10s warmup, and 60s measured windows.
 
 | Backend | Repeats | ops/s mean | ops/s min | ops/s max | ops/s stddev | p95 mean | p99 mean |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -177,13 +158,12 @@ baselines are MongoDB standalone acknowledged writes without `journal=true` and
 Postgres with `synchronous_commit=off`. This profile represents fast local
 tryout behavior, not host-crash durable media semantics.
 
-The latest `li-dev` Zipf-1.2 c=32 single-seed sanity run used 1000 sessions
+The latest dedicated-host Zipf-1.2 c=32 single-seed sanity run used 1000 sessions
 (10 tenants x 2 agents x 50 sessions), 10s warmup, and a 60s measured window.
 AgentDB uses a zero same-session coalescing wait in this profile; a 5ms wait
 was useful for fsync grouping but cut local WAL throughput to 8.4k ops/s.
 
-Results are on `li-dev` under
-`/home/lishen/work/agentdb-bench-runs/single-node-wal`.
+Results are from the dedicated benchmark host.
 
 | Backend/profile | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---:|---|
@@ -205,8 +185,7 @@ database/index overhead and about 42.0 GB of external artifact references. This
 cell is intended to expose storage footprint, cache pressure, and longer
 compaction/checkpoint behavior that the cache-warm 1000-session cell hides.
 
-Results are on `li-dev` under
-`/home/lishen/work/agentdb-bench-runs/working-set-cache`.
+Results are from the dedicated benchmark host.
 
 | Backend/profile | State size | ops/s | p50 | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -275,9 +254,7 @@ AgentDB ran RocksDB sync writes with adaptive append group commit, MongoDB used
 `journal=true&w=1`, and Postgres used `synchronous_commit=on`. This is a single
 seed (`43`) sanity run, not a publishable comparison.
 
-Results are on `li-dev` under
-`/home/lishen/work/agentdb-bench-runs/durable-single-zipf` and
-`/home/lishen/work/agentdb-bench-runs/single-node-fsync-sweep`.
+Results are from the dedicated benchmark host.
 
 | Backend/profile | ops/s | p95 | p99 | AgentDB ratio | Notes |
 |---|---:|---:|---:|---:|---|
@@ -296,7 +273,7 @@ cell showed `append_fetch` p95 at 897ms and p99 at 982ms, while metadata writes
 such as `record_write` and `fork` stayed near 53-54ms p95. That pointed at the
 durable append path rather than read caching as the bottleneck.
 
-Follow-up fsync group-commit tuning on `li-dev` used a smaller c=32 Zipf-1.2
+Follow-up fsync group-commit tuning on the dedicated benchmark host used a smaller c=32 Zipf-1.2
 cell (4 tenants, 2 agents/tenant, 25 sessions/agent, 50 prepared
 events/session, 10 records/session, 2 KiB payload, 15s measured window) to
 sweep `AGENTDB_APPEND_GROUP_COMMIT_US`:
@@ -341,7 +318,7 @@ The profiling is off by default. Wrapper scripts set `RUST_LOG=info` only when
 `APPEND_PATH_PROFILE_MS` or `AGENTDB_API_JSON_PROFILE_MS` is present so normal
 benchmark logs stay compact.
 
-The first profiled `single-node-fsync` Zipf c=32 run on `li-dev` used:
+The first profiled `single-node-fsync` Zipf c=32 run on the dedicated benchmark host used:
 
 ```bash
 APPEND_PATH_PROFILE_MS=5000 \
@@ -353,9 +330,6 @@ APPEND_PATH_PROFILE_MS=5000 \
   DURATION=60s \
   scripts/agentdb-bench-local.sh
 ```
-
-Run output:
-`/home/lishen/work/agentdb-bench-runs/append-path-profile/runs/agentdb-zipf-durable-profiled-r1-s43/report.md`.
 
 The throughput/latency cell was consistent with the prior `single-node-fsync`
 run:
@@ -378,7 +352,7 @@ write time dominating after same-session batching.
 
 The first same-session coalescing run validates that direction. With simple
 same-session `append_and_fetch` calls batched ahead of the durable write and a
-5ms coalescing window, the same `li-dev` durable Zipf c=32 cell improved from
+5ms coalescing window, the same dedicated-host durable Zipf c=32 cell improved from
 255 ops/s to 622 ops/s. Tail latency also dropped from p95 860ms / p99 950ms
 to p95 137ms / p99 217ms. This is a 2.4x AgentDB improvement for the matched
 `single-node-fsync` cell, but still below the prior MongoDB
@@ -512,7 +486,7 @@ Run every benchmark under at least one explicit durability profile.
 | `single-node-wal` | RocksDB WAL plus memtable, no forced media sync per request | Standalone acknowledged writes without `journal=true` | `synchronous_commit=off` | Default local developer setup and fast-path comparison. |
 | `single-node-fsync` | RocksDB sync writes with safe append group commit | Journaled acknowledged writes | `synchronous_commit=on` | Host-crash durable single-node sanity comparison. |
 | `strict-fsync` | RocksDB sync writes with append group commit disabled | Journaled acknowledged writes | `synchronous_commit=on` | Stress cell for per-operation fsync cost; not the default comparison. |
-| `durable-quorum` | Raft quorum write ack | Replica set `writeConcern=majority`, journaled | Sync replication when configured | Real safety comparison on `li-dev` or cluster test hardware. |
+| `durable-quorum` | Raft quorum write ack | Replica set `writeConcern=majority`, journaled | Sync replication when configured | Real safety comparison on dedicated benchmark or cluster test hardware. |
 
 The default local report should lead with `single-node-wal` because that is how
 developers will try the product on one machine. Production safety comparisons
@@ -521,11 +495,11 @@ clusters are part of the harness.
 
 ## Benchmark Host
 
-Use `li-dev` as the first reproducible benchmark host. Laptop runs are useful
+Use a dedicated benchmark host for reproducible comparison runs. Laptop runs are useful
 for smoke testing the harness, but they should not be used for comparison
 reports unless the report clearly labels them as laptop/dev runs.
 
-Current `li-dev` baseline observed on 2026-05-10:
+Dedicated benchmark host baseline observed on 2026-05-10:
 
 | Field | Value |
 |---|---|
@@ -542,11 +516,11 @@ Current `li-dev` baseline observed on 2026-05-10:
 The harness must capture the current host manifest at run time instead of
 relying on this static table. The table is only a starting point.
 
-Recommended `li-dev` rules:
+Recommended dedicated-host rules:
 
 - Run from a clean checkout of latest `main`.
-- Keep database data, logs, and reports outside the repo under
-  `/home/lishen/agentdb-bench-runs/`.
+- Keep database data, logs, and reports outside the repo under a dedicated
+  benchmark output directory.
 - Refuse full comparison runs if free disk is below a configurable threshold,
   default 80 GiB. Allow smoke runs with a lower threshold.
 - Keep only the latest N full runs by default and compress or delete older raw
@@ -556,7 +530,7 @@ Recommended `li-dev` rules:
 ## Current Scaling Finding
 
 The local RocksDB AgentDB benchmark currently exercises a single runtime tablet
-and single durable tablet log. The first `li-dev` runs were very fast at low and
+and single durable tablet log. The first dedicated-host runs were very fast at low and
 moderate concurrency, but append-heavy workloads flattened or regressed after
 about 8 workers:
 
@@ -574,7 +548,7 @@ storage could make progress.
 The `perf(runtime): narrow append state lock` change moves durable append I/O
 outside the global state mutex while keeping a per-session commit lock for
 same-session sequence ordering, idempotency replay, delete, and lifecycle
-transitions. On the same `li-dev` shape, append-heavy throughput no longer
+transitions. On the same dedicated-host shape, append-heavy throughput no longer
 collapses at higher concurrency:
 
 | Run | Workload | Dataset | c=1 | c=4 | c=8 | c=16 | c=32 |
@@ -1060,11 +1034,11 @@ Scale profiles should vary one dimension at a time:
 - Add a compact terminal summary for local runs.
 - Add optional static HTML output only after the JSON report format is stable.
 
-### PR 4: `li-dev` Benchmark Profile
+### PR 4: Dedicated Benchmark Host Profile
 
-- Add a `li-dev` profile that runs from a clean checkout of latest `main`.
-- Keep benchmark data outside the repo, for example under
-  `/home/lishen/agentdb-bench-runs/`.
+- Add a dedicated-host profile that runs from a clean checkout of latest `main`.
+- Keep benchmark data outside the repo under a dedicated benchmark output
+  directory.
 - Capture machine metadata, DB logs, AgentDB logs, and benchmark reports.
 - Add a disk-space guard and retention cleanup for old benchmark runs. Current
   scripts include `scripts/agentdb-bench-prune.sh` for dry-run-first pruning of
