@@ -341,6 +341,13 @@ PROFILE=smoke scripts/agentdb-bench-agentdb-mongodb.sh
 Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
 the same thing as real MongoDB.
 
+The MongoDB and Postgres baseline wrappers use per-run Docker Compose project
+names and tear containers down on exit. MongoDB data is bind-mounted under the
+benchmark output root and the container runs as the host `MONGO_UID:MONGO_GID`
+by default, so new benchmark data remains removable by the benchmark user. When
+testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an existing
+Cargo target directory without breaking the wrapper binary lookup.
+
 ## Working-Set-Exceeds-Cache Cell
 
 Use this cell to test whether the comparison survives beyond a cache-warm hot
