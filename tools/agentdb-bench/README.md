@@ -136,6 +136,12 @@ MATRIX_ID=value-wal-$(date +%Y%m%d) \
   BACKENDS=agentdb,mongodb,postgres \
   WORKLOADS=mixed-agent-loop,append-only,append-fetch-hot,artifact-only,record-search-only \
   PROFILE=default-agent-runtime \
+  TENANTS=10 \
+  AGENTS_PER_TENANT=2 \
+  SESSIONS_PER_AGENT=50 \
+  EVENTS_PER_SESSION=50 \
+  RECORDS_PER_SESSION=10 \
+  PAYLOAD_BYTES=2048 \
   DURABILITY_PROFILE=single-node-wal \
   CONCURRENCY=32 \
   WARMUP=10s \
@@ -150,7 +156,9 @@ MATRIX_ID=value-wal-$(date +%Y%m%d) \
 This writes a Markdown matrix under `bench-out/matrix/`. Use it for internal
 engineering comparisons before updating the curated table above. For
 publication-grade numbers, set `REPEATS=3` and keep the generated per-backend
-summaries.
+summaries. Keep the explicit dataset dimensions unless the host has enough disk
+for the full `default-agent-runtime` preset; the preset itself prepares a much
+larger corpus than the curated latest-comparison shape.
 
 AgentDB native:
 
