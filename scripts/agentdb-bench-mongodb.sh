@@ -21,7 +21,19 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
     MIN_FREE_GB=5
   fi
 fi
-MONGO_PORT="${MONGO_PORT:-27017}"
+choose_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+if [[ -z "${MONGO_PORT:-}" ]]; then
+  MONGO_PORT="$(choose_free_port)"
+fi
 MONGO_DB="${MONGO_DB:-agentdb_bench}"
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/mongodb"
 MONGO_DATA_DIR="${MONGO_DATA_DIR:-${OUT}/state/${RUN_ID}/mongo-data}"

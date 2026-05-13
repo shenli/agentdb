@@ -21,7 +21,19 @@ if [[ -z "${MIN_FREE_GB}" ]]; then
     MIN_FREE_GB=5
   fi
 fi
-PG_PORT="${PG_PORT:-5433}"
+choose_free_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+if [[ -z "${PG_PORT:-}" ]]; then
+  PG_PORT="$(choose_free_port)"
+fi
 COMPOSE_DIR="${ROOT}/tools/agentdb-bench/baselines/postgres"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-agentdb-bench-postgres-${RUN_ID}}"
 
