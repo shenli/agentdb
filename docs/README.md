@@ -1,8 +1,8 @@
 # AgentDB Docs
 
-This directory separates current project documentation from historical planning
-material. Start with the current docs unless you are looking for design history
-or implementation plans.
+This directory contains the public AgentDB documentation. Start with the current
+docs below; historical planning artifacts are intentionally not part of the main
+public docs path.
 
 ## Start Here
 
@@ -64,11 +64,6 @@ or implementation plans.
   - redesign for real hot/cold/archive session storage
 - [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
   - optimization plan for large artifact blobs and content backends
+- [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license
+  and release notice guidance
 - [roadmap.md](roadmap.md) - milestone direction and open work
-
-## Planning Archive
-
-- [superpowers/specs](superpowers/specs) - design specs
-- [superpowers/plans](superpowers/plans) - implementation plans
-- [superpowers/notes](superpowers/notes) - investigation notes and decision
-  records

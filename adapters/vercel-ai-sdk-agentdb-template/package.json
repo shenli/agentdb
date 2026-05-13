@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "AgentDB persistence template for Vercel AI SDK chat applications",
   "type": "module",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "scripts": {
     "test": "node --test tests/*.test.js",
     "check": "node --check src/agentdb-chat-store.js"

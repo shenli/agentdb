@@ -1,6 +1,6 @@
 # Manual CI. Automatic GitHub CI is intentionally disabled for
 # cost control; the default pre-merge validation path is the
-# local runner on li-dev:
+# local runner:
 #
 #   scripts/local-ci.sh
 #

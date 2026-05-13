@@ -28,8 +28,8 @@ Options:
   --help                 Show this help.
 
 Examples:
-  scripts/agentdb-bench-prune.sh --root /home/lishen/work/agentdb-bench-runs --keep 30
-  scripts/agentdb-bench-prune.sh --root /home/lishen/work/agentdb-bench-runs --keep 30 --target-free-gb 120 --delete
+  scripts/agentdb-bench-prune.sh --root bench-out --keep 30
+  scripts/agentdb-bench-prune.sh --root bench-out --keep 30 --target-free-gb 120 --delete
 EOF
 }
 

@@ -26,7 +26,7 @@ Output:
   Writes OUT/matrix/<matrix-id>-final.md and prints the path.
 
 Examples:
-  scripts/agentdb-bench-finalize-matrix.sh --out /home/lishen/work/agentdb-bench-runs --matrix-id longrun-value-wal-20260513-1
+  scripts/agentdb-bench-finalize-matrix.sh --out bench-out --matrix-id benchmark-matrix-1
 EOF
 }
 

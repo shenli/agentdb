@@ -8,6 +8,7 @@ RUN_SDK=1
 RUN_CLUSTER=1
 RUN_CLIPPY=1
 RUN_FMT=1
+RUN_LICENSE=1
 RUN_CHAOS=0
 CHAOS_ITERATIONS="${LOCAL_CI_CHAOS_ITERATIONS:-24}"
 CHAOS_SEED="${LOCAL_CI_CHAOS_SEED:-}"
@@ -21,7 +22,8 @@ Runs the local CI pipeline:
   2. cargo clippy --workspace --tests -- -D warnings
   3. cargo test --workspace --all-targets
   4. Python + TypeScript SDK smoke tests
-  5. compose-backed real cluster smoke with failover
+  5. dependency license policy check
+  6. compose-backed real cluster smoke with failover
 
 Options:
   --cargo-only       Run only fmt/clippy/cargo tests.
@@ -30,6 +32,7 @@ Options:
   --no-clippy        Skip clippy.
   --no-sdk           Skip Python/TypeScript SDK tests.
   --no-cluster       Skip the real cluster failover smoke.
+  --no-license       Skip dependency license policy checks.
   --chaos            Also run the bounded random cluster chaos smoke.
   --chaos-iterations N
                      Chaos kill/restart iterations. Defaults to LOCAL_CI_CHAOS_ITERATIONS or 24.
@@ -37,7 +40,9 @@ Options:
   --help             Show this help.
 
 Environment:
-  LIBCLANG_PATH      Used by librocksdb-sys bindgen. Auto-detected on li-dev.
+  LIBCLANG_PATH      Used by librocksdb-sys bindgen. Auto-detected from common Linux paths.
+  LICENSE_CHECK_STRICT
+                     If 1, missing license-audit tools fail the license stage.
   LOCAL_CI_RUN_ROOT  Root directory for CI runs. Defaults to /tmp/agentdb-local-ci.
   LOCAL_CI_RUN_ID    Run identifier. Defaults to an UTC timestamp plus pid.
   LOCAL_CI_LOG_DIR   Exact run directory for logs/status. Overrides LOCAL_CI_RUN_ROOT.
@@ -49,11 +54,13 @@ while [[ $# -gt 0 ]]; do
     --cargo-only)
       RUN_SDK=0
       RUN_CLUSTER=0
+      RUN_LICENSE=0
       ;;
     --cluster-only)
       RUN_CARGO=0
       RUN_SDK=0
       RUN_CLUSTER=1
+      RUN_LICENSE=0
       ;;
     --no-clippy)
       RUN_CLIPPY=0
@@ -66,6 +73,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-cluster)
       RUN_CLUSTER=0
+      ;;
+    --no-license)
+      RUN_LICENSE=0
       ;;
     --chaos)
       RUN_CHAOS=1
@@ -304,6 +314,10 @@ fi
 if [[ "$RUN_SDK" == "1" ]]; then
   run_shell_stage sdk-python "python3 -m pip install -e 'clients/python[async]' pytest && pytest clients/python -q"
   run_shell_stage sdk-typescript "cd clients/typescript && npm ci && npm run build && npm test"
+fi
+
+if [[ "$RUN_LICENSE" == "1" ]]; then
+  run_stage license-check scripts/license-check.sh
 fi
 
 if [[ "$RUN_CLUSTER" == "1" ]]; then

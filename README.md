@@ -80,8 +80,16 @@ AgentDB, then reads it back to resume, replay, fork, inspect, or stream a run.
    evaluators, replay viewers        application systems
 ```
 
-This repository is a pre-release prototype. The supported developer surfaces
-are:
+## Project Status
+
+AgentDB is alpha software. The single-node server, native HTTP API, Python SDK,
+TypeScript SDK, dashboard, local RocksDB storage, benchmark harness, and limited
+MongoDB wire adapter are the supported developer surfaces today. Multi-node
+Raft, tablet movement, and cluster operations are implemented for evaluation
+and active development, but the default production path is still single-node
+self-hosting.
+
+Supported developer surfaces:
 
 - Rust runtime and HTTP API crates in `crates/`
 - Server binary in `bin/agentdb-server`
@@ -309,9 +317,8 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
   [docs/runbooks/README.md](docs/runbooks/README.md) links runbooks for API
   errors that include `doc_url`.
 
-- **Roadmap and planning archive**:
-  [docs/roadmap.md](docs/roadmap.md) covers future direction; historical plans
-  live under [docs/superpowers/](docs/superpowers/).
+- **Roadmap**:
+  [docs/roadmap.md](docs/roadmap.md) covers future direction and open work.
 
 ## API and SDKs
 
@@ -460,3 +467,15 @@ TypeScript:
 (cd clients/typescript && npm test && npm run build)
 (cd adapters/vercel-ai-sdk-agentdb-template && npm test && npm run check)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, validation
+commands, and pull-request expectations. Please report security issues through
+[SECURITY.md](SECURITY.md), not public issues.
+
+## License
+
+AgentDB is licensed under the [MIT License](LICENSE).
+Third-party dependencies keep their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for release compliance notes.

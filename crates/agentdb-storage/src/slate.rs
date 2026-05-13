@@ -1,6 +1,7 @@
-//! SlateDB-backed `KvStore`. See
-//! docs/superpowers/specs/2026-04-19-m11-slatedb-s3-design.md
-//! and docs/superpowers/notes/2026-04-19-m11-slatedb-spike.md.
+//! SlateDB-backed `KvStore`.
+//!
+//! See `docs/architecture/STORAGE_ENGINE.md` for SlateDB's current role as an
+//! optional object-store-backed evaluation backend.
 
 use std::sync::Arc;
 

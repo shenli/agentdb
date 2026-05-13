@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "MCP stdio server exposing AgentDB sessions, artifacts, records, and replay"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "AgentDB contributors" }]
 dependencies = [
     "agentdb>=2.0.0",
