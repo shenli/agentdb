@@ -92,31 +92,68 @@ are:
 
 ## Performance Snapshot
 
-AgentDB is optimized for agent-runtime state, not generic OLTP. The repo-local
-benchmark suite compares AgentDB with normalized MongoDB and Postgres event-log
-schemas on workloads shaped like tool-using agents: append ordered session
-events, immediately read recent context, write/search memory records, fork
-sessions, and attach artifact metadata.
+AgentDB's performance goal is narrow and practical: make the common agent
+runtime loop cheap to run on a single node, then scale out with the same session
+semantics. The benchmark in this repo does not try to prove that AgentDB is a
+better general-purpose database. It compares AgentDB with reasonable MongoDB
+and Postgres event-log schemas for agent-shaped state.
 
-On the current `li-dev` long-run validation matrix
-(`single-node-wal`, c=32, Zipf-1.2 session skew, 1000 sessions, 30s warmup,
-10m measured window, 3 repeats), the valid rows show:
+The core workload is:
 
-| Workload | AgentDB | MongoDB | Postgres | Result |
-|---|---:|---:|---:|---|
-| `mixed-agent-loop` | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms | 1.59x MongoDB, 7.13x Postgres |
-| `append-only` | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms | 4.03x MongoDB, 5.58x Postgres |
-| `append-fetch-hot` | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms | 2.04x MongoDB, 1.62x Postgres |
+- Append the next session event.
+- Read the recent tail needed for the next model/tool step.
+- Occasionally write/search memory records, fork a session, or attach artifact
+  metadata.
 
-These are internal single-node benchmark results, not managed-service claims.
-The benchmark intentionally calls out API-shape advantages such as AgentDB's
-fused `append-and-fetch` primitive, durability profiles, cache-pressure cells,
-and invalid rows. The Postgres append rows above come from the repaired
-`longrun-value-wal-20260513-pg-rerun` matrix after the original Docker-volume
-run hit a host disk limit. See
-[tools/agentdb-bench](tools/agentdb-bench/README.md) to run the benchmark and
-[docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md) for
-methodology, caveats, and historical tuning notes.
+Current long-run result on `li-dev`:
+
+| Workload | What It Measures | AgentDB | MongoDB | Postgres |
+|---|---|---:|---:|---:|
+| `mixed-agent-loop` | Full agent loop: append+fetch, recent reads, records, forks, artifacts | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms |
+| `append-only` | Ordered event appends without tail reads | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms |
+| `append-fetch-hot` | Fused append plus hot-tail read, the common agent step path | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms |
+
+Ratios from those rows:
+
+- `mixed-agent-loop`: AgentDB is 1.59x MongoDB and 7.13x Postgres.
+- `append-only`: AgentDB is 4.03x MongoDB and 5.58x Postgres.
+- `append-fetch-hot`: AgentDB is 2.04x MongoDB and 1.62x Postgres.
+
+How to read this:
+
+- This is a single-node, localhost benchmark with RocksDB-backed AgentDB,
+  MongoDB standalone, and Postgres, all using normalized event-log layouts.
+- The profile is `single-node-wal`: fast local developer durability, not a
+  managed replicated production comparison.
+- The run uses 1000 sessions, Zipf-1.2 session skew, concurrency 32, 30s warmup,
+  10m measured windows, and 3 repeats.
+- AgentDB's fused `append-and-fetch` API is part of the product advantage; the
+  benchmark calls that out instead of hiding it.
+
+Run a quick local sanity check:
+
+```bash
+OUT=/tmp/agentdb-bench \
+  PROFILE=smoke \
+  WORKLOADS=mixed-agent-loop \
+  DURATION=10s \
+  WARMUP=2s \
+  REPEATS=1 \
+  scripts/agentdb-bench-value-matrix.sh
+```
+
+Run the full long-run comparison on a machine with enough disk:
+
+```bash
+OUT=/path/with/free-space \
+  MATRIX_ID=local-longrun-value \
+  scripts/agentdb-bench-longrun-value-matrix.sh
+```
+
+For the benchmark tool, schema details, hardware/software notes, and caveats,
+see [tools/agentdb-bench](tools/agentdb-bench/README.md). For the longer design
+and tuning history, see
+[docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md).
 
 ## Quick Start
 
