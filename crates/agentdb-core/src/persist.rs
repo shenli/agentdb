@@ -339,7 +339,7 @@ impl AdaptiveWriteBatcher {
             .and_then(|raw| raw.parse::<u64>().ok())
             // Preserve the direct fast path for isolated writes, but let the
             // writer coalesce briefly once a backlog already exists.
-            .unwrap_or_else(|| if sync_writes { 0 } else { 50 });
+            .unwrap_or_else(|| if sync_writes { 0 } else { 5 });
         Some(Arc::new(Self::new(
             kv,
             max_ops,
