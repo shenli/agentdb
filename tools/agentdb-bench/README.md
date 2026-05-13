@@ -215,6 +215,19 @@ scripts/agentdb-bench-status.sh \
 The status helper prints disk headroom, matching active processes, completed
 repeat summaries, completed run-report count, and the tail of the matrix log.
 
+To generate a comparison-ready Markdown summary from completed repeat summaries,
+use:
+
+```bash
+scripts/agentdb-bench-finalize-matrix.sh \
+  --out /home/lishen/work/agentdb-bench-runs \
+  --matrix-id longrun-value-wal-20260513-1
+```
+
+The finalizer writes `OUT/matrix/<matrix-id>-final.md`. It is safe to run while
+a matrix is still active: completed cells are included, missing cells remain
+absent, and active matching processes are recorded in the generated summary.
+
 Long-run outputs can fill disks quickly. Prune benchmark roots with a dry-run
 first:
 
