@@ -360,6 +360,7 @@ benchmark output root and the container runs as the host `MONGO_UID:MONGO_GID`
 by default, so new benchmark data remains removable by the benchmark user.
 Unless `MONGO_PORT` or `PG_PORT` is set, the wrappers choose a free localhost
 port at runtime so they do not conflict with existing development containers.
+The baseline containers publish those ports on `127.0.0.1` only.
 When testing from a separate worktree, set `CARGO_TARGET_DIR` to reuse an
 existing Cargo target directory without breaking the wrapper binary lookup.
 

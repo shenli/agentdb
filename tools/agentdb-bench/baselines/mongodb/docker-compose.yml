@@ -3,7 +3,7 @@ services:
     image: mongo:7
     user: "${MONGO_UID:-999}:${MONGO_GID:-999}"
     ports:
-      - "${MONGO_PORT:-27017}:27017"
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
     command: ["mongod", "--bind_ip_all"]
     volumes:
       - "${MONGO_DATA_DIR:-./mongo-data}:/data/db"
