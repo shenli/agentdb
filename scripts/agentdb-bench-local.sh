@@ -72,6 +72,10 @@ if [[ -n "${APPEND_PATH_PROFILE_MS:-}" ]]; then
   agentdb_server_env+=(AGENTDB_APPEND_PATH_PROFILE_MS="${APPEND_PATH_PROFILE_MS}")
   agentdb_server_env+=(RUST_LOG="${RUST_LOG:-info}")
 fi
+if [[ -n "${AGENTDB_API_JSON_PROFILE_MS:-}" ]]; then
+  agentdb_server_env+=(AGENTDB_API_JSON_PROFILE_MS="${AGENTDB_API_JSON_PROFILE_MS}")
+  agentdb_server_env+=(RUST_LOG="${RUST_LOG:-info}")
+fi
 if [[ "${PROFILE}" == "working-set-exceeds-cache" ]]; then
   agentdb_server_env+=(AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION="${AGENTDB_PERSISTED_HOT_EVENT_CACHE_PER_SESSION:-64}")
 fi

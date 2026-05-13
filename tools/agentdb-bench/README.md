@@ -208,6 +208,7 @@ for all backends.
 | `AGENTDB_ROCKSDB_COMPRESSION` | `lz4`, `none`, `snappy`, `lz4hc` | RocksDB compression used by AgentDB. Defaults to `lz4` to reduce working-set storage and compaction IO. |
 | `AGENTDB_APPEND_GROUP_COMMIT_US` | `0`, `1000`, `2000`, `4000` | AgentDB append group-commit wait window. The single-node fsync default is `2000`; WAL mode defaults to `0`. |
 | `APPEND_PATH_PROFILE_MS` | `5000` | Enables AgentDB server-side append-stage profiling in logs. |
+| `AGENTDB_API_JSON_PROFILE_MS` | `5000` | Enables AgentDB JSON response serialization profiling in logs. |
 
 `strict-fsync` disables append group commit and is mostly a stress profile. It
 should not be the default comparison row.

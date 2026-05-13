@@ -321,22 +321,25 @@ sync-write time, and state update time. If RocksDB sync dominates, the likely
 fix is a more explicit durable log/group-commit design; if queue wait dominates,
 a single-writer per-session coalescing actor is the stronger candidate.
 
-Enable append-path profiling for AgentDB native or AgentDB MongoDB-API wrapper
+Enable append/API profiling for AgentDB native or AgentDB MongoDB-API wrapper
 runs with:
 
 ```bash
 APPEND_PATH_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
+AGENTDB_API_JSON_PROFILE_MS=5000 scripts/agentdb-bench-local.sh
 ```
 
-The server log then emits two low-overhead aggregate lines:
+The server log then emits low-overhead aggregate lines:
 
 | Log line | What it separates |
 |---|---|
 | `append path profile` | Runtime refresh, per-session commit-lock wait, initial state-lock wait/work, durable write, post-write state-lock wait/work, and total append latency. |
 | `adaptive write profile` | Direct versus grouped batches, requests/ops per batch, group-commit queue wait, and KV write time. |
+| `api json response profile` | JSON response count, response bytes, average response size, and average serialization time. |
 
 The profiling is off by default. Wrapper scripts set `RUST_LOG=info` only when
-`APPEND_PATH_PROFILE_MS` is present so normal benchmark logs stay compact.
+`APPEND_PATH_PROFILE_MS` or `AGENTDB_API_JSON_PROFILE_MS` is present so normal
+benchmark logs stay compact.
 
 The first profiled `single-node-fsync` Zipf c=32 run on `li-dev` used:
 
