@@ -25,11 +25,12 @@ cargo run -q -p agentdb-bench -- tablet-store \
   --checkpoint-tablet 0
 ```
 
-The tablet-store report includes append latency percentiles, throughput,
-checkpoint duration, checkpoint size, and checkpoint checksum when checkpointing
-is enabled. On Linux it also samples process open file descriptors and resident
-memory before writes, after writes, and after checkpointing. Use `--layout
-prefix-scoped` for the current shared-LSM baseline.
+The tablet-store report includes append latency percentiles through p999,
+throughput, checkpoint duration, checkpoint size, and checkpoint checksum when
+checkpointing is enabled. For single-tablet grouped domains it also times an
+offline local restore into a fresh store root. On Linux it samples process open
+file descriptors and resident memory before writes, after writes, and after
+checkpointing. Use `--layout prefix-scoped` for the current shared-LSM baseline.
 
 The benchmark is meant for engineering decisions. Treat the numbers below as
 internal single-node, cache-warm, localhost microbenchmarks, not external

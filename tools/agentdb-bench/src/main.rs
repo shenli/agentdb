@@ -280,11 +280,15 @@ struct TabletStoreBenchReport {
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
+    p999_ms: f64,
     max_ms: f64,
     checkpoint_tablet: Option<i64>,
     checkpoint_ms: Option<f64>,
     checkpoint_size_bytes: Option<u64>,
     checkpoint_checksum_sha256: Option<String>,
+    restore_ms: Option<f64>,
+    restore_size_bytes: Option<u64>,
+    restore_checksum_sha256: Option<String>,
     resource_before: ProcessResourceSample,
     resource_after_writes: ProcessResourceSample,
     resource_after_checkpoint: ProcessResourceSample,
@@ -551,19 +555,49 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
     let resource_after_writes = process_resource_sample();
 
     let checkpoint_tablet = args.checkpoint_tablet;
-    let (checkpoint_ms, checkpoint_size_bytes, checkpoint_checksum_sha256) =
-        if let Some(tablet_id) = checkpoint_tablet {
-            let checkpoint_dir = root.join(format!("checkpoint-tablet-{tablet_id:020}"));
-            let checkpoint_started = Instant::now();
-            let manifest = lifecycle.checkpoint_tablet(tablet_id, &checkpoint_dir)?;
-            (
-                Some(duration_ms(checkpoint_started.elapsed())),
-                manifest.size_bytes,
-                manifest.checksum_sha256,
-            )
-        } else {
-            (None, None, None)
-        };
+    let (
+        checkpoint_ms,
+        checkpoint_size_bytes,
+        checkpoint_checksum_sha256,
+        restore_ms,
+        restore_size_bytes,
+        restore_checksum_sha256,
+    ) = if let Some(tablet_id) = checkpoint_tablet {
+        let checkpoint_dir = root.join(format!("checkpoint-tablet-{tablet_id:020}"));
+        let checkpoint_started = Instant::now();
+        let manifest = lifecycle.checkpoint_tablet(tablet_id, &checkpoint_dir)?;
+        let checkpoint_ms = Some(duration_ms(checkpoint_started.elapsed()));
+        let (restore_ms, restore_size_bytes, restore_checksum_sha256) =
+            if matches!(args.layout, TabletStoreLayout::GroupedRocksDb)
+                && args.tablets_per_domain == 1
+            {
+                let restore_lifecycle = GroupedRocksDbTabletStore::new(
+                    root.join("restore-grouped-rocksdb"),
+                    args.tablets_per_domain,
+                    args.max_open_domains,
+                );
+                let restore_started = Instant::now();
+                let restored =
+                    restore_lifecycle.restore_tablet_checkpoint(tablet_id, &checkpoint_dir)?;
+                (
+                    Some(duration_ms(restore_started.elapsed())),
+                    restored.size_bytes,
+                    restored.checksum_sha256,
+                )
+            } else {
+                (None, None, None)
+            };
+        (
+            checkpoint_ms,
+            manifest.size_bytes,
+            manifest.checksum_sha256,
+            restore_ms,
+            restore_size_bytes,
+            restore_checksum_sha256,
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
     let resource_after_checkpoint = process_resource_sample();
 
     let report = TabletStoreBenchReport {
@@ -578,6 +612,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         p50_ms: percentile_ms(&latencies, 0.50),
         p95_ms: percentile_ms(&latencies, 0.95),
         p99_ms: percentile_ms(&latencies, 0.99),
+        p999_ms: percentile_ms(&latencies, 0.999),
         max_ms: latencies
             .last()
             .copied()
@@ -587,6 +622,9 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         checkpoint_ms,
         checkpoint_size_bytes,
         checkpoint_checksum_sha256,
+        restore_ms,
+        restore_size_bytes,
+        restore_checksum_sha256,
         resource_before,
         resource_after_writes,
         resource_after_checkpoint,
