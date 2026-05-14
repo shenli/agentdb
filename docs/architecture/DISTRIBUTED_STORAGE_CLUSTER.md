@@ -1,7 +1,7 @@
 # Distributed Storage Cluster Next Step
 
-Status: Track A and bounded Track B implemented; online split/merge cutover
-hardening continues
+Status: Track A and bounded Track B implemented; two-cell failover smoke
+passes; online split/merge cutover hardening continues
 
 This document describes the next production-oriented step for AgentDB's
 distributed storage cluster. It combines the existing replicated tablet design
@@ -1142,16 +1142,17 @@ Operators should be able to answer:
 
 ### Real-Process Cluster Smoke
 
-The existing real-cluster smoke harness now seeds a cell, labels nodes with
-distinct AZs, verifies those labels through admin status, exercises ordinary
-appends, forces Raft catch-up, and can run owner-failover or deterministic
-single-node chaos scenarios. Extend it next with:
+The existing real-cluster smoke harness now seeds one or two cells, labels
+nodes with distinct AZs, verifies those labels through admin status, exercises
+ordinary appends, forces Raft catch-up, and can run owner-failover or
+deterministic single-node chaos scenarios. In two-cell mode it proves that
+writes in the unaffected cell continue while another cell loses an owner. Extend
+it next with:
 
 - process restart from persisted raft-engine and KV directories
 - explicit tablet replacement flow
 - split under active writes
 - merge after split
-- two-cell routing and blast-radius checks
 - AZ failure simulation for multi-AZ profiles
 
 ### Chaos Tests
@@ -1368,8 +1369,8 @@ Exit criteria:
 - Keep the real-cluster smoke harness seeding cells and distinct AZ labels.
 - Add restart and explicit replacement scenarios on top of existing owner-down,
   node-down chaos, and catch-up coverage.
-- Add a two-cell smoke scenario with assertions that unaffected cells keep
-  serving when one cell loses a node.
+- Keep the two-cell smoke scenario in the fast validation path so unaffected
+  cells keep serving when one cell loses a node.
 - Add nightly chaos with deterministic seeds.
 
 ### Phase 3: Tablet-Local Applied-State Isolation
@@ -1419,20 +1420,22 @@ Cluster mode should not be called production-supported until:
 
 ## Remaining Hardening Cut
 
-The remaining useful cut is no longer metadata migration or prefix-layout
-migration. The next work should focus on real-process lifecycle validation:
+The remaining useful cut is no longer metadata migration, prefix-layout
+migration, or basic two-cell smoke. The next work should focus on real-process
+lifecycle validation:
 
-1. Add a two-cell smoke topology with separate placement scopes and tablet
-   owners per cell. This first needs a tenant bootstrap path that can create a
-   tenant directly in a non-default cell before normal tenant-id routing exists.
-2. Prove writes in cell B continue while cell A loses an owner, restarts a
-   process, or runs an explicit replacement.
+1. Prove process restart from persisted raft-engine and KV directories.
+2. Add an explicit tablet replacement flow, including replacement from
+   checkpoint in the real-cluster smoke path.
 3. Add split and merge under active writes with routed watch cursor assertions
    across the cutover epoch.
 4. Add an AZ-failure simulation for multi-AZ cells and document the expected
    single-AZ profile behavior.
-5. Add replacement-from-checkpoint coverage in the real-cluster smoke path.
-6. Expand runbooks and alerts for movement backlog, metadata degradation,
+5. Add rolling restart and rolling upgrade drills per cell.
+6. Promote benchmark and regression gates for failover duration, catch-up
+   duration, open file descriptors, resident memory, compaction debt, and
+   p99/p999 write latency.
+7. Expand runbooks and alerts for movement backlog, metadata degradation,
    object-store degradation, rolling upgrades, and two-cell blast-radius drills.
 
 This cut hardens the distributed cluster behavior around the Track A and Track
