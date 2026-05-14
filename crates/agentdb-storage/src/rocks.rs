@@ -18,9 +18,58 @@ pub struct RocksKvStore {
     sync_writes: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RocksKvStoreConfig {
+    pub parallelism: i32,
+    pub max_background_jobs: i32,
+    pub write_buffer_size_bytes: usize,
+    pub max_write_buffer_number: i32,
+    pub min_write_buffer_number_to_merge: i32,
+    pub level_zero_file_num_compaction_trigger: i32,
+    pub level_zero_slowdown_writes_trigger: i32,
+    pub level_zero_stop_writes_trigger: i32,
+    pub max_open_files: i32,
+}
+
+impl Default for RocksKvStoreConfig {
+    fn default() -> Self {
+        Self {
+            parallelism: 2,
+            max_background_jobs: 2,
+            write_buffer_size_bytes: 128 * 1024 * 1024,
+            max_write_buffer_number: 4,
+            min_write_buffer_number_to_merge: 1,
+            level_zero_file_num_compaction_trigger: 8,
+            level_zero_slowdown_writes_trigger: 24,
+            level_zero_stop_writes_trigger: 36,
+            max_open_files: 512,
+        }
+    }
+}
+
+impl RocksKvStoreConfig {
+    pub fn tablet_domain() -> Self {
+        Self {
+            parallelism: 1,
+            max_background_jobs: 1,
+            write_buffer_size_bytes: 16 * 1024 * 1024,
+            max_write_buffer_number: 2,
+            min_write_buffer_number_to_merge: 1,
+            level_zero_file_num_compaction_trigger: 4,
+            level_zero_slowdown_writes_trigger: 12,
+            level_zero_stop_writes_trigger: 20,
+            max_open_files: 128,
+        }
+    }
+}
+
 impl RocksKvStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let opts = default_rocks_options();
+        Self::open_with_config(path, &RocksKvStoreConfig::default())
+    }
+
+    pub fn open_with_config(path: impl AsRef<Path>, config: &RocksKvStoreConfig) -> Result<Self> {
+        let opts = default_rocks_options(config);
         let db = DB::open(&opts, path)?;
         Ok(Self {
             db: Arc::new(db),
@@ -35,25 +84,32 @@ impl RocksKvStore {
     }
 }
 
-fn default_rocks_options() -> Options {
+fn default_rocks_options(config: &RocksKvStoreConfig) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
 
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get().min(8) as i32)
-        .unwrap_or(4);
+    let parallelism = std::env::var("AGENTDB_ROCKSDB_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(config.parallelism);
+    let max_background_jobs = std::env::var("AGENTDB_ROCKSDB_MAX_BACKGROUND_JOBS")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(config.max_background_jobs);
     opts.increase_parallelism(parallelism);
-    opts.set_max_background_jobs(parallelism);
+    opts.set_max_background_jobs(max_background_jobs);
 
     // AgentDB's local developer path is append-heavy with small metadata rows.
     // Larger memtables reduce flush pressure and keep the out-of-box RocksDB
     // profile from behaving like a tiny embedded default.
-    opts.set_write_buffer_size(128 * 1024 * 1024);
-    opts.set_max_write_buffer_number(4);
-    opts.set_min_write_buffer_number_to_merge(1);
-    opts.set_level_zero_file_num_compaction_trigger(8);
-    opts.set_level_zero_slowdown_writes_trigger(24);
-    opts.set_level_zero_stop_writes_trigger(36);
+    opts.set_write_buffer_size(config.write_buffer_size_bytes);
+    opts.set_max_write_buffer_number(config.max_write_buffer_number);
+    opts.set_min_write_buffer_number_to_merge(config.min_write_buffer_number_to_merge);
+    opts.set_level_zero_file_num_compaction_trigger(config.level_zero_file_num_compaction_trigger);
+    opts.set_level_zero_slowdown_writes_trigger(config.level_zero_slowdown_writes_trigger);
+    opts.set_level_zero_stop_writes_trigger(config.level_zero_stop_writes_trigger);
     opts.set_bytes_per_sync(1024 * 1024);
     let compression = match std::env::var("AGENTDB_ROCKSDB_COMPRESSION")
         .unwrap_or_else(|_| "lz4".to_string())
@@ -73,7 +129,7 @@ fn default_rocks_options() -> Options {
     let max_open_files = std::env::var("AGENTDB_ROCKSDB_MAX_OPEN_FILES")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
-        .unwrap_or(512);
+        .unwrap_or(config.max_open_files);
     opts.set_max_open_files(max_open_files);
 
     opts

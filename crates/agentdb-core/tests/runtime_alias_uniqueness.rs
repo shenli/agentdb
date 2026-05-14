@@ -10,12 +10,7 @@ use agentdb_core::errors::ErrorCode;
 use agentdb_core::runtime::Runtime;
 use agentdb_core::session::NewSession;
 use agentdb_core::tenant::NewTenant;
-use agentdb_storage::{ContentBackend, InMemoryContentBackend, KvStore, RocksKvStore};
-use tempfile::TempDir;
-
-fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
-    Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
-}
+use agentdb_storage::{ContentBackend, InMemoryContentBackend, InMemoryKvStore, KvStore};
 
 fn in_memory_content() -> Arc<dyn ContentBackend> {
     Arc::new(InMemoryContentBackend::default())
@@ -157,9 +152,8 @@ async fn create_session_rejects_duplicate_alias_within_tenant() {
 
 #[tokio::test]
 async fn alias_uniqueness_survives_restart() {
-    let dir = TempDir::new().unwrap();
-    let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv, in_memory_content());
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::new());
+    let rt = Runtime::with_kv(kv.clone(), in_memory_content());
     let t = rt
         .create_tenant(NewTenant {
             external_key: "acme".into(),
@@ -177,8 +171,8 @@ async fn alias_uniqueness_survives_restart() {
     .unwrap();
     drop(rt);
 
-    // Reopen — alias maps must rehydrate from on-disk alias index rows.
-    let kv2 = open_kv(dir.path());
+    // Rebuild runtime state from persisted alias index rows.
+    let kv2 = kv.clone();
     let rt2 = Runtime::with_kv(kv2, in_memory_content());
     let err = rt2
         .create_tenant(NewTenant {

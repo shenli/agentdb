@@ -5,9 +5,16 @@
 //! prefix, which can later map to a separate RocksDB instance, column family, or
 //! another tablet-local LSM implementation.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-use crate::{Error, KvIter, KvSnapshot, KvStore, Result, WriteOp};
+use crate::{
+    Error, KvIter, KvSnapshot, KvStore, Result, RocksKvStore, RocksKvStoreConfig, WriteOp,
+};
 
 const TABLET_STATE_PREFIX: &[u8] = b"tablet_state/";
 
@@ -15,7 +22,13 @@ const TABLET_STATE_PREFIX: &[u8] = b"tablet_state/";
 pub struct TabletKvStore {
     kv: Arc<dyn KvStore + Send + Sync>,
     tablet_id: i64,
-    prefix: Vec<u8>,
+    scope: TabletKvScope,
+}
+
+#[derive(Clone)]
+enum TabletKvScope {
+    SharedPrefix(Vec<u8>),
+    Physical,
 }
 
 impl TabletKvStore {
@@ -26,12 +39,27 @@ impl TabletKvStore {
         Ok(Self {
             kv,
             tablet_id,
-            prefix: tablet_prefix(tablet_id),
+            scope: TabletKvScope::SharedPrefix(tablet_prefix(tablet_id)),
+        })
+    }
+
+    pub fn physical(kv: Arc<dyn KvStore + Send + Sync>, tablet_id: i64) -> Result<Self> {
+        if tablet_id < 0 {
+            return Err(Error::Other("tablet_id must be non-negative".into()));
+        }
+        Ok(Self {
+            kv,
+            tablet_id,
+            scope: TabletKvScope::Physical,
         })
     }
 
     pub fn tablet_id(&self) -> i64 {
         self.tablet_id
+    }
+
+    pub fn is_physical(&self) -> bool {
+        matches!(self.scope, TabletKvScope::Physical)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -64,22 +92,15 @@ impl TabletKvStore {
 
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
         let scoped_prefix = self.key(prefix);
-        let tablet_prefix = self.prefix.clone();
+        let scope = self.scope.clone();
         let iter = self.kv.scan_prefix(&scoped_prefix)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 
     fn key(&self, key: &[u8]) -> Vec<u8> {
-        let mut scoped = self.prefix.clone();
-        scoped.extend_from_slice(key);
-        scoped
+        scoped_key(&self.scope, key)
     }
 }
 
@@ -103,15 +124,10 @@ impl KvStore for TabletKvStore {
     fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
         let scoped_prefix = self.key(prefix);
         let scoped_start = self.key(start);
-        let tablet_prefix = self.prefix.clone();
+        let scope = self.scope.clone();
         let iter = self.kv.scan_prefix_from(&scoped_prefix, &scoped_start)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 
@@ -123,7 +139,7 @@ impl KvStore for TabletKvStore {
         let snapshot = self.kv.snapshot()?;
         Ok(Box::new(TabletKvSnapshot {
             inner: snapshot,
-            prefix: self.prefix.clone(),
+            scope: self.scope.clone(),
         }))
     }
 
@@ -131,95 +147,320 @@ impl KvStore for TabletKvStore {
         let inner = self.kv.clone().snapshot_owned()?;
         Ok(Arc::new(TabletKvOwnedSnapshot {
             inner,
-            prefix: self.prefix.clone(),
+            scope: self.scope.clone(),
         }))
+    }
+
+    fn checkpoint(&self, out_dir: &Path) -> Result<()> {
+        match self.scope {
+            TabletKvScope::Physical => self.kv.checkpoint(out_dir),
+            TabletKvScope::SharedPrefix(_) => Err(Error::Other(
+                "tablet-scoped checkpoint requires a physical tablet store".into(),
+            )),
+        }
     }
 }
 
 struct TabletKvSnapshot<'a> {
     inner: Box<dyn KvSnapshot + 'a>,
-    prefix: Vec<u8>,
+    scope: TabletKvScope,
 }
 
 impl KvSnapshot for TabletKvSnapshot<'_> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(&scoped_key(&self.prefix, key))
+        self.inner.get(&scoped_key(&self.scope, key))
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
-        let scoped_prefix = scoped_key(&self.prefix, prefix);
-        let tablet_prefix = self.prefix.clone();
+        let scoped_prefix = scoped_key(&self.scope, prefix);
+        let scope = self.scope.clone();
         let iter = self.inner.scan_prefix(&scoped_prefix)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 
     fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
-        let scoped_prefix = scoped_key(&self.prefix, prefix);
-        let scoped_start = scoped_key(&self.prefix, start);
-        let tablet_prefix = self.prefix.clone();
+        let scoped_prefix = scoped_key(&self.scope, prefix);
+        let scoped_start = scoped_key(&self.scope, start);
+        let scope = self.scope.clone();
         let iter = self.inner.scan_prefix_from(&scoped_prefix, &scoped_start)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 }
 
 struct TabletKvOwnedSnapshot {
     inner: Arc<dyn KvSnapshot>,
-    prefix: Vec<u8>,
+    scope: TabletKvScope,
 }
 
 impl KvSnapshot for TabletKvOwnedSnapshot {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(&scoped_key(&self.prefix, key))
+        self.inner.get(&scoped_key(&self.scope, key))
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
-        let scoped_prefix = scoped_key(&self.prefix, prefix);
-        let tablet_prefix = self.prefix.clone();
+        let scoped_prefix = scoped_key(&self.scope, prefix);
+        let scope = self.scope.clone();
         let iter = self.inner.scan_prefix(&scoped_prefix)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 
     fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
-        let scoped_prefix = scoped_key(&self.prefix, prefix);
-        let scoped_start = scoped_key(&self.prefix, start);
-        let tablet_prefix = self.prefix.clone();
+        let scoped_prefix = scoped_key(&self.scope, prefix);
+        let scoped_start = scoped_key(&self.scope, start);
+        let scope = self.scope.clone();
         let iter = self.inner.scan_prefix_from(&scoped_prefix, &scoped_start)?;
         Ok(Box::new(iter.map(move |item| {
-            item.map(|(key, value)| {
-                let logical = key
-                    .strip_prefix(tablet_prefix.as_slice())
-                    .map_or_else(|| key.clone(), |suffix| suffix.to_vec());
-                (logical, value)
-            })
+            item.map(|(key, value)| (unscoped_key(&scope, key), value))
         })))
     }
 }
 
-fn scoped_key(prefix: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut scoped = prefix.to_vec();
-    scoped.extend_from_slice(key);
-    scoped
+pub trait TabletStoreLifecycle: Send + Sync {
+    fn layout_name(&self) -> &'static str;
+    fn open_tablet_store(&self, tablet_id: i64) -> Result<TabletKvStore>;
+    fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
+        let store = self.open_tablet_store(tablet_id)?;
+        store.checkpoint(out_dir)?;
+        Ok(TabletStoreManifest {
+            tablet_id,
+            layout: self.layout_name().to_string(),
+            engine: "unknown".into(),
+            storage_uri: out_dir.display().to_string(),
+            ..TabletStoreManifest::default_for(tablet_id)
+        })
+    }
+}
+
+pub struct PrefixScopedTabletStore {
+    kv: Arc<dyn KvStore + Send + Sync>,
+}
+
+impl PrefixScopedTabletStore {
+    pub fn new(kv: Arc<dyn KvStore + Send + Sync>) -> Self {
+        Self { kv }
+    }
+}
+
+impl TabletStoreLifecycle for PrefixScopedTabletStore {
+    fn layout_name(&self) -> &'static str {
+        "prefix_scoped"
+    }
+
+    fn open_tablet_store(&self, tablet_id: i64) -> Result<TabletKvStore> {
+        TabletKvStore::new(self.kv.clone(), tablet_id)
+    }
+
+    fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
+        let _ = (tablet_id, out_dir);
+        Err(Error::Other(
+            "prefix-scoped tablet stores do not support tablet-local checkpoints".into(),
+        ))
+    }
+}
+
+pub struct GroupedRocksDbTabletStore {
+    root_dir: PathBuf,
+    tablets_per_domain: i64,
+    max_open_domains: usize,
+    rocks_config: RocksKvStoreConfig,
+    cache: Mutex<GroupedRocksDbCache>,
+}
+
+#[derive(Default)]
+struct GroupedRocksDbCache {
+    next_use: u64,
+    domains: BTreeMap<i64, CachedRocksDbDomain>,
+}
+
+struct CachedRocksDbDomain {
+    kv: Arc<dyn KvStore + Send + Sync>,
+    last_used: u64,
+}
+
+impl GroupedRocksDbTabletStore {
+    pub fn new(
+        root_dir: impl Into<PathBuf>,
+        tablets_per_domain: i64,
+        max_open_domains: usize,
+    ) -> Self {
+        Self::new_with_rocks_config(
+            root_dir,
+            tablets_per_domain,
+            max_open_domains,
+            RocksKvStoreConfig::tablet_domain(),
+        )
+    }
+
+    pub fn new_with_rocks_config(
+        root_dir: impl Into<PathBuf>,
+        tablets_per_domain: i64,
+        max_open_domains: usize,
+        rocks_config: RocksKvStoreConfig,
+    ) -> Self {
+        Self {
+            root_dir: root_dir.into(),
+            tablets_per_domain: tablets_per_domain.max(1),
+            max_open_domains: max_open_domains.max(1),
+            rocks_config,
+            cache: Mutex::new(GroupedRocksDbCache::default()),
+        }
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    pub fn tablets_per_domain(&self) -> i64 {
+        self.tablets_per_domain
+    }
+
+    pub fn max_open_domains(&self) -> usize {
+        self.max_open_domains
+    }
+
+    pub fn rocks_config(&self) -> &RocksKvStoreConfig {
+        &self.rocks_config
+    }
+
+    pub fn domain_id(&self, tablet_id: i64) -> Result<i64> {
+        if tablet_id < 0 {
+            return Err(Error::Other("tablet_id must be non-negative".into()));
+        }
+        Ok(tablet_id / self.tablets_per_domain)
+    }
+
+    pub fn domain_path(&self, domain_id: i64) -> PathBuf {
+        self.root_dir.join(format!("domain-{domain_id:020}"))
+    }
+
+    fn open_domain(&self, domain_id: i64) -> Result<Arc<dyn KvStore + Send + Sync>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .expect("grouped rocksdb tablet store cache poisoned");
+        cache.next_use = cache.next_use.saturating_add(1);
+        let use_order = cache.next_use;
+        if let Some(domain) = cache.domains.get_mut(&domain_id) {
+            domain.last_used = use_order;
+            return Ok(domain.kv.clone());
+        }
+
+        let domain_path = self.domain_path(domain_id);
+        fs::create_dir_all(&domain_path)?;
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open_with_config(
+            &domain_path,
+            &self.rocks_config,
+        )?);
+        cache.domains.insert(
+            domain_id,
+            CachedRocksDbDomain {
+                kv: kv.clone(),
+                last_used: use_order,
+            },
+        );
+        while cache.domains.len() > self.max_open_domains {
+            let Some(evict_id) = cache
+                .domains
+                .iter()
+                .filter(|(_, domain)| Arc::strong_count(&domain.kv) == 1)
+                .min_by_key(|(_, domain)| domain.last_used)
+                .map(|(domain_id, _)| *domain_id)
+            else {
+                break;
+            };
+            cache.domains.remove(&evict_id);
+        }
+        Ok(kv)
+    }
+}
+
+impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
+    fn layout_name(&self) -> &'static str {
+        "grouped_rocksdb"
+    }
+
+    fn open_tablet_store(&self, tablet_id: i64) -> Result<TabletKvStore> {
+        let domain_id = self.domain_id(tablet_id)?;
+        let kv = self.open_domain(domain_id)?;
+        TabletKvStore::new(kv, tablet_id)
+    }
+
+    fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
+        if self.tablets_per_domain != 1 {
+            return Err(Error::Other(
+                "tablet checkpoint requires grouped_rocksdb tablets_per_domain=1".into(),
+            ));
+        }
+        let domain_id = self.domain_id(tablet_id)?;
+        let kv = self.open_domain(domain_id)?;
+        kv.checkpoint(out_dir)?;
+        Ok(TabletStoreManifest {
+            tablet_id,
+            layout: self.layout_name().into(),
+            engine: "rocksdb".into(),
+            storage_uri: out_dir.display().to_string(),
+            ..TabletStoreManifest::default_for(tablet_id)
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabletStoreManifest {
+    pub tablet_id: i64,
+    pub cell_id: Option<String>,
+    pub placement_scope_id: Option<String>,
+    pub tablet_epoch: Option<i64>,
+    pub latest_applied_index: u64,
+    pub latest_snapshot_index: Option<u64>,
+    pub layout: String,
+    pub engine: String,
+    pub storage_uri: String,
+    pub checksum_sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+impl TabletStoreManifest {
+    pub fn default_for(tablet_id: i64) -> Self {
+        Self {
+            tablet_id,
+            cell_id: None,
+            placement_scope_id: None,
+            tablet_epoch: None,
+            latest_applied_index: 0,
+            latest_snapshot_index: None,
+            layout: "unknown".into(),
+            engine: "unknown".into(),
+            storage_uri: String::new(),
+            checksum_sha256: None,
+            size_bytes: None,
+        }
+    }
+}
+
+fn scoped_key(scope: &TabletKvScope, key: &[u8]) -> Vec<u8> {
+    match scope {
+        TabletKvScope::SharedPrefix(prefix) => {
+            let mut scoped = prefix.clone();
+            scoped.extend_from_slice(key);
+            scoped
+        }
+        TabletKvScope::Physical => key.to_vec(),
+    }
+}
+
+fn unscoped_key(scope: &TabletKvScope, key: Vec<u8>) -> Vec<u8> {
+    match scope {
+        TabletKvScope::SharedPrefix(prefix) => key
+            .strip_prefix(prefix.as_slice())
+            .map_or_else(|| key.clone(), |suffix| suffix.to_vec()),
+        TabletKvScope::Physical => key,
+    }
 }
 
 fn tablet_prefix(tablet_id: i64) -> Vec<u8> {
@@ -293,6 +534,87 @@ mod tests {
                 (b"record/a".to_vec(), b"a".to_vec()),
                 (b"record/b".to_vec(), b"b".to_vec())
             ]
+        );
+    }
+
+    #[test]
+    fn physical_tablet_store_does_not_prefix_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+        let tablet = TabletKvStore::physical(kv.clone(), 7).unwrap();
+
+        tablet.put(b"record/a", b"a").unwrap();
+
+        assert!(tablet.is_physical());
+        assert_eq!(kv.get(b"record/a").unwrap().as_deref(), Some(&b"a"[..]));
+        assert!(kv
+            .get(b"tablet_state/00000000000000000007/record/a")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn grouped_rocksdb_store_isolates_tablets_inside_bounded_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = GroupedRocksDbTabletStore::new(dir.path(), 2, 8);
+        let tablet_a = lifecycle.open_tablet_store(7).unwrap();
+        let tablet_b = lifecycle.open_tablet_store(8).unwrap();
+
+        tablet_a.put(b"session/s1", b"a").unwrap();
+        tablet_b.put(b"session/s1", b"b").unwrap();
+
+        assert_eq!(
+            tablet_a.get(b"session/s1").unwrap().as_deref(),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            tablet_b.get(b"session/s1").unwrap().as_deref(),
+            Some(&b"b"[..])
+        );
+        let domain_a = lifecycle.domain_id(7).unwrap();
+        let domain_b = lifecycle.domain_id(8).unwrap();
+        assert!(lifecycle.domain_path(domain_a).exists());
+        assert!(lifecycle.domain_path(domain_b).exists());
+        assert_ne!(
+            lifecycle.domain_path(domain_a),
+            lifecycle.domain_path(domain_b)
+        );
+    }
+
+    #[test]
+    fn grouped_rocksdb_checkpoint_requires_single_tablet_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = GroupedRocksDbTabletStore::new(dir.path().join("tablets"), 4, 8);
+        let tablet = lifecycle.open_tablet_store(7).unwrap();
+        tablet.put(b"record/a", b"a").unwrap();
+
+        let err = lifecycle
+            .checkpoint_tablet(7, &dir.path().join("checkpoint"))
+            .unwrap_err();
+        assert!(err.to_string().contains("tablets_per_domain=1"));
+    }
+
+    #[test]
+    fn grouped_rocksdb_checkpoint_can_capture_single_tablet_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = GroupedRocksDbTabletStore::new(dir.path().join("tablets"), 1, 8);
+        let tablet = lifecycle.open_tablet_store(7).unwrap();
+        tablet.put(b"record/a", b"a").unwrap();
+        drop(tablet);
+
+        let checkpoint_dir = dir.path().join("checkpoint");
+        let manifest = lifecycle.checkpoint_tablet(7, &checkpoint_dir).unwrap();
+        let restored = RocksKvStore::open(&checkpoint_dir).unwrap();
+
+        assert_eq!(manifest.tablet_id, 7);
+        assert_eq!(manifest.layout, "grouped_rocksdb");
+        assert_eq!(manifest.engine, "rocksdb");
+        assert_eq!(
+            restored
+                .get(b"tablet_state/00000000000000000007/record/a")
+                .unwrap()
+                .as_deref(),
+            Some(&b"a"[..])
         );
     }
 }

@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
 
@@ -87,5 +88,132 @@ pub trait KvStore: Send + Sync {
         Err(crate::error::Error::Other(
             "checkpoint not supported by this KvStore backend".into(),
         ))
+    }
+}
+
+#[derive(Default)]
+pub struct InMemoryKvStore {
+    rows: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl InMemoryKvStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl KvStore for InMemoryKvStore {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .rows
+            .lock()
+            .expect("in-memory kv lock poisoned")
+            .get(key)
+            .cloned())
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.rows
+            .lock()
+            .expect("in-memory kv lock poisoned")
+            .insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        self.rows
+            .lock()
+            .expect("in-memory kv lock poisoned")
+            .remove(key);
+        Ok(())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let rows = self
+            .rows
+            .lock()
+            .expect("in-memory kv lock poisoned")
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect::<Vec<_>>();
+        Ok(Box::new(rows.into_iter()))
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let rows = self
+            .rows
+            .lock()
+            .expect("in-memory kv lock poisoned")
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix) && key.as_slice() >= start)
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect::<Vec<_>>();
+        Ok(Box::new(rows.into_iter()))
+    }
+
+    fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
+        let mut rows = self.rows.lock().expect("in-memory kv lock poisoned");
+        for op in ops {
+            match op {
+                WriteOp::Put { key, value } => {
+                    rows.insert(key, value);
+                }
+                WriteOp::Delete { key } => {
+                    rows.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot<'a>(&'a self) -> Result<Box<dyn KvSnapshot + 'a>> {
+        Ok(Box::new(InMemoryKvSnapshot {
+            rows: self
+                .rows
+                .lock()
+                .expect("in-memory kv lock poisoned")
+                .clone(),
+        }))
+    }
+
+    fn snapshot_owned(self: Arc<Self>) -> Result<Arc<dyn KvSnapshot>> {
+        Ok(Arc::new(InMemoryKvSnapshot {
+            rows: self
+                .rows
+                .lock()
+                .expect("in-memory kv lock poisoned")
+                .clone(),
+        }))
+    }
+}
+
+struct InMemoryKvSnapshot {
+    rows: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl KvSnapshot for InMemoryKvSnapshot {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.rows.get(key).cloned())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
+        let rows = self
+            .rows
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect::<Vec<_>>();
+        Ok(Box::new(rows.into_iter()))
+    }
+
+    fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+        let rows = self
+            .rows
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix) && key.as_slice() >= start)
+            .map(|(key, value)| Ok((key.clone(), value.clone())))
+            .collect::<Vec<_>>();
+        Ok(Box::new(rows.into_iter()))
     }
 }

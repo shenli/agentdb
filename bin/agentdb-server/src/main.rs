@@ -357,12 +357,50 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
                 tablet_count = logs.len(),
+                tablet_store_layout = ?config.tablet_store_layout,
                 "opened runtime with raft-rs replicated tablet logs"
             );
-            (
-                agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs),
-                content_mirror,
-            )
+            let runtime = match config.tablet_store_layout {
+                TabletStoreLayoutKind::PrefixScoped => {
+                    agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs)
+                }
+                TabletStoreLayoutKind::GroupedRocksDb => {
+                    std::fs::create_dir_all(&config.tablet_store_root_dir)?;
+                    let rocks_config = agentdb_storage::RocksKvStoreConfig {
+                        write_buffer_size_bytes: config.tablet_store_domain_write_buffer_size_mib
+                            * 1024
+                            * 1024,
+                        max_write_buffer_number: config.tablet_store_domain_max_write_buffers,
+                        parallelism: config.tablet_store_domain_parallelism,
+                        max_background_jobs: config.tablet_store_domain_max_background_jobs,
+                        max_open_files: config.tablet_store_domain_max_open_files,
+                        ..agentdb_storage::RocksKvStoreConfig::tablet_domain()
+                    };
+                    let lifecycle = Arc::new(
+                        agentdb_storage::GroupedRocksDbTabletStore::new_with_rocks_config(
+                            config.tablet_store_root_dir.clone(),
+                            config.tablet_store_tablets_per_domain,
+                            config.tablet_store_max_open_domains,
+                            rocks_config,
+                        ),
+                    );
+                    tracing::info!(
+                        root_dir = %config.tablet_store_root_dir.display(),
+                        tablets_per_domain = config.tablet_store_tablets_per_domain,
+                        max_open_domains = config.tablet_store_max_open_domains,
+                        domain_write_buffer_size_mib = config.tablet_store_domain_write_buffer_size_mib,
+                        domain_max_write_buffers = config.tablet_store_domain_max_write_buffers,
+                        domain_parallelism = config.tablet_store_domain_parallelism,
+                        domain_max_background_jobs = config.tablet_store_domain_max_background_jobs,
+                        domain_max_open_files = config.tablet_store_domain_max_open_files,
+                        "opened grouped RocksDB tablet-store lifecycle"
+                    );
+                    agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+                        lifecycle, content, logs,
+                    )
+                }
+            };
+            (runtime, content_mirror)
         } else {
             (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
         }
@@ -676,6 +714,15 @@ struct ResolvedServeConfig {
     data_dir: PathBuf,
     content_dir: PathBuf,
     kv_backend: KvBackendKind,
+    tablet_store_layout: TabletStoreLayoutKind,
+    tablet_store_root_dir: PathBuf,
+    tablet_store_tablets_per_domain: i64,
+    tablet_store_max_open_domains: usize,
+    tablet_store_domain_write_buffer_size_mib: usize,
+    tablet_store_domain_max_write_buffers: i32,
+    tablet_store_domain_parallelism: i32,
+    tablet_store_domain_max_background_jobs: i32,
+    tablet_store_domain_max_open_files: i32,
     content_backend: ContentBackendKind,
     object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
@@ -853,6 +900,12 @@ enum KvBackendKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabletStoreLayoutKind {
+    PrefixScoped,
+    GroupedRocksDb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContentBackendKind {
     LocalFs,
     ObjectStore,
@@ -888,6 +941,42 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let tablet_store_layout = resolve_tablet_store_layout(&file.storage.tablet)?;
+        let tablet_store_root_dir = file
+            .storage
+            .tablet
+            .root_dir
+            .unwrap_or_else(|| data_dir.join("tablet-stores"));
+        let tablet_store_tablets_per_domain =
+            file.storage.tablet.tablets_per_domain.unwrap_or(32).max(1);
+        let tablet_store_max_open_domains =
+            file.storage.tablet.max_open_domains.unwrap_or(16).max(1);
+        let tablet_store_domain_write_buffer_size_mib = file
+            .storage
+            .tablet
+            .domain_write_buffer_size_mib
+            .unwrap_or(16)
+            .max(1);
+        let tablet_store_domain_max_write_buffers = file
+            .storage
+            .tablet
+            .domain_max_write_buffers
+            .unwrap_or(2)
+            .max(1);
+        let tablet_store_domain_parallelism =
+            file.storage.tablet.domain_parallelism.unwrap_or(1).max(1);
+        let tablet_store_domain_max_background_jobs = file
+            .storage
+            .tablet
+            .domain_max_background_jobs
+            .unwrap_or(1)
+            .max(1);
+        let tablet_store_domain_max_open_files = file
+            .storage
+            .tablet
+            .domain_max_open_files
+            .unwrap_or(128)
+            .max(16);
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
@@ -929,6 +1018,15 @@ impl ResolvedServeConfig {
             data_dir,
             content_dir,
             kv_backend,
+            tablet_store_layout,
+            tablet_store_root_dir,
+            tablet_store_tablets_per_domain,
+            tablet_store_max_open_domains,
+            tablet_store_domain_write_buffer_size_mib,
+            tablet_store_domain_max_write_buffers,
+            tablet_store_domain_parallelism,
+            tablet_store_domain_max_background_jobs,
+            tablet_store_domain_max_open_files,
             content_backend,
             object_store,
             in_memory,
@@ -983,6 +1081,42 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let tablet_store_layout = resolve_tablet_store_layout(&file.storage.tablet)?;
+        let tablet_store_root_dir = file
+            .storage
+            .tablet
+            .root_dir
+            .unwrap_or_else(|| data_dir.join("tablet-stores"));
+        let tablet_store_tablets_per_domain =
+            file.storage.tablet.tablets_per_domain.unwrap_or(32).max(1);
+        let tablet_store_max_open_domains =
+            file.storage.tablet.max_open_domains.unwrap_or(16).max(1);
+        let tablet_store_domain_write_buffer_size_mib = file
+            .storage
+            .tablet
+            .domain_write_buffer_size_mib
+            .unwrap_or(16)
+            .max(1);
+        let tablet_store_domain_max_write_buffers = file
+            .storage
+            .tablet
+            .domain_max_write_buffers
+            .unwrap_or(2)
+            .max(1);
+        let tablet_store_domain_parallelism =
+            file.storage.tablet.domain_parallelism.unwrap_or(1).max(1);
+        let tablet_store_domain_max_background_jobs = file
+            .storage
+            .tablet
+            .domain_max_background_jobs
+            .unwrap_or(1)
+            .max(1);
+        let tablet_store_domain_max_open_files = file
+            .storage
+            .tablet
+            .domain_max_open_files
+            .unwrap_or(128)
+            .max(16);
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
@@ -1024,6 +1158,15 @@ impl ResolvedServeConfig {
             data_dir,
             content_dir,
             kv_backend,
+            tablet_store_layout,
+            tablet_store_root_dir,
+            tablet_store_tablets_per_domain,
+            tablet_store_max_open_domains,
+            tablet_store_domain_write_buffer_size_mib,
+            tablet_store_domain_max_write_buffers,
+            tablet_store_domain_parallelism,
+            tablet_store_domain_max_background_jobs,
+            tablet_store_domain_max_open_files,
             content_backend,
             object_store,
             in_memory,
@@ -1092,6 +1235,8 @@ struct StorageFileConfig {
     #[serde(default)]
     kv: KvFileConfig,
     #[serde(default)]
+    tablet: TabletStoreFileConfig,
+    #[serde(default)]
     content: ContentFileConfig,
     object_store: Option<ObjectStoreFileConfig>,
 }
@@ -1099,6 +1244,19 @@ struct StorageFileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct KvFileConfig {
     backend: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TabletStoreFileConfig {
+    layout: Option<String>,
+    root_dir: Option<PathBuf>,
+    tablets_per_domain: Option<i64>,
+    max_open_domains: Option<usize>,
+    domain_write_buffer_size_mib: Option<usize>,
+    domain_max_write_buffers: Option<i32>,
+    domain_parallelism: Option<i32>,
+    domain_max_background_jobs: Option<i32>,
+    domain_max_open_files: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1188,6 +1346,16 @@ fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
         "rocksdb" => Ok(KvBackendKind::RocksDb),
         "slatedb" => Ok(KvBackendKind::SlateDb),
         other => anyhow::bail!("unknown storage.kv.backend: {other}"),
+    }
+}
+
+fn resolve_tablet_store_layout(
+    cfg: &TabletStoreFileConfig,
+) -> anyhow::Result<TabletStoreLayoutKind> {
+    match cfg.layout.as_deref().unwrap_or("grouped_rocksdb") {
+        "prefix_scoped" => Ok(TabletStoreLayoutKind::PrefixScoped),
+        "grouped_rocksdb" => Ok(TabletStoreLayoutKind::GroupedRocksDb),
+        other => anyhow::bail!("unknown storage.tablet.layout: {other}"),
     }
 }
 
@@ -5157,6 +5325,21 @@ mod tests {
         assert_eq!(config.bind, default_bind());
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.content_dir, PathBuf::from("./data/content"));
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::GroupedRocksDb
+        );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("./data/tablet-stores")
+        );
+        assert_eq!(config.tablet_store_tablets_per_domain, 32);
+        assert_eq!(config.tablet_store_max_open_domains, 16);
+        assert_eq!(config.tablet_store_domain_write_buffer_size_mib, 16);
+        assert_eq!(config.tablet_store_domain_max_write_buffers, 2);
+        assert_eq!(config.tablet_store_domain_parallelism, 1);
+        assert_eq!(config.tablet_store_domain_max_background_jobs, 1);
+        assert_eq!(config.tablet_store_domain_max_open_files, 128);
         assert!(!config.in_memory);
     }
 
@@ -5251,6 +5434,78 @@ data_dir = "/tmp/agentdb-test"
         assert_eq!(
             config.content_dir,
             PathBuf::from("/tmp/agentdb-test/content")
+        );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("/tmp/agentdb-test/tablet-stores")
+        );
+    }
+
+    #[test]
+    fn config_file_sets_grouped_tablet_store_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage]
+data_dir = "/tmp/agentdb-test"
+
+[storage.tablet]
+layout = "grouped_rocksdb"
+root_dir = "/mnt/agentdb-tablets"
+tablets_per_domain = 16
+max_open_domains = 8
+domain_write_buffer_size_mib = 8
+domain_max_write_buffers = 2
+domain_parallelism = 2
+domain_max_background_jobs = 2
+domain_max_open_files = 96
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::GroupedRocksDb
+        );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("/mnt/agentdb-tablets")
+        );
+        assert_eq!(config.tablet_store_tablets_per_domain, 16);
+        assert_eq!(config.tablet_store_max_open_domains, 8);
+        assert_eq!(config.tablet_store_domain_write_buffer_size_mib, 8);
+        assert_eq!(config.tablet_store_domain_max_write_buffers, 2);
+        assert_eq!(config.tablet_store_domain_parallelism, 2);
+        assert_eq!(config.tablet_store_domain_max_background_jobs, 2);
+        assert_eq!(config.tablet_store_domain_max_open_files, 96);
+    }
+
+    #[test]
+    fn config_file_can_select_prefix_scoped_tablet_store_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage.tablet]
+layout = "prefix_scoped"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::PrefixScoped
         );
     }
 

@@ -29,8 +29,8 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
-    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, ReplicatedLog,
-    TabletKvStore, WriteOp,
+    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter,
+    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -877,14 +877,12 @@ struct RuntimeTabletKvStore {
 
 impl RuntimeTabletKvStore {
     fn new(
-        kv: Arc<dyn KvStore + Send + Sync>,
-        tablet_id: i64,
+        store: TabletKvStore,
         state_machine: Arc<dyn TabletStateMachine>,
     ) -> agentdb_storage::Result<Self> {
-        let store = Arc::new(TabletKvStore::new(kv, tablet_id)?);
         state_machine.apply_committed()?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             state_machine,
         })
     }
@@ -893,21 +891,25 @@ impl RuntimeTabletKvStore {
         kv: Arc<dyn KvStore + Send + Sync>,
         tablet_id: i64,
     ) -> agentdb_storage::Result<Self> {
+        let store = TabletKvStore::new(kv.clone(), tablet_id)?;
         let state_machine = Arc::new(LoggedTabletStateMachine::single_node(
             kv.clone(),
             tablet_id,
         )?);
-        Self::new(kv, tablet_id, state_machine)
+        Self::new(store, state_machine)
     }
 
     fn logged(
-        kv: Arc<dyn KvStore + Send + Sync>,
+        store: TabletKvStore,
         tablet_id: i64,
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> agentdb_storage::Result<(Self, Arc<LoggedTabletStateMachine>)> {
-        let tablet_store = TabletKvStore::new(kv.clone(), tablet_id)?;
-        let state_machine = Arc::new(LoggedTabletStateMachine::new(tablet_id, log, tablet_store)?);
-        let kv_store = Self::new(kv, tablet_id, state_machine.clone())?;
+        let state_machine = Arc::new(LoggedTabletStateMachine::new(
+            tablet_id,
+            log,
+            store.clone(),
+        )?);
+        let kv_store = Self::new(store, state_machine.clone())?;
         Ok((kv_store, state_machine))
     }
 }
@@ -966,7 +968,7 @@ struct RuntimeTabletHandle {
 }
 
 struct RuntimeTabletRouterKvStore {
-    kv: Arc<dyn KvStore + Send + Sync>,
+    store_lifecycle: Arc<dyn TabletStoreLifecycle>,
     default_tablet_id: i64,
     tablets: RwLock<BTreeMap<i64, RuntimeTabletHandle>>,
 }
@@ -974,6 +976,18 @@ struct RuntimeTabletRouterKvStore {
 impl RuntimeTabletRouterKvStore {
     fn new(
         kv: Arc<dyn KvStore + Send + Sync>,
+        default_tablet_id: i64,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> agentdb_storage::Result<Self> {
+        Self::new_with_lifecycle(
+            Arc::new(PrefixScopedTabletStore::new(kv)),
+            default_tablet_id,
+            logs,
+        )
+    }
+
+    fn new_with_lifecycle(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
         default_tablet_id: i64,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> agentdb_storage::Result<Self> {
@@ -989,8 +1003,8 @@ impl RuntimeTabletRouterKvStore {
         }
         let mut tablets = BTreeMap::new();
         for (tablet_id, log) in logs {
-            let (kv_store, state_machine) =
-                RuntimeTabletKvStore::logged(kv.clone(), tablet_id, log)?;
+            let store = store_lifecycle.open_tablet_store(tablet_id)?;
+            let (kv_store, state_machine) = RuntimeTabletKvStore::logged(store, tablet_id, log)?;
             tablets.insert(
                 tablet_id,
                 RuntimeTabletHandle {
@@ -1000,7 +1014,7 @@ impl RuntimeTabletRouterKvStore {
             );
         }
         Ok(Self {
-            kv,
+            store_lifecycle,
             default_tablet_id,
             tablets: RwLock::new(tablets),
         })
@@ -1018,8 +1032,8 @@ impl RuntimeTabletRouterKvStore {
         if tablets.contains_key(&tablet_id) {
             return Ok(false);
         }
-        let (kv_store, state_machine) =
-            RuntimeTabletKvStore::logged(self.kv.clone(), tablet_id, log)?;
+        let store = self.store_lifecycle.open_tablet_store(tablet_id)?;
+        let (kv_store, state_machine) = RuntimeTabletKvStore::logged(store, tablet_id, log)?;
         tablets.insert(
             tablet_id,
             RuntimeTabletHandle {
@@ -1860,6 +1874,32 @@ impl Runtime {
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
             logs,
+        )
+    }
+
+    pub fn with_tablet_store_lifecycle_and_replicated_logs(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new_with_lifecycle(
+                store_lifecycle,
+                RUNTIME_PRIMARY_TABLET_ID,
+                logs,
+            )
+            .expect("open runtime tablet router"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            tablet_router.clone(),
+            Arc::new(IdentityMetadataCryptoAdapter),
+        );
+        Self::from_persist_with_tablet_router(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            Some(tablet_router),
         )
     }
 

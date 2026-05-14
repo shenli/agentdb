@@ -96,6 +96,36 @@ Each node should have:
 - region / availability-zone metadata
 - local fast storage for hot working set
 
+For Track B tablet-local storage, the default cluster layout is bounded grouped
+RocksDB domains. This gives the deployment a physical tablet-store boundary
+without creating one RocksDB instance and memtable set per tablet:
+
+```toml
+[storage.tablet]
+layout = "grouped_rocksdb"
+root_dir = "/var/lib/agentdb/tablet-stores"
+tablets_per_domain = 32
+max_open_domains = 16
+domain_write_buffer_size_mib = 16
+domain_max_write_buffers = 2
+domain_parallelism = 1
+domain_max_background_jobs = 1
+domain_max_open_files = 128
+```
+
+`tablets_per_domain = 1` is the high-isolation mode, but it opens more RocksDB
+domains and therefore more memtables. Use it only when the node has explicit
+memory/file-handle capacity for that placement class.
+
+The rough mutable-memtable cap for grouped domains is:
+
+```text
+max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers
+```
+
+The default above is about 512 MiB before RocksDB overheads. Increase it only
+with matching instance memory and file descriptor limits.
+
 ### 2. Shared Control Plane
 
 The cluster needs a shared metadata plane for:

@@ -738,6 +738,30 @@ The target should be a hybrid policy, not a single universal layout:
 - `enterprise` and regulated domains should prefer tablet-local LSMs or a
   small dedicated tenant-local group with strict size limits.
 
+Implementation note: Track B starts with a bounded `grouped_rocksdb` layout
+rather than opening one RocksDB instance for every tablet. Operators set
+`storage.tablet.tablets_per_domain` and `storage.tablet.max_open_domains` so
+memtables and open-file usage stay capped. A one-tablet domain remains an
+explicit high-isolation setting, not the default. Each grouped domain also uses
+a smaller RocksDB write-buffer profile than the legacy single-DB runtime path;
+the default mutable-memtable budget is roughly:
+
+```text
+max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers
+```
+
+The current default is `16 * 16 MiB * 2`, or about 512 MiB before RocksDB
+metadata and block cache overheads. Grouped domains also default to one
+RocksDB background job and one parallelism unit per open domain; larger values
+should be tied to an explicit node CPU budget.
+
+TiKV RFC 0093, "Physical isolation between Region", is the reference model for
+the later full tablet-store design: multiple RocksDB instances on one node must
+share process-level controls where possible, bound memtable growth explicitly,
+name tablet directories with an epoch/applied-index component, checkpoint for
+snapshot transfer, and delay old-domain cleanup until existing handles are
+gone.
+
 Compaction controls should be explicit:
 
 - Track per-tablet key count, value bytes, storage bytes, write rate, retained
@@ -1220,8 +1244,9 @@ changefeed, compaction, and split/merge lifecycle.
    - local clone/reflink when available
    - manual compaction
 2. Prototype one physical layout:
-   - RocksDB per tablet, or
-   - grouped RocksDB per tablet set for economy/shared pools
+   - grouped RocksDB per tablet set with bounded open domains first
+   - RocksDB per tablet only as an explicit `tablets_per_domain = 1`
+     high-isolation mode
 3. Add tablet-store manifests:
    - tablet id
    - cell id

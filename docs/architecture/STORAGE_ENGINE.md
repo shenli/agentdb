@@ -919,6 +919,16 @@ single-session appends or record writes.
    namespace over the existing KV backend and implements the `KvStore` trait.
    The persisted runtime keyspace is now opened through the primary runtime
    tablet instead of writing directly into the raw configured KV store.
+   Track B adds a `TabletStoreLifecycle` boundary and a bounded
+   `grouped_rocksdb` physical layout. The grouped layout maps tablets into
+   local RocksDB domains with configurable `tablets_per_domain` and
+   `max_open_domains` values so physical isolation can improve without opening
+   unbounded memtables. Grouped domains use a smaller RocksDB write-buffer
+   profile by default, and the server exposes `domain_write_buffer_size_mib`,
+   `domain_max_write_buffers`, `domain_parallelism`,
+   `domain_max_background_jobs`, and `domain_max_open_files` so deployments can
+   size the domain count against node memory, background thread, and
+   file-handle limits.
 
 4. Add replicated log abstraction.
 

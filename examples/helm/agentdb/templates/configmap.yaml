@@ -14,3 +14,14 @@ data:
     [storage]
     data_dir = "/data/runtime"
     content_dir = "/data/content"
+
+    [storage.tablet]
+    layout = "{{ .Values.tabletStore.layout }}"
+    root_dir = "{{ .Values.tabletStore.rootDir }}"
+    tablets_per_domain = {{ .Values.tabletStore.tabletsPerDomain }}
+    max_open_domains = {{ .Values.tabletStore.maxOpenDomains }}
+    domain_write_buffer_size_mib = {{ .Values.tabletStore.domainWriteBufferSizeMiB }}
+    domain_max_write_buffers = {{ .Values.tabletStore.domainMaxWriteBuffers }}
+    domain_parallelism = {{ .Values.tabletStore.domainParallelism }}
+    domain_max_background_jobs = {{ .Values.tabletStore.domainMaxBackgroundJobs }}
+    domain_max_open_files = {{ .Values.tabletStore.domainMaxOpenFiles }}
