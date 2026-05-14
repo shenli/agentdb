@@ -60,6 +60,11 @@ enum Command {
         #[command(subcommand)]
         command: CellsCommand,
     },
+    /// Tenant placement policy operations.
+    TenantPolicies {
+        #[command(subcommand)]
+        command: TenantPoliciesCommand,
+    },
     /// Tablet placement and movement operations.
     Tablets {
         #[command(subcommand)]
@@ -124,6 +129,16 @@ enum CellsCommand {
     Upsert(UpsertCellArgs),
 }
 
+#[derive(Subcommand, Debug)]
+enum TenantPoliciesCommand {
+    /// List tenant placement policies.
+    List,
+    /// Create or update a tenant placement policy.
+    Upsert(UpsertTenantPolicyArgs),
+    /// Delete a tenant placement policy.
+    Delete { tenant_id: String },
+}
+
 #[derive(Args, Debug)]
 struct UpsertCellArgs {
     #[arg(long)]
@@ -146,6 +161,30 @@ struct UpsertCellArgs {
     object_store_namespace: Option<String>,
     #[arg(long, default_value_t = 0)]
     rollout_version: i64,
+}
+
+#[derive(Args, Debug)]
+struct UpsertTenantPolicyArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long, default_value = "shared")]
+    placement_class: String,
+    #[arg(long, default_value = "default")]
+    placement_scope_id: String,
+    #[arg(long, default_value = "default")]
+    cell_id: String,
+    #[arg(long, default_value = "free")]
+    tier: String,
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    #[arg(long, default_value = "pool")]
+    encryption_class: String,
+    #[arg(long)]
+    key_policy_id: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    encryption_policy_version: i64,
+    #[arg(long, default_value_t = 0)]
+    policy_version: i64,
 }
 
 #[derive(Args, Debug)]
@@ -479,6 +518,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
         }
         Command::Nodes { command } => nodes(api, command).await,
         Command::Cells { command } => cells(api, command).await,
+        Command::TenantPolicies { command } => tenant_policies(api, command).await,
         Command::Tablets { command } => tablets(api, command).await,
         Command::Raft { command } => raft(api, command).await,
         Command::Drain { command } => match command {
@@ -684,6 +724,34 @@ async fn cells(api: &Api, command: CellsCommand) -> Result<Value> {
                 }),
             )
             .await
+        }
+    }
+}
+
+async fn tenant_policies(api: &Api, command: TenantPoliciesCommand) -> Result<Value> {
+    match command {
+        TenantPoliciesCommand::List => api.get("/api/admin/tenant-policies").await,
+        TenantPoliciesCommand::Upsert(args) => {
+            api.post(
+                "/api/admin/tenant-policies",
+                json!({
+                    "tenant_id": args.tenant_id,
+                    "placement_class": args.placement_class,
+                    "placement_scope_id": args.placement_scope_id,
+                    "cell_id": args.cell_id,
+                    "tier": args.tier,
+                    "priority": args.priority,
+                    "encryption_class": args.encryption_class,
+                    "key_policy_id": args.key_policy_id,
+                    "encryption_policy_version": args.encryption_policy_version,
+                    "policy_version": args.policy_version
+                }),
+            )
+            .await
+        }
+        TenantPoliciesCommand::Delete { tenant_id } => {
+            api.delete(&format!("/api/admin/tenant-policies/{tenant_id}"))
+                .await
         }
     }
 }

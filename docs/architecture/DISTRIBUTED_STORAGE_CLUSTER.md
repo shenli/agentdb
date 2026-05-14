@@ -1373,7 +1373,8 @@ Exit criteria:
 
 - Document and test add-node, drain-node, replace-node, rolling restart, and
   rolling upgrade per cell.
-- Add `agentdbctl` commands for cell status and tenant placement inspection.
+- Use `agentdbctl cells` and `agentdbctl tenant-policies` for cell status and
+  tenant placement inspection/updates.
 - Add alerts and runbooks for quorum loss, lagging replicas, stale routing,
   movement backlog, metadata degradation, and object-store degradation.
 

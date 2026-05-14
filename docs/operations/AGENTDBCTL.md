@@ -53,6 +53,17 @@ deploying AWS or Kubernetes nodes to confirm `grouped_rocksdb`,
 `tablets_per_domain`, `max_open_domains`, and compaction pressure match the
 intended instance memory budget.
 
+Tenant placement:
+
+```bash
+agentdbctl cells list
+agentdbctl tenant-policies list
+agentdbctl tenant-policies upsert --tenant-id ten_123 \
+  --cell-id cell-a --placement-scope-id tenant/acme \
+  --tier paid --priority 100 --placement-class dedicated
+agentdbctl tenant-policies delete ten_123
+```
+
 Drain and undrain a node:
 
 ```bash
