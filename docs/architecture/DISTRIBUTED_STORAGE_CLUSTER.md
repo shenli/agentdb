@@ -1310,9 +1310,11 @@ changefeed, compaction, and split/merge lifecycle.
    times offline local restore into a fresh store root. Admin scheduler status
    exposes open tablet-store domain metrics, including memtable bytes, level-0
    files, pending compaction bytes, running compactions/flushes, and background
-   errors. On Linux the benchmark samples process open file descriptors and
-   resident memory before writes, after writes, and after checkpointing. The
-   real-cluster smoke harness reports Raft catch-up request duration,
+   errors. `agentdbctl tablet-store compact --tablet-id <id>` exposes the
+   manual compaction hook for local restore/heavy-churn maintenance. On Linux
+   the benchmark samples process open file descriptors and resident memory
+   before writes, after writes, and after checkpointing. The real-cluster smoke
+   harness reports Raft catch-up request duration,
    attempted/sent/skipped counts, and convergence wait time after the catch-up
    snapshot. Online routing cutover remains higher-level control-plane work.
 

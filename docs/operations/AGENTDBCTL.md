@@ -162,6 +162,13 @@ agentdbctl raft snapshots --tablet-id 7
 agentdbctl raft prune-snapshots --dry-run
 ```
 
+Tablet-store maintenance:
+
+```bash
+agentdbctl tablet-store compact --tablet-id 7 --dry-run
+agentdbctl tablet-store compact --tablet-id 7
+```
+
 Backup and restore validation:
 
 ```bash

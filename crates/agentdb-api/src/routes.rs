@@ -122,6 +122,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/tablet-stats", get(get_admin_tablet_stats))
         .route(
+            "/api/admin/tablet-store/compact",
+            post(compact_admin_tablet_store),
+        )
+        .route(
             "/api/admin/tablets/:tablet_id/split/prepare",
             post(prepare_admin_tablet_split),
         )
@@ -644,6 +648,21 @@ struct SchedulerStatusResponse {
     last_tick_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tablet_store: Option<crate::state::TabletStoreStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactTabletStoreBody {
+    tablet_id: i64,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactTabletStoreResponse {
+    tablet_id: i64,
+    dry_run: bool,
+    status: &'static str,
+    domains: Vec<agentdb_storage::TabletStoreDomainMetrics>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1384,6 +1403,33 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         last_tick_at_ms: snapshot.last_tick_at_ms,
         tablet_store,
     })
+}
+
+async fn compact_admin_tablet_store(
+    State(s): State<AppState>,
+    Json(body): Json<CompactTabletStoreBody>,
+) -> Result<Json<CompactTabletStoreResponse>, ApiError> {
+    if body.tablet_id <= 0 {
+        return Err(invalid_admin_request("tablet_id must be positive"));
+    }
+    if !body.dry_run {
+        s.runtime
+            .compact_tablet_store(body.tablet_id)
+            .map_err(|err| internal_error(err.message))?;
+    }
+    Ok(Json(CompactTabletStoreResponse {
+        tablet_id: body.tablet_id,
+        dry_run: body.dry_run,
+        status: if body.dry_run {
+            "would_compact"
+        } else {
+            "compacted"
+        },
+        domains: s
+            .runtime
+            .local_tablet_store_domain_metrics()
+            .unwrap_or_default(),
+    }))
 }
 
 async fn get_record_index_status(

@@ -3567,6 +3567,24 @@ async fn admin_scheduler_reports_tablet_store_domain_metrics() {
     assert_eq!(domains[0]["domain_id"], RUNTIME_PRIMARY_TABLET_ID);
     assert_eq!(domains[0]["open"], true);
     assert!(domains[0]["metrics"]["all_memtables_bytes"].is_u64());
+
+    let compact: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablet-store/compact", app.base))
+        .json(&json!({
+            "tablet_id": RUNTIME_PRIMARY_TABLET_ID
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(compact["status"], "compacted");
+    assert_eq!(compact["tablet_id"], RUNTIME_PRIMARY_TABLET_ID);
+    assert_eq!(compact["domains"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

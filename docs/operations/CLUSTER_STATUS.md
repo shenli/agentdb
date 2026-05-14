@@ -188,6 +188,8 @@ when metadata-backed cluster mode is enabled:
   budget. For open RocksDB tablet-store domains the scheduler status also
   includes memtable bytes, level-0 file count, pending compaction bytes, running
   compactions/flushes, background errors, and estimated key count.
+  `agentdbctl tablet-store compact --tablet-id <id>` can trigger the same
+  tablet-store manual compaction hook exposed by the admin API.
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,

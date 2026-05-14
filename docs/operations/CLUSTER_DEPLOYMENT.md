@@ -133,7 +133,9 @@ open tablet-store domains. The status includes open domain count, memtable
 bytes, level-0 file count, pending compaction bytes, running
 compactions/flushes, and background errors. On AWS, check these values before
 raising `max_open_domains` or lowering `tablets_per_domain`; per-tablet domains
-can multiply reserved memtable memory quickly.
+can multiply reserved memtable memory quickly. To compact one local tablet-store
+range after restore or heavy churn, run `agentdbctl tablet-store compact
+--tablet-id <id>` against the node that owns that local tablet.
 
 The AWS Terraform demo exposes these knobs as variables:
 `tablet_store_tablets_per_domain`, `tablet_store_max_open_domains`,

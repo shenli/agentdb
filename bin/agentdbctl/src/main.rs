@@ -85,6 +85,11 @@ enum Command {
         #[command(subcommand)]
         command: RestoreCommand,
     },
+    /// Local tablet-store maintenance operations.
+    TabletStore {
+        #[command(subcommand)]
+        command: TabletStoreCommand,
+    },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
         #[command(subcommand)]
@@ -370,6 +375,17 @@ enum RestoreCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum TabletStoreCommand {
+    /// Trigger manual compaction for one local tablet-store domain/range.
+    Compact {
+        #[arg(long)]
+        tablet_id: i64,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RawCommand {
     /// GET a raw API path.
     Get { path: String },
@@ -514,6 +530,18 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 tablets_per_domain,
                 max_open_domains,
             ),
+        },
+        Command::TabletStore { command } => match command {
+            TabletStoreCommand::Compact { tablet_id, dry_run } => {
+                api.post(
+                    "/api/admin/tablet-store/compact",
+                    json!({
+                        "tablet_id": tablet_id,
+                        "dry_run": dry_run
+                    }),
+                )
+                .await
+            }
         },
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
