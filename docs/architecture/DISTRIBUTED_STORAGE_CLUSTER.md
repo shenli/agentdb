@@ -1258,9 +1258,10 @@ changefeed, compaction, and split/merge lifecycle.
 
    Current implementation status: `TabletStoreManifest` is serializable and
    checkpoint creation fills `checksum_sha256` and `size_bytes` from a
-   deterministic walk of the checkpoint directory. Cell, placement scope, epoch,
-   and snapshot-index fields are present for control-plane integration but are
-   not yet populated by a tablet-aware backup API.
+   deterministic walk of the checkpoint directory. The runtime backup path can
+   populate `latest_applied_index` for local tablet checkpoints. Cell, placement
+   scope, epoch, and snapshot-index fields are present for control-plane
+   integration but are not yet populated.
 4. Implement tablet-aware backup/restore:
    - checkpoint one tablet-local domain
    - restore into a new local domain
@@ -1270,9 +1271,11 @@ changefeed, compaction, and split/merge lifecycle.
    Current implementation status: the storage lifecycle can checkpoint and
    restore a single-tablet grouped RocksDB domain when
    `tablets_per_domain = 1`. Restore refuses to overwrite a non-empty
-   destination or a domain currently open in the node process. Raft-tail replay,
-   applied-index verification, and routing cutover remain higher-level control
-   plane work.
+   destination or a domain currently open in the node process.
+   `agentdbctl backup create --include-tablet-checkpoints` can include local
+   tablet checkpoint manifests in an online backup when the node uses this
+   single-tablet-domain layout. Raft-tail replay, applied-index verification,
+   and routing cutover remain higher-level control-plane work.
 5. Preserve changefeed semantics:
    - changefeed cursor includes cell, placement scope, tablet, epoch, and
      applied index

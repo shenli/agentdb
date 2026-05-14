@@ -30,7 +30,8 @@ use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
     KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter,
-    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle, WriteOp,
+    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle,
+    TabletStoreManifest, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -1183,6 +1184,20 @@ impl RuntimeTabletRouterKvStore {
         Ok(stats)
     }
 
+    fn checkpoint_tablet_store(
+        &self,
+        tablet_id: i64,
+        out_dir: &std::path::Path,
+    ) -> agentdb_storage::Result<TabletStoreManifest> {
+        let applied_index = self.with_handle(tablet_id, |handle| {
+            handle.state_machine.apply_committed()?;
+            Ok(handle.state_machine.applied_index())
+        })?;
+        let mut manifest = self.store_lifecycle.checkpoint_tablet(tablet_id, out_dir)?;
+        manifest.latest_applied_index = applied_index;
+        Ok(manifest)
+    }
+
     fn apply_committed(&self) -> agentdb_storage::Result<usize> {
         let tablets = self
             .tablets
@@ -2147,6 +2162,22 @@ impl Runtime {
             return Ok(Vec::new());
         };
         router.storage_stats().map_err(internal)
+    }
+
+    pub fn checkpoint_tablet_store(
+        &self,
+        tablet_id: i64,
+        out_dir: &std::path::Path,
+    ) -> Result<TabletStoreManifest> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "tablet-store checkpoint requires a replicated tablet router",
+            ));
+        };
+        router
+            .checkpoint_tablet_store(tablet_id, out_dir)
+            .map_err(internal)
     }
 
     pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {

@@ -343,6 +343,9 @@ enum BackupCommand {
         /// Do not include runtime storage summary in the manifest.
         #[arg(long)]
         skip_runtime_summary: bool,
+        /// Include physical tablet-store checkpoints when the node uses single-tablet domains.
+        #[arg(long)]
+        include_tablet_checkpoints: bool,
     },
 }
 
@@ -458,6 +461,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 directory,
                 skip_meta,
                 skip_runtime_summary,
+                include_tablet_checkpoints,
             } => {
                 api.post(
                     "/api/admin/backups",
@@ -465,7 +469,8 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                         "backup_id": backup_id,
                         "directory": directory,
                         "include_meta": !skip_meta,
-                        "include_runtime_summary": !skip_runtime_summary
+                        "include_runtime_summary": !skip_runtime_summary,
+                        "include_tablet_checkpoints": include_tablet_checkpoints
                     }),
                 )
                 .await

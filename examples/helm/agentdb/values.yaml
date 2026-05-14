@@ -39,6 +39,8 @@ persistence:
 tabletStore:
   layout: grouped_rocksdb
   rootDir: /data/runtime/tablet-stores
+  # Use 1 only for high-isolation tablet checkpoint/restore tests and lower
+  # maxOpenDomains accordingly to keep memtables bounded.
   tabletsPerDomain: 32
   maxOpenDomains: 16
   domainWriteBufferSizeMiB: 16

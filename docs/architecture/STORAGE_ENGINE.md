@@ -931,7 +931,9 @@ single-session appends or record writes.
    file-handle limits. The lifecycle can also checkpoint and restore a
    single-tablet grouped RocksDB domain when `tablets_per_domain = 1`; restore
    refuses open or non-empty destinations, leaving routing cutover and Raft-tail
-   verification to the control plane.
+   verification to the control plane. Online backup can include local tablet
+   checkpoint manifests in that mode and records the checkpoint checksum, size,
+   and latest applied index.
 
 4. Add replicated log abstraction.
 

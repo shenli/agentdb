@@ -208,8 +208,12 @@ Current backup controls:
   snapshot when metadata is configured.
 - The manifest includes runtime storage summary data for observability. It is
   not a full runtime KV/content backup.
+- Add `--include-tablet-checkpoints` to checkpoint local physical tablet-store
+  domains. This is supported only for `grouped_rocksdb` with
+  `tablets_per_domain = 1`, where each checkpoint maps to exactly one tablet
+  store. The manifest records path, checksum, size, and latest applied index.
 - `agentdbctl restore validate <manifest-path>` validates a backup manifest and
-  referenced metadata snapshot.
+  referenced metadata snapshot and tablet checkpoint paths.
 
 Restore apply remains an offline operator procedure. The HTTP restore endpoint
 intentionally rejects destructive apply because live restore semantics require a

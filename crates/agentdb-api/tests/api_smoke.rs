@@ -29,9 +29,10 @@ use agentdb_meta::{
     nodes::Node, session_locators, tablet_replicas, tablet_snapshots, tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
-    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, KvStore, RaftRsNodeConfig,
-    RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
-    RaftRsWireMessage, ReplicatedLog, RocksKvStore, SingleNodeReplicatedLog,
+    AsyncMirrorContentBackend, ContentBackend, GroupedRocksDbTabletStore, InMemoryContentBackend,
+    InMemoryKvStore, KvStore, RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicatedLog,
+    RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsWireMessage, ReplicatedLog, RocksKvStore,
+    SingleNodeReplicatedLog,
 };
 use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
@@ -3270,6 +3271,98 @@ async fn admin_backup_and_restore_validation_round_trip() {
         .unwrap()
         .iter()
         .any(|check| check == "meta backup exists"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn admin_backup_can_include_single_tablet_store_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("agentdb-api-tablet-backup-test-{}", now_ms_i64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lifecycle = Arc::new(GroupedRocksDbTabletStore::new(
+        dir.join("tablet-stores"),
+        1,
+        8,
+    ));
+    let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
+        Arc::new(InMemoryKvStore::new()),
+    ));
+    let runtime = Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+        lifecycle,
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]),
+    );
+    runtime
+        .create_tenant(NewTenant {
+            external_key: "tablet-backup".into(),
+            policy: json!({}),
+        })
+        .await
+        .unwrap();
+    let app = spawn_app_with_state(AppState::new(runtime)).await;
+    let backup_root = dir.join("backups");
+
+    let backup: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/backups", app.base))
+        .json(&json!({
+            "backup_id": "tablet-backup",
+            "directory": backup_root.to_string_lossy(),
+            "include_meta": false,
+            "include_tablet_checkpoints": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let manifest_path = backup["manifest_path"].as_str().unwrap().to_string();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let checkpoints = manifest["tablet_store_checkpoints"].as_array().unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert!(std::path::Path::new(checkpoints[0]["path"].as_str().unwrap()).exists());
+    assert_eq!(
+        checkpoints[0]["manifest"]["tablet_id"].as_i64().unwrap(),
+        RUNTIME_PRIMARY_TABLET_ID
+    );
+    assert!(
+        checkpoints[0]["manifest"]["latest_applied_index"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["checksum_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let validation: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/restores", app.base))
+        .json(&json!({
+            "manifest_path": manifest_path,
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(validation["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check == "tablet store checkpoints present (1)"));
 
     let _ = std::fs::remove_dir_all(dir);
 }

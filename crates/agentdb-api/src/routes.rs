@@ -651,6 +651,7 @@ struct CreateBackupBody {
     directory: Option<String>,
     include_meta: Option<bool>,
     include_runtime_summary: Option<bool>,
+    include_tablet_checkpoints: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -677,6 +678,13 @@ struct AdminRestoreResponse {
     manifest_path: String,
     backup_id: Option<String>,
     checks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TabletCheckpointBackup {
+    tablet_id: i64,
+    path: String,
+    manifest: agentdb_storage::TabletStoreManifest,
 }
 
 #[derive(Debug, Serialize)]
@@ -1402,6 +1410,7 @@ async fn create_admin_backup(
 
     let include_meta = body.include_meta.unwrap_or(true);
     let include_runtime_summary = body.include_runtime_summary.unwrap_or(true);
+    let include_tablet_checkpoints = body.include_tablet_checkpoints.unwrap_or(false);
     let mut meta_backup_path = None;
     if include_meta {
         if let Some(meta) = s.meta.as_ref() {
@@ -1441,6 +1450,16 @@ async fn create_admin_backup(
     } else {
         None
     };
+    let tablet_store_checkpoints = if include_tablet_checkpoints {
+        let checkpoint_root = backup_dir.join("tablet-stores");
+        fs::create_dir_all(&checkpoint_root).map_err(internal_error)?;
+        Some(
+            serde_json::to_value(checkpoint_local_tablet_stores(&s, &checkpoint_root)?)
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
     let manifest = serde_json::json!({
         "schema_version": 1,
         "backup_id": backup_id,
@@ -1450,9 +1469,11 @@ async fn create_admin_backup(
         "runtime_summary": runtime_summary,
         "nodes": nodes,
         "tablets": tablets,
+        "tablet_store_checkpoints": tablet_store_checkpoints,
         "notes": [
             "This is an online backup manifest.",
             "Runtime summary is observability metadata, not a full runtime data copy.",
+            "Tablet-store checkpoints are included only when requested and require a physical single-tablet domain.",
             "Restore API currently validates manifests only; destructive apply must be done offline."
         ]
     });
@@ -1503,6 +1524,24 @@ async fn validate_admin_restore(
     if manifest.get("runtime_summary").is_some() {
         checks.push("runtime summary present".to_string());
     }
+    if let Some(checkpoints) = manifest["tablet_store_checkpoints"].as_array() {
+        for checkpoint in checkpoints {
+            let Some(path) = checkpoint["path"].as_str() else {
+                return Err(invalid_admin_request(
+                    "tablet_store_checkpoints entry is missing path",
+                ));
+            };
+            if !FsPath::new(path).exists() {
+                return Err(invalid_admin_request(format!(
+                    "tablet checkpoint path is missing: {path}"
+                )));
+            }
+        }
+        checks.push(format!(
+            "tablet store checkpoints present ({})",
+            checkpoints.len()
+        ));
+    }
     Ok(Json(AdminRestoreResponse {
         job_id: format!("job_restore_validate_{}", now_ms_i64()),
         status: "validated",
@@ -1511,6 +1550,31 @@ async fn validate_admin_restore(
         backup_id,
         checks,
     }))
+}
+
+fn checkpoint_local_tablet_stores(
+    state: &AppState,
+    checkpoint_root: &FsPath,
+) -> Result<Vec<TabletCheckpointBackup>, ApiError> {
+    let mut backups = Vec::new();
+    for tablet_id in state.runtime.registered_tablet_ids() {
+        let tablet_dir = checkpoint_root.join(format!("tablet-{tablet_id:020}"));
+        let manifest = state
+            .runtime
+            .checkpoint_tablet_store(tablet_id, &tablet_dir)
+            .map_err(|err| {
+                invalid_admin_request(format!(
+                    "tablet-store checkpoint for tablet {tablet_id} failed: {}",
+                    err.message
+                ))
+            })?;
+        backups.push(TabletCheckpointBackup {
+            tablet_id,
+            path: tablet_dir.display().to_string(),
+            manifest,
+        });
+    }
+    Ok(backups)
 }
 
 fn default_true() -> bool {

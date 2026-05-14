@@ -115,7 +115,9 @@ domain_max_open_files = 128
 
 `tablets_per_domain = 1` is the high-isolation mode, but it opens more RocksDB
 domains and therefore more memtables. Use it only when the node has explicit
-memory/file-handle capacity for that placement class.
+memory/file-handle capacity for that placement class. It is also the mode
+required by `agentdbctl backup create --include-tablet-checkpoints`, because a
+checkpoint must map to exactly one tablet store.
 
 The rough mutable-memtable cap for grouped domains is:
 
@@ -125,6 +127,16 @@ max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers
 
 The default above is about 512 MiB before RocksDB overheads. Increase it only
 with matching instance memory and file descriptor limits.
+
+The AWS Terraform demo exposes these knobs as variables:
+`tablet_store_tablets_per_domain`, `tablet_store_max_open_domains`,
+`tablet_store_domain_write_buffer_size_mib`,
+`tablet_store_domain_max_write_buffers`,
+`tablet_store_domain_max_background_jobs`, and
+`tablet_store_domain_max_open_files`. For AWS backup/restore experiments, start
+with `tablet_store_tablets_per_domain = 1` and reduce
+`tablet_store_max_open_domains` to keep the memtable budget inside the instance
+memory envelope.
 
 ### 2. Shared Control Plane
 

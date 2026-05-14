@@ -165,9 +165,16 @@ Backup and restore validation:
 
 ```bash
 agentdbctl backup create --backup-id nightly-2026-05-05 --directory ./backups
+agentdbctl backup create --backup-id tablet-copy --directory ./backups --include-tablet-checkpoints
 agentdbctl backup create --backup-id metadata-only --skip-runtime-summary
 agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
 ```
+
+`--include-tablet-checkpoints` checkpoints local physical tablet-store domains
+into the backup manifest. It requires `storage.tablet.layout = "grouped_rocksdb"`
+with `tablets_per_domain = 1`; grouped domains with multiple tablets are
+intentionally rejected because a checkpoint would include unrelated tablet
+state.
 
 Register or remove nodes:
 
