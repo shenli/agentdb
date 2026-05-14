@@ -105,6 +105,7 @@ struct NodeSpec {
     id: String,
     port: u16,
     url: String,
+    availability_zone: String,
     config_path: PathBuf,
     data_dir: PathBuf,
     content_dir: PathBuf,
@@ -191,11 +192,16 @@ fn node_specs(args: &Args) -> Vec<NodeSpec> {
                 content_dir: args.work_dir.join(&id).join("content"),
                 log_path: args.work_dir.join("logs").join(format!("{id}.log")),
                 url: format!("http://127.0.0.1:{port}"),
+                availability_zone: local_availability_zone(index),
                 id,
                 port,
             }
         })
         .collect()
+}
+
+fn local_availability_zone(index: usize) -> String {
+    format!("local-{}", (b'a' + u8::try_from(index).unwrap()) as char)
 }
 
 fn write_node_config(args: &Args, node: &NodeSpec) -> Result<()> {
@@ -231,7 +237,7 @@ node_id = "{node_id}"
 shard_count = {shard_count}
 cell_id = "default"
 region = "local"
-availability_zone = "local-a"
+availability_zone = "{availability_zone}"
 capacity_class = "stable"
 refresh_interval_ms = 500
 proxy_timeout_ms = 70000
@@ -244,6 +250,7 @@ proxy_timeout_ms = 70000
         region = args.s3_region,
         endpoint = args.s3_endpoint,
         node_id = node.id,
+        availability_zone = node.availability_zone,
         shard_count = DEFAULT_SHARD_COUNT,
     );
     fs::write(&node.config_path, text)?;
@@ -349,7 +356,7 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
             None,
             "alive",
             now_ms,
-            Some("local-a"),
+            Some(&node.availability_zone),
             Some("local"),
             cells::DEFAULT_CELL_ID,
             cells::DEFAULT_CAPACITY_CLASS,
@@ -527,6 +534,7 @@ async fn assert_cell_and_node_labels(client: &Client, nodes: &[NodeSpec]) -> Res
     }
 
     let node_rows = get_json(client, &first.url, "/api/admin/nodes").await?;
+    let mut zones = BTreeSet::new();
     for node in nodes {
         let row = node_rows
             .as_array()
@@ -538,11 +546,16 @@ async fn assert_cell_and_node_labels(client: &Client, nodes: &[NodeSpec]) -> Res
                 )
             })?;
         if row["cell_id"] != cells::DEFAULT_CELL_ID
-            || row["availability_zone"] != "local-a"
+            || row["availability_zone"] != node.availability_zone
             || row["capacity_class"] != cells::DEFAULT_CAPACITY_CLASS
         {
             bail!("node {} has unexpected placement labels: {row}", node.id);
         }
+        zones.insert(node.availability_zone.as_str());
+    }
+    let expected_zones = nodes.len().min(3);
+    if zones.len() < expected_zones {
+        bail!("cluster smoke expected at least {expected_zones} AZ labels, saw {zones:?}");
     }
     Ok(())
 }

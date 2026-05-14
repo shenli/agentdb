@@ -1129,17 +1129,17 @@ Operators should be able to answer:
 
 ### Real-Process Cluster Smoke
 
-Extend the existing real-cluster smoke harness with:
+The existing real-cluster smoke harness now seeds a cell, labels nodes with
+distinct AZs, verifies those labels through admin status, exercises ordinary
+appends, forces Raft catch-up, and can run owner-failover or deterministic
+single-node chaos scenarios. Extend it next with:
 
-- one-node kill while appends continue
-- owner kill and owner restart
-- follower kill and catch-up after missed writes
 - process restart from persisted raft-engine and KV directories
 - explicit tablet replacement flow
 - split under active writes
 - merge after split
-- per-cell routing checks
-- AZ-aware replica placement checks
+- two-cell routing and blast-radius checks
+- AZ failure simulation for multi-AZ profiles
 
 ### Chaos Tests
 
@@ -1352,9 +1352,11 @@ Exit criteria:
 
 ### Phase 2: Cell-Aware Test Harness
 
-- Teach the real-cluster smoke harness to seed cells and AZs.
-- Add node-down, owner-down, restart, and catch-up scenarios.
-- Add assertions that unaffected cells keep serving.
+- Keep the real-cluster smoke harness seeding cells and distinct AZ labels.
+- Add restart and explicit replacement scenarios on top of existing owner-down,
+  node-down chaos, and catch-up coverage.
+- Add a two-cell smoke scenario with assertions that unaffected cells keep
+  serving when one cell loses a node.
 - Add nightly chaos with deterministic seeds.
 
 ### Phase 3: Tablet-Local Applied-State Isolation
@@ -1401,31 +1403,23 @@ Cluster mode should not be called production-supported until:
 - SlateDB is clearly documented as optional/evaluation for runtime metadata,
   not the hot production commit path
 
-## Recommended Next Engineering Cut
+## Remaining Hardening Cut
 
-The smallest useful next cut is:
+The remaining useful cut is no longer metadata migration or prefix-layout
+migration. The next work should focus on real-process lifecycle validation:
 
-1. Add `cell_id` to metadata and routing snapshots.
-2. Add domain class, deployment profile, capacity class, tenant tier, and tenant
-   priority metadata.
-3. Keep a shared metadata database initially; make every relevant row and query
-   cell-scoped rather than provisioning per-cell databases.
-4. Make `tenant_policies` choose `cell_id`, `placement_scope_id`, tier, and
-   priority.
-5. Make node registration include `cell_id`, region, AZ, and capacity class.
-6. Enforce same-cell and tier-compatible placement in rebalance, split, merge,
-   and replacement.
-7. Add AZ-aware voter selection for new tablet replicas.
-8. Add single-AZ deployment-profile support that places voters on distinct
-   nodes in one AZ and reports no AZ-failure tolerance.
-9. Add rules that paid-or-higher tenants do not land in economy/preemptible
-   domains or single-AZ production-unsafe domains through automatic placement.
-10. Extend the real-cluster smoke harness to create one cell with three AZs.
-11. Add an economy/free-tier cell backed by preemptible-labeled nodes and prove
-   paid tenants are not placed there.
-12. Add a second stable cell in the smoke harness and prove a node failure in
-   cell A does not break writes in cell B.
+1. Add a two-cell smoke topology with separate placement scopes and tablet
+   owners per cell.
+2. Prove writes in cell B continue while cell A loses an owner, restarts a
+   process, or runs an explicit replacement.
+3. Add split and merge under active writes with routed watch cursor assertions
+   across the cutover epoch.
+4. Add an AZ-failure simulation for multi-AZ cells and document the expected
+   single-AZ profile behavior.
+5. Add replacement-from-checkpoint coverage in the real-cluster smoke path.
+6. Add runbooks and alerts for quorum loss, lagging replicas, stale routing,
+   checkpoint failures, tablet-store compaction debt, and domain memory growth.
 
-That cut creates the right blast-radius boundary without changing the core
-tablet write path. It also gives the test harness a concrete way to prove the
-tenant and operational isolation story before deeper storage-engine work.
+This cut hardens the distributed cluster behavior around the Track A and Track
+B primitives already in place without introducing per-cell metadata databases or
+per-tablet RocksDB domains by default.
