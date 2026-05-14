@@ -1311,8 +1311,10 @@ changefeed, compaction, and split/merge lifecycle.
    exposes open tablet-store domain metrics, including memtable bytes, level-0
    files, pending compaction bytes, running compactions/flushes, and background
    errors. On Linux the benchmark samples process open file descriptors and
-   resident memory before writes, after writes, and after checkpointing. Full
-   Raft catch-up timing remains higher-level control-plane instrumentation.
+   resident memory before writes, after writes, and after checkpointing. The
+   real-cluster smoke harness reports Raft catch-up request duration,
+   attempted/sent/skipped counts, and convergence wait time after the catch-up
+   snapshot. Online routing cutover remains higher-level control-plane work.
 
 Exit criteria:
 

@@ -147,7 +147,9 @@ ops/smoke/scripts/real-cluster-smoke.sh --chaos --chaos-seed 12345
 
 This is not a full network-partition test yet. It targets the most common local
 stability regressions: leader loss, follower loss/rejoin, restart recovery, and
-replica catch-up after missed writes.
+replica catch-up after missed writes. The smoke output prints the raft catch-up
+request duration, attempted/sent/skipped counts, and the convergence wait time
+after the catch-up snapshot so deployment runs can spot catch-up regressions.
 
 ## Generated Files
 

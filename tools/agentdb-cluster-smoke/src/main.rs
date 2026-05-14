@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agentdb_meta::{cells, nodes, tablet_ranges, tablet_replicas, tablets, MetaStore};
@@ -437,9 +437,22 @@ async fn run_smoke(
     let mut next_seq = 2;
 
     eprintln!("smoke: forcing raft catch-up snapshot after setup writes");
-    force_raft_catch_up(client, nodes).await?;
+    let catch_up_started = Instant::now();
+    let catch_up = force_raft_catch_up(client, nodes).await?;
+    eprintln!(
+        "smoke: raft catch-up request completed in {:.3}s attempted={} sent={} skipped={}",
+        catch_up_started.elapsed().as_secs_f64(),
+        text_u64(&catch_up["attempted"]),
+        text_u64(&catch_up["sent"]),
+        text_u64(&catch_up["skipped"])
+    );
     eprintln!("smoke: waiting for raft convergence after setup writes");
+    let convergence_started = Instant::now();
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
+    eprintln!(
+        "smoke: raft convergence after catch-up completed in {:.3}s",
+        convergence_started.elapsed().as_secs_f64()
+    );
     print_diagnostics(client, nodes).await?;
 
     if args.failover {
@@ -901,7 +914,7 @@ async fn event_count_with_convergence_retry(
     Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
 }
 
-async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
+async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<Value> {
     let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
     let response = post_json(
         client,
@@ -916,7 +929,11 @@ async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<()> 
     {
         bail!("raft catch-up reported failures: {response}");
     }
-    Ok(())
+    Ok(response)
+}
+
+fn text_u64(value: &Value) -> u64 {
+    value.as_u64().unwrap_or_default()
 }
 
 fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
