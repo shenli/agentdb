@@ -285,6 +285,15 @@ struct TabletStoreBenchReport {
     checkpoint_ms: Option<f64>,
     checkpoint_size_bytes: Option<u64>,
     checkpoint_checksum_sha256: Option<String>,
+    resource_before: ProcessResourceSample,
+    resource_after_writes: ProcessResourceSample,
+    resource_after_checkpoint: ProcessResourceSample,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessResourceSample {
+    open_fds: Option<u64>,
+    rss_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -510,6 +519,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         ));
     }
     fs::create_dir_all(&root)?;
+    let resource_before = process_resource_sample();
 
     let lifecycle: Arc<dyn TabletStoreLifecycle> = match args.layout {
         TabletStoreLayout::PrefixScoped => {
@@ -538,6 +548,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
     }
     let elapsed = started.elapsed();
     latencies.sort_unstable();
+    let resource_after_writes = process_resource_sample();
 
     let checkpoint_tablet = args.checkpoint_tablet;
     let (checkpoint_ms, checkpoint_size_bytes, checkpoint_checksum_sha256) =
@@ -553,6 +564,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         } else {
             (None, None, None)
         };
+    let resource_after_checkpoint = process_resource_sample();
 
     let report = TabletStoreBenchReport {
         run_id: run_id.clone(),
@@ -575,6 +587,9 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         checkpoint_ms,
         checkpoint_size_bytes,
         checkpoint_checksum_sha256,
+        resource_before,
+        resource_after_writes,
+        resource_after_checkpoint,
     };
     let report_path = root.join("report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -4030,6 +4045,35 @@ fn percentile(samples: &[f64], q: f64) -> f64 {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn process_resource_sample() -> ProcessResourceSample {
+    ProcessResourceSample {
+        open_fds: linux_self_open_fds(),
+        rss_bytes: linux_self_rss_bytes(),
+    }
+}
+
+fn linux_self_open_fds() -> Option<u64> {
+    let entries = fs::read_dir("/proc/self/fd").ok()?;
+    let count = entries.filter_map(std::result::Result::ok).count();
+    Some(count as u64)
+}
+
+fn linux_self_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        let mut parts = rest.split_whitespace();
+        let value = parts.next()?.parse::<u64>().ok()?;
+        let unit = parts.next().unwrap_or("kB");
+        match unit {
+            "B" => Some(value),
+            "kB" | "KB" => value.checked_mul(1024),
+            "mB" | "MB" => value.checked_mul(1024 * 1024),
+            _ => value.checked_mul(1024),
+        }
+    })
 }
 
 fn percentile_ms(samples: &[Duration], q: f64) -> f64 {

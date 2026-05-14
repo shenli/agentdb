@@ -1305,8 +1305,10 @@ changefeed, compaction, and split/merge lifecycle.
    local storage-layout microbenchmark for `prefix_scoped` and
    `grouped_rocksdb`. It reports append throughput, p50/p95/p99/max latency,
    and checkpoint duration/size/checksum when a single-tablet domain checkpoint
-   is requested. Write-amplification, compaction-debt, restore catch-up, and
-   open-file sampling still need host-level instrumentation.
+   is requested. On Linux it also samples process open file descriptors and
+   resident memory before writes, after writes, and after checkpointing.
+   Write-amplification, compaction-debt, and restore catch-up still need
+   host-level instrumentation.
 
 Exit criteria:
 
