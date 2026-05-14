@@ -495,14 +495,27 @@ Gateway behavior:
 When one node goes down in a quorum cell:
 
 1. Heartbeats for that node stop.
-2. Other nodes mark it stale/dead after the configured threshold.
-3. Tablet leaders or owners on that node are lost.
-4. Surviving replicas elect or expose a new leader when quorum remains.
-5. Ownership/routing metadata is refreshed.
-6. Requests for affected tablets may fail or see elevated latency during the
+2. Tablet leaders on that node are lost.
+3. Surviving replicas elect a new Raft leader when quorum remains.
+4. Ownership/routing metadata is reconciled to the new Raft leader.
+5. Other nodes mark the failed node stale/dead after the configured threshold.
+6. Replacement and rebalance cleanup can proceed after the dead-node decision.
+7. Requests for affected tablets may fail or see elevated latency during the
    failover window.
-7. Requests for tablets not owned by the failed node should continue normally.
-8. Replacement or catch-up work restores replica count later.
+8. Requests for tablets not owned by the failed node should continue normally.
+9. Replacement or catch-up work restores replica count later.
+
+The write-path RTO is governed by Raft election timing, ownership
+reconciliation, route refresh/change propagation, and client retry behavior.
+It is intentionally not the same as the stale-node/dead-node threshold. The
+dead-node threshold is a slower control-plane cleanup decision that should be
+tuned to avoid false positives during metadata stalls, network pauses, or host
+scheduling hiccups.
+
+For acknowledged writes, RPO is zero while a Raft quorum survives and durable
+`raft-engine` state remains available. Unacknowledged or timed-out writes are
+unknown to clients and must be retried with idempotency. If a tablet loses
+quorum, it should become unavailable rather than accepting unsafe writes.
 
 Tenant impact depends on placement:
 

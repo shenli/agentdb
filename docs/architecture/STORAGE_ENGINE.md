@@ -1011,8 +1011,14 @@ single-session appends or record writes.
    route-owned tablets can acknowledge writes only after Raft commit. The local
    Raft append path now releases its group lock while waiting for peer
    responses, allowing the HTTP outbox and ingress workers to complete
-   multi-node election and quorum commit. Configuration changes are serialized
-   per tablet: a second promotion/removal is rejected while the first change is
+   multi-node election and quorum commit. Raft followers tick continuously, and
+   `pre_vote` is enabled to reduce disruptive elections when a partitioned
+   peer rejoins. Fast Raft election/ownership recovery is intentionally
+   separate from the slower stale-node cleanup threshold: acknowledged writes
+   have zero RPO while quorum survives, while single-owner process failure RTO
+   is bounded by Raft election time, ownership reconciliation, routing refresh,
+   and client retry behavior. Configuration changes are serialized per tablet:
+   a second promotion/removal is rejected while the first change is
    still pending commit, and `/api/admin/raft` exposes pending configuration
    changes plus outbound raft-message backlog. Remaining production work is
    deeper tablet-aware compaction tuning and broader failure-injection coverage

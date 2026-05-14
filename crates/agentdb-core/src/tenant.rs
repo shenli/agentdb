@@ -22,8 +22,12 @@ pub struct NewTenant {
 
 impl Tenant {
     pub fn create(req: NewTenant) -> Self {
+        Self::create_with_id(Id::new(IdKind::Tenant), req)
+    }
+
+    pub fn create_with_id(tenant_id: Id, req: NewTenant) -> Self {
         Self {
-            tenant_id: Id::new(IdKind::Tenant),
+            tenant_id,
             external_key: req.external_key,
             policy: req.policy,
             created_at_ms: crate::now_ms(),

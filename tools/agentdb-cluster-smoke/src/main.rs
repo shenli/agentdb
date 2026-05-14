@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use agentdb_meta::{cells, nodes, tablet_ranges, tablet_replicas, tablets, MetaStore};
+use agentdb_meta::{
+    cells, nodes, placement_scopes, tablet_ranges, tablet_replicas, tablets, tenant_policies,
+    MetaStore,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use reqwest::Client;
@@ -15,6 +18,10 @@ use serde_json::{json, Value};
 const DEFAULT_INTERNAL_TOKEN: &str = "agentdb-cluster-smoke-token";
 const DEFAULT_SHARD_COUNT: i64 = agentdb_meta::shards::DEFAULT_SHARD_COUNT;
 const PRIMARY_TABLET_ID: i64 = 1;
+const SECONDARY_TABLET_ID: i64 = 2;
+const SECONDARY_CELL_ID: &str = "cell-b";
+const SECONDARY_PLACEMENT_SCOPE_ID: &str = "cell-b";
+const SMOKE_STALE_NODE_THRESHOLD_MS: u64 = 180_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run a throwaway multi-process AgentDB cluster smoke test")]
@@ -87,6 +94,10 @@ struct Args {
     #[arg(long)]
     chaos: bool,
 
+    /// Seed a second cell/tablet and verify independent writes there.
+    #[arg(long)]
+    two_cell: bool,
+
     /// Number of chaos kill/restart iterations.
     #[arg(long, default_value_t = 12)]
     chaos_iterations: usize,
@@ -105,6 +116,7 @@ struct NodeSpec {
     id: String,
     port: u16,
     url: String,
+    cell_id: String,
     availability_zone: String,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -117,6 +129,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if args.nodes < 3 {
         bail!("--nodes must be at least 3 for a quorum smoke test");
+    }
+    if args.two_cell && args.nodes < 6 {
+        bail!("--two-cell requires --nodes 6 or more so each cell has quorum");
     }
     if args.internal_auth_token.len() < 16 {
         bail!("internal auth token must be at least 16 characters");
@@ -146,7 +161,7 @@ async fn main() -> Result<()> {
         reset_cluster_meta(&meta).await?;
     }
     ensure_cluster_meta_empty(&meta).await?;
-    seed_cluster_meta(&meta, &nodes).await?;
+    seed_cluster_meta(&meta, &nodes, args.two_cell).await?;
 
     let mut children = spawn_nodes(&args, &nodes)?;
     let client = Client::builder()
@@ -192,6 +207,11 @@ fn node_specs(args: &Args) -> Vec<NodeSpec> {
                 content_dir: args.work_dir.join(&id).join("content"),
                 log_path: args.work_dir.join("logs").join(format!("{id}.log")),
                 url: format!("http://127.0.0.1:{port}"),
+                cell_id: if args.two_cell && index >= 3 {
+                    SECONDARY_CELL_ID.into()
+                } else {
+                    cells::DEFAULT_CELL_ID.into()
+                },
                 availability_zone: local_availability_zone(index),
                 id,
                 port,
@@ -201,7 +221,10 @@ fn node_specs(args: &Args) -> Vec<NodeSpec> {
 }
 
 fn local_availability_zone(index: usize) -> String {
-    format!("local-{}", (b'a' + u8::try_from(index).unwrap()) as char)
+    format!(
+        "local-{}",
+        (b'a' + u8::try_from(index % 3).unwrap()) as char
+    )
 }
 
 fn write_node_config(args: &Args, node: &NodeSpec) -> Result<()> {
@@ -235,7 +258,8 @@ allow_http = true
 [routing]
 node_id = "{node_id}"
 shard_count = {shard_count}
-cell_id = "default"
+default_tablet_id = {default_tablet_id}
+cell_id = "{cell_id}"
 region = "local"
 availability_zone = "{availability_zone}"
 capacity_class = "stable"
@@ -250,6 +274,12 @@ proxy_timeout_ms = 70000
         region = args.s3_region,
         endpoint = args.s3_endpoint,
         node_id = node.id,
+        default_tablet_id = if node.cell_id == SECONDARY_CELL_ID {
+            SECONDARY_TABLET_ID
+        } else {
+            PRIMARY_TABLET_ID
+        },
+        cell_id = node.cell_id,
         availability_zone = node.availability_zone,
         shard_count = DEFAULT_SHARD_COUNT,
     );
@@ -298,7 +328,11 @@ async fn ensure_cluster_meta_empty(meta: &MetaStore) -> Result<()> {
     Ok(())
 }
 
-async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<()> {
+async fn seed_cluster_meta(
+    meta: &MetaStore,
+    node_specs: &[NodeSpec],
+    two_cell: bool,
+) -> Result<()> {
     let pool = meta.pool();
     let now_ms = now_ms();
     cells::upsert(
@@ -316,38 +350,58 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
         now_ms,
     )
     .await?;
-    tablets::create_with_placement(
+    let default_nodes: Vec<_> = node_specs
+        .iter()
+        .filter(|node| node.cell_id == cells::DEFAULT_CELL_ID)
+        .collect();
+    seed_tablet_meta(
         pool,
         PRIMARY_TABLET_ID,
-        "default",
-        "serving",
-        Some("tablet-1"),
-        0,
+        placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID,
+        &default_nodes,
         now_ms,
     )
     .await?;
-    tablets::assign_to(pool, PRIMARY_TABLET_ID, &node_specs[0].id).await?;
-    let tablet = tablets::get(pool, PRIMARY_TABLET_ID)
-        .await?
-        .ok_or_else(|| anyhow!("seeded tablet missing"))?;
-    tablets::assume_ownership(
-        pool,
-        PRIMARY_TABLET_ID,
-        tablet.epoch,
-        &node_specs[0].id,
-        now_ms + 300_000,
-    )
-    .await?;
-    tablet_ranges::upsert(
-        pool,
-        "default",
-        0,
-        DEFAULT_SHARD_COUNT - 1,
-        PRIMARY_TABLET_ID,
-        1,
-        now_ms,
-    )
-    .await?;
+    if two_cell {
+        cells::upsert(
+            pool,
+            SECONDARY_CELL_ID,
+            Some("local"),
+            cells::DEFAULT_DOMAIN_CLASS,
+            cells::DEFAULT_DEPLOYMENT_PROFILE,
+            cells::DEFAULT_CAPACITY_CLASS,
+            cells::DEFAULT_METADATA_ISOLATION_LEVEL,
+            "serving",
+            Some("secondary"),
+            Some("secondary"),
+            0,
+            now_ms,
+        )
+        .await?;
+        placement_scopes::upsert_with_cell(
+            pool,
+            SECONDARY_PLACEMENT_SCOPE_ID,
+            "shared_pool",
+            DEFAULT_SHARD_COUNT,
+            None,
+            "serving",
+            SECONDARY_CELL_ID,
+            now_ms,
+        )
+        .await?;
+        let secondary_nodes: Vec<_> = node_specs
+            .iter()
+            .filter(|node| node.cell_id == SECONDARY_CELL_ID)
+            .collect();
+        seed_tablet_meta(
+            pool,
+            SECONDARY_TABLET_ID,
+            SECONDARY_PLACEMENT_SCOPE_ID,
+            &secondary_nodes,
+            now_ms,
+        )
+        .await?;
+    }
     for node in node_specs {
         nodes::upsert_with_cell(
             pool,
@@ -358,21 +412,59 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
             now_ms,
             Some(&node.availability_zone),
             Some("local"),
-            cells::DEFAULT_CELL_ID,
+            &node.cell_id,
             cells::DEFAULT_CAPACITY_CLASS,
         )
         .await?;
-        tablet_replicas::upsert(
-            pool,
-            PRIMARY_TABLET_ID,
-            &node.id,
-            "voter",
-            "healthy",
-            0,
-            0,
-            now_ms,
-        )
-        .await?;
+    }
+    Ok(())
+}
+
+async fn seed_tablet_meta(
+    pool: &sqlx::AnyPool,
+    tablet_id: i64,
+    placement_scope_id: &str,
+    node_specs: &[&NodeSpec],
+    now_ms: i64,
+) -> Result<()> {
+    if node_specs.len() < 3 {
+        bail!("tablet {tablet_id} requires at least three nodes for smoke quorum");
+    }
+    tablets::create_with_placement(
+        pool,
+        tablet_id,
+        placement_scope_id,
+        "serving",
+        Some(&format!("tablet-{tablet_id}")),
+        0,
+        now_ms,
+    )
+    .await?;
+    tablets::assign_to(pool, tablet_id, &node_specs[0].id).await?;
+    let tablet = tablets::get(pool, tablet_id)
+        .await?
+        .ok_or_else(|| anyhow!("seeded tablet missing"))?;
+    tablets::assume_ownership(
+        pool,
+        tablet_id,
+        tablet.epoch,
+        &node_specs[0].id,
+        now_ms + 300_000,
+    )
+    .await?;
+    tablet_ranges::upsert(
+        pool,
+        placement_scope_id,
+        0,
+        DEFAULT_SHARD_COUNT - 1,
+        tablet_id,
+        1,
+        now_ms,
+    )
+    .await?;
+    for node in node_specs {
+        tablet_replicas::upsert(pool, tablet_id, &node.id, "voter", "healthy", 0, 0, now_ms)
+            .await?;
     }
     Ok(())
 }
@@ -400,8 +492,12 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
         .env("AGENTDB_SCHEDULER_LEASE_MS", "1500")
-        .env("AGENTDB_STALE_NODE_THRESHOLD_MS", "30000")
+        .env(
+            "AGENTDB_STALE_NODE_THRESHOLD_MS",
+            SMOKE_STALE_NODE_THRESHOLD_MS.to_string(),
+        )
         .env("AGENTDB_REAPER_TICK_MS", "500")
+        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "0")
         .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
         .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
@@ -430,22 +526,91 @@ async fn run_smoke(
     }
     assert_cell_and_node_labels(client, nodes).await?;
     eprintln!("smoke: waiting for raft readiness");
-    wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
+    let raft_ready_timeout = if args.two_cell {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(90)
+    };
+    wait_raft_ready(client, nodes, raft_ready_timeout).await?;
 
     eprintln!("smoke: resolving initial tablet writer");
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    let owner = wait_tablet_owner(
+        client,
+        nodes,
+        PRIMARY_TABLET_ID,
+        None,
+        Duration::from_secs(90),
+    )
+    .await?;
     eprintln!("smoke: initial tablet writer {}", owner.id);
     eprintln!("smoke: creating tenant/agent/session");
-    let (tenant_id, agent_id, session_id) = create_session_smoke(client, nodes).await?;
+    let (tenant_id, agent_id, session_id) =
+        create_session_smoke(client, nodes, PRIMARY_TABLET_ID, None).await?;
     eprintln!("smoke: appending event 0");
-    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 0).await?;
+    append_and_verify(
+        client,
+        nodes,
+        PRIMARY_TABLET_ID,
+        &tenant_id,
+        &agent_id,
+        &session_id,
+        0,
+    )
+    .await?;
     eprintln!("smoke: appending event 1");
-    append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, 1).await?;
+    append_and_verify(
+        client,
+        nodes,
+        PRIMARY_TABLET_ID,
+        &tenant_id,
+        &agent_id,
+        &session_id,
+        1,
+    )
+    .await?;
     let mut next_seq = 2;
+    let mut secondary = if args.two_cell {
+        eprintln!("smoke: creating tenant/agent/session in {SECONDARY_CELL_ID}");
+        let session = create_session_smoke(
+            client,
+            nodes,
+            SECONDARY_TABLET_ID,
+            Some(TenantPlacement {
+                cell_id: SECONDARY_CELL_ID,
+                placement_scope_id: SECONDARY_PLACEMENT_SCOPE_ID,
+            }),
+        )
+        .await?;
+        eprintln!("smoke: appending secondary cell event 0");
+        append_and_verify(
+            client,
+            nodes,
+            SECONDARY_TABLET_ID,
+            &session.0,
+            &session.1,
+            &session.2,
+            0,
+        )
+        .await?;
+        eprintln!("smoke: appending secondary cell event 1");
+        append_and_verify(
+            client,
+            nodes,
+            SECONDARY_TABLET_ID,
+            &session.0,
+            &session.1,
+            &session.2,
+            1,
+        )
+        .await?;
+        Some((session.0, session.1, session.2, 2_u64))
+    } else {
+        None
+    };
 
     eprintln!("smoke: forcing raft catch-up snapshot after setup writes");
     let catch_up_started = Instant::now();
-    let catch_up = force_raft_catch_up(client, nodes).await?;
+    let catch_up = force_raft_catch_up(client, nodes, PRIMARY_TABLET_ID).await?;
     eprintln!(
         "smoke: raft catch-up request completed in {:.3}s attempted={} sent={} skipped={}",
         catch_up_started.elapsed().as_secs_f64(),
@@ -474,18 +639,56 @@ async fn run_smoke(
             .iter()
             .find(|node| node.id != owner.id)
             .ok_or_else(|| anyhow!("no surviving node after killing owner {}", owner.id))?;
-        eprintln!("smoke: waiting for {} to be marked dead", owner.id);
-        wait_node_marked_dead(client, &survivor.url, &owner.id, Duration::from_secs(45)).await?;
         eprintln!("smoke: waiting for tablet owner change");
-        wait_tablet_owner_changed(client, &survivor.url, &owner.id, Duration::from_secs(90))
-            .await?;
+        wait_tablet_owner_changed(
+            client,
+            &survivor.url,
+            PRIMARY_TABLET_ID,
+            &owner.id,
+            Duration::from_secs(45),
+        )
+        .await?;
         eprintln!("smoke: waiting for raft observability after failover");
         wait_raft_observable(client, &survivor.url, Duration::from_secs(20)).await?;
         eprintln!("smoke: waiting for new tablet writer");
-        wait_tablet_owner(client, nodes, Some(&owner.id), Duration::from_secs(90)).await?;
+        wait_tablet_owner(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            Some(&owner.id),
+            Duration::from_secs(90),
+        )
+        .await?;
         eprintln!("smoke: appending event {next_seq} after failover");
-        append_and_verify(client, nodes, &tenant_id, &agent_id, &session_id, next_seq).await?;
+        append_and_verify(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            &tenant_id,
+            &agent_id,
+            &session_id,
+            next_seq,
+        )
+        .await?;
         next_seq += 1;
+        if let Some((tenant_id, agent_id, session_id, next_secondary_seq)) = secondary.as_mut() {
+            eprintln!(
+                "smoke: appending secondary cell event {next_secondary_seq} after primary failover"
+            );
+            append_and_verify(
+                client,
+                nodes,
+                SECONDARY_TABLET_ID,
+                tenant_id,
+                agent_id,
+                session_id,
+                *next_secondary_seq,
+            )
+            .await?;
+            *next_secondary_seq += 1;
+        }
+        eprintln!("smoke: waiting for {} to be marked dead", owner.id);
+        wait_node_marked_dead(client, &survivor.url, &owner.id, stale_node_wait_timeout()).await?;
         let survivors: Vec<_> = nodes
             .iter()
             .filter(|node| node.id != owner.id)
@@ -532,6 +735,20 @@ async fn assert_cell_and_node_labels(client: &Client, nodes: &[NodeSpec]) -> Res
     {
         bail!("default cell has unexpected placement metadata: {default_cell}");
     }
+    if nodes.iter().any(|node| node.cell_id == SECONDARY_CELL_ID) {
+        let secondary = cells
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|cell| cell["cell_id"] == SECONDARY_CELL_ID)
+            })
+            .ok_or_else(|| {
+                anyhow!("secondary cell was not exposed by /api/admin/cells: {cells}")
+            })?;
+        if secondary["capacity_class"] != cells::DEFAULT_CAPACITY_CLASS {
+            bail!("secondary cell has unexpected placement metadata: {secondary}");
+        }
+    }
 
     let node_rows = get_json(client, &first.url, "/api/admin/nodes").await?;
     let mut zones = BTreeSet::new();
@@ -545,7 +762,7 @@ async fn assert_cell_and_node_labels(client: &Client, nodes: &[NodeSpec]) -> Res
                     node.id
                 )
             })?;
-        if row["cell_id"] != cells::DEFAULT_CELL_ID
+        if row["cell_id"] != node.cell_id
             || row["availability_zone"] != node.availability_zone
             || row["capacity_class"] != cells::DEFAULT_CAPACITY_CLASS
         {
@@ -565,6 +782,12 @@ struct ChaosSession<'a> {
     agent_id: &'a str,
     session_id: &'a str,
     next_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TenantPlacement<'a> {
+    cell_id: &'a str,
+    placement_scope_id: &'a str,
 }
 
 async fn run_chaos(
@@ -589,7 +812,14 @@ async fn run_chaos(
         wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
         let victim_index = rng.next_usize(nodes.len());
         let victim = &nodes[victim_index];
-        let owner_before = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        let owner_before = wait_tablet_owner(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            None,
+            Duration::from_secs(90),
+        )
+        .await?;
         eprintln!(
             "chaos: iteration {} killing {} (owner_before={})",
             iteration + 1,
@@ -608,10 +838,16 @@ async fn run_chaos(
             let survivor = survivors
                 .first()
                 .ok_or_else(|| anyhow!("chaos requires at least one surviving node"))?;
-            wait_node_marked_dead(client, &survivor.url, &victim.id, Duration::from_secs(45))
+            wait_node_marked_dead(client, &survivor.url, &victim.id, stale_node_wait_timeout())
                 .await?;
-            wait_tablet_owner_changed(client, &survivor.url, &victim.id, Duration::from_secs(90))
-                .await?;
+            wait_tablet_owner_changed(
+                client,
+                &survivor.url,
+                PRIMARY_TABLET_ID,
+                &victim.id,
+                stale_node_wait_timeout(),
+            )
+            .await?;
         } else {
             sleep_random(&mut rng, args.chaos_max_sleep_ms).await;
         }
@@ -621,7 +857,13 @@ async fn run_chaos(
             victim.id
         );
         append_and_verify(
-            client, &survivors, tenant_id, agent_id, session_id, next_seq,
+            client,
+            &survivors,
+            PRIMARY_TABLET_ID,
+            tenant_id,
+            agent_id,
+            session_id,
+            next_seq,
         )
         .await?;
         next_seq += 1;
@@ -641,13 +883,30 @@ async fn run_chaos(
             "chaos: appending event {next_seq} after {} restart",
             victim.id
         );
-        append_and_verify(client, nodes, tenant_id, agent_id, session_id, next_seq).await?;
+        append_and_verify(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            tenant_id,
+            agent_id,
+            session_id,
+            next_seq,
+        )
+        .await?;
         next_seq += 1;
     }
 
     eprintln!("chaos: waiting for all nodes to converge");
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
-    let len = event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10).await?;
+    let len = event_count_with_convergence_retry(
+        client,
+        nodes,
+        PRIMARY_TABLET_ID,
+        tenant_id,
+        session_id,
+        10,
+    )
+    .await?;
     if len < usize::try_from(next_seq).unwrap() {
         bail!("chaos expected at least {next_seq} events, got {len}");
     }
@@ -661,6 +920,10 @@ async fn sleep_random(rng: &mut SimpleRng, max_ms: u64) {
     }
     let delay_ms = 100 + (rng.next_u64() % max_ms);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+fn stale_node_wait_timeout() -> Duration {
+    Duration::from_millis(SMOKE_STALE_NODE_THRESHOLD_MS + 30_000)
 }
 
 struct SimpleRng(u64);
@@ -687,14 +950,20 @@ impl SimpleRng {
 async fn create_session_smoke(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
+    placement: Option<TenantPlacement<'_>>,
 ) -> Result<(String, String, String)> {
     let mut last_error = None;
     for attempt in 0..10 {
         eprintln!("smoke: create session attempt {}", attempt + 1);
         let suffix = format!("{}-{attempt}", now_ms());
-        match create_session_smoke_once(client, nodes, &suffix).await {
+        match create_session_smoke_once(client, nodes, tablet_id, placement, &suffix).await {
             Ok(session) => return Ok(session),
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                eprintln!(
+                    "smoke: create session retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -707,27 +976,65 @@ async fn create_session_smoke(
 async fn create_session_smoke_once(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
+    placement: Option<TenantPlacement<'_>>,
     suffix: &str,
 ) -> Result<(String, String, String)> {
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
     eprintln!("smoke: creating tenant via {}", owner.id);
-    let tenant = post_json(
-        client,
-        &owner.url,
-        "/api/tenants",
-        json!({"external_key": format!("cluster-smoke-{suffix}"), "policy": {}}),
-    )
-    .await?;
+    let tenant_body = match placement {
+        Some(placement) => json!({
+            "external_key": format!("cluster-smoke-{suffix}"),
+            "policy": {},
+            "placement": {
+                "placement_scope_id": placement.placement_scope_id,
+                "cell_id": placement.cell_id,
+                "placement_class": "shared",
+                "tier": tenant_policies::DEFAULT_TIER,
+                "priority": tenant_policies::DEFAULT_PRIORITY,
+                "encryption_class": tenant_policies::DEFAULT_ENCRYPTION_CLASS
+            }
+        }),
+        None => json!({"external_key": format!("cluster-smoke-{suffix}"), "policy": {}}),
+    };
+    let tenant = if let Some(placement) = placement {
+        post_json_with_route_headers(
+            client,
+            &owner.url,
+            "/api/tenants",
+            tenant_body,
+            tablet_id,
+            placement.cell_id,
+            placement.placement_scope_id,
+        )
+        .await?
+    } else {
+        post_json(client, &owner.url, "/api/tenants", tenant_body).await?
+    };
     let tenant_id = string_field(&tenant, "tenant_id")?;
+    if let Some(placement) = placement {
+        wait_route_decision(
+            client,
+            nodes,
+            &tenant_id,
+            tablet_id,
+            placement.cell_id,
+            placement.placement_scope_id,
+            Duration::from_secs(30),
+        )
+        .await?;
+    }
     eprintln!("smoke: creating agent for tenant {tenant_id}");
     let agent_alias = format!("cluster-smoke-agent-{suffix}");
     let agent =
-        create_agent_with_convergence_retry(client, nodes, &tenant_id, &agent_alias, 10).await?;
+        create_agent_with_convergence_retry(client, nodes, tablet_id, &tenant_id, &agent_alias, 10)
+            .await?;
     let agent_id = string_field(&agent, "agent_id")?;
     eprintln!("smoke: creating session for agent {agent_id}");
     let session = post_json_with_convergence_retry(
         client,
         nodes,
+        tablet_id,
         &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
         json!({"alias": null}),
         10,
@@ -740,6 +1047,7 @@ async fn create_session_smoke_once(
 async fn create_agent_with_convergence_retry(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     tenant_id: &str,
     alias: &str,
     attempts: usize,
@@ -748,7 +1056,8 @@ async fn create_agent_with_convergence_retry(
     let body = json!({"alias": alias, "config": {}});
     let mut last_error = None;
     for attempt in 0..attempts.max(1) {
-        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
         eprintln!(
             "smoke: POST {path} attempt {} via {}",
             attempt + 1,
@@ -757,9 +1066,13 @@ async fn create_agent_with_convergence_retry(
         match post_json(client, &owner.url, &path, body.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if is_alias_conflict(&error) => {
-                return find_agent_by_alias(client, nodes, tenant_id, alias).await;
+                return find_agent_by_alias(client, nodes, tablet_id, tenant_id, alias).await;
             }
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                eprintln!(
+                    "smoke: POST {path} retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -773,21 +1086,19 @@ async fn create_agent_with_convergence_retry(
 async fn find_agent_by_alias(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     tenant_id: &str,
     alias: &str,
 ) -> Result<Value> {
     let path = format!("/api/tenants/{tenant_id}/agents");
-    for node in nodes {
-        let Ok(response) = get_json(client, &node.url, &path).await else {
-            continue;
-        };
-        if let Some(agent) = response["agents"].as_array().and_then(|agents| {
-            agents
-                .iter()
-                .find(|agent| agent["alias"].as_str() == Some(alias))
-        }) {
-            return Ok(agent.clone());
-        }
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+    let response = get_json(client, &owner.url, &path).await?;
+    if let Some(agent) = response["agents"].as_array().and_then(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent["alias"].as_str() == Some(alias))
+    }) {
+        return Ok(agent.clone());
     }
     bail!("agent alias {alias} conflicted but existing agent was not observable")
 }
@@ -795,13 +1106,15 @@ async fn find_agent_by_alias(
 async fn post_json_with_convergence_retry(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     path: &str,
     body: Value,
     attempts: usize,
 ) -> Result<Value> {
     let mut last_error = None;
     for attempt in 0..attempts.max(1) {
-        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
         eprintln!(
             "smoke: POST {path} attempt {} via {}",
             attempt + 1,
@@ -810,6 +1123,10 @@ async fn post_json_with_convergence_retry(
         match post_json(client, &owner.url, path, body.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
+                eprintln!(
+                    "smoke: POST {path} retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -822,13 +1139,15 @@ async fn post_json_with_convergence_retry(
 async fn append_and_verify(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     tenant_id: &str,
     agent_id: &str,
     session_id: &str,
     expected_seq: u64,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
         eprintln!(
             "smoke: append seq {expected_seq} attempt {} via {}",
             attempt + 1,
@@ -854,10 +1173,23 @@ async fn append_and_verify(
                     .and_then(Value::as_u64)
                     .ok_or_else(|| anyhow!("append response missing seq: {event}"))?;
                 if seq == expected_seq {
-                    break;
+                    let len = event_count_from_base(client, &owner.url, tenant_id, session_id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "read back appended seq {expected_seq} from owner {}",
+                                owner.id
+                            )
+                        })?;
+                    if len >= usize::try_from(expected_seq + 1).unwrap() {
+                        return Ok(());
+                    }
+                    bail!("expected at least {} events, got {len}", expected_seq + 1);
                 }
-                if event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10)
-                    .await?
+                if event_count_with_convergence_retry(
+                    client, nodes, tablet_id, tenant_id, session_id, 10,
+                )
+                .await?
                     > usize::try_from(expected_seq).unwrap()
                 {
                     break;
@@ -865,9 +1197,15 @@ async fn append_and_verify(
                 bail!("expected appended seq {expected_seq}, got {seq}");
             }
             Err(error) if is_retryable_cluster_convergence_error(&error) && attempt < 2 => {
+                eprintln!(
+                    "smoke: append seq {expected_seq} retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                if event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10)
-                    .await?
+                if event_count_with_convergence_retry(
+                    client, nodes, tablet_id, tenant_id, session_id, 10,
+                )
+                .await?
                     > usize::try_from(expected_seq).unwrap()
                 {
                     break;
@@ -876,42 +1214,56 @@ async fn append_and_verify(
             Err(error) => return Err(error),
         }
     }
-    let len = event_count_with_convergence_retry(client, nodes, tenant_id, session_id, 10).await?;
+    let len =
+        event_count_with_convergence_retry(client, nodes, tablet_id, tenant_id, session_id, 10)
+            .await?;
     if len < usize::try_from(expected_seq + 1).unwrap() {
         bail!("expected at least {} events, got {len}", expected_seq + 1);
     }
     Ok(())
 }
 
-async fn event_count(
+async fn event_count_from_base(
     client: &Client,
-    nodes: &[NodeSpec],
+    base: &str,
     tenant_id: &str,
     session_id: &str,
-) -> Result<u64> {
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+) -> Result<usize> {
     let events = get_json(
         client,
-        &owner.url,
+        base,
         &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
     )
     .await?;
     Ok(events
         .as_array()
         .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
-        .len() as u64)
+        .len())
+}
+
+async fn event_count(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    session_id: &str,
+) -> Result<u64> {
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+    let count = event_count_from_base(client, &owner.url, tenant_id, session_id).await?;
+    Ok(count as u64)
 }
 
 async fn event_count_with_convergence_retry(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     tenant_id: &str,
     session_id: &str,
     attempts: usize,
 ) -> Result<usize> {
     let mut last_error = None;
     for attempt in 0..attempts.max(1) {
-        match event_count(client, nodes, tenant_id, session_id).await {
+        match event_count(client, nodes, tablet_id, tenant_id, session_id).await {
             Ok(count) => return usize::try_from(count).map_err(Into::into),
             Err(error) if is_retryable_cluster_convergence_error(&error) => {
                 eprintln!(
@@ -927,13 +1279,13 @@ async fn event_count_with_convergence_retry(
     Err(last_error.unwrap_or_else(|| anyhow!("event count failed without a captured error")))
 }
 
-async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec]) -> Result<Value> {
-    let owner = wait_tablet_owner(client, nodes, None, Duration::from_secs(90)).await?;
+async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec], tablet_id: i64) -> Result<Value> {
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
     let response = post_json(
         client,
         &owner.url,
         "/api/admin/raft/catch-up",
-        json!({"tablet_id": PRIMARY_TABLET_ID, "min_lag": 0}),
+        json!({"tablet_id": tablet_id, "min_lag": 0}),
     )
     .await?;
     if response["failures"]
@@ -975,10 +1327,20 @@ fn is_alias_conflict(error: &anyhow::Error) -> bool {
 
 async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration) -> Result<()> {
     let start = tokio::time::Instant::now();
+    let mut last_observed = Vec::new();
     loop {
         let mut ready = true;
+        last_observed.clear();
         for node in nodes {
             let raft = get_json(client, &node.url, "/api/admin/raft").await?;
+            last_observed.push(format!(
+                "{}: tablets={} unhealthy={} outbound={} summary={}",
+                node.id,
+                raft["tablet_count"].as_u64().unwrap_or(0),
+                raft["unhealthy_replica_count"].as_u64().unwrap_or(0),
+                raft["outbound_message_count"].as_u64().unwrap_or(0),
+                raft["summary"]
+            ));
             ready &= raft["enabled"] == true
                 && raft["tablet_count"].as_u64().unwrap_or(0) >= 1
                 && raft["unhealthy_replica_count"].as_u64().unwrap_or(1) == 0
@@ -1004,7 +1366,10 @@ async fn wait_raft_ready(client: &Client, nodes: &[NodeSpec], timeout: Duration)
             return Ok(());
         }
         if start.elapsed() > timeout {
-            bail!("raft groups did not become ready within {timeout:?}");
+            bail!(
+                "raft groups did not become ready within {timeout:?}; last observed: {}",
+                last_observed.join(" | ")
+            );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -1060,6 +1425,7 @@ async fn wait_node_marked_dead(
 async fn wait_tablet_owner_changed(
     client: &Client,
     base: &str,
+    tablet_id: i64,
     old_owner: &str,
     timeout: Duration,
 ) -> Result<()> {
@@ -1070,7 +1436,7 @@ async fn wait_tablet_owner_changed(
             .as_array()
             .map(|tablets| {
                 tablets.iter().any(|tablet| {
-                    tablet["tablet_id"] == PRIMARY_TABLET_ID
+                    tablet["tablet_id"] == tablet_id
                         && tablet["owner_node_id"].as_str().is_some()
                         && tablet["owner_node_id"] != old_owner
                 })
@@ -1080,9 +1446,7 @@ async fn wait_tablet_owner_changed(
             return Ok(());
         }
         if start.elapsed() > timeout {
-            bail!(
-                "tablet {PRIMARY_TABLET_ID} did not move away from {old_owner} within {timeout:?}"
-            );
+            bail!("tablet {tablet_id} did not move away from {old_owner} within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -1091,86 +1455,54 @@ async fn wait_tablet_owner_changed(
 async fn wait_tablet_owner(
     client: &Client,
     nodes: &[NodeSpec],
+    tablet_id: i64,
     previous_owner: Option<&str>,
     timeout: Duration,
 ) -> Result<NodeSpec> {
     let start = tokio::time::Instant::now();
     loop {
-        let leader_id = current_raft_leader_node_id(client, nodes).await?;
+        let live_node_ids = current_live_node_ids(client, nodes).await;
         for node in nodes {
             let Ok(tablets) = get_json(client, &node.url, "/api/admin/tablets").await else {
                 continue;
             };
-            let tablet_exists = tablets.as_array().is_some_and(|tablets| {
+            let Some(tablet) = tablets.as_array().and_then(|tablets| {
                 tablets
                     .iter()
-                    .any(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
-            });
-            if !tablet_exists {
-                continue;
-            }
-            let Some(leader_id) = leader_id.as_deref() else {
+                    .find(|tablet| tablet["tablet_id"] == tablet_id)
+            }) else {
                 continue;
             };
-            if previous_owner.is_some_and(|previous| previous == leader_id) {
+            let Some(owner_id) = tablet["owner_node_id"].as_str() else {
+                continue;
+            };
+            if previous_owner.is_some_and(|previous| previous == owner_id) {
                 continue;
             }
-            if let Some(leader) = nodes.iter().find(|candidate| candidate.id == leader_id) {
-                return Ok(leader.clone());
+            if !live_node_ids.contains(owner_id) {
+                continue;
             }
-            bail!("tablet {PRIMARY_TABLET_ID} raft leader {leader_id} is not in smoke node list");
+            if let Some(owner) = nodes.iter().find(|candidate| candidate.id == owner_id) {
+                return Ok(owner.clone());
+            }
+            bail!("tablet {tablet_id} owner {owner_id} is not in smoke node list");
         }
         if start.elapsed() > timeout {
-            bail!("tablet {PRIMARY_TABLET_ID} raft leader was not observable within {timeout:?}");
+            bail!("tablet {tablet_id} metadata owner was not observable within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-async fn current_raft_leader_node_id(
-    client: &Client,
-    nodes: &[NodeSpec],
-) -> Result<Option<String>> {
-    let live_node_ids = current_live_node_ids(client, nodes).await;
-    for node in nodes {
-        let Ok(raft) = get_json(client, &node.url, "/api/admin/raft").await else {
-            continue;
-        };
-        let Some(tablet) = raft["tablets"].as_array().and_then(|tablets| {
-            tablets
-                .iter()
-                .find(|tablet| tablet["tablet_id"] == PRIMARY_TABLET_ID)
-        }) else {
-            continue;
-        };
-        let Some(leader_raft_node_id) = tablet["replicas"].as_array().and_then(|replicas| {
-            replicas.iter().find_map(|replica| {
-                (replica["role"] == "Leader")
-                    .then(|| replica["node_id"].as_u64())
-                    .flatten()
-            })
-        }) else {
-            continue;
-        };
-        let Some(configured) = tablet["configured_replicas"].as_array() else {
-            continue;
-        };
-        for replica in configured {
-            if replica["raft_node_id"].as_u64() == Some(leader_raft_node_id) {
-                if let Some(node_id) = replica["node_id"].as_str() {
-                    if live_node_ids.contains(node_id) {
-                        return Ok(Some(node_id.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
 async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
     for node in nodes {
-        let Ok(response) = get_json(client, &node.url, "/api/admin/nodes").await else {
+        let Ok(response) = get_json(
+            client,
+            &node.url,
+            &format!("/api/admin/nodes?stale_threshold_ms={SMOKE_STALE_NODE_THRESHOLD_MS}"),
+        )
+        .await
+        else {
             continue;
         };
         let Some(items) = response.as_array() else {
@@ -1215,8 +1547,71 @@ async fn wait_json(client: &Client, base: &str, path: &str, timeout: Duration) -
     }
 }
 
+async fn wait_route_decision(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    tablet_id: i64,
+    cell_id: &str,
+    placement_scope_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        for node in nodes {
+            let Ok(decision) = get_json(
+                client,
+                &node.url,
+                &format!("/api/admin/routing/decision?tenant_id={tenant_id}"),
+            )
+            .await
+            else {
+                continue;
+            };
+            if decision["cell_id"] == cell_id
+                && decision["placement_scope_id"] == placement_scope_id
+                && decision["tablet_id"].as_i64() == Some(tablet_id)
+            {
+                return Ok(());
+            }
+        }
+        if start.elapsed() > timeout {
+            bail!(
+                "tenant {tenant_id} route did not converge to {cell_id}/{placement_scope_id}/tablet {tablet_id} within {timeout:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
     let response = client.get(format!("{base}{path}")).send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}{path}: {text}");
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+async fn post_json_with_route_headers(
+    client: &Client,
+    base: &str,
+    path: &str,
+    body: Value,
+    tablet_id: i64,
+    cell_id: &str,
+    placement_scope_id: &str,
+) -> Result<Value> {
+    let response = client
+        .post(format!("{base}{path}"))
+        .header("x-agentdb-tablet-id", tablet_id.to_string())
+        .header("x-agentdb-cell-id", cell_id)
+        .header("x-agentdb-placement-scope-id", placement_scope_id)
+        .header("x-agentdb-tablet-epoch", "0")
+        .json(&body)
+        .send()
+        .await?;
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {

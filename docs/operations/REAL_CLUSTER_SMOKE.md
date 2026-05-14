@@ -17,16 +17,22 @@ binaries, seeds a throwaway cluster topology, starts three local AgentDB server
 processes, runs the smoke checks, and keeps diagnostics under
 `/tmp/agentdb-cluster-smoke`.
 
-The seeded topology creates the default cell, one serving placement scope, one
-serving tablet, three Raft voters, and distinct local AZ labels
-(`local-a`, `local-b`, `local-c`). The harness verifies the cell and node
-placement labels through the admin APIs before running write checks.
+The default seeded topology creates the default cell, one serving placement
+scope, one serving tablet, three Raft voters, and distinct local AZ labels
+(`local-a`, `local-b`, `local-c`). With `--two-cell --nodes 6`, it also seeds
+`cell-b` with its own placement scope, tablet, and three voters. The harness
+verifies cell and node placement labels through the admin APIs before running
+write checks.
 
 Useful options:
 
 ```bash
 # Include the owner-kill failover probe.
 ops/smoke/scripts/real-cluster-smoke-compose.sh --failover
+
+# Seed two cells, run writes in both cells, kill the primary-cell owner,
+# then verify both the failed-over tablet and the unaffected cell can write.
+ops/smoke/scripts/real-cluster-smoke-compose.sh --nodes 6 --two-cell --failover
 
 # Include bounded random kill/restart chaos.
 ops/smoke/scripts/real-cluster-smoke-compose.sh --chaos --chaos-iterations 48
@@ -131,10 +137,11 @@ AGENTDB_URL=http://127.0.0.1:30102 target/debug/agentdbctl tablets list
 ops/smoke/scripts/real-cluster-smoke.sh --failover --keep-work-dir
 ```
 
-The failover probe kills the initial owner process, waits for the scheduler to
-mark it dead and move tablet ownership, then attempts another append through a
-surviving node. This is the first real-process validation target for the Raft
-and rebalance path.
+The failover probe kills the initial owner process, waits for tablet ownership
+to move through Raft election and ownership reconciliation, attempts another
+append through a surviving node, and then waits for the slower stale-node
+cleanup. In two-cell mode it also appends to the unaffected cell after the
+primary-cell owner failure.
 
 ## Optional Chaos Probe
 
@@ -156,16 +163,6 @@ stability regressions: leader loss, follower loss/rejoin, restart recovery, and
 replica catch-up after missed writes. The smoke output prints the raft catch-up
 request duration, attempted/sent/skipped counts, and the convergence wait time
 after the catch-up snapshot so deployment runs can spot catch-up regressions.
-
-## Remaining Smoke Gap
-
-The harness does not yet run a true two-cell write test. Metadata can represent
-multiple cells, but tenant creation currently happens before a tenant-specific
-placement policy can route the new tenant to a non-default cell. A real
-two-cell smoke should first add an explicit tenant bootstrap path that can
-create the tenant in the target cell, then run independent sessions in cell A
-and cell B and prove a node loss in one cell does not break writes in the
-other.
 
 ## Generated Files
 

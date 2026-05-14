@@ -14,6 +14,68 @@ That is still different from a supported, documented, user-facing cluster
 product. The remaining gap is operator hardening: failure-injection coverage,
 stable SLOs, broader failure runbooks, and storage lifecycle policy.
 
+## RTO/RPO Timing Model
+
+AgentDB separates fast write-path recovery from slower control-plane cleanup.
+This follows the same broad tradeoff as TiKV-style deployments: Raft elections
+and heartbeats should be fast, while dead-peer/store detection should be slow
+enough to avoid false positives during network or metadata stalls.
+
+Current default timing:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `AGENTDB_RAFT_TICK_INTERVAL_MS` | 100 ms | Base raft-rs logical tick. |
+| Raft heartbeat ticks | 3 ticks | Heartbeat cadence, currently compiled in. |
+| Raft election ticks | 10 ticks | Election timeout, currently compiled in. |
+| `AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS` | 1 s | How often current metadata owners ask their local Raft replica to campaign. |
+| `[routing].refresh_interval_ms` | 5 s | How often routing snapshots refresh without a metadata change hint. |
+| `AGENTDB_SCHEDULER_RENEW_INTERVAL_MS` | 10 s | Scheduler tick cadence for ownership reconciliation, rebalance, and cleanup. |
+| `AGENTDB_NODE_HEARTBEAT_MS` | 5 s | Node control-plane heartbeat cadence. |
+| `AGENTDB_STALE_NODE_THRESHOLD_MS` | 180 s | Time before an `alive` node is marked `dead`. |
+| `AGENTDB_REAPER_SAFETY_MARGIN_MS` | 5 s | Extra ownership-lease grace before expired leases are cleared. |
+
+Expected single-node failure RTO when quorum remains is:
+
+```text
+Raft election time
++ ownership reconciliation delay
++ routing refresh / change propagation delay
++ client retry/backoff
+```
+
+With the defaults above, the design target is seconds to tens of seconds for
+write availability on the affected tablet. The smoke harness enforces a
+45-second owner-move window for the current implementation. The 180-second
+stale-node threshold is not the intended write-availability RTO; it is the
+slower cleanup window for declaring a node dead, deleting stale stats, and
+enabling replacement/rebalance workflows that require a dead-node decision.
+
+RPO for acknowledged writes is `0` as long as a Raft quorum of voters survives
+and their durable `raft-engine` state is available. AgentDB acknowledges tablet
+writes only after Raft commit through the tablet group. Writes that timed out,
+lost the connection before acknowledgment, or could not reach quorum are
+unknown to the client and must be retried with normal idempotency semantics.
+If a tablet loses quorum, AgentDB should preserve acknowledged committed
+entries on the surviving durable replicas, but the tablet is unavailable until
+quorum is restored or an operator performs an explicit recovery workflow.
+
+Production impact of the timing knobs:
+
+- Lowering `AGENTDB_RAFT_TICK_INTERVAL_MS` can reduce failover latency, but
+  increases heartbeat/election traffic and sensitivity to scheduler stalls.
+- Lowering `AGENTDB_STALE_NODE_THRESHOLD_MS` makes failed-node cleanup and
+  replacement faster, but increases false-dead risk during transient network,
+  metadata, or GC stalls.
+- Raising `AGENTDB_STALE_NODE_THRESHOLD_MS` reduces false-dead risk, but keeps
+  failed nodes visible as degraded longer and delays automatic replacement
+  workflows.
+- Lowering `[routing].refresh_interval_ms` can reduce route convergence time,
+  but increases metadata polling. Metadata change hints already shorten the
+  common path when they are delivered.
+- Increasing scheduler/rebalance movement limits can reduce recovery backlog,
+  but increases control-plane churn and replica movement pressure.
+
 ## What Exists Today
 
 The codebase and docs contain these cluster pieces:

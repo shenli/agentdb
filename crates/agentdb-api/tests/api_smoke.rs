@@ -2236,6 +2236,68 @@ async fn admin_tenant_policies_round_trip() {
 }
 
 #[tokio::test]
+async fn create_tenant_can_bootstrap_placement_policy() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+    let tenant_id = "ten_018f0000-0000-7000-8000-000000000123";
+
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "tenant_id": tenant_id,
+            "external_key": "bootstrap-placement",
+            "policy": {},
+            "placement": {
+                "placement_scope_id": "tenant/bootstrap",
+                "cell_id": "cell-b",
+                "placement_class": "dedicated",
+                "tier": "paid",
+                "priority": 20,
+                "encryption_class": "tenant",
+                "key_policy_id": "key/bootstrap",
+                "encryption_policy_version": 3,
+                "policy_version": 7
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tenant["tenant_id"], tenant_id);
+
+    let policies: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tenant-policies", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy = policies
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|policy| policy["tenant_id"] == tenant_id)
+        .unwrap();
+    assert_eq!(policy["cell_id"], "cell-b");
+    assert_eq!(policy["placement_scope_id"], "tenant/bootstrap");
+    assert_eq!(policy["tier"], "paid");
+    assert_eq!(policy["priority"], 20);
+    assert_eq!(policy["key_policy_id"], "key/bootstrap");
+    assert_eq!(policy["policy_version"], 7);
+}
+
+#[tokio::test]
 async fn admin_tablet_ranges_replace_round_trip() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();

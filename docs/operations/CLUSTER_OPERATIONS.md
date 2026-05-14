@@ -187,17 +187,24 @@ Always:
 
 If the node dies:
 
-- other nodes should mark it stale after heartbeat expiry
-- leases should expire
-- ownership should be reassigned or made eligible for reassignment
+- surviving Raft voters should elect a new leader when quorum remains
+- ownership should be reconciled to the new Raft leader
 - client traffic should route elsewhere
+- other nodes should mark it stale/dead after the configured cleanup threshold
+- replacement/rebalance cleanup should proceed after the dead-node decision
 
-Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
-the lease reaper clears expired tablet ownership. Once tablets are unowned,
-`agentdbctl tablets rebalance` or the automatic scheduler rebalance pass can
-assign them to fresh `alive` nodes. Cooperative rebalance does not force-move a
-dead source; Raft membership retirement is tied to healthy caught-up
-replacement completion.
+Current behavior: local Raft groups keep ticking on all replicas, surviving
+voters can elect a new leader, and all nodes that host a local Raft group can
+reconcile tablet ownership to the observed Raft leader. The scheduler leader
+marks stale `alive` nodes as `dead` after `AGENTDB_STALE_NODE_THRESHOLD_MS`
+(default 180 seconds), and the lease reaper clears expired tablet ownership
+with `AGENTDB_REAPER_SAFETY_MARGIN_MS` grace. Cooperative rebalance does not
+force-move a dead source; Raft membership retirement is tied to healthy
+caught-up replacement completion.
+
+The operational RTO for write availability should be based on Raft election,
+ownership reconciliation, route refresh, and client retry. The dead-node
+threshold is a cleanup and replacement timer, not the write-path RTO.
 
 ### Backup And Restore
 

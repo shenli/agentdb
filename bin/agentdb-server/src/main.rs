@@ -32,7 +32,7 @@ const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
 const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
-const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
+const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
@@ -321,12 +321,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     if matches!(config.deployment_mode, DeploymentMode::Cluster)
         && !runtime_raft_logs
             .as_ref()
-            .is_some_and(|logs| logs.contains_key(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID))
+            .is_some_and(|logs| logs.contains_key(&config.route_default_tablet_id))
     {
         anyhow::bail!(
-            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime primary tablet {}",
+            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime default tablet {}",
             config.route_node_id.as_deref().unwrap_or("<missing-node-id>"),
-            agentdb_core::RUNTIME_PRIMARY_TABLET_ID
+            config.route_default_tablet_id
         );
     }
     let (runtime, content_mirror) = if config.in_memory {
@@ -362,7 +362,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             );
             let runtime = match config.tablet_store_layout {
                 TabletStoreLayoutKind::PrefixScoped => {
-                    agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs)
+                    agentdb_core::Runtime::with_kv_and_replicated_logs_for_default_tablet(
+                        kv,
+                        content,
+                        logs,
+                        config.route_default_tablet_id,
+                    )
                 }
                 TabletStoreLayoutKind::GroupedRocksDb => {
                     std::fs::create_dir_all(&config.tablet_store_root_dir)?;
@@ -395,8 +400,11 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         domain_max_open_files = config.tablet_store_domain_max_open_files,
                         "opened grouped RocksDB tablet-store lifecycle"
                     );
-                    agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs(
-                        lifecycle, content, logs,
+                    agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+                        lifecycle,
+                        content,
+                        logs,
+                        config.route_default_tablet_id,
                     )
                 }
             };
@@ -728,6 +736,7 @@ struct ResolvedServeConfig {
     in_memory: bool,
     route_node_id: Option<String>,
     route_shard_count: i64,
+    route_default_tablet_id: i64,
     route_region: Option<String>,
     route_cell_id: String,
     route_availability_zone: Option<String>,
@@ -1044,6 +1053,10 @@ impl ResolvedServeConfig {
                 .route_shard_count
                 .or(file.routing.shard_count)
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
+            route_default_tablet_id: file
+                .routing
+                .default_tablet_id
+                .unwrap_or(agentdb_core::RUNTIME_PRIMARY_TABLET_ID),
             route_region: opts.route_region.or(file.routing.region),
             route_cell_id: opts
                 .route_cell_id
@@ -1184,6 +1197,10 @@ impl ResolvedServeConfig {
                 .routing
                 .shard_count
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
+            route_default_tablet_id: file
+                .routing
+                .default_tablet_id
+                .unwrap_or(agentdb_core::RUNTIME_PRIMARY_TABLET_ID),
             route_region: file.routing.region,
             route_cell_id: file
                 .routing
@@ -1287,6 +1304,7 @@ struct ObjectStoreFileConfig {
 struct RoutingFileConfig {
     node_id: Option<String>,
     shard_count: Option<i64>,
+    default_tablet_id: Option<i64>,
     region: Option<String>,
     cell_id: Option<String>,
     availability_zone: Option<String>,
@@ -2576,7 +2594,10 @@ fn spawn_raft_rs_tick_worker(
                             })
                             .map(|(raft_node_id, _)| raft_node_id);
                         if failover_candidate == Some(local_raft_node_id) {
-                            let result = if raft_leader_missing {
+                            let result = if should_campaign_for_raft_failover(
+                                raft_leader_unavailable,
+                                raft_leader_missing,
+                            ) {
                                 group
                                     .campaign(local_raft_node_id)
                                     .and_then(|()| group.tick(local_raft_node_id))
@@ -2594,7 +2615,6 @@ fn spawn_raft_rs_tick_worker(
                             }
                         }
                     }
-                    continue;
                 }
                 if let Err(error) = group.tick(local_raft_node_id) {
                     tracing::warn!(
@@ -2615,7 +2635,14 @@ fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplic
 }
 
 fn should_attempt_raft_failover_tick(
-    _owner_unavailable: bool,
+    owner_unavailable: bool,
+    raft_leader_unavailable: bool,
+    raft_leader_missing: bool,
+) -> bool {
+    raft_leader_unavailable || (owner_unavailable && raft_leader_missing)
+}
+
+fn should_campaign_for_raft_failover(
     raft_leader_unavailable: bool,
     raft_leader_missing: bool,
 ) -> bool {
@@ -3747,6 +3774,23 @@ async fn run_cluster_scheduler_tick(
         leader_row.expires_at_ms,
         is_leader,
     );
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "aligned local tablet ownership with raft leaders"
+            );
+        }
+    }
     if !is_leader {
         return Ok(());
     }
@@ -3798,24 +3842,6 @@ async fn run_cluster_scheduler_tick(
     if !cleared.is_empty() {
         status.add_tablet_reassignments(cleared.len() as u64);
         tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
-    }
-
-    if let Some(registry) = raft_registry {
-        let aligned = reconcile_raft_leader_tablet_ownership(
-            meta,
-            registry,
-            now_ms,
-            config.scheduler_lease_ms,
-        )
-        .await?;
-        if aligned > 0 {
-            status.add_tablet_reassignments(aligned as u64);
-            tracing::info!(
-                node_id = %node_id,
-                aligned,
-                "scheduler aligned tablet ownership with raft leaders"
-            );
-        }
     }
 
     if config.rebalance_max_movements > 0 {
@@ -7588,7 +7614,7 @@ region = "us-west-2"
     }
 
     #[test]
-    fn raft_failover_tick_runs_when_local_replica_has_no_observed_leader() {
+    fn raft_failover_tick_skips_missing_leader_when_owner_is_available() {
         let local_status = agentdb_storage::RaftRsReplicaStatus {
             node_id: 11,
             role: "Follower".to_string(),
@@ -7601,7 +7627,19 @@ region = "us-west-2"
         };
 
         assert!(local_raft_leader_missing(Some(&local_status)));
-        assert!(should_attempt_raft_failover_tick(false, false, true));
+        assert!(!should_attempt_raft_failover_tick(false, false, true));
+    }
+
+    #[test]
+    fn raft_failover_tick_runs_when_owner_is_unavailable_and_leader_is_missing() {
+        assert!(should_attempt_raft_failover_tick(true, false, true));
+        assert!(should_campaign_for_raft_failover(false, true));
+    }
+
+    #[test]
+    fn raft_failover_campaigns_when_known_leader_is_unavailable() {
+        assert!(should_attempt_raft_failover_tick(false, true, false));
+        assert!(should_campaign_for_raft_failover(true, false));
     }
 
     #[test]
@@ -7619,6 +7657,7 @@ region = "us-west-2"
 
         assert!(!local_raft_leader_missing(Some(&local_status)));
         assert!(!should_attempt_raft_failover_tick(false, false, false));
+        assert!(!should_campaign_for_raft_failover(false, false));
     }
 
     #[test]

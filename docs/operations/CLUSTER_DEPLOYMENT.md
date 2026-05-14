@@ -315,6 +315,42 @@ agentdbctl status
 Use `agentdbctl raw ...` only for endpoints that are not modeled by the CLI
 yet.
 
+## Recovery Timing
+
+Do not tune all HA settings toward the same small number. AgentDB's intended
+production tradeoff is:
+
+- fast Raft election and ownership reconciliation for write-path RTO
+- slower stale-node marking for dead-node cleanup, replacement, and rebalance
+- bounded snapshot/log/catch-up work so recovery does not overload healthy
+  nodes
+
+With the defaults, a single owner process failure in a healthy quorum should
+recover write availability in seconds to tens of seconds. The real-cluster
+smoke asserts the current implementation moves ownership within 45 seconds.
+The default 180-second stale-node threshold is deliberately longer and affects
+when the node is marked `dead`, when stale stats are deleted, and when
+replacement workflows can safely treat the source as failed. It is not the
+write-path RTO.
+
+RPO for acknowledged writes is zero while a Raft quorum survives. A client that
+does not receive an acknowledgment must retry with idempotency; the write may
+or may not have committed before the timeout. If a tablet loses quorum, it is
+unavailable until quorum returns or an operator runs an explicit recovery
+workflow.
+
+Production tuning guidance:
+
+- reduce `AGENTDB_RAFT_TICK_INTERVAL_MS` only when the network and host
+  scheduling jitter are low enough to avoid spurious elections
+- keep `AGENTDB_STALE_NODE_THRESHOLD_MS` comfortably above normal network,
+  metadata, and GC pauses; lowering it improves cleanup RTO but increases
+  false-dead risk
+- set `[routing].refresh_interval_ms` low enough for route convergence, but
+  avoid excessive metadata polling in large clusters
+- treat `AGENTDB_REBALANCE_MAX_MOVEMENTS` and tablet lifecycle action limits as
+  pressure controls during recovery, not just placement controls
+
 ## Node Configuration Model
 
 Each node should have:
@@ -324,8 +360,19 @@ Each node should have:
 - cluster or deployment name
 - control-plane metadata DSN
 - object-store configuration
-- lease timing
-- heartbeat timing
+- Raft timing:
+  `AGENTDB_RAFT_TICK_INTERVAL_MS` (default 100 ms) and
+  `AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS` (default 1 second)
+- routing refresh timing (`[routing].refresh_interval_ms`, default 5 seconds)
+- scheduler lease/renew timing:
+  `AGENTDB_SCHEDULER_LEASE_MS` (default 30 seconds) and
+  `AGENTDB_SCHEDULER_RENEW_INTERVAL_MS` (default 10 seconds)
+- heartbeat timing (`AGENTDB_NODE_HEARTBEAT_MS`, default 5 seconds)
+- stale-node cleanup threshold (`AGENTDB_STALE_NODE_THRESHOLD_MS`, default
+  180 seconds)
+- ownership reaper timing:
+  `AGENTDB_REAPER_TICK_MS` (default 10 seconds) and
+  `AGENTDB_REAPER_SAFETY_MARGIN_MS` (default 5 seconds)
 - rebalance movement cap (`AGENTDB_REBALANCE_MAX_MOVEMENTS`; `0` disables
   automatic movement)
 - tablet lifecycle thresholds:

@@ -955,7 +955,7 @@ fn forward_loop_rejection(target: &RouteTarget) -> RouteRejection {
         status: StatusCode::MISDIRECTED_REQUEST,
         code: "ROUTE_FORWARD_LOOP",
         message: "request has already been forwarded once".into(),
-        retryable: false,
+        retryable: true,
         headers,
     }
 }
@@ -1296,6 +1296,7 @@ mod tests {
 
         assert_eq!(err.status, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(err.code, "ROUTE_FORWARD_LOOP");
+        assert!(err.retryable);
         assert_eq!(
             err.headers[HDR_ROUTE_REASON].to_str().unwrap(),
             "ROUTE_FORWARD_LOOP"

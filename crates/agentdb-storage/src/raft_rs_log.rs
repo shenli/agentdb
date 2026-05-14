@@ -935,6 +935,7 @@ impl RaftRsGroup {
         let mut light = node.raw.advance(ready);
         outbound.extend(light.take_messages());
         applied_conf_change |= node.apply_committed(light.take_committed_entries(), tablet_id)?;
+        node.raw.advance_apply_to(node.last_applied_index);
         if applied_conf_change {
             self.pending_conf_change = false;
         }
@@ -983,7 +984,7 @@ impl RaftRsNode {
             max_size_per_msg: u64::MAX,
             max_inflight_msgs: 256,
             check_quorum: false,
-            pre_vote: false,
+            pre_vote: true,
             ..Default::default()
         };
         raft_config.validate().map_err(map_raft_error)?;
@@ -1418,6 +1419,25 @@ mod tests {
         let entries = logs[0].committed_entries(7, current.index, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, b"after-compaction");
+    }
+
+    #[test]
+    fn raft_rs_log_can_campaign_after_compacting_replicated_entry() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        let current = logs[0]
+            .append(7, b"replicated-before-campaign".to_vec())
+            .unwrap();
+        assert!(logs[2]
+            .committed_entries(7, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.index == current.index));
+
+        logs[2].compact(7, current.index).unwrap();
+
+        group.campaign(3).unwrap();
     }
 
     #[test]

@@ -1912,13 +1912,14 @@ impl Runtime {
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> Arc<Self> {
         let logs = BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]);
-        Self::with_kv_kms_content_metadata_and_replicated_logs(
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
             kv,
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
             logs,
+            RUNTIME_PRIMARY_TABLET_ID,
         )
     }
 
@@ -1927,13 +1928,28 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
-        Self::with_kv_kms_content_metadata_and_replicated_logs(
+        Self::with_kv_and_replicated_logs_for_default_tablet(
+            kv,
+            content,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_kv_and_replicated_logs_for_default_tablet(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
             kv,
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
             logs,
+            default_tablet_id,
         )
     }
 
@@ -1942,10 +1958,24 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
+        Self::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+            store_lifecycle,
+            content,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
         let tablet_router = Arc::new(
             RuntimeTabletRouterKvStore::new_with_lifecycle(
                 store_lifecycle,
-                RUNTIME_PRIMARY_TABLET_ID,
+                default_tablet_id,
                 logs,
             )
             .expect("open runtime tablet router"),
@@ -1990,8 +2020,28 @@ impl Runtime {
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
+            kv,
+            content,
+            kms,
+            content_crypto,
+            metadata_crypto,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
         let tablet_router = Arc::new(
-            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+            RuntimeTabletRouterKvStore::new(kv, default_tablet_id, logs)
                 .expect("open runtime tablet router"),
         );
         let persist = Persist::with_metadata_crypto(tablet_router.clone(), metadata_crypto);
@@ -2982,8 +3032,19 @@ impl Runtime {
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
+        self.create_tenant_with_id(Id::new(IdKind::Tenant), req)
+            .await
+    }
+
+    pub async fn create_tenant_with_id(&self, tenant_id: Id, req: NewTenant) -> Result<Tenant> {
         let t = {
             let mut s = self.state.lock().await;
+            if s.tenants.contains_key(tenant_id.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::IdempotencyConflict,
+                    format!("tenant_id already in use: {tenant_id}"),
+                ));
+            }
             // External keys are tenant-name slots; a duplicate is an
             // unrecoverable client error (not a retry), so we surface it as
             // AliasConflict rather than IdempotencyConflict.
@@ -2993,7 +3054,7 @@ impl Runtime {
                     format!("tenant external_key already in use: {}", req.external_key),
                 ));
             }
-            let t = Tenant::create(req);
+            let t = Tenant::create_with_id(tenant_id, req);
             s.tenants
                 .insert(t.tenant_id.as_str().to_string(), t.clone());
             if !t.external_key.is_empty() {

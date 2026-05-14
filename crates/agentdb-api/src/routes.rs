@@ -66,6 +66,7 @@ const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
+const DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
@@ -953,7 +954,9 @@ async fn get_cluster_health(
     Json(build_cluster_health(
         &s.routing.describe(),
         s.drain.is_draining(),
-        query.stale_threshold_ms.unwrap_or(15_000),
+        query
+            .stale_threshold_ms
+            .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
     ))
 }
 
@@ -964,7 +967,9 @@ async fn get_cluster_readiness(
     let readiness = build_cluster_readiness(
         &s.routing.describe(),
         s.drain.is_draining(),
-        query.stale_threshold_ms.unwrap_or(15_000),
+        query
+            .stale_threshold_ms
+            .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
     );
     let status = if readiness.ready {
         StatusCode::OK
@@ -1492,7 +1497,9 @@ async fn create_admin_backup(
         Some(
             serde_json::to_value(
                 rows.into_iter()
-                    .map(|node| admin_node_view(node, now_ms, 15_000))
+                    .map(|node| {
+                        admin_node_view(node, now_ms, DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS)
+                    })
                     .collect::<Vec<_>>(),
             )
             .map_err(internal_error)?,
@@ -1712,7 +1719,9 @@ async fn get_admin_nodes(
             "metadata-backed cluster admin is not configured on this node",
         ))
     })?;
-    let stale_threshold_ms = query.stale_threshold_ms.unwrap_or(15_000);
+    let stale_threshold_ms = query
+        .stale_threshold_ms
+        .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -1839,7 +1848,11 @@ async fn register_admin_node(
                 ),
             ))
         })?;
-    Ok(Json(admin_node_view(node, now_ms, 15_000)))
+    Ok(Json(admin_node_view(
+        node,
+        now_ms,
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )))
 }
 
 async fn delete_admin_node(
@@ -1888,7 +1901,11 @@ async fn set_admin_node_maintenance(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_admin_request(format!("node {node_id} does not exist")))?;
-    Ok(Json(admin_node_view(node, now_ms, 15_000)))
+    Ok(Json(admin_node_view(
+        node,
+        now_ms,
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )))
 }
 
 fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
@@ -2954,7 +2971,13 @@ async fn assign_admin_tablet(
 ) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let _ = get_tablet_or_404(meta, tablet_id).await?;
-    let _ = require_assignable_node(meta, &body.node_id, now_ms_i64(), 15_000).await?;
+    let _ = require_assignable_node(
+        meta,
+        &body.node_id,
+        now_ms_i64(),
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )
+    .await?;
     let changed = tablets::assign_to(meta.pool(), tablet_id, &body.node_id)
         .await
         .map_err(internal_error)?;
@@ -2995,7 +3018,13 @@ async fn mark_admin_tablet_handoff(
             "handoff target must be different from the current owner",
         ));
     }
-    let _ = require_assignable_node(meta, &body.target_node_id, now_ms_i64(), 15_000).await?;
+    let _ = require_assignable_node(
+        meta,
+        &body.target_node_id,
+        now_ms_i64(),
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )
+    .await?;
     let changed = tablets::mark_for_handoff(meta.pool(), tablet_id, &body.target_node_id)
         .await
         .map_err(internal_error)?;
@@ -3071,7 +3100,9 @@ async fn prepare_admin_tablet_replacement(
         }
     }
     let now_ms = now_ms_i64();
-    let stale_threshold_ms = body.stale_threshold_ms.unwrap_or(15_000);
+    let stale_threshold_ms = body
+        .stale_threshold_ms
+        .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS);
     let _ = require_assignable_node(meta, &body.target_node_id, now_ms, stale_threshold_ms).await?;
     let existing_target = get_tablet_replica(meta, tablet_id, &body.target_node_id).await?;
     let target_applied = existing_target
@@ -3342,7 +3373,9 @@ async fn rebalance_admin_tablets(
         meta.pool(),
         tablet_rebalance::RebalanceRequest {
             dry_run: body.dry_run,
-            stale_threshold_ms: body.stale_threshold_ms.unwrap_or(15_000),
+            stale_threshold_ms: body
+                .stale_threshold_ms
+                .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
             max_movements: body.max_movements.unwrap_or(usize::MAX),
         },
         now_ms_i64(),
@@ -3601,17 +3634,34 @@ async fn get_routing_decision(
 
 async fn create_tenant(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateTenantBody>,
 ) -> Result<Json<Tenant>, ApiError> {
     reject_if_draining(&s)?;
-    let t = s
-        .runtime
-        .create_tenant(NewTenant {
+    let tenant_id = match body.tenant_id.as_deref() {
+        Some(raw) => Some(parse_id_or(
+            raw,
+            IdKind::Tenant,
+            agentdb_core::ErrorCode::TenantNotFound,
+        )?),
+        None => None,
+    };
+    let runtime = s.runtime.clone();
+    let tenant = with_route_tablet_context(runtime.clone(), &headers, async move {
+        let req = NewTenant {
             external_key: body.external_key,
             policy: body.policy,
-        })
-        .await?;
-    Ok(Json(t))
+        };
+        match tenant_id {
+            Some(tenant_id) => runtime.create_tenant_with_id(tenant_id, req).await,
+            None => runtime.create_tenant(req).await,
+        }
+    })
+    .await?;
+    if let Some(placement) = body.placement {
+        upsert_create_tenant_policy(&s, tenant.tenant_id.as_str(), placement).await?;
+    }
+    Ok(Json(tenant))
 }
 
 #[derive(Debug, Serialize)]
@@ -4608,23 +4658,93 @@ async fn delete_tenant(
 async fn create_agent(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<CreateAgentBody>,
-) -> Result<Json<Agent>, ApiError> {
+) -> Result<Response, ApiError> {
     reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
-    let a = s
-        .runtime
-        .create_agent(NewAgent {
-            tenant_id: tid,
-            alias: body.alias,
-            config: body.config,
-        })
-        .await?;
-    Ok(Json(a))
+    let forward_body = serde_json::to_vec(&body).expect("create-agent body must serialize");
+    let route_headers = match guard_routing_key_request(
+        &s,
+        RoutingKeyGuardRequest {
+            tenant_id: &tid,
+            routing_key: Some(tid.as_str()),
+            original_uri: &original_uri,
+            headers: &headers,
+            method: Method::POST,
+            body: Some(forward_body),
+            extra_forward_headers: HeaderMap::new(),
+        },
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let runtime = s.runtime.clone();
+    let agent_tid = tid.clone();
+    let agent = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .create_agent(NewAgent {
+                tenant_id: agent_tid,
+                alias: body.alias,
+                config: body.config,
+            })
+            .await
+    })
+    .await?;
+    Ok(with_headers(Json(agent).into_response(), route_headers))
+}
+
+async fn upsert_create_tenant_policy(
+    state: &AppState,
+    tenant_id: &str,
+    placement: crate::dto::CreateTenantPlacementBody,
+) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Err(invalid_admin_request(
+            "create tenant placement requires metadata-backed routing",
+        ));
+    };
+    tenant_policies::upsert_with_cell(
+        meta.pool(),
+        tenant_id,
+        placement
+            .placement_class
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_PLACEMENT_CLASS),
+        &placement.placement_scope_id,
+        placement
+            .encryption_class
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_ENCRYPTION_CLASS),
+        placement.key_policy_id.as_deref(),
+        placement.encryption_policy_version.unwrap_or(0),
+        placement.policy_version.unwrap_or(0),
+        placement
+            .cell_id
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_CELL_ID),
+        placement
+            .tier
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_TIER),
+        placement
+            .priority
+            .unwrap_or(tenant_policies::DEFAULT_PRIORITY),
+        now_ms_i64(),
+    )
+    .await
+    .map_err(|err| invalid_admin_request(err.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -4636,17 +4756,44 @@ struct ListAgentsResponse {
 async fn list_agents(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
-) -> Result<Json<ListAgentsResponse>, ApiError> {
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
-    let agents = s.runtime.list_agents(&tid).await?;
-    Ok(Json(ListAgentsResponse {
-        count: agents.len(),
-        agents,
-    }))
+    let route_headers = match guard_routing_key_request(
+        &s,
+        RoutingKeyGuardRequest {
+            tenant_id: &tid,
+            routing_key: Some(tid.as_str()),
+            original_uri: &original_uri,
+            headers: &headers,
+            method: Method::GET,
+            body: None,
+            extra_forward_headers: HeaderMap::new(),
+        },
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    let runtime = s.runtime.clone();
+    let agents = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.list_agents(&tid).await
+    })
+    .await?;
+    Ok(with_headers(
+        Json(ListAgentsResponse {
+            count: agents.len(),
+            agents,
+        })
+        .into_response(),
+        route_headers,
+    ))
 }
 
 async fn get_agent(
