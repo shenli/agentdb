@@ -69,6 +69,9 @@ small repo-wide entrypoints.
 
 ## Forward-Looking Designs
 
+- [architecture/OBSERVABILITY_EXPORT.md](architecture/OBSERVABILITY_EXPORT.md)
+  - design for exporting AgentDB runtime truth into observability and analytics
+  sinks
 - [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
   - redesign for real hot/cold/archive session storage
 - [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
