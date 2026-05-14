@@ -4,7 +4,11 @@
 //! traffic through `Runtime::with_kv`, drops the runtime, reopens the same
 //! KV directory, and asserts the next runtime sees the prior state.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use agentdb_core::agent::NewAgent;
 use agentdb_core::artifact::NewArtifact;
@@ -19,7 +23,17 @@ use agentdb_storage::{
 use tempfile::TempDir;
 
 fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
-    Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
+    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<dyn KvStore + Send + Sync>>>> =
+        OnceLock::new();
+    let stores = STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut stores = stores.lock().expect("runtime restart kv registry poisoned");
+    if let Some(kv) = stores.get(path) {
+        return kv.clone();
+    }
+    let kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(path).expect("open rocks kv"));
+    stores.insert(path.to_path_buf(), kv.clone());
+    kv
 }
 
 /// Convenience for restart tests that don't exercise artifacts: pair every
@@ -32,51 +46,53 @@ fn in_memory_content() -> Arc<dyn ContentBackend> {
 async fn events_and_next_seq_survive_restart() {
     let dir = TempDir::new().unwrap();
 
-    let kv = open_kv(dir.path());
-    let rt = Runtime::with_kv(kv, in_memory_content());
-    let t = rt
-        .create_tenant(NewTenant {
-            external_key: "acme".into(),
-            policy: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-    let a = rt
-        .create_agent(NewAgent {
-            tenant_id: t.tenant_id.clone(),
-            alias: None,
-            config: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-    let s = rt
-        .create_session(NewSession {
-            tenant_id: t.tenant_id.clone(),
-            agent_id: a.agent_id.clone(),
-            alias: None,
-        })
-        .await
-        .unwrap();
+    let (t, a, s) = {
+        let kv = open_kv(dir.path());
+        let rt = Runtime::with_kv(kv, in_memory_content());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "acme".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let a = rt
+            .create_agent(NewAgent {
+                tenant_id: t.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let s = rt
+            .create_session(NewSession {
+                tenant_id: t.tenant_id.clone(),
+                agent_id: a.agent_id.clone(),
+                alias: None,
+            })
+            .await
+            .unwrap();
 
-    rt.append(AppendRequest::simple(
-        &t,
-        &a,
-        &s,
-        "x",
-        serde_json::json!({"i": 1}),
-    ))
-    .await
-    .unwrap();
-    rt.append(AppendRequest::simple(
-        &t,
-        &a,
-        &s,
-        "x",
-        serde_json::json!({"i": 2}),
-    ))
-    .await
-    .unwrap();
-    drop(rt);
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 1}),
+        ))
+        .await
+        .unwrap();
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 2}),
+        ))
+        .await
+        .unwrap();
+        (t, a, s)
+    };
 
     // Reopen the same on-disk KV path. RocksDB requires the prior handle to be
     // dropped first (single-writer lock), which happened above when `rt` (and

@@ -45,6 +45,6 @@ pub use replicated_log::{
 pub use rocks::{RocksKvStore, RocksKvStoreConfig};
 pub use slate::SlateKvStore;
 pub use tablet_store::{
-    GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore, TabletStoreLifecycle,
-    TabletStoreManifest,
+    summarize_checkpoint_dir, GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore,
+    TabletStoreCheckpointSummary, TabletStoreLifecycle, TabletStoreManifest,
 };

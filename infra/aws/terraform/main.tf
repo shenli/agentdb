@@ -100,12 +100,12 @@ resource "aws_instance" "agentdb" {
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
     bucket                                    = aws_s3_bucket.agentdb.bucket
     region                                    = var.aws_region
-    tablet_store_tablets_per_domain          = var.tablet_store_tablets_per_domain
-    tablet_store_max_open_domains            = var.tablet_store_max_open_domains
+    tablet_store_tablets_per_domain           = var.tablet_store_tablets_per_domain
+    tablet_store_max_open_domains             = var.tablet_store_max_open_domains
     tablet_store_domain_write_buffer_size_mib = var.tablet_store_domain_write_buffer_size_mib
-    tablet_store_domain_max_write_buffers    = var.tablet_store_domain_max_write_buffers
-    tablet_store_domain_max_background_jobs  = var.tablet_store_domain_max_background_jobs
-    tablet_store_domain_max_open_files       = var.tablet_store_domain_max_open_files
+    tablet_store_domain_max_write_buffers     = var.tablet_store_domain_max_write_buffers
+    tablet_store_domain_max_background_jobs   = var.tablet_store_domain_max_background_jobs
+    tablet_store_domain_max_open_files        = var.tablet_store_domain_max_open_files
   })
 
   tags = {

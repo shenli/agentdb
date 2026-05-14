@@ -174,7 +174,8 @@ agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
 into the backup manifest. It requires `storage.tablet.layout = "grouped_rocksdb"`
 with `tablets_per_domain = 1`; grouped domains with multiple tablets are
 intentionally rejected because a checkpoint would include unrelated tablet
-state.
+state. Restore validation recomputes checkpoint size and checksum from disk and
+rejects mismatches.
 
 Register or remove nodes:
 

@@ -242,7 +242,7 @@ pub trait TabletStoreLifecycle: Send + Sync {
     fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
         let store = self.open_tablet_store(tablet_id)?;
         store.checkpoint(out_dir)?;
-        let summary = checkpoint_summary(out_dir)?;
+        let summary = summarize_checkpoint_dir(out_dir)?;
         Ok(TabletStoreManifest {
             tablet_id,
             layout: self.layout_name().to_string(),
@@ -452,7 +452,7 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
             fs::remove_dir_all(&domain_path)?;
         }
         copy_dir_all(checkpoint_dir, &domain_path)?;
-        let summary = checkpoint_summary(&domain_path)?;
+        let summary = summarize_checkpoint_dir(&domain_path)?;
         Ok(TabletStoreManifest {
             tablet_id,
             layout: self.layout_name().into(),
@@ -473,7 +473,7 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
         let domain_id = self.domain_id(tablet_id)?;
         let kv = self.open_domain(domain_id)?;
         kv.checkpoint(out_dir)?;
-        let summary = checkpoint_summary(out_dir)?;
+        let summary = summarize_checkpoint_dir(out_dir)?;
         Ok(TabletStoreManifest {
             tablet_id,
             layout: self.layout_name().into(),
@@ -536,12 +536,22 @@ impl TabletStoreManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CheckpointSummary {
+pub struct TabletStoreCheckpointSummary {
     checksum_sha256: String,
     size_bytes: u64,
 }
 
-fn checkpoint_summary(root: &Path) -> Result<CheckpointSummary> {
+impl TabletStoreCheckpointSummary {
+    pub fn checksum_sha256(&self) -> &str {
+        &self.checksum_sha256
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+pub fn summarize_checkpoint_dir(root: &Path) -> Result<TabletStoreCheckpointSummary> {
     let mut files = Vec::new();
     collect_checkpoint_files(root, root, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -564,7 +574,7 @@ fn checkpoint_summary(root: &Path) -> Result<CheckpointSummary> {
         hasher.update([0]);
     }
 
-    Ok(CheckpointSummary {
+    Ok(TabletStoreCheckpointSummary {
         checksum_sha256: format!("{:x}", hasher.finalize()),
         size_bytes,
     })

@@ -38,8 +38,9 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    cells, nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance,
-    tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies, tenants,
+    cells, nodes, placement_scopes, session_locators, tablet_movements, tablet_ranges,
+    tablet_rebalance, tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies,
+    tenants,
 };
 
 use crate::dto::{
@@ -1454,7 +1455,7 @@ async fn create_admin_backup(
         let checkpoint_root = backup_dir.join("tablet-stores");
         fs::create_dir_all(&checkpoint_root).map_err(internal_error)?;
         Some(
-            serde_json::to_value(checkpoint_local_tablet_stores(&s, &checkpoint_root)?)
+            serde_json::to_value(checkpoint_local_tablet_stores(&s, &checkpoint_root).await?)
                 .map_err(internal_error)?,
         )
     } else {
@@ -1536,6 +1537,7 @@ async fn validate_admin_restore(
                     "tablet checkpoint path is missing: {path}"
                 )));
             }
+            validate_tablet_checkpoint_manifest(checkpoint, FsPath::new(path))?;
         }
         checks.push(format!(
             "tablet store checkpoints present ({})",
@@ -1552,14 +1554,14 @@ async fn validate_admin_restore(
     }))
 }
 
-fn checkpoint_local_tablet_stores(
+async fn checkpoint_local_tablet_stores(
     state: &AppState,
     checkpoint_root: &FsPath,
 ) -> Result<Vec<TabletCheckpointBackup>, ApiError> {
     let mut backups = Vec::new();
     for tablet_id in state.runtime.registered_tablet_ids() {
         let tablet_dir = checkpoint_root.join(format!("tablet-{tablet_id:020}"));
-        let manifest = state
+        let mut manifest = state
             .runtime
             .checkpoint_tablet_store(tablet_id, &tablet_dir)
             .map_err(|err| {
@@ -1568,6 +1570,7 @@ fn checkpoint_local_tablet_stores(
                     err.message
                 ))
             })?;
+        enrich_tablet_checkpoint_manifest(state, &mut manifest).await?;
         backups.push(TabletCheckpointBackup {
             tablet_id,
             path: tablet_dir.display().to_string(),
@@ -1575,6 +1578,63 @@ fn checkpoint_local_tablet_stores(
         });
     }
     Ok(backups)
+}
+
+async fn enrich_tablet_checkpoint_manifest(
+    state: &AppState,
+    manifest: &mut agentdb_storage::TabletStoreManifest,
+) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    let Some(tablet) = tablets::get(meta.pool(), manifest.tablet_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(());
+    };
+    manifest.tablet_epoch = Some(tablet.epoch);
+    manifest.placement_scope_id = Some(tablet.placement_scope_id.clone());
+    if let Some(scope) = placement_scopes::get(meta.pool(), &tablet.placement_scope_id)
+        .await
+        .map_err(internal_error)?
+    {
+        manifest.cell_id = Some(scope.cell_id);
+    }
+    if let Some(snapshot) =
+        tablet_snapshots::list_recent(meta.pool(), Some(manifest.tablet_id), false, 1)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .next()
+    {
+        manifest.latest_snapshot_index = u64::try_from(snapshot.snapshot_index).ok();
+    }
+    Ok(())
+}
+
+fn validate_tablet_checkpoint_manifest(
+    checkpoint: &serde_json::Value,
+    path: &FsPath,
+) -> Result<(), ApiError> {
+    let summary = agentdb_storage::summarize_checkpoint_dir(path).map_err(internal_error)?;
+    if let Some(expected) = checkpoint["manifest"]["checksum_sha256"].as_str() {
+        if summary.checksum_sha256() != expected {
+            return Err(invalid_admin_request(format!(
+                "tablet checkpoint checksum mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(expected) = checkpoint["manifest"]["size_bytes"].as_u64() {
+        if summary.size_bytes() != expected {
+            return Err(invalid_admin_request(format!(
+                "tablet checkpoint size mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {

@@ -26,7 +26,8 @@ use agentdb_core::{
     RUNTIME_PRIMARY_TABLET_ID,
 };
 use agentdb_meta::{
-    nodes::Node, session_locators, tablet_replicas, tablet_snapshots, tablets::Tablet, MetaStore,
+    cells, nodes::Node, placement_scopes, session_locators, tablet_replicas, tablet_snapshots,
+    tablets, tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
     AsyncMirrorContentBackend, ContentBackend, GroupedRocksDbTabletStore, InMemoryContentBackend,
@@ -3299,7 +3300,69 @@ async fn admin_backup_can_include_single_tablet_store_checkpoint() {
         })
         .await
         .unwrap();
-    let app = spawn_app_with_state(AppState::new(runtime)).await;
+    let meta_path = dir.join("meta.sqlite");
+    let meta = MetaStore::open_sqlite(&meta_path.to_string_lossy())
+        .await
+        .unwrap();
+    cells::upsert(
+        meta.pool(),
+        "cell-a",
+        Some("us-west-2"),
+        "standard",
+        "multi_az_standard",
+        "stable",
+        "shared_logical",
+        "serving",
+        Some("cell-a"),
+        Some("cell-a"),
+        1,
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    placement_scopes::upsert_with_cell(
+        meta.pool(),
+        "tenant/tablet-backup",
+        "dedicated",
+        128,
+        Some("seed"),
+        "active",
+        "cell-a",
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    let tablet = tablets::create_with_placement(
+        meta.pool(),
+        RUNTIME_PRIMARY_TABLET_ID,
+        "tenant/tablet-backup",
+        "serving",
+        Some("rg-1"),
+        0,
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    tablet_snapshots::record(
+        meta.pool(),
+        "snap-tablet-backup",
+        RUNTIME_PRIMARY_TABLET_ID,
+        "node-a",
+        1,
+        "node-b",
+        2,
+        12,
+        3,
+        42,
+        "abc123",
+        Some("s3://snapshots/snap-tablet-backup"),
+        "available",
+        now_ms_i64(),
+        None,
+    )
+    .await
+    .unwrap();
+    let app = spawn_app_with_state(AppState::new(runtime).with_meta(meta)).await;
     let backup_root = dir.join("backups");
 
     let backup: serde_json::Value = app
@@ -3328,6 +3391,26 @@ async fn admin_backup_can_include_single_tablet_store_checkpoint() {
     assert_eq!(
         checkpoints[0]["manifest"]["tablet_id"].as_i64().unwrap(),
         RUNTIME_PRIMARY_TABLET_ID
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["cell_id"].as_str().unwrap(),
+        "cell-a"
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["placement_scope_id"]
+            .as_str()
+            .unwrap(),
+        "tenant/tablet-backup"
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["tablet_epoch"].as_i64().unwrap(),
+        tablet.epoch
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["latest_snapshot_index"]
+            .as_u64()
+            .unwrap(),
+        12
     );
     assert!(
         checkpoints[0]["manifest"]["latest_applied_index"]
@@ -3363,6 +3446,32 @@ async fn admin_backup_can_include_single_tablet_store_checkpoint() {
         .unwrap()
         .iter()
         .any(|check| check == "tablet store checkpoints present (1)"));
+
+    let mut tampered = manifest.clone();
+    tampered["tablet_store_checkpoints"][0]["manifest"]["checksum_sha256"] =
+        serde_json::Value::String("0".repeat(64));
+    let tampered_path = backup_root
+        .join("tablet-backup")
+        .join("manifest-tampered.json");
+    std::fs::write(
+        &tampered_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let bad_validation = app
+        .client
+        .post(format!("{}/api/admin/restores", app.base))
+        .json(&json!({
+            "manifest_path": tampered_path.to_string_lossy(),
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_validation.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
