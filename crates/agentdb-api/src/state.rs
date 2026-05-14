@@ -272,6 +272,19 @@ pub struct SchedulerStatusSnapshot {
     pub last_tick_at_ms: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct TabletStoreStatus {
+    pub layout: String,
+    pub root_dir: Option<String>,
+    pub tablets_per_domain: i64,
+    pub max_open_domains: usize,
+    pub domain_write_buffer_size_mib: usize,
+    pub domain_max_write_buffers: i32,
+    pub domain_parallelism: i32,
+    pub domain_max_background_jobs: i32,
+    pub domain_max_open_files: i32,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<Runtime>,
@@ -283,6 +296,7 @@ pub struct AppState {
     pub internal_auth_previous_token: Option<Arc<str>>,
     pub drain: DrainState,
     pub scheduler: Option<SchedulerStatus>,
+    pub tablet_store: Option<TabletStoreStatus>,
     pub content_mirror: Option<Arc<AsyncMirrorContentBackend>>,
     pub proxy: reqwest::Client,
     pub proxy_policy: ProxyPolicy,
@@ -301,6 +315,7 @@ impl AppState {
             internal_auth_previous_token: None,
             drain: DrainState::new("single-node"),
             scheduler: None,
+            tablet_store: None,
             content_mirror: None,
             proxy: reqwest::Client::new(),
             proxy_policy: ProxyPolicy::default(),
@@ -342,6 +357,11 @@ impl AppState {
 
     pub fn with_scheduler(mut self, scheduler: SchedulerStatus) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_tablet_store_status(mut self, tablet_store: TabletStoreStatus) -> Self {
+        self.tablet_store = Some(tablet_store);
         self
     }
 

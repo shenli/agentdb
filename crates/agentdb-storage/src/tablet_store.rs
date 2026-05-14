@@ -8,9 +8,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     Error, KvIter, KvSnapshot, KvStore, Result, RocksKvStore, RocksKvStoreConfig, WriteOp,
@@ -227,11 +230,14 @@ pub trait TabletStoreLifecycle: Send + Sync {
     fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
         let store = self.open_tablet_store(tablet_id)?;
         store.checkpoint(out_dir)?;
+        let summary = checkpoint_summary(out_dir)?;
         Ok(TabletStoreManifest {
             tablet_id,
             layout: self.layout_name().to_string(),
             engine: "unknown".into(),
             storage_uri: out_dir.display().to_string(),
+            checksum_sha256: Some(summary.checksum_sha256),
+            size_bytes: Some(summary.size_bytes),
             ..TabletStoreManifest::default_for(tablet_id)
         })
     }
@@ -400,17 +406,20 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
         let domain_id = self.domain_id(tablet_id)?;
         let kv = self.open_domain(domain_id)?;
         kv.checkpoint(out_dir)?;
+        let summary = checkpoint_summary(out_dir)?;
         Ok(TabletStoreManifest {
             tablet_id,
             layout: self.layout_name().into(),
             engine: "rocksdb".into(),
             storage_uri: out_dir.display().to_string(),
+            checksum_sha256: Some(summary.checksum_sha256),
+            size_bytes: Some(summary.size_bytes),
             ..TabletStoreManifest::default_for(tablet_id)
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TabletStoreManifest {
     pub tablet_id: i64,
     pub cell_id: Option<String>,
@@ -441,6 +450,66 @@ impl TabletStoreManifest {
             size_bytes: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckpointSummary {
+    checksum_sha256: String,
+    size_bytes: u64,
+}
+
+fn checkpoint_summary(root: &Path) -> Result<CheckpointSummary> {
+    let mut files = Vec::new();
+    collect_checkpoint_files(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    for (relative, path) in files {
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        let mut file = fs::File::open(&path)?;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            size_bytes = size_bytes.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+        hasher.update([0]);
+    }
+
+    Ok(CheckpointSummary {
+        checksum_sha256: format!("{:x}", hasher.finalize()),
+        size_bytes,
+    })
+}
+
+fn collect_checkpoint_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_checkpoint_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path.strip_prefix(root).map_err(|err| {
+                Error::Other(format!(
+                    "checkpoint path {} is outside root {}: {err}",
+                    path.display(),
+                    root.display()
+                ))
+            })?;
+            files.push((relative.to_path_buf(), path));
+        }
+    }
+    Ok(())
 }
 
 fn scoped_key(scope: &TabletKvScope, key: &[u8]) -> Vec<u8> {
@@ -609,6 +678,8 @@ mod tests {
         assert_eq!(manifest.tablet_id, 7);
         assert_eq!(manifest.layout, "grouped_rocksdb");
         assert_eq!(manifest.engine, "rocksdb");
+        assert!(manifest.size_bytes.unwrap_or_default() > 0);
+        assert_eq!(manifest.checksum_sha256.as_deref().unwrap().len(), 64);
         assert_eq!(
             restored
                 .get(b"tablet_state/00000000000000000007/record/a")

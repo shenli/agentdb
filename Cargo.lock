@@ -151,6 +151,7 @@ dependencies = [
  "raft",
  "raft-engine",
  "rocksdb",
+ "serde",
  "sha2",
  "slatedb",
  "slog",

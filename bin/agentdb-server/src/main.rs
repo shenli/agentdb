@@ -442,12 +442,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
     }
 
-    let mut state = agentdb_api::AppState::new(runtime.clone()).with_proxy_policy(
-        agentdb_api::state::ProxyPolicy {
+    let mut state = agentdb_api::AppState::new(runtime.clone())
+        .with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
-        },
-    );
+        })
+        .with_tablet_store_status(tablet_store_status(&config));
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror);
     }
@@ -903,6 +903,15 @@ enum KvBackendKind {
 enum TabletStoreLayoutKind {
     PrefixScoped,
     GroupedRocksDb,
+}
+
+impl TabletStoreLayoutKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefixScoped => "prefix_scoped",
+            Self::GroupedRocksDb => "grouped_rocksdb",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2188,6 +2197,20 @@ async fn load_route_snapshot(
         agentdb_meta::routing::ResidencyPolicy::default(),
     )
     .await
+}
+
+fn tablet_store_status(config: &ResolvedServeConfig) -> agentdb_api::state::TabletStoreStatus {
+    agentdb_api::state::TabletStoreStatus {
+        layout: config.tablet_store_layout.as_str().to_string(),
+        root_dir: Some(config.tablet_store_root_dir.display().to_string()),
+        tablets_per_domain: config.tablet_store_tablets_per_domain,
+        max_open_domains: config.tablet_store_max_open_domains,
+        domain_write_buffer_size_mib: config.tablet_store_domain_write_buffer_size_mib,
+        domain_max_write_buffers: config.tablet_store_domain_max_write_buffers,
+        domain_parallelism: config.tablet_store_domain_parallelism,
+        domain_max_background_jobs: config.tablet_store_domain_max_background_jobs,
+        domain_max_open_files: config.tablet_store_domain_max_open_files,
+    }
 }
 
 async fn prepare_route_startup(

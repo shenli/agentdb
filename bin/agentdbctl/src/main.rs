@@ -926,7 +926,32 @@ fn render_status(value: &Value) -> String {
             writeln!(out, "reasons={}", compact(reasons)).unwrap();
         }
     }
+    if let Some(tablet_store) = scheduler.get("tablet_store") {
+        writeln!(
+            out,
+            "tablet_store={} root={} tablets_per_domain={} max_open_domains={} memtable_budget_mib={} background_jobs_per_domain={}",
+            text(&tablet_store["layout"]),
+            text(&tablet_store["root_dir"]),
+            text(&tablet_store["tablets_per_domain"]),
+            text(&tablet_store["max_open_domains"]),
+            memtable_budget_mib(tablet_store)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            text(&tablet_store["domain_max_background_jobs"])
+        )
+        .unwrap();
+    }
     out.trim_end().to_string()
+}
+
+fn memtable_budget_mib(tablet_store: &Value) -> Option<u64> {
+    Some(
+        tablet_store
+            .get("max_open_domains")?
+            .as_u64()?
+            .saturating_mul(tablet_store.get("domain_write_buffer_size_mib")?.as_u64()?)
+            .saturating_mul(tablet_store.get("domain_max_write_buffers")?.as_u64()?),
+    )
 }
 
 fn render_object(object: &serde_json::Map<String, Value>) -> String {
@@ -1102,13 +1127,27 @@ mod tests {
                 }
             },
             "readiness": { "ready": true, "reasons": [] },
-            "scheduler": { "leader_node_id": "node-a", "tablet_reassignments_total": 3 },
+            "scheduler": {
+                "leader_node_id": "node-a",
+                "tablet_reassignments_total": 3,
+                "tablet_store": {
+                    "layout": "grouped_rocksdb",
+                    "root_dir": "/var/lib/agentdb/tablet-stores",
+                    "tablets_per_domain": 32,
+                    "max_open_domains": 16,
+                    "domain_write_buffer_size_mib": 16,
+                    "domain_max_write_buffers": 2,
+                    "domain_max_background_jobs": 1
+                }
+            },
             "drain": { "is_draining": false }
         });
         let rendered = render_status(&value);
         assert!(rendered.contains("status=ok"));
         assert!(rendered.contains("ready=true"));
         assert!(rendered.contains("leader=node-a"));
+        assert!(rendered.contains("tablet_store=grouped_rocksdb"));
+        assert!(rendered.contains("memtable_budget_mib=512"));
     }
 
     #[test]

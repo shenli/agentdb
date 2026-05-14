@@ -13,6 +13,7 @@ object_store = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 sha2 = { workspace = true }
 protobuf = { workspace = true }
 prost = { workspace = true }

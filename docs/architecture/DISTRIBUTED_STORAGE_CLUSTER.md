@@ -1255,6 +1255,12 @@ changefeed, compaction, and split/merge lifecycle.
    - latest applied index
    - latest snapshot index
    - checksum and size summary
+
+   Current implementation status: `TabletStoreManifest` is serializable and
+   checkpoint creation fills `checksum_sha256` and `size_bytes` from a
+   deterministic walk of the checkpoint directory. Cell, placement scope, epoch,
+   and snapshot-index fields are present for control-plane integration but are
+   not yet populated by a tablet-aware backup API.
 4. Implement tablet-aware backup/restore:
    - checkpoint one tablet-local domain
    - restore into a new local domain

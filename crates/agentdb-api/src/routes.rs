@@ -641,6 +641,8 @@ struct SchedulerStatusResponse {
     local_tablet_log_compaction_failures_total: u64,
     local_tablet_log_compaction_last_tick_at_ms: i64,
     last_tick_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tablet_store: Option<crate::state::TabletStoreStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1364,6 +1366,7 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         local_tablet_log_compaction_last_tick_at_ms: snapshot
             .local_tablet_log_compaction_last_tick_at_ms,
         last_tick_at_ms: snapshot.last_tick_at_ms,
+        tablet_store: s.tablet_store.clone(),
     })
 }
 

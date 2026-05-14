@@ -182,6 +182,10 @@ when metadata-backed cluster mode is enabled:
   `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`; `GET /api/admin/scheduler`
   and `agentdbctl status` expose local compaction success/failure counters so
   operators can distinguish an idle worker from a stuck one
+- local tablet-store layout and bounded-domain sizing through
+  `GET /api/admin/scheduler` and `agentdbctl status`, including layout, root
+  path, tablets per domain, max open domains, and the derived mutable memtable
+  budget
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
