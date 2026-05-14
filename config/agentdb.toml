@@ -65,3 +65,11 @@ backend = "localfs" # or "object_store"
 [routing]
 # Required in cluster mode.
 # node_id = "node-a"
+# Logical isolation cell for this node. Use the same value for nodes that
+# should share tablet placement and rebalance.
+cell_id = "default"
+# Region and AZ labels used by routing status and replica placement.
+# region = "us-west-2"
+# availability_zone = "us-west-2a"
+# stable, mixed, or preemptible.
+capacity_class = "stable"

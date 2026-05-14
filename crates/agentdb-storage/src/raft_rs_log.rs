@@ -829,7 +829,7 @@ impl RaftRsGroup {
         node.persist_snapshot(&snapshot)?;
         node.storage
             .wl()
-            .compact(up_to_index.saturating_add(1))
+            .compact(up_to_index)
             .map_err(map_raft_error)?;
         let persisted_deleted = node.compact_engine_entries(up_to_index)?;
         let retained_before = node.committed.len();
@@ -1402,6 +1402,22 @@ mod tests {
         let entries = logs[0].committed_entries(7, 0, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, b"second");
+    }
+
+    #[test]
+    fn raft_rs_log_can_append_after_compacting_through_current_commit() {
+        let (_dir, configs) = configs(3);
+        let (_group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        logs[0].append(7, b"before-compaction".to_vec()).unwrap();
+        let current = logs[0].append(7, b"compact-through-me".to_vec()).unwrap();
+
+        logs[0].compact(7, current.index).unwrap();
+        let after = logs[0].append(7, b"after-compaction".to_vec()).unwrap();
+
+        assert!(after.index > current.index);
+        let entries = logs[0].committed_entries(7, current.index, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, b"after-compaction");
     }
 
     #[test]

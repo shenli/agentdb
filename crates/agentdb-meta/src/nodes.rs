@@ -3,10 +3,11 @@
 
 use sqlx::AnyPool;
 
+use crate::cells::{self, DEFAULT_CAPACITY_CLASS, DEFAULT_CELL_ID};
 use crate::error::{MetaError, MetaResult};
 
 /// (node_id, address, mongo_address, state, last_heartbeat_ms,
-/// joined_at_ms, availability_zone, region). Aliased so the
+/// joined_at_ms, availability_zone, region, cell_id, capacity_class). Aliased so the
 /// `query_as` annotations don't have to spell the tuple at
 /// every call site.
 type NodeRow = (
@@ -18,6 +19,8 @@ type NodeRow = (
     i64,
     Option<String>,
     Option<String>,
+    String,
+    String,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,10 @@ pub struct Node {
     /// to `availability_zone` so older single-label deployments keep
     /// their previous behavior.
     pub region: Option<String>,
+    /// Logical isolation-domain / cell assignment.
+    pub cell_id: String,
+    /// Node capacity class used by placement policy.
+    pub capacity_class: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,17 +60,49 @@ pub async fn upsert(
     availability_zone: Option<&str>,
     region: Option<&str>,
 ) -> MetaResult<()> {
+    upsert_with_cell(
+        pool,
+        node_id,
+        address,
+        mongo_address,
+        state,
+        now_ms,
+        availability_zone,
+        region,
+        DEFAULT_CELL_ID,
+        DEFAULT_CAPACITY_CLASS,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_with_cell(
+    pool: &AnyPool,
+    node_id: &str,
+    address: &str,
+    mongo_address: Option<&str>,
+    state: &str,
+    now_ms: i64,
+    availability_zone: Option<&str>,
+    region: Option<&str>,
+    cell_id: &str,
+    capacity_class: &str,
+) -> MetaResult<()> {
+    cells::validate_cell_id(cell_id)?;
+    cells::validate_capacity_class(capacity_class)?;
     // SQLite's ON CONFLICT upsert syntax.
     sqlx::query(
-        "INSERT INTO nodes (node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region)
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "INSERT INTO nodes (node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region, cell_id, capacity_class)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (node_id) DO UPDATE SET
               address = excluded.address,
               mongo_address = excluded.mongo_address,
               state = excluded.state,
               last_heartbeat_ms = excluded.last_heartbeat_ms,
               availability_zone = excluded.availability_zone,
-              region = excluded.region",
+              region = excluded.region,
+              cell_id = excluded.cell_id,
+              capacity_class = excluded.capacity_class",
     )
     .bind(node_id)
     .bind(address)
@@ -73,6 +112,8 @@ pub async fn upsert(
     .bind(now_ms)
     .bind(availability_zone)
     .bind(region)
+    .bind(cell_id)
+    .bind(capacity_class)
     .execute(pool)
     .await?;
     Ok(())
@@ -113,7 +154,7 @@ pub async fn set_state(pool: &AnyPool, node_id: &str, state: &str, now_ms: i64) 
 
 pub async fn get(pool: &AnyPool, node_id: &str) -> MetaResult<Option<Node>> {
     let row: Option<NodeRow> = sqlx::query_as(
-        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region \
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region, cell_id, capacity_class \
            FROM nodes WHERE node_id = $1",
     )
     .bind(node_id)
@@ -128,7 +169,7 @@ pub async fn get(pool: &AnyPool, node_id: &str) -> MetaResult<Option<Node>> {
 /// scheduler's membership scan.
 pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Node>> {
     let rows: Vec<NodeRow> = sqlx::query_as(
-        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region, cell_id, capacity_class
            FROM nodes ORDER BY node_id",
     )
     .fetch_all(pool)
@@ -137,7 +178,7 @@ pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<Node>> {
 }
 
 fn into_node(row: NodeRow) -> Node {
-    let (n, a, m, s, h, j, az, region) = row;
+    let (n, a, m, s, h, j, az, region, cell_id, capacity_class) = row;
     Node {
         node_id: n,
         address: a,
@@ -147,6 +188,8 @@ fn into_node(row: NodeRow) -> Node {
         joined_at_ms: j,
         availability_zone: az,
         region,
+        cell_id,
+        capacity_class,
     }
 }
 
@@ -208,7 +251,7 @@ pub async fn remove(pool: &AnyPool, node_id: &str) -> MetaResult<bool> {
 /// the scheduler to detect dead nodes and start failover.
 pub async fn stale(pool: &AnyPool, threshold_ms: i64) -> MetaResult<Vec<Node>> {
     let rows: Vec<NodeRow> = sqlx::query_as(
-        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region
+        "SELECT node_id, address, mongo_address, state, last_heartbeat_ms, joined_at_ms, availability_zone, region, cell_id, capacity_class
            FROM nodes WHERE last_heartbeat_ms < $1 ORDER BY last_heartbeat_ms",
     )
     .bind(threshold_ms)
@@ -245,6 +288,8 @@ mod tests {
         assert_eq!(n.address, "127.0.0.1:9000");
         assert_eq!(n.state, "alive");
         assert_eq!(n.last_heartbeat_ms, 100);
+        assert_eq!(n.cell_id, DEFAULT_CELL_ID);
+        assert_eq!(n.capacity_class, DEFAULT_CAPACITY_CLASS);
     }
 
     #[tokio::test]
@@ -272,14 +317,16 @@ mod tests {
         assert_eq!(n.last_heartbeat_ms, 200);
         assert_eq!(n.availability_zone, None);
         assert_eq!(n.region, None);
+        assert_eq!(n.cell_id, DEFAULT_CELL_ID);
+        assert_eq!(n.capacity_class, DEFAULT_CAPACITY_CLASS);
         // joined_at should remain the original.
         assert_eq!(n.joined_at_ms, 100);
     }
 
     #[tokio::test]
-    async fn upsert_persists_region_and_availability_zone() {
+    async fn upsert_persists_cell_region_availability_zone_and_capacity() {
         let p = pool().await;
-        upsert(
+        upsert_with_cell(
             &p,
             "node-a",
             "addr",
@@ -288,6 +335,8 @@ mod tests {
             100,
             Some("us-west-2a"),
             Some("us-west-2"),
+            "cell-a",
+            "preemptible",
         )
         .await
         .unwrap();
@@ -295,6 +344,8 @@ mod tests {
         let n = get(&p, "node-a").await.unwrap().unwrap();
         assert_eq!(n.availability_zone.as_deref(), Some("us-west-2a"));
         assert_eq!(n.region.as_deref(), Some("us-west-2"));
+        assert_eq!(n.cell_id, "cell-a");
+        assert_eq!(n.capacity_class, "preemptible");
     }
 
     #[tokio::test]

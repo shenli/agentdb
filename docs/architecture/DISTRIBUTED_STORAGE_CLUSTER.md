@@ -1,6 +1,6 @@
 # Distributed Storage Cluster Next Step
 
-Status: design proposal
+Status: design proposal, Track A metadata/routing implementation started
 
 This document describes the next production-oriented step for AgentDB's
 distributed storage cluster. It combines the existing replicated tablet design
@@ -160,6 +160,14 @@ default next step should be one shared metadata backend with `cell_id` on the
 relevant rows and strict same-cell placement invariants in routing and the
 scheduler. A separate schema, partition, or database per cell is a later
 hardening option for scale, compliance, or stronger blast-radius requirements.
+
+Implementation note: Track A keeps the shared metadata backend. The current
+implementation has logical `cells`, `nodes.cell_id`, `placement_scopes.cell_id`,
+and tenant policy `cell_id`/`tier`/`priority` fields. Routing resolves tenant
+policy to cell and placement scope before tablet selection. Scheduler
+assignment, replacement, and load balancing select only same-cell nodes and use
+cell deployment profile plus tenant tier/capacity policy when choosing targets.
+Tablet-local physical LSM layout work remains Track B.
 
 An isolation domain should also declare a capacity and SLO profile:
 

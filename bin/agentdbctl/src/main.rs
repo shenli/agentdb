@@ -54,6 +54,11 @@ enum Command {
         #[command(subcommand)]
         command: NodesCommand,
     },
+    /// Logical cell / isolation-domain operations.
+    Cells {
+        #[command(subcommand)]
+        command: CellsCommand,
+    },
     /// Tablet placement and movement operations.
     Tablets {
         #[command(subcommand)]
@@ -105,6 +110,38 @@ enum NodesCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum CellsCommand {
+    /// List cells.
+    List,
+    /// Create or update a cell.
+    Upsert(UpsertCellArgs),
+}
+
+#[derive(Args, Debug)]
+struct UpsertCellArgs {
+    #[arg(long)]
+    cell_id: String,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "standard")]
+    domain_class: String,
+    #[arg(long, default_value = "single_az_cluster")]
+    deployment_profile: String,
+    #[arg(long, default_value = "stable")]
+    capacity_class: String,
+    #[arg(long, default_value = "shared_logical")]
+    metadata_isolation_level: String,
+    #[arg(long, default_value = "serving")]
+    state: String,
+    #[arg(long)]
+    metadata_namespace: Option<String>,
+    #[arg(long)]
+    object_store_namespace: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    rollout_version: i64,
+}
+
 #[derive(Args, Debug)]
 struct RegisterNodeArgs {
     #[arg(long)]
@@ -119,6 +156,10 @@ struct RegisterNodeArgs {
     availability_zone: Option<String>,
     #[arg(long)]
     region: Option<String>,
+    #[arg(long, default_value = "default")]
+    cell_id: String,
+    #[arg(long, default_value = "stable")]
+    capacity_class: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -404,6 +445,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
             }))
         }
         Command::Nodes { command } => nodes(api, command).await,
+        Command::Cells { command } => cells(api, command).await,
         Command::Tablets { command } => tablets(api, command).await,
         Command::Raft { command } => raft(api, command).await,
         Command::Drain { command } => match command {
@@ -522,7 +564,9 @@ async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
                     "mongo_address": args.mongo_address,
                     "state": args.state,
                     "availability_zone": args.availability_zone,
-                    "region": args.region
+                    "region": args.region,
+                    "cell_id": args.cell_id,
+                    "capacity_class": args.capacity_class
                 }),
             )
             .await
@@ -534,6 +578,30 @@ async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
             api.post(
                 &format!("/api/admin/nodes/{node_id}/maintenance"),
                 json!({ "state": state.as_str() }),
+            )
+            .await
+        }
+    }
+}
+
+async fn cells(api: &Api, command: CellsCommand) -> Result<Value> {
+    match command {
+        CellsCommand::List => api.get("/api/admin/cells").await,
+        CellsCommand::Upsert(args) => {
+            api.post(
+                "/api/admin/cells",
+                json!({
+                    "cell_id": args.cell_id,
+                    "region": args.region,
+                    "domain_class": args.domain_class,
+                    "deployment_profile": args.deployment_profile,
+                    "capacity_class": args.capacity_class,
+                    "metadata_isolation_level": args.metadata_isolation_level,
+                    "state": args.state,
+                    "metadata_namespace": args.metadata_namespace,
+                    "object_store_namespace": args.object_store_namespace,
+                    "rollout_version": args.rollout_version
+                }),
             )
             .await
         }

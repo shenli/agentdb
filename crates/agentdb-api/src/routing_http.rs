@@ -18,7 +18,9 @@ use axum::{
 use serde::Serialize;
 
 use agentdb_meta::{
+    cells::{self, Cell},
     nodes::{self, Node},
+    placement_scopes::{self, PlacementScope},
     routing::{plan_route, ResidencyPolicy, RouteAction, RouteDecision, RouteReason, RouteRequest},
     session_locators::{self, SessionLocator},
     shards::{self, ShardRow},
@@ -33,6 +35,8 @@ pub const HDR_OWNER_NODE: &str = "x-agentdb-owner-node";
 pub const HDR_OWNER_ADDRESS: &str = "x-agentdb-owner-address";
 pub const HDR_TABLET_ID: &str = "x-agentdb-tablet-id";
 pub const HDR_SHARD_ID: &str = "x-agentdb-shard-id";
+pub const HDR_CELL_ID: &str = "x-agentdb-cell-id";
+pub const HDR_PLACEMENT_SCOPE_ID: &str = "x-agentdb-placement-scope-id";
 pub const HDR_TABLET_EPOCH: &str = "x-agentdb-tablet-epoch";
 pub const HDR_ROUTE_REASON: &str = "x-agentdb-route-reason";
 pub const HDR_FORWARDED_BY: &str = "x-agentdb-forwarded-by";
@@ -88,6 +92,8 @@ pub struct RouteSnapshot {
     pub tablet_ranges: Arc<[TabletRange]>,
     pub tablets: Arc<[Tablet]>,
     pub nodes: Arc<[Node]>,
+    pub cells: Arc<[Cell]>,
+    pub placement_scopes: Arc<[PlacementScope]>,
     pub session_locators: Arc<[SessionLocator]>,
     pub tenant_policies: Arc<[TenantPolicy]>,
 }
@@ -134,6 +140,8 @@ pub struct RouteSnapshotStatus {
     pub tablet_range_count: usize,
     pub tablet_count: usize,
     pub node_count: usize,
+    pub cell_count: usize,
+    pub placement_scope_count: usize,
     pub session_locator_count: usize,
     pub tenant_policy_count: usize,
     pub nodes: Vec<RouteNodeStatus>,
@@ -145,8 +153,10 @@ pub struct RouteNodeStatus {
     pub node_id: String,
     pub address: String,
     pub state: String,
+    pub cell_id: String,
     pub region: Option<String>,
     pub availability_zone: Option<String>,
+    pub capacity_class: String,
     pub route_location: Option<String>,
     pub last_heartbeat_ms: i64,
     pub joined_at_ms: i64,
@@ -157,8 +167,10 @@ pub struct RouteTabletStatus {
     pub tablet_id: i64,
     pub owner_node_id: Option<String>,
     pub owner_state: Option<String>,
+    pub owner_cell_id: Option<String>,
     pub owner_region: Option<String>,
     pub owner_availability_zone: Option<String>,
+    pub owner_capacity_class: Option<String>,
     pub owner_route_location: Option<String>,
     pub local_owner: bool,
     pub epoch: i64,
@@ -171,6 +183,7 @@ pub struct RouteDecisionDryRun {
     pub local_node_id: String,
     pub tenant_id: String,
     pub session_id: Option<String>,
+    pub cell_id: Option<String>,
     pub placement_scope_id: Option<String>,
     pub session_locator_found: bool,
     pub action: &'static str,
@@ -253,6 +266,7 @@ impl RouteRuntime {
                 local_node_id: self.local_node_id.to_string(),
                 tenant_id: tenant_id.to_string(),
                 session_id: session_id.map(str::to_string),
+                cell_id: None,
                 placement_scope_id: None,
                 session_locator_found: false,
                 action: "local",
@@ -272,18 +286,20 @@ impl RouteRuntime {
                 tenant_id,
                 session_id,
                 None,
+                None,
                 false,
                 decision,
             ),
             RouteRuntimeMode::Snapshot(snapshot) => {
                 let session_locator =
                     session_id.and_then(|sid| snapshot.session_locator(tenant_id, sid));
-                let placement_scope_id = snapshot.placement_scope_id(tenant_id);
+                let (cell_id, placement_scope_id) = snapshot.tenant_route(tenant_id);
                 let decision = plan_route(
                     RouteRequest {
                         tenant_id,
                         routing_key: session_id,
                         placement_scope_id: Some(placement_scope_id),
+                        cell_id: Some(cell_id),
                         session_locator,
                         request_location: snapshot.request_location.as_deref(),
                         local_node_id: Some(&self.local_node_id),
@@ -294,6 +310,7 @@ impl RouteRuntime {
                     &snapshot.shards,
                     &snapshot.tablet_ranges,
                     &snapshot.tablets,
+                    &snapshot.placement_scopes,
                     &snapshot.nodes,
                 );
                 dry_run_from_decision(
@@ -301,6 +318,7 @@ impl RouteRuntime {
                     &self.local_node_id,
                     tenant_id,
                     session_id,
+                    Some(cell_id),
                     Some(placement_scope_id),
                     session_locator.is_some(),
                     &decision,
@@ -453,12 +471,13 @@ impl RouteRuntime {
         original_path_and_query: &str,
         incoming_headers: &HeaderMap,
     ) -> RouteGuardOutcome {
-        let placement_scope_id = snapshot.placement_scope_id(tenant_id);
+        let (cell_id, placement_scope_id) = snapshot.tenant_route(tenant_id);
         let decision = plan_route(
             RouteRequest {
                 tenant_id,
                 routing_key,
                 placement_scope_id: Some(placement_scope_id),
+                cell_id: Some(cell_id),
                 session_locator,
                 request_location: snapshot.request_location.as_deref(),
                 local_node_id: Some(&self.local_node_id),
@@ -469,6 +488,7 @@ impl RouteRuntime {
             &snapshot.shards,
             &snapshot.tablet_ranges,
             &snapshot.tablets,
+            &snapshot.placement_scopes,
             &snapshot.nodes,
         );
         match route_http_outcome(&decision) {
@@ -494,6 +514,7 @@ fn dry_run_from_decision(
     local_node_id: &str,
     tenant_id: &str,
     session_id: Option<&str>,
+    cell_id: Option<&str>,
     placement_scope_id: Option<&str>,
     session_locator_found: bool,
     decision: &RouteDecision,
@@ -511,6 +532,7 @@ fn dry_run_from_decision(
         local_node_id: local_node_id.to_string(),
         tenant_id: tenant_id.to_string(),
         session_id: session_id.map(str::to_string),
+        cell_id: cell_id.map(str::to_string),
         placement_scope_id: placement_scope_id.map(str::to_string),
         session_locator_found,
         action,
@@ -535,6 +557,8 @@ fn route_reason_code(reason: RouteReason) -> &'static str {
         RouteReason::NodeUnavailable => "node_unavailable",
         RouteReason::ResidencyDenied => "residency_denied",
         RouteReason::WrongLocation => "wrong_location",
+        RouteReason::WrongCell => "wrong_cell",
+        RouteReason::MissingPlacementScope => "missing_placement_scope",
         RouteReason::KeyUnavailable => "key_unavailable",
     }
 }
@@ -549,6 +573,8 @@ impl RouteSnapshot {
             tablet_ranges: Arc::from([]),
             tablets: Arc::from([]),
             nodes: Arc::from([]),
+            cells: Arc::from([]),
+            placement_scopes: Arc::from([]),
             session_locators: Arc::from([]),
             tenant_policies: Arc::from([]),
         }
@@ -569,6 +595,8 @@ impl RouteSnapshot {
             tablet_ranges: Arc::from(tablet_ranges::list_all(pool).await?),
             tablets: Arc::from(tablets::list_all(pool).await?),
             nodes: Arc::from(nodes::list_all(pool).await?),
+            cells: Arc::from(cells::list_all(pool).await?),
+            placement_scopes: Arc::from(placement_scopes::list_all(pool).await?),
             session_locators: Arc::from(session_locators::list_all(pool).await?),
             tenant_policies: Arc::from(tenant_policies::list_all(pool).await?),
         })
@@ -604,6 +632,16 @@ impl RouteSnapshot {
         self
     }
 
+    pub fn with_cells(mut self, cells: Vec<Cell>) -> Self {
+        self.cells = Arc::from(cells);
+        self
+    }
+
+    pub fn with_placement_scopes(mut self, placement_scopes: Vec<PlacementScope>) -> Self {
+        self.placement_scopes = Arc::from(placement_scopes);
+        self
+    }
+
     pub fn with_session_locators(mut self, session_locators: Vec<SessionLocator>) -> Self {
         self.session_locators = Arc::from(session_locators);
         self
@@ -624,12 +662,15 @@ impl RouteSnapshot {
         })
     }
 
-    fn placement_scope_id(&self, tenant_id: &str) -> &str {
+    fn tenant_route(&self, tenant_id: &str) -> (&str, &str) {
         self.tenant_policies
             .iter()
             .find(|policy| policy.tenant_id == tenant_id)
-            .map(|policy| policy.placement_scope_id.as_str())
-            .unwrap_or(agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID)
+            .map(|policy| (policy.cell_id.as_str(), policy.placement_scope_id.as_str()))
+            .unwrap_or((
+                agentdb_meta::cells::DEFAULT_CELL_ID,
+                agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID,
+            ))
     }
 
     fn describe(&self, local_node_id: &str) -> RouteSnapshotStatus {
@@ -645,8 +686,10 @@ impl RouteSnapshot {
                 node_id: node.node_id.clone(),
                 address: node.address.clone(),
                 state: node.state.clone(),
+                cell_id: node.cell_id.clone(),
                 region: node.region.clone(),
                 availability_zone: node.availability_zone.clone(),
+                capacity_class: node.capacity_class.clone(),
                 route_location: node_route_location(node).map(str::to_string),
                 last_heartbeat_ms: node.last_heartbeat_ms,
                 joined_at_ms: node.joined_at_ms,
@@ -664,8 +707,10 @@ impl RouteSnapshot {
                     tablet_id: tablet.tablet_id,
                     owner_node_id: tablet.owner_node_id.clone(),
                     owner_state: owner.map(|node| node.state.clone()),
+                    owner_cell_id: owner.map(|node| node.cell_id.clone()),
                     owner_region: owner.and_then(|node| node.region.clone()),
                     owner_availability_zone: owner.and_then(|node| node.availability_zone.clone()),
+                    owner_capacity_class: owner.map(|node| node.capacity_class.clone()),
                     owner_route_location: owner.and_then(node_route_location).map(str::to_string),
                     local_owner: tablet.owner_node_id.as_deref() == Some(local_node_id),
                     epoch: tablet.epoch,
@@ -682,6 +727,8 @@ impl RouteSnapshot {
             tablet_range_count: self.tablet_ranges.len(),
             tablet_count: self.tablets.len(),
             node_count: self.nodes.len(),
+            cell_count: self.cells.len(),
+            placement_scope_count: self.placement_scopes.len(),
             session_locator_count: self.session_locators.len(),
             tenant_policy_count: self.tenant_policies.len(),
             nodes,
@@ -792,6 +839,12 @@ fn route_target(decision: &RouteDecision, action: &'static str) -> RouteTarget {
     insert_header(&mut headers, HDR_OWNER_ADDRESS, &owner_address);
     insert_header(&mut headers, HDR_TABLET_ID, &decision.tablet_id.to_string());
     insert_header(&mut headers, HDR_SHARD_ID, &decision.shard_id.to_string());
+    insert_header(&mut headers, HDR_CELL_ID, &decision.cell_id);
+    insert_header(
+        &mut headers,
+        HDR_PLACEMENT_SCOPE_ID,
+        &decision.placement_scope_id,
+    );
     insert_header(&mut headers, HDR_TABLET_EPOCH, &epoch.to_string());
     RouteTarget {
         tablet_id: decision.tablet_id,
@@ -816,6 +869,18 @@ fn route_rejection(decision: &RouteDecision) -> RouteRejection {
             "ROUTE_RESIDENCY_DENIED",
             false,
             "tenant residency policy denies routing to the owner location",
+        ),
+        RouteReason::WrongCell => (
+            StatusCode::MISDIRECTED_REQUEST,
+            "ROUTE_WRONG_CELL",
+            false,
+            "request resolved to a tablet or node outside the tenant cell",
+        ),
+        RouteReason::MissingPlacementScope => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ROUTE_MISSING_PLACEMENT_SCOPE",
+            true,
+            "tenant placement scope metadata is missing",
         ),
         RouteReason::MissingTablet => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -858,6 +923,12 @@ fn route_rejection(decision: &RouteDecision) -> RouteRejection {
     insert_header(&mut headers, HDR_ROUTE_ACTION, "reject");
     insert_header(&mut headers, HDR_ROUTE_REASON, code);
     insert_header(&mut headers, HDR_TABLET_ID, &decision.tablet_id.to_string());
+    insert_header(&mut headers, HDR_CELL_ID, &decision.cell_id);
+    insert_header(
+        &mut headers,
+        HDR_PLACEMENT_SCOPE_ID,
+        &decision.placement_scope_id,
+    );
     if let Some(epoch) = decision.epoch {
         insert_header(&mut headers, HDR_TABLET_EPOCH, &epoch.to_string());
     }
@@ -944,6 +1015,8 @@ fn sanitize_forward_headers(incoming: &HeaderMap) -> HeaderMap {
             || name_s == HDR_OWNER_NODE
             || name_s == HDR_OWNER_ADDRESS
             || name_s == HDR_TABLET_ID
+            || name_s == HDR_CELL_ID
+            || name_s == HDR_PLACEMENT_SCOPE_ID
             || name_s == HDR_TABLET_EPOCH
         {
             continue;
@@ -983,6 +1056,8 @@ mod tests {
             joined_at_ms: 100,
             availability_zone: Some(location.into()),
             region: Some(location.into()),
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            capacity_class: "stable".into(),
         }
     }
 
@@ -1022,12 +1097,30 @@ mod tests {
             encryption_policy_version: 1,
             policy_version: 1,
             updated_at_ms: 100,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            tier: "paid".into(),
+            priority: 10,
+        }
+    }
+
+    fn placement_scope(id: &str) -> PlacementScope {
+        PlacementScope {
+            placement_scope_id: id.into(),
+            kind: "dedicated_tenant".into(),
+            shard_count: 1,
+            hash_seed: None,
+            state: "serving".into(),
+            epoch: 0,
+            created_at_ms: 0,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
         }
     }
 
     fn decision(action: RouteAction, reason: Option<RouteReason>) -> RouteDecision {
         RouteDecision {
             action,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            placement_scope_id: agentdb_meta::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID.into(),
             shard_id: 3,
             tablet_id: 7,
             owner_node_id: Some("node-a".into()),
@@ -1318,6 +1411,7 @@ mod tests {
     fn route_runtime_snapshot_uses_tenant_policy_placement_scope() {
         let snapshot = RouteSnapshot::new(1)
             .with_tenant_policies(vec![tenant_policy("ten_1", "tenant/acme")])
+            .with_placement_scopes(vec![placement_scope("tenant/acme")])
             .with_tablet_ranges(vec![
                 TabletRange {
                     placement_scope_id: "default".into(),
@@ -1336,7 +1430,10 @@ mod tests {
                     updated_at_ms: 10,
                 },
             ])
-            .with_tablets(vec![tablet(42, Some("node-a"), i64::MAX)])
+            .with_tablets(vec![Tablet {
+                placement_scope_id: "tenant/acme".into(),
+                ..tablet(42, Some("node-a"), i64::MAX)
+            }])
             .with_nodes(vec![node("node-a", "us-west-2a")]);
         let runtime = RouteRuntime::snapshot("node-a", snapshot);
 
@@ -1431,7 +1528,7 @@ mod tests {
         assert_eq!(snapshot.session_locators.len(), 1);
         assert_eq!(snapshot.session_locators[0].session_id, "ses_1");
         assert_eq!(snapshot.tenant_policies.len(), 1);
-        assert_eq!(snapshot.placement_scope_id("ten_1"), "tenant/ten_1");
+        assert_eq!(snapshot.tenant_route("ten_1"), ("default", "tenant/ten_1"));
     }
 
     #[test]

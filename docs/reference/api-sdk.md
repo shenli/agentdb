@@ -134,6 +134,8 @@ GET  /api/admin/cluster/readiness[?stale_threshold_ms={ms}]
 GET  /api/admin/scheduler
 GET  /api/admin/drain
 POST /api/admin/drain
+GET  /api/admin/cells
+POST /api/admin/cells
 GET  /api/admin/nodes[?stale_threshold_ms={ms}]
 POST /api/admin/nodes
 DELETE /api/admin/nodes/{node_id}

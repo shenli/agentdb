@@ -3741,6 +3741,8 @@ fn node_with_state_and_heartbeat(
         joined_at_ms: 100,
         availability_zone: Some("us-west-2a".into()),
         region: Some("us-west-2".into()),
+        cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+        capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
     }
 }
 

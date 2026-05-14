@@ -77,7 +77,12 @@ Today, the control-plane schema already has the early shape of this model:
 - `tablet_ranges`: compressed virtual-shard range to tablet map.
 - `tablet_replicas`: intended replica placement and catch-up metadata.
 - `tenant_policies`: tenant placement class, placement scope, encryption class,
-  key policy reference, and policy versions.
+  key policy reference, cell assignment, tenant tier/priority, and policy
+  versions.
+
+The Track A distributed-cluster work adds logical cells and placement-policy
+metadata only. It does not change the hot write path, RocksDB layout, or
+tablet-local physical LSM model described below.
 
 Those rows are control-plane routing metadata. In clustered mode, local tablet
 writes now flow through per-tablet `raft-rs` groups backed by TiKV

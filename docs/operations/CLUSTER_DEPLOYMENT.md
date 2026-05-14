@@ -232,12 +232,22 @@ The target bootstrap order should be:
 The intended operator shape is CLI-first:
 
 ```bash
+agentdbctl cells upsert \
+  --cell-id prod-c001 \
+  --region us-west-2 \
+  --domain-class standard \
+  --deployment-profile multi_az_standard \
+  --capacity-class stable
+
 agentdbctl nodes register \
   --node-id node-a \
   --address http://10.0.0.10:7878 \
+  --cell-id prod-c001 \
   --region us-west-2 \
-  --availability-zone us-west-2a
+  --availability-zone us-west-2a \
+  --capacity-class stable
 
+agentdbctl cells list
 agentdbctl tablets create 0
 agentdbctl tablets rebalance --dry-run
 agentdbctl tablets rebalance

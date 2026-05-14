@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agentdb_meta::{nodes, tablet_ranges, tablet_replicas, tablets, MetaStore};
+use agentdb_meta::{cells, nodes, tablet_ranges, tablet_replicas, tablets, MetaStore};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use reqwest::Client;
@@ -229,7 +229,10 @@ allow_http = true
 [routing]
 node_id = "{node_id}"
 shard_count = {shard_count}
+cell_id = "default"
 region = "local"
+availability_zone = "local-a"
+capacity_class = "stable"
 refresh_interval_ms = 500
 proxy_timeout_ms = 70000
 "#,
@@ -291,6 +294,21 @@ async fn ensure_cluster_meta_empty(meta: &MetaStore) -> Result<()> {
 async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<()> {
     let pool = meta.pool();
     let now_ms = now_ms();
+    cells::upsert(
+        pool,
+        cells::DEFAULT_CELL_ID,
+        Some("local"),
+        cells::DEFAULT_DOMAIN_CLASS,
+        cells::DEFAULT_DEPLOYMENT_PROFILE,
+        cells::DEFAULT_CAPACITY_CLASS,
+        cells::DEFAULT_METADATA_ISOLATION_LEVEL,
+        "serving",
+        Some("default"),
+        Some("default"),
+        0,
+        now_ms,
+    )
+    .await?;
     tablets::create_with_placement(
         pool,
         PRIMARY_TABLET_ID,
@@ -324,7 +342,7 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
     )
     .await?;
     for node in node_specs {
-        nodes::upsert(
+        nodes::upsert_with_cell(
             pool,
             &node.id,
             &node.url,
@@ -333,6 +351,8 @@ async fn seed_cluster_meta(meta: &MetaStore, node_specs: &[NodeSpec]) -> Result<
             now_ms,
             Some("local-a"),
             Some("local"),
+            cells::DEFAULT_CELL_ID,
+            cells::DEFAULT_CAPACITY_CLASS,
         )
         .await?;
         tablet_replicas::upsert(
@@ -401,6 +421,7 @@ async fn run_smoke(
         )
         .await?;
     }
+    assert_cell_and_node_labels(client, nodes).await?;
     eprintln!("smoke: waiting for raft readiness");
     wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
 
@@ -471,6 +492,45 @@ async fn run_smoke(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn assert_cell_and_node_labels(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
+    let first = nodes
+        .first()
+        .ok_or_else(|| anyhow!("cluster smoke requires at least one node"))?;
+    let cells = get_json(client, &first.url, "/api/admin/cells").await?;
+    let default_cell = cells
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|cell| cell["cell_id"] == cells::DEFAULT_CELL_ID)
+        })
+        .ok_or_else(|| anyhow!("default cell was not exposed by /api/admin/cells: {cells}"))?;
+    if default_cell["deployment_profile"] != cells::DEFAULT_DEPLOYMENT_PROFILE
+        || default_cell["capacity_class"] != cells::DEFAULT_CAPACITY_CLASS
+    {
+        bail!("default cell has unexpected placement metadata: {default_cell}");
+    }
+
+    let node_rows = get_json(client, &first.url, "/api/admin/nodes").await?;
+    for node in nodes {
+        let row = node_rows
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["node_id"] == node.id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "node {} missing from /api/admin/nodes: {node_rows}",
+                    node.id
+                )
+            })?;
+        if row["cell_id"] != cells::DEFAULT_CELL_ID
+            || row["availability_zone"] != "local-a"
+            || row["capacity_class"] != cells::DEFAULT_CAPACITY_CLASS
+        {
+            bail!("node {} has unexpected placement labels: {row}", node.id);
+        }
+    }
     Ok(())
 }
 

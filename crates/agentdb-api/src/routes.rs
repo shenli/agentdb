@@ -38,8 +38,8 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance, tablet_replicas,
-    tablet_snapshots, tablet_stats, tablets, tenant_policies, tenants,
+    cells, nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance,
+    tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -98,6 +98,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/admin/nodes",
             get(get_admin_nodes).post(register_admin_node),
+        )
+        .route(
+            "/api/admin/cells",
+            get(get_admin_cells).post(upsert_admin_cell),
         )
         .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
         .route(
@@ -373,10 +377,12 @@ struct AdminNodeView {
     address: String,
     mongo_address: Option<String>,
     state: String,
+    cell_id: String,
     last_heartbeat_ms: i64,
     joined_at_ms: i64,
     availability_zone: Option<String>,
     region: Option<String>,
+    capacity_class: String,
     is_stale: bool,
 }
 
@@ -388,6 +394,23 @@ struct RegisterNodeBody {
     state: Option<String>,
     availability_zone: Option<String>,
     region: Option<String>,
+    cell_id: Option<String>,
+    capacity_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertCellBody {
+    cell_id: String,
+    region: Option<String>,
+    domain_class: Option<String>,
+    deployment_profile: Option<String>,
+    capacity_class: Option<String>,
+    metadata_isolation_level: Option<String>,
+    state: Option<String>,
+    metadata_namespace: Option<String>,
+    object_store_namespace: Option<String>,
+    #[serde(default)]
+    rollout_version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +463,9 @@ struct UpsertTenantPolicyBody {
     tenant_id: String,
     placement_class: String,
     placement_scope_id: String,
+    cell_id: Option<String>,
+    tier: Option<String>,
+    priority: Option<i64>,
     encryption_class: String,
     key_policy_id: Option<String>,
     #[serde(default)]
@@ -1524,13 +1550,57 @@ async fn get_admin_nodes(
                 address: node.address,
                 mongo_address: node.mongo_address,
                 state: node.state,
+                cell_id: node.cell_id,
                 last_heartbeat_ms: node.last_heartbeat_ms,
                 joined_at_ms: node.joined_at_ms,
                 availability_zone: node.availability_zone,
                 region: node.region,
+                capacity_class: node.capacity_class,
             })
             .collect(),
     ))
+}
+
+async fn get_admin_cells(State(s): State<AppState>) -> Result<Json<Vec<cells::Cell>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = cells::list_all(meta.pool()).await.map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn upsert_admin_cell(
+    State(s): State<AppState>,
+    Json(body): Json<UpsertCellBody>,
+) -> Result<Json<cells::Cell>, ApiError> {
+    let meta = meta_required(&s)?;
+    cells::upsert(
+        meta.pool(),
+        &body.cell_id,
+        body.region.as_deref(),
+        body.domain_class
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_DOMAIN_CLASS),
+        body.deployment_profile
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_DEPLOYMENT_PROFILE),
+        body.capacity_class
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_CAPACITY_CLASS),
+        body.metadata_isolation_level
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_METADATA_ISOLATION_LEVEL),
+        body.state.as_deref().unwrap_or("serving"),
+        body.metadata_namespace.as_deref(),
+        body.object_store_namespace.as_deref(),
+        body.rollout_version,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let cell = cells::get(meta.pool(), &body.cell_id)
+        .await
+        .map_err(internal_error)?
+        .expect("cell upserted above");
+    Ok(Json(cell))
 }
 
 async fn register_admin_node(
@@ -1548,7 +1618,7 @@ async fn register_admin_node(
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0);
     let state = body.state.unwrap_or_else(|| "alive".into());
-    nodes::upsert(
+    nodes::upsert_with_cell(
         meta.pool(),
         &body.node_id,
         &body.address,
@@ -1557,6 +1627,12 @@ async fn register_admin_node(
         now_ms,
         body.availability_zone.as_deref(),
         body.region.as_deref(),
+        body.cell_id
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CELL_ID),
+        body.capacity_class
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CAPACITY_CLASS),
     )
     .await
     .map_err(|err| {
@@ -1664,10 +1740,12 @@ fn admin_node_view(node: nodes::Node, now_ms: i64, stale_threshold_ms: i64) -> A
         address: node.address,
         mongo_address: node.mongo_address,
         state: node.state,
+        cell_id: node.cell_id,
         last_heartbeat_ms: node.last_heartbeat_ms,
         joined_at_ms: node.joined_at_ms,
         availability_zone: node.availability_zone,
         region: node.region,
+        capacity_class: node.capacity_class,
     }
 }
 
@@ -2650,7 +2728,7 @@ async fn upsert_admin_tenant_policy(
     Json(body): Json<UpsertTenantPolicyBody>,
 ) -> Result<Json<tenant_policies::TenantPolicy>, ApiError> {
     let meta = meta_required(&s)?;
-    tenant_policies::upsert(
+    tenant_policies::upsert_with_cell(
         meta.pool(),
         &body.tenant_id,
         &body.placement_class,
@@ -2659,6 +2737,13 @@ async fn upsert_admin_tenant_policy(
         body.key_policy_id.as_deref(),
         body.encryption_policy_version,
         body.policy_version,
+        body.cell_id
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CELL_ID),
+        body.tier
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_TIER),
+        body.priority.unwrap_or(tenant_policies::DEFAULT_PRIORITY),
         now_ms_i64(),
     )
     .await

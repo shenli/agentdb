@@ -125,6 +125,18 @@ struct ServeOpts {
     #[arg(long)]
     route_region: Option<String>,
 
+    /// Logical isolation cell for this node.
+    #[arg(long)]
+    route_cell_id: Option<String>,
+
+    /// Availability zone / failure-domain label for this node.
+    #[arg(long)]
+    route_availability_zone: Option<String>,
+
+    /// Capacity class for this node: stable, mixed, or preemptible.
+    #[arg(long)]
+    route_capacity_class: Option<String>,
+
     /// Older location label. Prefer `--route-region` for new deployments.
     #[arg(long)]
     route_location: Option<String>,
@@ -432,6 +444,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 raft_registry: raft_registry.clone(),
                 node_address,
                 region: config.route_region.clone(),
+                cell_id: config.route_cell_id.clone(),
+                availability_zone: config.route_availability_zone.clone(),
+                capacity_class: config.route_capacity_class.clone(),
                 scheduler_status: startup.scheduler_status.clone(),
                 drain: state.drain.clone(),
             },
@@ -593,6 +608,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         tracing::info!(
             node_id = %startup.node_id,
             shard_count = config.route_shard_count,
+            cell_id = %config.route_cell_id,
+            availability_zone = ?config.route_availability_zone,
+            capacity_class = %config.route_capacity_class,
             location = ?route_location,
             refresh_interval_ms = config.route_refresh_interval_ms,
             "enabled metadata-backed route snapshot"
@@ -631,6 +649,9 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         route_node_id: None,
         route_shard_count: None,
         route_region: None,
+        route_cell_id: None,
+        route_availability_zone: None,
+        route_capacity_class: None,
         route_location: None,
         route_refresh_interval_ms: None,
         route_proxy_timeout_ms: None,
@@ -661,6 +682,9 @@ struct ResolvedServeConfig {
     route_node_id: Option<String>,
     route_shard_count: i64,
     route_region: Option<String>,
+    route_cell_id: String,
+    route_availability_zone: Option<String>,
+    route_capacity_class: String,
     route_location: Option<String>,
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
@@ -914,6 +938,17 @@ impl ResolvedServeConfig {
                 .or(file.routing.shard_count)
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
             route_region: opts.route_region.or(file.routing.region),
+            route_cell_id: opts
+                .route_cell_id
+                .or(file.routing.cell_id)
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CELL_ID.to_string()),
+            route_availability_zone: opts
+                .route_availability_zone
+                .or(file.routing.availability_zone),
+            route_capacity_class: opts
+                .route_capacity_class
+                .or(file.routing.capacity_class)
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.to_string()),
             route_location: opts.route_location.or(file.routing.location),
             route_refresh_interval_ms: opts
                 .route_refresh_interval_ms
@@ -998,6 +1033,15 @@ impl ResolvedServeConfig {
                 .shard_count
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
             route_region: file.routing.region,
+            route_cell_id: file
+                .routing
+                .cell_id
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CELL_ID.to_string()),
+            route_availability_zone: file.routing.availability_zone,
+            route_capacity_class: file
+                .routing
+                .capacity_class
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.to_string()),
             route_location: file.routing.location,
             route_refresh_interval_ms: file.routing.refresh_interval_ms.unwrap_or(5_000),
             route_proxy_timeout_ms: file.routing.proxy_timeout_ms.unwrap_or(5_000),
@@ -1077,6 +1121,9 @@ struct RoutingFileConfig {
     node_id: Option<String>,
     shard_count: Option<i64>,
     region: Option<String>,
+    cell_id: Option<String>,
+    availability_zone: Option<String>,
+    capacity_class: Option<String>,
     location: Option<String>,
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
@@ -3156,6 +3203,9 @@ struct ClusterWorkerDeps {
     raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
     node_address: String,
     region: Option<String>,
+    cell_id: String,
+    availability_zone: Option<String>,
+    capacity_class: String,
     scheduler_status: agentdb_api::state::SchedulerStatus,
     drain: agentdb_api::state::DrainState,
 }
@@ -3169,6 +3219,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
         raft_registry,
         node_address,
         region,
+        cell_id,
+        availability_zone,
+        capacity_class,
         scheduler_status,
         drain,
     } = deps;
@@ -3176,6 +3229,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
+    let heartbeat_cell_id = cell_id.clone();
+    let heartbeat_availability_zone = availability_zone.clone();
+    let heartbeat_capacity_class = capacity_class.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -3192,6 +3248,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
                 &heartbeat_node_id,
                 &heartbeat_node_address,
                 heartbeat_region.as_deref(),
+                &heartbeat_cell_id,
+                heartbeat_availability_zone.as_deref(),
+                &heartbeat_capacity_class,
                 state,
                 now_ms,
             )
@@ -3332,18 +3391,23 @@ async fn heartbeat_node_once(
     node_id: &str,
     node_address: &str,
     region: Option<&str>,
+    cell_id: &str,
+    availability_zone: Option<&str>,
+    capacity_class: &str,
     state: &str,
     now_ms: i64,
 ) -> agentdb_meta::MetaResult<()> {
-    agentdb_meta::nodes::upsert(
+    agentdb_meta::nodes::upsert_with_cell(
         meta.pool(),
         node_id,
         node_address,
         None,
         state,
         now_ms,
-        None,
+        availability_zone,
         region,
+        cell_id,
+        capacity_class,
     )
     .await
 }
@@ -4998,6 +5062,9 @@ mod tests {
             route_node_id: None,
             route_shard_count: None,
             route_region: None,
+            route_cell_id: None,
+            route_availability_zone: None,
+            route_capacity_class: None,
             route_location: None,
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
@@ -5448,6 +5515,9 @@ region = "us-west-2"
             "node-a",
             "http://127.0.0.1:18080",
             Some("us-west-2"),
+            "cell-a",
+            Some("us-west-2a"),
+            "stable",
             "alive",
             1_000,
         )
@@ -5457,6 +5527,9 @@ region = "us-west-2"
         assert_eq!(node.address, "http://127.0.0.1:18080");
         assert_eq!(node.state, "alive");
         assert_eq!(node.region.as_deref(), Some("us-west-2"));
+        assert_eq!(node.cell_id, "cell-a");
+        assert_eq!(node.availability_zone.as_deref(), Some("us-west-2a"));
+        assert_eq!(node.capacity_class, "stable");
     }
 
     #[tokio::test]
@@ -7285,6 +7358,8 @@ region = "us-west-2"
             joined_at_ms: 0,
             availability_zone: None,
             region: None,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
         };
         let fresh = agentdb_meta::nodes::Node {
             last_heartbeat_ms: 9_500,
@@ -7306,6 +7381,8 @@ region = "us-west-2"
             joined_at_ms: 9_000,
             availability_zone: None,
             region: None,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
         };
 
         assert!(cluster_node_available(Some(&warming), 10_000, 5_000));

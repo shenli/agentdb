@@ -166,12 +166,22 @@ agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
 Register or remove nodes:
 
 ```bash
+agentdbctl cells upsert \
+  --cell-id prod-c001 \
+  --region us-west-2 \
+  --domain-class standard \
+  --deployment-profile multi_az_standard \
+  --capacity-class stable
+
 agentdbctl nodes register \
   --node-id node-a \
   --address http://10.0.0.10:7878 \
+  --cell-id prod-c001 \
   --region us-west-2 \
-  --availability-zone us-west-2a
+  --availability-zone us-west-2a \
+  --capacity-class stable
 
+agentdbctl cells list
 agentdbctl nodes delete node-a
 ```
 

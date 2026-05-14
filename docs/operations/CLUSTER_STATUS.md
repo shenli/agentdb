@@ -78,6 +78,7 @@ procedure.
 The repository now has cluster-facing visibility endpoints:
 
 - `GET /api/admin/scheduler`
+- `GET /api/admin/cells`
 - `GET /api/admin/drain`
 - `GET /api/admin/nodes`
 - `GET /api/admin/tablets`
@@ -91,6 +92,9 @@ The repository now has cluster-facing visibility endpoints:
 And a very small amount of direct metadata admin:
 
 - `agentdbctl drain start` for one-way local drain activation
+- `agentdbctl cells list` and `agentdbctl cells upsert ...` for logical
+  isolation-domain metadata, including domain class, deployment profile, and
+  capacity class
 - `agentdbctl nodes register ...` for explicit node registration/upsert
 - `agentdbctl nodes delete <node_id>` for operator cleanup of a stale node row
 - `agentdbctl nodes maintenance <node_id> alive|draining|maintenance` for node
@@ -194,6 +198,14 @@ when metadata-backed cluster mode is enabled:
   follow-on movement or oscillation
 - tombstoned-tablet replica cleanup so split/merge source Raft groups stop
   being reopened after cutover
+
+The current metadata-backed scheduler is cell-aware. Automatic assignment,
+replacement, and load-balancing only choose nodes in the tablet placement
+scope's cell. Cell deployment profiles influence replacement target choice:
+`single_az_cluster` keeps quorum voters on distinct nodes in the existing AZ
+when possible, while `multi_az_standard` and `enterprise` prefer a target in a
+new AZ when enough AZs are available. Paid-or-higher tenant policies are not
+automatically placed into economy or preemptible domains.
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.
