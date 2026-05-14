@@ -399,6 +399,8 @@ actually supported today.
 - [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
   bootstrap model
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current support boundary
+- [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md) - evaluation alert and triage
+  runbook
 - [../runbooks/node_draining.md](../runbooks/node_draining.md) - current drain
   error/runbook shape
 - [../runbooks/lease_lost.md](../runbooks/lease_lost.md) - lease-loss handling

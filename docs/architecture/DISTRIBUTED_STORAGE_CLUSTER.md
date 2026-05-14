@@ -1377,8 +1377,9 @@ Exit criteria:
   rolling upgrade per cell.
 - Use `agentdbctl cells` and `agentdbctl tenant-policies` for cell status and
   tenant placement inspection/updates.
-- Add alerts and runbooks for quorum loss, lagging replicas, stale routing,
-  movement backlog, metadata degradation, and object-store degradation.
+- Expand alert/runbook coverage beyond the initial cluster alert triage for
+  quorum loss, lagging replicas, stale routing, tablet-store pressure, and
+  checkpoint/snapshot failures.
 
 ### Phase 5: Tenant Migration
 
@@ -1417,8 +1418,8 @@ migration. The next work should focus on real-process lifecycle validation:
 4. Add an AZ-failure simulation for multi-AZ cells and document the expected
    single-AZ profile behavior.
 5. Add replacement-from-checkpoint coverage in the real-cluster smoke path.
-6. Add runbooks and alerts for quorum loss, lagging replicas, stale routing,
-   checkpoint failures, tablet-store compaction debt, and domain memory growth.
+6. Expand runbooks and alerts for movement backlog, metadata degradation,
+   object-store degradation, rolling upgrades, and two-cell blast-radius drills.
 
 This cut hardens the distributed cluster behavior around the Track A and Track
 B primitives already in place without introducing per-cell metadata databases or

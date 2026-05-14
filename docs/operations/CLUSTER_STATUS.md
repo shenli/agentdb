@@ -12,7 +12,7 @@ rebalance-driven membership convergence.
 
 That is still different from a supported, documented, user-facing cluster
 product. The remaining gap is operator hardening: failure-injection coverage,
-stable SLOs, alerting, documented runbooks, and storage lifecycle policy.
+stable SLOs, broader failure runbooks, and storage lifecycle policy.
 
 ## What Exists Today
 
@@ -74,6 +74,11 @@ For local real-process validation of the current Raft path, use
 [REAL_CLUSTER_SMOKE.md](REAL_CLUSTER_SMOKE.md). That smoke harness is a
 development validation tool; it is not a supported production bootstrap
 procedure.
+
+For evaluation alert triage, use [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md). It
+documents the first page-level signals for leaderless tablets, lagging
+replicas, stale routing, tablet-store pressure, and checkpoint/snapshot
+failures.
 
 The repository now has cluster-facing visibility endpoints:
 
@@ -278,7 +283,7 @@ The honest operational message today is:
 - **supported**: single-node AgentDB
 - **evaluation only**: clustered AgentDB with tablet Raft quorum enabled
 - **future work**: production-hardened multi-node AgentDB with published SLOs,
-  runbooks, alerts, and compatibility guarantees
+  broader runbooks, alerts, and compatibility guarantees
 
 Forward-looking target-state docs exist for that future work:
 
