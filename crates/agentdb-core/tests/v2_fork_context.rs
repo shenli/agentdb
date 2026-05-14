@@ -3,8 +3,12 @@ use agentdb_core::runtime::{
     AppendRequest, ContextInclude, ContextRequest, ForkSessionRequest, Runtime, SearchRequest,
     WatchRequest, WatchScope,
 };
-use agentdb_core::{NewAgent, NewSession, NewTenant};
-use std::sync::Arc;
+use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
+use agentdb_storage::{
+    InMemoryContentBackend, InMemoryKvStore, PrefixScopedTabletStore, ReplicatedLog,
+    SingleNodeReplicatedLog,
+};
+use std::{collections::BTreeMap, sync::Arc};
 
 async fn seed() -> (
     Arc<Runtime>,
@@ -220,4 +224,78 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
         .unwrap();
     assert_eq!(after_first.len(), 1);
     assert_eq!(after_first[0].event.kind, "second");
+}
+
+#[tokio::test]
+async fn watch_cursor_includes_tablet_context_and_applied_index() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let lifecycle = Arc::new(PrefixScopedTabletStore::new(kv.clone()));
+    let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
+        Arc::new(InMemoryKvStore::new()),
+    ));
+    let rt = Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+        lifecycle,
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]),
+    );
+
+    let (tenant, agent, session) = rt
+        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async {
+            let tenant = rt
+                .create_tenant(NewTenant {
+                    external_key: "tablet-watch".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let agent = rt
+                .create_agent(NewAgent {
+                    tenant_id: tenant.tenant_id.clone(),
+                    alias: Some("watcher".into()),
+                    config: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let session = rt
+                .create_session(NewSession {
+                    tenant_id: tenant.tenant_id.clone(),
+                    agent_id: agent.agent_id.clone(),
+                    alias: Some("watch-session".into()),
+                })
+                .await
+                .unwrap();
+            rt.append(AppendRequest::simple(
+                &tenant,
+                &agent,
+                &session,
+                "observed",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+            (tenant, agent, session)
+        })
+        .await;
+
+    let items = rt
+        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async {
+            rt.watch(WatchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                scope: WatchScope::Session,
+                session_id: Some(session.session_id.clone()),
+                agent_id: Some(agent.agent_id.clone()),
+                from_cursor: None,
+                limit: 10,
+            })
+            .await
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].tablet_id, Some(RUNTIME_PRIMARY_TABLET_ID));
+    assert!(items[0].applied_index.unwrap_or_default() > 0);
+    assert!(items[0].cursor.starts_with("v2:"));
+    assert!(items[0].cursor.contains("tablet=1"));
+    assert!(items[0].cursor.contains("applied="));
 }

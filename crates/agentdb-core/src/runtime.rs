@@ -512,7 +512,20 @@ pub struct WatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangefeedItem {
     pub cursor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_index: Option<u64>,
     pub event: EventEnvelope,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChangefeedCursorContext {
+    tablet_id: Option<i64>,
+    tablet_epoch: Option<i64>,
+    applied_index: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -1196,6 +1209,13 @@ impl RuntimeTabletRouterKvStore {
         let mut manifest = self.store_lifecycle.checkpoint_tablet(tablet_id, out_dir)?;
         manifest.latest_applied_index = applied_index;
         Ok(manifest)
+    }
+
+    fn applied_index(&self, tablet_id: i64) -> agentdb_storage::Result<u64> {
+        self.with_handle(tablet_id, |handle| {
+            handle.state_machine.apply_committed()?;
+            Ok(handle.state_machine.applied_index())
+        })
     }
 
     fn apply_committed(&self) -> agentdb_storage::Result<usize> {
@@ -2178,6 +2198,21 @@ impl Runtime {
         router
             .checkpoint_tablet_store(tablet_id, out_dir)
             .map_err(internal)
+    }
+
+    fn changefeed_cursor_context(&self) -> Result<ChangefeedCursorContext> {
+        let tablet_id = RuntimeTabletRouterKvStore::current_tablet_id();
+        let applied_index = match (self.tablet_router.as_ref(), tablet_id) {
+            (Some(router), Some(tablet_id)) => {
+                Some(router.applied_index(tablet_id).map_err(internal)?)
+            }
+            _ => None,
+        };
+        Ok(ChangefeedCursorContext {
+            tablet_id,
+            tablet_epoch: None,
+            applied_index,
+        })
     }
 
     pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {
@@ -5902,8 +5937,9 @@ impl Runtime {
         });
 
         let mut out = Vec::new();
+        let cursor_context = self.changefeed_cursor_context()?;
         for event in events {
-            let cursor = event_cursor(&event);
+            let cursor = event_cursor(&event, cursor_context);
             if req
                 .from_cursor
                 .as_ref()
@@ -5911,7 +5947,13 @@ impl Runtime {
             {
                 continue;
             }
-            out.push(ChangefeedItem { cursor, event });
+            out.push(ChangefeedItem {
+                cursor,
+                tablet_id: cursor_context.tablet_id,
+                tablet_epoch: cursor_context.tablet_epoch,
+                applied_index: cursor_context.applied_index,
+                event,
+            });
             if out.len() >= req.limit {
                 break;
             }
@@ -7189,10 +7231,19 @@ fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) ->
     true
 }
 
-fn event_cursor(event: &EventEnvelope) -> String {
+fn event_cursor(event: &EventEnvelope, context: ChangefeedCursorContext) -> String {
+    let tablet = context
+        .tablet_id
+        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
+    let epoch = context
+        .tablet_epoch
+        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
+    let applied = context
+        .applied_index
+        .map_or_else(|| "none".to_string(), |index| index.to_string());
     format!(
-        "{:020}:{}:{:020}",
-        event.created_at_ms, event.session_id, event.seq
+        "v2:{:020}:{}:{:020}:tablet={}:epoch={}:applied={}",
+        event.created_at_ms, event.session_id, event.seq, tablet, epoch, applied
     )
 }
 

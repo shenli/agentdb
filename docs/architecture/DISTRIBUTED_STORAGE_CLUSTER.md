@@ -1281,6 +1281,13 @@ changefeed, compaction, and split/merge lifecycle.
      applied index
    - restore can include or rebuild tablet-local changefeed state
    - split/merge/migration publish cutover epochs without duplicate events
+
+   Current implementation status: routed watch requests run inside the tablet
+   context and emitted changefeed items include `tablet_id` and
+   `applied_index` when the node can resolve them. Cursor strings are versioned
+   and include tablet/applied-index provenance. Cell, placement-scope, and
+   tablet-epoch fields remain reserved until routing and tablet metadata expose
+   stable values at the runtime boundary.
 6. Benchmark against the current prefix-scoped layout:
    - append p50/p95/p99/p999
    - write amplification estimate

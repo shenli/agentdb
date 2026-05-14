@@ -5213,6 +5213,7 @@ async fn build_context(
 
 async fn watch(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(tenant_id): Path<String>,
     Query(q): Query<WatchQuery>,
 ) -> Result<Json<Vec<ChangefeedItem>>, ApiError> {
@@ -5232,17 +5233,20 @@ async fn watch(
         .as_deref()
         .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
         .transpose()?;
-    let items = s
-        .runtime
-        .watch(WatchRequest {
-            tenant_id: tid,
-            scope,
-            session_id,
-            agent_id,
-            from_cursor: q.from_cursor,
-            limit: q.limit.clamp(1, 1000),
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime
+            .watch(WatchRequest {
+                tenant_id: tid,
+                scope,
+                session_id,
+                agent_id,
+                from_cursor: q.from_cursor,
+                limit: q.limit.clamp(1, 1000),
+            })
+            .await
+    })
+    .await?;
     Ok(Json(items))
 }
 
