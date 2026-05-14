@@ -227,6 +227,18 @@ impl KvSnapshot for TabletKvOwnedSnapshot {
 pub trait TabletStoreLifecycle: Send + Sync {
     fn layout_name(&self) -> &'static str;
     fn open_tablet_store(&self, tablet_id: i64) -> Result<TabletKvStore>;
+    fn restore_tablet_checkpoint(
+        &self,
+        tablet_id: i64,
+        checkpoint_dir: &Path,
+    ) -> Result<TabletStoreManifest> {
+        let _ = (tablet_id, checkpoint_dir);
+        Err(Error::Other(format!(
+            "{} tablet stores do not support checkpoint restore",
+            self.layout_name()
+        )))
+    }
+
     fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
         let store = self.open_tablet_store(tablet_id)?;
         store.checkpoint(out_dir)?;
@@ -384,6 +396,19 @@ impl GroupedRocksDbTabletStore {
         }
         Ok(kv)
     }
+
+    fn ensure_domain_not_open(&self, domain_id: i64) -> Result<()> {
+        let cache = self
+            .cache
+            .lock()
+            .expect("grouped rocksdb tablet store cache poisoned");
+        if cache.domains.contains_key(&domain_id) {
+            return Err(Error::Other(format!(
+                "cannot restore domain {domain_id}; RocksDB domain is already open"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
@@ -395,6 +420,48 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
         let domain_id = self.domain_id(tablet_id)?;
         let kv = self.open_domain(domain_id)?;
         TabletKvStore::new(kv, tablet_id)
+    }
+
+    fn restore_tablet_checkpoint(
+        &self,
+        tablet_id: i64,
+        checkpoint_dir: &Path,
+    ) -> Result<TabletStoreManifest> {
+        if self.tablets_per_domain != 1 {
+            return Err(Error::Other(
+                "tablet restore requires grouped_rocksdb tablets_per_domain=1".into(),
+            ));
+        }
+        if !checkpoint_dir.is_dir() {
+            return Err(Error::Other(format!(
+                "checkpoint directory {} does not exist",
+                checkpoint_dir.display()
+            )));
+        }
+        let domain_id = self.domain_id(tablet_id)?;
+        self.ensure_domain_not_open(domain_id)?;
+        let domain_path = self.domain_path(domain_id);
+        if domain_path.exists() {
+            let mut entries = fs::read_dir(&domain_path)?;
+            if entries.next().is_some() {
+                return Err(Error::Other(format!(
+                    "cannot restore tablet {tablet_id}; destination {} already exists",
+                    domain_path.display()
+                )));
+            }
+            fs::remove_dir_all(&domain_path)?;
+        }
+        copy_dir_all(checkpoint_dir, &domain_path)?;
+        let summary = checkpoint_summary(&domain_path)?;
+        Ok(TabletStoreManifest {
+            tablet_id,
+            layout: self.layout_name().into(),
+            engine: "rocksdb".into(),
+            storage_uri: domain_path.display().to_string(),
+            checksum_sha256: Some(summary.checksum_sha256),
+            size_bytes: Some(summary.size_bytes),
+            ..TabletStoreManifest::default_for(tablet_id)
+        })
     }
 
     fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
@@ -417,6 +484,22 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
             ..TabletStoreManifest::default_for(tablet_id)
         })
     }
+}
+
+fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_all(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -687,5 +770,52 @@ mod tests {
                 .as_deref(),
             Some(&b"a"[..])
         );
+    }
+
+    #[test]
+    fn grouped_rocksdb_restore_can_seed_single_tablet_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = GroupedRocksDbTabletStore::new(dir.path().join("source"), 1, 8);
+        let tablet = source.open_tablet_store(7).unwrap();
+        tablet.put(b"record/a", b"a").unwrap();
+        drop(tablet);
+
+        let checkpoint_dir = dir.path().join("checkpoint");
+        let checkpoint_manifest = source.checkpoint_tablet(7, &checkpoint_dir).unwrap();
+
+        let target = GroupedRocksDbTabletStore::new(dir.path().join("target"), 1, 8);
+        let restore_manifest = target
+            .restore_tablet_checkpoint(7, &checkpoint_dir)
+            .unwrap();
+        let restored = target.open_tablet_store(7).unwrap();
+
+        assert_eq!(restore_manifest.tablet_id, 7);
+        assert_eq!(restore_manifest.layout, "grouped_rocksdb");
+        assert_eq!(restore_manifest.engine, "rocksdb");
+        assert_eq!(restore_manifest.size_bytes, checkpoint_manifest.size_bytes);
+        assert_eq!(
+            restored.get(b"record/a").unwrap().as_deref(),
+            Some(&b"a"[..])
+        );
+    }
+
+    #[test]
+    fn grouped_rocksdb_restore_refuses_open_destination_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = GroupedRocksDbTabletStore::new(dir.path().join("source"), 1, 8);
+        let tablet = source.open_tablet_store(7).unwrap();
+        tablet.put(b"record/a", b"a").unwrap();
+        drop(tablet);
+        let checkpoint_dir = dir.path().join("checkpoint");
+        source.checkpoint_tablet(7, &checkpoint_dir).unwrap();
+
+        let target = GroupedRocksDbTabletStore::new(dir.path().join("target"), 1, 8);
+        let open_target = target.open_tablet_store(7).unwrap();
+        let err = target
+            .restore_tablet_checkpoint(7, &checkpoint_dir)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("already open"));
+        drop(open_target);
     }
 }

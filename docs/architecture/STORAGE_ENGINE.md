@@ -928,7 +928,10 @@ single-session appends or record writes.
    `domain_max_write_buffers`, `domain_parallelism`,
    `domain_max_background_jobs`, and `domain_max_open_files` so deployments can
    size the domain count against node memory, background thread, and
-   file-handle limits.
+   file-handle limits. The lifecycle can also checkpoint and restore a
+   single-tablet grouped RocksDB domain when `tablets_per_domain = 1`; restore
+   refuses open or non-empty destinations, leaving routing cutover and Raft-tail
+   verification to the control plane.
 
 4. Add replicated log abstraction.
 

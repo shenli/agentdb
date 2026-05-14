@@ -1266,6 +1266,13 @@ changefeed, compaction, and split/merge lifecycle.
    - restore into a new local domain
    - replay committed Raft tail
    - verify applied index before routing
+
+   Current implementation status: the storage lifecycle can checkpoint and
+   restore a single-tablet grouped RocksDB domain when
+   `tablets_per_domain = 1`. Restore refuses to overwrite a non-empty
+   destination or a domain currently open in the node process. Raft-tail replay,
+   applied-index verification, and routing cutover remain higher-level control
+   plane work.
 5. Preserve changefeed semantics:
    - changefeed cursor includes cell, placement scope, tablet, epoch, and
      applied index
