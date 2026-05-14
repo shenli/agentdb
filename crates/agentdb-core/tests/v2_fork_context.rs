@@ -1,7 +1,7 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
-    AppendRequest, ContextInclude, ContextRequest, ForkSessionRequest, Runtime, SearchRequest,
-    WatchRequest, WatchScope,
+    AppendRequest, ContextInclude, ContextRequest, ForkSessionRequest, Runtime,
+    RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
@@ -277,8 +277,14 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
         })
         .await;
 
+    let route_context = RuntimeRouteContext {
+        tablet_id: Some(RUNTIME_PRIMARY_TABLET_ID),
+        cell_id: Some("cell-a".into()),
+        placement_scope_id: Some("tenant/tablet-watch".into()),
+        tablet_epoch: Some(9),
+    };
     let items = rt
-        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async {
+        .with_route_context(route_context, async {
             rt.watch(WatchRequest {
                 tenant_id: tenant.tenant_id.clone(),
                 scope: WatchScope::Session,
@@ -293,9 +299,18 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
         .unwrap();
 
     assert_eq!(items.len(), 1);
+    assert_eq!(items[0].cell_id.as_deref(), Some("cell-a"));
+    assert_eq!(
+        items[0].placement_scope_id.as_deref(),
+        Some("tenant/tablet-watch")
+    );
     assert_eq!(items[0].tablet_id, Some(RUNTIME_PRIMARY_TABLET_ID));
+    assert_eq!(items[0].tablet_epoch, Some(9));
     assert!(items[0].applied_index.unwrap_or_default() > 0);
     assert!(items[0].cursor.starts_with("v2:"));
+    assert!(items[0].cursor.contains("cell=cell-a"));
+    assert!(items[0].cursor.contains("scope=tenant/tablet-watch"));
     assert!(items[0].cursor.contains("tablet=1"));
+    assert!(items[0].cursor.contains("epoch=9"));
     assert!(items[0].cursor.contains("applied="));
 }

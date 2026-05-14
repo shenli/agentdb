@@ -68,6 +68,15 @@ static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalescePro
 
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
+    static CURRENT_RUNTIME_ROUTE_CONTEXT: RuntimeRouteContext;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeRouteContext {
+    pub tablet_id: Option<i64>,
+    pub cell_id: Option<String>,
+    pub placement_scope_id: Option<String>,
+    pub tablet_epoch: Option<i64>,
 }
 
 #[derive(Default)]
@@ -513,6 +522,10 @@ pub struct WatchRequest {
 pub struct ChangefeedItem {
     pub cursor: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tablet_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tablet_epoch: Option<i64>,
@@ -521,8 +534,10 @@ pub struct ChangefeedItem {
     pub event: EventEnvelope,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ChangefeedCursorContext {
+    cell_id: Option<String>,
+    placement_scope_id: Option<String>,
     tablet_id: Option<i64>,
     tablet_epoch: Option<i64>,
     applied_index: Option<u64>,
@@ -2035,7 +2050,27 @@ impl Runtime {
     where
         F: Future<Output = T>,
     {
-        CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future).await
+        self.with_route_context(
+            RuntimeRouteContext {
+                tablet_id: Some(tablet_id),
+                ..RuntimeRouteContext::default()
+            },
+            future,
+        )
+        .await
+    }
+
+    pub async fn with_route_context<F, T>(&self, context: RuntimeRouteContext, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Some(tablet_id) = context.tablet_id {
+            CURRENT_RUNTIME_ROUTE_CONTEXT
+                .scope(context, CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future))
+                .await
+        } else {
+            CURRENT_RUNTIME_ROUTE_CONTEXT.scope(context, future).await
+        }
     }
 
     fn session_commit_lock(&self, session_id: &Id) -> Arc<Mutex<()>> {
@@ -2230,7 +2265,12 @@ impl Runtime {
     }
 
     fn changefeed_cursor_context(&self) -> Result<ChangefeedCursorContext> {
-        let tablet_id = RuntimeTabletRouterKvStore::current_tablet_id();
+        let route_context = CURRENT_RUNTIME_ROUTE_CONTEXT
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        let tablet_id = route_context
+            .tablet_id
+            .or_else(RuntimeTabletRouterKvStore::current_tablet_id);
         let applied_index = match (self.tablet_router.as_ref(), tablet_id) {
             (Some(router), Some(tablet_id)) => {
                 Some(router.applied_index(tablet_id).map_err(internal)?)
@@ -2238,8 +2278,10 @@ impl Runtime {
             _ => None,
         };
         Ok(ChangefeedCursorContext {
+            cell_id: route_context.cell_id,
+            placement_scope_id: route_context.placement_scope_id,
             tablet_id,
-            tablet_epoch: None,
+            tablet_epoch: route_context.tablet_epoch,
             applied_index,
         })
     }
@@ -5968,7 +6010,7 @@ impl Runtime {
         let mut out = Vec::new();
         let cursor_context = self.changefeed_cursor_context()?;
         for event in events {
-            let cursor = event_cursor(&event, cursor_context);
+            let cursor = event_cursor(&event, &cursor_context);
             if req
                 .from_cursor
                 .as_ref()
@@ -5978,6 +6020,8 @@ impl Runtime {
             }
             out.push(ChangefeedItem {
                 cursor,
+                cell_id: cursor_context.cell_id.clone(),
+                placement_scope_id: cursor_context.placement_scope_id.clone(),
                 tablet_id: cursor_context.tablet_id,
                 tablet_epoch: cursor_context.tablet_epoch,
                 applied_index: cursor_context.applied_index,
@@ -7260,7 +7304,9 @@ fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) ->
     true
 }
 
-fn event_cursor(event: &EventEnvelope, context: ChangefeedCursorContext) -> String {
+fn event_cursor(event: &EventEnvelope, context: &ChangefeedCursorContext) -> String {
+    let cell = context.cell_id.as_deref().unwrap_or("none");
+    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
     let tablet = context
         .tablet_id
         .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
@@ -7271,8 +7317,15 @@ fn event_cursor(event: &EventEnvelope, context: ChangefeedCursorContext) -> Stri
         .applied_index
         .map_or_else(|| "none".to_string(), |index| index.to_string());
     format!(
-        "v2:{:020}:{}:{:020}:tablet={}:epoch={}:applied={}",
-        event.created_at_ms, event.session_id, event.seq, tablet, epoch, applied
+        "v2:{:020}:{}:{:020}:cell={}:scope={}:tablet={}:epoch={}:applied={}",
+        event.created_at_ms,
+        event.session_id,
+        event.seq,
+        cell,
+        placement_scope,
+        tablet,
+        epoch,
+        applied
     )
 }
 

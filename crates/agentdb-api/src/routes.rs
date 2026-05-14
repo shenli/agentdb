@@ -55,8 +55,9 @@ use crate::internal_raft_http::{
     RaftRsHttpOutbox, TabletMovementSnapshotExportRequest, TabletMovementSnapshotExportResponse,
 };
 use crate::routing_http::{
-    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_FORWARDED_BY,
-    HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_ID,
+    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_CELL_ID, HDR_FORWARDED_BY,
+    HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID,
+    HDR_TABLET_EPOCH, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -5549,18 +5550,43 @@ async fn with_route_tablet_context<F, T>(
 where
     F: Future<Output = T>,
 {
-    if let Some(tablet_id) = route_tablet_id(headers) {
-        runtime.with_tablet_context(tablet_id, future).await
+    let context = route_context(headers);
+    if context.tablet_id.is_some()
+        || context.cell_id.is_some()
+        || context.placement_scope_id.is_some()
+        || context.tablet_epoch.is_some()
+    {
+        runtime.with_route_context(context, future).await
     } else {
         future.await
     }
 }
 
+fn route_context(headers: &HeaderMap) -> agentdb_core::runtime::RuntimeRouteContext {
+    agentdb_core::runtime::RuntimeRouteContext {
+        tablet_id: route_tablet_id(headers),
+        cell_id: route_string_header(headers, HDR_CELL_ID),
+        placement_scope_id: route_string_header(headers, HDR_PLACEMENT_SCOPE_ID),
+        tablet_epoch: route_i64_header(headers, HDR_TABLET_EPOCH),
+    }
+}
+
 fn route_tablet_id(headers: &HeaderMap) -> Option<i64> {
+    route_i64_header(headers, HDR_TABLET_ID)
+}
+
+fn route_i64_header(headers: &HeaderMap, name: &'static str) -> Option<i64> {
     headers
-        .get(HDR_TABLET_ID)
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn route_string_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 fn route_shard_id(headers: &HeaderMap) -> Option<i32> {

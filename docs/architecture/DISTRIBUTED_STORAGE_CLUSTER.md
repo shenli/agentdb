@@ -1,6 +1,7 @@
 # Distributed Storage Cluster Next Step
 
-Status: design proposal, Track A metadata/routing implementation started
+Status: Track A and bounded Track B implemented; online split/merge cutover
+hardening continues
 
 This document describes the next production-oriented step for AgentDB's
 distributed storage cluster. It combines the existing replicated tablet design
@@ -167,7 +168,9 @@ and tenant policy `cell_id`/`tier`/`priority` fields. Routing resolves tenant
 policy to cell and placement scope before tablet selection. Scheduler
 assignment, replacement, and load balancing select only same-cell nodes and use
 cell deployment profile plus tenant tier/capacity policy when choosing targets.
-Tablet-local physical LSM layout work remains Track B.
+Track B now provides bounded grouped RocksDB tablet-store domains, tablet
+checkpoint/restore hooks, domain metrics, benchmark coverage, and manual
+compaction operations.
 
 An isolation domain should also declare a capacity and SLO profile:
 
@@ -1279,8 +1282,8 @@ changefeed, compaction, and split/merge lifecycle.
    paths, sizes, and checksums. `agentdbctl restore install-tablet-checkpoint`
    provides an offline local install path for stopped nodes. Core tests cover
    opening a restored tablet store against a log with post-checkpoint entries
-   and replaying that tail before serving. Cluster-wide applied-index
-   verification and routing cutover remain higher-level control-plane work.
+   and replaying that tail before serving. Because there are no production users
+   to migrate, no prefix-to-grouped online migration path is required.
 5. Preserve changefeed semantics:
    - changefeed cursor includes cell, placement scope, tablet, epoch, and
      applied index
@@ -1288,11 +1291,11 @@ changefeed, compaction, and split/merge lifecycle.
    - split/merge/migration publish cutover epochs without duplicate events
 
    Current implementation status: routed watch requests run inside the tablet
-   context and emitted changefeed items include `tablet_id` and
-   `applied_index` when the node can resolve them. Cursor strings are versioned
-   and include tablet/applied-index provenance. Cell, placement-scope, and
-   tablet-epoch fields remain reserved until routing and tablet metadata expose
-   stable values at the runtime boundary.
+   context and emitted changefeed items include `cell_id`,
+   `placement_scope_id`, `tablet_id`, `tablet_epoch`, and `applied_index` when
+   the node can resolve them. Cursor strings are versioned and include the same
+   provenance. Split/merge publish cutover epochs remain higher-level lifecycle
+   work.
 6. Benchmark against the current prefix-scoped layout:
    - append p50/p95/p99/p999
    - write amplification estimate
@@ -1316,7 +1319,8 @@ changefeed, compaction, and split/merge lifecycle.
    before writes, after writes, and after checkpointing. The real-cluster smoke
    harness reports Raft catch-up request duration,
    attempted/sent/skipped counts, and convergence wait time after the catch-up
-   snapshot. Online routing cutover remains higher-level control-plane work.
+   snapshot. Online split/merge routing cutover hardening remains higher-level
+   control-plane work.
 
 Exit criteria:
 
@@ -1324,7 +1328,8 @@ Exit criteria:
 - Restored tablet can replay Raft tail and serve after verification.
 - Changefeed replay remains ordered and non-duplicating across restore.
 - Compaction and storage metrics are visible per tablet/domain.
-- The old prefix-scoped layout remains available until migration is proven.
+- New deployments can run grouped tablet-store domains directly; no
+  prefix-scoped migration path is required before production testing.
 
 ## Rollout Phases
 
@@ -1354,10 +1359,15 @@ Exit criteria:
 
 ### Phase 3: Tablet-Local Applied-State Isolation
 
-- Implement one tablet-local physical store strategy.
-- Benchmark against the current prefix-scoped layout.
-- Measure compaction isolation and restart/snapshot cost.
-- Keep the implementation swappable until metrics justify the default.
+- Use bounded grouped RocksDB tablet-store domains as the default cluster
+  physical layout.
+- Use `tablets_per_domain = 1` only for explicit high-isolation
+  backup/restore testing.
+- Benchmark grouped domains with `agentdb-bench tablet-store`, including
+  latency, checkpoint/restore time, resource usage, write-amplification
+  estimates, and RocksDB domain metrics.
+- Track online split/merge routing cutover hardening separately from initial
+  no-existing-user deployments.
 
 ### Phase 4: Operational Workflows
 
