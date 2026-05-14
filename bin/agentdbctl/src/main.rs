@@ -4,8 +4,9 @@
 //! small operator surface on top: concise commands, table output by default,
 //! JSON output for automation, and no requirement to hand-write curl payloads.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, path::PathBuf};
 
+use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, Method, StatusCode};
@@ -353,6 +354,19 @@ enum BackupCommand {
 enum RestoreCommand {
     /// Validate a backup manifest. Destructive restore apply is not exposed.
     Validate { manifest_path: String },
+    /// Offline: install one tablet checkpoint into a local single-tablet store root.
+    InstallTabletCheckpoint {
+        #[arg(long)]
+        tablet_id: i64,
+        #[arg(long)]
+        checkpoint_dir: PathBuf,
+        #[arg(long)]
+        tablet_store_root: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        tablets_per_domain: i64,
+        #[arg(long, default_value_t = 1)]
+        max_open_domains: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -487,6 +501,19 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 )
                 .await
             }
+            RestoreCommand::InstallTabletCheckpoint {
+                tablet_id,
+                checkpoint_dir,
+                tablet_store_root,
+                tablets_per_domain,
+                max_open_domains,
+            } => install_tablet_checkpoint(
+                tablet_id,
+                checkpoint_dir,
+                tablet_store_root,
+                tablets_per_domain,
+                max_open_domains,
+            ),
         },
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
@@ -552,6 +579,26 @@ async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
             .await
         }
     }
+}
+
+fn install_tablet_checkpoint(
+    tablet_id: i64,
+    checkpoint_dir: PathBuf,
+    tablet_store_root: PathBuf,
+    tablets_per_domain: i64,
+    max_open_domains: usize,
+) -> Result<Value> {
+    if tablets_per_domain != 1 {
+        return Err(anyhow!(
+            "offline tablet checkpoint install requires --tablets-per-domain 1"
+        ));
+    }
+    let lifecycle =
+        GroupedRocksDbTabletStore::new(tablet_store_root, tablets_per_domain, max_open_domains);
+    let manifest = lifecycle
+        .restore_tablet_checkpoint(tablet_id, &checkpoint_dir)
+        .map_err(|error| anyhow!("install tablet checkpoint: {error}"))?;
+    Ok(serde_json::to_value(manifest)?)
 }
 
 async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {

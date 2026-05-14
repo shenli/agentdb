@@ -181,6 +181,7 @@ dependencies = [
 name = "agentdbctl"
 version = "0.1.0"
 dependencies = [
+ "agentdb-storage",
  "anyhow",
  "clap",
  "reqwest",

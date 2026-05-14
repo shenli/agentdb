@@ -168,6 +168,10 @@ agentdbctl backup create --backup-id nightly-2026-05-05 --directory ./backups
 agentdbctl backup create --backup-id tablet-copy --directory ./backups --include-tablet-checkpoints
 agentdbctl backup create --backup-id metadata-only --skip-runtime-summary
 agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
+agentdbctl restore install-tablet-checkpoint \
+  --tablet-id 7 \
+  --checkpoint-dir ./backups/tablet-copy/tablet-stores/tablet-00000000000000000007 \
+  --tablet-store-root /var/lib/agentdb/tablet-stores
 ```
 
 `--include-tablet-checkpoints` checkpoints local physical tablet-store domains
@@ -176,6 +180,11 @@ with `tablets_per_domain = 1`; grouped domains with multiple tablets are
 intentionally rejected because a checkpoint would include unrelated tablet
 state. Restore validation recomputes checkpoint size and checksum from disk and
 rejects mismatches.
+
+`restore install-tablet-checkpoint` is an offline local filesystem operation,
+not an online cluster cutover. Stop the target node first. It restores only
+`grouped_rocksdb` with `--tablets-per-domain 1` and refuses non-empty target
+domains.
 
 Register or remove nodes:
 

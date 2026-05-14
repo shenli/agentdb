@@ -217,6 +217,10 @@ Current backup controls:
 - `agentdbctl restore validate <manifest-path>` validates a backup manifest and
   referenced metadata snapshot plus tablet checkpoint paths, sizes, and
   checksums.
+- `agentdbctl restore install-tablet-checkpoint --tablet-id <id>
+  --checkpoint-dir <path> --tablet-store-root <path>` installs a checkpoint into
+  a stopped node's local `grouped_rocksdb` tablet-store root. It supports only
+  `tablets_per_domain = 1` and refuses to overwrite non-empty tablet domains.
 
 Restore apply remains an offline operator procedure. The HTTP restore endpoint
 intentionally rejects destructive apply because live restore semantics require a
