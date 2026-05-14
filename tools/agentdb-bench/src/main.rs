@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agentdb_storage::{
+    GroupedRocksDbTabletStore, PrefixScopedTabletStore, RocksKvStore, TabletStoreLifecycle,
+};
 use anyhow::{anyhow, Context, Result};
 use bson::{doc, Bson, DateTime as BsonDateTime, Document};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,6 +49,8 @@ enum Commands {
     Prepare(PrepareArgs),
     /// Run a workload against a previously prepared dataset.
     Run(RunArgs),
+    /// Run a local tablet-store layout microbenchmark.
+    TabletStore(TabletStoreArgs),
     /// Aggregate repeated benchmark report JSON files.
     SummarizeRepeats(SummarizeRepeatsArgs),
 }
@@ -152,6 +157,46 @@ struct SummarizeRepeatsArgs {
     reports: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct TabletStoreArgs {
+    #[arg(long, value_enum, default_value_t = TabletStoreLayout::GroupedRocksDb)]
+    layout: TabletStoreLayout,
+    #[arg(long, default_value = DEFAULT_OUT_DIR)]
+    out: PathBuf,
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value_t = 8)]
+    tablets: i64,
+    #[arg(long, default_value_t = 10_000)]
+    ops: usize,
+    #[arg(long, default_value_t = 256)]
+    value_bytes: usize,
+    #[arg(long, default_value_t = 32)]
+    tablets_per_domain: i64,
+    #[arg(long, default_value_t = 16)]
+    max_open_domains: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long)]
+    checkpoint_tablet: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum TabletStoreLayout {
+    PrefixScoped,
+    GroupedRocksDb,
+}
+
+impl TabletStoreLayout {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefixScoped => "prefix_scoped",
+            Self::GroupedRocksDb => "grouped_rocksdb",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Profile {
     Smoke,
@@ -220,6 +265,26 @@ struct ArtifactStats {
     content_backend_bytes: u64,
     external_reference_artifacts: u64,
     external_reference_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TabletStoreBenchReport {
+    run_id: String,
+    layout: String,
+    tablets: i64,
+    ops: usize,
+    value_bytes: usize,
+    tablets_per_domain: i64,
+    max_open_domains: usize,
+    ops_per_sec: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+    checkpoint_tablet: Option<i64>,
+    checkpoint_ms: Option<f64>,
+    checkpoint_size_bytes: Option<u64>,
+    checkpoint_checksum_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,8 +488,99 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Prepare(args) => prepare(args).await,
         Commands::Run(args) => run(args).await,
+        Commands::TabletStore(args) => tablet_store_bench(args),
         Commands::SummarizeRepeats(args) => summarize_repeats(args),
     }
+}
+
+fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
+    if args.tablets <= 0 {
+        return Err(anyhow!("--tablets must be positive"));
+    }
+    if args.ops == 0 {
+        return Err(anyhow!("--ops must be positive"));
+    }
+    fs::create_dir_all(&args.out)?;
+    let run_id = args.run_id.unwrap_or_else(default_run_id);
+    let root = args.out.join(format!("tablet-store-{run_id}"));
+    if root.exists() {
+        return Err(anyhow!(
+            "tablet-store benchmark directory already exists: {}",
+            root.display()
+        ));
+    }
+    fs::create_dir_all(&root)?;
+
+    let lifecycle: Arc<dyn TabletStoreLifecycle> = match args.layout {
+        TabletStoreLayout::PrefixScoped => {
+            let kv = Arc::new(RocksKvStore::open(root.join("prefix-scoped"))?);
+            Arc::new(PrefixScopedTabletStore::new(kv))
+        }
+        TabletStoreLayout::GroupedRocksDb => Arc::new(GroupedRocksDbTabletStore::new(
+            root.join("grouped-rocksdb"),
+            args.tablets_per_domain,
+            args.max_open_domains,
+        )),
+    };
+
+    let mut rng = StdRng::seed_from_u64(args.seed);
+    let mut value = vec![0u8; args.value_bytes];
+    let started = Instant::now();
+    let mut latencies = Vec::with_capacity(args.ops);
+    for op in 0..args.ops {
+        rng.fill(value.as_mut_slice());
+        let tablet_id = (op as i64) % args.tablets;
+        let store = lifecycle.open_tablet_store(tablet_id)?;
+        let key = format!("bench/{op:020}").into_bytes();
+        let op_started = Instant::now();
+        store.put(&key, &value)?;
+        latencies.push(op_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    latencies.sort_unstable();
+
+    let checkpoint_tablet = args.checkpoint_tablet;
+    let (checkpoint_ms, checkpoint_size_bytes, checkpoint_checksum_sha256) =
+        if let Some(tablet_id) = checkpoint_tablet {
+            let checkpoint_dir = root.join(format!("checkpoint-tablet-{tablet_id:020}"));
+            let checkpoint_started = Instant::now();
+            let manifest = lifecycle.checkpoint_tablet(tablet_id, &checkpoint_dir)?;
+            (
+                Some(duration_ms(checkpoint_started.elapsed())),
+                manifest.size_bytes,
+                manifest.checksum_sha256,
+            )
+        } else {
+            (None, None, None)
+        };
+
+    let report = TabletStoreBenchReport {
+        run_id: run_id.clone(),
+        layout: args.layout.as_str().into(),
+        tablets: args.tablets,
+        ops: args.ops,
+        value_bytes: args.value_bytes,
+        tablets_per_domain: args.tablets_per_domain,
+        max_open_domains: args.max_open_domains,
+        ops_per_sec: args.ops as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        p50_ms: percentile_ms(&latencies, 0.50),
+        p95_ms: percentile_ms(&latencies, 0.95),
+        p99_ms: percentile_ms(&latencies, 0.99),
+        max_ms: latencies
+            .last()
+            .copied()
+            .map(duration_ms)
+            .unwrap_or_default(),
+        checkpoint_tablet,
+        checkpoint_ms,
+        checkpoint_size_bytes,
+        checkpoint_checksum_sha256,
+    };
+    let report_path = root.join("report.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    eprintln!("tablet-store benchmark report: {}", report_path.display());
+    Ok(())
 }
 
 async fn prepare(args: PrepareArgs) -> Result<()> {
@@ -3870,6 +4026,18 @@ fn percentile(samples: &[f64], q: f64) -> f64 {
     }
     let idx = ((samples.len() - 1) as f64 * q).round() as usize;
     samples[idx.min(samples.len() - 1)]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn percentile_ms(samples: &[Duration], q: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let idx = ((samples.len() - 1) as f64 * q).round() as usize;
+    duration_ms(samples[idx.min(samples.len() - 1)])
 }
 
 fn summarize_operations(samples: &[OperationSample]) -> Vec<OperationReport> {

@@ -1298,6 +1298,13 @@ changefeed, compaction, and split/merge lifecycle.
    - restore and catch-up time
    - open file and memory overhead
 
+   Current implementation status: `agentdb-bench tablet-store` provides a
+   local storage-layout microbenchmark for `prefix_scoped` and
+   `grouped_rocksdb`. It reports append throughput, p50/p95/p99/max latency,
+   and checkpoint duration/size/checksum when a single-tablet domain checkpoint
+   is requested. Write-amplification, compaction-debt, restore catch-up, and
+   open-file sampling still need host-level instrumentation.
+
 Exit criteria:
 
 - One tablet can be backed up and restored into a new tablet-local store.

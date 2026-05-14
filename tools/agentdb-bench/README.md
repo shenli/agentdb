@@ -9,6 +9,26 @@ dataset and run it against:
 - `mongodb-event-log`: MongoDB with normalized event-log collections.
 - `postgres-event-log`: Postgres with normalized event-log tables.
 
+It also has a local tablet-store microbenchmark for storage-layout work:
+
+```bash
+cargo run -q -p agentdb-bench -- tablet-store \
+  --layout grouped-rocks-db \
+  --tablets 64 \
+  --ops 100000 \
+  --tablets-per-domain 32 \
+  --max-open-domains 16
+
+cargo run -q -p agentdb-bench -- tablet-store \
+  --layout grouped-rocks-db \
+  --tablets-per-domain 1 \
+  --checkpoint-tablet 0
+```
+
+The tablet-store report includes append latency percentiles, throughput,
+checkpoint duration, checkpoint size, and checkpoint checksum when checkpointing
+is enabled. Use `--layout prefix-scoped` for the current shared-LSM baseline.
+
 The benchmark is meant for engineering decisions. Treat the numbers below as
 internal single-node, cache-warm, localhost microbenchmarks, not external
 product claims.
