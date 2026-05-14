@@ -1277,9 +1277,10 @@ changefeed, compaction, and split/merge lifecycle.
    tablet checkpoint manifests in an online backup when the node uses this
    single-tablet-domain layout. Restore validation checks referenced checkpoint
    paths, sizes, and checksums. `agentdbctl restore install-tablet-checkpoint`
-   provides an offline local install path for stopped nodes. Raft-tail replay,
-   applied-index verification, and routing cutover remain higher-level
-   control-plane work.
+   provides an offline local install path for stopped nodes. Core tests cover
+   opening a restored tablet store against a log with post-checkpoint entries
+   and replaying that tail before serving. Cluster-wide applied-index
+   verification and routing cutover remain higher-level control-plane work.
 5. Preserve changefeed semantics:
    - changefeed cursor includes cell, placement scope, tablet, epoch, and
      applied index
