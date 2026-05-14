@@ -15,6 +15,9 @@ The Terraform variables `tablet_store_tablets_per_domain` and
 `tablet_store_max_open_domains` make it easy to switch between the default
 grouped layout and high-isolation `tablets_per_domain = 1` backup/restore test
 mode without editing the generated `agentdb.toml`.
+After deployment, `agentdbctl status` reports the configured memtable budget,
+open tablet-store domain count, and pending compaction bytes so AWS experiments
+can verify domain sizing before increasing isolation.
 
 Runtime operations that do not provision cloud infrastructure belong under
 `ops/`.

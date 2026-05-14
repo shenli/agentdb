@@ -11,6 +11,23 @@ pub enum WriteOp {
     Delete { key: Vec<u8> },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KvStoreMetrics {
+    pub live_data_size_bytes: Option<u64>,
+    pub total_sst_file_size_bytes: Option<u64>,
+    pub active_memtable_bytes: Option<u64>,
+    pub all_memtables_bytes: Option<u64>,
+    pub immutable_memtables: Option<u64>,
+    pub level0_files: Option<u64>,
+    pub pending_compaction_bytes: Option<u64>,
+    pub compaction_pending: Option<bool>,
+    pub memtable_flush_pending: Option<bool>,
+    pub running_compactions: Option<u64>,
+    pub running_flushes: Option<u64>,
+    pub background_errors: Option<u64>,
+    pub estimated_keys: Option<u64>,
+}
+
 /// Iterator yielded by `scan_prefix`.
 ///
 /// Items are owned `(key, value)` pairs so callers do not have to
@@ -88,6 +105,23 @@ pub trait KvStore: Send + Sync {
         Err(crate::error::Error::Other(
             "checkpoint not supported by this KvStore backend".into(),
         ))
+    }
+
+    /// Best-effort storage-engine metrics. Backends that do not expose native
+    /// properties return `Ok(None)`.
+    fn metrics(&self) -> Result<Option<KvStoreMetrics>> {
+        Ok(None)
+    }
+
+    /// Best-effort manual compaction hook. Backends without a native compaction
+    /// primitive may treat it as a no-op.
+    fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        let _ = (start, end);
+        Ok(())
+    }
+
+    fn compact_all(&self) -> Result<()> {
+        self.compact_range(None, None)
     }
 }
 

@@ -276,6 +276,9 @@ struct TabletStoreBenchReport {
     value_bytes: usize,
     tablets_per_domain: i64,
     max_open_domains: usize,
+    logical_write_bytes: u64,
+    physical_bytes_estimate_after_writes: Option<u64>,
+    write_amplification_estimate_after_writes: Option<f64>,
     ops_per_sec: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -292,6 +295,8 @@ struct TabletStoreBenchReport {
     resource_before: ProcessResourceSample,
     resource_after_writes: ProcessResourceSample,
     resource_after_checkpoint: ProcessResourceSample,
+    domain_metrics_after_writes: Vec<agentdb_storage::TabletStoreDomainMetrics>,
+    domain_metrics_after_checkpoint: Vec<agentdb_storage::TabletStoreDomainMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -541,11 +546,13 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
     let mut value = vec![0u8; args.value_bytes];
     let started = Instant::now();
     let mut latencies = Vec::with_capacity(args.ops);
+    let mut logical_write_bytes = 0u64;
     for op in 0..args.ops {
         rng.fill(value.as_mut_slice());
         let tablet_id = (op as i64) % args.tablets;
         let store = lifecycle.open_tablet_store(tablet_id)?;
         let key = format!("bench/{op:020}").into_bytes();
+        logical_write_bytes = logical_write_bytes.saturating_add((key.len() + value.len()) as u64);
         let op_started = Instant::now();
         store.put(&key, &value)?;
         latencies.push(op_started.elapsed());
@@ -553,6 +560,11 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
     let elapsed = started.elapsed();
     latencies.sort_unstable();
     let resource_after_writes = process_resource_sample();
+    let domain_metrics_after_writes = lifecycle.domain_metrics()?;
+    let physical_bytes_estimate_after_writes =
+        physical_bytes_estimate(&domain_metrics_after_writes);
+    let write_amplification_estimate_after_writes =
+        write_amplification_estimate(physical_bytes_estimate_after_writes, logical_write_bytes);
 
     let checkpoint_tablet = args.checkpoint_tablet;
     let (
@@ -599,6 +611,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         (None, None, None, None, None, None)
     };
     let resource_after_checkpoint = process_resource_sample();
+    let domain_metrics_after_checkpoint = lifecycle.domain_metrics()?;
 
     let report = TabletStoreBenchReport {
         run_id: run_id.clone(),
@@ -608,6 +621,9 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         value_bytes: args.value_bytes,
         tablets_per_domain: args.tablets_per_domain,
         max_open_domains: args.max_open_domains,
+        logical_write_bytes,
+        physical_bytes_estimate_after_writes,
+        write_amplification_estimate_after_writes,
         ops_per_sec: args.ops as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
         p50_ms: percentile_ms(&latencies, 0.50),
         p95_ms: percentile_ms(&latencies, 0.95),
@@ -628,6 +644,8 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         resource_before,
         resource_after_writes,
         resource_after_checkpoint,
+        domain_metrics_after_writes,
+        domain_metrics_after_checkpoint,
     };
     let report_path = root.join("report.json");
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -4112,6 +4130,32 @@ fn linux_self_rss_bytes() -> Option<u64> {
             _ => value.checked_mul(1024),
         }
     })
+}
+
+fn physical_bytes_estimate(domains: &[agentdb_storage::TabletStoreDomainMetrics]) -> Option<u64> {
+    let mut saw_value = false;
+    let mut total = 0u64;
+    for domain in domains {
+        if let Some(value) = domain.metrics.total_sst_file_size_bytes {
+            saw_value = true;
+            total = total.saturating_add(value);
+        }
+        if let Some(value) = domain.metrics.all_memtables_bytes {
+            saw_value = true;
+            total = total.saturating_add(value);
+        }
+    }
+    saw_value.then_some(total)
+}
+
+fn write_amplification_estimate(
+    physical_bytes: Option<u64>,
+    logical_write_bytes: u64,
+) -> Option<f64> {
+    if logical_write_bytes == 0 {
+        return None;
+    }
+    physical_bytes.map(|physical| physical as f64 / logical_write_bytes as f64)
 }
 
 fn percentile_ms(samples: &[Duration], q: f64) -> f64 {

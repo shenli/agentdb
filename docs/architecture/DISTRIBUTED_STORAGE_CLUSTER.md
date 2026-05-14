@@ -1304,12 +1304,15 @@ changefeed, compaction, and split/merge lifecycle.
    Current implementation status: `agentdb-bench tablet-store` provides a
    local storage-layout microbenchmark for `prefix_scoped` and
    `grouped_rocksdb`. It reports append throughput, p50/p95/p99/p999/max latency,
-   and checkpoint duration/size/checksum when a single-tablet domain checkpoint
-   is requested. For single-tablet grouped domains it also times offline local
-   restore into a fresh store root. On Linux it samples process open file
-   descriptors and resident memory before writes, after writes, and after
-   checkpointing. Write-amplification, compaction-debt, and full Raft catch-up
-   timing still need host-level instrumentation.
+   logical write bytes, a physical-byte/write-amplification estimate, RocksDB
+   domain metrics, and checkpoint duration/size/checksum when a single-tablet
+   domain checkpoint is requested. For single-tablet grouped domains it also
+   times offline local restore into a fresh store root. Admin scheduler status
+   exposes open tablet-store domain metrics, including memtable bytes, level-0
+   files, pending compaction bytes, running compactions/flushes, and background
+   errors. On Linux the benchmark samples process open file descriptors and
+   resident memory before writes, after writes, and after checkpointing. Full
+   Raft catch-up timing remains higher-level control-plane instrumentation.
 
 Exit criteria:
 

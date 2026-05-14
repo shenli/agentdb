@@ -102,6 +102,16 @@ impl TabletKvStore {
         })))
     }
 
+    pub fn compact_all(&self) -> Result<()> {
+        match &self.scope {
+            TabletKvScope::Physical => self.kv.compact_all(),
+            TabletKvScope::SharedPrefix(prefix) => {
+                let end = prefix_successor(prefix);
+                self.kv.compact_range(Some(prefix), end.as_deref())
+            }
+        }
+    }
+
     fn key(&self, key: &[u8]) -> Vec<u8> {
         scoped_key(&self.scope, key)
     }
@@ -161,6 +171,21 @@ impl KvStore for TabletKvStore {
                 "tablet-scoped checkpoint requires a physical tablet store".into(),
             )),
         }
+    }
+
+    fn metrics(&self) -> Result<Option<crate::KvStoreMetrics>> {
+        self.kv.metrics()
+    }
+
+    fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        let scoped_start = start.map(|key| self.key(key));
+        let scoped_end = end.map(|key| self.key(key));
+        self.kv
+            .compact_range(scoped_start.as_deref(), scoped_end.as_deref())
+    }
+
+    fn compact_all(&self) -> Result<()> {
+        Self::compact_all(self)
     }
 }
 
@@ -227,6 +252,12 @@ impl KvSnapshot for TabletKvOwnedSnapshot {
 pub trait TabletStoreLifecycle: Send + Sync {
     fn layout_name(&self) -> &'static str;
     fn open_tablet_store(&self, tablet_id: i64) -> Result<TabletKvStore>;
+    fn domain_metrics(&self) -> Result<Vec<TabletStoreDomainMetrics>> {
+        Ok(Vec::new())
+    }
+    fn compact_tablet(&self, tablet_id: i64) -> Result<()> {
+        self.open_tablet_store(tablet_id)?.compact_all()
+    }
     fn restore_tablet_checkpoint(
         &self,
         tablet_id: i64,
@@ -274,6 +305,20 @@ impl TabletStoreLifecycle for PrefixScopedTabletStore {
         TabletKvStore::new(self.kv.clone(), tablet_id)
     }
 
+    fn domain_metrics(&self) -> Result<Vec<TabletStoreDomainMetrics>> {
+        let Some(metrics) = self.kv.metrics()? else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![TabletStoreDomainMetrics {
+            domain_id: 0,
+            tablet_start: None,
+            tablet_end: None,
+            path: None,
+            open: true,
+            metrics,
+        }])
+    }
+
     fn checkpoint_tablet(&self, tablet_id: i64, out_dir: &Path) -> Result<TabletStoreManifest> {
         let _ = (tablet_id, out_dir);
         Err(Error::Other(
@@ -297,7 +342,7 @@ struct GroupedRocksDbCache {
 }
 
 struct CachedRocksDbDomain {
-    kv: Arc<dyn KvStore + Send + Sync>,
+    kv: Arc<RocksKvStore>,
     last_used: u64,
 }
 
@@ -357,7 +402,7 @@ impl GroupedRocksDbTabletStore {
         self.root_dir.join(format!("domain-{domain_id:020}"))
     }
 
-    fn open_domain(&self, domain_id: i64) -> Result<Arc<dyn KvStore + Send + Sync>> {
+    fn open_domain(&self, domain_id: i64) -> Result<Arc<RocksKvStore>> {
         let mut cache = self
             .cache
             .lock()
@@ -371,7 +416,7 @@ impl GroupedRocksDbTabletStore {
 
         let domain_path = self.domain_path(domain_id);
         fs::create_dir_all(&domain_path)?;
-        let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open_with_config(
+        let kv = Arc::new(RocksKvStore::open_with_config(
             &domain_path,
             &self.rocks_config,
         )?);
@@ -420,6 +465,31 @@ impl TabletStoreLifecycle for GroupedRocksDbTabletStore {
         let domain_id = self.domain_id(tablet_id)?;
         let kv = self.open_domain(domain_id)?;
         TabletKvStore::new(kv, tablet_id)
+    }
+
+    fn domain_metrics(&self) -> Result<Vec<TabletStoreDomainMetrics>> {
+        let cache = self
+            .cache
+            .lock()
+            .expect("grouped rocksdb tablet store cache poisoned");
+        let mut metrics = Vec::with_capacity(cache.domains.len());
+        for (domain_id, domain) in &cache.domains {
+            let tablet_start = domain_id.saturating_mul(self.tablets_per_domain);
+            metrics.push(TabletStoreDomainMetrics {
+                domain_id: *domain_id,
+                tablet_start: Some(tablet_start),
+                tablet_end: Some(
+                    tablet_start
+                        .saturating_add(self.tablets_per_domain)
+                        .saturating_sub(1),
+                ),
+                path: Some(self.domain_path(*domain_id)),
+                open: true,
+                metrics: domain.kv.metrics()?.unwrap_or_default(),
+            });
+        }
+        metrics.sort_by_key(|metric| metric.domain_id);
+        Ok(metrics)
     }
 
     fn restore_tablet_checkpoint(
@@ -515,6 +585,16 @@ pub struct TabletStoreManifest {
     pub storage_uri: String,
     pub checksum_sha256: Option<String>,
     pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TabletStoreDomainMetrics {
+    pub domain_id: i64,
+    pub tablet_start: Option<i64>,
+    pub tablet_end: Option<i64>,
+    pub path: Option<PathBuf>,
+    pub open: bool,
+    pub metrics: crate::KvStoreMetrics,
 }
 
 impl TabletStoreManifest {
@@ -623,6 +703,18 @@ fn unscoped_key(scope: &TabletKvScope, key: Vec<u8>) -> Vec<u8> {
             .map_or_else(|| key.clone(), |suffix| suffix.to_vec()),
         TabletKvScope::Physical => key,
     }
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != u8::MAX {
+            end[idx] = end[idx].saturating_add(1);
+            end.truncate(idx + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn tablet_prefix(tablet_id: i64) -> Vec<u8> {
@@ -741,6 +833,32 @@ mod tests {
             lifecycle.domain_path(domain_a),
             lifecycle.domain_path(domain_b)
         );
+    }
+
+    #[test]
+    fn grouped_rocksdb_reports_domain_metrics_and_compacts_tablet() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle = GroupedRocksDbTabletStore::new(dir.path(), 1, 8);
+        let tablet = lifecycle.open_tablet_store(7).unwrap();
+        for idx in 0..16 {
+            tablet
+                .put(
+                    format!("record/{idx:02}").as_bytes(),
+                    b"payload-for-domain-metrics",
+                )
+                .unwrap();
+        }
+        drop(tablet);
+
+        let metrics = lifecycle.domain_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].domain_id, 7);
+        assert_eq!(metrics[0].tablet_start, Some(7));
+        assert_eq!(metrics[0].tablet_end, Some(7));
+        assert!(metrics[0].open);
+        assert!(metrics[0].metrics.all_memtables_bytes.is_some());
+
+        lifecycle.compact_tablet(7).unwrap();
     }
 
     #[test]

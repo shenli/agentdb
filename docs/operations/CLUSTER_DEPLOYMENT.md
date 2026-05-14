@@ -128,6 +128,13 @@ max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers
 The default above is about 512 MiB before RocksDB overheads. Increase it only
 with matching instance memory and file descriptor limits.
 
+After startup, use `agentdbctl status` or `GET /api/admin/scheduler` to inspect
+open tablet-store domains. The status includes open domain count, memtable
+bytes, level-0 file count, pending compaction bytes, running
+compactions/flushes, and background errors. On AWS, check these values before
+raising `max_open_domains` or lowering `tablets_per_domain`; per-tablet domains
+can multiply reserved memtable memory quickly.
+
 The AWS Terraform demo exposes these knobs as variables:
 `tablet_store_tablets_per_domain`, `tablet_store_max_open_domains`,
 `tablet_store_domain_write_buffer_size_mib`,

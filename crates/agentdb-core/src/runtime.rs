@@ -1197,6 +1197,16 @@ impl RuntimeTabletRouterKvStore {
         Ok(stats)
     }
 
+    fn domain_metrics(
+        &self,
+    ) -> agentdb_storage::Result<Vec<agentdb_storage::TabletStoreDomainMetrics>> {
+        self.store_lifecycle.domain_metrics()
+    }
+
+    fn compact_tablet_store(&self, tablet_id: i64) -> agentdb_storage::Result<()> {
+        self.store_lifecycle.compact_tablet(tablet_id)
+    }
+
     fn checkpoint_tablet_store(
         &self,
         tablet_id: i64,
@@ -2182,6 +2192,25 @@ impl Runtime {
             return Ok(Vec::new());
         };
         router.storage_stats().map_err(internal)
+    }
+
+    pub fn local_tablet_store_domain_metrics(
+        &self,
+    ) -> Result<Vec<agentdb_storage::TabletStoreDomainMetrics>> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(Vec::new());
+        };
+        router.domain_metrics().map_err(internal)
+    }
+
+    pub fn compact_tablet_store(&self, tablet_id: i64) -> Result<()> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "tablet-store compaction requires a replicated tablet router",
+            ));
+        };
+        router.compact_tablet_store(tablet_id).map_err(internal)
     }
 
     pub fn checkpoint_tablet_store(

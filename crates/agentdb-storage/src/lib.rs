@@ -29,7 +29,7 @@ pub use kms::{
     AllowAllKmsKeyResolver, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KmsResult,
     StaticKeyState, StaticKmsKeyResolver,
 };
-pub use kv::{InMemoryKvStore, KvIter, KvSnapshot, KvStore, WriteOp};
+pub use kv::{InMemoryKvStore, KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
 };
@@ -46,5 +46,6 @@ pub use rocks::{RocksKvStore, RocksKvStoreConfig};
 pub use slate::SlateKvStore;
 pub use tablet_store::{
     summarize_checkpoint_dir, GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore,
-    TabletStoreCheckpointSummary, TabletStoreLifecycle, TabletStoreManifest,
+    TabletStoreCheckpointSummary, TabletStoreDomainMetrics, TabletStoreLifecycle,
+    TabletStoreManifest,
 };

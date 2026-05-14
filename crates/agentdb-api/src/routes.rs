@@ -1362,6 +1362,13 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
             local_tablet_log_compaction_last_tick_at_ms: 0,
             last_tick_at_ms: 0,
         });
+    let mut tablet_store = s.tablet_store.clone();
+    if let Some(status) = tablet_store.as_mut() {
+        status.domains = s
+            .runtime
+            .local_tablet_store_domain_metrics()
+            .unwrap_or_default();
+    }
     Json(SchedulerStatusResponse {
         leader_node_id: snapshot.leader_node_id,
         leader_epoch: snapshot.leader_epoch,
@@ -1375,7 +1382,7 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         local_tablet_log_compaction_last_tick_at_ms: snapshot
             .local_tablet_log_compaction_last_tick_at_ms,
         last_tick_at_ms: snapshot.last_tick_at_ms,
-        tablet_store: s.tablet_store.clone(),
+        tablet_store,
     })
 }
 

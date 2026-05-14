@@ -185,7 +185,9 @@ when metadata-backed cluster mode is enabled:
 - local tablet-store layout and bounded-domain sizing through
   `GET /api/admin/scheduler` and `agentdbctl status`, including layout, root
   path, tablets per domain, max open domains, and the derived mutable memtable
-  budget
+  budget. For open RocksDB tablet-store domains the scheduler status also
+  includes memtable bytes, level-0 file count, pending compaction bytes, running
+  compactions/flushes, background errors, and estimated key count.
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,

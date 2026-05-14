@@ -2210,6 +2210,7 @@ fn tablet_store_status(config: &ResolvedServeConfig) -> agentdb_api::state::Tabl
         domain_parallelism: config.tablet_store_domain_parallelism,
         domain_max_background_jobs: config.tablet_store_domain_max_background_jobs,
         domain_max_open_files: config.tablet_store_domain_max_open_files,
+        domains: Vec::new(),
     }
 }
 

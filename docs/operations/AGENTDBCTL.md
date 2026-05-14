@@ -47,10 +47,11 @@ agentdbctl raft status
 ```
 
 `agentdbctl status` also prints the local tablet-store layout and sizing when
-the server exposes it, including the grouped-domain memtable budget. Use this
-after deploying AWS or Kubernetes nodes to confirm `grouped_rocksdb`,
-`tablets_per_domain`, and `max_open_domains` match the intended instance
-memory budget.
+the server exposes it, including open domain count, grouped-domain memtable
+budget, and total pending compaction bytes for open domains. Use this after
+deploying AWS or Kubernetes nodes to confirm `grouped_rocksdb`,
+`tablets_per_domain`, `max_open_domains`, and compaction pressure match the
+intended instance memory budget.
 
 Drain and undrain a node:
 

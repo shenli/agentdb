@@ -283,6 +283,7 @@ pub struct TabletStoreStatus {
     pub domain_parallelism: i32,
     pub domain_max_background_jobs: i32,
     pub domain_max_open_files: i32,
+    pub domains: Vec<agentdb_storage::TabletStoreDomainMetrics>,
 }
 
 #[derive(Clone)]

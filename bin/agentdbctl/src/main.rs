@@ -981,15 +981,23 @@ fn render_status(value: &Value) -> String {
     if let Some(tablet_store) = scheduler.get("tablet_store") {
         writeln!(
             out,
-            "tablet_store={} root={} tablets_per_domain={} max_open_domains={} memtable_budget_mib={} background_jobs_per_domain={}",
+            "tablet_store={} root={} tablets_per_domain={} max_open_domains={} open_domains={} memtable_budget_mib={} background_jobs_per_domain={} pending_compaction_bytes={}",
             text(&tablet_store["layout"]),
             text(&tablet_store["root_dir"]),
             text(&tablet_store["tablets_per_domain"]),
             text(&tablet_store["max_open_domains"]),
+            tablet_store
+                .get("domains")
+                .and_then(Value::as_array)
+                .map(|domains| domains.len().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             memtable_budget_mib(tablet_store)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            text(&tablet_store["domain_max_background_jobs"])
+            text(&tablet_store["domain_max_background_jobs"]),
+            pending_compaction_bytes(tablet_store)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         )
         .unwrap();
     }
@@ -1003,6 +1011,22 @@ fn memtable_budget_mib(tablet_store: &Value) -> Option<u64> {
             .as_u64()?
             .saturating_mul(tablet_store.get("domain_write_buffer_size_mib")?.as_u64()?)
             .saturating_mul(tablet_store.get("domain_max_write_buffers")?.as_u64()?),
+    )
+}
+
+fn pending_compaction_bytes(tablet_store: &Value) -> Option<u64> {
+    Some(
+        tablet_store
+            .get("domains")?
+            .as_array()?
+            .iter()
+            .filter_map(|domain| {
+                domain
+                    .get("metrics")?
+                    .get("pending_compaction_bytes")?
+                    .as_u64()
+            })
+            .sum(),
     )
 }
 
@@ -1189,7 +1213,16 @@ mod tests {
                     "max_open_domains": 16,
                     "domain_write_buffer_size_mib": 16,
                     "domain_max_write_buffers": 2,
-                    "domain_max_background_jobs": 1
+                    "domain_max_background_jobs": 1,
+                    "domains": [
+                        {
+                            "domain_id": 0,
+                            "open": true,
+                            "metrics": {
+                                "pending_compaction_bytes": 1234
+                            }
+                        }
+                    ]
                 }
             },
             "drain": { "is_draining": false }
@@ -1199,7 +1232,9 @@ mod tests {
         assert!(rendered.contains("ready=true"));
         assert!(rendered.contains("leader=node-a"));
         assert!(rendered.contains("tablet_store=grouped_rocksdb"));
+        assert!(rendered.contains("open_domains=1"));
         assert!(rendered.contains("memtable_budget_mib=512"));
+        assert!(rendered.contains("pending_compaction_bytes=1234"));
     }
 
     #[test]

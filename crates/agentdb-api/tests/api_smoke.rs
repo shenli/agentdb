@@ -18,7 +18,7 @@ use agentdb_api::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_SHARD_ID, HDR_TABLET_ID,
     },
-    state::{ProxyPolicy, RaftRsIngress},
+    state::{ProxyPolicy, RaftRsIngress, TabletStoreStatus},
     AppState,
 };
 use agentdb_core::{
@@ -3511,6 +3511,62 @@ async fn admin_scheduler_reports_status_snapshot() {
     assert_eq!(body["local_tablet_log_compaction_failures_total"], 1);
     assert_eq!(body["local_tablet_log_compaction_last_tick_at_ms"], 40_500);
     assert_eq!(body["last_tick_at_ms"], 41_000);
+}
+
+#[tokio::test]
+async fn admin_scheduler_reports_tablet_store_domain_metrics() {
+    let dir = TempDir::new().unwrap();
+    let lifecycle = Arc::new(GroupedRocksDbTabletStore::new(
+        dir.path().join("tablet-stores"),
+        1,
+        8,
+    ));
+    let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
+        Arc::new(InMemoryKvStore::new()),
+    ));
+    let runtime = Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+        lifecycle,
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]),
+    );
+    runtime
+        .create_tenant(NewTenant {
+            external_key: "tablet-store-status".into(),
+            policy: json!({}),
+        })
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_tablet_store_status(TabletStoreStatus {
+        layout: "grouped_rocksdb".into(),
+        root_dir: Some(dir.path().join("tablet-stores").display().to_string()),
+        tablets_per_domain: 1,
+        max_open_domains: 8,
+        domain_write_buffer_size_mib: 16,
+        domain_max_write_buffers: 2,
+        domain_parallelism: 1,
+        domain_max_background_jobs: 1,
+        domain_max_open_files: 128,
+        domains: Vec::new(),
+    });
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/scheduler", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let domains = body["tablet_store"]["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain_id"], RUNTIME_PRIMARY_TABLET_ID);
+    assert_eq!(domains[0]["open"], true);
+    assert!(domains[0]["metrics"]["all_memtables_bytes"].is_u64());
 }
 
 #[tokio::test]

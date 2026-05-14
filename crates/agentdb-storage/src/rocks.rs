@@ -7,7 +7,7 @@ use rocksdb::{
 };
 
 use crate::error::{Error, Result};
-use crate::kv::{KvIter, KvSnapshot, KvStore, WriteOp};
+use crate::kv::{KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
 
 /// Result type for KV operations.
 type KvResult = std::result::Result<(Vec<u8>, Vec<u8>), crate::error::Error>;
@@ -212,6 +212,49 @@ impl KvStore for RocksKvStore {
             .map_err(|e| Error::Other(format!("rocksdb create_checkpoint: {e}")))?;
         Ok(())
     }
+
+    fn metrics(&self) -> Result<Option<KvStoreMetrics>> {
+        Ok(Some(KvStoreMetrics {
+            live_data_size_bytes: rocks_property_u64(&self.db, "rocksdb.estimate-live-data-size")?,
+            total_sst_file_size_bytes: rocks_property_u64(
+                &self.db,
+                "rocksdb.total-sst-files-size",
+            )?,
+            active_memtable_bytes: rocks_property_u64(
+                &self.db,
+                "rocksdb.cur-size-active-mem-table",
+            )?,
+            all_memtables_bytes: rocks_property_u64(&self.db, "rocksdb.cur-size-all-mem-tables")?,
+            immutable_memtables: rocks_property_u64(&self.db, "rocksdb.num-immutable-mem-table")?,
+            level0_files: rocks_property_u64(&self.db, "rocksdb.num-files-at-level0")?,
+            pending_compaction_bytes: rocks_property_u64(
+                &self.db,
+                "rocksdb.estimate-pending-compaction-bytes",
+            )?,
+            compaction_pending: rocks_property_bool(&self.db, "rocksdb.compaction-pending")?,
+            memtable_flush_pending: rocks_property_bool(
+                &self.db,
+                "rocksdb.mem-table-flush-pending",
+            )?,
+            running_compactions: rocks_property_u64(&self.db, "rocksdb.num-running-compactions")?,
+            running_flushes: rocks_property_u64(&self.db, "rocksdb.num-running-flushes")?,
+            background_errors: rocks_property_u64(&self.db, "rocksdb.background-errors")?,
+            estimated_keys: rocks_property_u64(&self.db, "rocksdb.estimate-num-keys")?,
+        }))
+    }
+
+    fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        self.db.compact_range::<&[u8], &[u8]>(start, end);
+        Ok(())
+    }
+}
+
+fn rocks_property_u64(db: &DB, name: &str) -> Result<Option<u64>> {
+    db.property_int_value(name).map_err(Error::from)
+}
+
+fn rocks_property_bool(db: &DB, name: &str) -> Result<Option<bool>> {
+    Ok(rocks_property_u64(db, name)?.map(|value| value != 0))
 }
 
 fn env_flag_enabled(name: &str) -> bool {
