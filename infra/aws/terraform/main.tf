@@ -4,6 +4,17 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
+locals {
+  effective_subnet_ids = length(var.subnet_ids) > 0 ? var.subnet_ids : (
+    var.subnet_id == null ? [] : [var.subnet_id]
+  )
+}
+
+data "aws_subnet" "agentdb" {
+  count = length(local.effective_subnet_ids)
+  id    = local.effective_subnet_ids[count.index]
+}
+
 resource "aws_s3_bucket" "agentdb" {
   bucket = "${var.name}-${data.aws_caller_identity.current.account_id}"
 }
@@ -75,10 +86,17 @@ resource "aws_security_group" "agentdb" {
   }
 
   ingress {
-    from_port   = 7878
-    to_port     = 7878
+    from_port   = var.http_port
+    to_port     = var.http_port
     protocol    = "tcp"
     cidr_blocks = [var.ssh_cidr]
+  }
+
+  ingress {
+    from_port = var.http_port
+    to_port   = var.http_port
+    protocol  = "tcp"
+    self      = true
   }
 
   egress {
@@ -90,14 +108,24 @@ resource "aws_security_group" "agentdb" {
 }
 
 resource "aws_instance" "agentdb" {
+  count = var.node_count
+
   ami                    = var.ami_id
   instance_type          = var.instance_type
-  subnet_id              = var.subnet_id
+  subnet_id              = local.effective_subnet_ids[count.index % length(local.effective_subnet_ids)]
   vpc_security_group_ids = [aws_security_group.agentdb.id]
   iam_instance_profile   = aws_iam_instance_profile.agentdb.name
   key_name               = var.key_name
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+    deployment_mode                           = var.deployment_mode
+    node_id                                   = format("%s-%02d", var.node_id_prefix, count.index + 1)
+    http_port                                 = var.http_port
+    cell_id                                   = var.cell_id
+    availability_zone                         = data.aws_subnet.agentdb[count.index % length(local.effective_subnet_ids)].availability_zone
+    capacity_class                            = var.capacity_class
+    internal_auth_token                       = var.internal_auth_token
+    meta_url                                  = var.meta_url
     bucket                                    = aws_s3_bucket.agentdb.bucket
     region                                    = var.aws_region
     tablet_store_tablets_per_domain           = var.tablet_store_tablets_per_domain
@@ -109,6 +137,10 @@ resource "aws_instance" "agentdb" {
   })
 
   tags = {
-    Name = var.name
+    Name                  = format("%s-%02d", var.name, count.index + 1)
+    AgentDBCell           = var.cell_id
+    AgentDBNodeId         = format("%s-%02d", var.node_id_prefix, count.index + 1)
+    AgentDBCapacityClass  = var.capacity_class
+    AgentDBDeploymentMode = var.deployment_mode
   }
 }

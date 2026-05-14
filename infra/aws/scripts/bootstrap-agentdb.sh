@@ -12,7 +12,14 @@ SSH_TARGET="${SSH_USER}@${SERVER_HOST}"
 
 echo "==> copying config and helper files to ${SSH_TARGET}"
 ssh "${SSH_TARGET}" 'mkdir -p ~/agentdb-deploy/config ~/agentdb-deploy/logs'
-scp config/agentdb.toml "${SSH_TARGET}:~/agentdb-deploy/config/agentdb.toml"
+if ssh "${SSH_TARGET}" 'test -f ~/agentdb.toml'; then
+  ssh "${SSH_TARGET}" 'cp ~/agentdb.toml ~/agentdb-deploy/config/agentdb.toml'
+else
+  scp config/agentdb.toml "${SSH_TARGET}:~/agentdb-deploy/config/agentdb.toml"
+fi
+if ssh "${SSH_TARGET}" 'test -f ~/agentdb.env'; then
+  ssh "${SSH_TARGET}" 'cp ~/agentdb.env ~/agentdb-deploy/agentdb.env'
+fi
 
 echo "==> ensuring Rust build prerequisites exist on ${SSH_TARGET}"
 ssh "${SSH_TARGET}" <<'EOF'

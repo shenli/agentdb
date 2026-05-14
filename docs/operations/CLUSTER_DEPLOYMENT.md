@@ -147,6 +147,13 @@ with `tablet_store_tablets_per_domain = 1` and reduce
 `tablet_store_max_open_domains` to keep the memtable budget inside the instance
 memory envelope.
 
+The same Terraform demo can now emit cell/AZ-aware node configs for AWS cluster
+experiments. Set `node_count`, pass multiple `subnet_ids` across AZs, and set
+`deployment_mode = "cluster"`, `cell_id`, `capacity_class`,
+`internal_auth_token`, and a shared Postgres `meta_url`. The generated
+`agentdb.toml` binds to the EC2 private IP and writes routing labels so node
+heartbeats advertise a reachable private URL instead of `0.0.0.0`.
+
 ### 2. Shared Control Plane
 
 The cluster needs a shared metadata plane for:

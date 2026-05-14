@@ -16,7 +16,31 @@ variable "vpc_id" {
 
 variable "subnet_id" {
   type        = string
-  description = "Existing subnet id for the EC2 instance."
+  description = "Existing subnet id for the EC2 instance. Used when subnet_ids is empty."
+  default     = null
+}
+
+variable "subnet_ids" {
+  type        = list(string)
+  description = "Existing subnet ids for AgentDB nodes. Provide subnets in different AZs for multi-AZ cluster tests."
+  default     = []
+}
+
+variable "node_count" {
+  type        = number
+  description = "Number of AgentDB EC2 nodes to create."
+  default     = 1
+
+  validation {
+    condition     = var.node_count >= 1
+    error_message = "node_count must be at least 1."
+  }
+}
+
+variable "http_port" {
+  type        = number
+  description = "AgentDB HTTP port."
+  default     = 7878
 }
 
 variable "instance_type" {
@@ -38,6 +62,54 @@ variable "ssh_cidr" {
 variable "ami_id" {
   type        = string
   description = "AMI id for the EC2 instance."
+}
+
+variable "deployment_mode" {
+  type        = string
+  description = "AgentDB deployment mode written to agentdb.toml. Use cluster only with a shared metadata backend."
+  default     = "single_node"
+
+  validation {
+    condition     = contains(["single_node", "cluster"], var.deployment_mode)
+    error_message = "deployment_mode must be single_node or cluster."
+  }
+}
+
+variable "node_id_prefix" {
+  type        = string
+  description = "Prefix for generated AgentDB routing node ids."
+  default     = "node"
+}
+
+variable "cell_id" {
+  type        = string
+  description = "AgentDB cell id written to cluster routing config."
+  default     = "default"
+}
+
+variable "capacity_class" {
+  type        = string
+  description = "AgentDB capacity class for node placement: stable, mixed, or preemptible."
+  default     = "stable"
+
+  validation {
+    condition     = contains(["stable", "mixed", "preemptible"], var.capacity_class)
+    error_message = "capacity_class must be stable, mixed, or preemptible."
+  }
+}
+
+variable "internal_auth_token" {
+  type        = string
+  description = "Shared internal token for cluster-mode Raft and movement RPCs. Leave empty for single-node."
+  default     = ""
+  sensitive   = true
+}
+
+variable "meta_url" {
+  type        = string
+  description = "Postgres metadata URL for cluster mode. Leave empty for local SQLite/single-node."
+  default     = ""
+  sensitive   = true
 }
 
 variable "tablet_store_tablets_per_domain" {
