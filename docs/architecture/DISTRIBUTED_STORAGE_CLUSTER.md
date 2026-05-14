@@ -1410,7 +1410,8 @@ The remaining useful cut is no longer metadata migration or prefix-layout
 migration. The next work should focus on real-process lifecycle validation:
 
 1. Add a two-cell smoke topology with separate placement scopes and tablet
-   owners per cell.
+   owners per cell. This first needs a tenant bootstrap path that can create a
+   tenant directly in a non-default cell before normal tenant-id routing exists.
 2. Prove writes in cell B continue while cell A loses an owner, restarts a
    process, or runs an explicit replacement.
 3. Add split and merge under active writes with routed watch cursor assertions

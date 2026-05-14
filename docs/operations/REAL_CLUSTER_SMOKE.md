@@ -17,6 +17,11 @@ binaries, seeds a throwaway cluster topology, starts three local AgentDB server
 processes, runs the smoke checks, and keeps diagnostics under
 `/tmp/agentdb-cluster-smoke`.
 
+The seeded topology creates the default cell, one serving placement scope, one
+serving tablet, three Raft voters, and distinct local AZ labels
+(`local-a`, `local-b`, `local-c`). The harness verifies the cell and node
+placement labels through the admin APIs before running write checks.
+
 Useful options:
 
 ```bash
@@ -101,9 +106,10 @@ ops/smoke/scripts/real-cluster-smoke.sh
 
 The script builds `agentdb-server` and `agentdb-cluster-smoke`, clears cluster
 control-plane rows in the throwaway metadata database, seeds one serving tablet
-with three Raft voters, starts three server processes, waits for local Raft
-leaders, appends events through more than one API node, fetches the event log,
-and prints health, scheduler, and Raft summaries.
+with three Raft voters in one cell, labels the nodes across three local AZs,
+starts three server processes, waits for local Raft leaders, appends events
+through more than one API node, fetches the event log, and prints health,
+scheduler, tablet-store, and Raft summaries.
 
 To leave the servers running for manual inspection:
 
@@ -150,6 +156,16 @@ stability regressions: leader loss, follower loss/rejoin, restart recovery, and
 replica catch-up after missed writes. The smoke output prints the raft catch-up
 request duration, attempted/sent/skipped counts, and the convergence wait time
 after the catch-up snapshot so deployment runs can spot catch-up regressions.
+
+## Remaining Smoke Gap
+
+The harness does not yet run a true two-cell write test. Metadata can represent
+multiple cells, but tenant creation currently happens before a tenant-specific
+placement policy can route the new tenant to a non-default cell. A real
+two-cell smoke should first add an explicit tenant bootstrap path that can
+create the tenant in the target cell, then run independent sessions in cell A
+and cell B and prove a node loss in one cell does not break writes in the
+other.
 
 ## Generated Files
 
