@@ -317,6 +317,7 @@ parameter, for example `include=events,records,skills`, to filter object types:
       "kind": "model_call",
       "model": "gpt-...",
       "duration_ms": 123,
+      "tombstone": null,
       "data": {}
     }
   ],
@@ -324,6 +325,9 @@ parameter, for example `include=events,records,skills`, to filter object types:
   "high_watermark": "ledger:ten_..."
 }
 ```
+
+Delete envelopes use `op = "delete"` and include `tombstone.reason`.
+Current reasons are `soft_delete`, `retention_gc`, and `tenant_purge`.
 
 Use `agentdbctl export clickhouse ...` for the first-party ClickHouse path.
 `exports/backfill` supports event snapshots plus tenant-scope metadata

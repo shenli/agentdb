@@ -21,7 +21,7 @@
 //! Events are NOT preloaded; `scan_events` is invoked lazily by
 //! `Runtime::fetch_from_seq` and `append_and_fetch` on-demand.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -223,6 +223,55 @@ fn export_item_from_value(
         created_at_ms: deleted_at_ms.unwrap_or(created_at_ms),
         data,
         tombstone,
+    }
+}
+
+fn export_tombstone_item(
+    object_type: &str,
+    tenant_id: crate::Id,
+    agent_id: Option<crate::Id>,
+    session_id: Option<crate::Id>,
+    object_id: String,
+    deleted_at_ms: u64,
+    reason: &str,
+    data: serde_json::Value,
+) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "delete".into(),
+        object_type: object_type.into(),
+        tenant_id,
+        agent_id,
+        session_id,
+        object_id,
+        seq: None,
+        created_at_ms: deleted_at_ms,
+        data,
+        tombstone: Some(serde_json::json!({
+            "deleted_at_ms": deleted_at_ms,
+            "reason": reason
+        })),
+    }
+}
+
+fn export_tombstone_item_from_event(
+    event: &EventEnvelope,
+    deleted_at_ms: u64,
+    reason: &str,
+) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "delete".into(),
+        object_type: "event".into(),
+        tenant_id: event.tenant_id.clone(),
+        agent_id: Some(event.agent_id.clone()),
+        session_id: Some(event.session_id.clone()),
+        object_id: event.event_id.as_str().to_string(),
+        seq: Some(event.seq),
+        created_at_ms: deleted_at_ms,
+        data: serde_json::to_value(event).expect("event serializes"),
+        tombstone: Some(serde_json::json!({
+            "deleted_at_ms": deleted_at_ms,
+            "reason": reason
+        })),
     }
 }
 
@@ -858,7 +907,7 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    pub fn delete_tenant(&self, t: &Tenant) -> KvResult<()> {
+    pub fn purge_tenant(&self, t: &Tenant, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Delete {
             key: tenant_record_key(t.tenant_id.as_str()).into_bytes(),
@@ -868,6 +917,16 @@ impl Persist {
                 key: tenant_alias_key(&t.external_key).into_bytes(),
             });
         }
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "tenant",
+            t.tenant_id.clone(),
+            None,
+            None,
+            t.tenant_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(t).expect("tenant serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -898,7 +957,7 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    pub fn delete_agent(&self, a: &Agent) -> KvResult<()> {
+    pub fn purge_agent(&self, a: &Agent, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Delete {
             key: agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str()).into_bytes(),
@@ -910,6 +969,16 @@ impl Persist {
                 });
             }
         }
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "agent",
+            a.tenant_id.clone(),
+            Some(a.agent_id.clone()),
+            None,
+            a.agent_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(a).expect("agent serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -954,7 +1023,7 @@ impl Persist {
         Ok(ops)
     }
 
-    pub fn delete_artifact(&self, a: &Artifact) -> KvResult<()> {
+    pub fn purge_artifact(&self, a: &Artifact, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
         let ops: Vec<WriteOp> = vec![
             WriteOp::Delete {
                 key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
@@ -962,7 +1031,19 @@ impl Persist {
             WriteOp::Delete {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
             },
-        ];
+        ]
+        .into_iter()
+        .chain(self.export_ledger_item_put_ops(export_tombstone_item(
+            "artifact",
+            a.tenant_id.clone(),
+            None,
+            None,
+            a.artifact_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(a).expect("artifact serializes"),
+        ))?)
+        .collect();
         self.write_ops(ops)
     }
 
@@ -1005,7 +1086,7 @@ impl Persist {
         }])
     }
 
-    pub fn delete_session(&self, s: &Session) -> KvResult<()> {
+    pub fn purge_session(&self, s: &Session, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
         ops.push(WriteOp::Delete {
             key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
@@ -1017,20 +1098,53 @@ impl Persist {
                 });
             }
         }
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "session",
+            s.tenant_id.clone(),
+            Some(s.agent_id.clone()),
+            Some(s.session_id.clone()),
+            s.session_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(s).expect("session serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
-    pub fn delete_session_events(&self, tenant_id: &str, session_id: &str) -> KvResult<usize> {
+    pub fn purge_session_events(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        reason: &str,
+        deleted_at_ms: u64,
+    ) -> KvResult<usize> {
+        self.delete_session_events_inner(tenant_id, session_id, Some((reason, deleted_at_ms)))
+    }
+
+    fn delete_session_events_inner(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        tombstone: Option<(&str, u64)>,
+    ) -> KvResult<usize> {
         let prefix = format!("event/{tenant_id}/{session_id}/");
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         let mut ops: Vec<WriteOp> = Vec::new();
         let mut count = 0;
+        let mut tombstoned_event_ids = BTreeSet::new();
         for res in iter {
             let (k, v) = res?;
             let context = self.event_context_from_key(tenant_id, session_id, 0);
             let plaintext = self.decrypt_metadata(&context, &v)?;
             let env: EventEnvelope =
                 serde_json::from_slice(&plaintext).expect("event envelope decodes");
+            if let Some((reason, deleted_at_ms)) = tombstone {
+                if tombstoned_event_ids.insert(env.event_id.as_str().to_string()) {
+                    ops.extend(self.export_ledger_item_put_ops(
+                        export_tombstone_item_from_event(&env, deleted_at_ms, reason),
+                    )?);
+                }
+            }
             ops.push(WriteOp::Delete { key: k });
             ops.push(WriteOp::Delete {
                 key: event_by_id_key(tenant_id, env.event_id.as_str()).into_bytes(),
@@ -1042,6 +1156,13 @@ impl Persist {
             let (k, v) = res?;
             let batch = self.decode_append_log_batch(tenant_id, session_id, &v)?;
             for event in &batch.events {
+                if let Some((reason, deleted_at_ms)) = tombstone {
+                    if tombstoned_event_ids.insert(event.event_id.as_str().to_string()) {
+                        ops.extend(self.export_ledger_item_put_ops(
+                            export_tombstone_item_from_event(event, deleted_at_ms, reason),
+                        )?);
+                    }
+                }
                 ops.push(WriteOp::Delete {
                     key: event_by_id_key(tenant_id, event.event_id.as_str()).into_bytes(),
                 });
@@ -1976,8 +2097,13 @@ impl Persist {
         }
     }
 
-    pub fn delete_record(&self, r: &SearchableRecord) -> KvResult<()> {
-        let ops: Vec<WriteOp> = vec![
+    pub fn purge_record(
+        &self,
+        r: &SearchableRecord,
+        reason: &str,
+        deleted_at_ms: u64,
+    ) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = vec![
             WriteOp::Delete {
                 key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
             },
@@ -1990,6 +2116,16 @@ impl Persist {
                 .into_bytes(),
             },
         ];
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "record",
+            r.tenant_id.clone(),
+            None,
+            None,
+            r.record_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(r).expect("record serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -2021,8 +2157,8 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    pub fn delete_skill(&self, skill: &Skill) -> KvResult<()> {
-        let ops: Vec<WriteOp> = vec![
+    pub fn purge_skill(&self, skill: &Skill, reason: &str, deleted_at_ms: u64) -> KvResult<()> {
+        let mut ops: Vec<WriteOp> = vec![
             WriteOp::Delete {
                 key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
                     .into_bytes(),
@@ -2032,6 +2168,16 @@ impl Persist {
                     .into_bytes(),
             },
         ];
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "skill",
+            skill.tenant_id.clone(),
+            None,
+            None,
+            skill.skill_id.as_str().to_string(),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(skill).expect("skill serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -2058,15 +2204,31 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    pub fn delete_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
-        self.write_ops(vec![WriteOp::Delete {
+    pub fn purge_agent_skill_binding(
+        &self,
+        binding: &AgentSkillBinding,
+        reason: &str,
+        deleted_at_ms: u64,
+    ) -> KvResult<()> {
+        let mut ops = vec![WriteOp::Delete {
             key: agent_skill_binding_key(
                 binding.tenant_id.as_str(),
                 binding.agent_id.as_str(),
                 binding.skill_id.as_str(),
             )
             .into_bytes(),
-        }])
+        }];
+        ops.extend(self.export_ledger_item_put_ops(export_tombstone_item(
+            "skill_binding",
+            binding.tenant_id.clone(),
+            Some(binding.agent_id.clone()),
+            None,
+            format!("{}:{}", binding.agent_id, binding.skill_id),
+            deleted_at_ms,
+            reason,
+            serde_json::to_value(binding).expect("agent skill binding serializes"),
+        ))?);
+        self.write_ops(ops)
     }
 
     pub fn put_idempotency(&self, full_key: &str, rec: &IdempotencyRecord) -> KvResult<()> {

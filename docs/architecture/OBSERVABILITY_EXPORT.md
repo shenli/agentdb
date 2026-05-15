@@ -817,6 +817,11 @@ Response:
   skill-binding mutation ledger rows.
 - Implemented: soft-delete tombstone export for metadata objects that use the
   runtime soft-delete contract.
+- Implemented: retention-GC and tenant-purge tombstone export for physical GC
+  removal of events and runtime metadata objects.
+- Implemented: persisted export watch can drain retained ledger rows after a
+  tenant has been physically purged, so final tenant-purge tombstones remain
+  observable.
 - Implemented: tablet movement snapshot classification for export ledger,
   scoped ledger indexes, high-watermark rows, and managed consumer rows.
 - Implemented: `GET /api/admin/exports` visibility for managed consumers and
@@ -857,8 +862,7 @@ consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 
 - Add first-class policy object ledger rows when runtime policy mutation APIs
   are promoted.
-- Add retention-GC, tenant-purge, and policy-redaction tombstone reasons beyond
-  current soft deletes.
+- Add policy-redaction tombstone reasons once redaction APIs exist.
 - Add explicit restore/conformance tests that prove export ledger high
   watermarks and managed consumers survive backup/restore, in addition to the
   tablet movement snapshot coverage.

@@ -4772,14 +4772,30 @@ impl Runtime {
                     let Some(session) = s.sessions.get(&session_id).cloned() else {
                         continue;
                     };
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(session.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms = first_deletion_ms(
+                        now_ms,
+                        &[
+                            session.deleted_at_ms,
+                            agent.deleted_at_ms,
+                            tenant_deleted_at,
+                        ],
+                    );
+                    let reason = gc_tombstone_reason(session.deleted_at_ms, tenant_deleted_at);
                     if let Some(p) = &self.persist {
                         report.events_purged += p
-                            .delete_session_events(
+                            .purge_session_events(
                                 session.tenant_id.as_str(),
                                 session.session_id.as_str(),
+                                reason,
+                                deleted_at_ms,
                             )
                             .map_err(internal)?;
-                        p.delete_session(&session).map_err(internal)?;
+                        p.purge_session(&session, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     } else {
                         let lo = (session.session_id.as_str().to_string(), 0);
                         let hi = (session.session_id.as_str().to_string(), u64::MAX);
@@ -4806,7 +4822,15 @@ impl Runtime {
                     report.work_units += 1;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_agent(&agent).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(agent.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[agent.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(agent.deleted_at_ms, tenant_deleted_at);
+                    p.purge_agent(&agent, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 let binding_keys: Vec<(String, String)> = s
                     .agent_skill_bindings
@@ -4822,7 +4846,21 @@ impl Runtime {
                         continue;
                     };
                     if let Some(p) = &self.persist {
-                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                        let tenant_deleted_at = s
+                            .tenants
+                            .get(binding.tenant_id.as_str())
+                            .and_then(|tenant| tenant.deleted_at_ms);
+                        let deleted_at_ms = first_deletion_ms(
+                            now_ms,
+                            &[
+                                binding.deleted_at_ms,
+                                agent.deleted_at_ms,
+                                tenant_deleted_at,
+                            ],
+                        );
+                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
+                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     }
                     s.agent_skill_bindings.remove(&key);
                     report.skill_bindings_purged += 1;
@@ -4872,18 +4910,34 @@ impl Runtime {
                 let Some(session) = s.sessions.get(&session_id).cloned() else {
                     continue;
                 };
+                let tenant_deleted_at = s
+                    .tenants
+                    .get(session.tenant_id.as_str())
+                    .and_then(|tenant| tenant.deleted_at_ms);
+                let agent_deleted_at = s
+                    .agents
+                    .get(session.agent_id.as_str())
+                    .and_then(|agent| agent.deleted_at_ms);
+                let deleted_at_ms = first_deletion_ms(
+                    now_ms,
+                    &[session.deleted_at_ms, agent_deleted_at, tenant_deleted_at],
+                );
+                let reason = gc_tombstone_reason(session.deleted_at_ms, tenant_deleted_at);
                 let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
                 if !gc_work_allowed(&mut report, &policy) {
                     break;
                 }
                 if let Some(p) = &self.persist {
                     report.events_purged += p
-                        .delete_session_events(
+                        .purge_session_events(
                             session.tenant_id.as_str(),
                             session.session_id.as_str(),
+                            reason,
+                            deleted_at_ms,
                         )
                         .map_err(internal)?;
-                    p.delete_session(&session).map_err(internal)?;
+                    p.purge_session(&session, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 } else {
                     let lo = (session.session_id.as_str().to_string(), 0);
                     let hi = (session.session_id.as_str().to_string(), u64::MAX);
@@ -4956,13 +5010,35 @@ impl Runtime {
                         continue;
                     };
                     if let Some(p) = &self.persist {
-                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                        let tenant_deleted_at = s
+                            .tenants
+                            .get(binding.tenant_id.as_str())
+                            .and_then(|tenant| tenant.deleted_at_ms);
+                        let deleted_at_ms = first_deletion_ms(
+                            now_ms,
+                            &[
+                                binding.deleted_at_ms,
+                                skill.deleted_at_ms,
+                                tenant_deleted_at,
+                            ],
+                        );
+                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
+                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     }
                     s.agent_skill_bindings.remove(&key);
                     report.skill_bindings_purged += 1;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_skill(&skill).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(skill.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[skill.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(skill.deleted_at_ms, tenant_deleted_at);
+                    p.purge_skill(&skill, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.skill_uniques.remove(&skill_unique_state_key(
                     skill.tenant_id.as_str(),
@@ -5008,7 +5084,15 @@ impl Runtime {
                     break;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_record(&record).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(record.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[record.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(record.deleted_at_ms, tenant_deleted_at);
+                    p.purge_record(&record, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.records.remove(&record_id);
                 if let Some(doc) = s.record_to_doc.remove(&record_id) {
@@ -5073,7 +5157,15 @@ impl Runtime {
                 continue;
             }
             if let Some(p) = &self.persist {
-                p.delete_artifact(&current).map_err(internal)?;
+                let tenant_deleted_at = s
+                    .tenants
+                    .get(current.tenant_id.as_str())
+                    .and_then(|tenant| tenant.deleted_at_ms);
+                let deleted_at_ms =
+                    first_deletion_ms(now_ms, &[current.deleted_at_ms, tenant_deleted_at]);
+                let reason = gc_tombstone_reason(current.deleted_at_ms, tenant_deleted_at);
+                p.purge_artifact(&current, reason, deleted_at_ms)
+                    .map_err(internal)?;
             }
             s.artifacts.remove(artifact.artifact_id.as_str());
             report.artifacts_purged += 1;
@@ -5131,7 +5223,9 @@ impl Runtime {
                     continue;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_tenant(&tenant).map_err(internal)?;
+                    let deleted_at_ms = tenant.deleted_at_ms.unwrap_or(now_ms);
+                    p.purge_tenant(&tenant, "tenant_purge", deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.tenants.remove(&tenant_id);
                 if !tenant.external_key.is_empty() {
@@ -6376,18 +6470,27 @@ impl Runtime {
     }
 
     pub async fn export_watch(&self, req: ExportWatchRequest) -> Result<Vec<ExportFeedItem>> {
-        {
-            let s = self.state.lock().await;
-            validate_export_consumer_scope_in_state(
-                &s,
-                &req.tenant_id,
-                req.scope,
-                req.agent_id.as_ref(),
-                req.session_id.as_ref(),
-            )?;
-        }
         validate_export_include(&req.include)?;
         if let Some(persist) = &self.persist {
+            let scope_validation = {
+                let s = self.state.lock().await;
+                validate_export_consumer_scope_in_state(
+                    &s,
+                    &req.tenant_id,
+                    req.scope,
+                    req.agent_id.as_ref(),
+                    req.session_id.as_ref(),
+                )
+            };
+            if let Err(error) = scope_validation {
+                let has_retained_ledger = persist
+                    .export_ledger_high_watermark(req.tenant_id.as_str())
+                    .map_err(internal)?
+                    .is_some();
+                if !has_retained_ledger || !export_scope_has_required_ids(&req) {
+                    return Err(error);
+                }
+            }
             self.validate_persistent_export_cursor(&req).await?;
             let mut out = Vec::new();
             let cursor_context = self.changefeed_cursor_context()?;
@@ -6442,6 +6545,17 @@ impl Runtime {
             }
             return Ok(out);
         }
+
+        {
+            let s = self.state.lock().await;
+            validate_export_consumer_scope_in_state(
+                &s,
+                &req.tenant_id,
+                req.scope,
+                req.agent_id.as_ref(),
+                req.session_id.as_ref(),
+            )?;
+        }
         let events = self
             .watch(WatchRequest {
                 tenant_id: req.tenant_id,
@@ -6486,10 +6600,11 @@ impl Runtime {
             ));
         }
         if req.scope == WatchScope::Session
-            && req
-                .session_id
-                .as_ref()
-                .is_some_and(|session_id| parts.session_id != Some(session_id.as_str()))
+            && req.session_id.as_ref().is_some_and(|session_id| {
+                parts
+                    .session_id
+                    .is_some_and(|cursor_session_id| cursor_session_id != session_id.as_str())
+            })
         {
             return Err(Error::new(
                 ErrorCode::InvalidCursor,
@@ -7750,6 +7865,26 @@ fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
     Some(usage.saturating_mul(100).saturating_div(soft_limit))
 }
 
+fn first_deletion_ms(now_ms: u64, candidates: &[Option<u64>]) -> u64 {
+    candidates
+        .iter()
+        .copied()
+        .flatten()
+        .next()
+        .unwrap_or(now_ms)
+}
+
+fn gc_tombstone_reason(
+    object_deleted_at: Option<u64>,
+    tenant_deleted_at: Option<u64>,
+) -> &'static str {
+    if object_deleted_at.is_none() && tenant_deleted_at.is_some() {
+        "tenant_purge"
+    } else {
+        "retention_gc"
+    }
+}
+
 fn resolve_policy_for_agent_in_state(
     s: &State,
     tenant_id: &Id,
@@ -8285,6 +8420,14 @@ fn export_item_matches_scope(
                 .as_ref()
                 .is_some_and(|item_session_id| item_session_id.as_str() == session_id.as_str())
         }),
+    }
+}
+
+fn export_scope_has_required_ids(req: &ExportWatchRequest) -> bool {
+    match req.scope {
+        WatchScope::Tenant => true,
+        WatchScope::Agent => req.agent_id.is_some(),
+        WatchScope::Session => req.session_id.is_some(),
     }
 }
 

@@ -9,7 +9,11 @@ use agentdb_storage::{
     InMemoryContentBackend, InMemoryKvStore, PrefixScopedTabletStore, ReplicatedLog,
     SingleNodeReplicatedLog,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 async fn seed() -> (
     Arc<Runtime>,
@@ -648,4 +652,135 @@ async fn export_watch_emits_metadata_updates_and_tombstones_with_persistent_kv()
         .unwrap();
     assert_eq!(session_items.len(), 1);
     assert_eq!(session_items[0].item.object_id, session.session_id.as_str());
+}
+
+#[tokio::test]
+async fn export_watch_emits_retention_gc_tombstones_with_persistent_kv() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv, content);
+
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-retention".into(),
+            policy: serde_json::json!({"retention": {"retention_ms": 0}}),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "will-be-purged",
+        serde_json::json!({"n": 1}),
+    ))
+    .await
+    .unwrap();
+    let record = rt
+        .write_record(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            namespace: vec!["mem".into()],
+            scope: serde_json::json!({}),
+            text: Some("retention memory".into()),
+            metadata: serde_json::json!({}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy: IndexingPolicy::default(),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    rt.delete_record(&tenant.tenant_id, &record.record_id)
+        .await
+        .unwrap();
+    rt.delete_session(&tenant.tenant_id, &session.session_id)
+        .await
+        .unwrap();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    rt.gc_sweep_for_tenant_at(&tenant.tenant_id, now_ms + 1)
+        .await
+        .unwrap();
+
+    let items = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["events".into(), "records".into(), "sessions".into()],
+            from_cursor: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert!(items.iter().any(|item| {
+        item.item.object_type == "record"
+            && item.item.object_id == record.record_id.as_str()
+            && item.item.op == "delete"
+            && item.item.tombstone.as_ref().and_then(|t| t.get("reason"))
+                == Some(&serde_json::json!("retention_gc"))
+    }));
+    assert!(items.iter().any(|item| {
+        item.item.object_type == "event"
+            && item.item.op == "delete"
+            && item.item.tombstone.as_ref().and_then(|t| t.get("reason"))
+                == Some(&serde_json::json!("retention_gc"))
+    }));
+    assert!(items.iter().any(|item| {
+        item.item.object_type == "session"
+            && item.item.object_id == session.session_id.as_str()
+            && item.item.op == "delete"
+            && item.item.tombstone.as_ref().and_then(|t| t.get("reason"))
+                == Some(&serde_json::json!("retention_gc"))
+    }));
+
+    let purged_tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-tenant-purge".into(),
+            policy: serde_json::json!({"retention": {"retention_ms": 0}}),
+        })
+        .await
+        .unwrap();
+    rt.delete_tenant(&purged_tenant.tenant_id).await.unwrap();
+    rt.gc_sweep_at(now_ms + 2).await.unwrap();
+    let tenant_items = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: purged_tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["tenants".into()],
+            from_cursor: None,
+            limit: 20,
+        })
+        .await
+        .unwrap();
+    assert!(tenant_items.iter().any(|item| {
+        item.item.object_type == "tenant"
+            && item.item.object_id == purged_tenant.tenant_id.as_str()
+            && item.item.op == "delete"
+            && item.item.tombstone.as_ref().and_then(|t| t.get("reason"))
+                == Some(&serde_json::json!("tenant_purge"))
+    }));
 }
