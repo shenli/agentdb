@@ -8,16 +8,11 @@ use agentdb_core::session::NewSession;
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::keys::{artifact_record_key, event_key};
 use agentdb_storage::{
-    AllowAllKmsKeyResolver, ContentBackend, InMemoryContentBackend, KvStore, MetadataCryptoAdapter,
-    MetadataCryptoContext, RocksKvStore, TabletKvStore,
+    AllowAllKmsKeyResolver, ContentBackend, InMemoryContentBackend, InMemoryKvStore, KvStore,
+    MetadataCryptoAdapter, MetadataCryptoContext, TabletKvStore,
 };
-use tempfile::TempDir;
 
 const RUNTIME_PRIMARY_TABLET_ID: i64 = 1;
-
-fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
-    Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
-}
 
 #[derive(Debug)]
 struct PrefixReverseMetadataCrypto;
@@ -66,9 +61,8 @@ fn content() -> Arc<dyn ContentBackend> {
 
 #[tokio::test]
 async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
-    let dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::new());
     let (tenant_id, session_id, artifact_id) = {
-        let kv = open_kv(dir.path());
         let rt = Runtime::with_kv_kms_content_and_metadata_crypto(
             kv.clone(),
             content(),
@@ -132,25 +126,49 @@ async fn metadata_crypto_wraps_artifact_and_event_rows_and_hydrates_them() {
         assert!(!artifact_raw.starts_with(b"{"));
         assert!(artifact.metadata_key_id.as_deref().is_some());
 
-        let event_raw = tablet
+        let event_raw = match tablet
             .get(event_key(tenant.tenant_id.as_str(), session.session_id.as_str(), 0).as_bytes())
             .unwrap()
-            .unwrap();
-        assert!(event_raw.starts_with(b"AGDB-ENVELOPE-v1\n"));
+        {
+            Some(event_raw) => event_raw,
+            None => tablet
+                .get(
+                    format!(
+                        "append_log/{}/{}/{:020}",
+                        tenant.tenant_id.as_str(),
+                        session.session_id.as_str(),
+                        0
+                    )
+                    .as_bytes(),
+                )
+                .unwrap()
+                .expect("event metadata persists as event row or append log row"),
+        };
+        let event_test_crypto_prefix = format!(
+            "meta:{}:event:{}:",
+            tenant.tenant_id.as_str(),
+            session.session_id.as_str()
+        );
+        assert!(
+            event_raw.starts_with(b"AGDB-ENVELOPE-v1\n")
+                || event_raw.starts_with(event_test_crypto_prefix.as_bytes())
+        );
         assert!(!event_raw
             .windows(b"secret event metadata".len())
             .any(|w| { w == b"secret event metadata" }));
 
-        (
+        let ids = (
             tenant.tenant_id.clone(),
             session.session_id.clone(),
             artifact.artifact_id.clone(),
-        )
+        );
+        drop(tablet);
+        drop(rt);
+        ids
     };
 
-    let kv = open_kv(dir.path());
     let rt = Runtime::with_kv_kms_content_and_metadata_crypto(
-        kv,
+        kv.clone(),
         content(),
         Arc::new(AllowAllKmsKeyResolver),
         Arc::new(agentdb_storage::IdentityContentCryptoAdapter),

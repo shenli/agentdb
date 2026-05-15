@@ -18,7 +18,7 @@ use agentdb_api::{
         RouteRuntime, RouteSnapshot, HDR_OWNER_NODE, HDR_ROUTE_ACTION, HDR_ROUTE_REASON,
         HDR_SHARD_ID, HDR_TABLET_ID,
     },
-    state::{ProxyPolicy, RaftRsIngress},
+    state::{ProxyPolicy, RaftRsIngress, TabletStoreStatus},
     AppState,
 };
 use agentdb_core::{
@@ -26,12 +26,14 @@ use agentdb_core::{
     RUNTIME_PRIMARY_TABLET_ID,
 };
 use agentdb_meta::{
-    nodes::Node, session_locators, tablet_replicas, tablet_snapshots, tablets::Tablet, MetaStore,
+    cells, nodes::Node, placement_scopes, session_locators, tablet_replicas, tablet_snapshots,
+    tablets, tablets::Tablet, MetaStore,
 };
 use agentdb_storage::{
-    AsyncMirrorContentBackend, ContentBackend, InMemoryContentBackend, KvStore, RaftRsNodeConfig,
-    RaftRsNodeRole, RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer,
-    RaftRsWireMessage, ReplicatedLog, RocksKvStore, SingleNodeReplicatedLog,
+    AsyncMirrorContentBackend, ContentBackend, GroupedRocksDbTabletStore, InMemoryContentBackend,
+    InMemoryKvStore, KvStore, RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicatedLog,
+    RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsWireMessage, ReplicatedLog, RocksKvStore,
+    SingleNodeReplicatedLog,
 };
 use base64::Engine as _;
 use common::{spawn_app, spawn_app_with_state, TestApp};
@@ -2234,6 +2236,68 @@ async fn admin_tenant_policies_round_trip() {
 }
 
 #[tokio::test]
+async fn create_tenant_can_bootstrap_placement_policy() {
+    let runtime = Runtime::in_memory();
+    let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+    let state = AppState::new(runtime).with_meta(meta);
+    let app = spawn_app_with_state(state).await;
+    let tenant_id = "ten_018f0000-0000-7000-8000-000000000123";
+
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "tenant_id": tenant_id,
+            "external_key": "bootstrap-placement",
+            "policy": {},
+            "placement": {
+                "placement_scope_id": "tenant/bootstrap",
+                "cell_id": "cell-b",
+                "placement_class": "dedicated",
+                "tier": "paid",
+                "priority": 20,
+                "encryption_class": "tenant",
+                "key_policy_id": "key/bootstrap",
+                "encryption_policy_version": 3,
+                "policy_version": 7
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tenant["tenant_id"], tenant_id);
+
+    let policies: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/tenant-policies", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let policy = policies
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|policy| policy["tenant_id"] == tenant_id)
+        .unwrap();
+    assert_eq!(policy["cell_id"], "cell-b");
+    assert_eq!(policy["placement_scope_id"], "tenant/bootstrap");
+    assert_eq!(policy["tier"], "paid");
+    assert_eq!(policy["priority"], 20);
+    assert_eq!(policy["key_policy_id"], "key/bootstrap");
+    assert_eq!(policy["policy_version"], 7);
+}
+
+#[tokio::test]
 async fn admin_tablet_ranges_replace_round_trip() {
     let runtime = Runtime::in_memory();
     let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
@@ -3275,6 +3339,206 @@ async fn admin_backup_and_restore_validation_round_trip() {
 }
 
 #[tokio::test]
+async fn admin_backup_can_include_single_tablet_store_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("agentdb-api-tablet-backup-test-{}", now_ms_i64()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lifecycle = Arc::new(GroupedRocksDbTabletStore::new(
+        dir.join("tablet-stores"),
+        1,
+        8,
+    ));
+    let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
+        Arc::new(InMemoryKvStore::new()),
+    ));
+    let runtime = Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+        lifecycle,
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]),
+    );
+    runtime
+        .create_tenant(NewTenant {
+            external_key: "tablet-backup".into(),
+            policy: json!({}),
+        })
+        .await
+        .unwrap();
+    let meta_path = dir.join("meta.sqlite");
+    let meta = MetaStore::open_sqlite(&meta_path.to_string_lossy())
+        .await
+        .unwrap();
+    cells::upsert(
+        meta.pool(),
+        "cell-a",
+        Some("us-west-2"),
+        "standard",
+        "multi_az_standard",
+        "stable",
+        "shared_logical",
+        "serving",
+        Some("cell-a"),
+        Some("cell-a"),
+        1,
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    placement_scopes::upsert_with_cell(
+        meta.pool(),
+        "tenant/tablet-backup",
+        "dedicated",
+        128,
+        Some("seed"),
+        "active",
+        "cell-a",
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    let tablet = tablets::create_with_placement(
+        meta.pool(),
+        RUNTIME_PRIMARY_TABLET_ID,
+        "tenant/tablet-backup",
+        "serving",
+        Some("rg-1"),
+        0,
+        now_ms_i64(),
+    )
+    .await
+    .unwrap();
+    tablet_snapshots::record(
+        meta.pool(),
+        "snap-tablet-backup",
+        RUNTIME_PRIMARY_TABLET_ID,
+        "node-a",
+        1,
+        "node-b",
+        2,
+        12,
+        3,
+        42,
+        "abc123",
+        Some("s3://snapshots/snap-tablet-backup"),
+        "available",
+        now_ms_i64(),
+        None,
+    )
+    .await
+    .unwrap();
+    let app = spawn_app_with_state(AppState::new(runtime).with_meta(meta)).await;
+    let backup_root = dir.join("backups");
+
+    let backup: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/backups", app.base))
+        .json(&json!({
+            "backup_id": "tablet-backup",
+            "directory": backup_root.to_string_lossy(),
+            "include_meta": false,
+            "include_tablet_checkpoints": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let manifest_path = backup["manifest_path"].as_str().unwrap().to_string();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let checkpoints = manifest["tablet_store_checkpoints"].as_array().unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert!(std::path::Path::new(checkpoints[0]["path"].as_str().unwrap()).exists());
+    assert_eq!(
+        checkpoints[0]["manifest"]["tablet_id"].as_i64().unwrap(),
+        RUNTIME_PRIMARY_TABLET_ID
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["cell_id"].as_str().unwrap(),
+        "cell-a"
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["placement_scope_id"]
+            .as_str()
+            .unwrap(),
+        "tenant/tablet-backup"
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["tablet_epoch"].as_i64().unwrap(),
+        tablet.epoch
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["latest_snapshot_index"]
+            .as_u64()
+            .unwrap(),
+        12
+    );
+    assert!(
+        checkpoints[0]["manifest"]["latest_applied_index"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        checkpoints[0]["manifest"]["checksum_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let validation: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/restores", app.base))
+        .json(&json!({
+            "manifest_path": manifest_path,
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(validation["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check == "tablet store checkpoints present (1)"));
+
+    let mut tampered = manifest.clone();
+    tampered["tablet_store_checkpoints"][0]["manifest"]["checksum_sha256"] =
+        serde_json::Value::String("0".repeat(64));
+    let tampered_path = backup_root
+        .join("tablet-backup")
+        .join("manifest-tampered.json");
+    std::fs::write(
+        &tampered_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let bad_validation = app
+        .client
+        .post(format!("{}/api/admin/restores", app.base))
+        .json(&json!({
+            "manifest_path": tampered_path.to_string_lossy(),
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_validation.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn admin_scheduler_reports_status_snapshot() {
     let runtime = Runtime::in_memory();
     let scheduler = agentdb_api::state::SchedulerStatus::new();
@@ -3309,6 +3573,80 @@ async fn admin_scheduler_reports_status_snapshot() {
     assert_eq!(body["local_tablet_log_compaction_failures_total"], 1);
     assert_eq!(body["local_tablet_log_compaction_last_tick_at_ms"], 40_500);
     assert_eq!(body["last_tick_at_ms"], 41_000);
+}
+
+#[tokio::test]
+async fn admin_scheduler_reports_tablet_store_domain_metrics() {
+    let dir = TempDir::new().unwrap();
+    let lifecycle = Arc::new(GroupedRocksDbTabletStore::new(
+        dir.path().join("tablet-stores"),
+        1,
+        8,
+    ));
+    let log: Arc<dyn ReplicatedLog + Send + Sync> = Arc::new(SingleNodeReplicatedLog::new(
+        Arc::new(InMemoryKvStore::new()),
+    ));
+    let runtime = Runtime::with_tablet_store_lifecycle_and_replicated_logs(
+        lifecycle,
+        Arc::new(InMemoryContentBackend::default()),
+        BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]),
+    );
+    runtime
+        .create_tenant(NewTenant {
+            external_key: "tablet-store-status".into(),
+            policy: json!({}),
+        })
+        .await
+        .unwrap();
+    let state = AppState::new(runtime).with_tablet_store_status(TabletStoreStatus {
+        layout: "grouped_rocksdb".into(),
+        root_dir: Some(dir.path().join("tablet-stores").display().to_string()),
+        tablets_per_domain: 1,
+        max_open_domains: 8,
+        domain_write_buffer_size_mib: 16,
+        domain_max_write_buffers: 2,
+        domain_parallelism: 1,
+        domain_max_background_jobs: 1,
+        domain_max_open_files: 128,
+        domains: Vec::new(),
+    });
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/scheduler", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let domains = body["tablet_store"]["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain_id"], RUNTIME_PRIMARY_TABLET_ID);
+    assert_eq!(domains[0]["open"], true);
+    assert!(domains[0]["metrics"]["all_memtables_bytes"].is_u64());
+
+    let compact: serde_json::Value = app
+        .client
+        .post(format!("{}/api/admin/tablet-store/compact", app.base))
+        .json(&json!({
+            "tablet_id": RUNTIME_PRIMARY_TABLET_ID
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(compact["status"], "compacted");
+    assert_eq!(compact["tablet_id"], RUNTIME_PRIMARY_TABLET_ID);
+    assert_eq!(compact["domains"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -3741,6 +4079,8 @@ fn node_with_state_and_heartbeat(
         joined_at_ms: 100,
         availability_zone: Some("us-west-2a".into()),
         region: Some("us-west-2".into()),
+        cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+        capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
     }
 }
 

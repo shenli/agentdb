@@ -28,7 +28,12 @@ set -euo pipefail
 cd ~/agentdb-src
 cargo build -p agentdb-server
 pkill -f "agentdb serve" || true
-nohup target/debug/agentdb serve --config config/agentdb.toml \
+if [[ -f ~/agentdb-deploy/agentdb.env ]]; then
+  set -a
+  source ~/agentdb-deploy/agentdb.env
+  set +a
+fi
+nohup target/debug/agentdb serve --config ~/agentdb-deploy/config/agentdb.toml \
   > ~/agentdb-deploy/logs/agentdb.log 2>&1 &
 EOF
 

@@ -23,6 +23,7 @@ dependencies = [
 name = "agentdb-bench"
 version = "0.1.0"
 dependencies = [
+ "agentdb-storage",
  "anyhow",
  "bson",
  "clap",
@@ -42,6 +43,7 @@ name = "agentdb-cluster-smoke"
 version = "0.1.0"
 dependencies = [
  "agentdb-meta",
+ "agentdb-storage",
  "anyhow",
  "clap",
  "reqwest",
@@ -151,6 +153,7 @@ dependencies = [
  "raft",
  "raft-engine",
  "rocksdb",
+ "serde",
  "sha2",
  "slatedb",
  "slog",
@@ -179,6 +182,7 @@ dependencies = [
 name = "agentdbctl"
 version = "0.1.0"
 dependencies = [
+ "agentdb-storage",
  "anyhow",
  "clap",
  "reqwest",

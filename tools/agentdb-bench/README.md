@@ -9,6 +9,43 @@ dataset and run it against:
 - `mongodb-event-log`: MongoDB with normalized event-log collections.
 - `postgres-event-log`: Postgres with normalized event-log tables.
 
+It also has a local tablet-store microbenchmark for storage-layout work:
+
+```bash
+cargo run -q -p agentdb-bench -- tablet-store \
+  --layout grouped-rocks-db \
+  --tablets 64 \
+  --ops 100000 \
+  --tablets-per-domain 32 \
+  --max-open-domains 16
+
+cargo run -q -p agentdb-bench -- tablet-store \
+  --layout grouped-rocks-db \
+  --tablets-per-domain 1 \
+  --checkpoint-tablet 0 \
+  --max-p99-ms 25 \
+  --max-p999-ms 100 \
+  --max-open-fds-growth 64 \
+  --max-rss-growth-mib 256
+```
+
+The tablet-store report includes append latency percentiles through p999,
+throughput, logical write bytes, a physical-byte/write-amplification estimate,
+checkpoint duration, checkpoint size, and checkpoint checksum when checkpointing
+is enabled. It also records RocksDB domain metrics such as memtable bytes,
+level-0 files, pending compaction bytes, and background errors. For
+single-tablet grouped domains it times an offline local restore into a fresh
+store root. On Linux it samples process open file descriptors and resident
+memory before writes, after writes, and after checkpointing. Use `--layout
+prefix-scoped` for the current shared-LSM baseline.
+
+Optional gate flags make the benchmark fail with a non-zero exit status when a
+regression crosses the configured threshold: `--max-p99-ms`,
+`--max-p999-ms`, `--max-write-amplification`, `--max-checkpoint-ms`,
+`--max-restore-ms`, `--max-open-fds-growth`, and `--max-rss-growth-mib`.
+Use generous host-local thresholds in CI and tighter thresholds only for
+dedicated benchmark machines.
+
 The benchmark is meant for engineering decisions. Treat the numbers below as
 internal single-node, cache-warm, localhost microbenchmarks, not external
 product claims.

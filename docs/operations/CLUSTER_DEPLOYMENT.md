@@ -96,6 +96,64 @@ Each node should have:
 - region / availability-zone metadata
 - local fast storage for hot working set
 
+For Track B tablet-local storage, the default cluster layout is bounded grouped
+RocksDB domains. This gives the deployment a physical tablet-store boundary
+without creating one RocksDB instance and memtable set per tablet:
+
+```toml
+[storage.tablet]
+layout = "grouped_rocksdb"
+root_dir = "/var/lib/agentdb/tablet-stores"
+tablets_per_domain = 32
+max_open_domains = 16
+domain_write_buffer_size_mib = 16
+domain_max_write_buffers = 2
+domain_parallelism = 1
+domain_max_background_jobs = 1
+domain_max_open_files = 128
+```
+
+`tablets_per_domain = 1` is the high-isolation mode, but it opens more RocksDB
+domains and therefore more memtables. Use it only when the node has explicit
+memory/file-handle capacity for that placement class. It is also the mode
+required by `agentdbctl backup create --include-tablet-checkpoints`, because a
+checkpoint must map to exactly one tablet store.
+
+The rough mutable-memtable cap for grouped domains is:
+
+```text
+max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers
+```
+
+The default above is about 512 MiB before RocksDB overheads. Increase it only
+with matching instance memory and file descriptor limits.
+
+After startup, use `agentdbctl status` or `GET /api/admin/scheduler` to inspect
+open tablet-store domains. The status includes open domain count, memtable
+bytes, level-0 file count, pending compaction bytes, running
+compactions/flushes, and background errors. On AWS, check these values before
+raising `max_open_domains` or lowering `tablets_per_domain`; per-tablet domains
+can multiply reserved memtable memory quickly. To compact one local tablet-store
+range after restore or heavy churn, run `agentdbctl tablet-store compact
+--tablet-id <id>` against the node that owns that local tablet.
+
+The AWS Terraform demo exposes these knobs as variables:
+`tablet_store_tablets_per_domain`, `tablet_store_max_open_domains`,
+`tablet_store_domain_write_buffer_size_mib`,
+`tablet_store_domain_max_write_buffers`,
+`tablet_store_domain_max_background_jobs`, and
+`tablet_store_domain_max_open_files`. For AWS backup/restore experiments, start
+with `tablet_store_tablets_per_domain = 1` and reduce
+`tablet_store_max_open_domains` to keep the memtable budget inside the instance
+memory envelope.
+
+The same Terraform demo can now emit cell/AZ-aware node configs for AWS cluster
+experiments. Set `node_count`, pass multiple `subnet_ids` across AZs, and set
+`deployment_mode = "cluster"`, `cell_id`, `capacity_class`,
+`internal_auth_token`, and a shared Postgres `meta_url`. The generated
+`agentdb.toml` binds to the EC2 private IP and writes routing labels so node
+heartbeats advertise a reachable private URL instead of `0.0.0.0`.
+
 ### 2. Shared Control Plane
 
 The cluster needs a shared metadata plane for:
@@ -232,12 +290,22 @@ The target bootstrap order should be:
 The intended operator shape is CLI-first:
 
 ```bash
+agentdbctl cells upsert \
+  --cell-id prod-c001 \
+  --region us-west-2 \
+  --domain-class standard \
+  --deployment-profile multi_az_standard \
+  --capacity-class stable
+
 agentdbctl nodes register \
   --node-id node-a \
   --address http://10.0.0.10:7878 \
+  --cell-id prod-c001 \
   --region us-west-2 \
-  --availability-zone us-west-2a
+  --availability-zone us-west-2a \
+  --capacity-class stable
 
+agentdbctl cells list
 agentdbctl tablets create 0
 agentdbctl tablets rebalance --dry-run
 agentdbctl tablets rebalance
@@ -246,6 +314,42 @@ agentdbctl status
 
 Use `agentdbctl raw ...` only for endpoints that are not modeled by the CLI
 yet.
+
+## Recovery Timing
+
+Do not tune all HA settings toward the same small number. AgentDB's intended
+production tradeoff is:
+
+- fast Raft election and ownership reconciliation for write-path RTO
+- slower stale-node marking for dead-node cleanup, replacement, and rebalance
+- bounded snapshot/log/catch-up work so recovery does not overload healthy
+  nodes
+
+With the defaults, a single owner process failure in a healthy quorum should
+recover write availability in seconds to tens of seconds. The real-cluster
+smoke asserts the current implementation moves ownership within 45 seconds.
+The default 180-second stale-node threshold is deliberately longer and affects
+when the node is marked `dead`, when stale stats are deleted, and when
+replacement workflows can safely treat the source as failed. It is not the
+write-path RTO.
+
+RPO for acknowledged writes is zero while a Raft quorum survives. A client that
+does not receive an acknowledgment must retry with idempotency; the write may
+or may not have committed before the timeout. If a tablet loses quorum, it is
+unavailable until quorum returns or an operator runs an explicit recovery
+workflow.
+
+Production tuning guidance:
+
+- reduce `AGENTDB_RAFT_TICK_INTERVAL_MS` only when the network and host
+  scheduling jitter are low enough to avoid spurious elections
+- keep `AGENTDB_STALE_NODE_THRESHOLD_MS` comfortably above normal network,
+  metadata, and GC pauses; lowering it improves cleanup RTO but increases
+  false-dead risk
+- set `[routing].refresh_interval_ms` low enough for route convergence, but
+  avoid excessive metadata polling in large clusters
+- treat `AGENTDB_REBALANCE_MAX_MOVEMENTS` and tablet lifecycle action limits as
+  pressure controls during recovery, not just placement controls
 
 ## Node Configuration Model
 
@@ -256,8 +360,19 @@ Each node should have:
 - cluster or deployment name
 - control-plane metadata DSN
 - object-store configuration
-- lease timing
-- heartbeat timing
+- Raft timing:
+  `AGENTDB_RAFT_TICK_INTERVAL_MS` (default 100 ms) and
+  `AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS` (default 1 second)
+- routing refresh timing (`[routing].refresh_interval_ms`, default 5 seconds)
+- scheduler lease/renew timing:
+  `AGENTDB_SCHEDULER_LEASE_MS` (default 30 seconds) and
+  `AGENTDB_SCHEDULER_RENEW_INTERVAL_MS` (default 10 seconds)
+- heartbeat timing (`AGENTDB_NODE_HEARTBEAT_MS`, default 5 seconds)
+- stale-node cleanup threshold (`AGENTDB_STALE_NODE_THRESHOLD_MS`, default
+  180 seconds)
+- ownership reaper timing:
+  `AGENTDB_REAPER_TICK_MS` (default 10 seconds) and
+  `AGENTDB_REAPER_SAFETY_MARGIN_MS` (default 5 seconds)
 - rebalance movement cap (`AGENTDB_REBALANCE_MAX_MOVEMENTS`; `0` disables
   automatic movement)
 - tablet lifecycle thresholds:

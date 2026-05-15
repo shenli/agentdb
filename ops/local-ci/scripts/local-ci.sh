@@ -10,6 +10,7 @@ RUN_CLIPPY=1
 RUN_FMT=1
 RUN_LICENSE=1
 RUN_CHAOS=0
+RUN_HARDENING=0
 CHAOS_ITERATIONS="${LOCAL_CI_CHAOS_ITERATIONS:-24}"
 CHAOS_SEED="${LOCAL_CI_CHAOS_SEED:-}"
 
@@ -34,6 +35,9 @@ Options:
   --no-cluster       Skip the real cluster failover smoke.
   --no-license       Skip dependency license policy checks.
   --chaos            Also run the bounded random cluster chaos smoke.
+  --hardening        Also run deterministic cluster hardening smoke
+                     (restart, checkpoint install, replacement, AZ failure,
+                     rolling restart, split/merge).
   --chaos-iterations N
                      Chaos kill/restart iterations. Defaults to LOCAL_CI_CHAOS_ITERATIONS or 24.
   --chaos-seed N     Deterministic chaos seed. Defaults to LOCAL_CI_CHAOS_SEED or current time.
@@ -79,6 +83,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --chaos)
       RUN_CHAOS=1
+      ;;
+    --hardening)
+      RUN_HARDENING=1
       ;;
     --chaos-iterations)
       shift
@@ -322,6 +329,10 @@ fi
 
 if [[ "$RUN_CLUSTER" == "1" ]]; then
   run_stage real-cluster-smoke ops/smoke/scripts/real-cluster-smoke-compose.sh --failover
+fi
+
+if [[ "$RUN_HARDENING" == "1" ]]; then
+  run_stage real-cluster-hardening ops/smoke/scripts/real-cluster-smoke-compose.sh --nodes 6 --two-cell --full-hardening
 fi
 
 if [[ "$RUN_CHAOS" == "1" ]]; then

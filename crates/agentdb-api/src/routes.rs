@@ -38,8 +38,9 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    nodes, session_locators, tablet_movements, tablet_ranges, tablet_rebalance, tablet_replicas,
-    tablet_snapshots, tablet_stats, tablets, tenant_policies, tenants,
+    cells, nodes, placement_scopes, session_locators, tablet_movements, tablet_ranges,
+    tablet_rebalance, tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies,
+    tenants,
 };
 
 use crate::dto::{
@@ -54,8 +55,9 @@ use crate::internal_raft_http::{
     RaftRsHttpOutbox, TabletMovementSnapshotExportRequest, TabletMovementSnapshotExportResponse,
 };
 use crate::routing_http::{
-    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_FORWARDED_BY,
-    HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_ID,
+    route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_CELL_ID, HDR_FORWARDED_BY,
+    HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID,
+    HDR_TABLET_EPOCH, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -64,7 +66,9 @@ const SHA256_HEADER: &str = "X-Sha256";
 const BACKPRESSURE_HEADER: &str = "X-AgentDB-Backpressure";
 const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
+const DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -99,6 +103,10 @@ pub fn routes() -> Router<AppState> {
             "/api/admin/nodes",
             get(get_admin_nodes).post(register_admin_node),
         )
+        .route(
+            "/api/admin/cells",
+            get(get_admin_cells).post(upsert_admin_cell),
+        )
         .route("/api/admin/nodes/:node_id", delete(delete_admin_node))
         .route(
             "/api/admin/nodes/:node_id/maintenance",
@@ -116,6 +124,10 @@ pub fn routes() -> Router<AppState> {
             get(get_admin_tablet_movements),
         )
         .route("/api/admin/tablet-stats", get(get_admin_tablet_stats))
+        .route(
+            "/api/admin/tablet-store/compact",
+            post(compact_admin_tablet_store),
+        )
         .route(
             "/api/admin/tablets/:tablet_id/split/prepare",
             post(prepare_admin_tablet_split),
@@ -373,10 +385,12 @@ struct AdminNodeView {
     address: String,
     mongo_address: Option<String>,
     state: String,
+    cell_id: String,
     last_heartbeat_ms: i64,
     joined_at_ms: i64,
     availability_zone: Option<String>,
     region: Option<String>,
+    capacity_class: String,
     is_stale: bool,
 }
 
@@ -388,6 +402,23 @@ struct RegisterNodeBody {
     state: Option<String>,
     availability_zone: Option<String>,
     region: Option<String>,
+    cell_id: Option<String>,
+    capacity_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertCellBody {
+    cell_id: String,
+    region: Option<String>,
+    domain_class: Option<String>,
+    deployment_profile: Option<String>,
+    capacity_class: Option<String>,
+    metadata_isolation_level: Option<String>,
+    state: Option<String>,
+    metadata_namespace: Option<String>,
+    object_store_namespace: Option<String>,
+    #[serde(default)]
+    rollout_version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +471,9 @@ struct UpsertTenantPolicyBody {
     tenant_id: String,
     placement_class: String,
     placement_scope_id: String,
+    cell_id: Option<String>,
+    tier: Option<String>,
+    priority: Option<i64>,
     encryption_class: String,
     key_policy_id: Option<String>,
     #[serde(default)]
@@ -544,13 +578,17 @@ struct PrepareTabletReplacementBody {
     stale_threshold_ms: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CompleteTabletReplacementBody {
     target_node_id: String,
     source_node_id: Option<String>,
     min_applied_index: Option<i64>,
     require_healthy: Option<bool>,
     retire_source: Option<bool>,
+    /// Drive raft snapshot catch-up for the target before enforcing applied-index readiness.
+    catch_up: Option<bool>,
+    catch_up_attempts: Option<usize>,
+    catch_up_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -593,6 +631,8 @@ struct AdminTabletReplacementCompleteResponse {
     tablet: AdminTabletView,
     source_replica: Option<AdminTabletReplicaView>,
     target_replica: AdminTabletReplicaView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catch_up: Option<RaftCatchUpResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -615,6 +655,23 @@ struct SchedulerStatusResponse {
     local_tablet_log_compaction_failures_total: u64,
     local_tablet_log_compaction_last_tick_at_ms: i64,
     last_tick_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tablet_store: Option<crate::state::TabletStoreStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactTabletStoreBody {
+    tablet_id: i64,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactTabletStoreResponse {
+    tablet_id: i64,
+    dry_run: bool,
+    status: &'static str,
+    domains: Vec<agentdb_storage::TabletStoreDomainMetrics>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -623,6 +680,7 @@ struct CreateBackupBody {
     directory: Option<String>,
     include_meta: Option<bool>,
     include_runtime_summary: Option<bool>,
+    include_tablet_checkpoints: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -649,6 +707,13 @@ struct AdminRestoreResponse {
     manifest_path: String,
     backup_id: Option<String>,
     checks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TabletCheckpointBackup {
+    tablet_id: i64,
+    path: String,
+    manifest: agentdb_storage::TabletStoreManifest,
 }
 
 #[derive(Debug, Serialize)]
@@ -779,7 +844,7 @@ struct RaftMembershipOperationStatus {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RaftCatchUpBody {
     tablet_id: Option<i64>,
     target_node_id: Option<String>,
@@ -896,7 +961,9 @@ async fn get_cluster_health(
     Json(build_cluster_health(
         &s.routing.describe(),
         s.drain.is_draining(),
-        query.stale_threshold_ms.unwrap_or(15_000),
+        query
+            .stale_threshold_ms
+            .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
     ))
 }
 
@@ -907,7 +974,9 @@ async fn get_cluster_readiness(
     let readiness = build_cluster_readiness(
         &s.routing.describe(),
         s.drain.is_draining(),
-        query.stale_threshold_ms.unwrap_or(15_000),
+        query
+            .stale_threshold_ms
+            .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
     );
     let status = if readiness.ready {
         StatusCode::OK
@@ -1052,12 +1121,45 @@ async fn post_internal_raft_snapshot(
             )
                 .into_response()
         }
+        Err(err) if is_stale_raft_snapshot_error(&err.to_string()) => {
+            if let Some(registry) = s.raft_registry.as_ref() {
+                if let Ok(statuses) = registry.status_for(body.tablet_id) {
+                    if let Some(status) = statuses
+                        .into_iter()
+                        .find(|status| status.node_id == body.to)
+                    {
+                        record_local_raft_replica_progress(
+                            &s,
+                            body.tablet_id,
+                            body.to,
+                            status.applied_index,
+                            status.commit_index,
+                        )
+                        .await;
+                    }
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(InternalRaftAccepted {
+                    status: "already_applied",
+                    tablet_id: body.tablet_id,
+                    from: body.from,
+                    to: body.to,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => internal_raft_error(
             StatusCode::BAD_REQUEST,
             "RAFT_SNAPSHOT_REJECTED",
             err.to_string(),
         ),
     }
+}
+
+fn is_stale_raft_snapshot_error(error: &str) -> bool {
+    error.contains("stale raft-rs snapshot") || error.contains("snapshot out of date")
 }
 
 async fn post_internal_tablet_movement_snapshot_export(
@@ -1325,6 +1427,13 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
             local_tablet_log_compaction_last_tick_at_ms: 0,
             last_tick_at_ms: 0,
         });
+    let mut tablet_store = s.tablet_store.clone();
+    if let Some(status) = tablet_store.as_mut() {
+        status.domains = s
+            .runtime
+            .local_tablet_store_domain_metrics()
+            .unwrap_or_default();
+    }
     Json(SchedulerStatusResponse {
         leader_node_id: snapshot.leader_node_id,
         leader_epoch: snapshot.leader_epoch,
@@ -1338,7 +1447,35 @@ async fn get_admin_scheduler(State(s): State<AppState>) -> Json<SchedulerStatusR
         local_tablet_log_compaction_last_tick_at_ms: snapshot
             .local_tablet_log_compaction_last_tick_at_ms,
         last_tick_at_ms: snapshot.last_tick_at_ms,
+        tablet_store,
     })
+}
+
+async fn compact_admin_tablet_store(
+    State(s): State<AppState>,
+    Json(body): Json<CompactTabletStoreBody>,
+) -> Result<Json<CompactTabletStoreResponse>, ApiError> {
+    if body.tablet_id <= 0 {
+        return Err(invalid_admin_request("tablet_id must be positive"));
+    }
+    if !body.dry_run {
+        s.runtime
+            .compact_tablet_store(body.tablet_id)
+            .map_err(|err| internal_error(err.message))?;
+    }
+    Ok(Json(CompactTabletStoreResponse {
+        tablet_id: body.tablet_id,
+        dry_run: body.dry_run,
+        status: if body.dry_run {
+            "would_compact"
+        } else {
+            "compacted"
+        },
+        domains: s
+            .runtime
+            .local_tablet_store_domain_metrics()
+            .unwrap_or_default(),
+    }))
 }
 
 async fn get_record_index_status(
@@ -1373,6 +1510,7 @@ async fn create_admin_backup(
 
     let include_meta = body.include_meta.unwrap_or(true);
     let include_runtime_summary = body.include_runtime_summary.unwrap_or(true);
+    let include_tablet_checkpoints = body.include_tablet_checkpoints.unwrap_or(false);
     let mut meta_backup_path = None;
     if include_meta {
         if let Some(meta) = s.meta.as_ref() {
@@ -1399,7 +1537,9 @@ async fn create_admin_backup(
         Some(
             serde_json::to_value(
                 rows.into_iter()
-                    .map(|node| admin_node_view(node, now_ms, 15_000))
+                    .map(|node| {
+                        admin_node_view(node, now_ms, DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS)
+                    })
                     .collect::<Vec<_>>(),
             )
             .map_err(internal_error)?,
@@ -1412,6 +1552,16 @@ async fn create_admin_backup(
     } else {
         None
     };
+    let tablet_store_checkpoints = if include_tablet_checkpoints {
+        let checkpoint_root = backup_dir.join("tablet-stores");
+        fs::create_dir_all(&checkpoint_root).map_err(internal_error)?;
+        Some(
+            serde_json::to_value(checkpoint_local_tablet_stores(&s, &checkpoint_root).await?)
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
     let manifest = serde_json::json!({
         "schema_version": 1,
         "backup_id": backup_id,
@@ -1421,9 +1571,11 @@ async fn create_admin_backup(
         "runtime_summary": runtime_summary,
         "nodes": nodes,
         "tablets": tablets,
+        "tablet_store_checkpoints": tablet_store_checkpoints,
         "notes": [
             "This is an online backup manifest.",
             "Runtime summary is observability metadata, not a full runtime data copy.",
+            "Tablet-store checkpoints are included only when requested and require a physical single-tablet domain.",
             "Restore API currently validates manifests only; destructive apply must be done offline."
         ]
     });
@@ -1474,6 +1626,25 @@ async fn validate_admin_restore(
     if manifest.get("runtime_summary").is_some() {
         checks.push("runtime summary present".to_string());
     }
+    if let Some(checkpoints) = manifest["tablet_store_checkpoints"].as_array() {
+        for checkpoint in checkpoints {
+            let Some(path) = checkpoint["path"].as_str() else {
+                return Err(invalid_admin_request(
+                    "tablet_store_checkpoints entry is missing path",
+                ));
+            };
+            if !FsPath::new(path).exists() {
+                return Err(invalid_admin_request(format!(
+                    "tablet checkpoint path is missing: {path}"
+                )));
+            }
+            validate_tablet_checkpoint_manifest(checkpoint, FsPath::new(path))?;
+        }
+        checks.push(format!(
+            "tablet store checkpoints present ({})",
+            checkpoints.len()
+        ));
+    }
     Ok(Json(AdminRestoreResponse {
         job_id: format!("job_restore_validate_{}", now_ms_i64()),
         status: "validated",
@@ -1482,6 +1653,89 @@ async fn validate_admin_restore(
         backup_id,
         checks,
     }))
+}
+
+async fn checkpoint_local_tablet_stores(
+    state: &AppState,
+    checkpoint_root: &FsPath,
+) -> Result<Vec<TabletCheckpointBackup>, ApiError> {
+    let mut backups = Vec::new();
+    for tablet_id in state.runtime.registered_tablet_ids() {
+        let tablet_dir = checkpoint_root.join(format!("tablet-{tablet_id:020}"));
+        let mut manifest = state
+            .runtime
+            .checkpoint_tablet_store(tablet_id, &tablet_dir)
+            .map_err(|err| {
+                invalid_admin_request(format!(
+                    "tablet-store checkpoint for tablet {tablet_id} failed: {}",
+                    err.message
+                ))
+            })?;
+        enrich_tablet_checkpoint_manifest(state, &mut manifest).await?;
+        backups.push(TabletCheckpointBackup {
+            tablet_id,
+            path: tablet_dir.display().to_string(),
+            manifest,
+        });
+    }
+    Ok(backups)
+}
+
+async fn enrich_tablet_checkpoint_manifest(
+    state: &AppState,
+    manifest: &mut agentdb_storage::TabletStoreManifest,
+) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Ok(());
+    };
+    let Some(tablet) = tablets::get(meta.pool(), manifest.tablet_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(());
+    };
+    manifest.tablet_epoch = Some(tablet.epoch);
+    manifest.placement_scope_id = Some(tablet.placement_scope_id.clone());
+    if let Some(scope) = placement_scopes::get(meta.pool(), &tablet.placement_scope_id)
+        .await
+        .map_err(internal_error)?
+    {
+        manifest.cell_id = Some(scope.cell_id);
+    }
+    if let Some(snapshot) =
+        tablet_snapshots::list_recent(meta.pool(), Some(manifest.tablet_id), false, 1)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .next()
+    {
+        manifest.latest_snapshot_index = u64::try_from(snapshot.snapshot_index).ok();
+    }
+    Ok(())
+}
+
+fn validate_tablet_checkpoint_manifest(
+    checkpoint: &serde_json::Value,
+    path: &FsPath,
+) -> Result<(), ApiError> {
+    let summary = agentdb_storage::summarize_checkpoint_dir(path).map_err(internal_error)?;
+    if let Some(expected) = checkpoint["manifest"]["checksum_sha256"].as_str() {
+        if summary.checksum_sha256() != expected {
+            return Err(invalid_admin_request(format!(
+                "tablet checkpoint checksum mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(expected) = checkpoint["manifest"]["size_bytes"].as_u64() {
+        if summary.size_bytes() != expected {
+            return Err(invalid_admin_request(format!(
+                "tablet checkpoint size mismatch for {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -1505,7 +1759,9 @@ async fn get_admin_nodes(
             "metadata-backed cluster admin is not configured on this node",
         ))
     })?;
-    let stale_threshold_ms = query.stale_threshold_ms.unwrap_or(15_000);
+    let stale_threshold_ms = query
+        .stale_threshold_ms
+        .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -1524,13 +1780,57 @@ async fn get_admin_nodes(
                 address: node.address,
                 mongo_address: node.mongo_address,
                 state: node.state,
+                cell_id: node.cell_id,
                 last_heartbeat_ms: node.last_heartbeat_ms,
                 joined_at_ms: node.joined_at_ms,
                 availability_zone: node.availability_zone,
                 region: node.region,
+                capacity_class: node.capacity_class,
             })
             .collect(),
     ))
+}
+
+async fn get_admin_cells(State(s): State<AppState>) -> Result<Json<Vec<cells::Cell>>, ApiError> {
+    let meta = meta_required(&s)?;
+    let rows = cells::list_all(meta.pool()).await.map_err(internal_error)?;
+    Ok(Json(rows))
+}
+
+async fn upsert_admin_cell(
+    State(s): State<AppState>,
+    Json(body): Json<UpsertCellBody>,
+) -> Result<Json<cells::Cell>, ApiError> {
+    let meta = meta_required(&s)?;
+    cells::upsert(
+        meta.pool(),
+        &body.cell_id,
+        body.region.as_deref(),
+        body.domain_class
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_DOMAIN_CLASS),
+        body.deployment_profile
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_DEPLOYMENT_PROFILE),
+        body.capacity_class
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_CAPACITY_CLASS),
+        body.metadata_isolation_level
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_METADATA_ISOLATION_LEVEL),
+        body.state.as_deref().unwrap_or("serving"),
+        body.metadata_namespace.as_deref(),
+        body.object_store_namespace.as_deref(),
+        body.rollout_version,
+        now_ms_i64(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let cell = cells::get(meta.pool(), &body.cell_id)
+        .await
+        .map_err(internal_error)?
+        .expect("cell upserted above");
+    Ok(Json(cell))
 }
 
 async fn register_admin_node(
@@ -1548,7 +1848,7 @@ async fn register_admin_node(
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0);
     let state = body.state.unwrap_or_else(|| "alive".into());
-    nodes::upsert(
+    nodes::upsert_with_cell(
         meta.pool(),
         &body.node_id,
         &body.address,
@@ -1557,6 +1857,12 @@ async fn register_admin_node(
         now_ms,
         body.availability_zone.as_deref(),
         body.region.as_deref(),
+        body.cell_id
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CELL_ID),
+        body.capacity_class
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CAPACITY_CLASS),
     )
     .await
     .map_err(|err| {
@@ -1582,7 +1888,11 @@ async fn register_admin_node(
                 ),
             ))
         })?;
-    Ok(Json(admin_node_view(node, now_ms, 15_000)))
+    Ok(Json(admin_node_view(
+        node,
+        now_ms,
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )))
 }
 
 async fn delete_admin_node(
@@ -1631,7 +1941,11 @@ async fn set_admin_node_maintenance(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_admin_request(format!("node {node_id} does not exist")))?;
-    Ok(Json(admin_node_view(node, now_ms, 15_000)))
+    Ok(Json(admin_node_view(
+        node,
+        now_ms,
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )))
 }
 
 fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
@@ -1664,10 +1978,12 @@ fn admin_node_view(node: nodes::Node, now_ms: i64, stale_threshold_ms: i64) -> A
         address: node.address,
         mongo_address: node.mongo_address,
         state: node.state,
+        cell_id: node.cell_id,
         last_heartbeat_ms: node.last_heartbeat_ms,
         joined_at_ms: node.joined_at_ms,
         availability_zone: node.availability_zone,
         region: node.region,
+        capacity_class: node.capacity_class,
     }
 }
 
@@ -2214,7 +2530,7 @@ async fn prepare_admin_tablet_split(
         tablet_movements::upsert_pending(
             meta.pool(),
             &movement_id,
-            "split",
+            "manual_split",
             tablet_id,
             child.tablet_id,
             &placement_scope_id,
@@ -2467,7 +2783,7 @@ async fn prepare_admin_tablet_merge(
         tablet_movements::upsert_pending(
             meta.pool(),
             &movement_id,
-            "merge",
+            "manual_merge",
             *source_id,
             body.destination_tablet_id,
             &placement_scope_id,
@@ -2650,7 +2966,7 @@ async fn upsert_admin_tenant_policy(
     Json(body): Json<UpsertTenantPolicyBody>,
 ) -> Result<Json<tenant_policies::TenantPolicy>, ApiError> {
     let meta = meta_required(&s)?;
-    tenant_policies::upsert(
+    tenant_policies::upsert_with_cell(
         meta.pool(),
         &body.tenant_id,
         &body.placement_class,
@@ -2659,6 +2975,13 @@ async fn upsert_admin_tenant_policy(
         body.key_policy_id.as_deref(),
         body.encryption_policy_version,
         body.policy_version,
+        body.cell_id
+            .as_deref()
+            .unwrap_or(agentdb_meta::cells::DEFAULT_CELL_ID),
+        body.tier
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_TIER),
+        body.priority.unwrap_or(tenant_policies::DEFAULT_PRIORITY),
         now_ms_i64(),
     )
     .await
@@ -2688,7 +3011,13 @@ async fn assign_admin_tablet(
 ) -> Result<Json<AdminTabletMutationResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let _ = get_tablet_or_404(meta, tablet_id).await?;
-    let _ = require_assignable_node(meta, &body.node_id, now_ms_i64(), 15_000).await?;
+    let _ = require_assignable_node(
+        meta,
+        &body.node_id,
+        now_ms_i64(),
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )
+    .await?;
     let changed = tablets::assign_to(meta.pool(), tablet_id, &body.node_id)
         .await
         .map_err(internal_error)?;
@@ -2729,7 +3058,13 @@ async fn mark_admin_tablet_handoff(
             "handoff target must be different from the current owner",
         ));
     }
-    let _ = require_assignable_node(meta, &body.target_node_id, now_ms_i64(), 15_000).await?;
+    let _ = require_assignable_node(
+        meta,
+        &body.target_node_id,
+        now_ms_i64(),
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    )
+    .await?;
     let changed = tablets::mark_for_handoff(meta.pool(), tablet_id, &body.target_node_id)
         .await
         .map_err(internal_error)?;
@@ -2748,10 +3083,14 @@ async fn complete_admin_tablet_handoff(
 ) -> Result<Json<AdminTabletHandoffCompleteResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let _ = get_tablet_or_404(meta, tablet_id).await?;
-    let new_owner =
-        tablets::complete_handoff(meta.pool(), tablet_id, &body.expected_source_node_id)
-            .await
-            .map_err(internal_error)?;
+    let new_owner = tablets::complete_handoff_with_lease(
+        meta.pool(),
+        tablet_id,
+        &body.expected_source_node_id,
+        now_ms_i64().saturating_add(DEFAULT_ADMIN_TABLET_LEASE_MS),
+    )
+    .await
+    .map_err(internal_error)?;
     let changed = new_owner.is_some();
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
     Ok(Json(AdminTabletHandoffCompleteResponse {
@@ -2805,7 +3144,9 @@ async fn prepare_admin_tablet_replacement(
         }
     }
     let now_ms = now_ms_i64();
-    let stale_threshold_ms = body.stale_threshold_ms.unwrap_or(15_000);
+    let stale_threshold_ms = body
+        .stale_threshold_ms
+        .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS);
     let _ = require_assignable_node(meta, &body.target_node_id, now_ms, stale_threshold_ms).await?;
     let existing_target = get_tablet_replica(meta, tablet_id, &body.target_node_id).await?;
     let target_applied = existing_target
@@ -2866,12 +3207,14 @@ async fn complete_admin_tablet_replacement(
 ) -> Result<Json<AdminTabletReplacementCompleteResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
-    if tablet.owner_node_id.as_deref() == Some(body.target_node_id.as_str()) {
+    let target_node_id = body.target_node_id.clone();
+    let require_healthy = body.require_healthy.unwrap_or(true);
+    if tablet.owner_node_id.as_deref() == Some(target_node_id.as_str()) {
         return Err(invalid_admin_request(
             "replacement target already owns the tablet",
         ));
     }
-    let source_node_id = body.source_node_id.or(tablet.owner_node_id.clone());
+    let source_node_id = body.source_node_id.clone().or(tablet.owner_node_id.clone());
     if source_node_id.is_none() {
         return Err(invalid_admin_request(
             "tablet replacement requires a current owner or explicit source_node_id",
@@ -2884,25 +3227,19 @@ async fn complete_admin_tablet_replacement(
             )));
         }
     }
-    if tablet.handoff_target_node_id.as_deref() != Some(body.target_node_id.as_str()) {
+    if tablet.handoff_target_node_id.as_deref() != Some(target_node_id.as_str()) {
         return Err(invalid_admin_request(
             "replacement must be prepared before it can be completed",
         ));
     }
-    let target_replica = get_tablet_replica(meta, tablet_id, &body.target_node_id)
+    let mut target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
         .await?
         .ok_or_else(|| {
             invalid_admin_request(format!(
                 "target replica {} does not exist for tablet {tablet_id}",
-                body.target_node_id
+                target_node_id
             ))
         })?;
-    if body.require_healthy.unwrap_or(true) && target_replica.health != "healthy" {
-        return Err(invalid_admin_request(format!(
-            "target replica {} is {}; wait for catch-up or set require_healthy=false",
-            body.target_node_id, target_replica.health
-        )));
-    }
     let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
         get_tablet_replica(meta, tablet_id, source_node_id).await?
     } else {
@@ -2922,14 +3259,151 @@ async fn complete_admin_tablet_replacement(
             "min_applied_index must be non-negative",
         ));
     }
+
+    let mut catch_up_response = None;
+    if body.catch_up.unwrap_or(false)
+        && ((require_healthy && target_replica.health != "healthy")
+            || target_replica.applied_index < required_applied_index)
+    {
+        let attempts = body.catch_up_attempts.unwrap_or(3).max(1);
+        let wait_ms = body.catch_up_wait_ms.unwrap_or(500);
+        for attempt in 0..attempts {
+            catch_up_response = Some(
+                run_raft_catch_up(
+                    &s,
+                    meta,
+                    RaftCatchUpBody {
+                        tablet_id: Some(tablet_id),
+                        target_node_id: Some(target_node_id.clone()),
+                        min_lag: Some(0),
+                        retention_ms: None,
+                        dry_run: Some(false),
+                    },
+                )
+                .await?,
+            );
+            target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid_admin_request(format!(
+                        "target replica {target_node_id} does not exist for tablet {tablet_id}"
+                    ))
+                })?;
+            if target_replica.applied_index >= required_applied_index
+                && (!require_healthy || target_replica.health == "healthy")
+            {
+                break;
+            }
+            if attempt + 1 < attempts && wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+        }
+    }
+    if require_healthy && target_replica.health != "healthy" {
+        return Err(invalid_admin_request(format!(
+            "target replica {} is {}; wait for catch-up or set require_healthy=false",
+            target_node_id, target_replica.health
+        )));
+    }
     if target_replica.applied_index < required_applied_index {
         return Err(invalid_admin_request(format!(
             "target replica {} applied_index {} is below required_applied_index {}",
-            body.target_node_id, target_replica.applied_index, required_applied_index
+            target_node_id, target_replica.applied_index, required_applied_index
         )));
     }
 
     let retire_source = body.retire_source.unwrap_or(false);
+    if retire_source {
+        if let Some(registry) = s.raft_registry.as_ref() {
+            if let Ok(statuses) = registry.status_for(tablet_id) {
+                let local_is_leader = statuses.iter().any(|status| status.role == "Leader");
+                if !local_is_leader {
+                    let leader_id = statuses
+                        .iter()
+                        .find(|status| status.leader_id != 0)
+                        .map(|status| status.leader_id);
+                    if let Some(leader_id) = leader_id {
+                        let Some(leader_node_id) =
+                            resolve_control_plane_node_id(meta, tablet_id, leader_id)
+                                .await
+                                .map_err(internal_error)?
+                        else {
+                            return Err(invalid_admin_request(format!(
+                                "tablet raft leader {leader_id} has no control-plane replica mapping"
+                            )));
+                        };
+                        if source_node_id.as_deref() == Some(leader_node_id.as_str()) {
+                            // Local raft-rs state can temporarily remember this
+                            // node as leader after a restart while the RawNode is
+                            // still catching up. Let the normal local retry path
+                            // report a retryable error instead of forwarding to
+                            // ourselves.
+                        } else if let Some(leader_node) = nodes::get(meta.pool(), &leader_node_id)
+                            .await
+                            .map_err(internal_error)?
+                        {
+                            let uri = format!(
+                                "{}/api/admin/tablets/{tablet_id}/replacement/complete",
+                                leader_node.address.trim_end_matches('/')
+                            );
+                            let response = s
+                                .proxy
+                                .post(&uri)
+                                .json(&body)
+                                .send()
+                                .await
+                                .map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to forward replacement completion to raft leader {leader_node_id}: {err}"
+                                    ))
+                                })?;
+                            let status = response.status();
+                            let bytes = response.bytes().await.map_err(|err| {
+                                internal_error(format!(
+                                    "failed to read raft-leader replacement completion response: {err}"
+                                ))
+                            })?;
+                            if !status.is_success() {
+                                return Err(internal_error(format!(
+                                    "raft-leader replacement completion on {leader_node_id} returned {status}: {}",
+                                    String::from_utf8_lossy(&bytes)
+                                )));
+                            }
+                            let tablet = get_tablet_or_404(meta, tablet_id).await?;
+                            let source_replica =
+                                if let Some(source_node_id) = source_node_id.as_ref() {
+                                    get_tablet_replica(meta, tablet_id, source_node_id).await?
+                                } else {
+                                    None
+                                };
+                            let target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    internal_error(format!(
+                                        "forwarded replacement completed without target replica {target_node_id}"
+                                    ))
+                                })?;
+                            return Ok(Json(AdminTabletReplacementCompleteResponse {
+                                action: "complete_replacement",
+                                changed: true,
+                                new_owner_node_id: tablet.owner_node_id.clone(),
+                                source_node_id,
+                                target_node_id,
+                                required_applied_index,
+                                raft_membership_changed: true,
+                                raft_membership_operations: Vec::new(),
+                                retired_source: retire_source,
+                                tablet: tablet_view(tablet),
+                                source_replica: source_replica.map(tablet_replica_view),
+                                target_replica: tablet_replica_view(target_replica),
+                                catch_up: catch_up_response,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut raft_membership_changed = false;
     let mut raft_membership_operations = Vec::new();
     if let Some(registry) = s.raft_registry.as_ref() {
@@ -2945,15 +3419,15 @@ async fn complete_admin_tablet_replacement(
                         .map(|status| status.leader_id)
                 })
                 .ok_or_else(|| invalid_admin_request("tablet raft group has no known leader"))?;
-            let target_raft_node_id = agentdb_storage::stable_raft_node_id(&body.target_node_id)
-                .map_err(internal_error)?;
+            let target_raft_node_id =
+                agentdb_storage::stable_raft_node_id(&target_node_id).map_err(internal_error)?;
             match registry.promote_to_voter(tablet_id, leader_id, target_raft_node_id) {
                 Ok(()) => {
                     raft_membership_changed = true;
                     raft_membership_operations.push(RaftMembershipOperationStatus {
                         tablet_id,
                         operation: "promote_to_voter",
-                        node_id: body.target_node_id.clone(),
+                        node_id: target_node_id.clone(),
                         raft_node_id: Some(target_raft_node_id),
                         status: "applied",
                         error: None,
@@ -2964,12 +3438,92 @@ async fn complete_admin_tablet_replacement(
                     raft_membership_operations.push(RaftMembershipOperationStatus {
                         tablet_id,
                         operation: "promote_to_voter",
-                        node_id: body.target_node_id.clone(),
+                        node_id: target_node_id.clone(),
                         raft_node_id: Some(target_raft_node_id),
                         status: "failed",
                         error: Some(message.clone()),
                     });
                     return Err(internal_error(message));
+                }
+            }
+            if let Some(source_node_id) = source_node_id.as_ref() {
+                let source_raft_node_id =
+                    agentdb_storage::stable_raft_node_id(source_node_id).map_err(internal_error)?;
+                if leader_id == source_raft_node_id && leader_id != target_raft_node_id {
+                    match registry.transfer_leader(tablet_id, leader_id, target_raft_node_id) {
+                        Ok(()) => {
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: "requested",
+                                error: None,
+                            });
+                            let token = s.internal_auth_token.clone().ok_or_else(|| {
+                                invalid_admin_request(
+                                    "internal auth token is required for raft leader transfer",
+                                )
+                            })?;
+                            let configured_by_tablet =
+                                load_configured_raft_replicas(Some(meta)).await?;
+                            let outbox = RaftRsHttpOutbox::new(token);
+                            outbox.replace_peer_urls(
+                                load_raft_peer_urls(meta, &configured_by_tablet).await?,
+                            );
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let mut observed = false;
+                            loop {
+                                let statuses = registry.status_for(tablet_id).map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to observe raft leader transfer: {err}"
+                                    ))
+                                })?;
+                                if statuses.iter().any(|status| {
+                                    status.node_id == target_raft_node_id && status.role == "Leader"
+                                }) || statuses
+                                    .iter()
+                                    .any(|status| status.leader_id == target_raft_node_id)
+                                {
+                                    observed = true;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    break;
+                                }
+                                outbox.flush_registry_once(registry).await.map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to flush raft leader transfer messages: {err}"
+                                    ))
+                                })?;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: if observed { "observed" } else { "timeout" },
+                                error: (!observed).then(|| {
+                                    format!(
+                                        "target {target_node_id} did not become raft leader before replacement completion"
+                                    )
+                                }),
+                            });
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: "failed",
+                                error: Some(message.clone()),
+                            });
+                            return Err(internal_error(message));
+                        }
+                    }
                 }
             }
             if retire_source {
@@ -3019,7 +3573,7 @@ async fn complete_admin_tablet_replacement(
     tablet_replicas::upsert(
         meta.pool(),
         tablet_id,
-        &body.target_node_id,
+        &target_node_id,
         "voter",
         &target_replica.health,
         target_replica.applied_index,
@@ -3038,9 +3592,14 @@ async fn complete_admin_tablet_replacement(
     let expected_source = source_node_id.clone().ok_or_else(|| {
         invalid_admin_request("source_node_id is required to complete tablet replacement")
     })?;
-    let new_owner = tablets::complete_handoff(meta.pool(), tablet_id, &expected_source)
-        .await
-        .map_err(internal_error)?;
+    let new_owner = tablets::complete_handoff_with_lease(
+        meta.pool(),
+        tablet_id,
+        &expected_source,
+        now_ms_i64().saturating_add(DEFAULT_ADMIN_TABLET_LEASE_MS),
+    )
+    .await
+    .map_err(internal_error)?;
     let changed = new_owner.is_some();
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
     let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
@@ -3056,7 +3615,7 @@ async fn complete_admin_tablet_replacement(
         changed,
         new_owner_node_id: new_owner,
         source_node_id,
-        target_node_id: body.target_node_id,
+        target_node_id,
         required_applied_index,
         raft_membership_changed,
         raft_membership_operations,
@@ -3064,6 +3623,7 @@ async fn complete_admin_tablet_replacement(
         tablet: tablet_view(tablet),
         source_replica: source_replica.map(tablet_replica_view),
         target_replica: tablet_replica_view(target_replica),
+        catch_up: catch_up_response,
     }))
 }
 
@@ -3076,7 +3636,9 @@ async fn rebalance_admin_tablets(
         meta.pool(),
         tablet_rebalance::RebalanceRequest {
             dry_run: body.dry_run,
-            stale_threshold_ms: body.stale_threshold_ms.unwrap_or(15_000),
+            stale_threshold_ms: body
+                .stale_threshold_ms
+                .unwrap_or(DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS),
             max_movements: body.max_movements.unwrap_or(usize::MAX),
         },
         now_ms_i64(),
@@ -3335,17 +3897,34 @@ async fn get_routing_decision(
 
 async fn create_tenant(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateTenantBody>,
 ) -> Result<Json<Tenant>, ApiError> {
     reject_if_draining(&s)?;
-    let t = s
-        .runtime
-        .create_tenant(NewTenant {
+    let tenant_id = match body.tenant_id.as_deref() {
+        Some(raw) => Some(parse_id_or(
+            raw,
+            IdKind::Tenant,
+            agentdb_core::ErrorCode::TenantNotFound,
+        )?),
+        None => None,
+    };
+    let runtime = s.runtime.clone();
+    let tenant = with_route_tablet_context(runtime.clone(), &headers, async move {
+        let req = NewTenant {
             external_key: body.external_key,
             policy: body.policy,
-        })
-        .await?;
-    Ok(Json(t))
+        };
+        match tenant_id {
+            Some(tenant_id) => runtime.create_tenant_with_id(tenant_id, req).await,
+            None => runtime.create_tenant(req).await,
+        }
+    })
+    .await?;
+    if let Some(placement) = body.placement {
+        upsert_create_tenant_policy(&s, tenant.tenant_id.as_str(), placement).await?;
+    }
+    Ok(Json(tenant))
 }
 
 #[derive(Debug, Serialize)]
@@ -3604,10 +4183,18 @@ async fn post_raft_catch_up(
     State(s): State<AppState>,
     Json(body): Json<RaftCatchUpBody>,
 ) -> Result<Json<RaftCatchUpResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    Ok(Json(run_raft_catch_up(&s, meta, body).await?))
+}
+
+async fn run_raft_catch_up(
+    s: &AppState,
+    meta: &agentdb_meta::MetaStore,
+    body: RaftCatchUpBody,
+) -> Result<RaftCatchUpResponse, ApiError> {
     if body.tablet_id.is_some_and(|tablet_id| tablet_id <= 0) {
         return Err(invalid_admin_request("tablet_id must be positive"));
     }
-    let meta = meta_required(&s)?;
     let Some(registry) = s.raft_registry.as_ref() else {
         return Err(invalid_admin_request(
             "raft registry is not configured on this node",
@@ -3860,7 +4447,7 @@ async fn post_raft_catch_up(
         ));
     }
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 async fn get_raft_snapshots(
@@ -4342,23 +4929,93 @@ async fn delete_tenant(
 async fn create_agent(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
     Json(body): Json<CreateAgentBody>,
-) -> Result<Json<Agent>, ApiError> {
+) -> Result<Response, ApiError> {
     reject_if_draining(&s)?;
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
-    let a = s
-        .runtime
-        .create_agent(NewAgent {
-            tenant_id: tid,
-            alias: body.alias,
-            config: body.config,
-        })
-        .await?;
-    Ok(Json(a))
+    let forward_body = serde_json::to_vec(&body).expect("create-agent body must serialize");
+    let route_headers = match guard_routing_key_request(
+        &s,
+        RoutingKeyGuardRequest {
+            tenant_id: &tid,
+            routing_key: Some(tid.as_str()),
+            original_uri: &original_uri,
+            headers: &headers,
+            method: Method::POST,
+            body: Some(forward_body),
+            extra_forward_headers: HeaderMap::new(),
+        },
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let runtime = s.runtime.clone();
+    let agent_tid = tid.clone();
+    let agent = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .create_agent(NewAgent {
+                tenant_id: agent_tid,
+                alias: body.alias,
+                config: body.config,
+            })
+            .await
+    })
+    .await?;
+    Ok(with_headers(Json(agent).into_response(), route_headers))
+}
+
+async fn upsert_create_tenant_policy(
+    state: &AppState,
+    tenant_id: &str,
+    placement: crate::dto::CreateTenantPlacementBody,
+) -> Result<(), ApiError> {
+    let Some(meta) = state.meta.as_ref() else {
+        return Err(invalid_admin_request(
+            "create tenant placement requires metadata-backed routing",
+        ));
+    };
+    tenant_policies::upsert_with_cell(
+        meta.pool(),
+        tenant_id,
+        placement
+            .placement_class
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_PLACEMENT_CLASS),
+        &placement.placement_scope_id,
+        placement
+            .encryption_class
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_ENCRYPTION_CLASS),
+        placement.key_policy_id.as_deref(),
+        placement.encryption_policy_version.unwrap_or(0),
+        placement.policy_version.unwrap_or(0),
+        placement
+            .cell_id
+            .as_deref()
+            .unwrap_or(cells::DEFAULT_CELL_ID),
+        placement
+            .tier
+            .as_deref()
+            .unwrap_or(tenant_policies::DEFAULT_TIER),
+        placement
+            .priority
+            .unwrap_or(tenant_policies::DEFAULT_PRIORITY),
+        now_ms_i64(),
+    )
+    .await
+    .map_err(|err| invalid_admin_request(err.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -4370,17 +5027,44 @@ struct ListAgentsResponse {
 async fn list_agents(
     State(s): State<AppState>,
     Path(tenant_id): Path<String>,
-) -> Result<Json<ListAgentsResponse>, ApiError> {
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let tid = parse_id_or(
         &tenant_id,
         IdKind::Tenant,
         agentdb_core::ErrorCode::TenantNotFound,
     )?;
-    let agents = s.runtime.list_agents(&tid).await?;
-    Ok(Json(ListAgentsResponse {
-        count: agents.len(),
-        agents,
-    }))
+    let route_headers = match guard_routing_key_request(
+        &s,
+        RoutingKeyGuardRequest {
+            tenant_id: &tid,
+            routing_key: Some(tid.as_str()),
+            original_uri: &original_uri,
+            headers: &headers,
+            method: Method::GET,
+            body: None,
+            extra_forward_headers: HeaderMap::new(),
+        },
+    )
+    .await
+    {
+        Ok(headers) => headers,
+        Err(response) => return Ok(response),
+    };
+    let runtime = s.runtime.clone();
+    let agents = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime.list_agents(&tid).await
+    })
+    .await?;
+    Ok(with_headers(
+        Json(ListAgentsResponse {
+            count: agents.len(),
+            agents,
+        })
+        .into_response(),
+        route_headers,
+    ))
 }
 
 async fn get_agent(
@@ -5061,6 +5745,7 @@ async fn build_context(
 
 async fn watch(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(tenant_id): Path<String>,
     Query(q): Query<WatchQuery>,
 ) -> Result<Json<Vec<ChangefeedItem>>, ApiError> {
@@ -5080,17 +5765,20 @@ async fn watch(
         .as_deref()
         .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
         .transpose()?;
-    let items = s
-        .runtime
-        .watch(WatchRequest {
-            tenant_id: tid,
-            scope,
-            session_id,
-            agent_id,
-            from_cursor: q.from_cursor,
-            limit: q.limit.clamp(1, 1000),
-        })
-        .await?;
+    let runtime = s.runtime.clone();
+    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime
+            .watch(WatchRequest {
+                tenant_id: tid,
+                scope,
+                session_id,
+                agent_id,
+                from_cursor: q.from_cursor,
+                limit: q.limit.clamp(1, 1000),
+            })
+            .await
+    })
+    .await?;
     Ok(Json(items))
 }
 
@@ -5280,18 +5968,43 @@ async fn with_route_tablet_context<F, T>(
 where
     F: Future<Output = T>,
 {
-    if let Some(tablet_id) = route_tablet_id(headers) {
-        runtime.with_tablet_context(tablet_id, future).await
+    let context = route_context(headers);
+    if context.tablet_id.is_some()
+        || context.cell_id.is_some()
+        || context.placement_scope_id.is_some()
+        || context.tablet_epoch.is_some()
+    {
+        runtime.with_route_context(context, future).await
     } else {
         future.await
     }
 }
 
+fn route_context(headers: &HeaderMap) -> agentdb_core::runtime::RuntimeRouteContext {
+    agentdb_core::runtime::RuntimeRouteContext {
+        tablet_id: route_tablet_id(headers),
+        cell_id: route_string_header(headers, HDR_CELL_ID),
+        placement_scope_id: route_string_header(headers, HDR_PLACEMENT_SCOPE_ID),
+        tablet_epoch: route_i64_header(headers, HDR_TABLET_EPOCH),
+    }
+}
+
 fn route_tablet_id(headers: &HeaderMap) -> Option<i64> {
+    route_i64_header(headers, HDR_TABLET_ID)
+}
+
+fn route_i64_header(headers: &HeaderMap, name: &'static str) -> Option<i64> {
     headers
-        .get(HDR_TABLET_ID)
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn route_string_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 fn route_shard_id(headers: &HeaderMap) -> Option<i32> {

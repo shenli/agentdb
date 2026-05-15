@@ -20,6 +20,9 @@ public docs path.
   boundaries, request flow, storage, routing, and operational model
 - [architecture/STORAGE_ENGINE.md](architecture/STORAGE_ENGINE.md) - current
   storage engine and replicated tablet/split-LSM improvement plan
+- [architecture/DISTRIBUTED_STORAGE_CLUSTER.md](architecture/DISTRIBUTED_STORAGE_CLUSTER.md)
+  - next-step design for cells, AZ-aware placement, tenant blast radius, and
+  distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
 

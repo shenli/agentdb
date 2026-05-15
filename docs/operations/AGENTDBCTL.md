@@ -46,6 +46,24 @@ agentdbctl tablets list
 agentdbctl raft status
 ```
 
+`agentdbctl status` also prints the local tablet-store layout and sizing when
+the server exposes it, including open domain count, grouped-domain memtable
+budget, and total pending compaction bytes for open domains. Use this after
+deploying AWS or Kubernetes nodes to confirm `grouped_rocksdb`,
+`tablets_per_domain`, `max_open_domains`, and compaction pressure match the
+intended instance memory budget.
+
+Tenant placement:
+
+```bash
+agentdbctl cells list
+agentdbctl tenant-policies list
+agentdbctl tenant-policies upsert --tenant-id ten_123 \
+  --cell-id cell-a --placement-scope-id tenant/acme \
+  --tier paid --priority 100 --placement-class dedicated
+agentdbctl tenant-policies delete ten_123
+```
+
 Drain and undrain a node:
 
 ```bash
@@ -155,23 +173,57 @@ agentdbctl raft snapshots --tablet-id 7
 agentdbctl raft prune-snapshots --dry-run
 ```
 
+Tablet-store maintenance:
+
+```bash
+agentdbctl tablet-store compact --tablet-id 7 --dry-run
+agentdbctl tablet-store compact --tablet-id 7
+```
+
 Backup and restore validation:
 
 ```bash
 agentdbctl backup create --backup-id nightly-2026-05-05 --directory ./backups
+agentdbctl backup create --backup-id tablet-copy --directory ./backups --include-tablet-checkpoints
 agentdbctl backup create --backup-id metadata-only --skip-runtime-summary
 agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
+agentdbctl restore install-tablet-checkpoint \
+  --tablet-id 7 \
+  --checkpoint-dir ./backups/tablet-copy/tablet-stores/tablet-00000000000000000007 \
+  --tablet-store-root /var/lib/agentdb/tablet-stores
 ```
+
+`--include-tablet-checkpoints` checkpoints local physical tablet-store domains
+into the backup manifest. It requires `storage.tablet.layout = "grouped_rocksdb"`
+with `tablets_per_domain = 1`; grouped domains with multiple tablets are
+intentionally rejected because a checkpoint would include unrelated tablet
+state. Restore validation recomputes checkpoint size and checksum from disk and
+rejects mismatches.
+
+`restore install-tablet-checkpoint` is an offline local filesystem operation,
+not an online cluster cutover. Stop the target node first. It restores only
+`grouped_rocksdb` with `--tablets-per-domain 1` and refuses non-empty target
+domains.
 
 Register or remove nodes:
 
 ```bash
+agentdbctl cells upsert \
+  --cell-id prod-c001 \
+  --region us-west-2 \
+  --domain-class standard \
+  --deployment-profile multi_az_standard \
+  --capacity-class stable
+
 agentdbctl nodes register \
   --node-id node-a \
   --address http://10.0.0.10:7878 \
+  --cell-id prod-c001 \
   --region us-west-2 \
-  --availability-zone us-west-2a
+  --availability-zone us-west-2a \
+  --capacity-class stable
 
+agentdbctl cells list
 agentdbctl nodes delete node-a
 ```
 

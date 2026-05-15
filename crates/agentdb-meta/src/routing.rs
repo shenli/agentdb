@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::cells::DEFAULT_CELL_ID;
 use crate::nodes::Node;
+use crate::placement_scopes::{PlacementScope, DEFAULT_PLACEMENT_SCOPE_ID};
 use crate::session_locators::SessionLocator;
 use crate::shards::ShardRow;
 use crate::tablet_ranges::{range_override, TabletRange};
@@ -47,6 +49,8 @@ pub struct RouteRequest<'a> {
     /// compatibility default scope until tenant policy resolution is wired into
     /// the routing caller.
     pub placement_scope_id: Option<&'a str>,
+    /// Logical isolation domain to route within. `None` uses the default cell.
+    pub cell_id: Option<&'a str>,
     pub session_locator: Option<&'a SessionLocator>,
     pub request_location: Option<&'a str>,
     pub local_node_id: Option<&'a str>,
@@ -58,6 +62,8 @@ pub struct RouteRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDecision {
     pub action: RouteAction,
+    pub cell_id: String,
+    pub placement_scope_id: String,
     pub shard_id: i64,
     pub tablet_id: i64,
     pub owner_node_id: Option<String>,
@@ -88,6 +94,8 @@ pub enum RouteReason {
     NodeUnavailable,
     ResidencyDenied,
     WrongLocation,
+    WrongCell,
+    MissingPlacementScope,
     KeyUnavailable,
 }
 
@@ -96,9 +104,37 @@ pub fn plan_route(
     shards: &[ShardRow],
     tablet_ranges: &[TabletRange],
     tablets: &[Tablet],
+    placement_scopes: &[PlacementScope],
     nodes: &[Node],
 ) -> RouteDecision {
     assert!(request.shard_count > 0, "shard_count must be positive");
+    let requested_cell_id = request.cell_id.unwrap_or(DEFAULT_CELL_ID);
+    let placement_scope_id = request
+        .placement_scope_id
+        .unwrap_or(DEFAULT_PLACEMENT_SCOPE_ID);
+    let scope_cell_id = placement_scopes
+        .iter()
+        .find(|scope| scope.placement_scope_id == placement_scope_id)
+        .map(|scope| scope.cell_id.as_str())
+        .or_else(|| (placement_scope_id == DEFAULT_PLACEMENT_SCOPE_ID).then_some(DEFAULT_CELL_ID));
+    let Some(scope_cell_id) = scope_cell_id else {
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            0,
+            0,
+            RouteReason::MissingPlacementScope,
+        );
+    };
+    if scope_cell_id != requested_cell_id {
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            0,
+            0,
+            RouteReason::WrongCell,
+        );
+    }
 
     let shard_id = request
         .session_locator
@@ -109,7 +145,7 @@ pub fn plan_route(
     let tablet_id = request
         .session_locator
         .and_then(|locator| locator.tablet_id)
-        .or_else(|| range_override(tablet_ranges, request.placement_scope_id, shard_id))
+        .or_else(|| range_override(tablet_ranges, Some(placement_scope_id), shard_id))
         .or_else(|| shard_override(shards, shard_id))
         .unwrap_or(shard_id);
 
@@ -123,19 +159,68 @@ pub fn plan_route(
         .collect();
 
     let Some(tablet) = tablets_by_id.get(&tablet_id) else {
-        return unresolved(shard_id, tablet_id, RouteReason::MissingTablet);
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::MissingTablet,
+        );
     };
+    if tablet.placement_scope_id != placement_scope_id {
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::WrongCell,
+        );
+    }
     let Some(owner_node_id) = tablet.owner_node_id.as_deref() else {
-        return unresolved(shard_id, tablet_id, RouteReason::MissingOwner);
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::MissingOwner,
+        );
     };
     if tablet.lease_expires_at_ms <= request.now_ms {
-        return unresolved(shard_id, tablet_id, RouteReason::ExpiredLease);
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::ExpiredLease,
+        );
     }
     let Some(owner) = nodes_by_id.get(owner_node_id) else {
-        return unresolved(shard_id, tablet_id, RouteReason::MissingNode);
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::MissingNode,
+        );
     };
+    if owner.cell_id != requested_cell_id {
+        return reject(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet,
+            owner,
+            RouteReason::WrongCell,
+        );
+    }
     if owner.state != "alive" {
-        return unresolved(shard_id, tablet_id, RouteReason::NodeUnavailable);
+        return unresolved(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet_id,
+            RouteReason::NodeUnavailable,
+        );
     }
 
     let owner_location = owner_route_location(owner).map(str::to_string);
@@ -148,14 +233,28 @@ pub fn plan_route(
                 .any(|allowed| allowed == loc)
         })
     {
-        return reject(shard_id, tablet, owner, RouteReason::ResidencyDenied);
+        return reject(
+            requested_cell_id,
+            placement_scope_id,
+            shard_id,
+            tablet,
+            owner,
+            RouteReason::ResidencyDenied,
+        );
     }
     if !request.policy.allow_cross_location {
         if let (Some(request_location), Some(owner_location)) =
             (request.request_location, owner_location.as_deref())
         {
             if request_location != owner_location {
-                return reject(shard_id, tablet, owner, RouteReason::WrongLocation);
+                return reject(
+                    requested_cell_id,
+                    placement_scope_id,
+                    shard_id,
+                    tablet,
+                    owner,
+                    RouteReason::WrongLocation,
+                );
             }
         }
     }
@@ -167,6 +266,8 @@ pub fn plan_route(
     };
     RouteDecision {
         action,
+        cell_id: requested_cell_id.to_string(),
+        placement_scope_id: placement_scope_id.to_string(),
         shard_id,
         tablet_id,
         owner_node_id: Some(owner.node_id.clone()),
@@ -206,9 +307,17 @@ fn shard_override(shards: &[ShardRow], shard_id: i64) -> Option<i64> {
         .and_then(|row| row.tablet_id)
 }
 
-fn unresolved(shard_id: i64, tablet_id: i64, reason: RouteReason) -> RouteDecision {
+fn unresolved(
+    cell_id: &str,
+    placement_scope_id: &str,
+    shard_id: i64,
+    tablet_id: i64,
+    reason: RouteReason,
+) -> RouteDecision {
     RouteDecision {
         action: RouteAction::Unassigned,
+        cell_id: cell_id.to_string(),
+        placement_scope_id: placement_scope_id.to_string(),
         shard_id,
         tablet_id,
         owner_node_id: None,
@@ -219,9 +328,18 @@ fn unresolved(shard_id: i64, tablet_id: i64, reason: RouteReason) -> RouteDecisi
     }
 }
 
-fn reject(shard_id: i64, tablet: &Tablet, owner: &Node, reason: RouteReason) -> RouteDecision {
+fn reject(
+    cell_id: &str,
+    placement_scope_id: &str,
+    shard_id: i64,
+    tablet: &Tablet,
+    owner: &Node,
+    reason: RouteReason,
+) -> RouteDecision {
     RouteDecision {
         action: RouteAction::Reject,
+        cell_id: cell_id.to_string(),
+        placement_scope_id: placement_scope_id.to_string(),
         shard_id,
         tablet_id: tablet.tablet_id,
         owner_node_id: Some(owner.node_id.clone()),
@@ -253,6 +371,21 @@ mod tests {
             joined_at_ms: 100,
             availability_zone: Some(format!("{location}a")),
             region: Some(location.into()),
+            cell_id: DEFAULT_CELL_ID.into(),
+            capacity_class: "stable".into(),
+        }
+    }
+
+    fn scope(id: &str, cell_id: &str) -> PlacementScope {
+        PlacementScope {
+            placement_scope_id: id.into(),
+            kind: "dedicated_tenant".into(),
+            shard_count: 16,
+            hash_seed: None,
+            state: "serving".into(),
+            epoch: 0,
+            created_at_ms: 0,
+            cell_id: cell_id.into(),
         }
     }
 
@@ -288,6 +421,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 3, Some(99))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -304,6 +438,7 @@ mod tests {
             }],
             &[],
             &[tablet(99, Some("node-a"), 2_000)],
+            &[],
             &[node("node-a", "us-west-2a")],
         );
 
@@ -323,6 +458,7 @@ mod tests {
             tenant_id: "tenant-a",
             routing_key: Some("session-a"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: None,
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -340,6 +476,7 @@ mod tests {
             }],
             &[],
             &[tablet(42, Some("node-b"), 2_000)],
+            &[],
             &[node("node-b", "us-west-2a")],
         );
 
@@ -354,6 +491,7 @@ mod tests {
             tenant_id: "tenant-a",
             routing_key: Some("session-a"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: None,
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -378,6 +516,7 @@ mod tests {
                 updated_at_ms: 0,
             }],
             &[tablet(42, Some("node-b"), 2_000)],
+            &[],
             &[node("node-b", "us-west-2a")],
         );
 
@@ -391,6 +530,7 @@ mod tests {
             tenant_id: "tenant-a",
             routing_key: Some("session-a"),
             placement_scope_id: Some("tenant/acme"),
+            cell_id: Some("cell-a"),
             session_locator: None,
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-a"),
@@ -419,8 +559,15 @@ mod tests {
                     updated_at_ms: 0,
                 },
             ],
-            &[tablet(42, Some("node-b"), 2_000)],
-            &[node("node-b", "us-west-2a")],
+            &[Tablet {
+                placement_scope_id: "tenant/acme".into(),
+                ..tablet(42, Some("node-b"), 2_000)
+            }],
+            &[scope("tenant/acme", "cell-a")],
+            &[Node {
+                cell_id: "cell-a".into(),
+                ..node("node-b", "us-west-2a")
+            }],
         );
 
         assert_eq!(decision.action, RouteAction::Forward);
@@ -445,6 +592,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: None,
             local_node_id: Some("node-a"),
@@ -457,6 +605,7 @@ mod tests {
             &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
+            &[],
             &[node("node-a", "us-west-2a")],
         );
 
@@ -470,6 +619,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
@@ -485,6 +635,7 @@ mod tests {
             &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
+            &[],
             &[node("node-a", "us-west-2a")],
         );
 
@@ -501,6 +652,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2"),
             local_node_id: Some("node-local"),
@@ -516,6 +668,7 @@ mod tests {
             &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
+            &[],
             &[owner],
         );
 
@@ -532,6 +685,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("us-west-2a"),
             local_node_id: Some("node-local"),
@@ -547,6 +701,7 @@ mod tests {
             &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
+            &[],
             &[owner],
         );
 
@@ -560,6 +715,7 @@ mod tests {
             tenant_id: "ten_1",
             routing_key: Some("ses_1"),
             placement_scope_id: None,
+            cell_id: None,
             session_locator: Some(&locator("ses_1", 1, Some(1))),
             request_location: Some("eu-central-1a"),
             local_node_id: Some("node-local"),
@@ -575,6 +731,7 @@ mod tests {
             &[],
             &[],
             &[tablet(1, Some("node-a"), 2_000)],
+            &[],
             &[node("node-a", "us-west-2a")],
         );
 

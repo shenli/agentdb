@@ -196,6 +196,7 @@ Before exposing a maintained node:
   bootstrap model
 - [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
   procedures
+- [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md) - evaluation cluster alert triage
 - [PERFORMANCE.md](PERFORMANCE.md) - benchmark notes and current caveats
 - [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
   process, storage, routing, and lifecycle implementation

@@ -10,6 +10,7 @@ name = "agentdb-bench"
 path = "src/main.rs"
 
 [dependencies]
+agentdb-storage = { path = "../../crates/agentdb-storage" }
 anyhow = { workspace = true }
 bson = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }

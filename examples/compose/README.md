@@ -57,6 +57,17 @@ dev = false
 [storage]
 data_dir = "/data/runtime"
 content_dir = "/data/content"
+
+[storage.tablet]
+layout = "grouped_rocksdb"
+root_dir = "/data/runtime/tablet-stores"
+tablets_per_domain = 32
+max_open_domains = 16
+domain_write_buffer_size_mib = 16
+domain_max_write_buffers = 2
+domain_parallelism = 1
+domain_max_background_jobs = 1
+domain_max_open_files = 128
 ```
 
 To override it, bind-mount your own config file and set the command to

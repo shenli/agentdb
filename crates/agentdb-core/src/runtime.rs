@@ -29,8 +29,9 @@ use agentdb_storage::content_crypto::{decode_keyed_envelope, encode_keyed_envelo
 use agentdb_storage::{
     AllowAllKmsKeyResolver, ContentCryptoAdapter, ContentCryptoContext,
     IdentityContentCryptoAdapter, IdentityMetadataCryptoAdapter, KeyOperation, KeyResolution,
-    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter, ReplicatedLog,
-    TabletKvStore, WriteOp,
+    KmsError, KmsKeyResolver, KvIter, KvSnapshot, KvStore, MetadataCryptoAdapter,
+    PrefixScopedTabletStore, ReplicatedLog, TabletKvStore, TabletStoreLifecycle,
+    TabletStoreManifest, WriteOp,
 };
 
 use crate::agent::{Agent, NewAgent};
@@ -67,6 +68,15 @@ static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalescePro
 
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
+    static CURRENT_RUNTIME_ROUTE_CONTEXT: RuntimeRouteContext;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeRouteContext {
+    pub tablet_id: Option<i64>,
+    pub cell_id: Option<String>,
+    pub placement_scope_id: Option<String>,
+    pub tablet_epoch: Option<i64>,
 }
 
 #[derive(Default)]
@@ -511,7 +521,26 @@ pub struct WatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangefeedItem {
     pub cursor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_index: Option<u64>,
     pub event: EventEnvelope,
+}
+
+#[derive(Debug, Clone)]
+struct ChangefeedCursorContext {
+    cell_id: Option<String>,
+    placement_scope_id: Option<String>,
+    tablet_id: Option<i64>,
+    tablet_epoch: Option<i64>,
+    applied_index: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -877,14 +906,12 @@ struct RuntimeTabletKvStore {
 
 impl RuntimeTabletKvStore {
     fn new(
-        kv: Arc<dyn KvStore + Send + Sync>,
-        tablet_id: i64,
+        store: TabletKvStore,
         state_machine: Arc<dyn TabletStateMachine>,
     ) -> agentdb_storage::Result<Self> {
-        let store = Arc::new(TabletKvStore::new(kv, tablet_id)?);
         state_machine.apply_committed()?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             state_machine,
         })
     }
@@ -893,21 +920,25 @@ impl RuntimeTabletKvStore {
         kv: Arc<dyn KvStore + Send + Sync>,
         tablet_id: i64,
     ) -> agentdb_storage::Result<Self> {
+        let store = TabletKvStore::new(kv.clone(), tablet_id)?;
         let state_machine = Arc::new(LoggedTabletStateMachine::single_node(
             kv.clone(),
             tablet_id,
         )?);
-        Self::new(kv, tablet_id, state_machine)
+        Self::new(store, state_machine)
     }
 
     fn logged(
-        kv: Arc<dyn KvStore + Send + Sync>,
+        store: TabletKvStore,
         tablet_id: i64,
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> agentdb_storage::Result<(Self, Arc<LoggedTabletStateMachine>)> {
-        let tablet_store = TabletKvStore::new(kv.clone(), tablet_id)?;
-        let state_machine = Arc::new(LoggedTabletStateMachine::new(tablet_id, log, tablet_store)?);
-        let kv_store = Self::new(kv, tablet_id, state_machine.clone())?;
+        let state_machine = Arc::new(LoggedTabletStateMachine::new(
+            tablet_id,
+            log,
+            store.clone(),
+        )?);
+        let kv_store = Self::new(store, state_machine.clone())?;
         Ok((kv_store, state_machine))
     }
 }
@@ -966,7 +997,7 @@ struct RuntimeTabletHandle {
 }
 
 struct RuntimeTabletRouterKvStore {
-    kv: Arc<dyn KvStore + Send + Sync>,
+    store_lifecycle: Arc<dyn TabletStoreLifecycle>,
     default_tablet_id: i64,
     tablets: RwLock<BTreeMap<i64, RuntimeTabletHandle>>,
 }
@@ -974,6 +1005,18 @@ struct RuntimeTabletRouterKvStore {
 impl RuntimeTabletRouterKvStore {
     fn new(
         kv: Arc<dyn KvStore + Send + Sync>,
+        default_tablet_id: i64,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> agentdb_storage::Result<Self> {
+        Self::new_with_lifecycle(
+            Arc::new(PrefixScopedTabletStore::new(kv)),
+            default_tablet_id,
+            logs,
+        )
+    }
+
+    fn new_with_lifecycle(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
         default_tablet_id: i64,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> agentdb_storage::Result<Self> {
@@ -989,8 +1032,8 @@ impl RuntimeTabletRouterKvStore {
         }
         let mut tablets = BTreeMap::new();
         for (tablet_id, log) in logs {
-            let (kv_store, state_machine) =
-                RuntimeTabletKvStore::logged(kv.clone(), tablet_id, log)?;
+            let store = store_lifecycle.open_tablet_store(tablet_id)?;
+            let (kv_store, state_machine) = RuntimeTabletKvStore::logged(store, tablet_id, log)?;
             tablets.insert(
                 tablet_id,
                 RuntimeTabletHandle {
@@ -1000,7 +1043,7 @@ impl RuntimeTabletRouterKvStore {
             );
         }
         Ok(Self {
-            kv,
+            store_lifecycle,
             default_tablet_id,
             tablets: RwLock::new(tablets),
         })
@@ -1018,8 +1061,8 @@ impl RuntimeTabletRouterKvStore {
         if tablets.contains_key(&tablet_id) {
             return Ok(false);
         }
-        let (kv_store, state_machine) =
-            RuntimeTabletKvStore::logged(self.kv.clone(), tablet_id, log)?;
+        let store = self.store_lifecycle.open_tablet_store(tablet_id)?;
+        let (kv_store, state_machine) = RuntimeTabletKvStore::logged(store, tablet_id, log)?;
         tablets.insert(
             tablet_id,
             RuntimeTabletHandle {
@@ -1167,6 +1210,37 @@ impl RuntimeTabletRouterKvStore {
         }
         stats.sort_by_key(|stats| stats.tablet_id);
         Ok(stats)
+    }
+
+    fn domain_metrics(
+        &self,
+    ) -> agentdb_storage::Result<Vec<agentdb_storage::TabletStoreDomainMetrics>> {
+        self.store_lifecycle.domain_metrics()
+    }
+
+    fn compact_tablet_store(&self, tablet_id: i64) -> agentdb_storage::Result<()> {
+        self.store_lifecycle.compact_tablet(tablet_id)
+    }
+
+    fn checkpoint_tablet_store(
+        &self,
+        tablet_id: i64,
+        out_dir: &std::path::Path,
+    ) -> agentdb_storage::Result<TabletStoreManifest> {
+        let applied_index = self.with_handle(tablet_id, |handle| {
+            handle.state_machine.apply_committed()?;
+            Ok(handle.state_machine.applied_index())
+        })?;
+        let mut manifest = self.store_lifecycle.checkpoint_tablet(tablet_id, out_dir)?;
+        manifest.latest_applied_index = applied_index;
+        Ok(manifest)
+    }
+
+    fn applied_index(&self, tablet_id: i64) -> agentdb_storage::Result<u64> {
+        self.with_handle(tablet_id, |handle| {
+            handle.state_machine.apply_committed()?;
+            Ok(handle.state_machine.applied_index())
+        })
     }
 
     fn apply_committed(&self) -> agentdb_storage::Result<usize> {
@@ -1476,6 +1550,33 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
         vector_index,
         global_record_index,
     }
+}
+
+fn reconcile_session_next_seq_from_persisted_events(
+    state: &mut State,
+    tenant_id: &Id,
+    session_id: &Id,
+    max_seq: u64,
+) -> Result<()> {
+    let Some(session) = state.sessions.get_mut(session_id.as_str()) else {
+        return Ok(());
+    };
+    if session.tenant_id.as_str() != tenant_id.as_str() {
+        return Ok(());
+    }
+    if session.next_seq > max_seq {
+        return Ok(());
+    }
+    session.next_seq = max_seq.checked_add(1).ok_or_else(|| {
+        Error::new(
+            ErrorCode::Internal,
+            "persisted session event sequence overflow",
+        )
+    })?;
+    if session.warm_head_from_seq > session.next_seq {
+        session.warm_head_from_seq = session.next_seq;
+    }
+    Ok(())
 }
 
 impl Runtime {
@@ -1838,13 +1939,14 @@ impl Runtime {
         log: Arc<dyn ReplicatedLog + Send + Sync>,
     ) -> Arc<Self> {
         let logs = BTreeMap::from([(RUNTIME_PRIMARY_TABLET_ID, log)]);
-        Self::with_kv_kms_content_metadata_and_replicated_logs(
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
             kv,
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
             logs,
+            RUNTIME_PRIMARY_TABLET_ID,
         )
     }
 
@@ -1853,13 +1955,68 @@ impl Runtime {
         content: Arc<dyn ContentBackend>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
-        Self::with_kv_kms_content_metadata_and_replicated_logs(
+        Self::with_kv_and_replicated_logs_for_default_tablet(
+            kv,
+            content,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_kv_and_replicated_logs_for_default_tablet(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
             kv,
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
             logs,
+            default_tablet_id,
+        )
+    }
+
+    pub fn with_tablet_store_lifecycle_and_replicated_logs(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+    ) -> Arc<Self> {
+        Self::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+            store_lifecycle,
+            content,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+        store_lifecycle: Arc<dyn TabletStoreLifecycle>,
+        content: Arc<dyn ContentBackend>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
+        let tablet_router = Arc::new(
+            RuntimeTabletRouterKvStore::new_with_lifecycle(
+                store_lifecycle,
+                default_tablet_id,
+                logs,
+            )
+            .expect("open runtime tablet router"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            tablet_router.clone(),
+            Arc::new(IdentityMetadataCryptoAdapter),
+        );
+        Self::from_persist_with_tablet_router(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            Some(tablet_router),
         )
     }
 
@@ -1890,8 +2047,28 @@ impl Runtime {
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
         logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
     ) -> Arc<Self> {
+        Self::with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
+            kv,
+            content,
+            kms,
+            content_crypto,
+            metadata_crypto,
+            logs,
+            RUNTIME_PRIMARY_TABLET_ID,
+        )
+    }
+
+    pub fn with_kv_kms_content_metadata_and_replicated_logs_for_default_tablet(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+        logs: BTreeMap<i64, Arc<dyn ReplicatedLog + Send + Sync>>,
+        default_tablet_id: i64,
+    ) -> Arc<Self> {
         let tablet_router = Arc::new(
-            RuntimeTabletRouterKvStore::new(kv, RUNTIME_PRIMARY_TABLET_ID, logs)
+            RuntimeTabletRouterKvStore::new(kv, default_tablet_id, logs)
                 .expect("open runtime tablet router"),
         );
         let persist = Persist::with_metadata_crypto(tablet_router.clone(), metadata_crypto);
@@ -1950,7 +2127,27 @@ impl Runtime {
     where
         F: Future<Output = T>,
     {
-        CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future).await
+        self.with_route_context(
+            RuntimeRouteContext {
+                tablet_id: Some(tablet_id),
+                ..RuntimeRouteContext::default()
+            },
+            future,
+        )
+        .await
+    }
+
+    pub async fn with_route_context<F, T>(&self, context: RuntimeRouteContext, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Some(tablet_id) = context.tablet_id {
+            CURRENT_RUNTIME_ROUTE_CONTEXT
+                .scope(context, CURRENT_RUNTIME_TABLET_ID.scope(tablet_id, future))
+                .await
+        } else {
+            CURRENT_RUNTIME_ROUTE_CONTEXT.scope(context, future).await
+        }
     }
 
     fn session_commit_lock(&self, session_id: &Id) -> Arc<Mutex<()>> {
@@ -2107,6 +2304,63 @@ impl Runtime {
             return Ok(Vec::new());
         };
         router.storage_stats().map_err(internal)
+    }
+
+    pub fn local_tablet_store_domain_metrics(
+        &self,
+    ) -> Result<Vec<agentdb_storage::TabletStoreDomainMetrics>> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Ok(Vec::new());
+        };
+        router.domain_metrics().map_err(internal)
+    }
+
+    pub fn compact_tablet_store(&self, tablet_id: i64) -> Result<()> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "tablet-store compaction requires a replicated tablet router",
+            ));
+        };
+        router.compact_tablet_store(tablet_id).map_err(internal)
+    }
+
+    pub fn checkpoint_tablet_store(
+        &self,
+        tablet_id: i64,
+        out_dir: &std::path::Path,
+    ) -> Result<TabletStoreManifest> {
+        let Some(router) = self.tablet_router.as_ref() else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "tablet-store checkpoint requires a replicated tablet router",
+            ));
+        };
+        router
+            .checkpoint_tablet_store(tablet_id, out_dir)
+            .map_err(internal)
+    }
+
+    fn changefeed_cursor_context(&self) -> Result<ChangefeedCursorContext> {
+        let route_context = CURRENT_RUNTIME_ROUTE_CONTEXT
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        let tablet_id = route_context
+            .tablet_id
+            .or_else(RuntimeTabletRouterKvStore::current_tablet_id);
+        let applied_index = match (self.tablet_router.as_ref(), tablet_id) {
+            (Some(router), Some(tablet_id)) => {
+                Some(router.applied_index(tablet_id).map_err(internal)?)
+            }
+            _ => None,
+        };
+        Ok(ChangefeedCursorContext {
+            cell_id: route_context.cell_id,
+            placement_scope_id: route_context.placement_scope_id,
+            tablet_id,
+            tablet_epoch: route_context.tablet_epoch,
+            applied_index,
+        })
     }
 
     pub fn compact_tablet_log_through(&self, tablet_id: i64, up_to_index: u64) -> Result<usize> {
@@ -2805,8 +3059,19 @@ impl Runtime {
     }
 
     pub async fn create_tenant(&self, req: NewTenant) -> Result<Tenant> {
+        self.create_tenant_with_id(Id::new(IdKind::Tenant), req)
+            .await
+    }
+
+    pub async fn create_tenant_with_id(&self, tenant_id: Id, req: NewTenant) -> Result<Tenant> {
         let t = {
             let mut s = self.state.lock().await;
+            if s.tenants.contains_key(tenant_id.as_str()) {
+                return Err(Error::new(
+                    ErrorCode::IdempotencyConflict,
+                    format!("tenant_id already in use: {tenant_id}"),
+                ));
+            }
             // External keys are tenant-name slots; a duplicate is an
             // unrecoverable client error (not a retry), so we surface it as
             // AliasConflict rather than IdempotencyConflict.
@@ -2816,7 +3081,7 @@ impl Runtime {
                     format!("tenant external_key already in use: {}", req.external_key),
                 ));
             }
-            let t = Tenant::create(req);
+            let t = Tenant::create_with_id(tenant_id, req);
             s.tenants
                 .insert(t.tenant_id.as_str().to_string(), t.clone());
             if !t.external_key.is_empty() {
@@ -4869,6 +5134,21 @@ impl Runtime {
             }
             return;
         }
+        let persisted_session_max_seq = match self.persist.as_ref() {
+            Some(persist) => {
+                match persist.max_event_seq(jobs[0].req.tenant_id.as_str(), session_id.as_str()) {
+                    Ok(max_seq) => max_seq,
+                    Err(err) => {
+                        let err = internal(err);
+                        for job in jobs {
+                            let _ = job.done.send(Err(err.clone()));
+                        }
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
 
         let mut prepared = Vec::with_capacity(jobs.len());
         let mut final_session_snapshot: Option<Session> = None;
@@ -4876,11 +5156,24 @@ impl Runtime {
 
         let prepare_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         {
-            let s = self.state.lock().await;
+            let mut s = self.state.lock().await;
             if let Some(started) = prepare_lock_wait_started {
                 coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
             }
             let prepare_work_started = coalesce_profile.map(|_| Instant::now());
+            if let Some(max_seq) = persisted_session_max_seq {
+                if let Err(err) = reconcile_session_next_seq_from_persisted_events(
+                    &mut s,
+                    &jobs[0].req.tenant_id,
+                    &session_id,
+                    max_seq,
+                ) {
+                    for job in jobs {
+                        let _ = job.done.send(Err(err.clone()));
+                    }
+                    return;
+                }
+            }
             let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
             let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
             for job in jobs {
@@ -5223,8 +5516,15 @@ impl Runtime {
         if let Some(started) = session_lock_wait_started {
             path_sample.session_lock_wait_nanos = started.elapsed().as_nanos();
         }
+        let persisted_session_max_seq = self
+            .persist
+            .as_ref()
+            .map(|persist| persist.max_event_seq(req.tenant_id.as_str(), req.session_id.as_str()))
+            .transpose()
+            .map_err(internal)?
+            .flatten();
         let initial_state_lock_wait_started = path_profile.map(|_| Instant::now());
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
         if let Some(started) = initial_state_lock_wait_started {
             path_sample.initial_state_lock_wait_nanos = started.elapsed().as_nanos();
         }
@@ -5244,6 +5544,14 @@ impl Runtime {
                     backpressure_complete: false,
                 });
             }
+        }
+        if let Some(max_seq) = persisted_session_max_seq {
+            reconcile_session_next_seq_from_persisted_events(
+                &mut s,
+                &req.tenant_id,
+                &req.session_id,
+                max_seq,
+            )?;
         }
 
         let policy = match resolved_policy {
@@ -5831,8 +6139,9 @@ impl Runtime {
         });
 
         let mut out = Vec::new();
+        let cursor_context = self.changefeed_cursor_context()?;
         for event in events {
-            let cursor = event_cursor(&event);
+            let cursor = event_cursor(&event, &cursor_context);
             if req
                 .from_cursor
                 .as_ref()
@@ -5840,7 +6149,15 @@ impl Runtime {
             {
                 continue;
             }
-            out.push(ChangefeedItem { cursor, event });
+            out.push(ChangefeedItem {
+                cursor,
+                cell_id: cursor_context.cell_id.clone(),
+                placement_scope_id: cursor_context.placement_scope_id.clone(),
+                tablet_id: cursor_context.tablet_id,
+                tablet_epoch: cursor_context.tablet_epoch,
+                applied_index: cursor_context.applied_index,
+                event,
+            });
             if out.len() >= req.limit {
                 break;
             }
@@ -7118,10 +7435,28 @@ fn push_budgeted<T: Serialize>(used: &mut usize, max_bytes: usize, value: &T) ->
     true
 }
 
-fn event_cursor(event: &EventEnvelope) -> String {
+fn event_cursor(event: &EventEnvelope, context: &ChangefeedCursorContext) -> String {
+    let cell = context.cell_id.as_deref().unwrap_or("none");
+    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
+    let tablet = context
+        .tablet_id
+        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
+    let epoch = context
+        .tablet_epoch
+        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
+    let applied = context
+        .applied_index
+        .map_or_else(|| "none".to_string(), |index| index.to_string());
     format!(
-        "{:020}:{}:{:020}",
-        event.created_at_ms, event.session_id, event.seq
+        "v2:{:020}:{}:{:020}:cell={}:scope={}:tablet={}:epoch={}:applied={}",
+        event.created_at_ms,
+        event.session_id,
+        event.seq,
+        cell,
+        placement_scope,
+        tablet,
+        epoch,
+        applied
     )
 }
 

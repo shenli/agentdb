@@ -15,6 +15,31 @@ pub struct CreateTenantBody {
     pub external_key: String,
     #[serde(default = "default_policy")]
     pub policy: serde_json::Value,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub placement: Option<CreateTenantPlacementBody>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateTenantPlacementBody {
+    pub placement_scope_id: String,
+    #[serde(default)]
+    pub cell_id: Option<String>,
+    #[serde(default)]
+    pub placement_class: Option<String>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub encryption_class: Option<String>,
+    #[serde(default)]
+    pub key_policy_id: Option<String>,
+    #[serde(default)]
+    pub encryption_policy_version: Option<i64>,
+    #[serde(default)]
+    pub policy_version: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

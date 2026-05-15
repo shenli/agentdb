@@ -32,7 +32,7 @@ const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
 const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
-const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 15_000;
+const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
 const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
@@ -124,6 +124,18 @@ struct ServeOpts {
     /// only populated the prototype location label.
     #[arg(long)]
     route_region: Option<String>,
+
+    /// Logical isolation cell for this node.
+    #[arg(long)]
+    route_cell_id: Option<String>,
+
+    /// Availability zone / failure-domain label for this node.
+    #[arg(long)]
+    route_availability_zone: Option<String>,
+
+    /// Capacity class for this node: stable, mixed, or preemptible.
+    #[arg(long)]
+    route_capacity_class: Option<String>,
 
     /// Older location label. Prefer `--route-region` for new deployments.
     #[arg(long)]
@@ -309,12 +321,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     if matches!(config.deployment_mode, DeploymentMode::Cluster)
         && !runtime_raft_logs
             .as_ref()
-            .is_some_and(|logs| logs.contains_key(&agentdb_core::RUNTIME_PRIMARY_TABLET_ID))
+            .is_some_and(|logs| logs.contains_key(&config.route_default_tablet_id))
     {
         anyhow::bail!(
-            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime primary tablet {}",
+            "deployment.mode=cluster requires local node {} to be a voter or learner for runtime default tablet {}",
             config.route_node_id.as_deref().unwrap_or("<missing-node-id>"),
-            agentdb_core::RUNTIME_PRIMARY_TABLET_ID
+            config.route_default_tablet_id
         );
     }
     let (runtime, content_mirror) = if config.in_memory {
@@ -345,12 +357,58 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
                 tablet_count = logs.len(),
+                tablet_store_layout = ?config.tablet_store_layout,
                 "opened runtime with raft-rs replicated tablet logs"
             );
-            (
-                agentdb_core::Runtime::with_kv_and_replicated_logs(kv, content, logs),
-                content_mirror,
-            )
+            let runtime = match config.tablet_store_layout {
+                TabletStoreLayoutKind::PrefixScoped => {
+                    agentdb_core::Runtime::with_kv_and_replicated_logs_for_default_tablet(
+                        kv,
+                        content,
+                        logs,
+                        config.route_default_tablet_id,
+                    )
+                }
+                TabletStoreLayoutKind::GroupedRocksDb => {
+                    std::fs::create_dir_all(&config.tablet_store_root_dir)?;
+                    let rocks_config = agentdb_storage::RocksKvStoreConfig {
+                        write_buffer_size_bytes: config.tablet_store_domain_write_buffer_size_mib
+                            * 1024
+                            * 1024,
+                        max_write_buffer_number: config.tablet_store_domain_max_write_buffers,
+                        parallelism: config.tablet_store_domain_parallelism,
+                        max_background_jobs: config.tablet_store_domain_max_background_jobs,
+                        max_open_files: config.tablet_store_domain_max_open_files,
+                        ..agentdb_storage::RocksKvStoreConfig::tablet_domain()
+                    };
+                    let lifecycle = Arc::new(
+                        agentdb_storage::GroupedRocksDbTabletStore::new_with_rocks_config(
+                            config.tablet_store_root_dir.clone(),
+                            config.tablet_store_tablets_per_domain,
+                            config.tablet_store_max_open_domains,
+                            rocks_config,
+                        ),
+                    );
+                    tracing::info!(
+                        root_dir = %config.tablet_store_root_dir.display(),
+                        tablets_per_domain = config.tablet_store_tablets_per_domain,
+                        max_open_domains = config.tablet_store_max_open_domains,
+                        domain_write_buffer_size_mib = config.tablet_store_domain_write_buffer_size_mib,
+                        domain_max_write_buffers = config.tablet_store_domain_max_write_buffers,
+                        domain_parallelism = config.tablet_store_domain_parallelism,
+                        domain_max_background_jobs = config.tablet_store_domain_max_background_jobs,
+                        domain_max_open_files = config.tablet_store_domain_max_open_files,
+                        "opened grouped RocksDB tablet-store lifecycle"
+                    );
+                    agentdb_core::Runtime::with_tablet_store_lifecycle_and_replicated_logs_for_default_tablet(
+                        lifecycle,
+                        content,
+                        logs,
+                        config.route_default_tablet_id,
+                    )
+                }
+            };
+            (runtime, content_mirror)
         } else {
             (agentdb_core::Runtime::with_kv(kv, content), content_mirror)
         }
@@ -392,12 +450,12 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
     }
 
-    let mut state = agentdb_api::AppState::new(runtime.clone()).with_proxy_policy(
-        agentdb_api::state::ProxyPolicy {
+    let mut state = agentdb_api::AppState::new(runtime.clone())
+        .with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
-        },
-    );
+        })
+        .with_tablet_store_status(tablet_store_status(&config));
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror);
     }
@@ -432,6 +490,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 raft_registry: raft_registry.clone(),
                 node_address,
                 region: config.route_region.clone(),
+                cell_id: config.route_cell_id.clone(),
+                availability_zone: config.route_availability_zone.clone(),
+                capacity_class: config.route_capacity_class.clone(),
                 scheduler_status: startup.scheduler_status.clone(),
                 drain: state.drain.clone(),
             },
@@ -593,6 +654,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         tracing::info!(
             node_id = %startup.node_id,
             shard_count = config.route_shard_count,
+            cell_id = %config.route_cell_id,
+            availability_zone = ?config.route_availability_zone,
+            capacity_class = %config.route_capacity_class,
             location = ?route_location,
             refresh_interval_ms = config.route_refresh_interval_ms,
             "enabled metadata-backed route snapshot"
@@ -631,6 +695,9 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         route_node_id: None,
         route_shard_count: None,
         route_region: None,
+        route_cell_id: None,
+        route_availability_zone: None,
+        route_capacity_class: None,
         route_location: None,
         route_refresh_interval_ms: None,
         route_proxy_timeout_ms: None,
@@ -655,12 +722,25 @@ struct ResolvedServeConfig {
     data_dir: PathBuf,
     content_dir: PathBuf,
     kv_backend: KvBackendKind,
+    tablet_store_layout: TabletStoreLayoutKind,
+    tablet_store_root_dir: PathBuf,
+    tablet_store_tablets_per_domain: i64,
+    tablet_store_max_open_domains: usize,
+    tablet_store_domain_write_buffer_size_mib: usize,
+    tablet_store_domain_max_write_buffers: i32,
+    tablet_store_domain_parallelism: i32,
+    tablet_store_domain_max_background_jobs: i32,
+    tablet_store_domain_max_open_files: i32,
     content_backend: ContentBackendKind,
     object_store: Option<ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<String>,
     route_shard_count: i64,
+    route_default_tablet_id: i64,
     route_region: Option<String>,
+    route_cell_id: String,
+    route_availability_zone: Option<String>,
+    route_capacity_class: String,
     route_location: Option<String>,
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
@@ -829,6 +909,21 @@ enum KvBackendKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabletStoreLayoutKind {
+    PrefixScoped,
+    GroupedRocksDb,
+}
+
+impl TabletStoreLayoutKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefixScoped => "prefix_scoped",
+            Self::GroupedRocksDb => "grouped_rocksdb",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContentBackendKind {
     LocalFs,
     ObjectStore,
@@ -864,6 +959,42 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let tablet_store_layout = resolve_tablet_store_layout(&file.storage.tablet)?;
+        let tablet_store_root_dir = file
+            .storage
+            .tablet
+            .root_dir
+            .unwrap_or_else(|| data_dir.join("tablet-stores"));
+        let tablet_store_tablets_per_domain =
+            file.storage.tablet.tablets_per_domain.unwrap_or(32).max(1);
+        let tablet_store_max_open_domains =
+            file.storage.tablet.max_open_domains.unwrap_or(16).max(1);
+        let tablet_store_domain_write_buffer_size_mib = file
+            .storage
+            .tablet
+            .domain_write_buffer_size_mib
+            .unwrap_or(16)
+            .max(1);
+        let tablet_store_domain_max_write_buffers = file
+            .storage
+            .tablet
+            .domain_max_write_buffers
+            .unwrap_or(2)
+            .max(1);
+        let tablet_store_domain_parallelism =
+            file.storage.tablet.domain_parallelism.unwrap_or(1).max(1);
+        let tablet_store_domain_max_background_jobs = file
+            .storage
+            .tablet
+            .domain_max_background_jobs
+            .unwrap_or(1)
+            .max(1);
+        let tablet_store_domain_max_open_files = file
+            .storage
+            .tablet
+            .domain_max_open_files
+            .unwrap_or(128)
+            .max(16);
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
@@ -905,6 +1036,15 @@ impl ResolvedServeConfig {
             data_dir,
             content_dir,
             kv_backend,
+            tablet_store_layout,
+            tablet_store_root_dir,
+            tablet_store_tablets_per_domain,
+            tablet_store_max_open_domains,
+            tablet_store_domain_write_buffer_size_mib,
+            tablet_store_domain_max_write_buffers,
+            tablet_store_domain_parallelism,
+            tablet_store_domain_max_background_jobs,
+            tablet_store_domain_max_open_files,
             content_backend,
             object_store,
             in_memory,
@@ -913,7 +1053,22 @@ impl ResolvedServeConfig {
                 .route_shard_count
                 .or(file.routing.shard_count)
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
+            route_default_tablet_id: file
+                .routing
+                .default_tablet_id
+                .unwrap_or(agentdb_core::RUNTIME_PRIMARY_TABLET_ID),
             route_region: opts.route_region.or(file.routing.region),
+            route_cell_id: opts
+                .route_cell_id
+                .or(file.routing.cell_id)
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CELL_ID.to_string()),
+            route_availability_zone: opts
+                .route_availability_zone
+                .or(file.routing.availability_zone),
+            route_capacity_class: opts
+                .route_capacity_class
+                .or(file.routing.capacity_class)
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.to_string()),
             route_location: opts.route_location.or(file.routing.location),
             route_refresh_interval_ms: opts
                 .route_refresh_interval_ms
@@ -948,6 +1103,42 @@ impl ResolvedServeConfig {
             .unwrap_or_else(|| data_dir.join("content"));
         let deployment_mode = resolve_deployment_mode(&file.deployment)?;
         let kv_backend = resolve_kv_backend(&file.storage.kv)?;
+        let tablet_store_layout = resolve_tablet_store_layout(&file.storage.tablet)?;
+        let tablet_store_root_dir = file
+            .storage
+            .tablet
+            .root_dir
+            .unwrap_or_else(|| data_dir.join("tablet-stores"));
+        let tablet_store_tablets_per_domain =
+            file.storage.tablet.tablets_per_domain.unwrap_or(32).max(1);
+        let tablet_store_max_open_domains =
+            file.storage.tablet.max_open_domains.unwrap_or(16).max(1);
+        let tablet_store_domain_write_buffer_size_mib = file
+            .storage
+            .tablet
+            .domain_write_buffer_size_mib
+            .unwrap_or(16)
+            .max(1);
+        let tablet_store_domain_max_write_buffers = file
+            .storage
+            .tablet
+            .domain_max_write_buffers
+            .unwrap_or(2)
+            .max(1);
+        let tablet_store_domain_parallelism =
+            file.storage.tablet.domain_parallelism.unwrap_or(1).max(1);
+        let tablet_store_domain_max_background_jobs = file
+            .storage
+            .tablet
+            .domain_max_background_jobs
+            .unwrap_or(1)
+            .max(1);
+        let tablet_store_domain_max_open_files = file
+            .storage
+            .tablet
+            .domain_max_open_files
+            .unwrap_or(128)
+            .max(16);
         let content_backend = resolve_content_backend(&file.storage.content)?;
         let object_store = resolve_object_store_config(
             file.storage.object_store.as_ref(),
@@ -989,6 +1180,15 @@ impl ResolvedServeConfig {
             data_dir,
             content_dir,
             kv_backend,
+            tablet_store_layout,
+            tablet_store_root_dir,
+            tablet_store_tablets_per_domain,
+            tablet_store_max_open_domains,
+            tablet_store_domain_write_buffer_size_mib,
+            tablet_store_domain_max_write_buffers,
+            tablet_store_domain_parallelism,
+            tablet_store_domain_max_background_jobs,
+            tablet_store_domain_max_open_files,
             content_backend,
             object_store,
             in_memory,
@@ -997,7 +1197,20 @@ impl ResolvedServeConfig {
                 .routing
                 .shard_count
                 .unwrap_or(agentdb_meta::shards::DEFAULT_SHARD_COUNT),
+            route_default_tablet_id: file
+                .routing
+                .default_tablet_id
+                .unwrap_or(agentdb_core::RUNTIME_PRIMARY_TABLET_ID),
             route_region: file.routing.region,
+            route_cell_id: file
+                .routing
+                .cell_id
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CELL_ID.to_string()),
+            route_availability_zone: file.routing.availability_zone,
+            route_capacity_class: file
+                .routing
+                .capacity_class
+                .unwrap_or_else(|| agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.to_string()),
             route_location: file.routing.location,
             route_refresh_interval_ms: file.routing.refresh_interval_ms.unwrap_or(5_000),
             route_proxy_timeout_ms: file.routing.proxy_timeout_ms.unwrap_or(5_000),
@@ -1048,6 +1261,8 @@ struct StorageFileConfig {
     #[serde(default)]
     kv: KvFileConfig,
     #[serde(default)]
+    tablet: TabletStoreFileConfig,
+    #[serde(default)]
     content: ContentFileConfig,
     object_store: Option<ObjectStoreFileConfig>,
 }
@@ -1055,6 +1270,19 @@ struct StorageFileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct KvFileConfig {
     backend: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TabletStoreFileConfig {
+    layout: Option<String>,
+    root_dir: Option<PathBuf>,
+    tablets_per_domain: Option<i64>,
+    max_open_domains: Option<usize>,
+    domain_write_buffer_size_mib: Option<usize>,
+    domain_max_write_buffers: Option<i32>,
+    domain_parallelism: Option<i32>,
+    domain_max_background_jobs: Option<i32>,
+    domain_max_open_files: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1076,7 +1304,11 @@ struct ObjectStoreFileConfig {
 struct RoutingFileConfig {
     node_id: Option<String>,
     shard_count: Option<i64>,
+    default_tablet_id: Option<i64>,
     region: Option<String>,
+    cell_id: Option<String>,
+    availability_zone: Option<String>,
+    capacity_class: Option<String>,
     location: Option<String>,
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
@@ -1141,6 +1373,16 @@ fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
         "rocksdb" => Ok(KvBackendKind::RocksDb),
         "slatedb" => Ok(KvBackendKind::SlateDb),
         other => anyhow::bail!("unknown storage.kv.backend: {other}"),
+    }
+}
+
+fn resolve_tablet_store_layout(
+    cfg: &TabletStoreFileConfig,
+) -> anyhow::Result<TabletStoreLayoutKind> {
+    match cfg.layout.as_deref().unwrap_or("grouped_rocksdb") {
+        "prefix_scoped" => Ok(TabletStoreLayoutKind::PrefixScoped),
+        "grouped_rocksdb" => Ok(TabletStoreLayoutKind::GroupedRocksDb),
+        other => anyhow::bail!("unknown storage.tablet.layout: {other}"),
     }
 }
 
@@ -1427,9 +1669,6 @@ fn validate_storage_backend_config(
     if matches!(deployment_mode, DeploymentMode::Cluster) {
         if in_memory {
             anyhow::bail!("deployment.mode=cluster does not support in-memory/dev mode");
-        }
-        if !matches!(kv_backend, KvBackendKind::SlateDb) {
-            anyhow::bail!("deployment.mode=cluster requires storage.kv.backend=slatedb");
         }
         if !matches!(content_backend, ContentBackendKind::ObjectStore) {
             anyhow::bail!("deployment.mode=cluster requires storage.content.backend=object_store");
@@ -1975,6 +2214,21 @@ async fn load_route_snapshot(
     .await
 }
 
+fn tablet_store_status(config: &ResolvedServeConfig) -> agentdb_api::state::TabletStoreStatus {
+    agentdb_api::state::TabletStoreStatus {
+        layout: config.tablet_store_layout.as_str().to_string(),
+        root_dir: Some(config.tablet_store_root_dir.display().to_string()),
+        tablets_per_domain: config.tablet_store_tablets_per_domain,
+        max_open_domains: config.tablet_store_max_open_domains,
+        domain_write_buffer_size_mib: config.tablet_store_domain_write_buffer_size_mib,
+        domain_max_write_buffers: config.tablet_store_domain_max_write_buffers,
+        domain_parallelism: config.tablet_store_domain_parallelism,
+        domain_max_background_jobs: config.tablet_store_domain_max_background_jobs,
+        domain_max_open_files: config.tablet_store_domain_max_open_files,
+        domains: Vec::new(),
+    }
+}
+
 async fn prepare_route_startup(
     config: &ResolvedServeConfig,
     route_location: Option<String>,
@@ -2303,11 +2557,22 @@ fn spawn_raft_rs_tick_worker(
                             stale_node_threshold_ms,
                         )
                     });
+                let raft_leader_available = local_status
+                    .filter(|status| status.leader_id != 0)
+                    .and_then(|status| raft_replicas_by_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|(leader_node_id, _)| {
+                        cluster_node_available(
+                            nodes_by_id.get(leader_node_id),
+                            now_ms,
+                            stale_node_threshold_ms,
+                        )
+                    });
                 let raft_leader_missing = local_raft_leader_missing(local_status);
                 if !local_is_owner && !local_is_leader {
                     if should_attempt_raft_failover_tick(
                         owner_unavailable,
                         raft_leader_unavailable,
+                        raft_leader_available,
                         raft_leader_missing,
                     ) {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
@@ -2337,7 +2602,11 @@ fn spawn_raft_rs_tick_worker(
                             })
                             .map(|(raft_node_id, _)| raft_node_id);
                         if failover_candidate == Some(local_raft_node_id) {
-                            let result = if raft_leader_missing {
+                            let result = if should_campaign_for_raft_failover(
+                                raft_leader_unavailable,
+                                raft_leader_available,
+                                raft_leader_missing,
+                            ) {
                                 group
                                     .campaign(local_raft_node_id)
                                     .and_then(|()| group.tick(local_raft_node_id))
@@ -2355,7 +2624,6 @@ fn spawn_raft_rs_tick_worker(
                             }
                         }
                     }
-                    continue;
                 }
                 if let Err(error) = group.tick(local_raft_node_id) {
                     tracing::warn!(
@@ -2376,11 +2644,21 @@ fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplic
 }
 
 fn should_attempt_raft_failover_tick(
-    _owner_unavailable: bool,
+    owner_unavailable: bool,
     raft_leader_unavailable: bool,
+    raft_leader_available: bool,
     raft_leader_missing: bool,
 ) -> bool {
-    raft_leader_unavailable || raft_leader_missing
+    raft_leader_unavailable
+        || (owner_unavailable && (raft_leader_missing || !raft_leader_available))
+}
+
+fn should_campaign_for_raft_failover(
+    raft_leader_unavailable: bool,
+    raft_leader_available: bool,
+    raft_leader_missing: bool,
+) -> bool {
+    raft_leader_unavailable || raft_leader_missing || !raft_leader_available
 }
 
 fn cluster_node_available(
@@ -2478,9 +2756,17 @@ async fn campaign_owned_raft_tablets(
                 local_node_id,
                 local_raft_node_id,
                 role = %local_status.role,
-                "skipping raft-rs owner campaign because local node is already campaigning"
+                "continuing raft-rs owner campaign while local node is already campaigning"
             );
-            continue;
+        }
+        if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+            tracing::warn!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                ?error,
+                "failed to expire local raft-rs leader lease before owner campaign"
+            );
         }
         match group.campaign(local_raft_node_id) {
             Ok(()) => {
@@ -3156,6 +3442,9 @@ struct ClusterWorkerDeps {
     raft_registry: Option<Arc<agentdb_api::raft_ingress::RaftRsGroupRegistry>>,
     node_address: String,
     region: Option<String>,
+    cell_id: String,
+    availability_zone: Option<String>,
+    capacity_class: String,
     scheduler_status: agentdb_api::state::SchedulerStatus,
     drain: agentdb_api::state::DrainState,
 }
@@ -3169,6 +3458,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
         raft_registry,
         node_address,
         region,
+        cell_id,
+        availability_zone,
+        capacity_class,
         scheduler_status,
         drain,
     } = deps;
@@ -3176,6 +3468,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     let heartbeat_node_id = node_id.clone();
     let heartbeat_node_address = node_address.clone();
     let heartbeat_region = region.clone();
+    let heartbeat_cell_id = cell_id.clone();
+    let heartbeat_availability_zone = availability_zone.clone();
+    let heartbeat_capacity_class = capacity_class.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_millis(config.heartbeat_interval_ms));
@@ -3192,6 +3487,9 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
                 &heartbeat_node_id,
                 &heartbeat_node_address,
                 heartbeat_region.as_deref(),
+                &heartbeat_cell_id,
+                heartbeat_availability_zone.as_deref(),
+                &heartbeat_capacity_class,
                 state,
                 now_ms,
             )
@@ -3332,18 +3630,23 @@ async fn heartbeat_node_once(
     node_id: &str,
     node_address: &str,
     region: Option<&str>,
+    cell_id: &str,
+    availability_zone: Option<&str>,
+    capacity_class: &str,
     state: &str,
     now_ms: i64,
 ) -> agentdb_meta::MetaResult<()> {
-    agentdb_meta::nodes::upsert(
+    agentdb_meta::nodes::upsert_with_cell(
         meta.pool(),
         node_id,
         node_address,
         None,
         state,
         now_ms,
-        None,
+        availability_zone,
         region,
+        cell_id,
+        capacity_class,
     )
     .await
 }
@@ -3449,6 +3752,23 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "aligned local tablet ownership with raft leaders"
+            );
+        }
+    }
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
         Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
             agentdb_meta::scheduler::renew(
@@ -3542,24 +3862,6 @@ async fn run_cluster_scheduler_tick(
     if !cleared.is_empty() {
         status.add_tablet_reassignments(cleared.len() as u64);
         tracing::info!(node_id = %node_id, tablets = ?cleared, "scheduler cleared expired tablet ownership");
-    }
-
-    if let Some(registry) = raft_registry {
-        let aligned = reconcile_raft_leader_tablet_ownership(
-            meta,
-            registry,
-            now_ms,
-            config.scheduler_lease_ms,
-        )
-        .await?;
-        if aligned > 0 {
-            status.add_tablet_reassignments(aligned as u64);
-            tracing::info!(
-                node_id = %node_id,
-                aligned,
-                "scheduler aligned tablet ownership with raft leaders"
-            );
-        }
     }
 
     if config.rebalance_max_movements > 0 {
@@ -3681,7 +3983,7 @@ async fn reconcile_raft_leader_tablet_ownership(
         let Some(tablet) = agentdb_meta::tablets::get(meta.pool(), tablet_id).await? else {
             continue;
         };
-        if tablet.state != "serving" {
+        if !tablet_state_keeps_raft_owner(&tablet.state) {
             continue;
         }
         let same_owner = tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str());
@@ -3704,6 +4006,10 @@ async fn reconcile_raft_leader_tablet_ownership(
         }
     }
     Ok(aligned)
+}
+
+fn tablet_state_keeps_raft_owner(state: &str) -> bool {
+    matches!(state, "serving" | "splitting" | "merging")
 }
 
 async fn apply_scheduler_rebalance_raft_membership_changes(
@@ -4722,7 +5028,7 @@ async fn run_local_tablet_movement_executor_tick(
     let mut executed = 0usize;
     for (destination_tablet_id, movements) in by_destination {
         let movement_type = movements[0].movement_type.as_str();
-        if movement_type == "split" && movements.len() != 1 {
+        if matches!(movement_type, "split" | "manual_split") && movements.len() != 1 {
             tracing::warn!(
                 destination_tablet_id,
                 movement_count = movements.len(),
@@ -4806,14 +5112,14 @@ async fn run_local_tablet_movement_executor_tick(
             let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
                 serde_json::from_slice(&payload)?;
             let installed = match movement_type {
-                "split" => runtime
+                "split" | "manual_split" => runtime
                     .install_tablet_snapshot_payload_and_rehydrate(
                         movement.destination_tablet_id,
                         &payload,
                     )
                     .await
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?,
-                "merge" => runtime
+                "merge" | "manual_merge" => runtime
                     .install_tablet_snapshot_payload_merge_and_rehydrate(
                         movement.destination_tablet_id,
                         &payload,
@@ -4998,6 +5304,9 @@ mod tests {
             route_node_id: None,
             route_shard_count: None,
             route_region: None,
+            route_cell_id: None,
+            route_availability_zone: None,
+            route_capacity_class: None,
             route_location: None,
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
@@ -5090,6 +5399,21 @@ mod tests {
         assert_eq!(config.bind, default_bind());
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.content_dir, PathBuf::from("./data/content"));
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::GroupedRocksDb
+        );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("./data/tablet-stores")
+        );
+        assert_eq!(config.tablet_store_tablets_per_domain, 32);
+        assert_eq!(config.tablet_store_max_open_domains, 16);
+        assert_eq!(config.tablet_store_domain_write_buffer_size_mib, 16);
+        assert_eq!(config.tablet_store_domain_max_write_buffers, 2);
+        assert_eq!(config.tablet_store_domain_parallelism, 1);
+        assert_eq!(config.tablet_store_domain_max_background_jobs, 1);
+        assert_eq!(config.tablet_store_domain_max_open_files, 128);
         assert!(!config.in_memory);
     }
 
@@ -5185,6 +5509,78 @@ data_dir = "/tmp/agentdb-test"
             config.content_dir,
             PathBuf::from("/tmp/agentdb-test/content")
         );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("/tmp/agentdb-test/tablet-stores")
+        );
+    }
+
+    #[test]
+    fn config_file_sets_grouped_tablet_store_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage]
+data_dir = "/tmp/agentdb-test"
+
+[storage.tablet]
+layout = "grouped_rocksdb"
+root_dir = "/mnt/agentdb-tablets"
+tablets_per_domain = 16
+max_open_domains = 8
+domain_write_buffer_size_mib = 8
+domain_max_write_buffers = 2
+domain_parallelism = 2
+domain_max_background_jobs = 2
+domain_max_open_files = 96
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::GroupedRocksDb
+        );
+        assert_eq!(
+            config.tablet_store_root_dir,
+            PathBuf::from("/mnt/agentdb-tablets")
+        );
+        assert_eq!(config.tablet_store_tablets_per_domain, 16);
+        assert_eq!(config.tablet_store_max_open_domains, 8);
+        assert_eq!(config.tablet_store_domain_write_buffer_size_mib, 8);
+        assert_eq!(config.tablet_store_domain_max_write_buffers, 2);
+        assert_eq!(config.tablet_store_domain_parallelism, 2);
+        assert_eq!(config.tablet_store_domain_max_background_jobs, 2);
+        assert_eq!(config.tablet_store_domain_max_open_files, 96);
+    }
+
+    #[test]
+    fn config_file_can_select_prefix_scoped_tablet_store_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage.tablet]
+layout = "prefix_scoped"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+
+        assert_eq!(
+            config.tablet_store_layout,
+            TabletStoreLayoutKind::PrefixScoped
+        );
     }
 
     #[test]
@@ -5217,7 +5613,7 @@ data_dir = "/tmp/from-config"
     }
 
     #[test]
-    fn cluster_mode_requires_slatedb() {
+    fn cluster_mode_allows_rocksdb_with_object_store_content() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agentdb.toml");
         std::fs::write(
@@ -5225,6 +5621,9 @@ data_dir = "/tmp/from-config"
             r#"
 [deployment]
 mode = "cluster"
+
+[server]
+internal_auth_token = "test-internal-token"
 
 [storage.kv]
 backend = "rocksdb"
@@ -5244,10 +5643,9 @@ node_id = "node-a"
         .unwrap();
         let mut opts = base_opts();
         opts.config = Some(config_path);
-        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("deployment.mode=cluster requires storage.kv.backend=slatedb"));
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        assert!(matches!(config.deployment_mode, DeploymentMode::Cluster));
+        assert!(matches!(config.kv_backend, KvBackendKind::RocksDb));
     }
 
     #[test]
@@ -5448,6 +5846,9 @@ region = "us-west-2"
             "node-a",
             "http://127.0.0.1:18080",
             Some("us-west-2"),
+            "cell-a",
+            Some("us-west-2a"),
+            "stable",
             "alive",
             1_000,
         )
@@ -5457,6 +5858,9 @@ region = "us-west-2"
         assert_eq!(node.address, "http://127.0.0.1:18080");
         assert_eq!(node.state, "alive");
         assert_eq!(node.region.as_deref(), Some("us-west-2"));
+        assert_eq!(node.cell_id, "cell-a");
+        assert_eq!(node.availability_zone.as_deref(), Some("us-west-2a"));
+        assert_eq!(node.capacity_class, "stable");
     }
 
     #[tokio::test]
@@ -5633,6 +6037,76 @@ region = "us-west-2"
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
         assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_follower_still_reconciles_local_raft_leader_ownership() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            1_000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(local_raft_node_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        run_cluster_scheduler_tick(
+            &meta,
+            "node-b",
+            2_000,
+            lifecycle_config(0, 0),
+            &status,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_leader);
+        assert_eq!(snapshot.leader_node_id.as_deref(), Some("scheduler-a"));
+        assert_eq!(snapshot.tablet_reassignments_total, 1);
     }
 
     #[tokio::test]
@@ -6298,7 +6772,88 @@ region = "us-west-2"
         )
         .await
         .unwrap();
-        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 1_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_aligns_valid_owner_lease_to_raft_leader() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:30100",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 30_000)
             .await
             .unwrap();
         tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
@@ -6397,7 +6952,7 @@ region = "us-west-2"
     }
 
     #[tokio::test]
-    async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
+    async fn scheduler_renews_splitting_tablet_owner_when_raft_leader_matches() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         nodes::upsert(
@@ -6416,7 +6971,7 @@ region = "us-west-2"
             meta.pool(),
             7,
             "default",
-            "serving",
+            "splitting",
             Some("raft/7"),
             0,
             100,
@@ -7236,7 +7791,7 @@ region = "us-west-2"
     }
 
     #[test]
-    fn raft_failover_tick_runs_when_local_replica_has_no_observed_leader() {
+    fn raft_failover_tick_skips_missing_leader_when_owner_is_available() {
         let local_status = agentdb_storage::RaftRsReplicaStatus {
             node_id: 11,
             role: "Follower".to_string(),
@@ -7249,7 +7804,21 @@ region = "us-west-2"
         };
 
         assert!(local_raft_leader_missing(Some(&local_status)));
-        assert!(should_attempt_raft_failover_tick(false, false, true));
+        assert!(!should_attempt_raft_failover_tick(
+            false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn raft_failover_tick_runs_when_owner_is_unavailable_and_leader_is_missing() {
+        assert!(should_attempt_raft_failover_tick(true, false, false, true));
+        assert!(should_campaign_for_raft_failover(false, false, true));
+    }
+
+    #[test]
+    fn raft_failover_campaigns_when_known_leader_is_unavailable() {
+        assert!(should_attempt_raft_failover_tick(false, true, false, false));
+        assert!(should_campaign_for_raft_failover(true, false, false));
     }
 
     #[test]
@@ -7266,12 +7835,22 @@ region = "us-west-2"
         };
 
         assert!(!local_raft_leader_missing(Some(&local_status)));
-        assert!(!should_attempt_raft_failover_tick(false, false, false));
+        assert!(!should_attempt_raft_failover_tick(
+            false, false, true, false
+        ));
+        assert!(!should_campaign_for_raft_failover(false, true, false));
     }
 
     #[test]
-    fn raft_failover_tick_skips_when_only_control_plane_owner_is_missing() {
-        assert!(!should_attempt_raft_failover_tick(true, false, false));
+    fn raft_failover_tick_runs_when_owner_is_missing_and_leader_is_not_proven_live() {
+        assert!(should_attempt_raft_failover_tick(true, false, false, false));
+        assert!(should_campaign_for_raft_failover(false, false, false));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_missing_owner_when_healthy_leader_is_observed() {
+        assert!(!should_attempt_raft_failover_tick(true, false, true, false));
+        assert!(!should_campaign_for_raft_failover(false, true, false));
     }
 
     #[test]
@@ -7285,6 +7864,8 @@ region = "us-west-2"
             joined_at_ms: 0,
             availability_zone: None,
             region: None,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
         };
         let fresh = agentdb_meta::nodes::Node {
             last_heartbeat_ms: 9_500,
@@ -7306,6 +7887,8 @@ region = "us-west-2"
             joined_at_ms: 9_000,
             availability_zone: None,
             region: None,
+            cell_id: agentdb_meta::cells::DEFAULT_CELL_ID.into(),
+            capacity_class: agentdb_meta::cells::DEFAULT_CAPACITY_CLASS.into(),
         };
 
         assert!(cluster_node_available(Some(&warming), 10_000, 5_000));
@@ -7573,7 +8156,11 @@ region = "us-west-2"
         let (source_group, logs) =
             agentdb_storage::RaftRsSharedGroup::open(7, source_raft_configs).unwrap();
         source_group.elect(node_a).unwrap();
-        logs[0].append(7, b"snapshot-source".to_vec()).unwrap();
+        logs.iter()
+            .find(|log| log.node_id() == node_a)
+            .unwrap()
+            .append(7, b"snapshot-source".to_vec())
+            .unwrap();
         let transfer = source_group
             .build_snapshot_transfer(node_a, node_b, Vec::new())
             .unwrap();

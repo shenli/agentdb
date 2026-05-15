@@ -630,6 +630,10 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
         let (tenant_id, session_id) = first_two_segments(rest)?;
         return placement(tenant_id, Some(session_id));
     }
+    if let Some(rest) = key.strip_prefix("append_log/") {
+        let (tenant_id, session_id) = first_two_segments(rest)?;
+        return placement(tenant_id, Some(session_id));
+    }
     if let Some(rest) = key.strip_prefix("event_by_id/") {
         let tenant_id = first_segment(rest)?;
         let pointer: serde_json::Value = serde_json::from_slice(value).map_err(|err| {
@@ -997,6 +1001,11 @@ mod tests {
                         value: b"event-a".to_vec(),
                     },
                     TabletWriteOp::Put {
+                        key: format!("append_log/tenant-a/{session_a}/00000000000000000000")
+                            .into_bytes(),
+                        value: b"append-log-a".to_vec(),
+                    },
+                    TabletWriteOp::Put {
                         key: b"event_by_id/tenant-a/evt_a".to_vec(),
                         value: serde_json::to_vec(&serde_json::json!({
                             "session_id": session_a,
@@ -1016,6 +1025,11 @@ mod tests {
                     TabletWriteOp::Put {
                         key: format!("record/session/tenant-a/{session_b}").into_bytes(),
                         value: b"session-b".to_vec(),
+                    },
+                    TabletWriteOp::Put {
+                        key: format!("append_log/tenant-a/{session_b}/00000000000000000000")
+                            .into_bytes(),
+                        value: b"append-log-b".to_vec(),
                     },
                     TabletWriteOp::Put {
                         key: b"event_by_id/tenant-a/evt_b".to_vec(),
@@ -1048,6 +1062,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                format!("append_log/tenant-a/{session_a}/00000000000000000000"),
                 format!("event/tenant-a/{session_a}/00000000000000000001"),
                 "event_by_id/tenant-a/evt_a".to_string(),
                 format!("record/idempotency/tenant-a::append::{session_a}::idem-a"),

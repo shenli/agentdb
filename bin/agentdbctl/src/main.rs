@@ -4,8 +4,9 @@
 //! small operator surface on top: concise commands, table output by default,
 //! JSON output for automation, and no requirement to hand-write curl payloads.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, path::PathBuf};
 
+use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, Method, StatusCode};
@@ -54,6 +55,16 @@ enum Command {
         #[command(subcommand)]
         command: NodesCommand,
     },
+    /// Logical cell / isolation-domain operations.
+    Cells {
+        #[command(subcommand)]
+        command: CellsCommand,
+    },
+    /// Tenant placement policy operations.
+    TenantPolicies {
+        #[command(subcommand)]
+        command: TenantPoliciesCommand,
+    },
     /// Tablet placement and movement operations.
     Tablets {
         #[command(subcommand)]
@@ -78,6 +89,11 @@ enum Command {
     Restore {
         #[command(subcommand)]
         command: RestoreCommand,
+    },
+    /// Local tablet-store maintenance operations.
+    TabletStore {
+        #[command(subcommand)]
+        command: TabletStoreCommand,
     },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
@@ -105,6 +121,72 @@ enum NodesCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum CellsCommand {
+    /// List cells.
+    List,
+    /// Create or update a cell.
+    Upsert(UpsertCellArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum TenantPoliciesCommand {
+    /// List tenant placement policies.
+    List,
+    /// Create or update a tenant placement policy.
+    Upsert(UpsertTenantPolicyArgs),
+    /// Delete a tenant placement policy.
+    Delete { tenant_id: String },
+}
+
+#[derive(Args, Debug)]
+struct UpsertCellArgs {
+    #[arg(long)]
+    cell_id: String,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long, default_value = "standard")]
+    domain_class: String,
+    #[arg(long, default_value = "single_az_cluster")]
+    deployment_profile: String,
+    #[arg(long, default_value = "stable")]
+    capacity_class: String,
+    #[arg(long, default_value = "shared_logical")]
+    metadata_isolation_level: String,
+    #[arg(long, default_value = "serving")]
+    state: String,
+    #[arg(long)]
+    metadata_namespace: Option<String>,
+    #[arg(long)]
+    object_store_namespace: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    rollout_version: i64,
+}
+
+#[derive(Args, Debug)]
+struct UpsertTenantPolicyArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long, default_value = "shared")]
+    placement_class: String,
+    #[arg(long, default_value = "default")]
+    placement_scope_id: String,
+    #[arg(long, default_value = "default")]
+    cell_id: String,
+    #[arg(long, default_value = "free")]
+    tier: String,
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    #[arg(long, default_value = "pool")]
+    encryption_class: String,
+    #[arg(long)]
+    key_policy_id: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    encryption_policy_version: i64,
+    #[arg(long, default_value_t = 0)]
+    policy_version: i64,
+}
+
 #[derive(Args, Debug)]
 struct RegisterNodeArgs {
     #[arg(long)]
@@ -119,6 +201,10 @@ struct RegisterNodeArgs {
     availability_zone: Option<String>,
     #[arg(long)]
     region: Option<String>,
+    #[arg(long, default_value = "default")]
+    cell_id: String,
+    #[arg(long, default_value = "stable")]
+    capacity_class: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -302,6 +388,9 @@ enum BackupCommand {
         /// Do not include runtime storage summary in the manifest.
         #[arg(long)]
         skip_runtime_summary: bool,
+        /// Include physical tablet-store checkpoints when the node uses single-tablet domains.
+        #[arg(long)]
+        include_tablet_checkpoints: bool,
     },
 }
 
@@ -309,6 +398,30 @@ enum BackupCommand {
 enum RestoreCommand {
     /// Validate a backup manifest. Destructive restore apply is not exposed.
     Validate { manifest_path: String },
+    /// Offline: install one tablet checkpoint into a local single-tablet store root.
+    InstallTabletCheckpoint {
+        #[arg(long)]
+        tablet_id: i64,
+        #[arg(long)]
+        checkpoint_dir: PathBuf,
+        #[arg(long)]
+        tablet_store_root: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        tablets_per_domain: i64,
+        #[arg(long, default_value_t = 1)]
+        max_open_domains: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TabletStoreCommand {
+    /// Trigger manual compaction for one local tablet-store domain/range.
+    Compact {
+        #[arg(long)]
+        tablet_id: i64,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -404,6 +517,8 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
             }))
         }
         Command::Nodes { command } => nodes(api, command).await,
+        Command::Cells { command } => cells(api, command).await,
+        Command::TenantPolicies { command } => tenant_policies(api, command).await,
         Command::Tablets { command } => tablets(api, command).await,
         Command::Raft { command } => raft(api, command).await,
         Command::Drain { command } => match command {
@@ -416,6 +531,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 directory,
                 skip_meta,
                 skip_runtime_summary,
+                include_tablet_checkpoints,
             } => {
                 api.post(
                     "/api/admin/backups",
@@ -423,7 +539,8 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                         "backup_id": backup_id,
                         "directory": directory,
                         "include_meta": !skip_meta,
-                        "include_runtime_summary": !skip_runtime_summary
+                        "include_runtime_summary": !skip_runtime_summary,
+                        "include_tablet_checkpoints": include_tablet_checkpoints
                     }),
                 )
                 .await
@@ -436,6 +553,31 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                     json!({
                         "manifest_path": manifest_path,
                         "dry_run": true
+                    }),
+                )
+                .await
+            }
+            RestoreCommand::InstallTabletCheckpoint {
+                tablet_id,
+                checkpoint_dir,
+                tablet_store_root,
+                tablets_per_domain,
+                max_open_domains,
+            } => install_tablet_checkpoint(
+                tablet_id,
+                checkpoint_dir,
+                tablet_store_root,
+                tablets_per_domain,
+                max_open_domains,
+            ),
+        },
+        Command::TabletStore { command } => match command {
+            TabletStoreCommand::Compact { tablet_id, dry_run } => {
+                api.post(
+                    "/api/admin/tablet-store/compact",
+                    json!({
+                        "tablet_id": tablet_id,
+                        "dry_run": dry_run
                     }),
                 )
                 .await
@@ -507,6 +649,26 @@ async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
     }
 }
 
+fn install_tablet_checkpoint(
+    tablet_id: i64,
+    checkpoint_dir: PathBuf,
+    tablet_store_root: PathBuf,
+    tablets_per_domain: i64,
+    max_open_domains: usize,
+) -> Result<Value> {
+    if tablets_per_domain != 1 {
+        return Err(anyhow!(
+            "offline tablet checkpoint install requires --tablets-per-domain 1"
+        ));
+    }
+    let lifecycle =
+        GroupedRocksDbTabletStore::new(tablet_store_root, tablets_per_domain, max_open_domains);
+    let manifest = lifecycle
+        .restore_tablet_checkpoint(tablet_id, &checkpoint_dir)
+        .map_err(|error| anyhow!("install tablet checkpoint: {error}"))?;
+    Ok(serde_json::to_value(manifest)?)
+}
+
 async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
     match command {
         NodesCommand::List { stale_threshold_ms } => {
@@ -522,7 +684,9 @@ async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
                     "mongo_address": args.mongo_address,
                     "state": args.state,
                     "availability_zone": args.availability_zone,
-                    "region": args.region
+                    "region": args.region,
+                    "cell_id": args.cell_id,
+                    "capacity_class": args.capacity_class
                 }),
             )
             .await
@@ -536,6 +700,58 @@ async fn nodes(api: &Api, command: NodesCommand) -> Result<Value> {
                 json!({ "state": state.as_str() }),
             )
             .await
+        }
+    }
+}
+
+async fn cells(api: &Api, command: CellsCommand) -> Result<Value> {
+    match command {
+        CellsCommand::List => api.get("/api/admin/cells").await,
+        CellsCommand::Upsert(args) => {
+            api.post(
+                "/api/admin/cells",
+                json!({
+                    "cell_id": args.cell_id,
+                    "region": args.region,
+                    "domain_class": args.domain_class,
+                    "deployment_profile": args.deployment_profile,
+                    "capacity_class": args.capacity_class,
+                    "metadata_isolation_level": args.metadata_isolation_level,
+                    "state": args.state,
+                    "metadata_namespace": args.metadata_namespace,
+                    "object_store_namespace": args.object_store_namespace,
+                    "rollout_version": args.rollout_version
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn tenant_policies(api: &Api, command: TenantPoliciesCommand) -> Result<Value> {
+    match command {
+        TenantPoliciesCommand::List => api.get("/api/admin/tenant-policies").await,
+        TenantPoliciesCommand::Upsert(args) => {
+            api.post(
+                "/api/admin/tenant-policies",
+                json!({
+                    "tenant_id": args.tenant_id,
+                    "placement_class": args.placement_class,
+                    "placement_scope_id": args.placement_scope_id,
+                    "cell_id": args.cell_id,
+                    "tier": args.tier,
+                    "priority": args.priority,
+                    "encryption_class": args.encryption_class,
+                    "key_policy_id": args.key_policy_id,
+                    "encryption_policy_version": args.encryption_policy_version,
+                    "policy_version": args.policy_version
+                }),
+            )
+            .await
+        }
+        TenantPoliciesCommand::Delete { tenant_id } => {
+            api.delete(&format!("/api/admin/tenant-policies/{tenant_id}"))
+                .await
         }
     }
 }
@@ -858,7 +1074,56 @@ fn render_status(value: &Value) -> String {
             writeln!(out, "reasons={}", compact(reasons)).unwrap();
         }
     }
+    if let Some(tablet_store) = scheduler.get("tablet_store") {
+        writeln!(
+            out,
+            "tablet_store={} root={} tablets_per_domain={} max_open_domains={} open_domains={} memtable_budget_mib={} background_jobs_per_domain={} pending_compaction_bytes={}",
+            text(&tablet_store["layout"]),
+            text(&tablet_store["root_dir"]),
+            text(&tablet_store["tablets_per_domain"]),
+            text(&tablet_store["max_open_domains"]),
+            tablet_store
+                .get("domains")
+                .and_then(Value::as_array)
+                .map(|domains| domains.len().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            memtable_budget_mib(tablet_store)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            text(&tablet_store["domain_max_background_jobs"]),
+            pending_compaction_bytes(tablet_store)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+        .unwrap();
+    }
     out.trim_end().to_string()
+}
+
+fn memtable_budget_mib(tablet_store: &Value) -> Option<u64> {
+    Some(
+        tablet_store
+            .get("max_open_domains")?
+            .as_u64()?
+            .saturating_mul(tablet_store.get("domain_write_buffer_size_mib")?.as_u64()?)
+            .saturating_mul(tablet_store.get("domain_max_write_buffers")?.as_u64()?),
+    )
+}
+
+fn pending_compaction_bytes(tablet_store: &Value) -> Option<u64> {
+    Some(
+        tablet_store
+            .get("domains")?
+            .as_array()?
+            .iter()
+            .filter_map(|domain| {
+                domain
+                    .get("metrics")?
+                    .get("pending_compaction_bytes")?
+                    .as_u64()
+            })
+            .sum(),
+    )
 }
 
 fn render_object(object: &serde_json::Map<String, Value>) -> String {
@@ -1034,13 +1299,38 @@ mod tests {
                 }
             },
             "readiness": { "ready": true, "reasons": [] },
-            "scheduler": { "leader_node_id": "node-a", "tablet_reassignments_total": 3 },
+            "scheduler": {
+                "leader_node_id": "node-a",
+                "tablet_reassignments_total": 3,
+                "tablet_store": {
+                    "layout": "grouped_rocksdb",
+                    "root_dir": "/var/lib/agentdb/tablet-stores",
+                    "tablets_per_domain": 32,
+                    "max_open_domains": 16,
+                    "domain_write_buffer_size_mib": 16,
+                    "domain_max_write_buffers": 2,
+                    "domain_max_background_jobs": 1,
+                    "domains": [
+                        {
+                            "domain_id": 0,
+                            "open": true,
+                            "metrics": {
+                                "pending_compaction_bytes": 1234
+                            }
+                        }
+                    ]
+                }
+            },
             "drain": { "is_draining": false }
         });
         let rendered = render_status(&value);
         assert!(rendered.contains("status=ok"));
         assert!(rendered.contains("ready=true"));
         assert!(rendered.contains("leader=node-a"));
+        assert!(rendered.contains("tablet_store=grouped_rocksdb"));
+        assert!(rendered.contains("open_domains=1"));
+        assert!(rendered.contains("memtable_budget_mib=512"));
+        assert!(rendered.contains("pending_compaction_bytes=1234"));
     }
 
     #[test]

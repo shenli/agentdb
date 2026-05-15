@@ -6,6 +6,7 @@
 
 use sqlx::AnyPool;
 
+use crate::cells::{self, DEFAULT_CELL_ID};
 use crate::error::{MetaError, MetaResult};
 use crate::placement_scopes::DEFAULT_PLACEMENT_SCOPE_ID;
 
@@ -18,10 +19,15 @@ type TenantPolicyRow = (
     i64,
     i64,
     i64,
+    String,
+    String,
+    i64,
 );
 
 pub const DEFAULT_PLACEMENT_CLASS: &str = "shared";
 pub const DEFAULT_ENCRYPTION_CLASS: &str = "pool";
+pub const DEFAULT_TIER: &str = "free";
+pub const DEFAULT_PRIORITY: i64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TenantPolicy {
@@ -33,6 +39,9 @@ pub struct TenantPolicy {
     pub encryption_policy_version: i64,
     pub policy_version: i64,
     pub updated_at_ms: i64,
+    pub cell_id: String,
+    pub tier: String,
+    pub priority: i64,
 }
 
 impl TenantPolicy {
@@ -46,6 +55,9 @@ impl TenantPolicy {
             encryption_policy_version: 0,
             policy_version: 0,
             updated_at_ms: 0,
+            cell_id: DEFAULT_CELL_ID.into(),
+            tier: DEFAULT_TIER.into(),
+            priority: DEFAULT_PRIORITY,
         }
     }
 }
@@ -62,18 +74,53 @@ pub async fn upsert(
     policy_version: i64,
     now_ms: i64,
 ) -> MetaResult<()> {
+    upsert_with_cell(
+        pool,
+        tenant_id,
+        placement_class,
+        placement_scope_id,
+        encryption_class,
+        key_policy_id,
+        encryption_policy_version,
+        policy_version,
+        DEFAULT_CELL_ID,
+        DEFAULT_TIER,
+        DEFAULT_PRIORITY,
+        now_ms,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_with_cell(
+    pool: &AnyPool,
+    tenant_id: &str,
+    placement_class: &str,
+    placement_scope_id: &str,
+    encryption_class: &str,
+    key_policy_id: Option<&str>,
+    encryption_policy_version: i64,
+    policy_version: i64,
+    cell_id: &str,
+    tier: &str,
+    priority: i64,
+    now_ms: i64,
+) -> MetaResult<()> {
     validate_policy(
         placement_class,
         placement_scope_id,
         encryption_class,
         encryption_policy_version,
         policy_version,
+        cell_id,
+        tier,
+        priority,
     )?;
     sqlx::query(
         "INSERT INTO tenant_policies
             (tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
-             encryption_policy_version, policy_version, updated_at_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             encryption_policy_version, policy_version, updated_at_ms, cell_id, tier, priority)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (tenant_id) DO UPDATE SET
             placement_class = excluded.placement_class,
             placement_scope_id = excluded.placement_scope_id,
@@ -81,7 +128,10 @@ pub async fn upsert(
             key_policy_id = excluded.key_policy_id,
             encryption_policy_version = excluded.encryption_policy_version,
             policy_version = excluded.policy_version,
-            updated_at_ms = excluded.updated_at_ms",
+            updated_at_ms = excluded.updated_at_ms,
+            cell_id = excluded.cell_id,
+            tier = excluded.tier,
+            priority = excluded.priority",
     )
     .bind(tenant_id)
     .bind(placement_class)
@@ -91,6 +141,9 @@ pub async fn upsert(
     .bind(encryption_policy_version)
     .bind(policy_version)
     .bind(now_ms)
+    .bind(cell_id)
+    .bind(tier)
+    .bind(priority)
     .execute(pool)
     .await?;
     Ok(())
@@ -99,7 +152,7 @@ pub async fn upsert(
 pub async fn get(pool: &AnyPool, tenant_id: &str) -> MetaResult<Option<TenantPolicy>> {
     let row: Option<TenantPolicyRow> = sqlx::query_as(
         "SELECT tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
-                encryption_policy_version, policy_version, updated_at_ms
+                encryption_policy_version, policy_version, updated_at_ms, cell_id, tier, priority
            FROM tenant_policies
           WHERE tenant_id = $1",
     )
@@ -118,7 +171,7 @@ pub async fn effective(pool: &AnyPool, tenant_id: &str) -> MetaResult<TenantPoli
 pub async fn list_all(pool: &AnyPool) -> MetaResult<Vec<TenantPolicy>> {
     let rows: Vec<TenantPolicyRow> = sqlx::query_as(
         "SELECT tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
-                encryption_policy_version, policy_version, updated_at_ms
+                encryption_policy_version, policy_version, updated_at_ms, cell_id, tier, priority
            FROM tenant_policies
           ORDER BY tenant_id",
     )
@@ -133,7 +186,7 @@ pub async fn list_by_placement_scope(
 ) -> MetaResult<Vec<TenantPolicy>> {
     let rows: Vec<TenantPolicyRow> = sqlx::query_as(
         "SELECT tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
-                encryption_policy_version, policy_version, updated_at_ms
+                encryption_policy_version, policy_version, updated_at_ms, cell_id, tier, priority
            FROM tenant_policies
           WHERE placement_scope_id = $1
           ORDER BY tenant_id",
@@ -159,7 +212,12 @@ fn validate_policy(
     encryption_class: &str,
     encryption_policy_version: i64,
     policy_version: i64,
+    cell_id: &str,
+    tier: &str,
+    priority: i64,
 ) -> MetaResult<()> {
+    cells::validate_cell_id(cell_id)?;
+    validate_tier(tier)?;
     match placement_class {
         "shared" | "dedicated" => {}
         other => {
@@ -196,7 +254,21 @@ fn validate_policy(
             "policy_version must be non-negative".into(),
         ));
     }
+    if priority < 0 {
+        return Err(MetaError::InvalidInput(
+            "priority must be non-negative".into(),
+        ));
+    }
     Ok(())
+}
+
+fn validate_tier(tier: &str) -> MetaResult<()> {
+    match tier {
+        "free" | "developer" | "paid" | "enterprise" | "regulated" => Ok(()),
+        other => Err(MetaError::InvalidInput(format!(
+            "invalid tenant tier `{other}`"
+        ))),
+    }
 }
 
 fn into_policy(
@@ -209,6 +281,9 @@ fn into_policy(
         encryption_policy_version,
         policy_version,
         updated_at_ms,
+        cell_id,
+        tier,
+        priority,
     ): TenantPolicyRow,
 ) -> TenantPolicy {
     TenantPolicy {
@@ -220,6 +295,9 @@ fn into_policy(
         encryption_policy_version,
         policy_version,
         updated_at_ms,
+        cell_id,
+        tier,
+        priority,
     }
 }
 
@@ -239,12 +317,15 @@ mod tests {
         assert_eq!(policy.placement_class, "shared");
         assert_eq!(policy.placement_scope_id, DEFAULT_PLACEMENT_SCOPE_ID);
         assert_eq!(policy.encryption_class, "pool");
+        assert_eq!(policy.cell_id, DEFAULT_CELL_ID);
+        assert_eq!(policy.tier, DEFAULT_TIER);
+        assert_eq!(policy.priority, DEFAULT_PRIORITY);
     }
 
     #[tokio::test]
     async fn upsert_and_get_roundtrip() {
         let p = pool().await;
-        upsert(
+        upsert_with_cell(
             &p,
             "acme",
             "dedicated",
@@ -253,6 +334,9 @@ mod tests {
             Some("key/acme"),
             3,
             7,
+            "cell-a",
+            "paid",
+            10,
             100,
         )
         .await
@@ -266,6 +350,9 @@ mod tests {
         assert_eq!(policy.key_policy_id.as_deref(), Some("key/acme"));
         assert_eq!(policy.encryption_policy_version, 3);
         assert_eq!(policy.policy_version, 7);
+        assert_eq!(policy.cell_id, "cell-a");
+        assert_eq!(policy.tier, "paid");
+        assert_eq!(policy.priority, 10);
     }
 
     #[tokio::test]

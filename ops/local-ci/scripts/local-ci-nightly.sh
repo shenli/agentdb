@@ -11,8 +11,8 @@ usage() {
   cat <<'EOF'
 Usage: ops/local-ci/scripts/local-ci-nightly.sh [OPTIONS]
 
-Runs the nightly local CI profile: cargo, SDKs, failover smoke, and bounded
-random cluster chaos.
+Runs the nightly local CI profile: cargo, SDKs, failover smoke, deterministic
+cluster hardening smoke, and bounded random cluster chaos.
 
 Options:
   --no-pull              Do not git pull before running.
@@ -62,4 +62,4 @@ if [[ "$SKIP_PULL" != "1" ]]; then
 fi
 
 export LOCAL_CI_RUN_ROOT="$RUN_ROOT"
-exec ops/local-ci/scripts/local-ci.sh --chaos --chaos-iterations "$CHAOS_ITERATIONS"
+exec ops/local-ci/scripts/local-ci.sh --hardening --chaos --chaos-iterations "$CHAOS_ITERATIONS"

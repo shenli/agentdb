@@ -157,6 +157,18 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/023_tablet_stats_compaction_debt.sql"),
         include_str!("../migrations/023_tablet_stats_compaction_debt.pg.sql"),
     ),
+    (
+        24,
+        "logical cells and placement policy fields",
+        include_str!("../migrations/024_cells_and_placement_policy.sql"),
+        include_str!("../migrations/024_cells_and_placement_policy.pg.sql"),
+    ),
+    (
+        25,
+        "manual tablet movement types",
+        include_str!("../migrations/025_manual_tablet_movements.sql"),
+        include_str!("../migrations/025_manual_tablet_movements.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

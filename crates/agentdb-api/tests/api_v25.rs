@@ -1,5 +1,8 @@
 mod common;
 
+use agentdb_api::routing_http::{
+    HDR_CELL_ID, HDR_PLACEMENT_SCOPE_ID, HDR_TABLET_EPOCH, HDR_TABLET_ID,
+};
 use common::spawn_app;
 use serde_json::json;
 
@@ -192,6 +195,7 @@ async fn context_and_watch_work_over_http() {
         .await
         .unwrap();
     assert_eq!(items.as_array().unwrap().len(), 2);
+    assert_eq!(items[0]["cell_id"], serde_json::Value::Null);
     let cursor = items[0]["cursor"].as_str().unwrap();
     let after: serde_json::Value = app
         .client
@@ -208,4 +212,29 @@ async fn context_and_watch_work_over_http() {
         .await
         .unwrap();
     assert_eq!(after.as_array().unwrap().len(), 1);
+
+    let routed_items: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/watch?scope=tenant", app.base))
+        .header(HDR_TABLET_ID, "7")
+        .header(HDR_TABLET_EPOCH, "11")
+        .header(HDR_CELL_ID, "cell-a")
+        .header(HDR_PLACEMENT_SCOPE_ID, "tenant/api-v25")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(routed_items[0]["cell_id"], "cell-a");
+    assert_eq!(routed_items[0]["placement_scope_id"], "tenant/api-v25");
+    assert_eq!(routed_items[0]["tablet_id"], 7);
+    assert_eq!(routed_items[0]["tablet_epoch"], 11);
+    let routed_cursor = routed_items[0]["cursor"].as_str().unwrap();
+    assert!(routed_cursor.contains("cell=cell-a"));
+    assert!(routed_cursor.contains("scope=tenant/api-v25"));
+    assert!(routed_cursor.contains("tablet=7"));
+    assert!(routed_cursor.contains("epoch=11"));
 }

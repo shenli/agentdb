@@ -32,6 +32,26 @@ data_dir = "./agentdb-data"
 [storage.kv]
 backend = "rocksdb" # or "slatedb"
 
+[storage.tablet]
+# Track B tablet-store layout. grouped_rocksdb places hot tablet state in
+# bounded local RocksDB domains. prefix_scoped remains available for local
+# development and narrow debugging.
+layout = "grouped_rocksdb" # or "prefix_scoped"
+# root_dir defaults to "<data_dir>/tablet-stores".
+# root_dir = "./agentdb-data/tablet-stores"
+# Number of tablets sharing one RocksDB domain when layout = "grouped_rocksdb".
+# Use 1 only for explicit high-isolation testing; larger values cap memtables.
+tablets_per_domain = 32
+# Maximum idle grouped RocksDB domains retained open by a node.
+# Memory budget note: mutable memtable capacity is roughly
+# max_open_domains * domain_write_buffer_size_mib * domain_max_write_buffers.
+max_open_domains = 16
+domain_write_buffer_size_mib = 16
+domain_max_write_buffers = 2
+domain_parallelism = 1
+domain_max_background_jobs = 1
+domain_max_open_files = 128
+
 # Support matrix:
 # - single_node + rocksdb + localfs: primary supported deployment
 # - single_node + slatedb + s3: testing/evaluation
@@ -65,3 +85,11 @@ backend = "localfs" # or "object_store"
 [routing]
 # Required in cluster mode.
 # node_id = "node-a"
+# Logical isolation cell for this node. Use the same value for nodes that
+# should share tablet placement and rebalance.
+cell_id = "default"
+# Region and AZ labels used by routing status and replica placement.
+# region = "us-west-2"
+# availability_zone = "us-west-2a"
+# stable, mixed, or preemptible.
+capacity_class = "stable"

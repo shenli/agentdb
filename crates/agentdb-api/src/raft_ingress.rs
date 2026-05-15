@@ -82,6 +82,16 @@ impl RaftRsGroupRegistry {
         self.group_for(tablet_id)?.remove_node(leader_id, node_id)
     }
 
+    pub fn transfer_leader(
+        &self,
+        tablet_id: i64,
+        leader_id: u64,
+        transferee_id: u64,
+    ) -> Result<()> {
+        self.group_for(tablet_id)?
+            .transfer_leader(leader_id, transferee_id)
+    }
+
     pub fn build_snapshot_transfer(
         &self,
         tablet_id: i64,

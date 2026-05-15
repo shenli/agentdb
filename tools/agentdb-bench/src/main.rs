@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agentdb_storage::{
+    GroupedRocksDbTabletStore, PrefixScopedTabletStore, RocksKvStore, TabletStoreLifecycle,
+};
 use anyhow::{anyhow, Context, Result};
 use bson::{doc, Bson, DateTime as BsonDateTime, Document};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -46,6 +49,8 @@ enum Commands {
     Prepare(PrepareArgs),
     /// Run a workload against a previously prepared dataset.
     Run(RunArgs),
+    /// Run a local tablet-store layout microbenchmark.
+    TabletStore(TabletStoreArgs),
     /// Aggregate repeated benchmark report JSON files.
     SummarizeRepeats(SummarizeRepeatsArgs),
 }
@@ -152,6 +157,67 @@ struct SummarizeRepeatsArgs {
     reports: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct TabletStoreArgs {
+    #[arg(long, value_enum, default_value_t = TabletStoreLayout::GroupedRocksDb)]
+    layout: TabletStoreLayout,
+    #[arg(long, default_value = DEFAULT_OUT_DIR)]
+    out: PathBuf,
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, default_value_t = 8)]
+    tablets: i64,
+    #[arg(long, default_value_t = 10_000)]
+    ops: usize,
+    #[arg(long, default_value_t = 256)]
+    value_bytes: usize,
+    #[arg(long, default_value_t = 32)]
+    tablets_per_domain: i64,
+    #[arg(long, default_value_t = 16)]
+    max_open_domains: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    #[arg(long)]
+    checkpoint_tablet: Option<i64>,
+    /// Fail if p99 append latency exceeds this threshold.
+    #[arg(long)]
+    max_p99_ms: Option<f64>,
+    /// Fail if p999 append latency exceeds this threshold.
+    #[arg(long)]
+    max_p999_ms: Option<f64>,
+    /// Fail if estimated write amplification exceeds this threshold.
+    #[arg(long)]
+    max_write_amplification: Option<f64>,
+    /// Fail if checkpoint duration exceeds this threshold.
+    #[arg(long)]
+    max_checkpoint_ms: Option<f64>,
+    /// Fail if restore duration exceeds this threshold.
+    #[arg(long)]
+    max_restore_ms: Option<f64>,
+    /// Fail if open file descriptors grow by more than this count.
+    #[arg(long)]
+    max_open_fds_growth: Option<u64>,
+    /// Fail if RSS grows by more than this many MiB.
+    #[arg(long)]
+    max_rss_growth_mib: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum TabletStoreLayout {
+    PrefixScoped,
+    GroupedRocksDb,
+}
+
+impl TabletStoreLayout {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefixScoped => "prefix_scoped",
+            Self::GroupedRocksDb => "grouped_rocksdb",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Profile {
     Smoke,
@@ -220,6 +286,44 @@ struct ArtifactStats {
     content_backend_bytes: u64,
     external_reference_artifacts: u64,
     external_reference_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TabletStoreBenchReport {
+    run_id: String,
+    layout: String,
+    tablets: i64,
+    ops: usize,
+    value_bytes: usize,
+    tablets_per_domain: i64,
+    max_open_domains: usize,
+    logical_write_bytes: u64,
+    physical_bytes_estimate_after_writes: Option<u64>,
+    write_amplification_estimate_after_writes: Option<f64>,
+    ops_per_sec: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    p999_ms: f64,
+    max_ms: f64,
+    checkpoint_tablet: Option<i64>,
+    checkpoint_ms: Option<f64>,
+    checkpoint_size_bytes: Option<u64>,
+    checkpoint_checksum_sha256: Option<String>,
+    restore_ms: Option<f64>,
+    restore_size_bytes: Option<u64>,
+    restore_checksum_sha256: Option<String>,
+    resource_before: ProcessResourceSample,
+    resource_after_writes: ProcessResourceSample,
+    resource_after_checkpoint: ProcessResourceSample,
+    domain_metrics_after_writes: Vec<agentdb_storage::TabletStoreDomainMetrics>,
+    domain_metrics_after_checkpoint: Vec<agentdb_storage::TabletStoreDomainMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessResourceSample {
+    open_fds: Option<u64>,
+    rss_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,8 +527,153 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Prepare(args) => prepare(args).await,
         Commands::Run(args) => run(args).await,
+        Commands::TabletStore(args) => tablet_store_bench(args),
         Commands::SummarizeRepeats(args) => summarize_repeats(args),
     }
+}
+
+fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
+    if args.tablets <= 0 {
+        return Err(anyhow!("--tablets must be positive"));
+    }
+    if args.ops == 0 {
+        return Err(anyhow!("--ops must be positive"));
+    }
+    fs::create_dir_all(&args.out)?;
+    let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
+    let root = args.out.join(format!("tablet-store-{run_id}"));
+    if root.exists() {
+        return Err(anyhow!(
+            "tablet-store benchmark directory already exists: {}",
+            root.display()
+        ));
+    }
+    fs::create_dir_all(&root)?;
+    let resource_before = process_resource_sample();
+
+    let lifecycle: Arc<dyn TabletStoreLifecycle> = match args.layout {
+        TabletStoreLayout::PrefixScoped => {
+            let kv = Arc::new(RocksKvStore::open(root.join("prefix-scoped"))?);
+            Arc::new(PrefixScopedTabletStore::new(kv))
+        }
+        TabletStoreLayout::GroupedRocksDb => Arc::new(GroupedRocksDbTabletStore::new(
+            root.join("grouped-rocksdb"),
+            args.tablets_per_domain,
+            args.max_open_domains,
+        )),
+    };
+
+    let mut rng = StdRng::seed_from_u64(args.seed);
+    let mut value = vec![0u8; args.value_bytes];
+    let started = Instant::now();
+    let mut latencies = Vec::with_capacity(args.ops);
+    let mut logical_write_bytes = 0u64;
+    for op in 0..args.ops {
+        rng.fill(value.as_mut_slice());
+        let tablet_id = (op as i64) % args.tablets;
+        let store = lifecycle.open_tablet_store(tablet_id)?;
+        let key = format!("bench/{op:020}").into_bytes();
+        logical_write_bytes = logical_write_bytes.saturating_add((key.len() + value.len()) as u64);
+        let op_started = Instant::now();
+        store.put(&key, &value)?;
+        latencies.push(op_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    latencies.sort_unstable();
+    let resource_after_writes = process_resource_sample();
+    let domain_metrics_after_writes = lifecycle.domain_metrics()?;
+    let physical_bytes_estimate_after_writes =
+        physical_bytes_estimate(&domain_metrics_after_writes);
+    let write_amplification_estimate_after_writes =
+        write_amplification_estimate(physical_bytes_estimate_after_writes, logical_write_bytes);
+
+    let checkpoint_tablet = args.checkpoint_tablet;
+    let (
+        checkpoint_ms,
+        checkpoint_size_bytes,
+        checkpoint_checksum_sha256,
+        restore_ms,
+        restore_size_bytes,
+        restore_checksum_sha256,
+    ) = if let Some(tablet_id) = checkpoint_tablet {
+        let checkpoint_dir = root.join(format!("checkpoint-tablet-{tablet_id:020}"));
+        let checkpoint_started = Instant::now();
+        let manifest = lifecycle.checkpoint_tablet(tablet_id, &checkpoint_dir)?;
+        let checkpoint_ms = Some(duration_ms(checkpoint_started.elapsed()));
+        let (restore_ms, restore_size_bytes, restore_checksum_sha256) =
+            if matches!(args.layout, TabletStoreLayout::GroupedRocksDb)
+                && args.tablets_per_domain == 1
+            {
+                let restore_lifecycle = GroupedRocksDbTabletStore::new(
+                    root.join("restore-grouped-rocksdb"),
+                    args.tablets_per_domain,
+                    args.max_open_domains,
+                );
+                let restore_started = Instant::now();
+                let restored =
+                    restore_lifecycle.restore_tablet_checkpoint(tablet_id, &checkpoint_dir)?;
+                (
+                    Some(duration_ms(restore_started.elapsed())),
+                    restored.size_bytes,
+                    restored.checksum_sha256,
+                )
+            } else {
+                (None, None, None)
+            };
+        (
+            checkpoint_ms,
+            manifest.size_bytes,
+            manifest.checksum_sha256,
+            restore_ms,
+            restore_size_bytes,
+            restore_checksum_sha256,
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
+    let resource_after_checkpoint = process_resource_sample();
+    let domain_metrics_after_checkpoint = lifecycle.domain_metrics()?;
+
+    let report = TabletStoreBenchReport {
+        run_id: run_id.clone(),
+        layout: args.layout.as_str().into(),
+        tablets: args.tablets,
+        ops: args.ops,
+        value_bytes: args.value_bytes,
+        tablets_per_domain: args.tablets_per_domain,
+        max_open_domains: args.max_open_domains,
+        logical_write_bytes,
+        physical_bytes_estimate_after_writes,
+        write_amplification_estimate_after_writes,
+        ops_per_sec: args.ops as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        p50_ms: percentile_ms(&latencies, 0.50),
+        p95_ms: percentile_ms(&latencies, 0.95),
+        p99_ms: percentile_ms(&latencies, 0.99),
+        p999_ms: percentile_ms(&latencies, 0.999),
+        max_ms: latencies
+            .last()
+            .copied()
+            .map(duration_ms)
+            .unwrap_or_default(),
+        checkpoint_tablet,
+        checkpoint_ms,
+        checkpoint_size_bytes,
+        checkpoint_checksum_sha256,
+        restore_ms,
+        restore_size_bytes,
+        restore_checksum_sha256,
+        resource_before,
+        resource_after_writes,
+        resource_after_checkpoint,
+        domain_metrics_after_writes,
+        domain_metrics_after_checkpoint,
+    };
+    let report_path = root.join("report.json");
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    eprintln!("tablet-store benchmark report: {}", report_path.display());
+    enforce_tablet_store_gates(&args, &report)?;
+    Ok(())
 }
 
 async fn prepare(args: PrepareArgs) -> Result<()> {
@@ -3870,6 +4119,153 @@ fn percentile(samples: &[f64], q: f64) -> f64 {
     }
     let idx = ((samples.len() - 1) as f64 * q).round() as usize;
     samples[idx.min(samples.len() - 1)]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn process_resource_sample() -> ProcessResourceSample {
+    ProcessResourceSample {
+        open_fds: linux_self_open_fds(),
+        rss_bytes: linux_self_rss_bytes(),
+    }
+}
+
+fn linux_self_open_fds() -> Option<u64> {
+    let entries = fs::read_dir("/proc/self/fd").ok()?;
+    let count = entries.filter_map(std::result::Result::ok).count();
+    Some(count as u64)
+}
+
+fn linux_self_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?;
+        let mut parts = rest.split_whitespace();
+        let value = parts.next()?.parse::<u64>().ok()?;
+        let unit = parts.next().unwrap_or("kB");
+        match unit {
+            "B" => Some(value),
+            "kB" | "KB" => value.checked_mul(1024),
+            "mB" | "MB" => value.checked_mul(1024 * 1024),
+            _ => value.checked_mul(1024),
+        }
+    })
+}
+
+fn physical_bytes_estimate(domains: &[agentdb_storage::TabletStoreDomainMetrics]) -> Option<u64> {
+    let mut saw_value = false;
+    let mut total = 0u64;
+    for domain in domains {
+        if let Some(value) = domain.metrics.total_sst_file_size_bytes {
+            saw_value = true;
+            total = total.saturating_add(value);
+        }
+        if let Some(value) = domain.metrics.all_memtables_bytes {
+            saw_value = true;
+            total = total.saturating_add(value);
+        }
+    }
+    saw_value.then_some(total)
+}
+
+fn write_amplification_estimate(
+    physical_bytes: Option<u64>,
+    logical_write_bytes: u64,
+) -> Option<f64> {
+    if logical_write_bytes == 0 {
+        return None;
+    }
+    physical_bytes.map(|physical| physical as f64 / logical_write_bytes as f64)
+}
+
+fn enforce_tablet_store_gates(
+    args: &TabletStoreArgs,
+    report: &TabletStoreBenchReport,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Some(max) = args.max_p99_ms {
+        if report.p99_ms > max {
+            failures.push(format!("p99_ms {:.3} > {:.3}", report.p99_ms, max));
+        }
+    }
+    if let Some(max) = args.max_p999_ms {
+        if report.p999_ms > max {
+            failures.push(format!("p999_ms {:.3} > {:.3}", report.p999_ms, max));
+        }
+    }
+    if let Some(max) = args.max_write_amplification {
+        match report.write_amplification_estimate_after_writes {
+            Some(value) if value > max => {
+                failures.push(format!("write_amplification {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("write_amplification estimate unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_checkpoint_ms {
+        match report.checkpoint_ms {
+            Some(value) if value > max => {
+                failures.push(format!("checkpoint_ms {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("checkpoint_ms unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_restore_ms {
+        match report.restore_ms {
+            Some(value) if value > max => {
+                failures.push(format!("restore_ms {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("restore_ms unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_open_fds_growth {
+        match (
+            report.resource_before.open_fds,
+            report.resource_after_checkpoint.open_fds,
+        ) {
+            (Some(before), Some(after)) if after.saturating_sub(before) > max => failures.push(
+                format!("open_fds_growth {} > {}", after.saturating_sub(before), max),
+            ),
+            (None, _) | (_, None) => failures.push("open_fds sample unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max_mib) = args.max_rss_growth_mib {
+        let max_bytes = max_mib.saturating_mul(1024 * 1024);
+        match (
+            report.resource_before.rss_bytes,
+            report.resource_after_checkpoint.rss_bytes,
+        ) {
+            (Some(before), Some(after)) if after.saturating_sub(before) > max_bytes => {
+                failures.push(format!(
+                    "rss_growth_mib {:.3} > {}",
+                    after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+                    max_mib
+                ));
+            }
+            (None, _) | (_, None) => failures.push("rss sample unavailable".into()),
+            _ => {}
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "tablet-store benchmark gates failed: {}",
+        failures.join("; ")
+    ))
+}
+
+fn percentile_ms(samples: &[Duration], q: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let idx = ((samples.len() - 1) as f64 * q).round() as usize;
+    duration_ms(samples[idx.min(samples.len() - 1)])
 }
 
 fn summarize_operations(samples: &[OperationSample]) -> Vec<OperationReport> {

@@ -6,13 +6,9 @@ use agentdb_core::runtime::Runtime;
 use agentdb_core::tenant::NewTenant;
 use agentdb_storage::{
     sha256_hex, AllowAllKmsKeyResolver, ContentBackend, ContentCryptoAdapter, ContentCryptoContext,
-    KvStore, LocalFsContentBackend, RocksKvStore,
+    InMemoryKvStore, KvStore, LocalFsContentBackend,
 };
 use tempfile::TempDir;
-
-fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
-    Arc::new(RocksKvStore::open(path).expect("open rocks kv"))
-}
 
 #[derive(Debug)]
 struct PrefixReverseCrypto;
@@ -43,15 +39,14 @@ impl ContentCryptoAdapter for PrefixReverseCrypto {
 #[tokio::test]
 async fn artifact_content_crypto_wraps_storage_bytes_but_preserves_plaintext_metadata() {
     let dir = TempDir::new().unwrap();
-    let kv_path = dir.path().join("kv");
     let content_root = dir.path().join("content");
     let plaintext = b"secret artifact bytes";
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::new());
 
     let (tenant_id, artifact_id, sha256) = {
-        let kv = open_kv(&kv_path);
         let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
         let rt = Runtime::with_kv_kms_and_content_crypto(
-            kv,
+            kv.clone(),
             content,
             Arc::new(AllowAllKmsKeyResolver),
             Arc::new(PrefixReverseCrypto),
@@ -96,17 +91,18 @@ async fn artifact_content_crypto_wraps_storage_bytes_but_preserves_plaintext_met
             .unwrap();
         assert_eq!(round_trip, plaintext);
 
-        (
+        let ids = (
             tenant.tenant_id.clone(),
             artifact.artifact_id.clone(),
             artifact.sha256,
-        )
+        );
+        drop(rt);
+        ids
     };
 
-    let kv = open_kv(&kv_path);
     let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(&content_root));
     let rt = Runtime::with_kv_kms_and_content_crypto(
-        kv,
+        kv.clone(),
         content,
         Arc::new(AllowAllKmsKeyResolver),
         Arc::new(PrefixReverseCrypto),

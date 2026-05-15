@@ -431,6 +431,20 @@ pub async fn complete_handoff(
     tablet_id: i64,
     expected_source: &str,
 ) -> MetaResult<Option<String>> {
+    complete_handoff_with_lease(pool, tablet_id, expected_source, 0).await
+}
+
+/// Like [`complete_handoff`], but installs an initial lease for the new owner.
+///
+/// This is used by admin/scheduler control-plane paths that synchronously
+/// complete the ownership transfer and need the new owner to be immediately
+/// routable.
+pub async fn complete_handoff_with_lease(
+    pool: &AnyPool,
+    tablet_id: i64,
+    expected_source: &str,
+    new_lease_expires_at_ms: i64,
+) -> MetaResult<Option<String>> {
     // Read first so we can return the new owner. Then UPDATE
     // with a stricter predicate so a concurrent admin DELETE
     // or another node's `assume_ownership` doesn't get
@@ -459,7 +473,7 @@ pub async fn complete_handoff(
         "UPDATE tablets \
             SET owner_node_id = $1, \
                 handoff_target_node_id = NULL, \
-                lease_expires_at_ms = 0, \
+                lease_expires_at_ms = $5, \
                 epoch = epoch + 1 \
             WHERE tablet_id = $2 AND owner_node_id = $3 AND handoff_target_node_id = $4",
     )
@@ -467,6 +481,7 @@ pub async fn complete_handoff(
     .bind(tablet_id)
     .bind(&owner)
     .bind(&target)
+    .bind(new_lease_expires_at_ms)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -695,6 +710,25 @@ mod tests {
             t.epoch, 2,
             "epoch must advance so the source's lease is fenced"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_handoff_with_lease_makes_target_immediately_routable() {
+        let p = pool().await;
+        get_or_create(&p, 7, 100).await.unwrap();
+        assume_ownership(&p, 7, 0, "node-a", 5_000).await.unwrap();
+        mark_for_handoff(&p, 7, "node-b").await.unwrap();
+
+        let new_owner = complete_handoff_with_lease(&p, 7, "node-a", 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(new_owner.as_deref(), Some("node-b"));
+        let t = get(&p, 7).await.unwrap().unwrap();
+        assert_eq!(t.owner_node_id.as_deref(), Some("node-b"));
+        assert!(t.handoff_target_node_id.is_none());
+        assert_eq!(t.lease_expires_at_ms, 30_000);
+        assert_eq!(t.epoch, 2);
     }
 
     #[tokio::test]

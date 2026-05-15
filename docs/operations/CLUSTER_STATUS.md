@@ -12,7 +12,69 @@ rebalance-driven membership convergence.
 
 That is still different from a supported, documented, user-facing cluster
 product. The remaining gap is operator hardening: failure-injection coverage,
-stable SLOs, alerting, documented runbooks, and storage lifecycle policy.
+stable SLOs, broader failure runbooks, and storage lifecycle policy.
+
+## RTO/RPO Timing Model
+
+AgentDB separates fast write-path recovery from slower control-plane cleanup.
+This follows the same broad tradeoff as TiKV-style deployments: Raft elections
+and heartbeats should be fast, while dead-peer/store detection should be slow
+enough to avoid false positives during network or metadata stalls.
+
+Current default timing:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `AGENTDB_RAFT_TICK_INTERVAL_MS` | 100 ms | Base raft-rs logical tick. |
+| Raft heartbeat ticks | 3 ticks | Heartbeat cadence, currently compiled in. |
+| Raft election ticks | 10 ticks | Election timeout, currently compiled in. |
+| `AGENTDB_RAFT_OWNER_CAMPAIGN_INTERVAL_MS` | 1 s | How often current metadata owners ask their local Raft replica to campaign. |
+| `[routing].refresh_interval_ms` | 5 s | How often routing snapshots refresh without a metadata change hint. |
+| `AGENTDB_SCHEDULER_RENEW_INTERVAL_MS` | 10 s | Scheduler tick cadence for ownership reconciliation, rebalance, and cleanup. |
+| `AGENTDB_NODE_HEARTBEAT_MS` | 5 s | Node control-plane heartbeat cadence. |
+| `AGENTDB_STALE_NODE_THRESHOLD_MS` | 180 s | Time before an `alive` node is marked `dead`. |
+| `AGENTDB_REAPER_SAFETY_MARGIN_MS` | 5 s | Extra ownership-lease grace before expired leases are cleared. |
+
+Expected single-node failure RTO when quorum remains is:
+
+```text
+Raft election time
++ ownership reconciliation delay
++ routing refresh / change propagation delay
++ client retry/backoff
+```
+
+With the defaults above, the design target is seconds to tens of seconds for
+write availability on the affected tablet. The smoke harness enforces a
+45-second owner-move window for the current implementation. The 180-second
+stale-node threshold is not the intended write-availability RTO; it is the
+slower cleanup window for declaring a node dead, deleting stale stats, and
+enabling replacement/rebalance workflows that require a dead-node decision.
+
+RPO for acknowledged writes is `0` as long as a Raft quorum of voters survives
+and their durable `raft-engine` state is available. AgentDB acknowledges tablet
+writes only after Raft commit through the tablet group. Writes that timed out,
+lost the connection before acknowledgment, or could not reach quorum are
+unknown to the client and must be retried with normal idempotency semantics.
+If a tablet loses quorum, AgentDB should preserve acknowledged committed
+entries on the surviving durable replicas, but the tablet is unavailable until
+quorum is restored or an operator performs an explicit recovery workflow.
+
+Production impact of the timing knobs:
+
+- Lowering `AGENTDB_RAFT_TICK_INTERVAL_MS` can reduce failover latency, but
+  increases heartbeat/election traffic and sensitivity to scheduler stalls.
+- Lowering `AGENTDB_STALE_NODE_THRESHOLD_MS` makes failed-node cleanup and
+  replacement faster, but increases false-dead risk during transient network,
+  metadata, or GC stalls.
+- Raising `AGENTDB_STALE_NODE_THRESHOLD_MS` reduces false-dead risk, but keeps
+  failed nodes visible as degraded longer and delays automatic replacement
+  workflows.
+- Lowering `[routing].refresh_interval_ms` can reduce route convergence time,
+  but increases metadata polling. Metadata change hints already shorten the
+  common path when they are delivered.
+- Increasing scheduler/rebalance movement limits can reduce recovery backlog,
+  but increases control-plane churn and replica movement pressure.
 
 ## What Exists Today
 
@@ -75,9 +137,15 @@ For local real-process validation of the current Raft path, use
 development validation tool; it is not a supported production bootstrap
 procedure.
 
+For evaluation alert triage, use [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md). It
+documents the first page-level signals for leaderless tablets, lagging
+replicas, stale routing, tablet-store pressure, and checkpoint/snapshot
+failures.
+
 The repository now has cluster-facing visibility endpoints:
 
 - `GET /api/admin/scheduler`
+- `GET /api/admin/cells`
 - `GET /api/admin/drain`
 - `GET /api/admin/nodes`
 - `GET /api/admin/tablets`
@@ -91,6 +159,9 @@ The repository now has cluster-facing visibility endpoints:
 And a very small amount of direct metadata admin:
 
 - `agentdbctl drain start` for one-way local drain activation
+- `agentdbctl cells list` and `agentdbctl cells upsert ...` for logical
+  isolation-domain metadata, including domain class, deployment profile, and
+  capacity class
 - `agentdbctl nodes register ...` for explicit node registration/upsert
 - `agentdbctl nodes delete <node_id>` for operator cleanup of a stale node row
 - `agentdbctl nodes maintenance <node_id> alive|draining|maintenance` for node
@@ -178,6 +249,14 @@ when metadata-backed cluster mode is enabled:
   `AGENTDB_TABLET_LOG_COMPACTION_MIN_DEBT_OPS`; `GET /api/admin/scheduler`
   and `agentdbctl status` expose local compaction success/failure counters so
   operators can distinguish an idle worker from a stuck one
+- local tablet-store layout and bounded-domain sizing through
+  `GET /api/admin/scheduler` and `agentdbctl status`, including layout, root
+  path, tablets per domain, max open domains, and the derived mutable memtable
+  budget. For open RocksDB tablet-store domains the scheduler status also
+  includes memtable bytes, level-0 file count, pending compaction bytes, running
+  compactions/flushes, background errors, and estimated key count.
+  `agentdbctl tablet-store compact --tablet-id <id>` can trigger the same
+  tablet-store manual compaction hook exposed by the admin API.
 - opt-in tablet lifecycle preparation based on shard-span and tablet-stat
   thresholds:
   `AGENTDB_TABLET_LIFECYCLE_SPLIT_MAX_SHARDS`,
@@ -194,6 +273,14 @@ when metadata-backed cluster mode is enabled:
   follow-on movement or oscillation
 - tombstoned-tablet replica cleanup so split/merge source Raft groups stop
   being reopened after cutover
+
+The current metadata-backed scheduler is cell-aware. Automatic assignment,
+replacement, and load-balancing only choose nodes in the tablet placement
+scope's cell. Cell deployment profiles influence replacement target choice:
+`single_az_cluster` keeps quorum voters on distinct nodes in the existing AZ
+when possible, while `multi_az_standard` and `enterprise` prefer a target in a
+new AZ when enough AZs are available. Paid-or-higher tenant policies are not
+automatically placed into economy or preemptible domains.
 
 This is the first live convergence loop in the product, but it is still a
 small subset of the eventual cluster control plane.
@@ -258,7 +345,7 @@ The honest operational message today is:
 - **supported**: single-node AgentDB
 - **evaluation only**: clustered AgentDB with tablet Raft quorum enabled
 - **future work**: production-hardened multi-node AgentDB with published SLOs,
-  runbooks, alerts, and compatibility guarantees
+  broader runbooks, alerts, and compatibility guarantees
 
 Forward-looking target-state docs exist for that future work:
 

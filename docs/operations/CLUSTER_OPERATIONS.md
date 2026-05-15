@@ -187,17 +187,24 @@ Always:
 
 If the node dies:
 
-- other nodes should mark it stale after heartbeat expiry
-- leases should expire
-- ownership should be reassigned or made eligible for reassignment
+- surviving Raft voters should elect a new leader when quorum remains
+- ownership should be reconciled to the new Raft leader
 - client traffic should route elsewhere
+- other nodes should mark it stale/dead after the configured cleanup threshold
+- replacement/rebalance cleanup should proceed after the dead-node decision
 
-Current behavior: the scheduler leader marks stale `alive` nodes as `dead`, and
-the lease reaper clears expired tablet ownership. Once tablets are unowned,
-`agentdbctl tablets rebalance` or the automatic scheduler rebalance pass can
-assign them to fresh `alive` nodes. Cooperative rebalance does not force-move a
-dead source; Raft membership retirement is tied to healthy caught-up
-replacement completion.
+Current behavior: local Raft groups keep ticking on all replicas, surviving
+voters can elect a new leader, and all nodes that host a local Raft group can
+reconcile tablet ownership to the observed Raft leader. The scheduler leader
+marks stale `alive` nodes as `dead` after `AGENTDB_STALE_NODE_THRESHOLD_MS`
+(default 180 seconds), and the lease reaper clears expired tablet ownership
+with `AGENTDB_REAPER_SAFETY_MARGIN_MS` grace. Cooperative rebalance does not
+force-move a dead source; Raft membership retirement is tied to healthy
+caught-up replacement completion.
+
+The operational RTO for write availability should be based on Raft election,
+ownership reconciliation, route refresh, and client retry. The dead-node
+threshold is a cleanup and replacement timer, not the write-path RTO.
 
 ### Backup And Restore
 
@@ -208,8 +215,19 @@ Current backup controls:
   snapshot when metadata is configured.
 - The manifest includes runtime storage summary data for observability. It is
   not a full runtime KV/content backup.
+- Add `--include-tablet-checkpoints` to checkpoint local physical tablet-store
+  domains. This is supported only for `grouped_rocksdb` with
+  `tablets_per_domain = 1`, where each checkpoint maps to exactly one tablet
+  store. The manifest records path, checksum, size, and latest applied index.
+  When metadata is configured, it also records cell, placement scope, tablet
+  epoch, and latest retained snapshot index.
 - `agentdbctl restore validate <manifest-path>` validates a backup manifest and
-  referenced metadata snapshot.
+  referenced metadata snapshot plus tablet checkpoint paths, sizes, and
+  checksums.
+- `agentdbctl restore install-tablet-checkpoint --tablet-id <id>
+  --checkpoint-dir <path> --tablet-store-root <path>` installs a checkpoint into
+  a stopped node's local `grouped_rocksdb` tablet-store root. It supports only
+  `tablets_per_domain = 1` and refuses to overwrite non-empty tablet domains.
 
 Restore apply remains an offline operator procedure. The HTTP restore endpoint
 intentionally rejects destructive apply because live restore semantics require a
@@ -388,6 +406,8 @@ actually supported today.
 - [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
   bootstrap model
 - [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current support boundary
+- [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md) - evaluation alert and triage
+  runbook
 - [../runbooks/node_draining.md](../runbooks/node_draining.md) - current drain
   error/runbook shape
 - [../runbooks/lease_lost.md](../runbooks/lease_lost.md) - lease-loss handling

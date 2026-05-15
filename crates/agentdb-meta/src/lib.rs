@@ -18,6 +18,7 @@
 
 pub mod admin_tokens;
 pub mod audit;
+pub mod cells;
 pub mod change_notifier;
 pub mod config;
 pub mod error;

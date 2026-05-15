@@ -29,7 +29,7 @@ pub use kms::{
     AllowAllKmsKeyResolver, KeyOperation, KeyResolution, KmsError, KmsKeyResolver, KmsResult,
     StaticKeyState, StaticKmsKeyResolver,
 };
-pub use kv::{KvIter, KvSnapshot, KvStore, WriteOp};
+pub use kv::{InMemoryKvStore, KvIter, KvSnapshot, KvStore, KvStoreMetrics, WriteOp};
 pub use metadata_crypto::{
     IdentityMetadataCryptoAdapter, MetadataCryptoAdapter, MetadataCryptoContext, MetadataObjectKind,
 };
@@ -42,6 +42,10 @@ pub use replicated_log::{
     LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,
     RaftLogTransport, RaftQuorumReplicatedLog, ReplicatedLog, SingleNodeReplicatedLog,
 };
-pub use rocks::RocksKvStore;
+pub use rocks::{RocksKvStore, RocksKvStoreConfig};
 pub use slate::SlateKvStore;
-pub use tablet_store::TabletKvStore;
+pub use tablet_store::{
+    summarize_checkpoint_dir, GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore,
+    TabletStoreCheckpointSummary, TabletStoreDomainMetrics, TabletStoreLifecycle,
+    TabletStoreManifest,
+};

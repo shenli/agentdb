@@ -41,6 +41,9 @@ common changes:
 - `image.tag` — pin to a released version.
 - `persistence.size` — bump above 10Gi for any real
   workload.
+- `tabletStore.*` — grouped RocksDB tablet-store sizing. The mutable memtable
+  budget is approximately
+  `maxOpenDomains * domainWriteBufferSizeMiB * domainMaxWriteBuffers`.
 
 ## Hardening checklist (before running in prod)
 

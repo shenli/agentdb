@@ -77,7 +77,12 @@ Today, the control-plane schema already has the early shape of this model:
 - `tablet_ranges`: compressed virtual-shard range to tablet map.
 - `tablet_replicas`: intended replica placement and catch-up metadata.
 - `tenant_policies`: tenant placement class, placement scope, encryption class,
-  key policy reference, and policy versions.
+  key policy reference, cell assignment, tenant tier/priority, and policy
+  versions.
+
+The Track A distributed-cluster work adds logical cells and placement-policy
+metadata only. It does not change the hot write path, RocksDB layout, or
+tablet-local physical LSM model described below.
 
 Those rows are control-plane routing metadata. In clustered mode, local tablet
 writes now flow through per-tablet `raft-rs` groups backed by TiKV
@@ -914,6 +919,21 @@ single-session appends or record writes.
    namespace over the existing KV backend and implements the `KvStore` trait.
    The persisted runtime keyspace is now opened through the primary runtime
    tablet instead of writing directly into the raw configured KV store.
+   Track B adds a `TabletStoreLifecycle` boundary and a bounded
+   `grouped_rocksdb` physical layout. The grouped layout maps tablets into
+   local RocksDB domains with configurable `tablets_per_domain` and
+   `max_open_domains` values so physical isolation can improve without opening
+   unbounded memtables. Grouped domains use a smaller RocksDB write-buffer
+   profile by default, and the server exposes `domain_write_buffer_size_mib`,
+   `domain_max_write_buffers`, `domain_parallelism`,
+   `domain_max_background_jobs`, and `domain_max_open_files` so deployments can
+   size the domain count against node memory, background thread, and
+   file-handle limits. The lifecycle can also checkpoint and restore a
+   single-tablet grouped RocksDB domain when `tablets_per_domain = 1`; restore
+   refuses open or non-empty destinations, leaving routing cutover and Raft-tail
+   verification to the control plane. Online backup can include local tablet
+   checkpoint manifests in that mode and records the checkpoint checksum, size,
+   and latest applied index.
 
 4. Add replicated log abstraction.
 
@@ -991,8 +1011,14 @@ single-session appends or record writes.
    route-owned tablets can acknowledge writes only after Raft commit. The local
    Raft append path now releases its group lock while waiting for peer
    responses, allowing the HTTP outbox and ingress workers to complete
-   multi-node election and quorum commit. Configuration changes are serialized
-   per tablet: a second promotion/removal is rejected while the first change is
+   multi-node election and quorum commit. Raft followers tick continuously, and
+   `pre_vote` is enabled to reduce disruptive elections when a partitioned
+   peer rejoins. Fast Raft election/ownership recovery is intentionally
+   separate from the slower stale-node cleanup threshold: acknowledged writes
+   have zero RPO while quorum survives, while single-owner process failure RTO
+   is bounded by Raft election time, ownership reconciliation, routing refresh,
+   and client retry behavior. Configuration changes are serialized per tablet:
+   a second promotion/removal is rejected while the first change is
    still pending commit, and `/api/admin/raft` exposes pending configuration
    changes plus outbound raft-message backlog. Remaining production work is
    deeper tablet-aware compaction tuning and broader failure-injection coverage

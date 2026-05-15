@@ -2,7 +2,7 @@
 
 CREATE TABLE IF NOT EXISTS tablet_movements (
     movement_id            TEXT PRIMARY KEY,
-    movement_type          TEXT NOT NULL CHECK (movement_type IN ('split', 'merge')),
+    movement_type          TEXT NOT NULL CHECK (movement_type IN ('split', 'merge', 'manual_split', 'manual_merge')),
     source_tablet_id       INTEGER NOT NULL,
     destination_tablet_id  INTEGER NOT NULL,
     placement_scope_id     TEXT NOT NULL,
