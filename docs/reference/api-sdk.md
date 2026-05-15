@@ -334,6 +334,11 @@ Use `agentdbctl export clickhouse ...` for the first-party ClickHouse path.
 OTel-shaped `agentdb_otel_logs` and `agentdb_otel_traces` projection tables.
 Use `run --mode native,otel --backfill --tail` to write both native AgentDB
 tables and ClickStack-friendly OTel projections.
+
+Use `agentdbctl export jsonl run --output ./events.jsonl` or an object-store URI
+such as `s3://bucket/prefix/events.jsonl` for raw JSONL archives. The JSONL
+command writes the same export envelopes returned by `exports/watch` and
+supports managed consumer claim/ack options.
 `exports/backfill` supports event snapshots plus tenant-scope metadata
 snapshots:
 

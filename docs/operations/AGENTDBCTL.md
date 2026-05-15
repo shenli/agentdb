@@ -288,6 +288,27 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
     --backfill
 ```
 
+Write durable export envelopes to JSONL:
+
+```bash
+agentdbctl export jsonl run --tenant-id ten_... --output ./agentdb-events.jsonl
+```
+
+For object-store archival, use an object-store URI. S3-compatible destinations
+use the standard AWS environment variables supported by the Rust object-store
+stack:
+
+```bash
+AWS_REGION=us-east-1 \
+agentdbctl export jsonl run --tenant-id ten_... \
+  --output s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --backfill --max-batches 100
+```
+
+Continuous `--tail` is supported for local files and stdout. Object-store
+outputs are uploaded as a completed object, so use `--max-batches` with
+`--tail` for bounded archival batches.
+
 Inspect AgentDB export capability for a tenant:
 
 ```bash

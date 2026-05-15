@@ -889,7 +889,8 @@ formalized.
 
 ### Phase 5: Additional Sinks
 
-- Build S3 JSONL sink.
+- Implemented: JSONL sink in `agentdbctl export jsonl run`, including local
+  files, stdout, and object-store URIs such as `s3://...`.
 - Add Parquet writer.
 - Add DuckDB demo queries and dashboards.
 - Add Kafka bridge if customers need queue-based fan-out or stream processing.

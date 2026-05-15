@@ -57,12 +57,24 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
     --backfill
 ```
 
+Archive raw export envelopes to JSONL locally or in S3-compatible object
+storage:
+
+```bash
+agentdbctl export jsonl run --tenant-id ten_... --output ./agentdb-events.jsonl
+
+AWS_REGION=us-east-1 \
+agentdbctl export jsonl run --tenant-id ten_... \
+  --output s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --backfill --max-batches 100
+```
+
 The current implementation exports event and runtime metadata envelopes from
 `/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
 watch cursors. It is suitable for local validation of schema, ClickHouse
 reachability, cursor resume, metadata snapshot backfill, tombstone handling,
-consumer leases, and dashboard queries.
+consumer leases, JSONL archival, and dashboard queries.
 
 `--mode otel` writes event-derived rows into `agentdb_otel_logs` and
 `agentdb_otel_traces` only. `--mode native,otel` writes the native raw/event

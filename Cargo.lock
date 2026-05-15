@@ -185,10 +185,12 @@ dependencies = [
  "agentdb-storage",
  "anyhow",
  "clap",
+ "object_store",
  "reqwest",
  "serde_json",
  "sha2",
  "tokio",
+ "url",
 ]
 
 [[package]]

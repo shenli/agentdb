@@ -13,7 +13,9 @@ path = "src/main.rs"
 agentdb-storage = { path = "../../crates/agentdb-storage" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
+object_store = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+url = "2"

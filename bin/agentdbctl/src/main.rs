@@ -4,7 +4,12 @@
 //! small operator surface on top: concise commands, table output by default,
 //! JSON output for automation, and no requirement to hand-write curl payloads.
 
-use std::{fmt::Write as _, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    fs::OpenOptions,
+    io::{self, Write as IoWrite},
+    path::PathBuf,
+};
 
 use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
 use anyhow::{anyhow, Context, Result};
@@ -12,6 +17,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
 const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
@@ -583,6 +589,11 @@ enum ExportCommand {
         #[command(subcommand)]
         command: ClickHouseCommand,
     },
+    /// Export durable envelopes as newline-delimited JSON.
+    Jsonl {
+        #[command(subcommand)]
+        command: JsonlCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -647,6 +658,49 @@ struct ClickHouseRunArgs {
     include: Vec<String>,
     #[arg(long = "mode", value_delimiter = ',', default_value = "native")]
     mode: Vec<String>,
+    #[arg(long)]
+    backfill: bool,
+    #[arg(long)]
+    tail: bool,
+    #[arg(long)]
+    max_batches: Option<u64>,
+    #[arg(long, default_value_t = 1000)]
+    poll_interval_ms: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum JsonlCommand {
+    /// Copy one or more export-watch batches into a JSONL file or object.
+    Run(JsonlRunArgs),
+}
+
+#[derive(Args, Debug)]
+struct JsonlRunArgs {
+    #[arg(long)]
+    tenant_id: String,
+    /// Local path, "-", file:// URI, or object-store URI such as s3://bucket/path.jsonl.
+    #[arg(long)]
+    output: String,
+    #[arg(long, default_value = "tenant")]
+    scope: String,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    consumer: Option<String>,
+    #[arg(long, default_value = "agentdbctl-jsonl")]
+    lease_owner: String,
+    #[arg(long, default_value_t = 30_000)]
+    lease_ms: u64,
+    #[arg(long)]
+    from_cursor: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    #[arg(long = "include", value_delimiter = ',')]
+    include: Vec<String>,
     #[arg(long)]
     backfill: bool,
     #[arg(long)]
@@ -888,6 +942,7 @@ async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
 async fn export(api: &Api, command: ExportCommand) -> Result<Value> {
     match command {
         ExportCommand::Clickhouse { command } => clickhouse(api, command).await,
+        ExportCommand::Jsonl { command } => jsonl(api, command).await,
     }
 }
 
@@ -1012,29 +1067,60 @@ async fn ensure_claimed_export_consumer(
     args: &ClickHouseRunArgs,
     consumer: &str,
 ) -> Result<Value> {
+    let include = vec!["events".to_string()];
+    ensure_claimed_export_consumer_for(
+        api,
+        &args.tenant_id,
+        consumer,
+        &args.scope,
+        args.agent_id.as_deref(),
+        args.session_id.as_deref(),
+        &include,
+        &args.lease_owner,
+        args.lease_ms,
+    )
+    .await
+}
+
+async fn ensure_claimed_export_consumer_for(
+    api: &Api,
+    tenant_id: &str,
+    consumer: &str,
+    scope: &str,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    include: &[String],
+    lease_owner: &str,
+    lease_ms: u64,
+) -> Result<Value> {
+    let include = if include.is_empty() {
+        vec!["events".to_string()]
+    } else {
+        include.to_vec()
+    };
     api.post(
         &format!(
             "/api/tenants/{}/exports/consumers",
-            query_component(&args.tenant_id)
+            query_component(tenant_id)
         ),
         json!({
             "name": consumer,
-            "scope": args.scope.clone(),
-            "agent_id": args.agent_id.clone(),
-            "session_id": args.session_id.clone(),
-            "include": ["events"]
+            "scope": scope,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "include": include
         }),
     )
     .await?;
     api.post(
         &format!(
             "/api/tenants/{}/exports/consumers/{}/claim",
-            query_component(&args.tenant_id),
+            query_component(tenant_id),
             query_component(consumer)
         ),
         json!({
-            "lease_owner": args.lease_owner.clone(),
-            "lease_ms": args.lease_ms
+            "lease_owner": lease_owner,
+            "lease_ms": lease_ms
         }),
     )
     .await
@@ -1084,7 +1170,7 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                         "scope": args.scope.clone(),
                         "agent_id": args.agent_id.clone(),
                         "session_id": args.session_id.clone(),
-                        "include": include,
+                        "include": include.clone(),
                         "from_cursor": cursor.clone(),
                         "limit": args.limit
                     }),
@@ -1209,6 +1295,162 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     }))
 }
 
+async fn jsonl(api: &Api, command: JsonlCommand) -> Result<Value> {
+    match command {
+        JsonlCommand::Run(args) => jsonl_run(api, args).await,
+    }
+}
+
+async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
+    let mut output = JsonlOutput::new(
+        &args.output,
+        args.tail && args.max_batches.is_none(),
+        args.dry_run,
+    )
+    .await?;
+    let include = if args.include.is_empty() {
+        vec!["events".to_string()]
+    } else {
+        args.include.clone()
+    };
+    let mut cursor = args.from_cursor.clone();
+    if let Some(consumer) = &args.consumer {
+        let claimed = ensure_claimed_export_consumer_for(
+            api,
+            &args.tenant_id,
+            consumer,
+            &args.scope,
+            args.agent_id.as_deref(),
+            args.session_id.as_deref(),
+            &include,
+            &args.lease_owner,
+            args.lease_ms,
+        )
+        .await?;
+        if cursor.is_none() {
+            cursor = claimed
+                .get("last_acked_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let mut batches = 0_u64;
+    let mut rows = 0_u64;
+    let max_batches = args.max_batches.unwrap_or(if args.tail || args.backfill {
+        u64::MAX
+    } else {
+        1
+    });
+    let mut phase = if args.backfill {
+        ExportRunPhase::Backfill
+    } else {
+        ExportRunPhase::Watch
+    };
+    loop {
+        if batches >= max_batches {
+            break;
+        }
+        let response = match phase {
+            ExportRunPhase::Backfill => {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/backfill",
+                        query_component(&args.tenant_id)
+                    ),
+                    json!({
+                        "scope": args.scope.clone(),
+                        "agent_id": args.agent_id.clone(),
+                        "session_id": args.session_id.clone(),
+                        "include": include.clone(),
+                        "from_cursor": cursor.clone(),
+                        "limit": args.limit
+                    }),
+                )
+                .await?
+            }
+            ExportRunPhase::Watch => {
+                api.get(&jsonl_export_watch_path(&args, cursor.as_deref()))
+                    .await?
+            }
+        };
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            if phase == ExportRunPhase::Backfill {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            if args.tail {
+                tokio::time::sleep(std::time::Duration::from_millis(args.poll_interval_ms)).await;
+                continue;
+            }
+            break;
+        }
+        batches = batches.saturating_add(1);
+        rows = rows.saturating_add(items.len() as u64);
+        output.write_items(&items).await?;
+        cursor = response
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+            if !args.dry_run {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/consumers/{}/ack",
+                        query_component(&args.tenant_id),
+                        query_component(consumer)
+                    ),
+                    json!({
+                        "cursor": cursor,
+                        "snapshot_high_watermark": response
+                            .get("snapshot_high_watermark")
+                            .and_then(Value::as_str),
+                        "lease_owner": args.lease_owner.clone()
+                    }),
+                )
+                .await?;
+            }
+        }
+        if phase == ExportRunPhase::Backfill {
+            let complete = response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        if !args.tail {
+            break;
+        }
+    }
+    let output = output.finish().await?;
+    Ok(json!({
+        "status": "ok",
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "output": output,
+        "backfill": args.backfill,
+        "tail": args.tail,
+        "batches": batches,
+        "rows": rows,
+        "last_cursor": cursor,
+        "dry_run": args.dry_run
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportRunPhase {
     Backfill,
@@ -1235,6 +1477,158 @@ fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
         query_component(&args.tenant_id),
         query_pairs_encoded(&pairs)
     )
+}
+
+fn jsonl_export_watch_path(args: &JsonlRunArgs, cursor: Option<&str>) -> String {
+    let limit = args.limit.to_string();
+    let include = if args.include.is_empty() {
+        "events".to_string()
+    } else {
+        args.include.join(",")
+    };
+    let pairs = [
+        ("scope", Some(args.scope.as_str())),
+        ("agent_id", args.agent_id.as_deref()),
+        ("session_id", args.session_id.as_deref()),
+        ("include", Some(include.as_str())),
+        ("from_cursor", cursor),
+        ("limit", Some(limit.as_str())),
+    ];
+    format!(
+        "/api/tenants/{}/exports/watch{}",
+        query_component(&args.tenant_id),
+        query_pairs_encoded(&pairs)
+    )
+}
+
+enum JsonlOutput {
+    DryRun {
+        target: String,
+        rows: u64,
+    },
+    Stdout {
+        rows: u64,
+    },
+    Local {
+        path: PathBuf,
+        rows: u64,
+    },
+    ObjectStore {
+        uri: String,
+        store: Box<dyn object_store::ObjectStore>,
+        path: object_store::path::Path,
+        body: Vec<u8>,
+        rows: u64,
+    },
+}
+
+impl JsonlOutput {
+    async fn new(target: &str, infinite_tail: bool, dry_run: bool) -> Result<Self> {
+        if dry_run {
+            return Ok(Self::DryRun {
+                target: target.to_string(),
+                rows: 0,
+            });
+        }
+        if target == "-" {
+            return Ok(Self::Stdout { rows: 0 });
+        }
+        if let Ok(url) = Url::parse(target) {
+            if url.scheme() == "file" {
+                let path = url
+                    .to_file_path()
+                    .map_err(|_| anyhow!("file output URI must be an absolute file:// path"))?;
+                return Ok(Self::Local { path, rows: 0 });
+            }
+            if infinite_tail {
+                return Err(anyhow!(
+                    "object-store JSONL output requires --max-batches when --tail is set"
+                ));
+            }
+            let (store, path) = object_store::parse_url(&url)
+                .map_err(|error| anyhow!("parse JSONL object-store output URI: {error}"))?;
+            return Ok(Self::ObjectStore {
+                uri: target.to_string(),
+                store,
+                path,
+                body: Vec::new(),
+                rows: 0,
+            });
+        }
+        Ok(Self::Local {
+            path: PathBuf::from(target),
+            rows: 0,
+        })
+    }
+
+    async fn write_items(&mut self, items: &[Value]) -> Result<()> {
+        let mut batch = Vec::new();
+        for item in items {
+            serde_json::to_writer(&mut batch, item)?;
+            batch.push(b'\n');
+        }
+        match self {
+            Self::DryRun { rows, .. } => {
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::Stdout { rows } => {
+                io::stdout().write_all(&batch)?;
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::Local { path, rows } => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&*path)
+                    .with_context(|| format!("open JSONL output {}", path.display()))?;
+                file.write_all(&batch)
+                    .with_context(|| format!("write JSONL output {}", path.display()))?;
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::ObjectStore { body, rows, .. } => {
+                body.extend_from_slice(&batch);
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<Value> {
+        match self {
+            Self::DryRun { target, rows } => Ok(json!({
+                "type": "dry_run",
+                "target": target,
+                "rows": rows
+            })),
+            Self::Stdout { rows } => Ok(json!({
+                "type": "stdout",
+                "rows": rows
+            })),
+            Self::Local { path, rows } => Ok(json!({
+                "type": "local",
+                "path": path,
+                "rows": rows
+            })),
+            Self::ObjectStore {
+                uri,
+                store,
+                path,
+                body,
+                rows,
+            } => {
+                store
+                    .put(&path, body.into())
+                    .await
+                    .map_err(|error| anyhow!("write JSONL object {uri}: {error}"))?;
+                Ok(json!({
+                    "type": "object_store",
+                    "uri": uri,
+                    "path": path.as_ref(),
+                    "rows": rows
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2387,6 +2781,32 @@ mod tests {
     }
 
     #[test]
+    fn builds_encoded_jsonl_export_watch_path() {
+        let args = JsonlRunArgs {
+            tenant_id: "ten_1".into(),
+            output: "s3://agentdb-exports/ten_1/events.jsonl".into(),
+            scope: "agent".into(),
+            agent_id: Some("agt_1".into()),
+            session_id: None,
+            consumer: None,
+            lease_owner: "agentdbctl-jsonl".into(),
+            lease_ms: 30_000,
+            from_cursor: Some("ledger:ten_1/0001/event/evt_1".into()),
+            limit: 250,
+            include: vec!["events".into(), "sessions".into()],
+            backfill: false,
+            tail: false,
+            max_batches: None,
+            poll_interval_ms: 1000,
+            dry_run: false,
+        };
+        assert_eq!(
+            jsonl_export_watch_path(&args, args.from_cursor.as_deref()),
+            "/api/tenants/ten_1/exports/watch?scope=agent&agent_id=agt_1&include=events%2Csessions&from_cursor=ledger%3Aten_1%2F0001%2Fevent%2Fevt_1&limit=250"
+        );
+    }
+
+    #[test]
     fn clickhouse_schema_contains_event_and_raw_tables() {
         let ddl = CLICKHOUSE_SCHEMA_DDL.join("\n");
         assert!(ddl.contains("agentdb_export_items_raw"));
@@ -2513,5 +2933,34 @@ mod tests {
             }
         );
         assert!(export_modes(&["unknown".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_writes_local_file() {
+        let path = std::env::temp_dir().join(format!(
+            "agentdbctl-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            "writer"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut output = JsonlOutput::new(path.to_str().unwrap(), false, false)
+            .await
+            .unwrap();
+        output
+            .write_items(&[
+                json!({"cursor": "ledger:1", "object_type": "event"}),
+                json!({"cursor": "ledger:2", "object_type": "session"}),
+            ])
+            .await
+            .unwrap();
+        let summary = output.finish().await.unwrap();
+        assert_eq!(summary["type"], "local");
+        assert_eq!(summary["rows"], 2);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines = body.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"cursor\":\"ledger:1\""));
+        assert!(lines[1].contains("\"object_type\":\"session\""));
+        let _ = std::fs::remove_file(&path);
     }
 }
