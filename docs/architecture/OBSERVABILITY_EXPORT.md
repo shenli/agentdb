@@ -738,16 +738,18 @@ it in production.
 Required controls:
 
 - tenant-scoped export authorization
-- object-type allow/deny lists
-- event-kind allow/deny lists
-- payload field redaction rules
+- implemented in `agentdbctl`: object-type allow/deny lists
+- implemented in `agentdbctl`: event-kind allow/deny lists
+- implemented in `agentdbctl`: payload field redaction rules
 - artifact metadata export without blob export by default
-- optional payload hashing or summary-only mode
+- implemented in `agentdbctl`: payload hashing or payload drop mode
 - tombstones for policy redaction and retention purge
 - ClickHouse grants with least privilege: create/migrate role separate from
   insert-only connector role
 
-The connector should never print secrets in logs or `doctor` output.
+The connector should never print secrets in logs or `doctor` output. Current
+exporter-side controls are a sink-boundary safeguard; policy-driven server-side
+redaction remains future work once tenant policy mutation APIs are promoted.
 
 ## API Sketch
 
@@ -836,16 +838,29 @@ Response:
   lag, oldest pending timestamp, lease counts, and oldest retained cursors.
 - Implemented: normalized event observability fields for common convention
   payload keys.
-- Implemented: `agentdbctl export clickhouse doctor/init/run/status`, including
-  `run --backfill --tail`, using ClickHouse HTTP and `JSONEachRow`.
+- Implemented: `agentdbctl export clickhouse doctor/init/migrate/run/status`,
+  including `run --backfill --tail`, using ClickHouse HTTP and
+  `JSONEachRow`.
 - Implemented: first-party ClickHouse DDL for raw envelopes, flattened events,
   checkpoints, schema migrations, and tombstones.
+- Implemented: latest-schema stamp checks for ClickHouse schema drift. Because
+  AgentDB has no production compatibility requirement yet, this is a
+  current-schema apply/check path rather than a historical upgrade ladder.
+- Implemented: retry-safe ClickHouse inserts with stable per-table
+  deduplication tokens derived from the exported cursor range.
+- Implemented: exporter-side privacy gates for ClickHouse and JSONL runs:
+  object/event allow-deny filters, dot-path redaction, and payload
+  `full`/`hash`/`drop` modes.
+- Implemented: local exporter status output through `--metrics-output`,
+  refreshed after every processed batch for tailing workers.
 - Implemented: focused tests for cursor resume, route context propagation,
   durable ledger resume after restart, normalized fields, and CLI schema/path
-  helpers.
-- Deferred: a separate `agentdb-export-clickhouse` daemon binary. The current
-  connector is built into `agentdbctl`; a daemon wrapper can reuse the same API
-  and consumer lease protocol.
+  helpers, ClickStack config templates, privacy filtering/redaction, and
+  exporter metrics.
+- Implemented: systemd service/env packaging for the long-running
+  `agentdbctl` exporter. A separate `agentdb-export-clickhouse` daemon binary
+  remains optional because the packaged service uses the same consumer lease
+  protocol.
 
 This phase is a durable export API, metadata snapshot, schema, HA, and UX
 commitment. It includes tenant-prefixed durable ledger rows for persisted
@@ -865,6 +880,76 @@ last unacked batch without data loss. RPO is zero for committed AgentDB events
 that remain in the export ledger. RTO is bounded by the configured export
 consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 
+Local exporter baseline: on a developer workstation with in-memory AgentDB,
+local Docker ClickHouse, one tenant/session, 10 batches, and 1000 envelopes per
+batch, the ClickHouse exporter copied 10,000 `native` envelopes in 3.22s
+(3,106 envelopes/s) and inserted 20,000 sink rows. The same run shape copied
+10,000 `native,otel` envelopes in 5.41s (1,847 envelopes/s) and inserted 40,000
+sink rows. The corresponding batch times were 322ms and 541ms per 1000-envelope
+batch. These figures are a reproducible local smoke baseline, not a production
+capacity promise; production throughput depends on ClickHouse sizing, network
+latency, payload size, projection mode, batch size, and tenant-level
+parallelism.
+
+The theoretical performance model is:
+
+```text
+throughput = min(source_read,
+                 transform_cpu,
+                 sink_insert / sink_rows_per_envelope,
+                 network_bytes / bytes_per_envelope)
+
+latency = ledger_visible
+          + poll_or_batch_wait
+          + transform_time
+          + sink_insert_time
+          + ack_time
+```
+
+`native` ClickHouse export writes roughly two sink rows per event envelope:
+raw envelope plus flattened event. `native,otel` writes roughly four sink rows:
+raw envelope, flattened event, OTel log, and OTel trace. When ClickHouse insert
+capacity is the bottleneck, `native,otel` should therefore deliver roughly half
+the envelope throughput of `native`; the local smoke baseline matches that
+shape.
+
+For a single node, reasonable initial expectations are low thousands to low
+tens of thousands of envelopes per second for small-payload same-AZ `native`
+exports, with p95 export freshness around 1s to 2s when ClickHouse is healthy.
+Remote ClickHouse, large payloads, hash/redaction, or `native,otel` projections
+shift the bottleneck to network, CPU, or sink insert latency; p95 freshness of
+1s to 5s is a more realistic early target.
+
+Cluster export throughput scales through tenant and consumer parallelism:
+
+```text
+cluster throughput ~= sum(active tenant consumers) * per-consumer throughput
+```
+
+A single tenant/consumer remains ordered and acked serially. Many tenants can
+be exported by multiple workers across nodes or cells until ClickHouse ingest,
+network, or exporter CPU becomes the shared bottleneck.
+
+Initial SLO guidance:
+
+| Metric | Target |
+|---|---:|
+| Same-AZ export freshness | p95 under 2s |
+| Remote sink export freshness | p95 under 5s |
+| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| RPO | zero for committed events retained in the export ledger |
+
+With default `lease_ms=30000` and `poll_interval_ms=1000`, failover RTO is
+roughly 31s plus the active insert time. Shorter leases can reduce RTO, but
+they must remain above ClickHouse insert p99 to avoid unnecessary lease churn.
+
+Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
+ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
+1 KiB, 10 KiB, and 100 KiB, batch sizes of 100/1000/5000, `native` versus
+`native,otel`, worker failover, and throttled ClickHouse inserts. Reports
+should include envelopes/s, sink rows/s, p50/p95/p99 batch latency, export
+freshness, lag recovery time, retries, CPU, memory, and network throughput.
+
 ### Phase 2: Remaining Durable Ledger Coverage
 
 - Add first-class policy object ledger rows when runtime policy mutation APIs
@@ -882,10 +967,19 @@ formalized.
 - Implemented: optional `agentdb_otel_logs` and `agentdb_otel_traces`
   ClickHouse output from `agentdbctl export clickhouse run --mode otel` or
   `--mode native,otel`.
+- Implemented: ClickStack/HyperDX-compatible views
+  `agentdb_clickstack_logs` and `agentdb_clickstack_traces`, plus `otel_logs`
+  and `otel_traces` aliases for dedicated AgentDB observability databases.
 - Implemented: deterministic AgentDB ID to OTel trace/span ID mapping.
 - Implemented: source-ref preservation as trace `links_json`.
-- Remaining: ClickStack/HyperDX end-to-end setup docs and smoke tests against
-  the actual UI stack.
+- Implemented: local schema/projection smoke script for ClickHouse OTel and
+  ClickStack view compatibility.
+- Implemented: local ClickStack/HyperDX UI reachability smoke plus ClickHouse
+  source-view compilation checks.
+- Implemented: `agentdbctl export clickhouse clickstack-config` emits source
+  and dashboard configuration templates for ClickStack Cloud/HyperDX setup.
+- Remaining: live saved source/dashboard API writes once the ClickStack API is
+  generally available enough to depend on in unattended deployments.
 
 ### Phase 5: Additional Sinks
 
@@ -896,7 +990,11 @@ formalized.
   JSONL archives.
 - Implemented: DuckDB demo queries for JSONL archives in
   `ops/observability/duckdb-jsonl-demo.sql`.
-- Add dashboard packaging beyond the SQL demo queries.
+- Implemented: starter native and ClickStack dashboard query bundle through
+  `agentdbctl export clickhouse queries` and
+  `ops/observability/clickhouse-dashboard-queries.sql`.
+- Implemented: ClickHouse/AWS/systemd deployment hooks for schema apply,
+  retries, payload minimization, and local exporter status files.
 - Add Kafka bridge if customers need queue-based fan-out or stream processing.
 - Add warehouse/lakehouse connectors only after the envelope and Parquet layout
   are stable.

@@ -14,28 +14,37 @@ docker compose -f ops/observability/clickhouse-compose.yml up -d
 Initialize the AgentDB schema:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
-  agentdbctl export clickhouse init --apply
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse migrate --apply
 ```
+
+`init --apply` is kept as an alias for the same latest-schema apply path.
+`migrate --apply` records the current AgentDB schema stamp in
+`agentdb_schema_migrations`; `doctor` and `status` use that stamp plus required
+table/view checks to report schema drift.
 
 Check both sides:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse doctor --tenant-id ten_...
 ```
+
+`doctor` validates AgentDB reachability, export status, ClickHouse reachability,
+schema currency, query grants, and a bounded write/read/drop smoke. Use
+`--skip-write-smoke` only for read-only inspection.
 
 Run a one-shot export batch:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse
 ```
 
 Tail continuously:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
 ```
 
@@ -43,15 +52,154 @@ Write both native AgentDB tables and OTel-shaped ClickStack-friendly
 projections:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
     --mode native,otel --backfill --tail
+```
+
+Exporter-side privacy gates are available for ClickHouse and JSONL sinks. They
+filter or redact export envelopes before the connector writes the external
+system; they do not replace AgentDB tenant auth or future policy-driven
+redaction.
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --mode native,otel --backfill --tail \
+    --deny-event-kind debug,trace \
+    --redact-field data.payload.api_key \
+    --payload-mode hash \
+    --metrics-output ./clickhouse-export-status.json
+```
+
+`--payload-mode full` preserves payloads, `hash` replaces
+`data.payload` with a SHA-256 fingerprint, and `drop` writes a null payload.
+`--metrics-output` is refreshed after each processed batch and includes rows,
+filtered items, sink insert rows, retry attempts, rows per second, and the last
+cursor. Use `status --consumer` for AgentDB-side lag and lease state.
+
+## Local Exporter Baseline
+
+A local benchmark run on a developer workstation with in-memory AgentDB, local
+Docker ClickHouse, one tenant/session, and 10 batches of 1000 export envelopes
+produced:
+
+| Export Mode | Exported Envelopes | Sink Rows Inserted | Duration | Throughput | Batch Time |
+|---|---:|---:|---:|---:|---:|
+| `native` | 10,000 | 20,000 | 3.22s | 3,106 envelopes/s | 322ms per 1000-envelope batch |
+| `native,otel` | 10,000 | 40,000 | 5.41s | 1,847 envelopes/s | 541ms per 1000-envelope batch |
+
+The run used `agentdbctl export clickhouse run --backfill --limit 1000
+--max-batches 10 --metrics-output ...`. Treat this as a local reproducibility
+baseline. Real throughput is usually bounded by ClickHouse insert latency,
+network round trips, projection mode, payload size, and batch sizing.
+
+## Expected Performance Model
+
+The exporter is outside the hot append path. Runtime writes commit to AgentDB
+first; export workers later read durable envelopes, transform them, write the
+sink, and ack the managed consumer cursor.
+
+```text
+throughput = min(source_read,
+                 transform_cpu,
+                 sink_insert / sink_rows_per_envelope,
+                 network_bytes / bytes_per_envelope)
+
+latency = ledger_visible
+          + poll_or_batch_wait
+          + transform_time
+          + ClickHouse_insert_time
+          + ack_time
+```
+
+For ClickHouse:
+
+- `native` writes roughly two sink rows per event envelope: raw envelope plus
+  flattened event.
+- `native,otel` writes roughly four sink rows per event envelope: raw envelope,
+  flattened event, OTel log, and OTel trace.
+- If ClickHouse insert throughput is the bottleneck, `native,otel` envelope
+  throughput should be about half of `native`.
+
+Expected single-node shape:
+
+| Scenario | Expected Throughput | Expected Export Freshness |
+|---|---:|---:|
+| Local/same-AZ ClickHouse, small payloads, `native` | low thousands to low tens of thousands envelopes/s | p95 around 1s to 2s |
+| Local/same-AZ ClickHouse, small payloads, `native,otel` | about half to two-thirds of `native` | p95 around 1s to 3s |
+| Remote ClickHouse over normal network | hundreds to several thousand envelopes/s | p95 around 1s to 5s |
+| Large payloads or heavy redaction/hash | CPU/network-bound | seconds possible |
+
+Cluster throughput scales by tenant and consumer parallelism, not by making one
+consumer infinitely fast. One tenant/consumer remains ordered and acked
+serially. Many tenants can be exported by multiple workers across nodes or
+cells until ClickHouse ingest, network, or exporter CPU becomes the shared
+bottleneck.
+
+```text
+cluster throughput ~= sum(active tenant consumers) * per-consumer throughput
+```
+
+Recommended initial SLO targets:
+
+| Metric | Initial Target |
+|---|---:|
+| Export freshness, same-AZ sink | p95 under 2s |
+| Export freshness, remote sink | p95 under 5s |
+| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| RPO | zero for committed events retained in the export ledger |
+
+With the default `lease_ms=30000` and `poll_interval_ms=1000`, exporter
+failover RTO is roughly 31s plus the active insert time. Faster HA is possible
+with shorter leases, but the lease must stay comfortably above ClickHouse insert
+p99 so healthy workers do not lose ownership during slow batches.
+
+Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
+ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
+1 KiB, 10 KiB, and 100 KiB, batch sizes of 100/1000/5000, `native` vs
+`native,otel`, worker failover, and throttled ClickHouse inserts. Reports should
+include envelopes/s, sink rows/s, p50/p95/p99 batch latency, export freshness,
+lag recovery time, retries, CPU, memory, and network throughput.
+
+The schema also installs ClickStack/HyperDX-friendly views over those
+projections:
+
+| View | Purpose |
+|---|---|
+| `agentdb_clickstack_logs` | Wide log source with `Timestamp`, `TraceId`, `SpanId`, `ServiceName`, `Body`, `ResourceAttributes`, and `LogAttributes`. |
+| `agentdb_clickstack_traces` | Wide trace source with `Timestamp`, `TraceId`, `SpanId`, `ParentSpanId`, `SpanName`, `Duration`, `ResourceAttributes`, and `SpanAttributes`. |
+| `otel_logs` / `otel_traces` | Convenience aliases for tools that expect the default ClickStack table names in a dedicated AgentDB observability database. |
+
+For HyperDX, create sources pointing at `agentdb_clickstack_logs` and
+`agentdb_clickstack_traces`, or use the `otel_logs` / `otel_traces` aliases in
+a dedicated AgentDB database. The important source expressions are:
+
+```text
+timestamp: TimestampTime
+display timestamp: Timestamp
+service name: ServiceName
+body: Body
+trace id: TraceId
+span id: SpanId
+log attributes: LogAttributes
+span attributes: SpanAttributes
+resource attributes: ResourceAttributes
+duration: Duration
+```
+
+Print source and dashboard configuration templates for ClickStack Cloud or
+HyperDX setup:
+
+```bash
+agentdbctl -o json export clickhouse clickstack-config \
+  --service-name "AgentDB Prod"
 ```
 
 Backfill metadata snapshots into the raw export table:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
     --backfill
@@ -94,6 +242,40 @@ agentdbctl export parquet from-jsonl \
   --s3-region us-east-1
 ```
 
+Print copyable ClickHouse dashboard queries:
+
+```bash
+agentdbctl export clickhouse queries
+agentdbctl -o json export clickhouse queries
+```
+
+The same queries are stored in
+`ops/observability/clickhouse-dashboard-queries.sql`.
+
+Run the local ClickHouse/OTel projection smoke:
+
+```bash
+docker compose -f ops/observability/clickhouse-compose.yml up -d
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  ops/observability/smoke-clickhouse-otel.sh
+```
+
+Set `TENANT_ID=ten_... AGENTDB_EXPORT_SMOKE_RUN=1` to also copy one bounded
+`native,otel` export batch from a running AgentDB server.
+
+Run a local ClickStack/HyperDX UI smoke:
+
+```bash
+docker compose -f ops/observability/clickstack-compose.yml up -d
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+HYPERDX_URL=http://127.0.0.1:8080 \
+  ops/observability/smoke-clickstack-hyperdx.sh
+```
+
+The smoke checks that the HyperDX UI is reachable and that the AgentDB
+ClickStack source views compile in ClickHouse. Create HyperDX sources using the
+field names above.
+
 The current implementation exports event and runtime metadata envelopes from
 `/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
@@ -106,6 +288,12 @@ consumer leases, JSONL archival, and dashboard queries.
 tables plus those projections. Trace IDs are deterministic from
 `tenant_id/session_id`, span IDs are deterministic from event IDs, and
 `source_refs` are preserved in trace `links_json`.
+
+ClickStack itself can be run as the full ClickHouse-provided stack or as
+HyperDX against an existing ClickHouse database. The AgentDB path is deliberately
+direct-to-ClickHouse: AgentDB exports the rows, and HyperDX reads the
+ClickStack-compatible views. This keeps AgentDB appends independent from the
+OpenTelemetry Collector and preserves the managed export-consumer ack boundary.
 
 ## HA Connector Pattern
 
@@ -130,10 +318,27 @@ Recommended production shape:
   ClickHouse tables.
 - Set a unique `--lease-owner`, for example the pod name or instance id.
 - Keep `--lease-ms` comfortably above expected ClickHouse insert latency.
+- Use `--max-retries` and `--retry-initial-backoff-ms` to absorb transient
+  ClickHouse failures. Retries reuse a stable per-table batch id derived from
+  the exported cursor range.
 - Alert on increasing `lag_ms`, `pending_items`, expired leases, and stale
   `high_watermark`.
 - Never ack before ClickHouse accepts the batch. The ClickHouse tables use
   stable ids so retrying an already inserted batch is safe.
+
+For systemd deployments, install:
+
+```bash
+sudo install -D -m 0644 ops/observability/agentdb-export-clickhouse.env.example \
+  /etc/agentdb/agentdb-export-clickhouse.env
+sudo install -D -m 0644 ops/observability/agentdb-export-clickhouse.service \
+  /etc/systemd/system/agentdb-export-clickhouse.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentdb-export-clickhouse.service
+```
+
+Edit the env file first so `AGENTDB_EXPORT_TENANT_ID`,
+`AGENTDB_EXPORT_LEASE_OWNER`, and `CLICKHOUSE_URL` are deployment-specific.
 
 Stop ClickHouse:
 

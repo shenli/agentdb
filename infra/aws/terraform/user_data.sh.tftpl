@@ -72,6 +72,12 @@ AGENTDB_EXPORT_TENANT_ID=${clickhouse_export_tenant_id}
 AGENTDB_EXPORT_CONSUMER=${clickhouse_export_consumer}
 AGENTDB_EXPORT_MODE=${clickhouse_export_mode}
 AGENTDB_EXPORT_LEASE_MS=${clickhouse_export_lease_ms}
+AGENTDB_EXPORT_MAX_RETRIES=${clickhouse_export_max_retries}
+AGENTDB_EXPORT_RETRY_INITIAL_BACKOFF_MS=${clickhouse_export_retry_initial_backoff_ms}
+AGENTDB_EXPORT_PAYLOAD_MODE=${clickhouse_export_payload_mode}
+AGENTDB_EXPORT_METRICS_OUTPUT=${clickhouse_export_metrics_output}
+AGENTDB_EXPORT_DENY_EVENT_KINDS=${clickhouse_export_deny_event_kinds}
+AGENTDB_EXPORT_REDACT_FIELDS=${clickhouse_export_redact_fields}
 EOF
 %{ endif }
 
@@ -84,6 +90,8 @@ AGENTDB_JSONL_EXPORT_CONSUMER=${jsonl_export_consumer}
 AGENTDB_JSONL_EXPORT_INCLUDE=${jsonl_export_include}
 AGENTDB_JSONL_EXPORT_LEASE_MS=${jsonl_export_lease_ms}
 AGENTDB_JSONL_EXPORT_MAX_BATCHES=${jsonl_export_max_batches}
+AGENTDB_JSONL_EXPORT_PAYLOAD_MODE=${jsonl_export_payload_mode}
+AGENTDB_JSONL_EXPORT_METRICS_OUTPUT=${jsonl_export_metrics_output}
 AWS_REGION=${region}
 EOF
 %{ endif }

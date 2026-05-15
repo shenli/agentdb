@@ -56,11 +56,32 @@ if [[ -f ~/agentdb-deploy/clickhouse-export.env ]]; then
   source ~/agentdb-deploy/clickhouse-export.env
   set +a
   AGENTDB_EXPORT_LEASE_OWNER="${AGENTDB_EXPORT_LEASE_OWNER:-$(hostname)-clickhouse-export}"
-  target/debug/agentdbctl export clickhouse init --apply
+  clickhouse_privacy_args=(--payload-mode "${AGENTDB_EXPORT_PAYLOAD_MODE:-full}")
+  if [[ -n "${AGENTDB_EXPORT_ALLOW_OBJECT_TYPES:-}" ]]; then
+    clickhouse_privacy_args+=(--allow-object-type "$AGENTDB_EXPORT_ALLOW_OBJECT_TYPES")
+  fi
+  if [[ -n "${AGENTDB_EXPORT_DENY_OBJECT_TYPES:-}" ]]; then
+    clickhouse_privacy_args+=(--deny-object-type "$AGENTDB_EXPORT_DENY_OBJECT_TYPES")
+  fi
+  if [[ -n "${AGENTDB_EXPORT_ALLOW_EVENT_KINDS:-}" ]]; then
+    clickhouse_privacy_args+=(--allow-event-kind "$AGENTDB_EXPORT_ALLOW_EVENT_KINDS")
+  fi
+  if [[ -n "${AGENTDB_EXPORT_DENY_EVENT_KINDS:-}" ]]; then
+    clickhouse_privacy_args+=(--deny-event-kind "$AGENTDB_EXPORT_DENY_EVENT_KINDS")
+  fi
+  if [[ -n "${AGENTDB_EXPORT_REDACT_FIELDS:-}" ]]; then
+    IFS=',' read -ra redact_fields <<< "$AGENTDB_EXPORT_REDACT_FIELDS"
+    for field in "${redact_fields[@]}"; do
+      clickhouse_privacy_args+=(--redact-field "$field")
+    done
+  fi
+  target/debug/agentdbctl export clickhouse migrate --apply
   target/debug/agentdbctl export clickhouse run \
     --tenant-id "$AGENTDB_EXPORT_TENANT_ID" \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
     --mode native \
+    "${clickhouse_privacy_args[@]}" \
+    --metrics-output "${AGENTDB_EXPORT_BACKFILL_METRICS_OUTPUT:-$HOME/agentdb-deploy/logs/clickhouse-export-backfill-status.json}" \
     --backfill \
     --max-batches 1000
   nohup target/debug/agentdbctl export clickhouse run \
@@ -70,6 +91,10 @@ if [[ -f ~/agentdb-deploy/clickhouse-export.env ]]; then
     --lease-ms "${AGENTDB_EXPORT_LEASE_MS:-30000}" \
     --include events \
     --mode "${AGENTDB_EXPORT_MODE:-native}" \
+    --max-retries "${AGENTDB_EXPORT_MAX_RETRIES:-6}" \
+    --retry-initial-backoff-ms "${AGENTDB_EXPORT_RETRY_INITIAL_BACKOFF_MS:-250}" \
+    "${clickhouse_privacy_args[@]}" \
+    --metrics-output "${AGENTDB_EXPORT_METRICS_OUTPUT:-$HOME/agentdb-deploy/logs/clickhouse-export-status.json}" \
     --backfill \
     --tail \
     > ~/agentdb-deploy/logs/clickhouse-export.log 2>&1 &
@@ -85,6 +110,25 @@ if [[ -f ~/agentdb-deploy/jsonl-export.env ]]; then
   source ~/agentdb-deploy/jsonl-export.env
   set +a
   AGENTDB_JSONL_EXPORT_LEASE_OWNER="${AGENTDB_JSONL_EXPORT_LEASE_OWNER:-$(hostname)-jsonl-export}"
+  jsonl_privacy_args=(--payload-mode "${AGENTDB_JSONL_EXPORT_PAYLOAD_MODE:-full}")
+  if [[ -n "${AGENTDB_JSONL_EXPORT_ALLOW_OBJECT_TYPES:-}" ]]; then
+    jsonl_privacy_args+=(--allow-object-type "$AGENTDB_JSONL_EXPORT_ALLOW_OBJECT_TYPES")
+  fi
+  if [[ -n "${AGENTDB_JSONL_EXPORT_DENY_OBJECT_TYPES:-}" ]]; then
+    jsonl_privacy_args+=(--deny-object-type "$AGENTDB_JSONL_EXPORT_DENY_OBJECT_TYPES")
+  fi
+  if [[ -n "${AGENTDB_JSONL_EXPORT_ALLOW_EVENT_KINDS:-}" ]]; then
+    jsonl_privacy_args+=(--allow-event-kind "$AGENTDB_JSONL_EXPORT_ALLOW_EVENT_KINDS")
+  fi
+  if [[ -n "${AGENTDB_JSONL_EXPORT_DENY_EVENT_KINDS:-}" ]]; then
+    jsonl_privacy_args+=(--deny-event-kind "$AGENTDB_JSONL_EXPORT_DENY_EVENT_KINDS")
+  fi
+  if [[ -n "${AGENTDB_JSONL_EXPORT_REDACT_FIELDS:-}" ]]; then
+    IFS=',' read -ra jsonl_redact_fields <<< "$AGENTDB_JSONL_EXPORT_REDACT_FIELDS"
+    for field in "${jsonl_redact_fields[@]}"; do
+      jsonl_privacy_args+=(--redact-field "$field")
+    done
+  fi
   nohup target/debug/agentdbctl export jsonl run \
     --tenant-id "$AGENTDB_JSONL_EXPORT_TENANT_ID" \
     --output "$AGENTDB_JSONL_EXPORT_URI" \
@@ -95,6 +139,8 @@ if [[ -f ~/agentdb-deploy/jsonl-export.env ]]; then
     --backfill \
     --tail \
     --max-batches "${AGENTDB_JSONL_EXPORT_MAX_BATCHES:-1000}" \
+    "${jsonl_privacy_args[@]}" \
+    --metrics-output "${AGENTDB_JSONL_EXPORT_METRICS_OUTPUT:-$HOME/agentdb-deploy/logs/jsonl-export-status.json}" \
     > ~/agentdb-deploy/logs/jsonl-export.log 2>&1 &
 fi
 EOF

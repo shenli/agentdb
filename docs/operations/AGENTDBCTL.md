@@ -245,28 +245,36 @@ docker compose -f ops/observability/clickhouse-compose.yml up -d
 Initialize the schema:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
-  agentdbctl export clickhouse init --apply
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse migrate --apply
 ```
+
+`init --apply` is an alias for applying the current schema. Prefer
+`migrate --apply` in deployment scripts because it records the current schema
+stamp in `agentdb_schema_migrations`.
 
 Check AgentDB and ClickHouse reachability:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl -o json export clickhouse doctor --tenant-id ten_...
 ```
+
+`doctor` checks AgentDB reachability, export status, ClickHouse reachability,
+schema currency, query grants, and a bounded write/read/drop smoke. Use
+`--skip-write-smoke` only when validating with a read-only role.
 
 Export one batch:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse
 ```
 
 Backfill current events and then tail continuously:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
 ```
 
@@ -274,18 +282,74 @@ Export OTel-shaped ClickStack-friendly projections in addition to the native
 tables:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
     --mode native,otel --backfill --tail
+```
+
+Use exporter-side privacy gates when a deployment must suppress or minimize
+payload data before it reaches the external sink:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --deny-event-kind debug,trace \
+    --redact-field data.payload.api_key \
+    --payload-mode hash \
+    --metrics-output ./clickhouse-export-status.json \
+    --backfill --tail
+```
+
+The same `--allow-object-type`, `--deny-object-type`, `--allow-event-kind`,
+`--deny-event-kind`, `--redact-field`, `--payload-mode full|hash|drop`, and
+`--metrics-output` flags are supported by `export jsonl run`. The metrics file
+is refreshed after each processed batch and contains the current cursor, rows,
+filtered items, sink insert rows, retry attempts, and rows per second.
+
+`migrate --apply` also installs ClickStack-compatible views:
+`agentdb_clickstack_logs`, `agentdb_clickstack_traces`, and convenience
+`otel_logs` / `otel_traces` aliases for dedicated AgentDB observability
+databases. HyperDX sources should use `TimestampTime`, `Timestamp`,
+`ServiceName`, `TraceId`, `SpanId`, `ResourceAttributes`, `LogAttributes`, and
+`SpanAttributes`.
+
+Print ClickStack source and dashboard configuration templates:
+
+```bash
+agentdbctl -o json export clickhouse clickstack-config \
+  --service-name "AgentDB Prod"
 ```
 
 Backfill metadata snapshots before the event tail:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
     --backfill
+```
+
+Print starter dashboard queries for native AgentDB tables and ClickStack views:
+
+```bash
+agentdbctl export clickhouse queries
+agentdbctl -o json export clickhouse queries
+```
+
+Run the schema/projection smoke against local ClickHouse:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  ops/observability/smoke-clickhouse-otel.sh
+```
+
+Run the ClickStack/HyperDX UI smoke:
+
+```bash
+docker compose -f ops/observability/clickstack-compose.yml up -d
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+HYPERDX_URL=http://127.0.0.1:8080 \
+  ops/observability/smoke-clickstack-hyperdx.sh
 ```
 
 Write durable export envelopes to JSONL:
@@ -335,7 +399,8 @@ Inspect AgentDB export capability for a tenant:
 
 ```bash
 agentdbctl export clickhouse status --tenant-id ten_...
-agentdbctl export clickhouse status --tenant-id ten_... --consumer prod-clickhouse
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse status --tenant-id ten_... --consumer prod-clickhouse
 ```
 
 The underlying HTTP API also exposes
@@ -353,6 +418,14 @@ lease writes to ClickHouse and acks only after ClickHouse accepts the batch. A
 standby process can claim the lease after `--lease-ms` expires and resumes from
 the last acked cursor. Use `status --consumer` or `/api/admin/exports` to watch
 lag, pending item count, high watermark, active lease state, and lease owner.
+ClickHouse inserts retry with stable per-table deduplication tokens derived
+from the exported cursor range; tune `--max-retries` and
+`--retry-initial-backoff-ms` for the deployment.
+
+For systemd deployments, use
+`ops/observability/agentdb-export-clickhouse.service` with
+`ops/observability/agentdb-export-clickhouse.env.example` as the starting env
+file. The unit runs `migrate --apply` before starting the tailing exporter.
 
 ## Raw Escape Hatch
 

@@ -21,6 +21,20 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
+const CLICKHOUSE_SCHEMA_VERSION: &str = "2026_05_15_clickstack_views";
+const CLICKHOUSE_REQUIRED_OBJECTS: &[&str] = &[
+    "agentdb_schema_migrations",
+    "agentdb_export_checkpoints",
+    "agentdb_export_items_raw",
+    "agentdb_events",
+    "agentdb_otel_logs",
+    "agentdb_otel_traces",
+    "agentdb_clickstack_logs",
+    "agentdb_clickstack_traces",
+    "otel_logs",
+    "otel_traces",
+    "agentdb_tombstones",
+];
 const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
     r#"
 CREATE TABLE IF NOT EXISTS agentdb_schema_migrations (
@@ -154,6 +168,55 @@ PARTITION BY toYYYYMM(start_time)
 ORDER BY (tenant_id, session_id, start_time, span_id)
 "#,
     r#"
+CREATE VIEW IF NOT EXISTS agentdb_clickstack_logs AS
+SELECT
+    timestamp AS Timestamp,
+    timestamp AS TimestampTime,
+    trace_id AS TraceId,
+    span_id AS SpanId,
+    severity_text AS SeverityText,
+    body AS Body,
+    ifNull(resource_attributes['service.name'], 'agentdb') AS ServiceName,
+    resource_attributes AS ResourceAttributes,
+    log_attributes AS LogAttributes,
+    tenant_id AS AgentDBTenantId,
+    session_id AS AgentDBSessionId,
+    event_id AS AgentDBEventId,
+    envelope_json AS AgentDBEnvelope
+FROM agentdb_otel_logs
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS agentdb_clickstack_traces AS
+SELECT
+    start_time AS Timestamp,
+    start_time AS TimestampTime,
+    trace_id AS TraceId,
+    span_id AS SpanId,
+    parent_span_id AS ParentSpanId,
+    span_name AS SpanName,
+    span_kind AS SpanKind,
+    status_code AS StatusCode,
+    '' AS StatusMessage,
+    toUInt64(ifNull(duration_ms, 0)) * 1000000 AS Duration,
+    ifNull(resource_attributes['service.name'], 'agentdb') AS ServiceName,
+    resource_attributes AS ResourceAttributes,
+    span_attributes AS SpanAttributes,
+    links_json AS Links,
+    tenant_id AS AgentDBTenantId,
+    session_id AS AgentDBSessionId,
+    event_id AS AgentDBEventId,
+    envelope_json AS AgentDBEnvelope
+FROM agentdb_otel_traces
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS otel_logs AS
+SELECT * FROM agentdb_clickstack_logs
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS otel_traces AS
+SELECT * FROM agentdb_clickstack_traces
+"#,
+    r#"
 CREATE TABLE IF NOT EXISTS agentdb_tombstones (
     tenant_id String,
     object_type LowCardinality(String),
@@ -166,6 +229,69 @@ CREATE TABLE IF NOT EXISTS agentdb_tombstones (
 PARTITION BY toYYYYMM(deleted_at)
 ORDER BY (tenant_id, object_type, object_id, deleted_at)
 "#,
+];
+
+const CLICKHOUSE_SAMPLE_QUERIES: &[(&str, &str, &str)] = &[
+    (
+        "recent_failures",
+        "Recent event failures and tool errors",
+        r#"
+SELECT created_at, session_id, kind, error_kind, error_message
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND created_at >= now() - INTERVAL 1 HOUR
+  AND (kind = 'tool_error' OR error_kind != '')
+ORDER BY created_at DESC
+LIMIT 100
+"#,
+    ),
+    (
+        "model_cost_by_model",
+        "Model token and cost totals by model",
+        r#"
+SELECT model, sum(total_tokens) AS tokens, sum(cost_micros) / 1000000 AS cost
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND created_at >= now() - INTERVAL 1 DAY
+GROUP BY model
+ORDER BY cost DESC
+"#,
+    ),
+    (
+        "slow_tools",
+        "Tool p95 latency and volume",
+        r#"
+SELECT tool_name, quantile(0.95)(duration_ms) AS p95_ms, count() AS n
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND kind IN ('tool_result', 'tool_error')
+  AND created_at >= now() - INTERVAL 1 DAY
+GROUP BY tool_name
+ORDER BY p95_ms DESC
+"#,
+    ),
+    (
+        "clickstack_logs",
+        "ClickStack-compatible wide log rows",
+        r#"
+SELECT Timestamp, ServiceName, SeverityText, Body, TraceId, SpanId
+FROM agentdb_clickstack_logs
+WHERE AgentDBTenantId = {tenant_id:String}
+ORDER BY Timestamp DESC
+LIMIT 100
+"#,
+    ),
+    (
+        "clickstack_traces",
+        "ClickStack-compatible trace spans",
+        r#"
+SELECT Timestamp, ServiceName, StatusCode, round(Duration / 1000000), SpanName, TraceId, SpanId
+FROM agentdb_clickstack_traces
+WHERE AgentDBTenantId = {tenant_id:String}
+ORDER BY Timestamp DESC
+LIMIT 100
+"#,
+    ),
 ];
 
 #[derive(Parser, Debug)]
@@ -608,8 +734,14 @@ enum ClickHouseCommand {
     Doctor(ClickHouseDoctorArgs),
     /// Print or apply the first-party ClickHouse schema.
     Init(ClickHouseInitArgs),
+    /// Apply versioned first-party ClickHouse schema migrations.
+    Migrate(ClickHouseMigrateArgs),
     /// Show AgentDB export status for one tenant.
     Status(ClickHouseStatusArgs),
+    /// Print first-party dashboard and ClickStack smoke queries.
+    Queries,
+    /// Print ClickStack source/dashboard configuration templates.
+    ClickstackConfig(ClickStackConfigArgs),
     /// Copy one or more export-watch batches into ClickHouse.
     Run(ClickHouseRunArgs),
 }
@@ -620,6 +752,8 @@ struct ClickHouseDoctorArgs {
     tenant_id: Option<String>,
     #[arg(long, env = "CLICKHOUSE_URL")]
     clickhouse_url: Option<String>,
+    #[arg(long)]
+    skip_write_smoke: bool,
 }
 
 #[derive(Args, Debug)]
@@ -631,11 +765,35 @@ struct ClickHouseInitArgs {
 }
 
 #[derive(Args, Debug)]
+struct ClickHouseMigrateArgs {
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+    #[arg(long, default_value = "latest")]
+    to: String,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    allow_destructive: bool,
+}
+
+#[derive(Args, Debug)]
 struct ClickHouseStatusArgs {
     #[arg(long)]
     tenant_id: String,
     #[arg(long)]
     consumer: Option<String>,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ClickStackConfigArgs {
+    #[arg(long, default_value = "AgentDB")]
+    service_name: String,
+    #[arg(long, default_value = "agentdb_clickstack_logs")]
+    logs_source: String,
+    #[arg(long, default_value = "agentdb_clickstack_traces")]
+    traces_source: String,
 }
 
 #[derive(Args, Debug)]
@@ -672,8 +830,47 @@ struct ClickHouseRunArgs {
     max_batches: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+    #[arg(long, default_value_t = 250)]
+    retry_initial_backoff_ms: u64,
+    #[command(flatten)]
+    privacy: ExportPrivacyArgs,
+    /// Optional local file path to refresh with exporter status JSON.
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct ExportPrivacyArgs {
+    /// Comma-separated object types to export. Empty allows all object types.
+    #[arg(long = "allow-object-type", value_delimiter = ',')]
+    allow_object_types: Vec<String>,
+    /// Comma-separated object types to suppress.
+    #[arg(long = "deny-object-type", value_delimiter = ',')]
+    deny_object_types: Vec<String>,
+    /// Comma-separated event kinds to export. Empty allows all event kinds.
+    #[arg(long = "allow-event-kind", value_delimiter = ',')]
+    allow_event_kinds: Vec<String>,
+    /// Comma-separated event kinds to suppress.
+    #[arg(long = "deny-event-kind", value_delimiter = ',')]
+    deny_event_kinds: Vec<String>,
+    /// Dot-separated JSON paths to redact before writing a sink row.
+    #[arg(long = "redact-field")]
+    redact_fields: Vec<String>,
+    /// Payload handling policy for exported `data.payload` values.
+    #[arg(long, value_enum, default_value = "full")]
+    payload_mode: ExportPayloadMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum ExportPayloadMode {
+    #[default]
+    Full,
+    Hash,
+    Drop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -715,6 +912,11 @@ struct JsonlRunArgs {
     max_batches: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    #[command(flatten)]
+    privacy: ExportPrivacyArgs,
+    /// Optional local file path to refresh with exporter status JSON.
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
 }
@@ -983,36 +1185,118 @@ async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
     match command {
         ClickHouseCommand::Doctor(args) => clickhouse_doctor(api, args).await,
         ClickHouseCommand::Init(args) => clickhouse_init(args).await,
-        ClickHouseCommand::Status(args) => {
-            if let Some(consumer) = args.consumer {
-                api.get(&format!(
-                    "/api/tenants/{}/exports/consumers/{}",
-                    query_component(&args.tenant_id),
-                    query_component(&consumer)
-                ))
-                .await
-            } else {
-                api.get(&format!(
-                    "/api/tenants/{}/exports/status",
-                    query_component(&args.tenant_id)
-                ))
-                .await
-            }
-        }
+        ClickHouseCommand::Migrate(args) => clickhouse_migrate(args).await,
+        ClickHouseCommand::Status(args) => clickhouse_status(api, args).await,
+        ClickHouseCommand::Queries => Ok(clickhouse_sample_queries()),
+        ClickHouseCommand::ClickstackConfig(args) => Ok(clickstack_config(args)),
         ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
     }
+}
+
+fn clickstack_config(args: ClickStackConfigArgs) -> Value {
+    json!({
+        "sources": [
+            {
+                "name": format!("{} Logs", args.service_name),
+                "table": args.logs_source,
+                "timestamp_field": "TimestampTime",
+                "display_timestamp_field": "Timestamp",
+                "service_name_field": "ServiceName",
+                "body_field": "Body",
+                "trace_id_field": "TraceId",
+                "span_id_field": "SpanId",
+                "attributes_field": "LogAttributes",
+                "resource_attributes_field": "ResourceAttributes"
+            },
+            {
+                "name": format!("{} Traces", args.service_name),
+                "table": args.traces_source,
+                "timestamp_field": "TimestampTime",
+                "display_timestamp_field": "Timestamp",
+                "service_name_field": "ServiceName",
+                "trace_id_field": "TraceId",
+                "span_id_field": "SpanId",
+                "parent_span_id_field": "ParentSpanId",
+                "span_name_field": "SpanName",
+                "duration_field": "Duration",
+                "attributes_field": "SpanAttributes",
+                "resource_attributes_field": "ResourceAttributes"
+            }
+        ],
+        "clickhouse_cloud_api": {
+            "base_url": "https://api.clickhouse.cloud/v1/organizations/{organizationId}/services/{serviceId}/clickstack",
+            "list_dashboards": "GET /dashboards",
+            "create_dashboard": "POST /dashboards",
+            "authentication": "ClickHouse Cloud API basic auth: <keyId>:<keySecret>"
+        },
+        "dashboard": {
+            "name": format!("{} Runtime Observability", args.service_name),
+            "tags": ["agentdb", "observability"],
+            "tiles": [
+                {
+                    "x": 0,
+                    "y": 0,
+                    "w": 12,
+                    "h": 8,
+                    "name": "Recent errors",
+                    "config": {
+                        "displayType": "table",
+                        "sourceId": "<logsSourceId>",
+                        "select": [{
+                            "aggFn": "count",
+                            "where": "SeverityText:ERROR OR LogAttributes.agentdb.error_kind:*",
+                            "whereLanguage": "lucene"
+                        }]
+                    }
+                },
+                {
+                    "x": 12,
+                    "y": 0,
+                    "w": 12,
+                    "h": 8,
+                    "name": "Slow spans",
+                    "config": {
+                        "displayType": "table",
+                        "sourceId": "<tracesSourceId>",
+                        "select": [{
+                            "aggFn": "count",
+                            "where": "Duration:>1000000000",
+                            "whereLanguage": "lucene"
+                        }]
+                    }
+                }
+            ]
+        }
+    })
+}
+
+fn clickhouse_sample_queries() -> Value {
+    json!({
+        "queries": CLICKHOUSE_SAMPLE_QUERIES
+            .iter()
+            .map(|(name, description, sql)| {
+                json!({
+                    "name": name,
+                    "description": description,
+                    "sql": sql.trim()
+                })
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Value> {
     let agentdb_ready = match api.get("/health/ready").await {
         Ok(_) => json!({
             "check_id": "agentdb_reachable",
-            "status": "ok"
+            "status": "ok",
+            "remediation": null
         }),
         Err(error) => json!({
             "check_id": "agentdb_reachable",
             "status": "error",
-            "message": error.to_string()
+            "message": error.to_string(),
+            "remediation": "start AgentDB or pass --url/AGENTDB_URL for a reachable server"
         }),
     };
     let export_status = if let Some(tenant_id) = args.tenant_id {
@@ -1026,42 +1310,107 @@ async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Valu
             Ok(value) => json!({
                 "check_id": "agentdb_export_status",
                 "status": "ok",
-                "details": value
+                "details": value,
+                "remediation": null
             }),
             Err(error) => json!({
                 "check_id": "agentdb_export_status",
                 "status": "error",
-                "message": error.to_string()
+                "message": error.to_string(),
+                "remediation": "verify the tenant id and AgentDB export API health"
             }),
         }
     } else {
         json!({
             "check_id": "agentdb_export_status",
             "status": "skipped",
-            "message": "--tenant-id not supplied"
+            "message": "--tenant-id not supplied",
+            "remediation": "pass --tenant-id to validate tenant export status and lag"
         })
     };
-    let clickhouse = if let Some(url) = args.clickhouse_url {
-        match clickhouse_query(&url, "SELECT 1").await {
+    let mut checks = vec![agentdb_ready, export_status];
+    if let Some(url) = args.clickhouse_url {
+        checks.push(match clickhouse_query(&url, "SELECT 1").await {
             Ok(text) => json!({
                 "check_id": "clickhouse_reachable",
                 "status": "ok",
-                "response": text.trim()
+                "response": text.trim(),
+                "remediation": null
             }),
             Err(error) => json!({
                 "check_id": "clickhouse_reachable",
                 "status": "error",
-                "message": error.to_string()
+                "message": error.to_string(),
+                "remediation": "start ClickHouse or pass --clickhouse-url/CLICKHOUSE_URL with valid credentials"
             }),
+        });
+        checks.push(match clickhouse_schema_status(&url).await {
+            Ok(schema) if schema.current => json!({
+                "check_id": "schema_current",
+                "status": "ok",
+                "details": schema.to_json(),
+                "remediation": null
+            }),
+            Ok(schema) => json!({
+                "check_id": "schema_current",
+                "status": "error",
+                "details": schema.to_json(),
+                "remediation": "run `agentdbctl export clickhouse migrate --apply`"
+            }),
+            Err(error) => json!({
+                "check_id": "schema_current",
+                "status": "error",
+                "message": error.to_string(),
+                "remediation": "run `agentdbctl export clickhouse migrate --apply` after ClickHouse is reachable"
+            }),
+        });
+        checks.push(
+            match clickhouse_query(&url, "SELECT count() FROM agentdb_events").await {
+                Ok(text) => json!({
+                    "check_id": "can_query",
+                    "status": "ok",
+                    "response": text.trim(),
+                    "remediation": null
+                }),
+                Err(error) => json!({
+                    "check_id": "can_query",
+                    "status": "error",
+                    "message": error.to_string(),
+                    "remediation": "grant SELECT on the AgentDB observability tables/views"
+                }),
+            },
+        );
+        if args.skip_write_smoke {
+            checks.push(json!({
+                "check_id": "can_insert",
+                "status": "skipped",
+                "message": "--skip-write-smoke supplied",
+                "remediation": "run without --skip-write-smoke before production cutover"
+            }));
+        } else {
+            checks.push(match clickhouse_write_smoke(&url).await {
+                Ok(value) => json!({
+                    "check_id": "can_insert",
+                    "status": "ok",
+                    "details": value,
+                    "remediation": null
+                }),
+                Err(error) => json!({
+                    "check_id": "can_insert",
+                    "status": "error",
+                    "message": error.to_string(),
+                    "remediation": "grant CREATE/INSERT/SELECT/DROP for migration validation or run connector with an insert-capable role after schema is initialized"
+                }),
+            });
         }
     } else {
-        json!({
+        checks.push(json!({
             "check_id": "clickhouse_reachable",
             "status": "skipped",
-            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
-        })
-    };
-    let checks = vec![agentdb_ready, export_status, clickhouse];
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied",
+            "remediation": "pass --clickhouse-url to validate schema, grants, and write path"
+        }));
+    }
     let ok = checks
         .iter()
         .all(|check| check.get("status").and_then(Value::as_str) != Some("error"));
@@ -1071,28 +1420,229 @@ async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Valu
     }))
 }
 
+async fn clickhouse_write_smoke(url: &str) -> Result<Value> {
+    let table = format!("agentdb_export_doctor_smoke_{}", std::process::id());
+    let create =
+        format!("CREATE TABLE IF NOT EXISTS {table} (id UInt64, value String) ENGINE = Memory");
+    let insert = format!("INSERT INTO {table} FORMAT JSONEachRow\n{{\"id\":1,\"value\":\"ok\"}}\n");
+    let select = format!("SELECT count() FROM {table}");
+    let drop = format!("DROP TABLE IF EXISTS {table}");
+    clickhouse_query(url, &create).await?;
+    let result = async {
+        clickhouse_query(url, &insert).await?;
+        clickhouse_scalar_u64(url, &select).await
+    }
+    .await;
+    let _ = clickhouse_query(url, &drop).await;
+    let rows = result?;
+    Ok(json!({
+        "table": table,
+        "rows": rows
+    }))
+}
+
+async fn clickhouse_status(api: &Api, args: ClickHouseStatusArgs) -> Result<Value> {
+    let agentdb = if let Some(consumer) = &args.consumer {
+        api.get(&format!(
+            "/api/tenants/{}/exports/consumers/{}",
+            query_component(&args.tenant_id),
+            query_component(consumer)
+        ))
+        .await?
+    } else {
+        api.get(&format!(
+            "/api/tenants/{}/exports/status",
+            query_component(&args.tenant_id)
+        ))
+        .await?
+    };
+    let clickhouse = if let Some(url) = args.clickhouse_url.as_deref() {
+        let schema = clickhouse_schema_status(url).await?;
+        let native_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_events WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        let otel_log_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_otel_logs WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        let otel_trace_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_otel_traces WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        json!({
+            "schema": schema.to_json(),
+            "rows": {
+                "agentdb_events": native_rows,
+                "agentdb_otel_logs": otel_log_rows,
+                "agentdb_otel_traces": otel_trace_rows
+            }
+        })
+    } else {
+        json!({
+            "schema": null,
+            "rows": null,
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
+        })
+    };
+    Ok(json!({
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "agentdb": agentdb,
+        "clickhouse": clickhouse
+    }))
+}
+
 async fn clickhouse_init(args: ClickHouseInitArgs) -> Result<Value> {
     if !args.apply {
         return Ok(json!({
             "status": "dry_run",
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
             "statements": CLICKHOUSE_SCHEMA_DDL
         }));
     }
     let url = args
         .clickhouse_url
         .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    apply_clickhouse_schema(&url).await
+}
+
+async fn clickhouse_migrate(args: ClickHouseMigrateArgs) -> Result<Value> {
+    if args.to != "latest" && args.to != CLICKHOUSE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported ClickHouse migration target `{}`; use latest or {}",
+            args.to,
+            CLICKHOUSE_SCHEMA_VERSION
+        ));
+    }
+    if !args.apply {
+        return Ok(json!({
+            "status": "dry_run",
+            "target": args.to,
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+            "destructive": false,
+            "allow_destructive": args.allow_destructive,
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+    }
+    let url = args
+        .clickhouse_url
+        .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    apply_clickhouse_schema(&url).await
+}
+
+async fn apply_clickhouse_schema(url: &str) -> Result<Value> {
     let mut applied = Vec::new();
     for statement in CLICKHOUSE_SCHEMA_DDL {
-        clickhouse_query(&url, statement).await?;
+        clickhouse_query(url, statement).await?;
         applied.push(json!({
             "statement": statement.lines().next().unwrap_or(statement).trim(),
             "status": "ok"
         }));
     }
+    let version_insert = format!(
+        "INSERT INTO agentdb_schema_migrations (version) SELECT {} WHERE NOT EXISTS (SELECT 1 FROM agentdb_schema_migrations WHERE version = {})",
+        sql_string(CLICKHOUSE_SCHEMA_VERSION),
+        sql_string(CLICKHOUSE_SCHEMA_VERSION)
+    );
+    clickhouse_query(url, &version_insert).await?;
+    let schema = clickhouse_schema_status(url).await?;
     Ok(json!({
-        "status": "ok",
-        "applied": applied
+        "status": if schema.current { "ok" } else { "error" },
+        "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+        "applied": applied,
+        "schema": schema.to_json()
     }))
+}
+
+struct ClickHouseSchemaStatus {
+    current: bool,
+    latest_version: &'static str,
+    latest_applied: bool,
+    existing_objects: Vec<String>,
+    missing_objects: Vec<String>,
+}
+
+impl ClickHouseSchemaStatus {
+    fn to_json(&self) -> Value {
+        json!({
+            "current": self.current,
+            "latest_version": self.latest_version,
+            "latest_applied": self.latest_applied,
+            "existing_objects": self.existing_objects,
+            "missing_objects": self.missing_objects
+        })
+    }
+}
+
+async fn clickhouse_schema_status(url: &str) -> Result<ClickHouseSchemaStatus> {
+    let names = CLICKHOUSE_REQUIRED_OBJECTS
+        .iter()
+        .map(|name| sql_string(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names}) FORMAT TabSeparated"
+    );
+    let response = clickhouse_query(url, &sql).await?;
+    let mut existing_objects = response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    existing_objects.sort();
+    let mut missing_objects = CLICKHOUSE_REQUIRED_OBJECTS
+        .iter()
+        .filter(|required| !existing_objects.iter().any(|name| name == **required))
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    missing_objects.sort();
+    let latest_applied = clickhouse_schema_version_applied(url)
+        .await
+        .unwrap_or(false);
+    Ok(ClickHouseSchemaStatus {
+        current: missing_objects.is_empty() && latest_applied,
+        latest_version: CLICKHOUSE_SCHEMA_VERSION,
+        latest_applied,
+        existing_objects,
+        missing_objects,
+    })
+}
+
+async fn clickhouse_schema_version_applied(url: &str) -> Result<bool> {
+    let exists_sql = "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = 'agentdb_schema_migrations'";
+    if clickhouse_scalar_u64(url, exists_sql).await? == 0 {
+        return Ok(false);
+    }
+    let sql = format!(
+        "SELECT count() FROM agentdb_schema_migrations WHERE version = {}",
+        sql_string(CLICKHOUSE_SCHEMA_VERSION)
+    );
+    Ok(clickhouse_scalar_u64(url, &sql).await? > 0)
+}
+
+async fn clickhouse_scalar_u64(url: &str, sql: &str) -> Result<u64> {
+    let response = clickhouse_query(url, sql).await?;
+    response
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("ClickHouse scalar response was not u64: {response:?}"))
 }
 
 async fn ensure_claimed_export_consumer(
@@ -1162,6 +1712,10 @@ async fn ensure_claimed_export_consumer_for(
 async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     let modes = export_modes(&args.mode)?;
     let mut cursor = args.from_cursor.clone();
+    let started_at_ms = now_ms();
+    let mut retry_attempts = 0_u64;
+    let mut filtered_items = 0_u64;
+    let mut inserted_rows = 0_u64;
     if let Some(consumer) = &args.consumer {
         let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
         if cursor.is_none() {
@@ -1215,12 +1769,16 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                     .await?
             }
         };
-        let items = response
+        let raw_items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if items.is_empty() {
+        let raw_item_count = raw_items.len();
+        let items = apply_export_privacy(raw_items, &args.privacy)?;
+        filtered_items =
+            filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
+        if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -1238,32 +1796,60 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
         rows = rows.saturating_add(items.len() as u64);
         if !args.dry_run {
             if modes.native {
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_export_items_raw",
-                    &clickhouse_raw_rows(&items)?,
-                )
-                .await?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_events",
-                    &clickhouse_event_rows(&items)?,
-                )
-                .await?;
+                let raw_rows = clickhouse_raw_rows(&items)?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_export_items_raw",
+                        &raw_rows,
+                        &export_batch_id("agentdb_export_items_raw", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(raw_rows.len() as u64);
+                let event_rows = clickhouse_event_rows(&items)?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_events",
+                        &event_rows,
+                        &export_batch_id("agentdb_events", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(event_rows.len() as u64);
             }
             if modes.otel {
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_otel_logs",
-                    &clickhouse_otel_log_rows(&items)?,
-                )
-                .await?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_otel_traces",
-                    &clickhouse_otel_trace_rows(&items)?,
-                )
-                .await?;
+                let otel_log_rows = clickhouse_otel_log_rows(&items)?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_otel_logs",
+                        &otel_log_rows,
+                        &export_batch_id("agentdb_otel_logs", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(otel_log_rows.len() as u64);
+                let otel_trace_rows = clickhouse_otel_trace_rows(&items)?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_otel_traces",
+                        &otel_trace_rows,
+                        &export_batch_id("agentdb_otel_traces", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(otel_trace_rows.len() as u64);
             }
         }
         cursor = response
@@ -1296,6 +1882,19 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                 .await?;
             }
         }
+        write_metrics_output(
+            args.metrics_output.as_ref(),
+            &clickhouse_run_result(
+                &args,
+                started_at_ms,
+                batches,
+                rows,
+                filtered_items,
+                inserted_rows,
+                retry_attempts,
+                cursor.as_deref(),
+            ),
+        )?;
         if phase == ExportRunPhase::Backfill {
             let complete = response
                 .get("complete")
@@ -1314,18 +1913,51 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             break;
         }
     }
-    Ok(json!({
+    let result = clickhouse_run_result(
+        &args,
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        inserted_rows,
+        retry_attempts,
+        cursor.as_deref(),
+    );
+    write_metrics_output(args.metrics_output.as_ref(), &result)?;
+    Ok(result)
+}
+
+fn clickhouse_run_result(
+    args: &ClickHouseRunArgs,
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    inserted_rows: u64,
+    retry_attempts: u64,
+    cursor: Option<&str>,
+) -> Value {
+    let metrics = export_metrics(
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        inserted_rows,
+        retry_attempts,
+    );
+    json!({
         "status": "ok",
-        "tenant_id": args.tenant_id,
-        "consumer": args.consumer,
-        "mode": args.mode,
+        "tenant_id": &args.tenant_id,
+        "consumer": &args.consumer,
+        "mode": &args.mode,
         "backfill": args.backfill,
         "tail": args.tail,
         "batches": batches,
         "rows": rows,
         "last_cursor": cursor,
+        "metrics": metrics,
         "dry_run": args.dry_run
-    }))
+    })
 }
 
 async fn jsonl(api: &Api, command: JsonlCommand) -> Result<Value> {
@@ -1341,6 +1973,8 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         args.dry_run,
     )
     .await?;
+    let started_at_ms = now_ms();
+    let mut filtered_items = 0_u64;
     let include = if args.include.is_empty() {
         vec!["events".to_string()]
     } else {
@@ -1406,12 +2040,16 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                     .await?
             }
         };
-        let items = response
+        let raw_items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if items.is_empty() {
+        let raw_item_count = raw_items.len();
+        let items = apply_export_privacy(raw_items, &args.privacy)?;
+        filtered_items =
+            filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
+        if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -1427,7 +2065,9 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         }
         batches = batches.saturating_add(1);
         rows = rows.saturating_add(items.len() as u64);
-        output.write_items(&items).await?;
+        if !items.is_empty() {
+            output.write_items(&items).await?;
+        }
         cursor = response
             .get("next_cursor")
             .and_then(Value::as_str)
@@ -1451,6 +2091,18 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                 .await?;
             }
         }
+        write_metrics_output(
+            args.metrics_output.as_ref(),
+            &jsonl_run_result(
+                &args,
+                None,
+                started_at_ms,
+                batches,
+                rows,
+                filtered_items,
+                cursor.as_deref(),
+            ),
+        )?;
         if phase == ExportRunPhase::Backfill {
             let complete = response
                 .get("complete")
@@ -1470,18 +2122,42 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         }
     }
     let output = output.finish().await?;
-    Ok(json!({
+    let result = jsonl_run_result(
+        &args,
+        Some(output),
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        cursor.as_deref(),
+    );
+    write_metrics_output(args.metrics_output.as_ref(), &result)?;
+    Ok(result)
+}
+
+fn jsonl_run_result(
+    args: &JsonlRunArgs,
+    output: Option<Value>,
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    cursor: Option<&str>,
+) -> Value {
+    let metrics = export_metrics(started_at_ms, batches, rows, filtered_items, rows, 0);
+    json!({
         "status": "ok",
-        "tenant_id": args.tenant_id,
-        "consumer": args.consumer,
+        "tenant_id": &args.tenant_id,
+        "consumer": &args.consumer,
         "output": output,
         "backfill": args.backfill,
         "tail": args.tail,
         "batches": batches,
         "rows": rows,
         "last_cursor": cursor,
+        "metrics": metrics,
         "dry_run": args.dry_run
-    }))
+    })
 }
 
 async fn parquet(command: ParquetCommand) -> Result<Value> {
@@ -1567,6 +2243,162 @@ fn sql_string(value: &str) -> String {
 enum ExportRunPhase {
     Backfill,
     Watch,
+}
+
+fn apply_export_privacy(items: Vec<Value>, privacy: &ExportPrivacyArgs) -> Result<Vec<Value>> {
+    items
+        .into_iter()
+        .filter(|item| export_item_allowed(item, privacy))
+        .map(|mut item| {
+            for field in &privacy.redact_fields {
+                redact_json_path(&mut item, field);
+            }
+            apply_payload_mode(&mut item, privacy.payload_mode)?;
+            Ok(item)
+        })
+        .collect()
+}
+
+fn export_item_allowed(item: &Value, privacy: &ExportPrivacyArgs) -> bool {
+    let object_type = item
+        .get("object_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !privacy.allow_object_types.is_empty()
+        && !contains_object_type(&privacy.allow_object_types, object_type)
+    {
+        return false;
+    }
+    if contains_object_type(&privacy.deny_object_types, object_type) {
+        return false;
+    }
+    if object_type == "event" {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if !privacy.allow_event_kinds.is_empty() && !contains_text(&privacy.allow_event_kinds, kind)
+        {
+            return false;
+        }
+        if contains_text(&privacy.deny_event_kinds, kind) {
+            return false;
+        }
+    }
+    true
+}
+
+fn contains_text(values: &[String], needle: &str) -> bool {
+    values.iter().any(|value| value == needle)
+}
+
+fn contains_object_type(values: &[String], object_type: &str) -> bool {
+    values
+        .iter()
+        .any(|value| object_type_filter_matches(value, object_type))
+}
+
+fn object_type_filter_matches(filter: &str, object_type: &str) -> bool {
+    match filter {
+        "events" => object_type == "event",
+        "tenants" => object_type == "tenant",
+        "agents" => object_type == "agent",
+        "sessions" => object_type == "session",
+        "artifacts" => object_type == "artifact",
+        "records" => object_type == "record",
+        "skills" => object_type == "skill",
+        "skill_bindings" => object_type == "skill_binding",
+        other => other == object_type,
+    }
+}
+
+fn redact_json_path(value: &mut Value, path: &str) {
+    let mut current = value;
+    let mut parts = path.split('.').filter(|part| !part.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        let Some(object) = current.as_object_mut() else {
+            return;
+        };
+        if parts.peek().is_none() {
+            if object.contains_key(part) {
+                object.insert(part.to_string(), Value::String("[REDACTED]".to_string()));
+            }
+            return;
+        }
+        let Some(next) = object.get_mut(part) else {
+            return;
+        };
+        current = next;
+    }
+}
+
+fn apply_payload_mode(item: &mut Value, mode: ExportPayloadMode) -> Result<()> {
+    if mode == ExportPayloadMode::Full {
+        return Ok(());
+    }
+    let Some(payload) = item
+        .get_mut("data")
+        .and_then(|data| data.get_mut("payload"))
+    else {
+        return Ok(());
+    };
+    match mode {
+        ExportPayloadMode::Full => {}
+        ExportPayloadMode::Hash => {
+            let payload_json = serde_json::to_string(payload)?;
+            *payload = json!({
+                "sha256": sha256_hex(&payload_json),
+                "redacted": true
+            });
+        }
+        ExportPayloadMode::Drop => {
+            *payload = Value::Null;
+        }
+    }
+    Ok(())
+}
+
+fn export_metrics(
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    inserted_rows: u64,
+    retry_attempts: u64,
+) -> Value {
+    let completed_at_ms = now_ms();
+    let duration_ms = completed_at_ms.saturating_sub(started_at_ms).max(1);
+    json!({
+        "started_at_ms": started_at_ms,
+        "completed_at_ms": completed_at_ms,
+        "duration_ms": duration_ms,
+        "batches": batches,
+        "rows": rows,
+        "filtered_items": filtered_items,
+        "inserted_rows": inserted_rows,
+        "retry_attempts": retry_attempts,
+        "rows_per_second": (rows as f64) * 1000.0 / (duration_ms as f64)
+    })
+}
+
+fn write_metrics_output(path: Option<&PathBuf>, result: &Value) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create metrics output directory {}", parent.display()))?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(result)?)
+        .with_context(|| format!("write metrics output {}", path.display()))?;
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
@@ -1952,6 +2784,10 @@ fn sha256_hex_64(input: &str) -> String {
     hex_prefix(input, 8)
 }
 
+fn sha256_hex(input: &str) -> String {
+    hex_prefix(input, 32)
+}
+
 fn hex_prefix(input: &str, bytes: usize) -> String {
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(bytes * 2);
@@ -2069,23 +2905,75 @@ fn otel_span_kind(item: &Value) -> &'static str {
     }
 }
 
-async fn clickhouse_insert_json_each_row(url: &str, table: &str, rows: &[Value]) -> Result<()> {
+async fn clickhouse_insert_json_each_row(
+    url: &str,
+    table: &str,
+    rows: &[Value],
+    batch_id: &str,
+    max_retries: u32,
+    retry_initial_backoff_ms: u64,
+) -> Result<u32> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let mut body = format!("INSERT INTO {table} FORMAT JSONEachRow\n");
+    let mut body = format!(
+        "INSERT INTO {table} SETTINGS insert_deduplicate=1, insert_deduplication_token={} FORMAT JSONEachRow\n",
+        sql_string(batch_id)
+    );
     for row in rows {
         body.push_str(&serde_json::to_string(row)?);
         body.push('\n');
     }
-    clickhouse_query(url, &body).await?;
-    Ok(())
+    clickhouse_query_with_retry(url, &body, max_retries, retry_initial_backoff_ms).await
+}
+
+async fn clickhouse_query_with_retry(
+    url: &str,
+    sql: &str,
+    max_retries: u32,
+    retry_initial_backoff_ms: u64,
+) -> Result<u32> {
+    let mut attempt = 0_u32;
+    loop {
+        match clickhouse_query(url, sql).await {
+            Ok(_) => return Ok(attempt),
+            Err(error) if attempt < max_retries => {
+                let delay = retry_initial_backoff_ms.saturating_mul(1_u64 << attempt.min(10));
+                eprintln!(
+                    "clickhouse insert attempt {} failed; retrying in {}ms: {error}",
+                    attempt + 1,
+                    delay
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn export_batch_id(table: &str, items: &[Value]) -> String {
+    let first = items
+        .first()
+        .and_then(|item| item.get("cursor"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let last = items
+        .last()
+        .and_then(|item| item.get("cursor"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    sha256_hex_128(&format!(
+        "agentdb.clickhouse.batch:{table}:{first}:{last}:{}",
+        items.len()
+    ))
 }
 
 async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
+    let request_url = clickhouse_request_url(url)?;
     let redacted_url = redact_clickhouse_url(url);
     let response = Client::new()
-        .post(url)
+        .post(request_url)
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(sql.to_string())
         .send()
@@ -2105,6 +2993,19 @@ async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
         return Err(anyhow!("ClickHouse returned {status}: {text}"));
     }
     Ok(text)
+}
+
+fn clickhouse_request_url(raw: &str) -> Result<Url> {
+    let mut url = Url::parse(raw).with_context(|| format!("parse ClickHouse URL `{raw}`"))?;
+    let database = url.path().trim_matches('/').to_string();
+    if !database.is_empty() {
+        url.set_path("/");
+        let has_database = url.query_pairs().any(|(key, _)| key == "database");
+        if !has_database {
+            url.query_pairs_mut().append_pair("database", &database);
+        }
+    }
+    Ok(url)
 }
 
 fn sanitize_clickhouse_error(url: &str, message: &str) -> String {
@@ -2525,6 +3426,12 @@ fn render_table(value: &Value) -> String {
         if object.contains_key("health") && object.contains_key("readiness") {
             return render_status(value);
         }
+        if let Some(queries) = object.get("queries").and_then(Value::as_array) {
+            return render_queries(queries);
+        }
+        if let Some(statements) = object.get("statements").and_then(Value::as_array) {
+            return render_statements(object, statements);
+        }
         if let Some(actions) = object.get("actions").and_then(Value::as_array) {
             if !actions.is_empty() {
                 return render_rows(actions);
@@ -2600,6 +3507,46 @@ fn render_status(value: &Value) -> String {
                 .unwrap_or_else(|| "unknown".to_string())
         )
         .unwrap();
+    }
+    out.trim_end().to_string()
+}
+
+fn render_queries(queries: &[Value]) -> String {
+    let mut out = String::new();
+    for (index, query) in queries.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let name = query.get("name").and_then(Value::as_str).unwrap_or("query");
+        let description = query
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sql = query.get("sql").and_then(Value::as_str).unwrap_or_default();
+        if description.is_empty() {
+            writeln!(out, "-- {name}").unwrap();
+        } else {
+            writeln!(out, "-- {name}: {description}").unwrap();
+        }
+        writeln!(out, "{sql};").unwrap();
+    }
+    out.trim_end().to_string()
+}
+
+fn render_statements(object: &serde_json::Map<String, Value>, statements: &[Value]) -> String {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "status={} latest_version={} statements={}",
+        text(object.get("status").unwrap_or(&Value::Null)),
+        text(object.get("latest_version").unwrap_or(&Value::Null)),
+        statements.len()
+    )
+    .unwrap();
+    for statement in statements {
+        if let Some(sql) = statement.as_str() {
+            writeln!(out, "\n{};", sql.trim()).unwrap();
+        }
     }
     out.trim_end().to_string()
 }
@@ -2884,6 +3831,10 @@ mod tests {
             tail: false,
             max_batches: None,
             poll_interval_ms: 1000,
+            max_retries: 3,
+            retry_initial_backoff_ms: 250,
+            privacy: ExportPrivacyArgs::default(),
+            metrics_output: None,
             dry_run: false,
         };
         assert_eq!(
@@ -2910,6 +3861,8 @@ mod tests {
             tail: false,
             max_batches: None,
             poll_interval_ms: 1000,
+            privacy: ExportPrivacyArgs::default(),
+            metrics_output: None,
             dry_run: false,
         };
         assert_eq!(
@@ -2925,7 +3878,156 @@ mod tests {
         assert!(ddl.contains("agentdb_events"));
         assert!(ddl.contains("agentdb_otel_logs"));
         assert!(ddl.contains("agentdb_otel_traces"));
+        assert!(ddl.contains("agentdb_clickstack_logs"));
+        assert!(ddl.contains("agentdb_clickstack_traces"));
+        assert!(ddl.contains("CREATE VIEW IF NOT EXISTS otel_logs"));
+        assert!(ddl.contains("TimestampTime"));
+        assert!(ddl.contains("TraceId"));
+        assert!(ddl.contains("agentdb_schema_migrations"));
         assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
+    }
+
+    #[test]
+    fn clickhouse_required_objects_include_latest_views() {
+        assert_eq!(CLICKHOUSE_SCHEMA_VERSION, "2026_05_15_clickstack_views");
+        for required in [
+            "agentdb_events",
+            "agentdb_otel_logs",
+            "agentdb_clickstack_logs",
+            "otel_logs",
+        ] {
+            assert!(CLICKHOUSE_REQUIRED_OBJECTS.contains(&required));
+        }
+    }
+
+    #[test]
+    fn clickhouse_sample_queries_include_native_and_clickstack_views() {
+        let queries = clickhouse_sample_queries();
+        let rows = queries["queries"].as_array().unwrap();
+        assert!(rows.iter().any(|row| row["name"] == "recent_failures"
+            && row["sql"].as_str().unwrap().contains("agentdb_events")));
+        assert!(rows.iter().any(|row| row["name"] == "clickstack_logs"
+            && row["sql"]
+                .as_str()
+                .unwrap()
+                .contains("agentdb_clickstack_logs")));
+        assert!(rows.iter().any(|row| row["name"] == "clickstack_traces"
+            && row["sql"]
+                .as_str()
+                .unwrap()
+                .contains("agentdb_clickstack_traces")));
+    }
+
+    #[test]
+    fn renders_clickhouse_queries_as_copyable_sql() {
+        let rendered = render_table(&clickhouse_sample_queries());
+        assert!(rendered.contains("-- recent_failures:"));
+        assert!(rendered.contains("FROM agentdb_events"));
+        assert!(rendered.contains("FROM agentdb_clickstack_logs"));
+        assert!(rendered.contains("LIMIT 100;"));
+    }
+
+    #[test]
+    fn clickstack_config_includes_source_fields_and_dashboard_payload() {
+        let config = clickstack_config(ClickStackConfigArgs {
+            service_name: "AgentDB Prod".into(),
+            logs_source: "agentdb_clickstack_logs".into(),
+            traces_source: "agentdb_clickstack_traces".into(),
+        });
+        assert_eq!(config["sources"][0]["table"], "agentdb_clickstack_logs");
+        assert_eq!(config["sources"][0]["trace_id_field"], "TraceId");
+        assert_eq!(config["sources"][1]["duration_field"], "Duration");
+        assert_eq!(
+            config["dashboard"]["name"],
+            "AgentDB Prod Runtime Observability"
+        );
+        assert!(config["clickhouse_cloud_api"]["base_url"]
+            .as_str()
+            .unwrap()
+            .contains("/clickstack"));
+    }
+
+    #[test]
+    fn renders_clickhouse_schema_plan_as_copyable_sql() {
+        let rendered = render_table(&json!({
+            "status": "dry_run",
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+        assert!(rendered.contains("status=dry_run"));
+        assert!(rendered.contains("latest_version=2026_05_15_clickstack_views"));
+        assert!(rendered.contains("CREATE TABLE IF NOT EXISTS agentdb_events"));
+        assert!(rendered.contains("CREATE VIEW IF NOT EXISTS agentdb_clickstack_logs"));
+    }
+
+    #[test]
+    fn export_batch_id_is_stable_for_replayed_cursor_range() {
+        let items = vec![
+            json!({"cursor": "ledger:ten_1/0001/event/evt_1"}),
+            json!({"cursor": "ledger:ten_1/0002/event/evt_2"}),
+        ];
+        assert_eq!(
+            export_batch_id("agentdb_events", &items),
+            export_batch_id("agentdb_events", &items)
+        );
+        assert_ne!(
+            export_batch_id("agentdb_events", &items),
+            export_batch_id("agentdb_otel_logs", &items)
+        );
+    }
+
+    #[test]
+    fn export_privacy_filters_and_redacts_items() {
+        let items = vec![
+            json!({
+                "cursor": "ledger:1",
+                "object_type": "event",
+                "kind": "model_call",
+                "data": {
+                    "payload": {
+                        "prompt": "secret",
+                        "nested": {"token": "abc"}
+                    }
+                }
+            }),
+            json!({
+                "cursor": "ledger:2",
+                "object_type": "event",
+                "kind": "debug"
+            }),
+            json!({
+                "cursor": "ledger:3",
+                "object_type": "record",
+                "data": {"payload": "record-secret"}
+            }),
+        ];
+        let privacy = ExportPrivacyArgs {
+            allow_object_types: vec!["events".into()],
+            deny_object_types: vec![],
+            allow_event_kinds: vec![],
+            deny_event_kinds: vec!["debug".into()],
+            redact_fields: vec!["data.payload.nested.token".into()],
+            payload_mode: ExportPayloadMode::Hash,
+        };
+
+        let filtered = apply_export_privacy(items, &privacy).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["kind"], "model_call");
+        assert_eq!(filtered[0]["data"]["payload"]["redacted"], true);
+        assert!(filtered[0]["data"]["payload"]["sha256"].as_str().is_some());
+        assert!(!filtered[0].to_string().contains("secret"));
+        assert!(!filtered[0].to_string().contains("abc"));
+    }
+
+    #[test]
+    fn export_metrics_reports_rates_and_filtered_items() {
+        let metrics = export_metrics(now_ms().saturating_sub(1000), 2, 10, 3, 20, 1);
+        assert_eq!(metrics["batches"], 2);
+        assert_eq!(metrics["rows"], 10);
+        assert_eq!(metrics["filtered_items"], 3);
+        assert_eq!(metrics["inserted_rows"], 20);
+        assert_eq!(metrics["retry_attempts"], 1);
+        assert!(metrics["rows_per_second"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -2938,6 +4040,22 @@ mod tests {
         assert_eq!(
             sanitize_clickhouse_error(url, &format!("request failed for {url}")),
             "request failed for https://***@clickhouse.example.com:8443/agentdb"
+        );
+    }
+
+    #[test]
+    fn clickhouse_request_url_maps_path_to_database_query() {
+        assert_eq!(
+            clickhouse_request_url("http://agentdb:secret@127.0.0.1:8123/agentdb")
+                .unwrap()
+                .as_str(),
+            "http://agentdb:secret@127.0.0.1:8123/?database=agentdb"
+        );
+        assert_eq!(
+            clickhouse_request_url("http://127.0.0.1:8123/?database=custom")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8123/?database=custom"
         );
     }
 
