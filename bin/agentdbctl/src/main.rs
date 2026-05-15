@@ -21,6 +21,20 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
+const CLICKHOUSE_SCHEMA_VERSION: &str = "2026_05_15_clickstack_views";
+const CLICKHOUSE_REQUIRED_OBJECTS: &[&str] = &[
+    "agentdb_schema_migrations",
+    "agentdb_export_checkpoints",
+    "agentdb_export_items_raw",
+    "agentdb_events",
+    "agentdb_otel_logs",
+    "agentdb_otel_traces",
+    "agentdb_clickstack_logs",
+    "agentdb_clickstack_traces",
+    "otel_logs",
+    "otel_traces",
+    "agentdb_tombstones",
+];
 const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
     r#"
 CREATE TABLE IF NOT EXISTS agentdb_schema_migrations (
@@ -720,6 +734,8 @@ enum ClickHouseCommand {
     Doctor(ClickHouseDoctorArgs),
     /// Print or apply the first-party ClickHouse schema.
     Init(ClickHouseInitArgs),
+    /// Apply versioned first-party ClickHouse schema migrations.
+    Migrate(ClickHouseMigrateArgs),
     /// Show AgentDB export status for one tenant.
     Status(ClickHouseStatusArgs),
     /// Print first-party dashboard and ClickStack smoke queries.
@@ -734,6 +750,8 @@ struct ClickHouseDoctorArgs {
     tenant_id: Option<String>,
     #[arg(long, env = "CLICKHOUSE_URL")]
     clickhouse_url: Option<String>,
+    #[arg(long)]
+    skip_write_smoke: bool,
 }
 
 #[derive(Args, Debug)]
@@ -745,11 +763,25 @@ struct ClickHouseInitArgs {
 }
 
 #[derive(Args, Debug)]
+struct ClickHouseMigrateArgs {
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+    #[arg(long, default_value = "latest")]
+    to: String,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    allow_destructive: bool,
+}
+
+#[derive(Args, Debug)]
 struct ClickHouseStatusArgs {
     #[arg(long)]
     tenant_id: String,
     #[arg(long)]
     consumer: Option<String>,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -786,6 +818,10 @@ struct ClickHouseRunArgs {
     max_batches: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+    #[arg(long, default_value_t = 250)]
+    retry_initial_backoff_ms: u64,
     #[arg(long)]
     dry_run: bool,
 }
@@ -1097,22 +1133,8 @@ async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
     match command {
         ClickHouseCommand::Doctor(args) => clickhouse_doctor(api, args).await,
         ClickHouseCommand::Init(args) => clickhouse_init(args).await,
-        ClickHouseCommand::Status(args) => {
-            if let Some(consumer) = args.consumer {
-                api.get(&format!(
-                    "/api/tenants/{}/exports/consumers/{}",
-                    query_component(&args.tenant_id),
-                    query_component(&consumer)
-                ))
-                .await
-            } else {
-                api.get(&format!(
-                    "/api/tenants/{}/exports/status",
-                    query_component(&args.tenant_id)
-                ))
-                .await
-            }
-        }
+        ClickHouseCommand::Migrate(args) => clickhouse_migrate(args).await,
+        ClickHouseCommand::Status(args) => clickhouse_status(api, args).await,
         ClickHouseCommand::Queries => Ok(clickhouse_sample_queries()),
         ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
     }
@@ -1137,12 +1159,14 @@ async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Valu
     let agentdb_ready = match api.get("/health/ready").await {
         Ok(_) => json!({
             "check_id": "agentdb_reachable",
-            "status": "ok"
+            "status": "ok",
+            "remediation": null
         }),
         Err(error) => json!({
             "check_id": "agentdb_reachable",
             "status": "error",
-            "message": error.to_string()
+            "message": error.to_string(),
+            "remediation": "start AgentDB or pass --url/AGENTDB_URL for a reachable server"
         }),
     };
     let export_status = if let Some(tenant_id) = args.tenant_id {
@@ -1156,42 +1180,107 @@ async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Valu
             Ok(value) => json!({
                 "check_id": "agentdb_export_status",
                 "status": "ok",
-                "details": value
+                "details": value,
+                "remediation": null
             }),
             Err(error) => json!({
                 "check_id": "agentdb_export_status",
                 "status": "error",
-                "message": error.to_string()
+                "message": error.to_string(),
+                "remediation": "verify the tenant id and AgentDB export API health"
             }),
         }
     } else {
         json!({
             "check_id": "agentdb_export_status",
             "status": "skipped",
-            "message": "--tenant-id not supplied"
+            "message": "--tenant-id not supplied",
+            "remediation": "pass --tenant-id to validate tenant export status and lag"
         })
     };
-    let clickhouse = if let Some(url) = args.clickhouse_url {
-        match clickhouse_query(&url, "SELECT 1").await {
+    let mut checks = vec![agentdb_ready, export_status];
+    if let Some(url) = args.clickhouse_url {
+        checks.push(match clickhouse_query(&url, "SELECT 1").await {
             Ok(text) => json!({
                 "check_id": "clickhouse_reachable",
                 "status": "ok",
-                "response": text.trim()
+                "response": text.trim(),
+                "remediation": null
             }),
             Err(error) => json!({
                 "check_id": "clickhouse_reachable",
                 "status": "error",
-                "message": error.to_string()
+                "message": error.to_string(),
+                "remediation": "start ClickHouse or pass --clickhouse-url/CLICKHOUSE_URL with valid credentials"
             }),
+        });
+        checks.push(match clickhouse_schema_status(&url).await {
+            Ok(schema) if schema.current => json!({
+                "check_id": "schema_current",
+                "status": "ok",
+                "details": schema.to_json(),
+                "remediation": null
+            }),
+            Ok(schema) => json!({
+                "check_id": "schema_current",
+                "status": "error",
+                "details": schema.to_json(),
+                "remediation": "run `agentdbctl export clickhouse migrate --apply`"
+            }),
+            Err(error) => json!({
+                "check_id": "schema_current",
+                "status": "error",
+                "message": error.to_string(),
+                "remediation": "run `agentdbctl export clickhouse migrate --apply` after ClickHouse is reachable"
+            }),
+        });
+        checks.push(
+            match clickhouse_query(&url, "SELECT count() FROM agentdb_events").await {
+                Ok(text) => json!({
+                    "check_id": "can_query",
+                    "status": "ok",
+                    "response": text.trim(),
+                    "remediation": null
+                }),
+                Err(error) => json!({
+                    "check_id": "can_query",
+                    "status": "error",
+                    "message": error.to_string(),
+                    "remediation": "grant SELECT on the AgentDB observability tables/views"
+                }),
+            },
+        );
+        if args.skip_write_smoke {
+            checks.push(json!({
+                "check_id": "can_insert",
+                "status": "skipped",
+                "message": "--skip-write-smoke supplied",
+                "remediation": "run without --skip-write-smoke before production cutover"
+            }));
+        } else {
+            checks.push(match clickhouse_write_smoke(&url).await {
+                Ok(value) => json!({
+                    "check_id": "can_insert",
+                    "status": "ok",
+                    "details": value,
+                    "remediation": null
+                }),
+                Err(error) => json!({
+                    "check_id": "can_insert",
+                    "status": "error",
+                    "message": error.to_string(),
+                    "remediation": "grant CREATE/INSERT/SELECT/DROP for migration validation or run connector with an insert-capable role after schema is initialized"
+                }),
+            });
         }
     } else {
-        json!({
+        checks.push(json!({
             "check_id": "clickhouse_reachable",
             "status": "skipped",
-            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
-        })
-    };
-    let checks = vec![agentdb_ready, export_status, clickhouse];
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied",
+            "remediation": "pass --clickhouse-url to validate schema, grants, and write path"
+        }));
+    }
     let ok = checks
         .iter()
         .all(|check| check.get("status").and_then(Value::as_str) != Some("error"));
@@ -1201,28 +1290,229 @@ async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Valu
     }))
 }
 
+async fn clickhouse_write_smoke(url: &str) -> Result<Value> {
+    let table = format!("agentdb_export_doctor_smoke_{}", std::process::id());
+    let create =
+        format!("CREATE TABLE IF NOT EXISTS {table} (id UInt64, value String) ENGINE = Memory");
+    let insert = format!("INSERT INTO {table} FORMAT JSONEachRow\n{{\"id\":1,\"value\":\"ok\"}}\n");
+    let select = format!("SELECT count() FROM {table}");
+    let drop = format!("DROP TABLE IF EXISTS {table}");
+    clickhouse_query(url, &create).await?;
+    let result = async {
+        clickhouse_query(url, &insert).await?;
+        clickhouse_scalar_u64(url, &select).await
+    }
+    .await;
+    let _ = clickhouse_query(url, &drop).await;
+    let rows = result?;
+    Ok(json!({
+        "table": table,
+        "rows": rows
+    }))
+}
+
+async fn clickhouse_status(api: &Api, args: ClickHouseStatusArgs) -> Result<Value> {
+    let agentdb = if let Some(consumer) = &args.consumer {
+        api.get(&format!(
+            "/api/tenants/{}/exports/consumers/{}",
+            query_component(&args.tenant_id),
+            query_component(consumer)
+        ))
+        .await?
+    } else {
+        api.get(&format!(
+            "/api/tenants/{}/exports/status",
+            query_component(&args.tenant_id)
+        ))
+        .await?
+    };
+    let clickhouse = if let Some(url) = args.clickhouse_url.as_deref() {
+        let schema = clickhouse_schema_status(url).await?;
+        let native_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_events WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        let otel_log_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_otel_logs WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        let otel_trace_rows = clickhouse_scalar_u64(
+            url,
+            &format!(
+                "SELECT count() FROM agentdb_otel_traces WHERE tenant_id = {}",
+                sql_string(&args.tenant_id)
+            ),
+        )
+        .await
+        .unwrap_or(0);
+        json!({
+            "schema": schema.to_json(),
+            "rows": {
+                "agentdb_events": native_rows,
+                "agentdb_otel_logs": otel_log_rows,
+                "agentdb_otel_traces": otel_trace_rows
+            }
+        })
+    } else {
+        json!({
+            "schema": null,
+            "rows": null,
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
+        })
+    };
+    Ok(json!({
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "agentdb": agentdb,
+        "clickhouse": clickhouse
+    }))
+}
+
 async fn clickhouse_init(args: ClickHouseInitArgs) -> Result<Value> {
     if !args.apply {
         return Ok(json!({
             "status": "dry_run",
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
             "statements": CLICKHOUSE_SCHEMA_DDL
         }));
     }
     let url = args
         .clickhouse_url
         .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    apply_clickhouse_schema(&url).await
+}
+
+async fn clickhouse_migrate(args: ClickHouseMigrateArgs) -> Result<Value> {
+    if args.to != "latest" && args.to != CLICKHOUSE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "unsupported ClickHouse migration target `{}`; use latest or {}",
+            args.to,
+            CLICKHOUSE_SCHEMA_VERSION
+        ));
+    }
+    if !args.apply {
+        return Ok(json!({
+            "status": "dry_run",
+            "target": args.to,
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+            "destructive": false,
+            "allow_destructive": args.allow_destructive,
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+    }
+    let url = args
+        .clickhouse_url
+        .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    apply_clickhouse_schema(&url).await
+}
+
+async fn apply_clickhouse_schema(url: &str) -> Result<Value> {
     let mut applied = Vec::new();
     for statement in CLICKHOUSE_SCHEMA_DDL {
-        clickhouse_query(&url, statement).await?;
+        clickhouse_query(url, statement).await?;
         applied.push(json!({
             "statement": statement.lines().next().unwrap_or(statement).trim(),
             "status": "ok"
         }));
     }
+    let version_insert = format!(
+        "INSERT INTO agentdb_schema_migrations (version) SELECT {} WHERE NOT EXISTS (SELECT 1 FROM agentdb_schema_migrations WHERE version = {})",
+        sql_string(CLICKHOUSE_SCHEMA_VERSION),
+        sql_string(CLICKHOUSE_SCHEMA_VERSION)
+    );
+    clickhouse_query(url, &version_insert).await?;
+    let schema = clickhouse_schema_status(url).await?;
     Ok(json!({
-        "status": "ok",
-        "applied": applied
+        "status": if schema.current { "ok" } else { "error" },
+        "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+        "applied": applied,
+        "schema": schema.to_json()
     }))
+}
+
+struct ClickHouseSchemaStatus {
+    current: bool,
+    latest_version: &'static str,
+    latest_applied: bool,
+    existing_objects: Vec<String>,
+    missing_objects: Vec<String>,
+}
+
+impl ClickHouseSchemaStatus {
+    fn to_json(&self) -> Value {
+        json!({
+            "current": self.current,
+            "latest_version": self.latest_version,
+            "latest_applied": self.latest_applied,
+            "existing_objects": self.existing_objects,
+            "missing_objects": self.missing_objects
+        })
+    }
+}
+
+async fn clickhouse_schema_status(url: &str) -> Result<ClickHouseSchemaStatus> {
+    let names = CLICKHOUSE_REQUIRED_OBJECTS
+        .iter()
+        .map(|name| sql_string(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT name FROM system.tables WHERE database = currentDatabase() AND name IN ({names}) FORMAT TabSeparated"
+    );
+    let response = clickhouse_query(url, &sql).await?;
+    let mut existing_objects = response
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    existing_objects.sort();
+    let mut missing_objects = CLICKHOUSE_REQUIRED_OBJECTS
+        .iter()
+        .filter(|required| !existing_objects.iter().any(|name| name == **required))
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    missing_objects.sort();
+    let latest_applied = clickhouse_schema_version_applied(url)
+        .await
+        .unwrap_or(false);
+    Ok(ClickHouseSchemaStatus {
+        current: missing_objects.is_empty() && latest_applied,
+        latest_version: CLICKHOUSE_SCHEMA_VERSION,
+        latest_applied,
+        existing_objects,
+        missing_objects,
+    })
+}
+
+async fn clickhouse_schema_version_applied(url: &str) -> Result<bool> {
+    let exists_sql = "SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = 'agentdb_schema_migrations'";
+    if clickhouse_scalar_u64(url, exists_sql).await? == 0 {
+        return Ok(false);
+    }
+    let sql = format!(
+        "SELECT count() FROM agentdb_schema_migrations WHERE version = {}",
+        sql_string(CLICKHOUSE_SCHEMA_VERSION)
+    );
+    Ok(clickhouse_scalar_u64(url, &sql).await? > 0)
+}
+
+async fn clickhouse_scalar_u64(url: &str, sql: &str) -> Result<u64> {
+    let response = clickhouse_query(url, sql).await?;
+    response
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("ClickHouse scalar response was not u64: {response:?}"))
 }
 
 async fn ensure_claimed_export_consumer(
@@ -1368,30 +1658,46 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
         rows = rows.saturating_add(items.len() as u64);
         if !args.dry_run {
             if modes.native {
+                let raw_rows = clickhouse_raw_rows(&items)?;
                 clickhouse_insert_json_each_row(
                     &args.clickhouse_url,
                     "agentdb_export_items_raw",
-                    &clickhouse_raw_rows(&items)?,
+                    &raw_rows,
+                    &export_batch_id("agentdb_export_items_raw", &items),
+                    args.max_retries,
+                    args.retry_initial_backoff_ms,
                 )
                 .await?;
+                let event_rows = clickhouse_event_rows(&items)?;
                 clickhouse_insert_json_each_row(
                     &args.clickhouse_url,
                     "agentdb_events",
-                    &clickhouse_event_rows(&items)?,
+                    &event_rows,
+                    &export_batch_id("agentdb_events", &items),
+                    args.max_retries,
+                    args.retry_initial_backoff_ms,
                 )
                 .await?;
             }
             if modes.otel {
+                let otel_log_rows = clickhouse_otel_log_rows(&items)?;
                 clickhouse_insert_json_each_row(
                     &args.clickhouse_url,
                     "agentdb_otel_logs",
-                    &clickhouse_otel_log_rows(&items)?,
+                    &otel_log_rows,
+                    &export_batch_id("agentdb_otel_logs", &items),
+                    args.max_retries,
+                    args.retry_initial_backoff_ms,
                 )
                 .await?;
+                let otel_trace_rows = clickhouse_otel_trace_rows(&items)?;
                 clickhouse_insert_json_each_row(
                     &args.clickhouse_url,
                     "agentdb_otel_traces",
-                    &clickhouse_otel_trace_rows(&items)?,
+                    &otel_trace_rows,
+                    &export_batch_id("agentdb_otel_traces", &items),
+                    args.max_retries,
+                    args.retry_initial_backoff_ms,
                 )
                 .await?;
             }
@@ -2199,23 +2505,75 @@ fn otel_span_kind(item: &Value) -> &'static str {
     }
 }
 
-async fn clickhouse_insert_json_each_row(url: &str, table: &str, rows: &[Value]) -> Result<()> {
+async fn clickhouse_insert_json_each_row(
+    url: &str,
+    table: &str,
+    rows: &[Value],
+    batch_id: &str,
+    max_retries: u32,
+    retry_initial_backoff_ms: u64,
+) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let mut body = format!("INSERT INTO {table} FORMAT JSONEachRow\n");
+    let mut body = format!(
+        "INSERT INTO {table} SETTINGS insert_deduplicate=1, insert_deduplication_token={} FORMAT JSONEachRow\n",
+        sql_string(batch_id)
+    );
     for row in rows {
         body.push_str(&serde_json::to_string(row)?);
         body.push('\n');
     }
-    clickhouse_query(url, &body).await?;
-    Ok(())
+    clickhouse_query_with_retry(url, &body, max_retries, retry_initial_backoff_ms).await
+}
+
+async fn clickhouse_query_with_retry(
+    url: &str,
+    sql: &str,
+    max_retries: u32,
+    retry_initial_backoff_ms: u64,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+    loop {
+        match clickhouse_query(url, sql).await {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < max_retries => {
+                let delay = retry_initial_backoff_ms.saturating_mul(1_u64 << attempt.min(10));
+                eprintln!(
+                    "clickhouse insert attempt {} failed; retrying in {}ms: {error}",
+                    attempt + 1,
+                    delay
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn export_batch_id(table: &str, items: &[Value]) -> String {
+    let first = items
+        .first()
+        .and_then(|item| item.get("cursor"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let last = items
+        .last()
+        .and_then(|item| item.get("cursor"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    sha256_hex_128(&format!(
+        "agentdb.clickhouse.batch:{table}:{first}:{last}:{}",
+        items.len()
+    ))
 }
 
 async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
+    let request_url = clickhouse_request_url(url)?;
     let redacted_url = redact_clickhouse_url(url);
     let response = Client::new()
-        .post(url)
+        .post(request_url)
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(sql.to_string())
         .send()
@@ -2235,6 +2593,19 @@ async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
         return Err(anyhow!("ClickHouse returned {status}: {text}"));
     }
     Ok(text)
+}
+
+fn clickhouse_request_url(raw: &str) -> Result<Url> {
+    let mut url = Url::parse(raw).with_context(|| format!("parse ClickHouse URL `{raw}`"))?;
+    let database = url.path().trim_matches('/').to_string();
+    if !database.is_empty() {
+        url.set_path("/");
+        let has_database = url.query_pairs().any(|(key, _)| key == "database");
+        if !has_database {
+            url.query_pairs_mut().append_pair("database", &database);
+        }
+    }
+    Ok(url)
 }
 
 fn sanitize_clickhouse_error(url: &str, message: &str) -> String {
@@ -2658,6 +3029,9 @@ fn render_table(value: &Value) -> String {
         if let Some(queries) = object.get("queries").and_then(Value::as_array) {
             return render_queries(queries);
         }
+        if let Some(statements) = object.get("statements").and_then(Value::as_array) {
+            return render_statements(object, statements);
+        }
         if let Some(actions) = object.get("actions").and_then(Value::as_array) {
             if !actions.is_empty() {
                 return render_rows(actions);
@@ -2755,6 +3129,24 @@ fn render_queries(queries: &[Value]) -> String {
             writeln!(out, "-- {name}: {description}").unwrap();
         }
         writeln!(out, "{sql};").unwrap();
+    }
+    out.trim_end().to_string()
+}
+
+fn render_statements(object: &serde_json::Map<String, Value>, statements: &[Value]) -> String {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "status={} latest_version={} statements={}",
+        text(object.get("status").unwrap_or(&Value::Null)),
+        text(object.get("latest_version").unwrap_or(&Value::Null)),
+        statements.len()
+    )
+    .unwrap();
+    for statement in statements {
+        if let Some(sql) = statement.as_str() {
+            writeln!(out, "\n{};", sql.trim()).unwrap();
+        }
     }
     out.trim_end().to_string()
 }
@@ -3039,6 +3431,8 @@ mod tests {
             tail: false,
             max_batches: None,
             poll_interval_ms: 1000,
+            max_retries: 3,
+            retry_initial_backoff_ms: 250,
             dry_run: false,
         };
         assert_eq!(
@@ -3085,7 +3479,21 @@ mod tests {
         assert!(ddl.contains("CREATE VIEW IF NOT EXISTS otel_logs"));
         assert!(ddl.contains("TimestampTime"));
         assert!(ddl.contains("TraceId"));
+        assert!(ddl.contains("agentdb_schema_migrations"));
         assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
+    }
+
+    #[test]
+    fn clickhouse_required_objects_include_latest_views() {
+        assert_eq!(CLICKHOUSE_SCHEMA_VERSION, "2026_05_15_clickstack_views");
+        for required in [
+            "agentdb_events",
+            "agentdb_otel_logs",
+            "agentdb_clickstack_logs",
+            "otel_logs",
+        ] {
+            assert!(CLICKHOUSE_REQUIRED_OBJECTS.contains(&required));
+        }
     }
 
     #[test]
@@ -3116,6 +3524,35 @@ mod tests {
     }
 
     #[test]
+    fn renders_clickhouse_schema_plan_as_copyable_sql() {
+        let rendered = render_table(&json!({
+            "status": "dry_run",
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+        assert!(rendered.contains("status=dry_run"));
+        assert!(rendered.contains("latest_version=2026_05_15_clickstack_views"));
+        assert!(rendered.contains("CREATE TABLE IF NOT EXISTS agentdb_events"));
+        assert!(rendered.contains("CREATE VIEW IF NOT EXISTS agentdb_clickstack_logs"));
+    }
+
+    #[test]
+    fn export_batch_id_is_stable_for_replayed_cursor_range() {
+        let items = vec![
+            json!({"cursor": "ledger:ten_1/0001/event/evt_1"}),
+            json!({"cursor": "ledger:ten_1/0002/event/evt_2"}),
+        ];
+        assert_eq!(
+            export_batch_id("agentdb_events", &items),
+            export_batch_id("agentdb_events", &items)
+        );
+        assert_ne!(
+            export_batch_id("agentdb_events", &items),
+            export_batch_id("agentdb_otel_logs", &items)
+        );
+    }
+
+    #[test]
     fn redacts_clickhouse_url_credentials() {
         let url = "https://agentdb:secret@clickhouse.example.com:8443/agentdb";
         assert_eq!(
@@ -3125,6 +3562,22 @@ mod tests {
         assert_eq!(
             sanitize_clickhouse_error(url, &format!("request failed for {url}")),
             "request failed for https://***@clickhouse.example.com:8443/agentdb"
+        );
+    }
+
+    #[test]
+    fn clickhouse_request_url_maps_path_to_database_query() {
+        assert_eq!(
+            clickhouse_request_url("http://agentdb:secret@127.0.0.1:8123/agentdb")
+                .unwrap()
+                .as_str(),
+            "http://agentdb:secret@127.0.0.1:8123/?database=agentdb"
+        );
+        assert_eq!(
+            clickhouse_request_url("http://127.0.0.1:8123/?database=custom")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8123/?database=custom"
         );
     }
 

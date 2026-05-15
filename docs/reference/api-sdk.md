@@ -330,12 +330,14 @@ Delete envelopes use `op = "delete"` and include `tombstone.reason`.
 Current reasons are `soft_delete`, `retention_gc`, and `tenant_purge`.
 
 Use `agentdbctl export clickhouse ...` for the first-party ClickHouse path.
-`init --apply` creates native raw/event/tombstone tables plus optional
+`migrate --apply` creates native raw/event/tombstone tables plus optional
 OTel-shaped `agentdb_otel_logs` and `agentdb_otel_traces` projection tables,
 with ClickStack-compatible `agentdb_clickstack_logs` and
 `agentdb_clickstack_traces` views.
 Use `run --mode native,otel --backfill --tail` to write both native AgentDB
-tables and ClickStack-friendly OTel projections.
+tables and ClickStack-friendly OTel projections. `doctor` and `status` validate
+the ClickHouse schema stamp, required tables/views, query grants, and optional
+write-smoke behavior.
 
 Use `agentdbctl export jsonl run --output ./events.jsonl` or an object-store URI
 such as `s3://bucket/prefix/events.jsonl` for raw JSONL archives. The JSONL

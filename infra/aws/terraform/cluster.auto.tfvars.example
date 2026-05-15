@@ -41,6 +41,8 @@ clickhouse_export_tenant_id = ""
 clickhouse_export_consumer  = "prod-clickhouse"
 clickhouse_export_mode      = "native"
 clickhouse_export_lease_ms  = 30000
+clickhouse_export_max_retries = 6
+clickhouse_export_retry_initial_backoff_ms = 250
 
 # Optional JSONL/S3 observability archive. Leave jsonl_export_uri and
 # jsonl_export_tenant_id empty to skip exporter setup. For S3 outputs, use a

@@ -14,28 +14,37 @@ docker compose -f ops/observability/clickhouse-compose.yml up -d
 Initialize the AgentDB schema:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
-  agentdbctl export clickhouse init --apply
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse migrate --apply
 ```
+
+`init --apply` is kept as an alias for the same latest-schema apply path.
+`migrate --apply` records the current AgentDB schema stamp in
+`agentdb_schema_migrations`; `doctor` and `status` use that stamp plus required
+table/view checks to report schema drift.
 
 Check both sides:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse doctor --tenant-id ten_...
 ```
+
+`doctor` validates AgentDB reachability, export status, ClickHouse reachability,
+schema currency, query grants, and a bounded write/read/drop smoke. Use
+`--skip-write-smoke` only for read-only inspection.
 
 Run a one-shot export batch:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse
 ```
 
 Tail continuously:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
 ```
 
@@ -43,7 +52,7 @@ Write both native AgentDB tables and OTel-shaped ClickStack-friendly
 projections:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
     --mode native,otel --backfill --tail
 ```
@@ -77,7 +86,7 @@ duration: Duration
 Backfill metadata snapshots into the raw export table:
 
 ```bash
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
     --backfill
@@ -134,12 +143,25 @@ Run the local ClickHouse/OTel projection smoke:
 
 ```bash
 docker compose -f ops/observability/clickhouse-compose.yml up -d
-CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
   ops/observability/smoke-clickhouse-otel.sh
 ```
 
 Set `TENANT_ID=ten_... AGENTDB_EXPORT_SMOKE_RUN=1` to also copy one bounded
 `native,otel` export batch from a running AgentDB server.
+
+Run a local ClickStack/HyperDX UI smoke:
+
+```bash
+docker compose -f ops/observability/clickstack-compose.yml up -d
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+HYPERDX_URL=http://127.0.0.1:8080 \
+  ops/observability/smoke-clickstack-hyperdx.sh
+```
+
+The smoke checks that the HyperDX UI is reachable and that the AgentDB
+ClickStack source views compile in ClickHouse. Create HyperDX sources using the
+field names above.
 
 The current implementation exports event and runtime metadata envelopes from
 `/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
@@ -183,10 +205,27 @@ Recommended production shape:
   ClickHouse tables.
 - Set a unique `--lease-owner`, for example the pod name or instance id.
 - Keep `--lease-ms` comfortably above expected ClickHouse insert latency.
+- Use `--max-retries` and `--retry-initial-backoff-ms` to absorb transient
+  ClickHouse failures. Retries reuse a stable per-table batch id derived from
+  the exported cursor range.
 - Alert on increasing `lag_ms`, `pending_items`, expired leases, and stale
   `high_watermark`.
 - Never ack before ClickHouse accepts the batch. The ClickHouse tables use
   stable ids so retrying an already inserted batch is safe.
+
+For systemd deployments, install:
+
+```bash
+sudo install -D -m 0644 ops/observability/agentdb-export-clickhouse.env.example \
+  /etc/agentdb/agentdb-export-clickhouse.env
+sudo install -D -m 0644 ops/observability/agentdb-export-clickhouse.service \
+  /etc/systemd/system/agentdb-export-clickhouse.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentdb-export-clickhouse.service
+```
+
+Edit the env file first so `AGENTDB_EXPORT_TENANT_ID`,
+`AGENTDB_EXPORT_LEASE_OWNER`, and `CLICKHOUSE_URL` are deployment-specific.
 
 Stop ClickHouse:
 

@@ -184,6 +184,18 @@ variable "clickhouse_export_lease_ms" {
   default     = 30000
 }
 
+variable "clickhouse_export_max_retries" {
+  type        = number
+  description = "Maximum ClickHouse insert retries before the exporter exits and lets the process manager restart it."
+  default     = 6
+}
+
+variable "clickhouse_export_retry_initial_backoff_ms" {
+  type        = number
+  description = "Initial ClickHouse insert retry backoff in milliseconds. Retries use exponential backoff."
+  default     = 250
+}
+
 variable "jsonl_export_tenant_id" {
   type        = string
   description = "Tenant id to export to JSONL when jsonl_export_uri is set."

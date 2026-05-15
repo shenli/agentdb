@@ -1,0 +1,35 @@
+[Unit]
+Description=AgentDB ClickHouse observability exporter
+Documentation=https://github.com/shenli/agentdb/tree/main/ops/observability
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agentdb/agentdb-export-clickhouse.env
+ExecStartPre=/usr/local/bin/agentdbctl export clickhouse migrate --clickhouse-url ${CLICKHOUSE_URL} --apply
+ExecStart=/usr/local/bin/agentdbctl export clickhouse run \
+  --tenant-id ${AGENTDB_EXPORT_TENANT_ID} \
+  --clickhouse-url ${CLICKHOUSE_URL} \
+  --consumer ${AGENTDB_EXPORT_CONSUMER} \
+  --lease-owner ${AGENTDB_EXPORT_LEASE_OWNER} \
+  --lease-ms ${AGENTDB_EXPORT_LEASE_MS} \
+  --include ${AGENTDB_EXPORT_INCLUDE} \
+  --mode ${AGENTDB_EXPORT_MODE} \
+  --limit ${AGENTDB_EXPORT_LIMIT} \
+  --poll-interval-ms ${AGENTDB_EXPORT_POLL_INTERVAL_MS} \
+  --max-retries ${AGENTDB_EXPORT_MAX_RETRIES} \
+  --retry-initial-backoff-ms ${AGENTDB_EXPORT_RETRY_INITIAL_BACKOFF_MS} \
+  --backfill \
+  --tail
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

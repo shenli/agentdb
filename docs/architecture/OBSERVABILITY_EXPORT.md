@@ -836,16 +836,23 @@ Response:
   lag, oldest pending timestamp, lease counts, and oldest retained cursors.
 - Implemented: normalized event observability fields for common convention
   payload keys.
-- Implemented: `agentdbctl export clickhouse doctor/init/run/status`, including
-  `run --backfill --tail`, using ClickHouse HTTP and `JSONEachRow`.
+- Implemented: `agentdbctl export clickhouse doctor/init/migrate/run/status`,
+  including `run --backfill --tail`, using ClickHouse HTTP and
+  `JSONEachRow`.
 - Implemented: first-party ClickHouse DDL for raw envelopes, flattened events,
   checkpoints, schema migrations, and tombstones.
+- Implemented: latest-schema stamp checks for ClickHouse schema drift. Because
+  AgentDB has no production compatibility requirement yet, this is a
+  current-schema apply/check path rather than a historical upgrade ladder.
+- Implemented: retry-safe ClickHouse inserts with stable per-table
+  deduplication tokens derived from the exported cursor range.
 - Implemented: focused tests for cursor resume, route context propagation,
   durable ledger resume after restart, normalized fields, and CLI schema/path
   helpers.
-- Deferred: a separate `agentdb-export-clickhouse` daemon binary. The current
-  connector is built into `agentdbctl`; a daemon wrapper can reuse the same API
-  and consumer lease protocol.
+- Implemented: systemd service/env packaging for the long-running
+  `agentdbctl` exporter. A separate `agentdb-export-clickhouse` daemon binary
+  remains optional because the packaged service uses the same consumer lease
+  protocol.
 
 This phase is a durable export API, metadata snapshot, schema, HA, and UX
 commitment. It includes tenant-prefixed durable ledger rows for persisted
@@ -889,8 +896,10 @@ formalized.
 - Implemented: source-ref preservation as trace `links_json`.
 - Implemented: local schema/projection smoke script for ClickHouse OTel and
   ClickStack view compatibility.
-- Remaining: browser-level HyperDX smoke against the actual UI stack and saved
-  source/dashboard packaging through the ClickStack API.
+- Implemented: local ClickStack/HyperDX UI reachability smoke plus ClickHouse
+  source-view compilation checks.
+- Remaining: saved source/dashboard packaging through the ClickStack API once
+  that API surface is stable enough to automate without hand-built UI state.
 
 ### Phase 5: Additional Sinks
 

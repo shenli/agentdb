@@ -56,7 +56,7 @@ if [[ -f ~/agentdb-deploy/clickhouse-export.env ]]; then
   source ~/agentdb-deploy/clickhouse-export.env
   set +a
   AGENTDB_EXPORT_LEASE_OWNER="${AGENTDB_EXPORT_LEASE_OWNER:-$(hostname)-clickhouse-export}"
-  target/debug/agentdbctl export clickhouse init --apply
+  target/debug/agentdbctl export clickhouse migrate --apply
   target/debug/agentdbctl export clickhouse run \
     --tenant-id "$AGENTDB_EXPORT_TENANT_ID" \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
@@ -70,6 +70,8 @@ if [[ -f ~/agentdb-deploy/clickhouse-export.env ]]; then
     --lease-ms "${AGENTDB_EXPORT_LEASE_MS:-30000}" \
     --include events \
     --mode "${AGENTDB_EXPORT_MODE:-native}" \
+    --max-retries "${AGENTDB_EXPORT_MAX_RETRIES:-6}" \
+    --retry-initial-backoff-ms "${AGENTDB_EXPORT_RETRY_INITIAL_BACKOFF_MS:-250}" \
     --backfill \
     --tail \
     > ~/agentdb-deploy/logs/clickhouse-export.log 2>&1 &

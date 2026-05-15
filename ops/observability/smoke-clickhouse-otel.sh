@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AGENTDBCTL="${AGENTDBCTL:-$ROOT_DIR/target/debug/agentdbctl}"
-CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://agentdb:agentdb@127.0.0.1:8123/agentdb}"
+CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb}"
 AGENTDB_URL="${AGENTDB_URL:-http://127.0.0.1:7878}"
 TENANT_ID="${TENANT_ID:-}"
 
@@ -17,7 +17,18 @@ if [[ ! -x "$AGENTDBCTL" ]]; then
 fi
 
 echo "initializing AgentDB ClickHouse schema"
-CLICKHOUSE_URL="$CLICKHOUSE_URL" "$AGENTDBCTL" export clickhouse init --apply >/dev/null
+for _ in $(seq 1 60); do
+  if clickhouse_query "SELECT 1" >/dev/null 2>&1; then
+    clickhouse_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${clickhouse_ready:-0}" != "1" ]]; then
+  echo "ClickHouse did not become reachable at $CLICKHOUSE_URL" >&2
+  exit 1
+fi
+CLICKHOUSE_URL="$CLICKHOUSE_URL" "$AGENTDBCTL" export clickhouse migrate --apply >/dev/null
 
 echo "checking ClickStack compatibility views"
 expected=$(
