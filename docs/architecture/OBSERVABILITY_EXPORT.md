@@ -880,6 +880,17 @@ last unacked batch without data loss. RPO is zero for committed AgentDB events
 that remain in the export ledger. RTO is bounded by the configured export
 consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 
+Local exporter baseline: on a developer workstation with in-memory AgentDB,
+local Docker ClickHouse, one tenant/session, 10 batches, and 1000 envelopes per
+batch, the ClickHouse exporter copied 10,000 `native` envelopes in 3.22s
+(3,106 envelopes/s) and inserted 20,000 sink rows. The same run shape copied
+10,000 `native,otel` envelopes in 5.41s (1,847 envelopes/s) and inserted 40,000
+sink rows. The corresponding batch times were 322ms and 541ms per 1000-envelope
+batch. These figures are a reproducible local smoke baseline, not a production
+capacity promise; production throughput depends on ClickHouse sizing, network
+latency, payload size, projection mode, batch size, and tenant-level
+parallelism.
+
 ### Phase 2: Remaining Durable Ledger Coverage
 
 - Add first-class policy object ledger rows when runtime policy mutation APIs

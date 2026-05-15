@@ -146,6 +146,20 @@ How to read this:
 - AgentDB's fused `append-and-fetch` API is part of the product advantage; the
   benchmark calls that out instead of hiding it.
 
+Current local observability-export smoke measurement on the same class of
+developer workstation, using in-memory AgentDB, local Docker ClickHouse, one
+tenant/session, and 10 batches of 1000 export envelopes:
+
+| Export Mode | Exported Envelopes | Sink Rows Inserted | Duration | Throughput | Batch Time |
+|---|---:|---:|---:|---:|---:|
+| `native` | 10,000 | 20,000 | 3.22s | 3,106 envelopes/s | 322ms per 1000-envelope batch |
+| `native,otel` | 10,000 | 40,000 | 5.41s | 1,847 envelopes/s | 541ms per 1000-envelope batch |
+
+These exporter numbers are a reproducibility baseline, not a production
+capacity limit. Production throughput depends on ClickHouse sizing, network
+latency, batch size, selected projections, payload size, and how many tenant
+consumers are exported in parallel.
+
 Run a quick local sanity check:
 
 ```bash

@@ -78,6 +78,22 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
 filtered items, sink insert rows, retry attempts, rows per second, and the last
 cursor. Use `status --consumer` for AgentDB-side lag and lease state.
 
+## Local Exporter Baseline
+
+A local benchmark run on a developer workstation with in-memory AgentDB, local
+Docker ClickHouse, one tenant/session, and 10 batches of 1000 export envelopes
+produced:
+
+| Export Mode | Exported Envelopes | Sink Rows Inserted | Duration | Throughput | Batch Time |
+|---|---:|---:|---:|---:|---:|
+| `native` | 10,000 | 20,000 | 3.22s | 3,106 envelopes/s | 322ms per 1000-envelope batch |
+| `native,otel` | 10,000 | 40,000 | 5.41s | 1,847 envelopes/s | 541ms per 1000-envelope batch |
+
+The run used `agentdbctl export clickhouse run --backfill --limit 1000
+--max-batches 10 --metrics-output ...`. Treat this as a local reproducibility
+baseline. Real throughput is usually bounded by ClickHouse insert latency,
+network round trips, projection mode, payload size, and batch sizing.
+
 The schema also installs ClickStack/HyperDX-friendly views over those
 projections:
 
