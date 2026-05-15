@@ -309,6 +309,14 @@ Continuous `--tail` is supported for local files and stdout. Object-store
 outputs are uploaded as a completed object, so use `--max-batches` with
 `--tail` for bounded archival batches.
 
+Use `ops/observability/duckdb-jsonl-demo.sql` to inspect local or S3 JSONL
+archives with DuckDB:
+
+```bash
+duckdb -cmd ".param set jsonl_path './agentdb-events.jsonl'" \
+  -init ops/observability/duckdb-jsonl-demo.sql
+```
+
 Inspect AgentDB export capability for a tenant:
 
 ```bash

@@ -892,7 +892,9 @@ formalized.
 - Implemented: JSONL sink in `agentdbctl export jsonl run`, including local
   files, stdout, and object-store URIs such as `s3://...`.
 - Add Parquet writer.
-- Add DuckDB demo queries and dashboards.
+- Implemented: DuckDB demo queries for JSONL archives in
+  `ops/observability/duckdb-jsonl-demo.sql`.
+- Add dashboard packaging beyond the SQL demo queries.
 - Add Kafka bridge if customers need queue-based fan-out or stream processing.
 - Add warehouse/lakehouse connectors only after the envelope and Parquet layout
   are stable.

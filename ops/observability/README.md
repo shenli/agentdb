@@ -69,6 +69,18 @@ agentdbctl export jsonl run --tenant-id ten_... \
   --backfill --max-batches 100
 ```
 
+Inspect JSONL archives with DuckDB:
+
+```bash
+duckdb -cmd ".param set jsonl_path './agentdb-events.jsonl'" \
+  -init ops/observability/duckdb-jsonl-demo.sql
+
+duckdb -cmd "INSTALL httpfs; LOAD httpfs;" \
+  -cmd "SET s3_region='us-east-1';" \
+  -cmd ".param set jsonl_path 's3://agentdb-exports/tenants/ten_.../events.jsonl'" \
+  -init ops/observability/duckdb-jsonl-demo.sql
+```
+
 The current implementation exports event and runtime metadata envelopes from
 `/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
