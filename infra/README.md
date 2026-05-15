@@ -29,9 +29,20 @@ The AWS Terraform template can also write optional ClickHouse export settings.
 Set `clickhouse_url` and `clickhouse_export_tenant_id` after creating a tenant;
 `infra/aws/scripts/deploy-demo.sh` will build `agentdbctl`, initialize the
 ClickHouse schema, and start `agentdbctl export clickhouse run --backfill
---tail` with a managed consumer lease. Run the same deploy flow on multiple
-nodes with the same `clickhouse_export_consumer` to get active/passive exporter
-HA; each node derives a distinct lease owner from its hostname.
+--tail` with a managed consumer lease. Set `clickhouse_export_mode` to
+`native,otel` to write the native ClickHouse tables plus
+`agentdb_otel_logs`/`agentdb_otel_traces` projections. Run the same deploy flow
+on multiple nodes with the same `clickhouse_export_consumer` to get
+active/passive exporter HA; each node derives a distinct lease owner from its
+hostname.
+
+The same template can also start a bounded JSONL archive worker. Set
+`jsonl_export_tenant_id` and `jsonl_export_uri`, for example
+`s3://<bucket>/agentdb-exports/tenants/<tenant>/events.jsonl`; deploy will run
+`agentdbctl export jsonl run --backfill --tail --max-batches ...` with a
+managed consumer. Use `agentdbctl export parquet from-jsonl` or
+`ops/observability/duckdb-jsonl-demo.sql` after the archive lands to inspect or
+convert it.
 
 Runtime operations that do not provision cloud infrastructure belong under
 `ops/`.

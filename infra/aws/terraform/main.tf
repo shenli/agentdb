@@ -137,7 +137,14 @@ resource "aws_instance" "agentdb" {
     clickhouse_url                            = var.clickhouse_url
     clickhouse_export_tenant_id               = var.clickhouse_export_tenant_id
     clickhouse_export_consumer                = var.clickhouse_export_consumer
+    clickhouse_export_mode                    = var.clickhouse_export_mode
     clickhouse_export_lease_ms                = var.clickhouse_export_lease_ms
+    jsonl_export_tenant_id                    = var.jsonl_export_tenant_id
+    jsonl_export_uri                          = var.jsonl_export_uri
+    jsonl_export_consumer                     = var.jsonl_export_consumer
+    jsonl_export_include                      = var.jsonl_export_include
+    jsonl_export_lease_ms                     = var.jsonl_export_lease_ms
+    jsonl_export_max_batches                  = var.jsonl_export_max_batches
   })
 
   tags = {
