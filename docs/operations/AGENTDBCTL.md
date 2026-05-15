@@ -317,6 +317,20 @@ duckdb -cmd ".param set jsonl_path './agentdb-events.jsonl'" \
   -init ops/observability/duckdb-jsonl-demo.sql
 ```
 
+Convert a JSONL archive to Parquet using DuckDB:
+
+```bash
+agentdbctl export parquet from-jsonl \
+  --input ./agentdb-events.jsonl \
+  --output ./agentdb-events.parquet
+
+AWS_REGION=us-east-1 \
+agentdbctl export parquet from-jsonl \
+  --input s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --output s3://agentdb-exports/tenants/ten_.../events.parquet \
+  --s3-region us-east-1
+```
+
 Inspect AgentDB export capability for a tenant:
 
 ```bash

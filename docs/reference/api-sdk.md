@@ -339,6 +339,8 @@ Use `agentdbctl export jsonl run --output ./events.jsonl` or an object-store URI
 such as `s3://bucket/prefix/events.jsonl` for raw JSONL archives. The JSONL
 command writes the same export envelopes returned by `exports/watch` and
 supports managed consumer claim/ack options.
+Use `agentdbctl export parquet from-jsonl` to convert those archives to Parquet
+through DuckDB for warehouse and lakehouse ingestion.
 `exports/backfill` supports event snapshots plus tenant-scope metadata
 snapshots:
 

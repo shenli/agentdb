@@ -891,7 +891,9 @@ formalized.
 
 - Implemented: JSONL sink in `agentdbctl export jsonl run`, including local
   files, stdout, and object-store URIs such as `s3://...`.
-- Add Parquet writer.
+- Implemented: Parquet conversion command in
+  `agentdbctl export parquet from-jsonl`, backed by DuckDB for local and S3
+  JSONL archives.
 - Implemented: DuckDB demo queries for JSONL archives in
   `ops/observability/duckdb-jsonl-demo.sql`.
 - Add dashboard packaging beyond the SQL demo queries.

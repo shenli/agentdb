@@ -9,6 +9,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Write as IoWrite},
     path::PathBuf,
+    process::Command as ProcessCommand,
 };
 
 use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
@@ -594,6 +595,11 @@ enum ExportCommand {
         #[command(subcommand)]
         command: JsonlCommand,
     },
+    /// Convert JSONL export archives into Parquet files.
+    Parquet {
+        #[command(subcommand)]
+        command: ParquetCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -709,6 +715,32 @@ struct JsonlRunArgs {
     max_batches: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ParquetCommand {
+    /// Convert a JSONL export archive to Parquet using DuckDB.
+    FromJsonl(ParquetFromJsonlArgs),
+}
+
+#[derive(Args, Debug)]
+struct ParquetFromJsonlArgs {
+    /// Local path or object-store URI for the JSONL input.
+    #[arg(long)]
+    input: String,
+    /// Local path or object-store URI for the Parquet output.
+    #[arg(long)]
+    output: String,
+    /// DuckDB executable to invoke.
+    #[arg(long, default_value = "duckdb")]
+    duckdb_bin: String,
+    /// Optional S3 region for DuckDB httpfs.
+    #[arg(long)]
+    s3_region: Option<String>,
+    #[arg(long, default_value = "zstd")]
+    compression: String,
     #[arg(long)]
     dry_run: bool,
 }
@@ -943,6 +975,7 @@ async fn export(api: &Api, command: ExportCommand) -> Result<Value> {
     match command {
         ExportCommand::Clickhouse { command } => clickhouse(api, command).await,
         ExportCommand::Jsonl { command } => jsonl(api, command).await,
+        ExportCommand::Parquet { command } => parquet(command).await,
     }
 }
 
@@ -1449,6 +1482,85 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         "last_cursor": cursor,
         "dry_run": args.dry_run
     }))
+}
+
+async fn parquet(command: ParquetCommand) -> Result<Value> {
+    match command {
+        ParquetCommand::FromJsonl(args) => parquet_from_jsonl(args).await,
+    }
+}
+
+async fn parquet_from_jsonl(args: ParquetFromJsonlArgs) -> Result<Value> {
+    let sql = parquet_from_jsonl_sql(
+        &args.input,
+        &args.output,
+        args.s3_region.as_deref(),
+        &args.compression,
+    )?;
+    if args.dry_run {
+        return Ok(json!({
+            "status": "dry_run",
+            "input": args.input,
+            "output": args.output,
+            "sql": sql
+        }));
+    }
+    let status = ProcessCommand::new(&args.duckdb_bin)
+        .arg("-c")
+        .arg(&sql)
+        .status()
+        .with_context(|| format!("run DuckDB binary `{}`", args.duckdb_bin))?;
+    if !status.success() {
+        return Err(anyhow!("DuckDB parquet conversion failed with {status}"));
+    }
+    Ok(json!({
+        "status": "ok",
+        "input": args.input,
+        "output": args.output,
+        "compression": args.compression
+    }))
+}
+
+fn parquet_from_jsonl_sql(
+    input: &str,
+    output: &str,
+    s3_region: Option<&str>,
+    compression: &str,
+) -> Result<String> {
+    let compression = compression.trim().to_ascii_uppercase();
+    if !matches!(
+        compression.as_str(),
+        "UNCOMPRESSED" | "SNAPPY" | "GZIP" | "ZSTD"
+    ) {
+        return Err(anyhow!(
+            "unsupported parquet compression `{compression}`; use uncompressed, snappy, gzip, or zstd"
+        ));
+    }
+    let mut sql = String::new();
+    if uses_object_store_uri(input) || uses_object_store_uri(output) || s3_region.is_some() {
+        sql.push_str("INSTALL httpfs; LOAD httpfs;\n");
+    }
+    if let Some(region) = s3_region {
+        writeln!(sql, "SET s3_region={};", sql_string(region))?;
+    }
+    writeln!(
+        sql,
+        "COPY (SELECT * FROM read_json_auto({}, format='newline_delimited')) TO {} (FORMAT PARQUET, COMPRESSION {});",
+        sql_string(input),
+        sql_string(output),
+        compression
+    )?;
+    Ok(sql)
+}
+
+fn uses_object_store_uri(value: &str) -> bool {
+    Url::parse(value)
+        .map(|url| url.scheme() != "file")
+        .unwrap_or(false)
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2962,5 +3074,26 @@ mod tests {
         assert!(lines[0].contains("\"cursor\":\"ledger:1\""));
         assert!(lines[1].contains("\"object_type\":\"session\""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn builds_parquet_from_jsonl_sql() {
+        let sql = parquet_from_jsonl_sql(
+            "s3://agentdb-exports/tenant/events.jsonl",
+            "s3://agentdb-exports/tenant/events.parquet",
+            Some("us-east-1"),
+            "zstd",
+        )
+        .unwrap();
+        assert!(sql.contains("INSTALL httpfs; LOAD httpfs;"));
+        assert!(sql.contains("SET s3_region='us-east-1';"));
+        assert!(sql.contains("read_json_auto('s3://agentdb-exports/tenant/events.jsonl'"));
+        assert!(sql.contains("COMPRESSION ZSTD"));
+
+        let escaped =
+            parquet_from_jsonl_sql("agent's.jsonl", "agent's.parquet", None, "snappy").unwrap();
+        assert!(escaped.contains("'agent''s.jsonl'"));
+        assert!(escaped.contains("'agent''s.parquet'"));
+        assert!(parquet_from_jsonl_sql("in.jsonl", "out.parquet", None, "brotli").is_err());
     }
 }

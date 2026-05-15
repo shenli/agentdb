@@ -81,6 +81,19 @@ duckdb -cmd "INSTALL httpfs; LOAD httpfs;" \
   -init ops/observability/duckdb-jsonl-demo.sql
 ```
 
+Convert JSONL archives to Parquet with DuckDB:
+
+```bash
+agentdbctl export parquet from-jsonl \
+  --input ./agentdb-events.jsonl \
+  --output ./agentdb-events.parquet
+
+agentdbctl export parquet from-jsonl \
+  --input s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --output s3://agentdb-exports/tenants/ten_.../events.parquet \
+  --s3-region us-east-1
+```
+
 The current implementation exports event and runtime metadata envelopes from
 `/api/tenants/{tenant_id}/exports/watch`. Persistent AgentDB runtimes return
 durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
