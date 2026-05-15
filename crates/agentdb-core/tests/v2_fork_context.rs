@@ -10,7 +10,7 @@ use agentdb_storage::{
     SingleNodeReplicatedLog,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -589,6 +589,96 @@ async fn export_watch_uses_durable_ledger_cursors_with_persistent_kv() {
         .unwrap_err();
     assert_eq!(expired_cursor.code, agentdb_core::ErrorCode::InvalidCursor);
     assert!(expired_cursor.message.contains("oldest_available_cursor="));
+}
+
+#[tokio::test]
+async fn export_watch_paged_resume_survives_rehydrate_without_gaps_or_duplicates() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv.clone(), content.clone());
+
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-ledger-stability".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    for n in 0..64_u64 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "paged",
+            serde_json::json!({ "n": n }),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let mut active = Runtime::with_kv(kv.clone(), content.clone());
+    let mut cursor = None;
+    let mut cursors = BTreeSet::new();
+    let mut values = Vec::new();
+    let mut pages = 0_u64;
+    loop {
+        let page = active
+            .export_watch(ExportWatchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                scope: WatchScope::Tenant,
+                session_id: None,
+                agent_id: None,
+                include: vec!["events".into()],
+                from_cursor: cursor.clone(),
+                limit: 7,
+            })
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        pages += 1;
+        for item in &page {
+            assert!(
+                cursors.insert(item.cursor.clone()),
+                "duplicate export cursor {}",
+                item.cursor
+            );
+            values.push(item.item.data["payload"]["n"].as_u64().unwrap());
+        }
+        cursor = page.last().map(|item| item.cursor.clone());
+        if pages % 3 == 0 {
+            active = Runtime::with_kv(kv.clone(), content.clone());
+        }
+    }
+
+    assert!(pages > 8, "expected multiple small export pages");
+    assert_eq!(values, (0..64_u64).collect::<Vec<_>>());
+    assert_eq!(cursors.len(), 64);
+    assert_eq!(
+        active
+            .export_high_watermark(&tenant.tenant_id)
+            .await
+            .unwrap(),
+        cursor
+    );
 }
 
 #[tokio::test]

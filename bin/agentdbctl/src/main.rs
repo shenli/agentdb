@@ -3059,10 +3059,11 @@ mod tests {
             .await
             .unwrap();
         output
-            .write_items(&[
-                json!({"cursor": "ledger:1", "object_type": "event"}),
-                json!({"cursor": "ledger:2", "object_type": "session"}),
-            ])
+            .write_items(&[json!({"cursor": "ledger:1", "object_type": "event"})])
+            .await
+            .unwrap();
+        output
+            .write_items(&[json!({"cursor": "ledger:2", "object_type": "session"})])
             .await
             .unwrap();
         let summary = output.finish().await.unwrap();
@@ -3074,6 +3075,39 @@ mod tests {
         assert!(lines[0].contains("\"cursor\":\"ledger:1\""));
         assert!(lines[1].contains("\"object_type\":\"session\""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_dry_run_does_not_create_target() {
+        let path = std::env::temp_dir().join(format!(
+            "agentdbctl-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            "dry-run"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut output = JsonlOutput::new(path.to_str().unwrap(), true, true)
+            .await
+            .unwrap();
+        output
+            .write_items(&[json!({"cursor": "ledger:dry", "object_type": "event"})])
+            .await
+            .unwrap();
+        let summary = output.finish().await.unwrap();
+        assert_eq!(summary["type"], "dry_run");
+        assert_eq!(summary["rows"], 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_rejects_unbounded_object_store_tail() {
+        let err =
+            match JsonlOutput::new("s3://agentdb-exports/path/events.jsonl", true, false).await {
+                Ok(_) => panic!("expected unbounded object-store tail to be rejected"),
+                Err(err) => err,
+            };
+        assert!(err
+            .to_string()
+            .contains("requires --max-batches when --tail is set"));
     }
 
     #[test]
