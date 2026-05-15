@@ -6,189 +6,44 @@
 <div align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   <a href="docs/README.md"><img src="https://img.shields.io/badge/docs-local-0f766e" alt="Docs"></a>
-  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deploy-self--hosted%20today%20%2B%20cluster%20target-7c3aed" alt="Deployment"></a>
+  <a href="docs/operations/DEPLOYMENT.md"><img src="https://img.shields.io/badge/deployment-guide-7c3aed" alt="Deployment"></a>
 </div>
 
 <br>
 
-AgentDB is a runtime database for AI agent platforms, built for the workload
-shape of autonomous agents: many ordered session events, large tool/model
-outputs, long-running tasks, sparse tenant traffic, and retained history. It
-stores durable execution state outside the model context window so agents can
-resume, replay, fork, inspect, and stream work without forcing every application
-to rebuild session semantics on top of a generic database.
+AgentDB is a purpose-built distributed database for AI agent runtime state. It
+stores the durable execution state that sits outside the model context window:
+ordered session events, tool calls, tool results, artifacts, memory records,
+lifecycle state, and replay metadata.
 
-**What AgentDB gives you:**
+Agents create a different data shape than request/response applications. A
+single run can stay open for minutes or hours, emit many partial events, attach
+large model outputs and tool payloads, fork into alternate timelines, and keep
+accumulating history long after the active context window has moved on. The
+write path is usually append-heavy, while the hot read path repeatedly asks for
+the newest session tail, selected memory records, artifacts, and enough context
+to take the next step.
 
-- **Session-native runtime semantics** — tenant-scoped agents, sessions,
-  ordered events, artifacts, records, skills, policy, replay, fork, subscribe,
-  context, and lifecycle state
-- **Multi-tenant runtime architecture** — tenant boundaries are built into
-  routing, policy, quota, lifecycle, watch streams, storage layout, and future
-  placement decisions instead of being bolted on in application code
-- **DynamoDB-style record index behavior** — owner-local record searches with
-  read-after-write semantics when a `sharding_key` is known, plus async
-  eventually consistent global discovery when it is not
-- **Object-store based storage engine** — scale retained history and keep costs
-  predictable by separating hot session metadata from cold events, large
-  artifacts, and derived state
-- **Agent-runtime performance and cost efficiency** — optimized append,
-  append-and-fetch, hot-tail reads, and bounded local storage paths reduce the
-  infrastructure needed for common agent session workloads
-- **Compatibility where it helps** — native HTTP/SDK APIs remain canonical,
-  while the optional MongoDB listener lets existing drivers and tools inspect
-  and write AgentDB runtime collections
-- **Operate and debug agent runs** — dashboard, watch streams, structured
-  errors, observability export, runbooks, health checks, and deployment docs
-  make runtime state inspectable
-- **SDK and adapter surfaces** — Python and TypeScript clients plus LangGraph,
-  OpenAI Agents SDK, MCP, and Vercel AI SDK integration paths
+Generic databases and log stores can hold pieces of that data, but application
+teams still have to rebuild agent-specific semantics around ordering,
+idempotency, replay, fork, hot-tail reads, retained artifacts, lifecycle, and
+tenant boundaries. AgentDB makes those runtime primitives first-class so agent
+harnesses can keep moving while the durable record remains inspectable,
+recoverable, and cost-aware as data accumulates.
 
-In a typical AI agent architecture, AgentDB is the durable runtime state service
-between the agent harness and its tools. The harness writes every model output,
-tool call, tool result, artifact, policy decision, and lifecycle transition to
-AgentDB, then reads it back to resume, replay, fork, inspect, or stream a run.
+Use AgentDB when you are building agents that need to:
 
-```text
-                         AI agent platform
+- resume long-running work after process, model, sandbox, or worker failures;
+- replay or fork a session to debug a decision or explore another path;
+- keep model outputs, tool calls, files, memory, and context decisions in one
+  queryable runtime record;
+- stream live agent state to dashboards, supervisors, or evaluators;
+- scale retained history without keeping every event and artifact in a hot
+  application database.
 
-  tenant A / workspace A                         tenant B / workspace B
-  support agents, sessions                       research agents, sessions
-             |                                              |
-             | native SDK / HTTP: append, fetch, search     |
-             | replay, fork, context, subscribe, watch      |
-             v                                              v
-      +------------------------------------------------------------------+
-      |                              AgentDB                             |
-      | multi-tenant runtime, policy, routing, and storage boundary      |
-      |                                                                  |
-      |  tenants -> agents -> sessions -> ordered events                 |
-      |      |          |          |                                      |
-      |      |          |          +--> artifacts -> content backend      |
-      |      |          |          +--> records   -> local/global indexes |
-      |      |          |          +--> skills, lifecycle, policy         |
-      |      |                                                         |
-      |      +--> watch cursors for live dashboards and supervisors      |
-      |      +--> managed export consumers with durable ack cursors      |
-      |                                                                  |
-      |  single node: RocksDB runtime store                              |
-      |  cluster path: cells -> shards -> tablets -> Raft/local LSM      |
-      +------------------------------------------------------------------+
-          |                     |                         |
-          | read/replay/watch   | export backfill/tail    | tool outputs
-          v                     v                         v
-   dashboard, replay     ClickHouse / ClickStack     tools, sandboxes,
-   viewers, evaluators   JSONL / Parquet archives    MCP, app systems
-```
-
-## Project Status
-
-AgentDB is alpha software. The single-node server, native HTTP API, Python SDK,
-TypeScript SDK, dashboard, local RocksDB storage, benchmark harness, and limited
-MongoDB wire adapter are the supported developer surfaces today. Multi-node
-Raft, tablet movement, and cluster operations are implemented for evaluation
-and active development, but the default production path is still single-node
-self-hosting.
-
-Supported developer surfaces:
-
-- Rust runtime and HTTP API crates in `crates/`
-- Server binary in `bin/agentdb-server`
-- Operational CLI in `bin/agentdbctl`, including cluster operations and
-  observability export
-- Python SDK in `clients/python`
-- TypeScript SDK in `clients/typescript`
-- Framework adapters and templates in `adapters/`
-- Session dashboard mounted at `/dashboard`
-
-## Performance Snapshot
-
-AgentDB's performance goal is narrow and practical: make the common agent
-runtime loop cheap to run on a single node, then scale out with the same session
-semantics. The benchmark in this repo does not try to prove that AgentDB is a
-better general-purpose database. It compares AgentDB with reasonable MongoDB
-and Postgres event-log schemas for agent-shaped state.
-
-The core workload is:
-
-- Append the next session event.
-- Read the recent tail needed for the next model/tool step.
-- Occasionally write/search memory records, fork a session, or attach artifact
-  metadata.
-
-Current long-run result on this benchmark configuration:
-
-- Host: Ubuntu 22.04, Linux 6.8, x86_64.
-- CPU/RAM: Intel Core i7-14700KF, 20 cores / 28 hardware threads, 31 GiB RAM.
-- Storage/runtime: local NVMe filesystem, AgentDB with RocksDB, MongoDB and
-  Postgres in Docker.
-- Workload profile: `single-node-wal`, 1000 sessions, Zipf-1.2 session skew,
-  concurrency 32, 30s warmup, 10m measured windows, 3 repeats.
-
-| Workload | What It Measures | AgentDB | MongoDB | Postgres |
-|---|---|---:|---:|---:|
-| `mixed-agent-loop` | Full agent loop: append+fetch, recent reads, records, forks, artifacts | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms |
-| `append-only` | Ordered event appends without tail reads | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms |
-| `append-fetch-hot` | Fused append plus hot-tail read, the common agent step path | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms |
-
-Throughput speedup versus each baseline:
-
-![AgentDB benchmark speedup chart](docs/assets/agentdb-benchmark-speedup.png)
-
-How to read this:
-
-- This is a single-node, localhost benchmark with RocksDB-backed AgentDB,
-  MongoDB standalone, and Postgres, all using normalized event-log layouts.
-- The profile is `single-node-wal`: fast local developer durability, not a
-  managed replicated production comparison.
-- The run uses 1000 sessions, Zipf-1.2 session skew, concurrency 32, 30s warmup,
-  10m measured windows, and 3 repeats.
-- AgentDB's fused `append-and-fetch` API is part of the product advantage; the
-  benchmark calls that out instead of hiding it.
-
-Current local observability-export smoke measurement on the same class of
-developer workstation, using in-memory AgentDB, local Docker ClickHouse, one
-tenant/session, and 10 batches of 1000 export envelopes:
-
-| Export Mode | Exported Envelopes | Sink Rows Inserted | Duration | Throughput | Batch Time |
-|---|---:|---:|---:|---:|---:|
-| `native` | 10,000 | 20,000 | 3.22s | 3,106 envelopes/s | 322ms per 1000-envelope batch |
-| `native,otel` | 10,000 | 40,000 | 5.41s | 1,847 envelopes/s | 541ms per 1000-envelope batch |
-
-These exporter numbers are a reproducibility baseline, not a production
-capacity limit. Production throughput depends on ClickHouse sizing, network
-latency, batch size, selected projections, payload size, and how many tenant
-consumers are exported in parallel. The expected model is that `native` writes
-roughly two sink rows per event envelope, `native,otel` writes roughly four, and
-cluster throughput scales through parallel tenant consumers until ClickHouse,
-network, or exporter CPU becomes the bottleneck. See
-[ops/observability/README.md](ops/observability/README.md) for the SLO model
-and future real-world benchmark plan.
-
-Run a quick local sanity check:
-
-```bash
-OUT=/tmp/agentdb-bench \
-  PROFILE=smoke \
-  WORKLOADS=mixed-agent-loop \
-  DURATION=10s \
-  WARMUP=2s \
-  REPEATS=1 \
-  tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh
-```
-
-Run the full long-run comparison on a machine with enough disk:
-
-```bash
-OUT=/path/with/free-space \
-  MATRIX_ID=local-longrun-value \
-  tools/agentdb-bench/scripts/agentdb-bench-longrun-value-matrix.sh
-```
-
-For the benchmark tool, schema details, hardware/software notes, and caveats,
-see [tools/agentdb-bench](tools/agentdb-bench/README.md). For the longer design
-and tuning history, see
-[docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md).
+The native HTTP API, Python SDK, and TypeScript SDK are the canonical runtime
+surface. A narrow MongoDB-compatible listener is available for existing drivers
+and inspection tools.
 
 ## Quick Start
 
@@ -220,7 +75,8 @@ http://127.0.0.1:7878/dashboard/
 `127.0.0.1:7879`, creates a `dev` workspace with a demo agent/session, and
 prints copy-paste commands for SDK examples, diagnostics, and local CI status.
 
-In another terminal, install the local Python SDK and run the session quickstart:
+In another terminal, install the local Python SDK and run the session
+quickstart:
 
 ```bash
 pip install -e clients/python
@@ -321,6 +177,118 @@ See [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) for
 deployment guidance and [docs/operations/OPERATIONS.md](docs/operations/OPERATIONS.md)
 for concrete start/stop, backup, and upgrade commands.
 
+## Architecture
+
+AgentDB sits between agent harnesses, tools, dashboards, and downstream
+analytics systems. It exposes session-native APIs for append, fetch, replay,
+fork, context, subscribe, and watch, while the runtime owns tenant boundaries,
+policy, routing, storage layout, lifecycle, and durable export cursors.
+
+```text
+                         AI agent platform
+
+  tenant A / workspace A                         tenant B / workspace B
+  support agents, sessions                       research agents, sessions
+             |                                              |
+             | native SDK / HTTP: append, fetch, search     |
+             | replay, fork, context, subscribe, watch      |
+             v                                              v
+      +------------------------------------------------------------------+
+      |                              AgentDB                             |
+      | multi-tenant runtime, policy, routing, and storage boundary      |
+      |                                                                  |
+      |  tenants -> agents -> sessions -> ordered events                 |
+      |      |          |          |                                      |
+      |      |          |          +--> artifacts -> content backend      |
+      |      |          |          +--> records   -> local/global indexes |
+      |      |          |          +--> skills, lifecycle, policy         |
+      |      |                                                         |
+      |      +--> watch cursors for live dashboards and supervisors      |
+      |      +--> managed export consumers with durable ack cursors      |
+      |                                                                  |
+      |  single node: RocksDB runtime store                              |
+      |  distributed: cells -> shards -> tablets -> Raft/local LSM       |
+      +------------------------------------------------------------------+
+          |                     |                         |
+          | read/replay/watch   | export backfill/tail    | tool outputs
+          v                     v                         v
+   dashboard, replay     ClickHouse / ClickStack     tools, sandboxes,
+   viewers, evaluators   JSONL / Parquet archives    MCP, app systems
+```
+
+For the full crate layout, request flow, storage model, and distributed
+components, see [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md).
+
+## Performance
+
+AgentDB's performance goal is narrow and practical: make the common agent
+runtime loop cheap to run on a single node, then scale out with the same session
+semantics. The benchmark in this repo does not try to prove that AgentDB is a
+better general-purpose database. It compares AgentDB with reasonable MongoDB
+and Postgres event-log schemas for agent-shaped state.
+
+The core workload is:
+
+- Append the next session event.
+- Read the recent tail needed for the next model/tool step.
+- Occasionally write/search memory records, fork a session, or attach artifact
+  metadata.
+
+Current long-run result on this benchmark configuration:
+
+- Host: Ubuntu 22.04, Linux 6.8, x86_64.
+- CPU/RAM: Intel Core i7-14700KF, 20 cores / 28 hardware threads, 31 GiB RAM.
+- Storage/runtime: local NVMe filesystem, AgentDB with RocksDB, MongoDB and
+  Postgres in Docker.
+- Workload profile: `single-node-wal`, 1000 sessions, Zipf-1.2 session skew,
+  concurrency 32, 30s warmup, 10m measured windows, 3 repeats.
+
+| Workload | What It Measures | AgentDB | MongoDB | Postgres |
+|---|---|---:|---:|---:|
+| `mixed-agent-loop` | Full agent loop: append+fetch, recent reads, records, forks, artifacts | 38,358 ops/s, p99 2.26ms | 24,166 ops/s, p99 2.19ms | 5,378 ops/s, p99 129.75ms |
+| `append-only` | Ordered event appends without tail reads | 73,345 ops/s, p99 1.27ms | 18,191 ops/s, p99 4.07ms | 13,154 ops/s, p99 28.12ms |
+| `append-fetch-hot` | Fused append plus hot-tail read, the common agent step path | 34,154 ops/s, p99 2.60ms | 16,742 ops/s, p99 2.86ms | 21,039 ops/s, p99 13.08ms |
+
+Throughput speedup versus each baseline:
+
+![AgentDB benchmark speedup chart](docs/assets/agentdb-benchmark-speedup.png)
+
+How to read this:
+
+- This is a single-node, localhost benchmark with RocksDB-backed AgentDB,
+  MongoDB standalone, and Postgres, all using normalized event-log layouts.
+- The profile is `single-node-wal`: fast local developer durability, not a
+  managed replicated production comparison.
+- The run uses 1000 sessions, Zipf-1.2 session skew, concurrency 32, 30s warmup,
+  10m measured windows, and 3 repeats.
+- AgentDB's fused `append-and-fetch` API is part of the product advantage; the
+  benchmark calls that out instead of hiding it.
+
+Run a quick local sanity check:
+
+```bash
+OUT=/tmp/agentdb-bench \
+  PROFILE=smoke \
+  WORKLOADS=mixed-agent-loop \
+  DURATION=10s \
+  WARMUP=2s \
+  REPEATS=1 \
+  tools/agentdb-bench/scripts/agentdb-bench-value-matrix.sh
+```
+
+Run the full long-run comparison on a machine with enough disk:
+
+```bash
+OUT=/path/with/free-space \
+  MATRIX_ID=local-longrun-value \
+  tools/agentdb-bench/scripts/agentdb-bench-longrun-value-matrix.sh
+```
+
+For the benchmark tool, schema details, hardware/software notes, and caveats,
+see [tools/agentdb-bench](tools/agentdb-bench/README.md). For the longer design
+and tuning history, see
+[docs/operations/AGENTDB_BENCH.md](docs/operations/AGENTDB_BENCH.md).
+
 ## Documentation
 
 Start with [docs/README.md](docs/README.md) for the full documentation map.
@@ -330,8 +298,8 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
   supported deployment paths and current cluster status;
   [docs/operations/OPERATIONS.md](docs/operations/OPERATIONS.md) has exact
   start/stop, backup, upgrade, and troubleshooting guidance for the supported
-  single-node shape; [docs/operations/CLUSTER_STATUS.md](docs/operations/CLUSTER_STATUS.md)
-  explains what multi-node workflows are not yet supported.
+  deployment shapes; [docs/operations/CLUSTER_STATUS.md](docs/operations/CLUSTER_STATUS.md)
+  tracks distributed deployment status and operations.
 
 - **Understand the server**:
   [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)
