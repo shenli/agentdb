@@ -445,8 +445,7 @@ examples/                      Usage examples
 infra/                         Cloud provisioning and deployment assets
 ops/                           Operational scripts, local CI, smoke tests, and systemd units
 scripts/                       Small repo-level entrypoints, install, and license checks
-tools/                         Developer/operator tools such as agentdb-bench
-workload/                      Load-generation and benchmark helpers
+tools/                         Developer/operator tools, benchmarks, and workload helpers
 ```
 
 ## Validation

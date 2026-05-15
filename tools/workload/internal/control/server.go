@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/shenli/agentdb/workload/internal/client"
+	"github.com/shenli/agentdb/tools/workload/internal/client"
 )
 
 type Server struct {

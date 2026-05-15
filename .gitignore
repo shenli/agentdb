@@ -7,7 +7,7 @@ __pycache__/
 target/
 data/
 .worktrees/
-workload/agentdb-workload
-workload/perf-probe
+tools/workload/agentdb-workload
+tools/workload/perf-probe
 perf-out/
 bench-out/
