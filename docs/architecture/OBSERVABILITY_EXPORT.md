@@ -824,6 +824,8 @@ Response:
   observable.
 - Implemented: tablet movement snapshot classification for export ledger,
   scoped ledger indexes, high-watermark rows, and managed consumer rows.
+- Implemented: restore/conformance coverage proving tablet snapshot restore
+  preserves export ledger high watermarks and managed consumer checkpoints.
 - Implemented: `GET /api/admin/exports` visibility for managed consumers and
   current export capability, including pending item count, high watermark,
   oldest pending item timestamp, lag, and lease-active state.
@@ -863,9 +865,6 @@ consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 - Add first-class policy object ledger rows when runtime policy mutation APIs
   are promoted.
 - Add policy-redaction tombstone reasons once redaction APIs exist.
-- Add explicit restore/conformance tests that prove export ledger high
-  watermarks and managed consumers survive backup/restore, in addition to the
-  tablet movement snapshot coverage.
 
 ### Phase 3: Retention And Metrics
 
