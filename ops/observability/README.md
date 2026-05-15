@@ -39,6 +39,15 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
 ```
 
+Write both native AgentDB tables and OTel-shaped ClickStack-friendly
+projections:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --mode native,otel --backfill --tail
+```
+
 Backfill metadata snapshots into the raw export table:
 
 ```bash
@@ -54,6 +63,12 @@ durable `ledger:...` cursors; in-memory/dev runtimes return `v2:...` event
 watch cursors. It is suitable for local validation of schema, ClickHouse
 reachability, cursor resume, metadata snapshot backfill, tombstone handling,
 consumer leases, and dashboard queries.
+
+`--mode otel` writes event-derived rows into `agentdb_otel_logs` and
+`agentdb_otel_traces` only. `--mode native,otel` writes the native raw/event
+tables plus those projections. Trace IDs are deterministic from
+`tenant_id/session_id`, span IDs are deterministic from event IDs, and
+`source_refs` are preserved in trace `links_json`.
 
 ## HA Connector Pattern
 

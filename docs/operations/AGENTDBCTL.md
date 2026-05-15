@@ -270,6 +270,15 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
 ```
 
+Export OTel-shaped ClickStack-friendly projections in addition to the native
+tables:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --mode native,otel --backfill --tail
+```
+
 Backfill metadata snapshots before the event tail:
 
 ```bash

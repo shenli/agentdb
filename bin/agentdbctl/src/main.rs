@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
 const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
@@ -102,6 +103,48 @@ CREATE TABLE IF NOT EXISTS agentdb_events (
 ) ENGINE = ReplacingMergeTree(observed_at_ms)
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (tenant_id, session_id, seq, event_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_otel_logs (
+    trace_id String,
+    span_id String,
+    timestamp_unix_nano UInt64,
+    timestamp DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(timestamp_unix_nano)),
+    severity_text LowCardinality(String),
+    body String,
+    resource_attributes Map(String, String),
+    log_attributes Map(String, String),
+    tenant_id String,
+    session_id String,
+    event_id String,
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (tenant_id, session_id, timestamp, event_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_otel_traces (
+    trace_id String,
+    span_id String,
+    parent_span_id Nullable(String),
+    span_name String,
+    span_kind LowCardinality(String),
+    start_time_unix_nano UInt64,
+    end_time_unix_nano UInt64,
+    start_time DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(start_time_unix_nano)),
+    end_time DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(end_time_unix_nano)),
+    duration_ms Nullable(UInt64),
+    status_code LowCardinality(String),
+    resource_attributes Map(String, String),
+    span_attributes Map(String, String),
+    links_json String,
+    tenant_id String,
+    session_id String,
+    event_id String,
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (tenant_id, session_id, start_time, span_id)
 "#,
     r#"
 CREATE TABLE IF NOT EXISTS agentdb_tombstones (
@@ -602,6 +645,8 @@ struct ClickHouseRunArgs {
     limit: usize,
     #[arg(long = "include", value_delimiter = ',')]
     include: Vec<String>,
+    #[arg(long = "mode", value_delimiter = ',', default_value = "native")]
+    mode: Vec<String>,
     #[arg(long)]
     backfill: bool,
     #[arg(long)]
@@ -996,6 +1041,7 @@ async fn ensure_claimed_export_consumer(
 }
 
 async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
+    let modes = export_modes(&args.mode)?;
     let mut cursor = args.from_cursor.clone();
     if let Some(consumer) = &args.consumer {
         let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
@@ -1072,18 +1118,34 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
         batches = batches.saturating_add(1);
         rows = rows.saturating_add(items.len() as u64);
         if !args.dry_run {
-            clickhouse_insert_json_each_row(
-                &args.clickhouse_url,
-                "agentdb_export_items_raw",
-                &clickhouse_raw_rows(&items)?,
-            )
-            .await?;
-            clickhouse_insert_json_each_row(
-                &args.clickhouse_url,
-                "agentdb_events",
-                &clickhouse_event_rows(&items)?,
-            )
-            .await?;
+            if modes.native {
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_export_items_raw",
+                    &clickhouse_raw_rows(&items)?,
+                )
+                .await?;
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_events",
+                    &clickhouse_event_rows(&items)?,
+                )
+                .await?;
+            }
+            if modes.otel {
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_otel_logs",
+                    &clickhouse_otel_log_rows(&items)?,
+                )
+                .await?;
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_otel_traces",
+                    &clickhouse_otel_trace_rows(&items)?,
+                )
+                .await?;
+            }
         }
         cursor = response
             .get("next_cursor")
@@ -1137,6 +1199,7 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
         "status": "ok",
         "tenant_id": args.tenant_id,
         "consumer": args.consumer,
+        "mode": args.mode,
         "backfill": args.backfill,
         "tail": args.tail,
         "batches": batches,
@@ -1172,6 +1235,36 @@ fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
         query_component(&args.tenant_id),
         query_pairs_encoded(&pairs)
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportModes {
+    native: bool,
+    otel: bool,
+}
+
+fn export_modes(raw_modes: &[String]) -> Result<ExportModes> {
+    let mut modes = ExportModes {
+        native: false,
+        otel: false,
+    };
+    let requested = if raw_modes.is_empty() {
+        vec!["native".to_string()]
+    } else {
+        raw_modes.to_vec()
+    };
+    for mode in requested {
+        match mode.trim() {
+            "native" => modes.native = true,
+            "otel" => modes.otel = true,
+            "" => {}
+            other => return Err(anyhow!("unsupported ClickHouse export mode `{other}`")),
+        }
+    }
+    if !modes.native && !modes.otel {
+        return Err(anyhow!("at least one ClickHouse export mode is required"));
+    }
+    Ok(modes)
 }
 
 fn clickhouse_raw_rows(items: &[Value]) -> Result<Vec<Value>> {
@@ -1250,6 +1343,224 @@ fn clickhouse_event_rows(items: &[Value]) -> Result<Vec<Value>> {
             }))
         })
         .collect()
+}
+
+fn clickhouse_otel_log_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let tenant_id = item_string(item, "tenant_id");
+            let session_id = item_string(item, "session_id");
+            let event_id = event_id(item);
+            let trace_id = otel_trace_id(&tenant_id, &session_id);
+            let span_id = otel_span_id("log", &event_id);
+            Ok(json!({
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "timestamp_unix_nano": timestamp_unix_nano(item),
+                "severity_text": otel_severity_text(item),
+                "body": otel_log_body(item)?,
+                "resource_attributes": otel_resource_attributes(item),
+                "log_attributes": otel_event_attributes(item),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn clickhouse_otel_trace_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let tenant_id = item_string(item, "tenant_id");
+            let session_id = item_string(item, "session_id");
+            let event_id = event_id(item);
+            let duration_ms = item.get("duration_ms").and_then(Value::as_u64);
+            let start_time_unix_nano = timestamp_unix_nano(item);
+            let end_time_unix_nano = duration_ms
+                .and_then(|duration| duration.checked_mul(1_000_000))
+                .and_then(|duration_ns| start_time_unix_nano.checked_add(duration_ns))
+                .unwrap_or(start_time_unix_nano);
+            Ok(json!({
+                "trace_id": otel_trace_id(&tenant_id, &session_id),
+                "span_id": otel_span_id("span", &event_id),
+                "parent_span_id": item.get("parent_event_id").and_then(Value::as_str).map(|parent| otel_span_id("span", parent)),
+                "span_name": item.get("kind").and_then(Value::as_str).unwrap_or("agentdb.event"),
+                "span_kind": otel_span_kind(item),
+                "start_time_unix_nano": start_time_unix_nano,
+                "end_time_unix_nano": end_time_unix_nano,
+                "duration_ms": duration_ms,
+                "status_code": otel_status_code(item),
+                "resource_attributes": otel_resource_attributes(item),
+                "span_attributes": otel_event_attributes(item),
+                "links_json": item.get("source_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn item_string(item: &Value, field: &str) -> String {
+    item.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn event_id(item: &Value) -> String {
+    item.get("event_id")
+        .or_else(|| item.get("object_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn timestamp_unix_nano(item: &Value) -> u64 {
+    item.get("created_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000)
+}
+
+fn otel_trace_id(tenant_id: &str, session_id: &str) -> String {
+    sha256_hex_128(&format!("agentdb.trace:{tenant_id}:{session_id}"))
+}
+
+fn otel_span_id(kind: &str, id: &str) -> String {
+    sha256_hex_64(&format!("agentdb.{kind}:{id}"))
+}
+
+fn sha256_hex_128(input: &str) -> String {
+    hex_prefix(input, 16)
+}
+
+fn sha256_hex_64(input: &str) -> String {
+    hex_prefix(input, 8)
+}
+
+fn hex_prefix(input: &str, bytes: usize) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(bytes * 2);
+    for byte in digest.iter().take(bytes) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn otel_resource_attributes(item: &Value) -> Value {
+    let mut attrs = serde_json::Map::new();
+    insert_attr(&mut attrs, "service.name", "agentdb");
+    for field in [
+        "tenant_id",
+        "agent_id",
+        "session_id",
+        "cell_id",
+        "placement_scope_id",
+    ] {
+        if let Some(value) = item.get(field).and_then(Value::as_str) {
+            insert_attr(&mut attrs, &format!("agentdb.{field}"), value);
+        }
+    }
+    Value::Object(attrs)
+}
+
+fn otel_event_attributes(item: &Value) -> Value {
+    let mut attrs = serde_json::Map::new();
+    for field in [
+        "cursor",
+        "object_id",
+        "event_id",
+        "kind",
+        "status",
+        "model",
+        "provider",
+        "finish_reason",
+        "tool_name",
+        "tool_call_id",
+        "error_kind",
+        "approval_id",
+        "approval_decision",
+        "context_pack_id",
+    ] {
+        if let Some(value) = item.get(field).and_then(Value::as_str) {
+            insert_attr(&mut attrs, &format!("agentdb.{field}"), value);
+        }
+    }
+    for field in [
+        "seq",
+        "created_at_ms",
+        "observed_at_ms",
+        "tablet_id",
+        "tablet_epoch",
+        "applied_index",
+        "duration_ms",
+        "timeout_ms",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_micros",
+        "exit_code",
+    ] {
+        if let Some(value) = item.get(field) {
+            if value.is_number() || value.is_boolean() {
+                insert_attr(&mut attrs, &format!("agentdb.{field}"), &value.to_string());
+            }
+        }
+    }
+    Value::Object(attrs)
+}
+
+fn insert_attr(attrs: &mut serde_json::Map<String, Value>, key: &str, value: &str) {
+    attrs.insert(key.to_string(), Value::String(value.to_string()));
+}
+
+fn otel_log_body(item: &Value) -> Result<String> {
+    if let Some(value) = item
+        .get("data")
+        .and_then(|data| data.get("payload"))
+        .and_then(Value::as_str)
+    {
+        return Ok(value.to_string());
+    }
+    if let Some(value) = item.get("kind").and_then(Value::as_str) {
+        return Ok(value.to_string());
+    }
+    Ok(serde_json::to_string(
+        item.get("data").unwrap_or(&Value::Null),
+    )?)
+}
+
+fn otel_severity_text(item: &Value) -> &'static str {
+    match item.get("status").and_then(Value::as_str) {
+        Some("error" | "failed" | "failure") => "ERROR",
+        Some("warn" | "warning") => "WARN",
+        _ if item.get("error_kind").is_some() || item.get("error_message").is_some() => "ERROR",
+        _ => "INFO",
+    }
+}
+
+fn otel_status_code(item: &Value) -> &'static str {
+    match item.get("status").and_then(Value::as_str) {
+        Some("error" | "failed" | "failure") => "ERROR",
+        Some("ok" | "success" | "completed") => "OK",
+        _ if item.get("error_kind").is_some() || item.get("error_message").is_some() => "ERROR",
+        _ => "UNSET",
+    }
+}
+
+fn otel_span_kind(item: &Value) -> &'static str {
+    match item.get("kind").and_then(Value::as_str) {
+        Some("model_call" | "tool_call" | "approval_request") => "CLIENT",
+        _ => "INTERNAL",
+    }
 }
 
 async fn clickhouse_insert_json_each_row(url: &str, table: &str, rows: &[Value]) -> Result<()> {
@@ -2062,6 +2373,7 @@ mod tests {
             from_cursor: Some("v2:0001:ses_1:0002:cell=cell-a".into()),
             limit: 500,
             include: vec![],
+            mode: vec!["native".into()],
             backfill: false,
             tail: false,
             max_batches: None,
@@ -2079,6 +2391,8 @@ mod tests {
         let ddl = CLICKHOUSE_SCHEMA_DDL.join("\n");
         assert!(ddl.contains("agentdb_export_items_raw"));
         assert!(ddl.contains("agentdb_events"));
+        assert!(ddl.contains("agentdb_otel_logs"));
+        assert!(ddl.contains("agentdb_otel_traces"));
         assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
     }
 
@@ -2157,5 +2471,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("\"model\":\"gpt-test\""));
+
+        let otel_logs = clickhouse_otel_log_rows(&items).unwrap();
+        assert_eq!(otel_logs.len(), 1);
+        assert_eq!(otel_logs[0]["tenant_id"], "ten_1");
+        assert_eq!(otel_logs[0]["session_id"], "ses_1");
+        assert_eq!(otel_logs[0]["event_id"], "evt_1");
+        assert_eq!(otel_logs[0]["timestamp_unix_nano"], 1_000_000_000_u64);
+        assert_eq!(otel_logs[0]["severity_text"], "INFO");
+        assert_eq!(
+            otel_logs[0]["resource_attributes"]["agentdb.tenant_id"],
+            "ten_1"
+        );
+        assert_eq!(otel_logs[0]["log_attributes"]["agentdb.kind"], "model_call");
+
+        let otel_traces = clickhouse_otel_trace_rows(&items).unwrap();
+        assert_eq!(otel_traces.len(), 1);
+        assert_eq!(otel_traces[0]["trace_id"], otel_logs[0]["trace_id"]);
+        assert_eq!(otel_traces[0]["span_name"], "model_call");
+        assert_eq!(otel_traces[0]["span_kind"], "CLIENT");
+        assert_eq!(otel_traces[0]["duration_ms"], 123);
+        assert_eq!(otel_traces[0]["status_code"], "UNSET");
+    }
+
+    #[test]
+    fn parses_clickhouse_export_modes() {
+        let native = export_modes(&["native".into()]).unwrap();
+        assert_eq!(
+            native,
+            ExportModes {
+                native: true,
+                otel: false
+            }
+        );
+        let both = export_modes(&["native".into(), "otel".into()]).unwrap();
+        assert_eq!(
+            both,
+            ExportModes {
+                native: true,
+                otel: true
+            }
+        );
+        assert!(export_modes(&["unknown".into()]).is_err());
     }
 }

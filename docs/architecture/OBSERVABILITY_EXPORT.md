@@ -879,10 +879,13 @@ formalized.
 
 ### Phase 4: OTel / ClickStack Projection
 
-- Add optional `agentdb_otel_logs` and `agentdb_otel_traces` output.
-- Add deterministic AgentDB ID to OTel trace/span ID mapping.
-- Add source-ref to span-link conversion.
-- Add ClickStack/HyperDX setup docs and smoke tests.
+- Implemented: optional `agentdb_otel_logs` and `agentdb_otel_traces`
+  ClickHouse output from `agentdbctl export clickhouse run --mode otel` or
+  `--mode native,otel`.
+- Implemented: deterministic AgentDB ID to OTel trace/span ID mapping.
+- Implemented: source-ref preservation as trace `links_json`.
+- Remaining: ClickStack/HyperDX end-to-end setup docs and smoke tests against
+  the actual UI stack.
 
 ### Phase 5: Additional Sinks
 
