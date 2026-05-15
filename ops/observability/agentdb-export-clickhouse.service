@@ -20,12 +20,15 @@ ExecStart=/usr/local/bin/agentdbctl export clickhouse run \
   --poll-interval-ms ${AGENTDB_EXPORT_POLL_INTERVAL_MS} \
   --max-retries ${AGENTDB_EXPORT_MAX_RETRIES} \
   --retry-initial-backoff-ms ${AGENTDB_EXPORT_RETRY_INITIAL_BACKOFF_MS} \
+  --payload-mode ${AGENTDB_EXPORT_PAYLOAD_MODE} \
+  --metrics-output ${AGENTDB_EXPORT_METRICS_OUTPUT} \
   --backfill \
   --tail
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
+StateDirectory=agentdb
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

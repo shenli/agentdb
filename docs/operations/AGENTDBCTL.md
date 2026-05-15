@@ -287,12 +287,38 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
     --mode native,otel --backfill --tail
 ```
 
+Use exporter-side privacy gates when a deployment must suppress or minimize
+payload data before it reaches the external sink:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --deny-event-kind debug,trace \
+    --redact-field data.payload.api_key \
+    --payload-mode hash \
+    --metrics-output ./clickhouse-export-status.json \
+    --backfill --tail
+```
+
+The same `--allow-object-type`, `--deny-object-type`, `--allow-event-kind`,
+`--deny-event-kind`, `--redact-field`, `--payload-mode full|hash|drop`, and
+`--metrics-output` flags are supported by `export jsonl run`. The metrics file
+is refreshed after each processed batch and contains the current cursor, rows,
+filtered items, sink insert rows, retry attempts, and rows per second.
+
 `migrate --apply` also installs ClickStack-compatible views:
 `agentdb_clickstack_logs`, `agentdb_clickstack_traces`, and convenience
 `otel_logs` / `otel_traces` aliases for dedicated AgentDB observability
 databases. HyperDX sources should use `TimestampTime`, `Timestamp`,
 `ServiceName`, `TraceId`, `SpanId`, `ResourceAttributes`, `LogAttributes`, and
 `SpanAttributes`.
+
+Print ClickStack source and dashboard configuration templates:
+
+```bash
+agentdbctl -o json export clickhouse clickstack-config \
+  --service-name "AgentDB Prod"
+```
 
 Backfill metadata snapshots before the event tail:
 

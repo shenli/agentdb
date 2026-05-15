@@ -57,6 +57,27 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
     --mode native,otel --backfill --tail
 ```
 
+Exporter-side privacy gates are available for ClickHouse and JSONL sinks. They
+filter or redact export envelopes before the connector writes the external
+system; they do not replace AgentDB tenant auth or future policy-driven
+redaction.
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --mode native,otel --backfill --tail \
+    --deny-event-kind debug,trace \
+    --redact-field data.payload.api_key \
+    --payload-mode hash \
+    --metrics-output ./clickhouse-export-status.json
+```
+
+`--payload-mode full` preserves payloads, `hash` replaces
+`data.payload` with a SHA-256 fingerprint, and `drop` writes a null payload.
+`--metrics-output` is refreshed after each processed batch and includes rows,
+filtered items, sink insert rows, retry attempts, rows per second, and the last
+cursor. Use `status --consumer` for AgentDB-side lag and lease state.
+
 The schema also installs ClickStack/HyperDX-friendly views over those
 projections:
 
@@ -81,6 +102,14 @@ log attributes: LogAttributes
 span attributes: SpanAttributes
 resource attributes: ResourceAttributes
 duration: Duration
+```
+
+Print source and dashboard configuration templates for ClickStack Cloud or
+HyperDX setup:
+
+```bash
+agentdbctl -o json export clickhouse clickstack-config \
+  --service-name "AgentDB Prod"
 ```
 
 Backfill metadata snapshots into the raw export table:

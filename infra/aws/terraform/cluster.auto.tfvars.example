@@ -43,6 +43,10 @@ clickhouse_export_mode      = "native"
 clickhouse_export_lease_ms  = 30000
 clickhouse_export_max_retries = 6
 clickhouse_export_retry_initial_backoff_ms = 250
+clickhouse_export_payload_mode = "full"
+clickhouse_export_metrics_output = "/home/ec2-user/agentdb-deploy/logs/clickhouse-export-status.json"
+clickhouse_export_deny_event_kinds = ""
+clickhouse_export_redact_fields = ""
 
 # Optional JSONL/S3 observability archive. Leave jsonl_export_uri and
 # jsonl_export_tenant_id empty to skip exporter setup. For S3 outputs, use a
@@ -54,3 +58,5 @@ jsonl_export_consumer    = "prod-jsonl"
 jsonl_export_include     = "events"
 jsonl_export_lease_ms    = 30000
 jsonl_export_max_batches = 1000
+jsonl_export_payload_mode = "full"
+jsonl_export_metrics_output = "/home/ec2-user/agentdb-deploy/logs/jsonl-export-status.json"

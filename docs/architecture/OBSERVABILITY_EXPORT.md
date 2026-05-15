@@ -738,16 +738,18 @@ it in production.
 Required controls:
 
 - tenant-scoped export authorization
-- object-type allow/deny lists
-- event-kind allow/deny lists
-- payload field redaction rules
+- implemented in `agentdbctl`: object-type allow/deny lists
+- implemented in `agentdbctl`: event-kind allow/deny lists
+- implemented in `agentdbctl`: payload field redaction rules
 - artifact metadata export without blob export by default
-- optional payload hashing or summary-only mode
+- implemented in `agentdbctl`: payload hashing or payload drop mode
 - tombstones for policy redaction and retention purge
 - ClickHouse grants with least privilege: create/migrate role separate from
   insert-only connector role
 
-The connector should never print secrets in logs or `doctor` output.
+The connector should never print secrets in logs or `doctor` output. Current
+exporter-side controls are a sink-boundary safeguard; policy-driven server-side
+redaction remains future work once tenant policy mutation APIs are promoted.
 
 ## API Sketch
 
@@ -846,9 +848,15 @@ Response:
   current-schema apply/check path rather than a historical upgrade ladder.
 - Implemented: retry-safe ClickHouse inserts with stable per-table
   deduplication tokens derived from the exported cursor range.
+- Implemented: exporter-side privacy gates for ClickHouse and JSONL runs:
+  object/event allow-deny filters, dot-path redaction, and payload
+  `full`/`hash`/`drop` modes.
+- Implemented: local exporter status output through `--metrics-output`,
+  refreshed after every processed batch for tailing workers.
 - Implemented: focused tests for cursor resume, route context propagation,
   durable ledger resume after restart, normalized fields, and CLI schema/path
-  helpers.
+  helpers, ClickStack config templates, privacy filtering/redaction, and
+  exporter metrics.
 - Implemented: systemd service/env packaging for the long-running
   `agentdbctl` exporter. A separate `agentdb-export-clickhouse` daemon binary
   remains optional because the packaged service uses the same consumer lease
@@ -898,8 +906,10 @@ formalized.
   ClickStack view compatibility.
 - Implemented: local ClickStack/HyperDX UI reachability smoke plus ClickHouse
   source-view compilation checks.
-- Remaining: saved source/dashboard packaging through the ClickStack API once
-  that API surface is stable enough to automate without hand-built UI state.
+- Implemented: `agentdbctl export clickhouse clickstack-config` emits source
+  and dashboard configuration templates for ClickStack Cloud/HyperDX setup.
+- Remaining: live saved source/dashboard API writes once the ClickStack API is
+  generally available enough to depend on in unattended deployments.
 
 ### Phase 5: Additional Sinks
 
@@ -913,8 +923,8 @@ formalized.
 - Implemented: starter native and ClickStack dashboard query bundle through
   `agentdbctl export clickhouse queries` and
   `ops/observability/clickhouse-dashboard-queries.sql`.
-- Add saved dashboard packaging once the ClickStack dashboard/source API is
-  stable enough to automate without hand-built UI state.
+- Implemented: ClickHouse/AWS/systemd deployment hooks for schema apply,
+  retries, payload minimization, and local exporter status files.
 - Add Kafka bridge if customers need queue-based fan-out or stream processing.
 - Add warehouse/lakehouse connectors only after the envelope and Parquet layout
   are stable.

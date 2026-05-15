@@ -141,12 +141,18 @@ resource "aws_instance" "agentdb" {
     clickhouse_export_lease_ms                 = var.clickhouse_export_lease_ms
     clickhouse_export_max_retries              = var.clickhouse_export_max_retries
     clickhouse_export_retry_initial_backoff_ms = var.clickhouse_export_retry_initial_backoff_ms
+    clickhouse_export_payload_mode             = var.clickhouse_export_payload_mode
+    clickhouse_export_metrics_output           = var.clickhouse_export_metrics_output
+    clickhouse_export_deny_event_kinds         = var.clickhouse_export_deny_event_kinds
+    clickhouse_export_redact_fields            = var.clickhouse_export_redact_fields
     jsonl_export_tenant_id                     = var.jsonl_export_tenant_id
     jsonl_export_uri                           = var.jsonl_export_uri
     jsonl_export_consumer                      = var.jsonl_export_consumer
     jsonl_export_include                       = var.jsonl_export_include
     jsonl_export_lease_ms                      = var.jsonl_export_lease_ms
     jsonl_export_max_batches                   = var.jsonl_export_max_batches
+    jsonl_export_payload_mode                  = var.jsonl_export_payload_mode
+    jsonl_export_metrics_output                = var.jsonl_export_metrics_output
   })
 
   tags = {

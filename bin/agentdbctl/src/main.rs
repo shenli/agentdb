@@ -740,6 +740,8 @@ enum ClickHouseCommand {
     Status(ClickHouseStatusArgs),
     /// Print first-party dashboard and ClickStack smoke queries.
     Queries,
+    /// Print ClickStack source/dashboard configuration templates.
+    ClickstackConfig(ClickStackConfigArgs),
     /// Copy one or more export-watch batches into ClickHouse.
     Run(ClickHouseRunArgs),
 }
@@ -785,6 +787,16 @@ struct ClickHouseStatusArgs {
 }
 
 #[derive(Args, Debug)]
+struct ClickStackConfigArgs {
+    #[arg(long, default_value = "AgentDB")]
+    service_name: String,
+    #[arg(long, default_value = "agentdb_clickstack_logs")]
+    logs_source: String,
+    #[arg(long, default_value = "agentdb_clickstack_traces")]
+    traces_source: String,
+}
+
+#[derive(Args, Debug)]
 struct ClickHouseRunArgs {
     #[arg(long)]
     tenant_id: String,
@@ -822,8 +834,43 @@ struct ClickHouseRunArgs {
     max_retries: u32,
     #[arg(long, default_value_t = 250)]
     retry_initial_backoff_ms: u64,
+    #[command(flatten)]
+    privacy: ExportPrivacyArgs,
+    /// Optional local file path to refresh with exporter status JSON.
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct ExportPrivacyArgs {
+    /// Comma-separated object types to export. Empty allows all object types.
+    #[arg(long = "allow-object-type", value_delimiter = ',')]
+    allow_object_types: Vec<String>,
+    /// Comma-separated object types to suppress.
+    #[arg(long = "deny-object-type", value_delimiter = ',')]
+    deny_object_types: Vec<String>,
+    /// Comma-separated event kinds to export. Empty allows all event kinds.
+    #[arg(long = "allow-event-kind", value_delimiter = ',')]
+    allow_event_kinds: Vec<String>,
+    /// Comma-separated event kinds to suppress.
+    #[arg(long = "deny-event-kind", value_delimiter = ',')]
+    deny_event_kinds: Vec<String>,
+    /// Dot-separated JSON paths to redact before writing a sink row.
+    #[arg(long = "redact-field")]
+    redact_fields: Vec<String>,
+    /// Payload handling policy for exported `data.payload` values.
+    #[arg(long, value_enum, default_value = "full")]
+    payload_mode: ExportPayloadMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum ExportPayloadMode {
+    #[default]
+    Full,
+    Hash,
+    Drop,
 }
 
 #[derive(Subcommand, Debug)]
@@ -865,6 +912,11 @@ struct JsonlRunArgs {
     max_batches: Option<u64>,
     #[arg(long, default_value_t = 1000)]
     poll_interval_ms: u64,
+    #[command(flatten)]
+    privacy: ExportPrivacyArgs,
+    /// Optional local file path to refresh with exporter status JSON.
+    #[arg(long)]
+    metrics_output: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
 }
@@ -1136,8 +1188,86 @@ async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
         ClickHouseCommand::Migrate(args) => clickhouse_migrate(args).await,
         ClickHouseCommand::Status(args) => clickhouse_status(api, args).await,
         ClickHouseCommand::Queries => Ok(clickhouse_sample_queries()),
+        ClickHouseCommand::ClickstackConfig(args) => Ok(clickstack_config(args)),
         ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
     }
+}
+
+fn clickstack_config(args: ClickStackConfigArgs) -> Value {
+    json!({
+        "sources": [
+            {
+                "name": format!("{} Logs", args.service_name),
+                "table": args.logs_source,
+                "timestamp_field": "TimestampTime",
+                "display_timestamp_field": "Timestamp",
+                "service_name_field": "ServiceName",
+                "body_field": "Body",
+                "trace_id_field": "TraceId",
+                "span_id_field": "SpanId",
+                "attributes_field": "LogAttributes",
+                "resource_attributes_field": "ResourceAttributes"
+            },
+            {
+                "name": format!("{} Traces", args.service_name),
+                "table": args.traces_source,
+                "timestamp_field": "TimestampTime",
+                "display_timestamp_field": "Timestamp",
+                "service_name_field": "ServiceName",
+                "trace_id_field": "TraceId",
+                "span_id_field": "SpanId",
+                "parent_span_id_field": "ParentSpanId",
+                "span_name_field": "SpanName",
+                "duration_field": "Duration",
+                "attributes_field": "SpanAttributes",
+                "resource_attributes_field": "ResourceAttributes"
+            }
+        ],
+        "clickhouse_cloud_api": {
+            "base_url": "https://api.clickhouse.cloud/v1/organizations/{organizationId}/services/{serviceId}/clickstack",
+            "list_dashboards": "GET /dashboards",
+            "create_dashboard": "POST /dashboards",
+            "authentication": "ClickHouse Cloud API basic auth: <keyId>:<keySecret>"
+        },
+        "dashboard": {
+            "name": format!("{} Runtime Observability", args.service_name),
+            "tags": ["agentdb", "observability"],
+            "tiles": [
+                {
+                    "x": 0,
+                    "y": 0,
+                    "w": 12,
+                    "h": 8,
+                    "name": "Recent errors",
+                    "config": {
+                        "displayType": "table",
+                        "sourceId": "<logsSourceId>",
+                        "select": [{
+                            "aggFn": "count",
+                            "where": "SeverityText:ERROR OR LogAttributes.agentdb.error_kind:*",
+                            "whereLanguage": "lucene"
+                        }]
+                    }
+                },
+                {
+                    "x": 12,
+                    "y": 0,
+                    "w": 12,
+                    "h": 8,
+                    "name": "Slow spans",
+                    "config": {
+                        "displayType": "table",
+                        "sourceId": "<tracesSourceId>",
+                        "select": [{
+                            "aggFn": "count",
+                            "where": "Duration:>1000000000",
+                            "whereLanguage": "lucene"
+                        }]
+                    }
+                }
+            ]
+        }
+    })
 }
 
 fn clickhouse_sample_queries() -> Value {
@@ -1582,6 +1712,10 @@ async fn ensure_claimed_export_consumer_for(
 async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     let modes = export_modes(&args.mode)?;
     let mut cursor = args.from_cursor.clone();
+    let started_at_ms = now_ms();
+    let mut retry_attempts = 0_u64;
+    let mut filtered_items = 0_u64;
+    let mut inserted_rows = 0_u64;
     if let Some(consumer) = &args.consumer {
         let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
         if cursor.is_none() {
@@ -1635,12 +1769,16 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                     .await?
             }
         };
-        let items = response
+        let raw_items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if items.is_empty() {
+        let raw_item_count = raw_items.len();
+        let items = apply_export_privacy(raw_items, &args.privacy)?;
+        filtered_items =
+            filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
+        if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -1659,47 +1797,59 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
         if !args.dry_run {
             if modes.native {
                 let raw_rows = clickhouse_raw_rows(&items)?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_export_items_raw",
-                    &raw_rows,
-                    &export_batch_id("agentdb_export_items_raw", &items),
-                    args.max_retries,
-                    args.retry_initial_backoff_ms,
-                )
-                .await?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_export_items_raw",
+                        &raw_rows,
+                        &export_batch_id("agentdb_export_items_raw", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(raw_rows.len() as u64);
                 let event_rows = clickhouse_event_rows(&items)?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_events",
-                    &event_rows,
-                    &export_batch_id("agentdb_events", &items),
-                    args.max_retries,
-                    args.retry_initial_backoff_ms,
-                )
-                .await?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_events",
+                        &event_rows,
+                        &export_batch_id("agentdb_events", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(event_rows.len() as u64);
             }
             if modes.otel {
                 let otel_log_rows = clickhouse_otel_log_rows(&items)?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_otel_logs",
-                    &otel_log_rows,
-                    &export_batch_id("agentdb_otel_logs", &items),
-                    args.max_retries,
-                    args.retry_initial_backoff_ms,
-                )
-                .await?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_otel_logs",
+                        &otel_log_rows,
+                        &export_batch_id("agentdb_otel_logs", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(otel_log_rows.len() as u64);
                 let otel_trace_rows = clickhouse_otel_trace_rows(&items)?;
-                clickhouse_insert_json_each_row(
-                    &args.clickhouse_url,
-                    "agentdb_otel_traces",
-                    &otel_trace_rows,
-                    &export_batch_id("agentdb_otel_traces", &items),
-                    args.max_retries,
-                    args.retry_initial_backoff_ms,
-                )
-                .await?;
+                retry_attempts = retry_attempts.saturating_add(
+                    clickhouse_insert_json_each_row(
+                        &args.clickhouse_url,
+                        "agentdb_otel_traces",
+                        &otel_trace_rows,
+                        &export_batch_id("agentdb_otel_traces", &items),
+                        args.max_retries,
+                        args.retry_initial_backoff_ms,
+                    )
+                    .await? as u64,
+                );
+                inserted_rows = inserted_rows.saturating_add(otel_trace_rows.len() as u64);
             }
         }
         cursor = response
@@ -1732,6 +1882,19 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                 .await?;
             }
         }
+        write_metrics_output(
+            args.metrics_output.as_ref(),
+            &clickhouse_run_result(
+                &args,
+                started_at_ms,
+                batches,
+                rows,
+                filtered_items,
+                inserted_rows,
+                retry_attempts,
+                cursor.as_deref(),
+            ),
+        )?;
         if phase == ExportRunPhase::Backfill {
             let complete = response
                 .get("complete")
@@ -1750,18 +1913,51 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             break;
         }
     }
-    Ok(json!({
+    let result = clickhouse_run_result(
+        &args,
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        inserted_rows,
+        retry_attempts,
+        cursor.as_deref(),
+    );
+    write_metrics_output(args.metrics_output.as_ref(), &result)?;
+    Ok(result)
+}
+
+fn clickhouse_run_result(
+    args: &ClickHouseRunArgs,
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    inserted_rows: u64,
+    retry_attempts: u64,
+    cursor: Option<&str>,
+) -> Value {
+    let metrics = export_metrics(
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        inserted_rows,
+        retry_attempts,
+    );
+    json!({
         "status": "ok",
-        "tenant_id": args.tenant_id,
-        "consumer": args.consumer,
-        "mode": args.mode,
+        "tenant_id": &args.tenant_id,
+        "consumer": &args.consumer,
+        "mode": &args.mode,
         "backfill": args.backfill,
         "tail": args.tail,
         "batches": batches,
         "rows": rows,
         "last_cursor": cursor,
+        "metrics": metrics,
         "dry_run": args.dry_run
-    }))
+    })
 }
 
 async fn jsonl(api: &Api, command: JsonlCommand) -> Result<Value> {
@@ -1777,6 +1973,8 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         args.dry_run,
     )
     .await?;
+    let started_at_ms = now_ms();
+    let mut filtered_items = 0_u64;
     let include = if args.include.is_empty() {
         vec!["events".to_string()]
     } else {
@@ -1842,12 +2040,16 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                     .await?
             }
         };
-        let items = response
+        let raw_items = response
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        if items.is_empty() {
+        let raw_item_count = raw_items.len();
+        let items = apply_export_privacy(raw_items, &args.privacy)?;
+        filtered_items =
+            filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
+        if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
                 if args.tail {
                     phase = ExportRunPhase::Watch;
@@ -1863,7 +2065,9 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         }
         batches = batches.saturating_add(1);
         rows = rows.saturating_add(items.len() as u64);
-        output.write_items(&items).await?;
+        if !items.is_empty() {
+            output.write_items(&items).await?;
+        }
         cursor = response
             .get("next_cursor")
             .and_then(Value::as_str)
@@ -1887,6 +2091,18 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                 .await?;
             }
         }
+        write_metrics_output(
+            args.metrics_output.as_ref(),
+            &jsonl_run_result(
+                &args,
+                None,
+                started_at_ms,
+                batches,
+                rows,
+                filtered_items,
+                cursor.as_deref(),
+            ),
+        )?;
         if phase == ExportRunPhase::Backfill {
             let complete = response
                 .get("complete")
@@ -1906,18 +2122,42 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
         }
     }
     let output = output.finish().await?;
-    Ok(json!({
+    let result = jsonl_run_result(
+        &args,
+        Some(output),
+        started_at_ms,
+        batches,
+        rows,
+        filtered_items,
+        cursor.as_deref(),
+    );
+    write_metrics_output(args.metrics_output.as_ref(), &result)?;
+    Ok(result)
+}
+
+fn jsonl_run_result(
+    args: &JsonlRunArgs,
+    output: Option<Value>,
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    cursor: Option<&str>,
+) -> Value {
+    let metrics = export_metrics(started_at_ms, batches, rows, filtered_items, rows, 0);
+    json!({
         "status": "ok",
-        "tenant_id": args.tenant_id,
-        "consumer": args.consumer,
+        "tenant_id": &args.tenant_id,
+        "consumer": &args.consumer,
         "output": output,
         "backfill": args.backfill,
         "tail": args.tail,
         "batches": batches,
         "rows": rows,
         "last_cursor": cursor,
+        "metrics": metrics,
         "dry_run": args.dry_run
-    }))
+    })
 }
 
 async fn parquet(command: ParquetCommand) -> Result<Value> {
@@ -2003,6 +2243,162 @@ fn sql_string(value: &str) -> String {
 enum ExportRunPhase {
     Backfill,
     Watch,
+}
+
+fn apply_export_privacy(items: Vec<Value>, privacy: &ExportPrivacyArgs) -> Result<Vec<Value>> {
+    items
+        .into_iter()
+        .filter(|item| export_item_allowed(item, privacy))
+        .map(|mut item| {
+            for field in &privacy.redact_fields {
+                redact_json_path(&mut item, field);
+            }
+            apply_payload_mode(&mut item, privacy.payload_mode)?;
+            Ok(item)
+        })
+        .collect()
+}
+
+fn export_item_allowed(item: &Value, privacy: &ExportPrivacyArgs) -> bool {
+    let object_type = item
+        .get("object_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !privacy.allow_object_types.is_empty()
+        && !contains_object_type(&privacy.allow_object_types, object_type)
+    {
+        return false;
+    }
+    if contains_object_type(&privacy.deny_object_types, object_type) {
+        return false;
+    }
+    if object_type == "event" {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if !privacy.allow_event_kinds.is_empty() && !contains_text(&privacy.allow_event_kinds, kind)
+        {
+            return false;
+        }
+        if contains_text(&privacy.deny_event_kinds, kind) {
+            return false;
+        }
+    }
+    true
+}
+
+fn contains_text(values: &[String], needle: &str) -> bool {
+    values.iter().any(|value| value == needle)
+}
+
+fn contains_object_type(values: &[String], object_type: &str) -> bool {
+    values
+        .iter()
+        .any(|value| object_type_filter_matches(value, object_type))
+}
+
+fn object_type_filter_matches(filter: &str, object_type: &str) -> bool {
+    match filter {
+        "events" => object_type == "event",
+        "tenants" => object_type == "tenant",
+        "agents" => object_type == "agent",
+        "sessions" => object_type == "session",
+        "artifacts" => object_type == "artifact",
+        "records" => object_type == "record",
+        "skills" => object_type == "skill",
+        "skill_bindings" => object_type == "skill_binding",
+        other => other == object_type,
+    }
+}
+
+fn redact_json_path(value: &mut Value, path: &str) {
+    let mut current = value;
+    let mut parts = path.split('.').filter(|part| !part.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        let Some(object) = current.as_object_mut() else {
+            return;
+        };
+        if parts.peek().is_none() {
+            if object.contains_key(part) {
+                object.insert(part.to_string(), Value::String("[REDACTED]".to_string()));
+            }
+            return;
+        }
+        let Some(next) = object.get_mut(part) else {
+            return;
+        };
+        current = next;
+    }
+}
+
+fn apply_payload_mode(item: &mut Value, mode: ExportPayloadMode) -> Result<()> {
+    if mode == ExportPayloadMode::Full {
+        return Ok(());
+    }
+    let Some(payload) = item
+        .get_mut("data")
+        .and_then(|data| data.get_mut("payload"))
+    else {
+        return Ok(());
+    };
+    match mode {
+        ExportPayloadMode::Full => {}
+        ExportPayloadMode::Hash => {
+            let payload_json = serde_json::to_string(payload)?;
+            *payload = json!({
+                "sha256": sha256_hex(&payload_json),
+                "redacted": true
+            });
+        }
+        ExportPayloadMode::Drop => {
+            *payload = Value::Null;
+        }
+    }
+    Ok(())
+}
+
+fn export_metrics(
+    started_at_ms: u64,
+    batches: u64,
+    rows: u64,
+    filtered_items: u64,
+    inserted_rows: u64,
+    retry_attempts: u64,
+) -> Value {
+    let completed_at_ms = now_ms();
+    let duration_ms = completed_at_ms.saturating_sub(started_at_ms).max(1);
+    json!({
+        "started_at_ms": started_at_ms,
+        "completed_at_ms": completed_at_ms,
+        "duration_ms": duration_ms,
+        "batches": batches,
+        "rows": rows,
+        "filtered_items": filtered_items,
+        "inserted_rows": inserted_rows,
+        "retry_attempts": retry_attempts,
+        "rows_per_second": (rows as f64) * 1000.0 / (duration_ms as f64)
+    })
+}
+
+fn write_metrics_output(path: Option<&PathBuf>, result: &Value) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create metrics output directory {}", parent.display()))?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(result)?)
+        .with_context(|| format!("write metrics output {}", path.display()))?;
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
@@ -2388,6 +2784,10 @@ fn sha256_hex_64(input: &str) -> String {
     hex_prefix(input, 8)
 }
 
+fn sha256_hex(input: &str) -> String {
+    hex_prefix(input, 32)
+}
+
 fn hex_prefix(input: &str, bytes: usize) -> String {
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(bytes * 2);
@@ -2512,9 +2912,9 @@ async fn clickhouse_insert_json_each_row(
     batch_id: &str,
     max_retries: u32,
     retry_initial_backoff_ms: u64,
-) -> Result<()> {
+) -> Result<u32> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut body = format!(
         "INSERT INTO {table} SETTINGS insert_deduplicate=1, insert_deduplication_token={} FORMAT JSONEachRow\n",
@@ -2532,11 +2932,11 @@ async fn clickhouse_query_with_retry(
     sql: &str,
     max_retries: u32,
     retry_initial_backoff_ms: u64,
-) -> Result<()> {
+) -> Result<u32> {
     let mut attempt = 0_u32;
     loop {
         match clickhouse_query(url, sql).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(attempt),
             Err(error) if attempt < max_retries => {
                 let delay = retry_initial_backoff_ms.saturating_mul(1_u64 << attempt.min(10));
                 eprintln!(
@@ -3433,6 +3833,8 @@ mod tests {
             poll_interval_ms: 1000,
             max_retries: 3,
             retry_initial_backoff_ms: 250,
+            privacy: ExportPrivacyArgs::default(),
+            metrics_output: None,
             dry_run: false,
         };
         assert_eq!(
@@ -3459,6 +3861,8 @@ mod tests {
             tail: false,
             max_batches: None,
             poll_interval_ms: 1000,
+            privacy: ExportPrivacyArgs::default(),
+            metrics_output: None,
             dry_run: false,
         };
         assert_eq!(
@@ -3524,6 +3928,26 @@ mod tests {
     }
 
     #[test]
+    fn clickstack_config_includes_source_fields_and_dashboard_payload() {
+        let config = clickstack_config(ClickStackConfigArgs {
+            service_name: "AgentDB Prod".into(),
+            logs_source: "agentdb_clickstack_logs".into(),
+            traces_source: "agentdb_clickstack_traces".into(),
+        });
+        assert_eq!(config["sources"][0]["table"], "agentdb_clickstack_logs");
+        assert_eq!(config["sources"][0]["trace_id_field"], "TraceId");
+        assert_eq!(config["sources"][1]["duration_field"], "Duration");
+        assert_eq!(
+            config["dashboard"]["name"],
+            "AgentDB Prod Runtime Observability"
+        );
+        assert!(config["clickhouse_cloud_api"]["base_url"]
+            .as_str()
+            .unwrap()
+            .contains("/clickstack"));
+    }
+
+    #[test]
     fn renders_clickhouse_schema_plan_as_copyable_sql() {
         let rendered = render_table(&json!({
             "status": "dry_run",
@@ -3550,6 +3974,60 @@ mod tests {
             export_batch_id("agentdb_events", &items),
             export_batch_id("agentdb_otel_logs", &items)
         );
+    }
+
+    #[test]
+    fn export_privacy_filters_and_redacts_items() {
+        let items = vec![
+            json!({
+                "cursor": "ledger:1",
+                "object_type": "event",
+                "kind": "model_call",
+                "data": {
+                    "payload": {
+                        "prompt": "secret",
+                        "nested": {"token": "abc"}
+                    }
+                }
+            }),
+            json!({
+                "cursor": "ledger:2",
+                "object_type": "event",
+                "kind": "debug"
+            }),
+            json!({
+                "cursor": "ledger:3",
+                "object_type": "record",
+                "data": {"payload": "record-secret"}
+            }),
+        ];
+        let privacy = ExportPrivacyArgs {
+            allow_object_types: vec!["events".into()],
+            deny_object_types: vec![],
+            allow_event_kinds: vec![],
+            deny_event_kinds: vec!["debug".into()],
+            redact_fields: vec!["data.payload.nested.token".into()],
+            payload_mode: ExportPayloadMode::Hash,
+        };
+
+        let filtered = apply_export_privacy(items, &privacy).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["kind"], "model_call");
+        assert_eq!(filtered[0]["data"]["payload"]["redacted"], true);
+        assert!(filtered[0]["data"]["payload"]["sha256"].as_str().is_some());
+        assert!(!filtered[0].to_string().contains("secret"));
+        assert!(!filtered[0].to_string().contains("abc"));
+    }
+
+    #[test]
+    fn export_metrics_reports_rates_and_filtered_items() {
+        let metrics = export_metrics(now_ms().saturating_sub(1000), 2, 10, 3, 20, 1);
+        assert_eq!(metrics["batches"], 2);
+        assert_eq!(metrics["rows"], 10);
+        assert_eq!(metrics["filtered_items"], 3);
+        assert_eq!(metrics["inserted_rows"], 20);
+        assert_eq!(metrics["retry_attempts"], 1);
+        assert!(metrics["rows_per_second"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

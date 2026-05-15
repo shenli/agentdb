@@ -343,6 +343,11 @@ Use `agentdbctl export jsonl run --output ./events.jsonl` or an object-store URI
 such as `s3://bucket/prefix/events.jsonl` for raw JSONL archives. The JSONL
 command writes the same export envelopes returned by `exports/watch` and
 supports managed consumer claim/ack options.
+ClickHouse and JSONL runs also support exporter-side minimization flags:
+`--allow-object-type`, `--deny-object-type`, `--allow-event-kind`,
+`--deny-event-kind`, `--redact-field`, `--payload-mode full|hash|drop`, and
+`--metrics-output`. These controls run in the connector before external sink
+writes and the metrics file is refreshed after each processed batch.
 Use `agentdbctl export parquet from-jsonl` to convert those archives to Parquet
 through DuckDB for warehouse and lakehouse ingestion.
 `exports/backfill` supports event snapshots plus tenant-scope metadata

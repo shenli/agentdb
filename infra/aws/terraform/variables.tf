@@ -196,6 +196,35 @@ variable "clickhouse_export_retry_initial_backoff_ms" {
   default     = 250
 }
 
+variable "clickhouse_export_payload_mode" {
+  type        = string
+  description = "Exporter-side payload handling before writing ClickHouse: full, hash, or drop."
+  default     = "full"
+
+  validation {
+    condition     = contains(["full", "hash", "drop"], var.clickhouse_export_payload_mode)
+    error_message = "clickhouse_export_payload_mode must be full, hash, or drop."
+  }
+}
+
+variable "clickhouse_export_metrics_output" {
+  type        = string
+  description = "Local status JSON path refreshed by the ClickHouse exporter."
+  default     = "/home/ec2-user/agentdb-deploy/logs/clickhouse-export-status.json"
+}
+
+variable "clickhouse_export_deny_event_kinds" {
+  type        = string
+  description = "Optional comma-separated event kinds to suppress before writing ClickHouse."
+  default     = ""
+}
+
+variable "clickhouse_export_redact_fields" {
+  type        = string
+  description = "Optional comma-separated dot paths to redact before writing ClickHouse."
+  default     = ""
+}
+
 variable "jsonl_export_tenant_id" {
   type        = string
   description = "Tenant id to export to JSONL when jsonl_export_uri is set."
@@ -230,4 +259,21 @@ variable "jsonl_export_max_batches" {
   type        = number
   description = "Maximum JSONL export batches for bounded object-store archive runs."
   default     = 1000
+}
+
+variable "jsonl_export_payload_mode" {
+  type        = string
+  description = "Exporter-side payload handling before writing JSONL: full, hash, or drop."
+  default     = "full"
+
+  validation {
+    condition     = contains(["full", "hash", "drop"], var.jsonl_export_payload_mode)
+    error_message = "jsonl_export_payload_mode must be full, hash, or drop."
+  }
+}
+
+variable "jsonl_export_metrics_output" {
+  type        = string
+  description = "Local status JSON path refreshed by the JSONL exporter."
+  default     = "/home/ec2-user/agentdb-deploy/logs/jsonl-export-status.json"
 }
