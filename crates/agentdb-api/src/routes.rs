@@ -68,6 +68,7 @@ const RECORD_COMMIT_SEQ_HEADER: &str = "X-AgentDB-Record-Commit-Seq";
 const INTERNAL_AUTH_HEADER: &str = "X-AgentDB-Internal-Token";
 const DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 
 /// Per-request body cap for the artifact POST route. The runtime enforces a
 /// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
@@ -577,13 +578,17 @@ struct PrepareTabletReplacementBody {
     stale_threshold_ms: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CompleteTabletReplacementBody {
     target_node_id: String,
     source_node_id: Option<String>,
     min_applied_index: Option<i64>,
     require_healthy: Option<bool>,
     retire_source: Option<bool>,
+    /// Drive raft snapshot catch-up for the target before enforcing applied-index readiness.
+    catch_up: Option<bool>,
+    catch_up_attempts: Option<usize>,
+    catch_up_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -626,6 +631,8 @@ struct AdminTabletReplacementCompleteResponse {
     tablet: AdminTabletView,
     source_replica: Option<AdminTabletReplicaView>,
     target_replica: AdminTabletReplicaView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catch_up: Option<RaftCatchUpResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -837,7 +844,7 @@ struct RaftMembershipOperationStatus {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RaftCatchUpBody {
     tablet_id: Option<i64>,
     target_node_id: Option<String>,
@@ -1114,12 +1121,45 @@ async fn post_internal_raft_snapshot(
             )
                 .into_response()
         }
+        Err(err) if is_stale_raft_snapshot_error(&err.to_string()) => {
+            if let Some(registry) = s.raft_registry.as_ref() {
+                if let Ok(statuses) = registry.status_for(body.tablet_id) {
+                    if let Some(status) = statuses
+                        .into_iter()
+                        .find(|status| status.node_id == body.to)
+                    {
+                        record_local_raft_replica_progress(
+                            &s,
+                            body.tablet_id,
+                            body.to,
+                            status.applied_index,
+                            status.commit_index,
+                        )
+                        .await;
+                    }
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(InternalRaftAccepted {
+                    status: "already_applied",
+                    tablet_id: body.tablet_id,
+                    from: body.from,
+                    to: body.to,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => internal_raft_error(
             StatusCode::BAD_REQUEST,
             "RAFT_SNAPSHOT_REJECTED",
             err.to_string(),
         ),
     }
+}
+
+fn is_stale_raft_snapshot_error(error: &str) -> bool {
+    error.contains("stale raft-rs snapshot") || error.contains("snapshot out of date")
 }
 
 async fn post_internal_tablet_movement_snapshot_export(
@@ -2490,7 +2530,7 @@ async fn prepare_admin_tablet_split(
         tablet_movements::upsert_pending(
             meta.pool(),
             &movement_id,
-            "split",
+            "manual_split",
             tablet_id,
             child.tablet_id,
             &placement_scope_id,
@@ -2743,7 +2783,7 @@ async fn prepare_admin_tablet_merge(
         tablet_movements::upsert_pending(
             meta.pool(),
             &movement_id,
-            "merge",
+            "manual_merge",
             *source_id,
             body.destination_tablet_id,
             &placement_scope_id,
@@ -3043,10 +3083,14 @@ async fn complete_admin_tablet_handoff(
 ) -> Result<Json<AdminTabletHandoffCompleteResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let _ = get_tablet_or_404(meta, tablet_id).await?;
-    let new_owner =
-        tablets::complete_handoff(meta.pool(), tablet_id, &body.expected_source_node_id)
-            .await
-            .map_err(internal_error)?;
+    let new_owner = tablets::complete_handoff_with_lease(
+        meta.pool(),
+        tablet_id,
+        &body.expected_source_node_id,
+        now_ms_i64().saturating_add(DEFAULT_ADMIN_TABLET_LEASE_MS),
+    )
+    .await
+    .map_err(internal_error)?;
     let changed = new_owner.is_some();
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
     Ok(Json(AdminTabletHandoffCompleteResponse {
@@ -3163,12 +3207,14 @@ async fn complete_admin_tablet_replacement(
 ) -> Result<Json<AdminTabletReplacementCompleteResponse>, ApiError> {
     let meta = meta_required(&s)?;
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
-    if tablet.owner_node_id.as_deref() == Some(body.target_node_id.as_str()) {
+    let target_node_id = body.target_node_id.clone();
+    let require_healthy = body.require_healthy.unwrap_or(true);
+    if tablet.owner_node_id.as_deref() == Some(target_node_id.as_str()) {
         return Err(invalid_admin_request(
             "replacement target already owns the tablet",
         ));
     }
-    let source_node_id = body.source_node_id.or(tablet.owner_node_id.clone());
+    let source_node_id = body.source_node_id.clone().or(tablet.owner_node_id.clone());
     if source_node_id.is_none() {
         return Err(invalid_admin_request(
             "tablet replacement requires a current owner or explicit source_node_id",
@@ -3181,25 +3227,19 @@ async fn complete_admin_tablet_replacement(
             )));
         }
     }
-    if tablet.handoff_target_node_id.as_deref() != Some(body.target_node_id.as_str()) {
+    if tablet.handoff_target_node_id.as_deref() != Some(target_node_id.as_str()) {
         return Err(invalid_admin_request(
             "replacement must be prepared before it can be completed",
         ));
     }
-    let target_replica = get_tablet_replica(meta, tablet_id, &body.target_node_id)
+    let mut target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
         .await?
         .ok_or_else(|| {
             invalid_admin_request(format!(
                 "target replica {} does not exist for tablet {tablet_id}",
-                body.target_node_id
+                target_node_id
             ))
         })?;
-    if body.require_healthy.unwrap_or(true) && target_replica.health != "healthy" {
-        return Err(invalid_admin_request(format!(
-            "target replica {} is {}; wait for catch-up or set require_healthy=false",
-            body.target_node_id, target_replica.health
-        )));
-    }
     let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
         get_tablet_replica(meta, tablet_id, source_node_id).await?
     } else {
@@ -3219,14 +3259,151 @@ async fn complete_admin_tablet_replacement(
             "min_applied_index must be non-negative",
         ));
     }
+
+    let mut catch_up_response = None;
+    if body.catch_up.unwrap_or(false)
+        && ((require_healthy && target_replica.health != "healthy")
+            || target_replica.applied_index < required_applied_index)
+    {
+        let attempts = body.catch_up_attempts.unwrap_or(3).max(1);
+        let wait_ms = body.catch_up_wait_ms.unwrap_or(500);
+        for attempt in 0..attempts {
+            catch_up_response = Some(
+                run_raft_catch_up(
+                    &s,
+                    meta,
+                    RaftCatchUpBody {
+                        tablet_id: Some(tablet_id),
+                        target_node_id: Some(target_node_id.clone()),
+                        min_lag: Some(0),
+                        retention_ms: None,
+                        dry_run: Some(false),
+                    },
+                )
+                .await?,
+            );
+            target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid_admin_request(format!(
+                        "target replica {target_node_id} does not exist for tablet {tablet_id}"
+                    ))
+                })?;
+            if target_replica.applied_index >= required_applied_index
+                && (!require_healthy || target_replica.health == "healthy")
+            {
+                break;
+            }
+            if attempt + 1 < attempts && wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+        }
+    }
+    if require_healthy && target_replica.health != "healthy" {
+        return Err(invalid_admin_request(format!(
+            "target replica {} is {}; wait for catch-up or set require_healthy=false",
+            target_node_id, target_replica.health
+        )));
+    }
     if target_replica.applied_index < required_applied_index {
         return Err(invalid_admin_request(format!(
             "target replica {} applied_index {} is below required_applied_index {}",
-            body.target_node_id, target_replica.applied_index, required_applied_index
+            target_node_id, target_replica.applied_index, required_applied_index
         )));
     }
 
     let retire_source = body.retire_source.unwrap_or(false);
+    if retire_source {
+        if let Some(registry) = s.raft_registry.as_ref() {
+            if let Ok(statuses) = registry.status_for(tablet_id) {
+                let local_is_leader = statuses.iter().any(|status| status.role == "Leader");
+                if !local_is_leader {
+                    let leader_id = statuses
+                        .iter()
+                        .find(|status| status.leader_id != 0)
+                        .map(|status| status.leader_id);
+                    if let Some(leader_id) = leader_id {
+                        let Some(leader_node_id) =
+                            resolve_control_plane_node_id(meta, tablet_id, leader_id)
+                                .await
+                                .map_err(internal_error)?
+                        else {
+                            return Err(invalid_admin_request(format!(
+                                "tablet raft leader {leader_id} has no control-plane replica mapping"
+                            )));
+                        };
+                        if source_node_id.as_deref() == Some(leader_node_id.as_str()) {
+                            // Local raft-rs state can temporarily remember this
+                            // node as leader after a restart while the RawNode is
+                            // still catching up. Let the normal local retry path
+                            // report a retryable error instead of forwarding to
+                            // ourselves.
+                        } else if let Some(leader_node) = nodes::get(meta.pool(), &leader_node_id)
+                            .await
+                            .map_err(internal_error)?
+                        {
+                            let uri = format!(
+                                "{}/api/admin/tablets/{tablet_id}/replacement/complete",
+                                leader_node.address.trim_end_matches('/')
+                            );
+                            let response = s
+                                .proxy
+                                .post(&uri)
+                                .json(&body)
+                                .send()
+                                .await
+                                .map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to forward replacement completion to raft leader {leader_node_id}: {err}"
+                                    ))
+                                })?;
+                            let status = response.status();
+                            let bytes = response.bytes().await.map_err(|err| {
+                                internal_error(format!(
+                                    "failed to read raft-leader replacement completion response: {err}"
+                                ))
+                            })?;
+                            if !status.is_success() {
+                                return Err(internal_error(format!(
+                                    "raft-leader replacement completion on {leader_node_id} returned {status}: {}",
+                                    String::from_utf8_lossy(&bytes)
+                                )));
+                            }
+                            let tablet = get_tablet_or_404(meta, tablet_id).await?;
+                            let source_replica =
+                                if let Some(source_node_id) = source_node_id.as_ref() {
+                                    get_tablet_replica(meta, tablet_id, source_node_id).await?
+                                } else {
+                                    None
+                                };
+                            let target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    internal_error(format!(
+                                        "forwarded replacement completed without target replica {target_node_id}"
+                                    ))
+                                })?;
+                            return Ok(Json(AdminTabletReplacementCompleteResponse {
+                                action: "complete_replacement",
+                                changed: true,
+                                new_owner_node_id: tablet.owner_node_id.clone(),
+                                source_node_id,
+                                target_node_id,
+                                required_applied_index,
+                                raft_membership_changed: true,
+                                raft_membership_operations: Vec::new(),
+                                retired_source: retire_source,
+                                tablet: tablet_view(tablet),
+                                source_replica: source_replica.map(tablet_replica_view),
+                                target_replica: tablet_replica_view(target_replica),
+                                catch_up: catch_up_response,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut raft_membership_changed = false;
     let mut raft_membership_operations = Vec::new();
     if let Some(registry) = s.raft_registry.as_ref() {
@@ -3242,15 +3419,15 @@ async fn complete_admin_tablet_replacement(
                         .map(|status| status.leader_id)
                 })
                 .ok_or_else(|| invalid_admin_request("tablet raft group has no known leader"))?;
-            let target_raft_node_id = agentdb_storage::stable_raft_node_id(&body.target_node_id)
-                .map_err(internal_error)?;
+            let target_raft_node_id =
+                agentdb_storage::stable_raft_node_id(&target_node_id).map_err(internal_error)?;
             match registry.promote_to_voter(tablet_id, leader_id, target_raft_node_id) {
                 Ok(()) => {
                     raft_membership_changed = true;
                     raft_membership_operations.push(RaftMembershipOperationStatus {
                         tablet_id,
                         operation: "promote_to_voter",
-                        node_id: body.target_node_id.clone(),
+                        node_id: target_node_id.clone(),
                         raft_node_id: Some(target_raft_node_id),
                         status: "applied",
                         error: None,
@@ -3261,12 +3438,92 @@ async fn complete_admin_tablet_replacement(
                     raft_membership_operations.push(RaftMembershipOperationStatus {
                         tablet_id,
                         operation: "promote_to_voter",
-                        node_id: body.target_node_id.clone(),
+                        node_id: target_node_id.clone(),
                         raft_node_id: Some(target_raft_node_id),
                         status: "failed",
                         error: Some(message.clone()),
                     });
                     return Err(internal_error(message));
+                }
+            }
+            if let Some(source_node_id) = source_node_id.as_ref() {
+                let source_raft_node_id =
+                    agentdb_storage::stable_raft_node_id(source_node_id).map_err(internal_error)?;
+                if leader_id == source_raft_node_id && leader_id != target_raft_node_id {
+                    match registry.transfer_leader(tablet_id, leader_id, target_raft_node_id) {
+                        Ok(()) => {
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: "requested",
+                                error: None,
+                            });
+                            let token = s.internal_auth_token.clone().ok_or_else(|| {
+                                invalid_admin_request(
+                                    "internal auth token is required for raft leader transfer",
+                                )
+                            })?;
+                            let configured_by_tablet =
+                                load_configured_raft_replicas(Some(meta)).await?;
+                            let outbox = RaftRsHttpOutbox::new(token);
+                            outbox.replace_peer_urls(
+                                load_raft_peer_urls(meta, &configured_by_tablet).await?,
+                            );
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            let mut observed = false;
+                            loop {
+                                let statuses = registry.status_for(tablet_id).map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to observe raft leader transfer: {err}"
+                                    ))
+                                })?;
+                                if statuses.iter().any(|status| {
+                                    status.node_id == target_raft_node_id && status.role == "Leader"
+                                }) || statuses
+                                    .iter()
+                                    .any(|status| status.leader_id == target_raft_node_id)
+                                {
+                                    observed = true;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    break;
+                                }
+                                outbox.flush_registry_once(registry).await.map_err(|err| {
+                                    internal_error(format!(
+                                        "failed to flush raft leader transfer messages: {err}"
+                                    ))
+                                })?;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: if observed { "observed" } else { "timeout" },
+                                error: (!observed).then(|| {
+                                    format!(
+                                        "target {target_node_id} did not become raft leader before replacement completion"
+                                    )
+                                }),
+                            });
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            raft_membership_operations.push(RaftMembershipOperationStatus {
+                                tablet_id,
+                                operation: "transfer_leader",
+                                node_id: target_node_id.clone(),
+                                raft_node_id: Some(target_raft_node_id),
+                                status: "failed",
+                                error: Some(message.clone()),
+                            });
+                            return Err(internal_error(message));
+                        }
+                    }
                 }
             }
             if retire_source {
@@ -3316,7 +3573,7 @@ async fn complete_admin_tablet_replacement(
     tablet_replicas::upsert(
         meta.pool(),
         tablet_id,
-        &body.target_node_id,
+        &target_node_id,
         "voter",
         &target_replica.health,
         target_replica.applied_index,
@@ -3335,9 +3592,14 @@ async fn complete_admin_tablet_replacement(
     let expected_source = source_node_id.clone().ok_or_else(|| {
         invalid_admin_request("source_node_id is required to complete tablet replacement")
     })?;
-    let new_owner = tablets::complete_handoff(meta.pool(), tablet_id, &expected_source)
-        .await
-        .map_err(internal_error)?;
+    let new_owner = tablets::complete_handoff_with_lease(
+        meta.pool(),
+        tablet_id,
+        &expected_source,
+        now_ms_i64().saturating_add(DEFAULT_ADMIN_TABLET_LEASE_MS),
+    )
+    .await
+    .map_err(internal_error)?;
     let changed = new_owner.is_some();
     let tablet = get_tablet_or_404(meta, tablet_id).await?;
     let source_replica = if let Some(source_node_id) = source_node_id.as_ref() {
@@ -3353,7 +3615,7 @@ async fn complete_admin_tablet_replacement(
         changed,
         new_owner_node_id: new_owner,
         source_node_id,
-        target_node_id: body.target_node_id,
+        target_node_id,
         required_applied_index,
         raft_membership_changed,
         raft_membership_operations,
@@ -3361,6 +3623,7 @@ async fn complete_admin_tablet_replacement(
         tablet: tablet_view(tablet),
         source_replica: source_replica.map(tablet_replica_view),
         target_replica: tablet_replica_view(target_replica),
+        catch_up: catch_up_response,
     }))
 }
 
@@ -3920,10 +4183,18 @@ async fn post_raft_catch_up(
     State(s): State<AppState>,
     Json(body): Json<RaftCatchUpBody>,
 ) -> Result<Json<RaftCatchUpResponse>, ApiError> {
+    let meta = meta_required(&s)?;
+    Ok(Json(run_raft_catch_up(&s, meta, body).await?))
+}
+
+async fn run_raft_catch_up(
+    s: &AppState,
+    meta: &agentdb_meta::MetaStore,
+    body: RaftCatchUpBody,
+) -> Result<RaftCatchUpResponse, ApiError> {
     if body.tablet_id.is_some_and(|tablet_id| tablet_id <= 0) {
         return Err(invalid_admin_request("tablet_id must be positive"));
     }
-    let meta = meta_required(&s)?;
     let Some(registry) = s.raft_registry.as_ref() else {
         return Err(invalid_admin_request(
             "raft registry is not configured on this node",
@@ -4176,7 +4447,7 @@ async fn post_raft_catch_up(
         ));
     }
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 async fn get_raft_snapshots(

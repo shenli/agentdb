@@ -32,16 +32,20 @@ Nightly stability validation:
 ops/local-ci/scripts/local-ci-nightly.sh
 ```
 
-The nightly profile runs the full local CI plus bounded random cluster chaos:
-one node is killed and restarted at a time while the harness keeps appending and
-verifying session events. This preserves quorum, but exercises leader failover,
-follower loss/rejoin, restart recovery, and catch-up.
+The nightly profile runs the full local CI plus deterministic cluster hardening
+and bounded random cluster chaos. The hardening stage covers persisted process
+restart, checkpoint install, explicit replacement, one-AZ loss, rolling restart,
+and split/merge metadata cutover. The chaos stage kills and restarts one node at
+a time while the harness keeps appending and verifying session events. This
+preserves quorum, but exercises leader failover, follower loss/rejoin, restart
+recovery, and catch-up.
 
 Useful chaos options:
 
 ```bash
 ops/local-ci/scripts/local-ci.sh --cluster-only --chaos --chaos-iterations 48
 ops/local-ci/scripts/local-ci.sh --cluster-only --chaos --chaos-seed 12345
+ops/local-ci/scripts/local-ci.sh --cluster-only --hardening
 ```
 
 ## Results

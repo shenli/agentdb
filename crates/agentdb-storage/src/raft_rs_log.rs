@@ -19,7 +19,7 @@ use prost::Message as ProstMessage;
 use raft::{
     eraftpb::{
         ConfChangeSingle, ConfChangeType, ConfChangeV2, Entry, EntryType, HardState, Message,
-        Snapshot,
+        MessageType, Snapshot,
     },
     raw_node::RawNode,
     storage::MemStorage,
@@ -323,6 +323,13 @@ impl RaftRsSharedGroup {
             .lock()
             .expect("raft-rs group lock poisoned")
             .campaign(node_id)
+    }
+
+    pub fn transfer_leader(&self, leader_id: u64, transferee_id: u64) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("raft-rs group lock poisoned")
+            .transfer_leader(leader_id, transferee_id)
     }
 
     pub fn status(&self) -> Vec<RaftRsReplicaStatus> {
@@ -644,12 +651,32 @@ impl RaftRsGroup {
             return Ok(());
         }
         let to = message.to;
-        let raft_message = message.into_raft_message()?;
+        let mut raft_message = message.into_raft_message()?;
+        self.clamp_out_of_order_heartbeat_commit(to, &mut raft_message)?;
         self.node_mut(to)?
             .raw
             .step(raft_message)
             .map_err(map_raft_error)?;
         self.drive_until_idle()
+    }
+
+    fn clamp_out_of_order_heartbeat_commit(&self, to: u64, message: &mut Message) -> Result<()> {
+        if message.get_msg_type() != MessageType::MsgHeartbeat {
+            return Ok(());
+        }
+        let last_index = self.node(to)?.raw.raft.raft_log.last_index();
+        if message.commit > last_index {
+            tracing::debug!(
+                tablet_id = self.tablet_id,
+                to,
+                from = message.from,
+                leader_commit = message.commit,
+                last_index,
+                "clamped out-of-order raft heartbeat commit to local last index"
+            );
+            message.commit = last_index;
+        }
+        Ok(())
     }
 
     fn tick(&mut self, node_id: u64) -> Result<()> {
@@ -736,10 +763,11 @@ impl RaftRsGroup {
         let node = self.node_mut(to)?;
         let snapshot = transfer.into_snapshot()?;
         let metadata = snapshot.get_metadata();
-        if metadata.index < node.last_applied_index {
+        let applied_index = node.last_applied_index.max(node.raw.raft.raft_log.applied);
+        if metadata.index < applied_index {
             return Err(Error::Other(format!(
                 "stale raft-rs snapshot at index {}; node {to} is already applied through {}",
-                metadata.index, node.last_applied_index
+                metadata.index, applied_index
             )));
         }
         let application_snapshot = snapshot.get_data().to_vec();
@@ -765,10 +793,25 @@ impl RaftRsGroup {
         self.drive_until_idle()
     }
 
+    fn transfer_leader(&mut self, leader_id: u64, transferee_id: u64) -> Result<()> {
+        if leader_id == transferee_id {
+            return Ok(());
+        }
+        if self.node(leader_id)?.raw.status().ss.raft_state != StateRole::Leader {
+            return Err(Error::Other(format!(
+                "raft-rs node {leader_id} is not leader and cannot transfer leadership to {transferee_id}"
+            )));
+        }
+        self.node_mut(leader_id)?.raw.transfer_leader(transferee_id);
+        self.drive_until_idle()
+    }
+
     fn append(&mut self, node_id: u64, tablet_id: i64, command: Vec<u8>) -> Result<LogCommit> {
         self.validate_append_target(node_id, tablet_id)?;
         if self.node(node_id)?.raw.status().ss.raft_state != StateRole::Leader {
-            self.elect(node_id)?;
+            return Err(Error::Other(format!(
+                "raft-rs node {node_id} is not leader for tablet {tablet_id}"
+            )));
         }
         let previous_applied_index = self.node(node_id)?.last_applied_index;
         self.node_mut(node_id)?
@@ -822,6 +865,15 @@ impl RaftRsGroup {
             )));
         }
         let node = self.node_mut(node_id)?;
+        let applied_index = node.last_applied_index.min(node.raw.raft.raft_log.applied);
+        let up_to_index = if up_to_index >= applied_index {
+            applied_index.saturating_sub(1)
+        } else {
+            up_to_index
+        };
+        if up_to_index == 0 {
+            return Ok(0);
+        }
         let snapshot = node
             .storage
             .snapshot(up_to_index, node_id)
@@ -932,10 +984,17 @@ impl RaftRsGroup {
         outbound.extend(ready.take_persisted_messages());
         let mut applied_conf_change =
             node.apply_committed(ready.take_committed_entries(), tablet_id)?;
-        let mut light = node.raw.advance(ready);
+        let mut light = node.raw.advance_append(ready);
         outbound.extend(light.take_messages());
         applied_conf_change |= node.apply_committed(light.take_committed_entries(), tablet_id)?;
-        node.raw.advance_apply_to(node.last_applied_index);
+        let raft_applied_index = node.raw.raft.raft_log.applied;
+        let committed_index = node.raw.raft.raft_log.committed;
+        if committed_index >= raft_applied_index {
+            node.last_applied_index = node
+                .last_applied_index
+                .clamp(raft_applied_index, committed_index);
+            node.raw.advance_apply_to(node.last_applied_index);
+        }
         if applied_conf_change {
             self.pending_conf_change = false;
         }
@@ -977,16 +1036,7 @@ impl RaftRsNode {
         let engine = open_engine(&config.raft_engine_dir)?;
         let storage = MemStorage::new_with_conf_state((voters.to_vec(), learners.to_vec()));
         let replay = replay_raft_engine_to_storage(&engine, raft_group_id, &storage)?;
-        let raft_config = Config {
-            id: config.node_id,
-            election_tick: 10,
-            heartbeat_tick: 3,
-            max_size_per_msg: u64::MAX,
-            max_inflight_msgs: 256,
-            check_quorum: false,
-            pre_vote: true,
-            ..Default::default()
-        };
+        let raft_config = raft_node_config(config.node_id, replay.last_applied_index);
         raft_config.validate().map_err(map_raft_error)?;
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         let raw = RawNode::new(&raft_config, storage.clone(), &logger).map_err(map_raft_error)?;
@@ -1038,6 +1088,9 @@ impl RaftRsNode {
     fn apply_committed(&mut self, entries: Vec<Entry>, tablet_id: i64) -> Result<bool> {
         let mut applied_conf_change = false;
         for entry in entries {
+            if entry.index <= self.last_applied_index {
+                continue;
+            }
             self.last_applied_index = entry.index;
             if entry.entry_type == EntryType::EntryConfChangeV2 as i32 {
                 let cc = ConfChangeV2::decode(entry.data.as_slice()).map_err(map_prost_error)?;
@@ -1102,10 +1155,27 @@ impl RaftRsNode {
             .wl()
             .apply_snapshot(snapshot.clone())
             .map_err(map_raft_error)?;
+        let mut hard_state = self
+            .storage
+            .initial_state()
+            .map_err(map_raft_error)?
+            .hard_state;
+        hard_state.commit = hard_state.commit.max(index);
+        self.storage.wl().set_hardstate(hard_state);
         self.persist_snapshot(&snapshot)?;
-        self.last_applied_index = index;
+        self.rebuild_raw_node(index)?;
+        self.last_applied_index = self.last_applied_index.max(index);
         self.committed.retain(|entry| entry.index > index);
         self.compact_engine_entries(index)?;
+        Ok(())
+    }
+
+    fn rebuild_raw_node(&mut self, applied: u64) -> Result<()> {
+        let raft_config = raft_node_config(self.node_id, applied);
+        raft_config.validate().map_err(map_raft_error)?;
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        self.raw =
+            RawNode::new(&raft_config, self.storage.clone(), &logger).map_err(map_raft_error)?;
         Ok(())
     }
 
@@ -1134,6 +1204,20 @@ impl RaftRsNode {
             .write(&mut batch, true)
             .map(|_| ())
             .map_err(map_raft_engine_error)
+    }
+}
+
+fn raft_node_config(node_id: u64, applied: u64) -> Config {
+    Config {
+        id: node_id,
+        election_tick: 10,
+        heartbeat_tick: 3,
+        applied,
+        max_size_per_msg: u64::MAX,
+        max_inflight_msgs: 256,
+        check_quorum: false,
+        pre_vote: true,
+        ..Default::default()
     }
 }
 
@@ -1184,10 +1268,8 @@ fn replay_raft_engine_to_storage(
     } else {
         0
     };
-    let hard_state = if let Some(bytes) = engine.get(raft_group_id, HARD_STATE_KEY) {
-        let hard_state = HardState::decode(bytes.as_slice()).map_err(map_prost_error)?;
-        storage.wl().set_hardstate(hard_state.clone());
-        hard_state
+    let mut hard_state = if let Some(bytes) = engine.get(raft_group_id, HARD_STATE_KEY) {
+        HardState::decode(bytes.as_slice()).map_err(map_prost_error)?
     } else {
         HardState::default()
     };
@@ -1206,10 +1288,21 @@ fn replay_raft_engine_to_storage(
             },
         )
         .map_err(map_raft_engine_error)?;
-    let entries: Vec<_> = entries_by_index.into_values().collect();
+    let entries: Vec<_> = entries_by_index
+        .into_values()
+        .filter(|entry| entry.index > snapshot_index)
+        .collect();
     if !entries.is_empty() {
         storage.wl().append(&entries).map_err(map_raft_error)?;
     }
+    let last_index = entries
+        .last()
+        .map(|entry| entry.index)
+        .unwrap_or(snapshot_index);
+    if hard_state.commit > last_index {
+        hard_state.set_commit(last_index);
+    }
+    storage.wl().set_hardstate(hard_state.clone());
     let mut committed_entries = Vec::new();
     for entry in &entries {
         if entry.index <= hard_state.commit
@@ -1226,7 +1319,7 @@ fn replay_raft_engine_to_storage(
     }
     Ok(RaftEngineReplay {
         committed_entries,
-        last_applied_index: hard_state.commit.max(snapshot_index),
+        last_applied_index: hard_state.commit,
     })
 }
 
@@ -1356,6 +1449,7 @@ mod tests {
     fn raft_rs_log_persists_entries_to_tikv_raft_engine() {
         let (_dir, configs) = configs(3);
         let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
         logs[0].append(7, b"persisted".to_vec()).unwrap();
 
         let guard = group.inner.lock().unwrap();
@@ -1391,7 +1485,8 @@ mod tests {
     #[test]
     fn raft_rs_log_compacts_persisted_engine_entries() {
         let (_dir, configs) = configs(3);
-        let (_group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
         logs[0].append(7, b"first".to_vec()).unwrap();
         logs[0].append(7, b"second".to_vec()).unwrap();
 
@@ -1408,7 +1503,8 @@ mod tests {
     #[test]
     fn raft_rs_log_can_append_after_compacting_through_current_commit() {
         let (_dir, configs) = configs(3);
-        let (_group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
         logs[0].append(7, b"before-compaction".to_vec()).unwrap();
         let current = logs[0].append(7, b"compact-through-me".to_vec()).unwrap();
 
@@ -1438,6 +1534,20 @@ mod tests {
         logs[2].compact(7, current.index).unwrap();
 
         group.campaign(3).unwrap();
+    }
+
+    #[test]
+    fn raft_rs_transfer_leader_moves_leadership_to_transferee() {
+        let (_dir, configs) = configs(3);
+        let (group, _logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+
+        group.transfer_leader(1, 2).unwrap();
+
+        let statuses = group.status();
+        assert!(statuses
+            .iter()
+            .any(|status| status.node_id == 2 && status.role == "Leader"));
     }
 
     #[test]
@@ -1498,6 +1608,25 @@ mod tests {
             b"majority"
         );
         assert!(logs[2].committed_entries(7, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn raft_rs_log_rejects_append_on_non_leader() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+
+        let err = logs[1]
+            .append(7, b"stale-owner-write".to_vec())
+            .unwrap_err();
+
+        assert!(err.to_string().contains("is not leader"));
+        let leader_status = group
+            .status()
+            .into_iter()
+            .find(|status| status.node_id == 1)
+            .unwrap();
+        assert_eq!(leader_status.role, "Leader");
     }
 
     #[test]
@@ -1718,6 +1847,50 @@ mod tests {
     }
 
     #[test]
+    fn raft_rs_snapshot_transfer_rejects_snapshot_behind_raw_applied() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        logs[0].append(7, b"first".to_vec()).unwrap();
+        let stale = group
+            .build_snapshot_transfer(1, 3, b"stale-snapshot".to_vec())
+            .unwrap();
+        logs[0].append(7, b"second".to_vec()).unwrap();
+        let fresh = group
+            .build_snapshot_transfer(1, 3, b"fresh-snapshot".to_vec())
+            .unwrap();
+        group.install_snapshot_transfer(3, fresh).unwrap();
+        {
+            let mut guard = group.inner.lock().expect("raft-rs group lock poisoned");
+            let node = guard.node_mut(3).unwrap();
+            node.last_applied_index = stale.index;
+        }
+
+        let err = group.install_snapshot_transfer(3, stale).unwrap_err();
+
+        assert!(err.to_string().contains("stale raft-rs snapshot"));
+    }
+
+    #[test]
+    fn raft_rs_apply_committed_ignores_entries_below_applied_watermark() {
+        let (_dir, configs) = configs(3);
+        let (group, _logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        let mut guard = group.inner.lock().expect("raft-rs group lock poisoned");
+        let node = guard.node_mut(1).unwrap();
+        node.last_applied_index = 10;
+        let mut stale = Entry::default();
+        stale.index = 9;
+        stale.term = 1;
+        stale.entry_type = EntryType::EntryNormal as i32;
+        stale.data = b"stale-entry".to_vec().into();
+
+        node.apply_committed(vec![stale], 7).unwrap();
+
+        assert_eq!(node.last_applied_index, 10);
+        assert!(node.committed.is_empty());
+    }
+
+    #[test]
     fn raft_rs_snapshot_transfer_persists_across_restart() {
         let (_dir, configs) = configs(3);
         let (group, logs) = RaftRsSharedGroup::open(7, configs.clone()).unwrap();
@@ -1737,6 +1910,45 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(reopened_logs[2].compact(7, commit.index).unwrap(), 0);
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_advances_persisted_watermark() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        let commit = logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+        let transfer = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+
+        group.install_snapshot_transfer(3, transfer).unwrap();
+
+        let guard = group.inner.lock().expect("raft-rs group lock poisoned");
+        let node = guard.node(3).unwrap();
+        assert!(node.raw.raft.raft_log.persisted >= commit.index);
+        assert!(node.raw.raft.raft_log.applied >= commit.index);
+    }
+
+    #[test]
+    fn raft_rs_snapshot_transfer_keeps_raw_node_apply_cursor_consistent() {
+        let (_dir, configs) = configs(3);
+        let (group, logs) = RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(1).unwrap();
+        let snapshot_commit = logs[0].append(7, b"before-snapshot".to_vec()).unwrap();
+        let transfer = group
+            .build_snapshot_transfer(1, 3, b"tablet-state-snapshot".to_vec())
+            .unwrap();
+        group.install_snapshot_transfer(3, transfer).unwrap();
+
+        let after_snapshot = logs[0].append(7, b"after-snapshot".to_vec()).unwrap();
+
+        assert!(after_snapshot.index > snapshot_commit.index);
+        assert!(logs[2]
+            .committed_entries(7, snapshot_commit.index, 10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.command == b"after-snapshot"));
     }
 
     #[test]
@@ -1931,5 +2143,25 @@ mod tests {
             .status()
             .iter()
             .any(|status| status.node_id == 1 && status.role == "Leader"));
+    }
+
+    #[test]
+    fn raft_rs_wire_heartbeat_clamps_commit_ahead_of_local_log() {
+        let (_dir, configs) = configs(3);
+        let (group_2, _log_2) = RaftRsSharedGroup::open_local(7, configs, 2).unwrap();
+
+        let mut heartbeat = Message::default();
+        heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+        heartbeat.from = 1;
+        heartbeat.to = 2;
+        heartbeat.term = 1;
+        heartbeat.commit = 12;
+
+        group_2
+            .step_wire_message(RaftRsWireMessage::from_raft_message(7, &heartbeat))
+            .unwrap();
+
+        let status = group_2.status();
+        assert!(status[0].commit_index < 12);
     }
 }

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 agentdb-meta = { path = "../../crates/agentdb-meta" }
+agentdb-storage = { path = "../../crates/agentdb-storage" }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { workspace = true }

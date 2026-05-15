@@ -179,6 +179,27 @@ struct TabletStoreArgs {
     seed: u64,
     #[arg(long)]
     checkpoint_tablet: Option<i64>,
+    /// Fail if p99 append latency exceeds this threshold.
+    #[arg(long)]
+    max_p99_ms: Option<f64>,
+    /// Fail if p999 append latency exceeds this threshold.
+    #[arg(long)]
+    max_p999_ms: Option<f64>,
+    /// Fail if estimated write amplification exceeds this threshold.
+    #[arg(long)]
+    max_write_amplification: Option<f64>,
+    /// Fail if checkpoint duration exceeds this threshold.
+    #[arg(long)]
+    max_checkpoint_ms: Option<f64>,
+    /// Fail if restore duration exceeds this threshold.
+    #[arg(long)]
+    max_restore_ms: Option<f64>,
+    /// Fail if open file descriptors grow by more than this count.
+    #[arg(long)]
+    max_open_fds_growth: Option<u64>,
+    /// Fail if RSS grows by more than this many MiB.
+    #[arg(long)]
+    max_rss_growth_mib: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
@@ -519,7 +540,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
         return Err(anyhow!("--ops must be positive"));
     }
     fs::create_dir_all(&args.out)?;
-    let run_id = args.run_id.unwrap_or_else(default_run_id);
+    let run_id = args.run_id.clone().unwrap_or_else(default_run_id);
     let root = args.out.join(format!("tablet-store-{run_id}"));
     if root.exists() {
         return Err(anyhow!(
@@ -651,6 +672,7 @@ fn tablet_store_bench(args: TabletStoreArgs) -> Result<()> {
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     eprintln!("tablet-store benchmark report: {}", report_path.display());
+    enforce_tablet_store_gates(&args, &report)?;
     Ok(())
 }
 
@@ -4156,6 +4178,86 @@ fn write_amplification_estimate(
         return None;
     }
     physical_bytes.map(|physical| physical as f64 / logical_write_bytes as f64)
+}
+
+fn enforce_tablet_store_gates(
+    args: &TabletStoreArgs,
+    report: &TabletStoreBenchReport,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Some(max) = args.max_p99_ms {
+        if report.p99_ms > max {
+            failures.push(format!("p99_ms {:.3} > {:.3}", report.p99_ms, max));
+        }
+    }
+    if let Some(max) = args.max_p999_ms {
+        if report.p999_ms > max {
+            failures.push(format!("p999_ms {:.3} > {:.3}", report.p999_ms, max));
+        }
+    }
+    if let Some(max) = args.max_write_amplification {
+        match report.write_amplification_estimate_after_writes {
+            Some(value) if value > max => {
+                failures.push(format!("write_amplification {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("write_amplification estimate unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_checkpoint_ms {
+        match report.checkpoint_ms {
+            Some(value) if value > max => {
+                failures.push(format!("checkpoint_ms {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("checkpoint_ms unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_restore_ms {
+        match report.restore_ms {
+            Some(value) if value > max => {
+                failures.push(format!("restore_ms {:.3} > {:.3}", value, max));
+            }
+            None => failures.push("restore_ms unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max) = args.max_open_fds_growth {
+        match (
+            report.resource_before.open_fds,
+            report.resource_after_checkpoint.open_fds,
+        ) {
+            (Some(before), Some(after)) if after.saturating_sub(before) > max => failures.push(
+                format!("open_fds_growth {} > {}", after.saturating_sub(before), max),
+            ),
+            (None, _) | (_, None) => failures.push("open_fds sample unavailable".into()),
+            _ => {}
+        }
+    }
+    if let Some(max_mib) = args.max_rss_growth_mib {
+        let max_bytes = max_mib.saturating_mul(1024 * 1024);
+        match (
+            report.resource_before.rss_bytes,
+            report.resource_after_checkpoint.rss_bytes,
+        ) {
+            (Some(before), Some(after)) if after.saturating_sub(before) > max_bytes => {
+                failures.push(format!(
+                    "rss_growth_mib {:.3} > {}",
+                    after.saturating_sub(before) as f64 / (1024.0 * 1024.0),
+                    max_mib
+                ));
+            }
+            (None, _) | (_, None) => failures.push("rss sample unavailable".into()),
+            _ => {}
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "tablet-store benchmark gates failed: {}",
+        failures.join("; ")
+    ))
 }
 
 fn percentile_ms(samples: &[Duration], q: f64) -> f64 {

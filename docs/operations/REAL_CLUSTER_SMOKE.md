@@ -4,6 +4,9 @@ This runbook validates the current multi-process Raft path on one development
 machine. It is intentionally a throwaway harness, not a production bootstrap
 procedure.
 
+For the detailed scenario matrix, invariants, ASCII topology diagrams, and
+planned unimplemented failure cases, see [ops/smoke/README.md](../../ops/smoke/README.md).
+
 ## One-Command Local Stack
 
 The easiest local path is the Compose-backed wrapper:
@@ -36,6 +39,11 @@ ops/smoke/scripts/real-cluster-smoke-compose.sh --nodes 6 --two-cell --failover
 
 # Include bounded random kill/restart chaos.
 ops/smoke/scripts/real-cluster-smoke-compose.sh --chaos --chaos-iterations 48
+
+# Run deterministic hardening probes: process restart from persisted
+# raft/KV directories, tablet-store checkpoint install, one-AZ loss,
+# rolling restart, explicit replacement, and split/merge metadata cutover.
+ops/smoke/scripts/real-cluster-smoke-compose.sh --nodes 6 --two-cell --full-hardening
 
 # Leave Postgres and MinIO running after the smoke finishes.
 AGENTDB_CLUSTER_SMOKE_KEEP_DEPS=1 ops/smoke/scripts/real-cluster-smoke-compose.sh
@@ -117,6 +125,14 @@ starts three server processes, waits for local Raft leaders, appends events
 through more than one API node, fetches the event log, and prints health,
 scheduler, tablet-store, and Raft summaries.
 
+Generated node configs use the cluster RocksDB tablet-store runtime with
+`layout = "grouped_rocksdb"` and `tablets_per_domain = 1` so the smoke can
+exercise checkpoint install without opening unbounded RocksDB instances. Each
+domain is capped to a 4 MiB write buffer, two write buffers, one background job,
+and 64 open files. Production deployments should normally use larger grouped
+domains, for example `tablets_per_domain = 32`, and reserve single-tablet
+domains for checkpoint/restore validation or high-isolation experiments.
+
 To leave the servers running for manual inspection:
 
 ```bash
@@ -163,6 +179,30 @@ stability regressions: leader loss, follower loss/rejoin, restart recovery, and
 replica catch-up after missed writes. The smoke output prints the raft catch-up
 request duration, attempted/sent/skipped counts, and the convergence wait time
 after the catch-up snapshot so deployment runs can spot catch-up regressions.
+
+## Optional Hardening Probe
+
+```bash
+ops/smoke/scripts/real-cluster-smoke.sh --nodes 6 --two-cell --full-hardening --keep-work-dir
+```
+
+`--full-hardening` runs deterministic lifecycle checks after the normal write
+and catch-up smoke:
+
+- restarts the current owner with the same raft-engine and KV directories, then
+  verifies another committed write
+- creates a tablet-store checkpoint through the admin backup API and installs it
+  offline into a fresh single-tablet grouped RocksDB root
+- stops every node in one local AZ, verifies quorum writes continue in both
+  cells, then restarts that AZ
+- restarts every node one at a time and verifies writes after each restart
+- runs explicit tablet replacement prepare/complete with a source applied-index
+  watermark and verifies writes through the new metadata owner
+- prepares and completes split/merge metadata cutover while asserting watch
+  cursors still observe writes committed during the prepared split window
+
+Individual probes can be run with `--restart-persistence`, `--checkpoint-replacement`,
+`--replacement`, `--az-failure`, `--rolling-restart`, or `--split-merge`.
 
 ## Generated Files
 

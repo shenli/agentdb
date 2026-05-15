@@ -129,6 +129,95 @@ async fn events_and_next_seq_survive_restart() {
 }
 
 #[tokio::test]
+async fn stale_live_runtime_reconciles_next_seq_before_append() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv.clone(), in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "stale-live".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let a = rt
+        .create_agent(NewAgent {
+            tenant_id: t.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let s = rt
+        .create_session(NewSession {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let stale_simple = Runtime::with_kv(kv.clone(), in_memory_content());
+    let stale_direct = Runtime::with_kv(kv.clone(), in_memory_content());
+
+    assert_eq!(
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 0}),
+        ))
+        .await
+        .unwrap()
+        .seq,
+        0
+    );
+    assert_eq!(
+        rt.append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 1}),
+        ))
+        .await
+        .unwrap()
+        .seq,
+        1
+    );
+
+    let simple = stale_simple
+        .append(AppendRequest::simple(
+            &t,
+            &a,
+            &s,
+            "x",
+            serde_json::json!({"i": 2}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(simple.seq, 2);
+
+    let mut direct_req = AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({"i": 3}));
+    direct_req.idempotency_key = Some("direct-after-stale".into());
+    let direct = stale_direct.append(direct_req).await.unwrap();
+    assert_eq!(direct.seq, 3);
+
+    let events = stale_direct
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let seqs = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+    assert_eq!(seqs, vec![0, 1, 2, 3]);
+}
+
+#[tokio::test]
 async fn concurrent_append_and_fetch_same_session_survives_restart() {
     let dir = TempDir::new().unwrap();
 

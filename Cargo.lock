@@ -43,6 +43,7 @@ name = "agentdb-cluster-smoke"
 version = "0.1.0"
 dependencies = [
  "agentdb-meta",
+ "agentdb-storage",
  "anyhow",
  "clap",
  "reqwest",

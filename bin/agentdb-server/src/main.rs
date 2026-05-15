@@ -1670,9 +1670,6 @@ fn validate_storage_backend_config(
         if in_memory {
             anyhow::bail!("deployment.mode=cluster does not support in-memory/dev mode");
         }
-        if !matches!(kv_backend, KvBackendKind::SlateDb) {
-            anyhow::bail!("deployment.mode=cluster requires storage.kv.backend=slatedb");
-        }
         if !matches!(content_backend, ContentBackendKind::ObjectStore) {
             anyhow::bail!("deployment.mode=cluster requires storage.content.backend=object_store");
         }
@@ -2560,11 +2557,22 @@ fn spawn_raft_rs_tick_worker(
                             stale_node_threshold_ms,
                         )
                     });
+                let raft_leader_available = local_status
+                    .filter(|status| status.leader_id != 0)
+                    .and_then(|status| raft_replicas_by_id.get(&(tablet_id, status.leader_id)))
+                    .is_some_and(|(leader_node_id, _)| {
+                        cluster_node_available(
+                            nodes_by_id.get(leader_node_id),
+                            now_ms,
+                            stale_node_threshold_ms,
+                        )
+                    });
                 let raft_leader_missing = local_raft_leader_missing(local_status);
                 if !local_is_owner && !local_is_leader {
                     if should_attempt_raft_failover_tick(
                         owner_unavailable,
                         raft_leader_unavailable,
+                        raft_leader_available,
                         raft_leader_missing,
                     ) {
                         if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
@@ -2596,6 +2604,7 @@ fn spawn_raft_rs_tick_worker(
                         if failover_candidate == Some(local_raft_node_id) {
                             let result = if should_campaign_for_raft_failover(
                                 raft_leader_unavailable,
+                                raft_leader_available,
                                 raft_leader_missing,
                             ) {
                                 group
@@ -2637,16 +2646,19 @@ fn local_raft_leader_missing(local_status: Option<&agentdb_storage::RaftRsReplic
 fn should_attempt_raft_failover_tick(
     owner_unavailable: bool,
     raft_leader_unavailable: bool,
+    raft_leader_available: bool,
     raft_leader_missing: bool,
 ) -> bool {
-    raft_leader_unavailable || (owner_unavailable && raft_leader_missing)
+    raft_leader_unavailable
+        || (owner_unavailable && (raft_leader_missing || !raft_leader_available))
 }
 
 fn should_campaign_for_raft_failover(
     raft_leader_unavailable: bool,
+    raft_leader_available: bool,
     raft_leader_missing: bool,
 ) -> bool {
-    raft_leader_unavailable || raft_leader_missing
+    raft_leader_unavailable || raft_leader_missing || !raft_leader_available
 }
 
 fn cluster_node_available(
@@ -2744,9 +2756,17 @@ async fn campaign_owned_raft_tablets(
                 local_node_id,
                 local_raft_node_id,
                 role = %local_status.role,
-                "skipping raft-rs owner campaign because local node is already campaigning"
+                "continuing raft-rs owner campaign while local node is already campaigning"
             );
-            continue;
+        }
+        if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+            tracing::warn!(
+                tablet_id = tablet.tablet_id,
+                local_node_id,
+                local_raft_node_id,
+                ?error,
+                "failed to expire local raft-rs leader lease before owner campaign"
+            );
         }
         match group.campaign(local_raft_node_id) {
             Ok(()) => {
@@ -3732,6 +3752,23 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "aligned local tablet ownership with raft leaders"
+            );
+        }
+    }
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
         Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
             agentdb_meta::scheduler::renew(
@@ -3774,23 +3811,6 @@ async fn run_cluster_scheduler_tick(
         leader_row.expires_at_ms,
         is_leader,
     );
-    if let Some(registry) = raft_registry {
-        let aligned = reconcile_raft_leader_tablet_ownership(
-            meta,
-            registry,
-            now_ms,
-            config.scheduler_lease_ms,
-        )
-        .await?;
-        if aligned > 0 {
-            status.add_tablet_reassignments(aligned as u64);
-            tracing::info!(
-                node_id = %node_id,
-                aligned,
-                "aligned local tablet ownership with raft leaders"
-            );
-        }
-    }
     if !is_leader {
         return Ok(());
     }
@@ -3963,7 +3983,7 @@ async fn reconcile_raft_leader_tablet_ownership(
         let Some(tablet) = agentdb_meta::tablets::get(meta.pool(), tablet_id).await? else {
             continue;
         };
-        if tablet.state != "serving" {
+        if !tablet_state_keeps_raft_owner(&tablet.state) {
             continue;
         }
         let same_owner = tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str());
@@ -3986,6 +4006,10 @@ async fn reconcile_raft_leader_tablet_ownership(
         }
     }
     Ok(aligned)
+}
+
+fn tablet_state_keeps_raft_owner(state: &str) -> bool {
+    matches!(state, "serving" | "splitting" | "merging")
 }
 
 async fn apply_scheduler_rebalance_raft_membership_changes(
@@ -5004,7 +5028,7 @@ async fn run_local_tablet_movement_executor_tick(
     let mut executed = 0usize;
     for (destination_tablet_id, movements) in by_destination {
         let movement_type = movements[0].movement_type.as_str();
-        if movement_type == "split" && movements.len() != 1 {
+        if matches!(movement_type, "split" | "manual_split") && movements.len() != 1 {
             tracing::warn!(
                 destination_tablet_id,
                 movement_count = movements.len(),
@@ -5088,14 +5112,14 @@ async fn run_local_tablet_movement_executor_tick(
             let snapshot: agentdb_core::tablet_state::TabletStateSnapshot =
                 serde_json::from_slice(&payload)?;
             let installed = match movement_type {
-                "split" => runtime
+                "split" | "manual_split" => runtime
                     .install_tablet_snapshot_payload_and_rehydrate(
                         movement.destination_tablet_id,
                         &payload,
                     )
                     .await
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?,
-                "merge" => runtime
+                "merge" | "manual_merge" => runtime
                     .install_tablet_snapshot_payload_merge_and_rehydrate(
                         movement.destination_tablet_id,
                         &payload,
@@ -5589,7 +5613,7 @@ data_dir = "/tmp/from-config"
     }
 
     #[test]
-    fn cluster_mode_requires_slatedb() {
+    fn cluster_mode_allows_rocksdb_with_object_store_content() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agentdb.toml");
         std::fs::write(
@@ -5597,6 +5621,9 @@ data_dir = "/tmp/from-config"
             r#"
 [deployment]
 mode = "cluster"
+
+[server]
+internal_auth_token = "test-internal-token"
 
 [storage.kv]
 backend = "rocksdb"
@@ -5616,10 +5643,9 @@ node_id = "node-a"
         .unwrap();
         let mut opts = base_opts();
         opts.config = Some(config_path);
-        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("deployment.mode=cluster requires storage.kv.backend=slatedb"));
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        assert!(matches!(config.deployment_mode, DeploymentMode::Cluster));
+        assert!(matches!(config.kv_backend, KvBackendKind::RocksDb));
     }
 
     #[test]
@@ -6011,6 +6037,76 @@ region = "us-west-2"
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("leader-a"));
         assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_follower_still_reconciles_local_raft_leader_ownership() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            1_000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(local_raft_node_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        run_cluster_scheduler_tick(
+            &meta,
+            "node-b",
+            2_000,
+            lifecycle_config(0, 0),
+            &status,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_leader);
+        assert_eq!(snapshot.leader_node_id.as_deref(), Some("scheduler-a"));
+        assert_eq!(snapshot.tablet_reassignments_total, 1);
     }
 
     #[tokio::test]
@@ -6676,7 +6772,88 @@ region = "us-west-2"
         )
         .await
         .unwrap();
-        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 10_000)
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 1_000)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 100)
+            .await
+            .unwrap();
+
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-a",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let leader_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(leader_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(aligned, 1);
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_aligns_valid_owner_lease_to_raft_leader() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-a",
+            "http://127.0.0.1:30100",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            100,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-a", 30_000)
             .await
             .unwrap();
         tablet_replicas::upsert(meta.pool(), 7, "node-a", "voter", "healthy", 0, 0, 100)
@@ -6775,7 +6952,7 @@ region = "us-west-2"
     }
 
     #[tokio::test]
-    async fn scheduler_renews_tablet_owner_when_raft_leader_matches() {
+    async fn scheduler_renews_splitting_tablet_owner_when_raft_leader_matches() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         nodes::upsert(
@@ -6794,7 +6971,7 @@ region = "us-west-2"
             meta.pool(),
             7,
             "default",
-            "serving",
+            "splitting",
             Some("raft/7"),
             0,
             100,
@@ -7627,19 +7804,21 @@ region = "us-west-2"
         };
 
         assert!(local_raft_leader_missing(Some(&local_status)));
-        assert!(!should_attempt_raft_failover_tick(false, false, true));
+        assert!(!should_attempt_raft_failover_tick(
+            false, false, false, true
+        ));
     }
 
     #[test]
     fn raft_failover_tick_runs_when_owner_is_unavailable_and_leader_is_missing() {
-        assert!(should_attempt_raft_failover_tick(true, false, true));
-        assert!(should_campaign_for_raft_failover(false, true));
+        assert!(should_attempt_raft_failover_tick(true, false, false, true));
+        assert!(should_campaign_for_raft_failover(false, false, true));
     }
 
     #[test]
     fn raft_failover_campaigns_when_known_leader_is_unavailable() {
-        assert!(should_attempt_raft_failover_tick(false, true, false));
-        assert!(should_campaign_for_raft_failover(true, false));
+        assert!(should_attempt_raft_failover_tick(false, true, false, false));
+        assert!(should_campaign_for_raft_failover(true, false, false));
     }
 
     #[test]
@@ -7656,13 +7835,22 @@ region = "us-west-2"
         };
 
         assert!(!local_raft_leader_missing(Some(&local_status)));
-        assert!(!should_attempt_raft_failover_tick(false, false, false));
-        assert!(!should_campaign_for_raft_failover(false, false));
+        assert!(!should_attempt_raft_failover_tick(
+            false, false, true, false
+        ));
+        assert!(!should_campaign_for_raft_failover(false, true, false));
     }
 
     #[test]
-    fn raft_failover_tick_skips_when_only_control_plane_owner_is_missing() {
-        assert!(!should_attempt_raft_failover_tick(true, false, false));
+    fn raft_failover_tick_runs_when_owner_is_missing_and_leader_is_not_proven_live() {
+        assert!(should_attempt_raft_failover_tick(true, false, false, false));
+        assert!(should_campaign_for_raft_failover(false, false, false));
+    }
+
+    #[test]
+    fn raft_failover_tick_skips_missing_owner_when_healthy_leader_is_observed() {
+        assert!(!should_attempt_raft_failover_tick(true, false, true, false));
+        assert!(!should_campaign_for_raft_failover(false, true, false));
     }
 
     #[test]
@@ -7968,7 +8156,11 @@ region = "us-west-2"
         let (source_group, logs) =
             agentdb_storage::RaftRsSharedGroup::open(7, source_raft_configs).unwrap();
         source_group.elect(node_a).unwrap();
-        logs[0].append(7, b"snapshot-source".to_vec()).unwrap();
+        logs.iter()
+            .find(|log| log.node_id() == node_a)
+            .unwrap()
+            .append(7, b"snapshot-source".to_vec())
+            .unwrap();
         let transfer = source_group
             .build_snapshot_transfer(node_a, node_b, Vec::new())
             .unwrap();

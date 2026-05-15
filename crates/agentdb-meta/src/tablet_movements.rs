@@ -263,7 +263,7 @@ fn validate(
 
 fn validate_type(movement_type: &str) -> MetaResult<()> {
     match movement_type {
-        "split" | "merge" => Ok(()),
+        "split" | "merge" | "manual_split" | "manual_merge" => Ok(()),
         other => Err(MetaError::InvalidInput(format!(
             "invalid tablet movement type `{other}`"
         ))),
@@ -353,6 +353,49 @@ mod tests {
         let rows = list_open_merge_group(&p, "default", 9).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].movement_id, "merge:7:9");
+    }
+
+    #[tokio::test]
+    async fn manual_movements_do_not_join_auto_cutover_groups() {
+        let p = pool().await;
+        upsert_pending(
+            &p,
+            "split:7:8",
+            "manual_split",
+            7,
+            8,
+            "default",
+            0,
+            49,
+            12,
+            100,
+        )
+        .await
+        .unwrap();
+        upsert_pending(
+            &p,
+            "merge:7:9",
+            "manual_merge",
+            7,
+            9,
+            "default",
+            0,
+            49,
+            12,
+            100,
+        )
+        .await
+        .unwrap();
+
+        assert!(list_open_split_group(&p, "default", 7)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(list_open_merge_group(&p, "default", 9)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(list_pending(&p, 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

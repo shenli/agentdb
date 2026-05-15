@@ -159,7 +159,14 @@ pub async fn run(
         if actions.len() >= request.max_movements {
             break;
         }
-        let step = complete_ready_replacement_intent(pool, tablet, request.dry_run, now_ms).await?;
+        let step = complete_ready_replacement_intent(
+            pool,
+            tablet,
+            request.dry_run,
+            now_ms,
+            assignment_lease_expires_at_ms(&request, now_ms),
+        )
+        .await?;
         if let Some(skipped_action) = step.skipped {
             skipped.push(skipped_action);
         }
@@ -407,6 +414,7 @@ async fn complete_ready_replacement_intent(
     tablet: &tablets::Tablet,
     dry_run: bool,
     now_ms: i64,
+    lease_expires_at_ms: i64,
 ) -> MetaResult<RebalanceStep> {
     let Some(source_node_id) = tablet.owner_node_id.as_ref() else {
         return Ok(RebalanceStep {
@@ -488,9 +496,14 @@ async fn complete_ready_replacement_intent(
             now_ms,
         )
         .await?;
-        let changed = tablets::complete_handoff(pool, tablet.tablet_id, source_node_id)
-            .await?
-            .is_some();
+        let changed = tablets::complete_handoff_with_lease(
+            pool,
+            tablet.tablet_id,
+            source_node_id,
+            lease_expires_at_ms,
+        )
+        .await?
+        .is_some();
         if changed {
             let _ = tablet_replicas::set_health(
                 pool,

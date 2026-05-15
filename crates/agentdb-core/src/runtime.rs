@@ -1552,6 +1552,33 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
     }
 }
 
+fn reconcile_session_next_seq_from_persisted_events(
+    state: &mut State,
+    tenant_id: &Id,
+    session_id: &Id,
+    max_seq: u64,
+) -> Result<()> {
+    let Some(session) = state.sessions.get_mut(session_id.as_str()) else {
+        return Ok(());
+    };
+    if session.tenant_id.as_str() != tenant_id.as_str() {
+        return Ok(());
+    }
+    if session.next_seq > max_seq {
+        return Ok(());
+    }
+    session.next_seq = max_seq.checked_add(1).ok_or_else(|| {
+        Error::new(
+            ErrorCode::Internal,
+            "persisted session event sequence overflow",
+        )
+    })?;
+    if session.warm_head_from_seq > session.next_seq {
+        session.warm_head_from_seq = session.next_seq;
+    }
+    Ok(())
+}
+
 impl Runtime {
     fn bump_lifecycle_counts(counts: &mut LifecycleCounts, lifecycle: Lifecycle) {
         match lifecycle {
@@ -5107,6 +5134,21 @@ impl Runtime {
             }
             return;
         }
+        let persisted_session_max_seq = match self.persist.as_ref() {
+            Some(persist) => {
+                match persist.max_event_seq(jobs[0].req.tenant_id.as_str(), session_id.as_str()) {
+                    Ok(max_seq) => max_seq,
+                    Err(err) => {
+                        let err = internal(err);
+                        for job in jobs {
+                            let _ = job.done.send(Err(err.clone()));
+                        }
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
 
         let mut prepared = Vec::with_capacity(jobs.len());
         let mut final_session_snapshot: Option<Session> = None;
@@ -5114,11 +5156,24 @@ impl Runtime {
 
         let prepare_lock_wait_started = coalesce_profile.map(|_| Instant::now());
         {
-            let s = self.state.lock().await;
+            let mut s = self.state.lock().await;
             if let Some(started) = prepare_lock_wait_started {
                 coalesce_sample.prepare_lock_wait_nanos = started.elapsed().as_nanos();
             }
             let prepare_work_started = coalesce_profile.map(|_| Instant::now());
+            if let Some(max_seq) = persisted_session_max_seq {
+                if let Err(err) = reconcile_session_next_seq_from_persisted_events(
+                    &mut s,
+                    &jobs[0].req.tenant_id,
+                    &session_id,
+                    max_seq,
+                ) {
+                    for job in jobs {
+                        let _ = job.done.send(Err(err.clone()));
+                    }
+                    return;
+                }
+            }
             let mut policy_cache: BTreeMap<(String, String), RuntimePolicy> = BTreeMap::new();
             let mut metadata_key_cache: BTreeMap<String, KeyResolution> = BTreeMap::new();
             for job in jobs {
@@ -5461,8 +5516,15 @@ impl Runtime {
         if let Some(started) = session_lock_wait_started {
             path_sample.session_lock_wait_nanos = started.elapsed().as_nanos();
         }
+        let persisted_session_max_seq = self
+            .persist
+            .as_ref()
+            .map(|persist| persist.max_event_seq(req.tenant_id.as_str(), req.session_id.as_str()))
+            .transpose()
+            .map_err(internal)?
+            .flatten();
         let initial_state_lock_wait_started = path_profile.map(|_| Instant::now());
-        let s = self.state.lock().await;
+        let mut s = self.state.lock().await;
         if let Some(started) = initial_state_lock_wait_started {
             path_sample.initial_state_lock_wait_nanos = started.elapsed().as_nanos();
         }
@@ -5482,6 +5544,14 @@ impl Runtime {
                     backpressure_complete: false,
                 });
             }
+        }
+        if let Some(max_seq) = persisted_session_max_seq {
+            reconcile_session_next_seq_from_persisted_events(
+                &mut s,
+                &req.tenant_id,
+                &req.session_id,
+                max_seq,
+            )?;
         }
 
         let policy = match resolved_policy {
