@@ -154,6 +154,55 @@ PARTITION BY toYYYYMM(start_time)
 ORDER BY (tenant_id, session_id, start_time, span_id)
 "#,
     r#"
+CREATE VIEW IF NOT EXISTS agentdb_clickstack_logs AS
+SELECT
+    timestamp AS Timestamp,
+    timestamp AS TimestampTime,
+    trace_id AS TraceId,
+    span_id AS SpanId,
+    severity_text AS SeverityText,
+    body AS Body,
+    ifNull(resource_attributes['service.name'], 'agentdb') AS ServiceName,
+    resource_attributes AS ResourceAttributes,
+    log_attributes AS LogAttributes,
+    tenant_id AS AgentDBTenantId,
+    session_id AS AgentDBSessionId,
+    event_id AS AgentDBEventId,
+    envelope_json AS AgentDBEnvelope
+FROM agentdb_otel_logs
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS agentdb_clickstack_traces AS
+SELECT
+    start_time AS Timestamp,
+    start_time AS TimestampTime,
+    trace_id AS TraceId,
+    span_id AS SpanId,
+    parent_span_id AS ParentSpanId,
+    span_name AS SpanName,
+    span_kind AS SpanKind,
+    status_code AS StatusCode,
+    '' AS StatusMessage,
+    toUInt64(ifNull(duration_ms, 0)) * 1000000 AS Duration,
+    ifNull(resource_attributes['service.name'], 'agentdb') AS ServiceName,
+    resource_attributes AS ResourceAttributes,
+    span_attributes AS SpanAttributes,
+    links_json AS Links,
+    tenant_id AS AgentDBTenantId,
+    session_id AS AgentDBSessionId,
+    event_id AS AgentDBEventId,
+    envelope_json AS AgentDBEnvelope
+FROM agentdb_otel_traces
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS otel_logs AS
+SELECT * FROM agentdb_clickstack_logs
+"#,
+    r#"
+CREATE VIEW IF NOT EXISTS otel_traces AS
+SELECT * FROM agentdb_clickstack_traces
+"#,
+    r#"
 CREATE TABLE IF NOT EXISTS agentdb_tombstones (
     tenant_id String,
     object_type LowCardinality(String),
@@ -166,6 +215,69 @@ CREATE TABLE IF NOT EXISTS agentdb_tombstones (
 PARTITION BY toYYYYMM(deleted_at)
 ORDER BY (tenant_id, object_type, object_id, deleted_at)
 "#,
+];
+
+const CLICKHOUSE_SAMPLE_QUERIES: &[(&str, &str, &str)] = &[
+    (
+        "recent_failures",
+        "Recent event failures and tool errors",
+        r#"
+SELECT created_at, session_id, kind, error_kind, error_message
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND created_at >= now() - INTERVAL 1 HOUR
+  AND (kind = 'tool_error' OR error_kind != '')
+ORDER BY created_at DESC
+LIMIT 100
+"#,
+    ),
+    (
+        "model_cost_by_model",
+        "Model token and cost totals by model",
+        r#"
+SELECT model, sum(total_tokens) AS tokens, sum(cost_micros) / 1000000 AS cost
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND created_at >= now() - INTERVAL 1 DAY
+GROUP BY model
+ORDER BY cost DESC
+"#,
+    ),
+    (
+        "slow_tools",
+        "Tool p95 latency and volume",
+        r#"
+SELECT tool_name, quantile(0.95)(duration_ms) AS p95_ms, count() AS n
+FROM agentdb_events
+WHERE tenant_id = {tenant_id:String}
+  AND kind IN ('tool_result', 'tool_error')
+  AND created_at >= now() - INTERVAL 1 DAY
+GROUP BY tool_name
+ORDER BY p95_ms DESC
+"#,
+    ),
+    (
+        "clickstack_logs",
+        "ClickStack-compatible wide log rows",
+        r#"
+SELECT Timestamp, ServiceName, SeverityText, Body, TraceId, SpanId
+FROM agentdb_clickstack_logs
+WHERE AgentDBTenantId = {tenant_id:String}
+ORDER BY Timestamp DESC
+LIMIT 100
+"#,
+    ),
+    (
+        "clickstack_traces",
+        "ClickStack-compatible trace spans",
+        r#"
+SELECT Timestamp, ServiceName, StatusCode, round(Duration / 1000000), SpanName, TraceId, SpanId
+FROM agentdb_clickstack_traces
+WHERE AgentDBTenantId = {tenant_id:String}
+ORDER BY Timestamp DESC
+LIMIT 100
+"#,
+    ),
 ];
 
 #[derive(Parser, Debug)]
@@ -610,6 +722,8 @@ enum ClickHouseCommand {
     Init(ClickHouseInitArgs),
     /// Show AgentDB export status for one tenant.
     Status(ClickHouseStatusArgs),
+    /// Print first-party dashboard and ClickStack smoke queries.
+    Queries,
     /// Copy one or more export-watch batches into ClickHouse.
     Run(ClickHouseRunArgs),
 }
@@ -999,8 +1113,24 @@ async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
                 .await
             }
         }
+        ClickHouseCommand::Queries => Ok(clickhouse_sample_queries()),
         ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
     }
+}
+
+fn clickhouse_sample_queries() -> Value {
+    json!({
+        "queries": CLICKHOUSE_SAMPLE_QUERIES
+            .iter()
+            .map(|(name, description, sql)| {
+                json!({
+                    "name": name,
+                    "description": description,
+                    "sql": sql.trim()
+                })
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Value> {
@@ -2525,6 +2655,9 @@ fn render_table(value: &Value) -> String {
         if object.contains_key("health") && object.contains_key("readiness") {
             return render_status(value);
         }
+        if let Some(queries) = object.get("queries").and_then(Value::as_array) {
+            return render_queries(queries);
+        }
         if let Some(actions) = object.get("actions").and_then(Value::as_array) {
             if !actions.is_empty() {
                 return render_rows(actions);
@@ -2600,6 +2733,28 @@ fn render_status(value: &Value) -> String {
                 .unwrap_or_else(|| "unknown".to_string())
         )
         .unwrap();
+    }
+    out.trim_end().to_string()
+}
+
+fn render_queries(queries: &[Value]) -> String {
+    let mut out = String::new();
+    for (index, query) in queries.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let name = query.get("name").and_then(Value::as_str).unwrap_or("query");
+        let description = query
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sql = query.get("sql").and_then(Value::as_str).unwrap_or_default();
+        if description.is_empty() {
+            writeln!(out, "-- {name}").unwrap();
+        } else {
+            writeln!(out, "-- {name}: {description}").unwrap();
+        }
+        writeln!(out, "{sql};").unwrap();
     }
     out.trim_end().to_string()
 }
@@ -2925,7 +3080,39 @@ mod tests {
         assert!(ddl.contains("agentdb_events"));
         assert!(ddl.contains("agentdb_otel_logs"));
         assert!(ddl.contains("agentdb_otel_traces"));
+        assert!(ddl.contains("agentdb_clickstack_logs"));
+        assert!(ddl.contains("agentdb_clickstack_traces"));
+        assert!(ddl.contains("CREATE VIEW IF NOT EXISTS otel_logs"));
+        assert!(ddl.contains("TimestampTime"));
+        assert!(ddl.contains("TraceId"));
         assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
+    }
+
+    #[test]
+    fn clickhouse_sample_queries_include_native_and_clickstack_views() {
+        let queries = clickhouse_sample_queries();
+        let rows = queries["queries"].as_array().unwrap();
+        assert!(rows.iter().any(|row| row["name"] == "recent_failures"
+            && row["sql"].as_str().unwrap().contains("agentdb_events")));
+        assert!(rows.iter().any(|row| row["name"] == "clickstack_logs"
+            && row["sql"]
+                .as_str()
+                .unwrap()
+                .contains("agentdb_clickstack_logs")));
+        assert!(rows.iter().any(|row| row["name"] == "clickstack_traces"
+            && row["sql"]
+                .as_str()
+                .unwrap()
+                .contains("agentdb_clickstack_traces")));
+    }
+
+    #[test]
+    fn renders_clickhouse_queries_as_copyable_sql() {
+        let rendered = render_table(&clickhouse_sample_queries());
+        assert!(rendered.contains("-- recent_failures:"));
+        assert!(rendered.contains("FROM agentdb_events"));
+        assert!(rendered.contains("FROM agentdb_clickstack_logs"));
+        assert!(rendered.contains("LIMIT 100;"));
     }
 
     #[test]

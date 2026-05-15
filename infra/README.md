@@ -31,7 +31,10 @@ Set `clickhouse_url` and `clickhouse_export_tenant_id` after creating a tenant;
 ClickHouse schema, and start `agentdbctl export clickhouse run --backfill
 --tail` with a managed consumer lease. Set `clickhouse_export_mode` to
 `native,otel` to write the native ClickHouse tables plus
-`agentdb_otel_logs`/`agentdb_otel_traces` projections. Run the same deploy flow
+`agentdb_otel_logs`/`agentdb_otel_traces` projections and
+ClickStack-compatible views. Point HyperDX sources at
+`agentdb_clickstack_logs` and `agentdb_clickstack_traces`, or at the `otel_*`
+aliases in a dedicated AgentDB observability database. Run the same deploy flow
 on multiple nodes with the same `clickhouse_export_consumer` to get
 active/passive exporter HA; each node derives a distinct lease owner from its
 hostname.

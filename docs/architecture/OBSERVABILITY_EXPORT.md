@@ -882,10 +882,15 @@ formalized.
 - Implemented: optional `agentdb_otel_logs` and `agentdb_otel_traces`
   ClickHouse output from `agentdbctl export clickhouse run --mode otel` or
   `--mode native,otel`.
+- Implemented: ClickStack/HyperDX-compatible views
+  `agentdb_clickstack_logs` and `agentdb_clickstack_traces`, plus `otel_logs`
+  and `otel_traces` aliases for dedicated AgentDB observability databases.
 - Implemented: deterministic AgentDB ID to OTel trace/span ID mapping.
 - Implemented: source-ref preservation as trace `links_json`.
-- Remaining: ClickStack/HyperDX end-to-end setup docs and smoke tests against
-  the actual UI stack.
+- Implemented: local schema/projection smoke script for ClickHouse OTel and
+  ClickStack view compatibility.
+- Remaining: browser-level HyperDX smoke against the actual UI stack and saved
+  source/dashboard packaging through the ClickStack API.
 
 ### Phase 5: Additional Sinks
 
@@ -896,7 +901,11 @@ formalized.
   JSONL archives.
 - Implemented: DuckDB demo queries for JSONL archives in
   `ops/observability/duckdb-jsonl-demo.sql`.
-- Add dashboard packaging beyond the SQL demo queries.
+- Implemented: starter native and ClickStack dashboard query bundle through
+  `agentdbctl export clickhouse queries` and
+  `ops/observability/clickhouse-dashboard-queries.sql`.
+- Add saved dashboard packaging once the ClickStack dashboard/source API is
+  stable enough to automate without hand-built UI state.
 - Add Kafka bridge if customers need queue-based fan-out or stream processing.
 - Add warehouse/lakehouse connectors only after the envelope and Parquet layout
   are stable.

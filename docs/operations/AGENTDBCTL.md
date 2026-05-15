@@ -279,6 +279,13 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
     --mode native,otel --backfill --tail
 ```
 
+`init --apply` also installs ClickStack-compatible views:
+`agentdb_clickstack_logs`, `agentdb_clickstack_traces`, and convenience
+`otel_logs` / `otel_traces` aliases for dedicated AgentDB observability
+databases. HyperDX sources should use `TimestampTime`, `Timestamp`,
+`ServiceName`, `TraceId`, `SpanId`, `ResourceAttributes`, `LogAttributes`, and
+`SpanAttributes`.
+
 Backfill metadata snapshots before the event tail:
 
 ```bash
@@ -286,6 +293,20 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
   agentdbctl export clickhouse run --tenant-id ten_... \
     --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
     --backfill
+```
+
+Print starter dashboard queries for native AgentDB tables and ClickStack views:
+
+```bash
+agentdbctl export clickhouse queries
+agentdbctl -o json export clickhouse queries
+```
+
+Run the schema/projection smoke against local ClickHouse:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  ops/observability/smoke-clickhouse-otel.sh
 ```
 
 Write durable export envelopes to JSONL:
