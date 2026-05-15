@@ -2,15 +2,17 @@
 
 ## Core Positioning
 
-AgentDB is the durable operational database for long-running agent systems.
+AgentDB is the runtime-state database for AI agents.
 
-It stores the session logs, records, artifacts, source references, and
-execution state that let agent harnesses recover, replay, inspect context, and
-continue across model, process, and sandbox failures.
+It stores what happened while an agent was running: session events, messages,
+tool calls, outputs, artifacts, lifecycle state, replay metadata, and context
+assembly records.
 
 ## Primary Message
 
-Agents need more than memory. They need durable execution state.
+AI agent storage has three pillars: Metadata, Memory, and Runtime State.
+AgentDB owns Runtime State: the durable session log of what an agent did, so
+agents can be inspected, replayed, resumed, and recovered.
 
 Modern agent systems split into a model, a harness, and one or more sandboxes
 or tools. The harness and sandboxes should be replaceable. AgentDB keeps the
@@ -62,18 +64,18 @@ Pain addressed: harness crashes, container failures, long-running jobs, human
 approval pauses, and restarts should not require replaying side effects or
 reconstructing state from scattered logs.
 
-### 2. Replayable Context And Memory
+### 2. Replayable Context And Memory Provenance
 
-AgentDB treats context and memory as durable runtime data, not just tokens in a
-model window or vectors in a sidecar.
+AgentDB stores the runtime history that memory systems can learn from and cite.
+It does not try to replace the full memory layer.
 
 Harnesses can fetch event slices, rebuild prompts, compact history, search
-records, preserve source truth, and make memory writes visible to the next
-agent step with consistency semantics built for agent loops.
+records, preserve source truth, and record which events, artifacts, or records
+influenced a context decision.
 
 Pain addressed: context windows roll over, compaction can be lossy, retrieval
-results need provenance, and memory written by the agent must be visible when
-the agent immediately depends on it.
+results need provenance, and memory systems need durable source material rather
+than scattered logs.
 
 ### 3. Scalable, Cost-Efficient Agent Storage
 
@@ -105,13 +107,13 @@ governed after the run.
 ### For Agent Platform Teams
 
 Build durable, restartable agent infrastructure without inventing your own
-session log, artifact store, memory layer, and replay semantics.
+session log, artifact store, context lineage, and replay semantics.
 
 ### For AI Application Developers
 
-Persist the important state of every agent run: events, context, memories,
-files, and outputs, without coupling your app to one framework or sandbox
-provider.
+Persist the important state of every agent run: messages, tool calls, outputs,
+artifacts, context decisions, and replay history, without coupling your app to
+one framework or sandbox provider.
 
 ### For Infrastructure Teams
 
@@ -123,23 +125,27 @@ enough lineage to debug and govern long-running work.
 
 One-liner:
 
-> AgentDB is the durable operational database for long-running agent systems.
+> AgentDB is the runtime-state database for AI agents.
 
 Two-liner:
 
-> AgentDB stores session logs, memory records, artifacts, and source references
-> outside ephemeral harnesses and sandboxes. Agents can recover, replay
-> context, and continue work across failures.
+> AgentDB stores what happened while an agent was running: messages, tool
+> calls, outputs, artifacts, replay history, and context decisions. Agents can
+> be inspected, replayed, resumed, and recovered.
+
+Plain-English version:
+
+> AgentDB is the durable session log for AI agents.
 
 Homepage hero:
 
-> Durable state for long-running agents.
+> Runtime state for AI agents.
 
 Homepage subhead:
 
-> AgentDB gives agent systems append-only sessions, searchable records,
-> artifacts, source references, and replayable context, so harnesses and
-> sandboxes can fail, restart, or change without losing the run.
+> AgentDB stores the durable session log of what an agent did, including
+> messages, tool calls, outputs, artifacts, replay history, and context
+> decisions, so agents can be inspected, replayed, resumed, and recovered.
 
 ## Positioning Contrast
 
@@ -148,6 +154,12 @@ Homepage subhead:
 Vector databases store embeddings. AgentDB stores the operational state of an
 agent run: events, records, artifacts, source references, and replayable
 context.
+
+### Not A Memory Platform
+
+Memory platforms decide what agents should learn, recall, rank, forget, and
+cite. AgentDB stores the durable runtime history and provenance that memory
+systems can build on.
 
 ### Not An Agent Framework
 
@@ -180,18 +192,19 @@ context, records, artifacts, and lineage that survive sandbox replacement.
 
 Preferred external category:
 
-> Agent operational database
+> Agent runtime-state database
 
 Recommended technical category:
 
-> Agent runtime database
+> Durable session log for AI agents
 
 Alternative category names:
 
 - Durable agent state store.
 - Agent session database.
-- Operational memory for agents.
+- Agent runtime database.
 
-Avoid leading with "vector database", "agent framework", "sandbox platform",
-or "workflow engine". Those categories are either too narrow or imply AgentDB
-owns behavior that should remain in the harness.
+Avoid leading with "vector database", "memory platform", "agent framework",
+"sandbox platform", or "workflow engine". Those categories are either too
+narrow or imply AgentDB owns behavior that should remain in the harness or
+memory layer.
