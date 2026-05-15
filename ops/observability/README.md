@@ -94,6 +94,74 @@ The run used `agentdbctl export clickhouse run --backfill --limit 1000
 baseline. Real throughput is usually bounded by ClickHouse insert latency,
 network round trips, projection mode, payload size, and batch sizing.
 
+## Expected Performance Model
+
+The exporter is outside the hot append path. Runtime writes commit to AgentDB
+first; export workers later read durable envelopes, transform them, write the
+sink, and ack the managed consumer cursor.
+
+```text
+throughput = min(source_read,
+                 transform_cpu,
+                 sink_insert / sink_rows_per_envelope,
+                 network_bytes / bytes_per_envelope)
+
+latency = ledger_visible
+          + poll_or_batch_wait
+          + transform_time
+          + ClickHouse_insert_time
+          + ack_time
+```
+
+For ClickHouse:
+
+- `native` writes roughly two sink rows per event envelope: raw envelope plus
+  flattened event.
+- `native,otel` writes roughly four sink rows per event envelope: raw envelope,
+  flattened event, OTel log, and OTel trace.
+- If ClickHouse insert throughput is the bottleneck, `native,otel` envelope
+  throughput should be about half of `native`.
+
+Expected single-node shape:
+
+| Scenario | Expected Throughput | Expected Export Freshness |
+|---|---:|---:|
+| Local/same-AZ ClickHouse, small payloads, `native` | low thousands to low tens of thousands envelopes/s | p95 around 1s to 2s |
+| Local/same-AZ ClickHouse, small payloads, `native,otel` | about half to two-thirds of `native` | p95 around 1s to 3s |
+| Remote ClickHouse over normal network | hundreds to several thousand envelopes/s | p95 around 1s to 5s |
+| Large payloads or heavy redaction/hash | CPU/network-bound | seconds possible |
+
+Cluster throughput scales by tenant and consumer parallelism, not by making one
+consumer infinitely fast. One tenant/consumer remains ordered and acked
+serially. Many tenants can be exported by multiple workers across nodes or
+cells until ClickHouse ingest, network, or exporter CPU becomes the shared
+bottleneck.
+
+```text
+cluster throughput ~= sum(active tenant consumers) * per-consumer throughput
+```
+
+Recommended initial SLO targets:
+
+| Metric | Initial Target |
+|---|---:|
+| Export freshness, same-AZ sink | p95 under 2s |
+| Export freshness, remote sink | p95 under 5s |
+| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| RPO | zero for committed events retained in the export ledger |
+
+With the default `lease_ms=30000` and `poll_interval_ms=1000`, exporter
+failover RTO is roughly 31s plus the active insert time. Faster HA is possible
+with shorter leases, but the lease must stay comfortably above ClickHouse insert
+p99 so healthy workers do not lose ownership during slow batches.
+
+Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
+ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
+1 KiB, 10 KiB, and 100 KiB, batch sizes of 100/1000/5000, `native` vs
+`native,otel`, worker failover, and throttled ClickHouse inserts. Reports should
+include envelopes/s, sink rows/s, p50/p95/p99 batch latency, export freshness,
+lag recovery time, retries, CPU, memory, and network throughput.
+
 The schema also installs ClickStack/HyperDX-friendly views over those
 projections:
 

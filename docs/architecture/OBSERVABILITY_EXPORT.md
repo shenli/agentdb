@@ -891,6 +891,65 @@ capacity promise; production throughput depends on ClickHouse sizing, network
 latency, payload size, projection mode, batch size, and tenant-level
 parallelism.
 
+The theoretical performance model is:
+
+```text
+throughput = min(source_read,
+                 transform_cpu,
+                 sink_insert / sink_rows_per_envelope,
+                 network_bytes / bytes_per_envelope)
+
+latency = ledger_visible
+          + poll_or_batch_wait
+          + transform_time
+          + sink_insert_time
+          + ack_time
+```
+
+`native` ClickHouse export writes roughly two sink rows per event envelope:
+raw envelope plus flattened event. `native,otel` writes roughly four sink rows:
+raw envelope, flattened event, OTel log, and OTel trace. When ClickHouse insert
+capacity is the bottleneck, `native,otel` should therefore deliver roughly half
+the envelope throughput of `native`; the local smoke baseline matches that
+shape.
+
+For a single node, reasonable initial expectations are low thousands to low
+tens of thousands of envelopes per second for small-payload same-AZ `native`
+exports, with p95 export freshness around 1s to 2s when ClickHouse is healthy.
+Remote ClickHouse, large payloads, hash/redaction, or `native,otel` projections
+shift the bottleneck to network, CPU, or sink insert latency; p95 freshness of
+1s to 5s is a more realistic early target.
+
+Cluster export throughput scales through tenant and consumer parallelism:
+
+```text
+cluster throughput ~= sum(active tenant consumers) * per-consumer throughput
+```
+
+A single tenant/consumer remains ordered and acked serially. Many tenants can
+be exported by multiple workers across nodes or cells until ClickHouse ingest,
+network, or exporter CPU becomes the shared bottleneck.
+
+Initial SLO guidance:
+
+| Metric | Target |
+|---|---:|
+| Same-AZ export freshness | p95 under 2s |
+| Remote sink export freshness | p95 under 5s |
+| Failover RTO | `lease_ms + poll_interval_ms + insert_time` |
+| RPO | zero for committed events retained in the export ledger |
+
+With default `lease_ms=30000` and `poll_interval_ms=1000`, failover RTO is
+roughly 31s plus the active insert time. Shorter leases can reduce RTO, but
+they must remain above ClickHouse insert p99 to avoid unnecessary lease churn.
+
+Future real-world tests should cover persistent AgentDB, AWS ClickHouse or
+ClickHouse Cloud, 1/10/100 tenants, many sessions per tenant, payload sizes of
+1 KiB, 10 KiB, and 100 KiB, batch sizes of 100/1000/5000, `native` versus
+`native,otel`, worker failover, and throttled ClickHouse inserts. Reports
+should include envelopes/s, sink rows/s, p50/p95/p99 batch latency, export
+freshness, lag recovery time, retries, CPU, memory, and network throughput.
+
 ### Phase 2: Remaining Durable Ledger Coverage
 
 - Add first-class policy object ledger rows when runtime policy mutation APIs

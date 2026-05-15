@@ -158,7 +158,12 @@ tenant/session, and 10 batches of 1000 export envelopes:
 These exporter numbers are a reproducibility baseline, not a production
 capacity limit. Production throughput depends on ClickHouse sizing, network
 latency, batch size, selected projections, payload size, and how many tenant
-consumers are exported in parallel.
+consumers are exported in parallel. The expected model is that `native` writes
+roughly two sink rows per event envelope, `native,otel` writes roughly four, and
+cluster throughput scales through parallel tenant consumers until ClickHouse,
+network, or exporter CPU becomes the bottleneck. See
+[ops/observability/README.md](ops/observability/README.md) for the SLO model
+and future real-world benchmark plan.
 
 Run a quick local sanity check:
 
