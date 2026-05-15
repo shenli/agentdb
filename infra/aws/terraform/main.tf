@@ -134,6 +134,10 @@ resource "aws_instance" "agentdb" {
     tablet_store_domain_max_write_buffers     = var.tablet_store_domain_max_write_buffers
     tablet_store_domain_max_background_jobs   = var.tablet_store_domain_max_background_jobs
     tablet_store_domain_max_open_files        = var.tablet_store_domain_max_open_files
+    clickhouse_url                            = var.clickhouse_url
+    clickhouse_export_tenant_id               = var.clickhouse_export_tenant_id
+    clickhouse_export_consumer                = var.clickhouse_export_consumer
+    clickhouse_export_lease_ms                = var.clickhouse_export_lease_ms
   })
 
   tags = {

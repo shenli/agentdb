@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 use agentdb_core::{
     record::{NewRecord, SearchableRecord},
     runtime::{
-        AppendRequest, ContextInclude, ContextRequest, FetchRequest, ForkSessionRequest,
-        SearchRequest, WatchRequest, WatchScope,
+        AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
+        ContextRequest, CreateExportConsumerRequest, ExportFeedItem, ExportWatchRequest,
+        FetchRequest, ForkSessionRequest, RewindExportConsumerRequest, SearchRequest, WatchRequest,
+        WatchScope,
     },
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
@@ -44,11 +46,13 @@ use agentdb_meta::{
 };
 
 use crate::dto::{
-    AppendAndFetchBody, AppendBody, BindSkillBody, ContextBody, CreateAgentBody, CreateRecordBody,
-    CreateSessionBody, CreateSkillBody, CreateTenantBody, FetchQuery, ForkSessionBody,
-    IncludeDeletedQuery, ListAgentSkillsResponse, PolicyWorkerRunBody, ReplayQuery,
-    RestoreSessionStorageBody, SearchRecordsBody, SearchRecordsResponse, SweepBody,
-    TransitionSessionLifecycleBody, WatchQuery,
+    AckExportConsumerBody, AppendAndFetchBody, AppendBody, BindSkillBody, ClaimExportConsumerBody,
+    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody, CreateSessionBody,
+    CreateSkillBody, CreateTenantBody, ExportBackfillBody, ExportBackfillResponse, ExportEnvelope,
+    ExportObservabilityFields, ExportStatusResponse, ExportWatchResponse, FetchQuery,
+    ForkSessionBody, IncludeDeletedQuery, ListAgentSkillsResponse, PolicyWorkerRunBody,
+    ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody, SearchRecordsBody,
+    SearchRecordsResponse, SweepBody, TransitionSessionLifecycleBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::internal_raft_http::{
@@ -95,6 +99,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/cluster/health", get(get_cluster_health))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/scheduler", get(get_admin_scheduler))
+        .route("/api/admin/exports", get(get_admin_exports))
         .route(
             "/api/admin/drain",
             get(get_admin_drain).post(post_admin_drain),
@@ -269,6 +274,32 @@ pub fn routes() -> Router<AppState> {
             post(build_context),
         )
         .route("/api/tenants/:tenant_id/watch", get(watch))
+        .route("/api/tenants/:tenant_id/exports/watch", get(export_watch))
+        .route(
+            "/api/tenants/:tenant_id/exports/backfill",
+            post(export_backfill),
+        )
+        .route("/api/tenants/:tenant_id/exports/status", get(export_status))
+        .route(
+            "/api/tenants/:tenant_id/exports/consumers",
+            post(create_export_consumer),
+        )
+        .route(
+            "/api/tenants/:tenant_id/exports/consumers/:name",
+            get(get_export_consumer),
+        )
+        .route(
+            "/api/tenants/:tenant_id/exports/consumers/:name/claim",
+            post(claim_export_consumer),
+        )
+        .route(
+            "/api/tenants/:tenant_id/exports/consumers/:name/ack",
+            post(ack_export_consumer),
+        )
+        .route(
+            "/api/tenants/:tenant_id/exports/consumers/:name/rewind",
+            post(rewind_export_consumer),
+        )
         .route(
             "/api/tenants/:tenant_id/artifacts",
             post(create_artifact)
@@ -319,6 +350,28 @@ pub fn routes() -> Router<AppState> {
 
 async fn health_ready() -> StatusCode {
     StatusCode::OK
+}
+
+async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let consumers = s.runtime.list_export_consumer_statuses().await?;
+    Ok(Json(serde_json::json!({
+        "export_version": "2026-05-14",
+        "mode": "durable_ledger",
+        "durable_ledger": s.runtime.durable_export_ledger_enabled(),
+        "managed_consumers": true,
+        "supported_object_types": [
+            "event",
+            "tenant",
+            "agent",
+            "session",
+            "artifact",
+            "record",
+            "skill",
+            "skill_binding"
+        ],
+        "consumer_count": consumers.len(),
+        "consumers": consumers
+    })))
 }
 
 fn now_ms_i64() -> i64 {
@@ -5749,12 +5802,441 @@ async fn watch(
     Path(tenant_id): Path<String>,
     Query(q): Query<WatchQuery>,
 ) -> Result<Json<Vec<ChangefeedItem>>, ApiError> {
-    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
-    let scope = match q.scope.as_str() {
-        "session" => WatchScope::Session,
-        "agent" => WatchScope::Agent,
-        _ => WatchScope::Tenant,
+    let req = watch_request_from_query(&tenant_id, q)?;
+    let runtime = s.runtime.clone();
+    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime.watch(req).await
+    })
+    .await?;
+    Ok(Json(items))
+}
+
+async fn export_watch(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<WatchQuery>,
+) -> Result<Json<ExportWatchResponse>, ApiError> {
+    let req = export_watch_request_from_query(&tenant_id, q)?;
+    let req_tenant_id = req.tenant_id.clone();
+    let runtime = s.runtime.clone();
+    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime.export_watch(req).await
+    })
+    .await?;
+    let observed_at_ms = current_ms();
+    let envelopes = items
+        .into_iter()
+        .map(|item| export_envelope_from_changefeed(item, observed_at_ms))
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_cursor = envelopes.last().map(|item| item.cursor.clone());
+    let oldest_available_cursor = s
+        .runtime
+        .export_oldest_available_cursor(&req_tenant_id)
+        .await?;
+    Ok(Json(ExportWatchResponse {
+        high_watermark: next_cursor.clone(),
+        next_cursor,
+        oldest_available_cursor,
+        items: envelopes,
+    }))
+}
+
+async fn export_backfill(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<ExportBackfillBody>,
+) -> Result<Json<ExportBackfillResponse>, ApiError> {
+    let include = if body.include.is_empty() {
+        vec!["events".to_string()]
+    } else {
+        body.include.clone()
     };
+    for include in &include {
+        if include != "events" {
+            validate_export_snapshot_include(include)?;
+        }
+    }
+    if include.iter().any(|item| item == "events") && include.len() > 1 {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::PolicyDenied,
+            "exports/backfill does not mix events with metadata object snapshots yet",
+        )));
+    }
+    if !include.iter().any(|item| item == "events") {
+        let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+        if parse_watch_scope(&body.scope) != WatchScope::Tenant {
+            return Err(ApiError(agentdb_core::Error::new(
+                ErrorCode::PolicyDenied,
+                "metadata snapshot backfill currently supports tenant scope only",
+            )));
+        }
+        let observed_at_ms = current_ms();
+        let (items, complete, oldest_available_cursor) = export_snapshot_backfill(
+            &s.runtime,
+            &tid,
+            &include,
+            body.from_cursor.as_deref(),
+            body.limit.clamp(1, 1000),
+            observed_at_ms,
+        )
+        .await?;
+        let next_cursor = items.last().map(|item| item.cursor.clone());
+        return Ok(Json(ExportBackfillResponse {
+            snapshot_high_watermark: next_cursor.clone(),
+            next_cursor,
+            oldest_available_cursor,
+            complete,
+            items,
+        }));
+    }
+    let req = export_watch_request_from_query(
+        &tenant_id,
+        WatchQuery {
+            scope: body.scope,
+            session_id: body.session_id,
+            agent_id: body.agent_id,
+            include: Some(include.join(",")),
+            from_cursor: body.from_cursor,
+            limit: body.limit,
+        },
+    )?;
+    let requested_limit = req.limit;
+    let req_tenant_id = req.tenant_id.clone();
+    let runtime = s.runtime.clone();
+    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime.export_watch(req).await
+    })
+    .await?;
+    let observed_at_ms = current_ms();
+    let complete = items.len() < requested_limit;
+    let envelopes = items
+        .into_iter()
+        .map(|item| export_envelope_from_changefeed_with_op(item, observed_at_ms, "snapshot"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_cursor = envelopes.last().map(|item| item.cursor.clone());
+    let oldest_available_cursor = s
+        .runtime
+        .export_oldest_available_cursor(&req_tenant_id)
+        .await?;
+    Ok(Json(ExportBackfillResponse {
+        snapshot_high_watermark: next_cursor.clone(),
+        next_cursor,
+        oldest_available_cursor,
+        complete,
+        items: envelopes,
+    }))
+}
+
+fn validate_export_snapshot_include(include: &str) -> Result<(), ApiError> {
+    match include {
+        "tenants" | "agents" | "sessions" | "artifacts" | "records" | "skills"
+        | "skill_bindings" => Ok(()),
+        other => Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::PolicyDenied,
+            format!("unsupported exports/backfill include: {other}"),
+        ))),
+    }
+}
+
+async fn export_snapshot_backfill(
+    runtime: &Arc<agentdb_core::runtime::Runtime>,
+    tenant_id: &Id,
+    include: &[String],
+    from_cursor: Option<&str>,
+    limit: usize,
+    observed_at_ms: u64,
+) -> Result<(Vec<ExportEnvelope>, bool, Option<String>), ApiError> {
+    if from_cursor.is_some_and(|cursor| !cursor.starts_with("snapshot:")) {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::InvalidCursor,
+            "metadata snapshot backfill cursor must use the snapshot: format",
+        )));
+    }
+
+    let mut items = Vec::new();
+    if include.iter().any(|item| item == "tenants") {
+        let tenant = runtime.get_tenant(tenant_id).await?;
+        push_snapshot_envelope(
+            &mut items,
+            "tenant",
+            tenant.tenant_id.as_str(),
+            tenant.tenant_id.as_str(),
+            None,
+            None,
+            tenant.created_at_ms,
+            observed_at_ms,
+            serde_json::to_value(&tenant).map_err(internal_error)?,
+        );
+    }
+    if include.iter().any(|item| item == "agents") {
+        for agent in runtime.list_agents(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "agent",
+                tenant_id.as_str(),
+                agent.agent_id.as_str(),
+                Some(agent.agent_id.as_str()),
+                None,
+                agent.created_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&agent).map_err(internal_error)?,
+            );
+        }
+    }
+    if include.iter().any(|item| item == "sessions") {
+        for session in runtime.list_sessions(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "session",
+                tenant_id.as_str(),
+                session.session_id.as_str(),
+                Some(session.agent_id.as_str()),
+                Some(session.session_id.as_str()),
+                session.created_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&session).map_err(internal_error)?,
+            );
+        }
+    }
+    if include.iter().any(|item| item == "artifacts") {
+        for artifact in runtime.list_artifacts(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "artifact",
+                tenant_id.as_str(),
+                artifact.artifact_id.as_str(),
+                None,
+                None,
+                artifact.created_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&artifact).map_err(internal_error)?,
+            );
+        }
+    }
+    if include.iter().any(|item| item == "records") {
+        for record in runtime.list_records(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "record",
+                tenant_id.as_str(),
+                record.record_id.as_str(),
+                None,
+                None,
+                record.created_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&record).map_err(internal_error)?,
+            );
+        }
+    }
+    if include.iter().any(|item| item == "skills") {
+        for skill in runtime.list_skills(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "skill",
+                tenant_id.as_str(),
+                skill.skill_id.as_str(),
+                None,
+                None,
+                skill.created_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&skill).map_err(internal_error)?,
+            );
+        }
+    }
+    if include.iter().any(|item| item == "skill_bindings") {
+        for binding in runtime.list_skill_bindings(tenant_id).await? {
+            push_snapshot_envelope(
+                &mut items,
+                "skill_binding",
+                tenant_id.as_str(),
+                &format!("{}:{}", binding.agent_id, binding.skill_id),
+                Some(binding.agent_id.as_str()),
+                None,
+                binding.bound_at_ms,
+                observed_at_ms,
+                serde_json::to_value(&binding).map_err(internal_error)?,
+            );
+        }
+    }
+
+    items.sort_by(|left, right| left.cursor.cmp(&right.cursor));
+    let oldest_available_cursor = items.first().map(|item| item.cursor.clone());
+    if let Some(from_cursor) = from_cursor {
+        items.retain(|item| item.cursor.as_str() > from_cursor);
+    }
+    let complete = items.len() <= limit;
+    items.truncate(limit);
+    Ok((items, complete, oldest_available_cursor))
+}
+
+fn push_snapshot_envelope(
+    items: &mut Vec<ExportEnvelope>,
+    object_type: &'static str,
+    tenant_id: &str,
+    object_id: &str,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    created_at_ms: u64,
+    observed_at_ms: u64,
+    data: serde_json::Value,
+) {
+    items.push(ExportEnvelope {
+        export_version: "2026-05-14",
+        cursor: format!("snapshot:{tenant_id}/{created_at_ms:020}/{object_type}/{object_id}"),
+        op: "snapshot",
+        object_type,
+        tenant_id: tenant_id.to_string(),
+        agent_id: agent_id.map(str::to_string),
+        session_id: session_id.map(str::to_string),
+        object_id: object_id.to_string(),
+        seq: None,
+        created_at_ms,
+        observed_at_ms,
+        cell_id: None,
+        placement_scope_id: None,
+        tablet_id: None,
+        tablet_epoch: None,
+        applied_index: None,
+        observability: ExportObservabilityFields::default(),
+        data,
+        tombstone: None,
+    });
+}
+
+async fn export_status(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<ExportStatusResponse>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let runtime = s.runtime.clone();
+    let high_watermark = with_route_tablet_context(runtime.clone(), &headers, async move {
+        runtime.export_high_watermark(&tid).await
+    })
+    .await?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let oldest_available_cursor = s.runtime.export_oldest_available_cursor(&tid).await?;
+    Ok(Json(ExportStatusResponse {
+        export_version: "2026-05-14",
+        tenant_id,
+        mode: "durable_ledger",
+        durable_ledger: s.runtime.durable_export_ledger_enabled(),
+        managed_consumers: true,
+        supported_object_types: vec![
+            "event",
+            "tenant",
+            "agent",
+            "session",
+            "artifact",
+            "record",
+            "skill",
+            "skill_binding",
+        ],
+        oldest_available_cursor,
+        high_watermark,
+    }))
+}
+
+async fn create_export_consumer(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<CreateExportConsumerBody>,
+) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let session_id = body
+        .session_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Session, ErrorCode::SessionNotFound))
+        .transpose()?;
+    let agent_id = body
+        .agent_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
+        .transpose()?;
+    let consumer = s
+        .runtime
+        .create_export_consumer(CreateExportConsumerRequest {
+            tenant_id: tid,
+            consumer_name: body.name,
+            scope: parse_watch_scope(&body.scope),
+            agent_id,
+            session_id,
+            include: body.include,
+        })
+        .await?;
+    Ok(Json(consumer))
+}
+
+async fn get_export_consumer(
+    State(s): State<AppState>,
+    Path((tenant_id, name)): Path<(String, String)>,
+) -> Result<Json<agentdb_core::runtime::ExportConsumerStatus>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    Ok(Json(
+        s.runtime.get_export_consumer_status(&tid, &name).await?,
+    ))
+}
+
+async fn claim_export_consumer(
+    State(s): State<AppState>,
+    Path((tenant_id, name)): Path<(String, String)>,
+    Json(body): Json<ClaimExportConsumerBody>,
+) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let consumer = s
+        .runtime
+        .claim_export_consumer(ClaimExportConsumerRequest {
+            tenant_id: tid,
+            consumer_name: name,
+            lease_owner: body.lease_owner,
+            lease_ms: body.lease_ms,
+        })
+        .await?;
+    Ok(Json(consumer))
+}
+
+async fn ack_export_consumer(
+    State(s): State<AppState>,
+    Path((tenant_id, name)): Path<(String, String)>,
+    Json(body): Json<AckExportConsumerBody>,
+) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let consumer = s
+        .runtime
+        .ack_export_consumer(AckExportConsumerRequest {
+            tenant_id: tid,
+            consumer_name: name,
+            cursor: body.cursor,
+            snapshot_high_watermark: body.snapshot_high_watermark,
+            lease_owner: body.lease_owner,
+        })
+        .await?;
+    Ok(Json(consumer))
+}
+
+async fn rewind_export_consumer(
+    State(s): State<AppState>,
+    Path((tenant_id, name)): Path<(String, String)>,
+    Json(body): Json<RewindExportConsumerBody>,
+) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let consumer = s
+        .runtime
+        .rewind_export_consumer(RewindExportConsumerRequest {
+            tenant_id: tid,
+            consumer_name: name,
+            cursor: body.cursor,
+            lease_owner: body.lease_owner,
+        })
+        .await?;
+    Ok(Json(consumer))
+}
+
+fn watch_request_from_query(tenant_id: &str, q: WatchQuery) -> Result<WatchRequest, ApiError> {
+    let tid = parse_id_or(tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let scope = parse_watch_scope(&q.scope);
     let session_id = q
         .session_id
         .as_deref()
@@ -5765,21 +6247,192 @@ async fn watch(
         .as_deref()
         .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
         .transpose()?;
-    let runtime = s.runtime.clone();
-    let items = with_route_tablet_context(runtime.clone(), &headers, async move {
-        runtime
-            .watch(WatchRequest {
-                tenant_id: tid,
-                scope,
-                session_id,
-                agent_id,
-                from_cursor: q.from_cursor,
-                limit: q.limit.clamp(1, 1000),
-            })
-            .await
+    Ok(WatchRequest {
+        tenant_id: tid,
+        scope,
+        session_id,
+        agent_id,
+        from_cursor: q.from_cursor,
+        limit: q.limit.clamp(1, 1000),
     })
-    .await?;
-    Ok(Json(items))
+}
+
+fn parse_export_include_query(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn export_watch_request_from_query(
+    tenant_id: &str,
+    q: WatchQuery,
+) -> Result<ExportWatchRequest, ApiError> {
+    let tid = parse_id_or(tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let scope = parse_watch_scope(&q.scope);
+    let session_id = q
+        .session_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Session, ErrorCode::SessionNotFound))
+        .transpose()?;
+    let agent_id = q
+        .agent_id
+        .as_deref()
+        .map(|raw| parse_id_or(raw, IdKind::Agent, ErrorCode::AgentNotFound))
+        .transpose()?;
+    Ok(ExportWatchRequest {
+        tenant_id: tid,
+        scope,
+        session_id,
+        agent_id,
+        include: q
+            .include
+            .as_deref()
+            .map(parse_export_include_query)
+            .unwrap_or_default(),
+        from_cursor: q.from_cursor,
+        limit: q.limit.clamp(1, 1000),
+    })
+}
+
+fn parse_watch_scope(scope: &str) -> WatchScope {
+    match scope {
+        "session" => WatchScope::Session,
+        "agent" => WatchScope::Agent,
+        _ => WatchScope::Tenant,
+    }
+}
+
+fn export_envelope_from_changefeed(
+    item: ExportFeedItem,
+    observed_at_ms: u64,
+) -> Result<ExportEnvelope, ApiError> {
+    export_envelope_from_changefeed_with_op(item, observed_at_ms, "insert")
+}
+
+fn export_envelope_from_changefeed_with_op(
+    item: ExportFeedItem,
+    observed_at_ms: u64,
+    op: &'static str,
+) -> Result<ExportEnvelope, ApiError> {
+    let ledger_item = item.item;
+    let observability = if ledger_item.object_type == "event" {
+        let event: agentdb_core::EventEnvelope =
+            serde_json::from_value(ledger_item.data.clone()).map_err(internal_error)?;
+        export_observability_fields(&event)?
+    } else {
+        ExportObservabilityFields::default()
+    };
+    let object_type: &'static str = match ledger_item.object_type.as_str() {
+        "event" => "event",
+        "tenant" => "tenant",
+        "agent" => "agent",
+        "session" => "session",
+        "artifact" => "artifact",
+        "record" => "record",
+        "skill" => "skill",
+        "skill_binding" => "skill_binding",
+        _ => "unknown",
+    };
+    let effective_op = if op == "snapshot" {
+        "snapshot"
+    } else {
+        match ledger_item.op.as_str() {
+            "delete" => "delete",
+            "upsert" => "upsert",
+            "insert" => "insert",
+            _ => op,
+        }
+    };
+    Ok(ExportEnvelope {
+        export_version: "2026-05-14",
+        cursor: item.cursor,
+        op: effective_op,
+        object_type,
+        tenant_id: ledger_item.tenant_id.to_string(),
+        agent_id: ledger_item.agent_id.map(|agent_id| agent_id.to_string()),
+        session_id: ledger_item
+            .session_id
+            .map(|session_id| session_id.to_string()),
+        object_id: ledger_item.object_id,
+        seq: ledger_item.seq,
+        created_at_ms: ledger_item.created_at_ms,
+        observed_at_ms,
+        cell_id: item.cell_id,
+        placement_scope_id: item.placement_scope_id,
+        tablet_id: item.tablet_id,
+        tablet_epoch: item.tablet_epoch,
+        applied_index: item.applied_index,
+        observability,
+        data: ledger_item.data,
+        tombstone: ledger_item.tombstone,
+    })
+}
+
+fn export_observability_fields(
+    event: &agentdb_core::EventEnvelope,
+) -> Result<ExportObservabilityFields, ApiError> {
+    let source_refs = if event.source_refs.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&event.source_refs).map_err(internal_error)?)
+    };
+    let artifact_refs = if event.artifact_refs.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&event.artifact_refs).map_err(internal_error)?)
+    };
+    Ok(ExportObservabilityFields {
+        event_id: Some(event.event_id.to_string()),
+        kind: Some(event.kind.clone()),
+        parent_event_id: payload_string(&event.payload, "parent_event_id").or_else(|| {
+            event
+                .source_refs
+                .iter()
+                .find_map(|source| source.event_id.as_ref().map(ToString::to_string))
+        }),
+        source_refs,
+        status: payload_string(&event.payload, "status"),
+        model: payload_string(&event.payload, "model"),
+        provider: payload_string(&event.payload, "provider"),
+        finish_reason: payload_string(&event.payload, "finish_reason"),
+        tool_name: payload_string(&event.payload, "tool_name"),
+        tool_call_id: payload_string(&event.payload, "tool_call_id"),
+        duration_ms: payload_u64(&event.payload, "duration_ms"),
+        timeout_ms: payload_u64(&event.payload, "timeout_ms"),
+        input_tokens: payload_u64(&event.payload, "input_tokens"),
+        output_tokens: payload_u64(&event.payload, "output_tokens"),
+        total_tokens: payload_u64(&event.payload, "total_tokens"),
+        cost_micros: payload_u64(&event.payload, "cost_micros"),
+        error_kind: payload_string(&event.payload, "error_kind"),
+        error_message: payload_string(&event.payload, "error_message"),
+        retryable: event
+            .payload
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool),
+        exit_code: event
+            .payload
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64),
+        approval_id: payload_string(&event.payload, "approval_id"),
+        approval_decision: payload_string(&event.payload, "approval_decision"),
+        context_pack_id: payload_string(&event.payload, "context_pack_id"),
+        artifact_refs,
+        tags: event.payload.get("tags").cloned(),
+        metadata: event.payload.get("metadata").cloned(),
+    })
+}
+
+fn payload_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn payload_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(serde_json::Value::as_u64)
 }
 
 /// `POST /api/tenants/:tenant_id/artifacts`

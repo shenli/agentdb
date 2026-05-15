@@ -25,5 +25,13 @@ After deployment, `agentdbctl status` reports the configured memtable budget,
 open tablet-store domain count, and pending compaction bytes so AWS experiments
 can verify domain sizing before increasing isolation.
 
+The AWS Terraform template can also write optional ClickHouse export settings.
+Set `clickhouse_url` and `clickhouse_export_tenant_id` after creating a tenant;
+`infra/aws/scripts/deploy-demo.sh` will build `agentdbctl`, initialize the
+ClickHouse schema, and start `agentdbctl export clickhouse run --backfill
+--tail` with a managed consumer lease. Run the same deploy flow on multiple
+nodes with the same `clickhouse_export_consumer` to get active/passive exporter
+HA; each node derives a distinct lease owner from its hostname.
+
 Runtime operations that do not provision cloud infrastructure belong under
 `ops/`.

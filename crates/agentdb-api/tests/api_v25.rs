@@ -7,10 +7,14 @@ use common::spawn_app;
 use serde_json::json;
 
 async fn seed(app: &common::TestApp) -> (String, String, String) {
+    seed_with_key(app, "api-v25").await
+}
+
+async fn seed_with_key(app: &common::TestApp, external_key: &str) -> (String, String, String) {
     let tenant: serde_json::Value = app
         .client
         .post(format!("{}/api/tenants", app.base))
-        .json(&json!({"external_key": "api-v25", "policy": {}}))
+        .json(&json!({"external_key": external_key, "policy": {}}))
         .send()
         .await
         .unwrap()
@@ -53,6 +57,17 @@ async fn seed(app: &common::TestApp) -> (String, String, String) {
 }
 
 async fn append(app: &common::TestApp, tid: &str, aid: &str, sid: &str, kind: &str, n: u64) {
+    append_payload(app, tid, aid, sid, kind, json!({ "n": n })).await;
+}
+
+async fn append_payload(
+    app: &common::TestApp,
+    tid: &str,
+    aid: &str,
+    sid: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) {
     app.client
         .post(format!(
             "{}/api/tenants/{tid}/sessions/{sid}/events",
@@ -61,7 +76,7 @@ async fn append(app: &common::TestApp, tid: &str, aid: &str, sid: &str, kind: &s
         .json(&json!({
             "agent_id": aid,
             "kind": kind,
-            "payload": {"n": n},
+            "payload": payload,
             "artifact_refs": [],
             "source_refs": []
         }))
@@ -237,4 +252,522 @@ async fn context_and_watch_work_over_http() {
     assert!(routed_cursor.contains("scope=tenant/api-v25"));
     assert!(routed_cursor.contains("tablet=7"));
     assert!(routed_cursor.contains("epoch=11"));
+}
+
+#[tokio::test]
+async fn export_watch_returns_event_envelopes_and_resume_cursor() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = seed(&app).await;
+    append_payload(
+        &app,
+        &tid,
+        &aid,
+        &sid,
+        "model_call",
+        json!({
+            "model": "gpt-test",
+            "provider": "openai",
+            "status": "ok",
+            "duration_ms": 123,
+            "input_tokens": 7,
+            "output_tokens": 11,
+            "total_tokens": 18,
+            "cost_micros": 42,
+            "metadata": {"trace": "abc"},
+            "tags": ["golden-path"]
+        }),
+    )
+    .await;
+    append_payload(
+        &app,
+        &tid,
+        &aid,
+        &sid,
+        "tool_result",
+        json!({
+            "tool_name": "shell",
+            "tool_call_id": "call-1",
+            "status": "ok",
+            "duration_ms": 9
+        }),
+    )
+    .await;
+
+    let first: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/exports/watch?scope=tenant&limit=1",
+            app.base
+        ))
+        .header(HDR_TABLET_ID, "7")
+        .header(HDR_TABLET_EPOCH, "11")
+        .header(HDR_CELL_ID, "cell-a")
+        .header(HDR_PLACEMENT_SCOPE_ID, "tenant/api-v25")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_items = first["items"].as_array().unwrap();
+    assert_eq!(first_items.len(), 1);
+    assert_eq!(first["next_cursor"], first_items[0]["cursor"]);
+    assert_eq!(first["high_watermark"], first_items[0]["cursor"]);
+    assert_eq!(first_items[0]["export_version"], "2026-05-14");
+    assert_eq!(first_items[0]["op"], "insert");
+    assert_eq!(first_items[0]["object_type"], "event");
+    assert_eq!(first_items[0]["tenant_id"], tid);
+    assert_eq!(first_items[0]["agent_id"], aid);
+    assert_eq!(first_items[0]["session_id"], sid);
+    assert_eq!(first_items[0]["seq"], 0);
+    assert_eq!(first_items[0]["kind"], "model_call");
+    assert_eq!(first_items[0]["model"], "gpt-test");
+    assert_eq!(first_items[0]["provider"], "openai");
+    assert_eq!(first_items[0]["duration_ms"], 123);
+    assert_eq!(first_items[0]["total_tokens"], 18);
+    assert_eq!(first_items[0]["cost_micros"], 42);
+    assert_eq!(first_items[0]["cell_id"], "cell-a");
+    assert_eq!(first_items[0]["placement_scope_id"], "tenant/api-v25");
+    assert_eq!(first_items[0]["tablet_id"], 7);
+    assert_eq!(first_items[0]["tablet_epoch"], 11);
+    assert_eq!(
+        first_items[0]["data"]["event_id"],
+        first_items[0]["event_id"]
+    );
+    assert_eq!(
+        first_items[0]["data"]["payload"]["metadata"]["trace"],
+        "abc"
+    );
+
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let after: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/exports/watch?scope=session&session_id={sid}&from_cursor={cursor}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let after_items = after["items"].as_array().unwrap();
+    assert_eq!(after_items.len(), 1);
+    assert_eq!(after_items[0]["kind"], "tool_result");
+    assert_eq!(after_items[0]["tool_name"], "shell");
+    assert_eq!(after_items[0]["tool_call_id"], "call-1");
+}
+
+#[tokio::test]
+async fn export_status_reports_durable_export_capabilities() {
+    let app = spawn_app().await;
+    let (tid, _aid, _sid) = seed(&app).await;
+    let status: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/exports/status", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["export_version"], "2026-05-14");
+    assert_eq!(status["tenant_id"], tid);
+    assert_eq!(status["mode"], "durable_ledger");
+    assert_eq!(status["durable_ledger"], false);
+    assert_eq!(status["managed_consumers"], true);
+    assert_eq!(
+        status["supported_object_types"],
+        json!([
+            "event",
+            "tenant",
+            "agent",
+            "session",
+            "artifact",
+            "record",
+            "skill",
+            "skill_binding"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
+    let app = spawn_app().await;
+    let (tenant_a, agent_a, session_a) = seed_with_key(&app, "api-v25-a").await;
+    let (tenant_b, agent_b, session_b) = seed_with_key(&app, "api-v25-b").await;
+    append(&app, &tenant_a, &agent_a, &session_a, "tenant-a", 1).await;
+    append(&app, &tenant_b, &agent_b, &session_b, "tenant-b", 2).await;
+
+    let tenant_items: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tenant_a}/exports/watch?scope=tenant",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = tenant_items["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["tenant_id"], tenant_a);
+    assert_eq!(items[0]["agent_id"], agent_a);
+    assert_eq!(items[0]["session_id"], session_a);
+    assert_eq!(items[0]["kind"], "tenant-a");
+
+    let agent_items: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tenant_a}/exports/watch?scope=agent&agent_id={agent_a}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(agent_items["items"].as_array().unwrap().len(), 1);
+
+    let wrong_agent = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tenant_a}/exports/watch?scope=agent&agent_id={agent_b}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_agent.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let wrong_session = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tenant_a}/exports/watch?scope=session&session_id={session_b}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_session.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = seed(&app).await;
+    append(&app, &tid, &aid, &sid, "first", 1).await;
+    append(&app, &tid, &aid, &sid, "second", 2).await;
+
+    let first_page: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "session",
+            "session_id": sid,
+            "include": ["events"],
+            "limit": 1
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = first_page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["op"], "snapshot");
+    assert_eq!(items[0]["kind"], "first");
+    assert_eq!(first_page["complete"], false);
+    assert_eq!(first_page["snapshot_high_watermark"], items[0]["cursor"]);
+
+    let cursor = first_page["next_cursor"].as_str().unwrap();
+    let second_page: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "session",
+            "session_id": sid,
+            "include": ["events"],
+            "from_cursor": cursor,
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_items = second_page["items"].as_array().unwrap();
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["kind"], "second");
+    assert_eq!(second_page["complete"], true);
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "namespace": ["mem"],
+            "text": "snapshot memory",
+            "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let metadata_page: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "tenant",
+            "include": ["tenants", "agents", "sessions", "records"],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let object_types = metadata_page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["object_type"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        object_types,
+        ["agent", "record", "session", "tenant"]
+            .into_iter()
+            .collect()
+    );
+    assert!(metadata_page["next_cursor"]
+        .as_str()
+        .unwrap()
+        .starts_with("snapshot:"));
+    assert_eq!(metadata_page["complete"], true);
+
+    let rejected = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "tenant",
+            "include": ["widgets"],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn export_consumers_claim_ack_and_rewind_cursors() {
+    let app = spawn_app().await;
+    let (tid, aid, sid) = seed(&app).await;
+    append(&app, &tid, &aid, &sid, "before-consumer", 1).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/consumers", app.base))
+        .json(&json!({
+            "name": "clickhouse",
+            "scope": "tenant",
+            "include": ["events"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["consumer_name"], "clickhouse");
+    assert_eq!(created["scope"], "tenant");
+    assert_eq!(created["include"], json!(["events"]));
+    assert!(created["last_acked_cursor"].is_null());
+    assert_eq!(created["pending_items"], serde_json::Value::Null);
+
+    let claimed: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/claim",
+            app.base
+        ))
+        .json(&json!({
+            "lease_owner": "worker-a",
+            "lease_ms": 60_000
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(claimed["lease_owner"], "worker-a");
+    assert!(
+        claimed["lease_expires_at_ms"].as_u64().unwrap()
+            > claimed["updated_at_ms"].as_u64().unwrap()
+    );
+
+    let rejected_claim = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/claim",
+            app.base
+        ))
+        .json(&json!({
+            "lease_owner": "worker-b",
+            "lease_ms": 60_000
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_claim.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let rejected_ack = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/ack",
+            app.base
+        ))
+        .json(&json!({
+            "cursor": "v2:0001",
+            "lease_owner": "worker-b"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_ack.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let acked: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/ack",
+            app.base
+        ))
+        .json(&json!({
+            "cursor": "v2:0001",
+            "snapshot_high_watermark": "v2:0001",
+            "lease_owner": "worker-a"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(acked["last_acked_cursor"], "v2:0001");
+    assert_eq!(acked["snapshot_high_watermark"], "v2:0001");
+    append(&app, &tid, &aid, &sid, "after-ack", 2).await;
+
+    let stale_ack = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/ack",
+            app.base
+        ))
+        .json(&json!({
+            "cursor": "v2:0000",
+            "lease_owner": "worker-a"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_ack.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let rewound: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/rewind",
+            app.base
+        ))
+        .json(&json!({
+            "cursor": null,
+            "lease_owner": "worker-a"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(rewound["last_acked_cursor"].is_null());
+
+    let fetched: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched["consumer_name"], "clickhouse");
+    assert!(fetched["last_acked_cursor"].is_null());
+    assert_eq!(fetched["pending_items"], 2);
+    assert!(fetched["high_watermark"]
+        .as_str()
+        .unwrap()
+        .starts_with("v2:"));
+    assert!(fetched["pending_oldest_created_at_ms"].is_u64());
+    assert!(fetched["lag_ms"].is_u64());
+    assert_eq!(fetched["lease_active"], true);
+
+    let admin: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/exports", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin["managed_consumers"], true);
+    assert_eq!(admin["consumer_count"], 1);
+    assert_eq!(admin["consumers"][0]["consumer_name"], "clickhouse");
+    assert_eq!(admin["consumers"][0]["pending_items"], 2);
 }

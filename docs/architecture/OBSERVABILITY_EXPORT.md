@@ -373,7 +373,7 @@ Allowed `op` values:
 
 ```text
 insert
-update
+upsert
 delete
 snapshot
 ```
@@ -388,6 +388,7 @@ event
 artifact
 record
 skill
+skill_binding
 policy
 consumer
 ```
@@ -407,6 +408,7 @@ For deletes, `data` may be omitted and `tombstone` should include the reason:
 Allowed tombstone reasons:
 
 ```text
+soft_delete
 user_delete
 retention_gc
 tenant_purge
@@ -791,34 +793,78 @@ Response:
 
 ## Implementation Plan
 
-### Phase 1: ClickHouse Golden Path On Current Watch
+### Phase 1: ClickHouse Golden Path And Durable Export Ledger
 
-- Add `ExportEnvelope` DTOs.
-- Add `exports/watch` returning event envelopes backed by current watch logic.
-- Add normalized observability fields for event conventions.
-- Build `agentdb-export-clickhouse` with event-only export.
-- Build `agentdbctl export clickhouse doctor/init/run/status`.
-- Publish first-party ClickHouse DDL and sample queries.
-- Add tests for cursor resume, duplicate-safe object keys, and scoped exports.
+- Implemented: `ExportEnvelope` DTOs for events and runtime metadata objects.
+- Implemented: `GET /api/tenants/{tenant_id}/exports/watch` returning export
+  envelopes. Persistent runtimes serve this from a durable export ledger;
+  in-memory/dev runtimes fall back to current event watch logic.
+- Implemented: `GET /api/tenants/{tenant_id}/exports/status` exposing the
+  durable ledger capability and supported object types.
+- Implemented: `POST /api/tenants/{tenant_id}/exports/backfill` with event
+  snapshots plus tenant-scope metadata snapshots for tenants, agents, sessions,
+  artifacts, records, skills, and skill bindings.
+- Implemented: explicit persisted cursor validation and
+  `oldest_available_cursor` reporting for export watch, backfill, and status.
+- Implemented: managed export consumers with durable checkpoints, include
+  filters, leases, ack, and rewind.
+- Implemented: per-tenant durable export high-watermark pointers for
+  persistent runtimes, so `exports/status` does not scan the full ledger.
+- Implemented: durable session and agent export ledger indexes for scoped
+  event and metadata consumers. The public cursor remains the canonical tenant
+  `ledger:...` cursor.
+- Implemented: tenant, agent, session, artifact, record, skill, and
+  skill-binding mutation ledger rows.
+- Implemented: soft-delete tombstone export for metadata objects that use the
+  runtime soft-delete contract.
+- Implemented: tablet movement snapshot classification for export ledger,
+  scoped ledger indexes, high-watermark rows, and managed consumer rows.
+- Implemented: `GET /api/admin/exports` visibility for managed consumers and
+  current export capability, including pending item count, high watermark,
+  oldest pending item timestamp, lag, and lease-active state.
+- Implemented: normalized event observability fields for common convention
+  payload keys.
+- Implemented: `agentdbctl export clickhouse doctor/init/run/status`, including
+  `run --backfill --tail`, using ClickHouse HTTP and `JSONEachRow`.
+- Implemented: first-party ClickHouse DDL for raw envelopes, flattened events,
+  checkpoints, schema migrations, and tombstones.
+- Implemented: focused tests for cursor resume, route context propagation,
+  durable ledger resume after restart, normalized fields, and CLI schema/path
+  helpers.
+- Deferred: a separate `agentdb-export-clickhouse` daemon binary. The current
+  connector is built into `agentdbctl`; a daemon wrapper can reuse the same API
+  and consumer lease protocol.
 
-This phase is mostly an API, schema, and UX commitment. It does not yet solve
-every durability issue, but it gives ClickHouse users a stable target.
+This phase is a durable export API, metadata snapshot, schema, HA, and UX
+commitment. It includes tenant-prefixed durable ledger rows for persisted
+runtimes and tombstone envelopes for runtime soft deletes.
 
-### Phase 2: Durable Export Ledger And Managed Consumers
+Current scale boundary: tenant export resumes use a KV lower bound derived from
+`ledger:...` cursors, so normal polling does not scan from the start. Tenant
+high watermark is stored separately and read directly. Agent and session scoped
+exports use secondary index rows that point back to the canonical tenant ledger
+entry, avoiding full tenant scans while preserving one sink checkpoint cursor
+format.
 
-- Add tablet-local or tenant-local export ledger rows.
-- Write ledger rows for event appends and session lifecycle transitions.
-- Return export cursors from the ledger rather than reconstructing from session
-  scans.
-- Add named consumers, leases, ack, rewind, and export status endpoints.
-- Add expired-cursor errors.
-- Include ledger state in backup/restore and tablet movement work.
+HA behavior: run multiple connector workers with the same consumer name and
+distinct lease owners. Only the active lease holder can ack. The connector
+writes a batch to ClickHouse before acking AgentDB, so failover can replay the
+last unacked batch without data loss. RPO is zero for committed AgentDB events
+that remain in the export ledger. RTO is bounded by the configured export
+consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 
-### Phase 3: Full Runtime Mutation Coverage
+### Phase 2: Remaining Durable Ledger Coverage
 
-- Add artifact, record, skill, session metadata, policy, consumer, and tombstone
-  export entries.
-- Add backfill with snapshot high-watermark.
+- Add first-class policy object ledger rows when runtime policy mutation APIs
+  are promoted.
+- Add retention-GC, tenant-purge, and policy-redaction tombstone reasons beyond
+  current soft deletes.
+- Add explicit restore/conformance tests that prove export ledger high
+  watermarks and managed consumers survive backup/restore, in addition to the
+  tablet movement snapshot coverage.
+
+### Phase 3: Retention And Metrics
+
 - Add retention-aware export cursor policy.
 - Add metrics for export lag and oldest retained cursor.
 

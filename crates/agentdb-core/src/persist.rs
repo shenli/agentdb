@@ -46,6 +46,7 @@ use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
+use crate::runtime::{ExportConsumer, ExportLedgerItem};
 use crate::segment::SessionSegment;
 use crate::session::Session;
 use crate::skill::{AgentSkillBinding, Skill};
@@ -75,6 +76,154 @@ fn append_log_session_prefix(tenant_id: &str, session_id: &str) -> String {
 
 fn append_log_tenant_prefix(tenant_id: &str) -> String {
     format!("append_log/{tenant_id}/")
+}
+
+fn export_consumer_key(tenant_id: &str, consumer_name: &str) -> String {
+    format!("record/export_consumer/{tenant_id}/{consumer_name}")
+}
+
+fn export_ledger_event_key(event: &EventEnvelope) -> String {
+    format!(
+        "export_ledger/{}/{:020}/{}/{:020}/event/{}",
+        event.tenant_id, event.created_at_ms, event.session_id, event.seq, event.event_id
+    )
+}
+
+static EXPORT_LEDGER_OBJECT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_export_ledger_object_seq() -> u64 {
+    EXPORT_LEDGER_OBJECT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn export_ledger_object_key(item: &ExportLedgerItem) -> String {
+    format!(
+        "export_ledger/{}/{:020}/{:020}/{}/{}",
+        item.tenant_id,
+        item.created_at_ms,
+        next_export_ledger_object_seq(),
+        item.object_type,
+        item.object_id
+    )
+}
+
+fn export_ledger_item_cursor_from_key(key: &[u8]) -> String {
+    let raw = std::str::from_utf8(key).expect("export ledger key is utf8");
+    format!("ledger:{}", raw.trim_start_matches("export_ledger/"))
+}
+
+fn export_ledger_key_from_item_cursor(tenant_id: &str, cursor: &str) -> Option<String> {
+    let raw = cursor.strip_prefix("ledger:")?;
+    if raw != tenant_id && !raw.starts_with(&format!("{tenant_id}/")) {
+        return None;
+    }
+    Some(format!("export_ledger/{raw}"))
+}
+
+fn export_ledger_session_index_key(event: &EventEnvelope) -> String {
+    format!(
+        "export_ledger_by_session/{}/{}/{:020}/{:020}/event/{}",
+        event.tenant_id, event.session_id, event.created_at_ms, event.seq, event.event_id
+    )
+}
+
+fn export_ledger_agent_index_key(event: &EventEnvelope) -> String {
+    format!(
+        "export_ledger_by_agent/{}/{}/{:020}/{}/{:020}/event/{}",
+        event.tenant_id,
+        event.agent_id,
+        event.created_at_ms,
+        event.session_id,
+        event.seq,
+        event.event_id
+    )
+}
+
+fn export_ledger_tenant_prefix(tenant_id: &str) -> String {
+    format!("export_ledger/{tenant_id}/")
+}
+
+fn export_ledger_session_index_prefix(tenant_id: &str, session_id: &str) -> String {
+    format!("export_ledger_by_session/{tenant_id}/{session_id}/")
+}
+
+fn export_ledger_agent_index_prefix(tenant_id: &str, agent_id: &str) -> String {
+    format!("export_ledger_by_agent/{tenant_id}/{agent_id}/")
+}
+
+fn export_ledger_high_watermark_key(tenant_id: &str) -> String {
+    format!("export_ledger_high_watermark/{tenant_id}")
+}
+
+fn export_ledger_cursor_at_or_before(cursor: &str, from_cursor: Option<&str>) -> bool {
+    from_cursor.is_some_and(|from| from.starts_with("ledger:") && cursor <= from)
+}
+
+fn export_ledger_object_id_from_key(key: &[u8]) -> Option<&str> {
+    let raw = std::str::from_utf8(key).ok()?;
+    let parts = raw.split('/').collect::<Vec<_>>();
+    if parts.len() == 7 && parts[5] == "event" {
+        return Some(parts[6]);
+    }
+    if parts.len() == 6 {
+        return Some(parts[5]);
+    }
+    None
+}
+
+fn export_ledger_tenant_from_key(key: &[u8]) -> Option<&str> {
+    let raw = std::str::from_utf8(key).ok()?;
+    let mut parts = raw.split('/');
+    let _namespace = parts.next()?;
+    parts.next()
+}
+
+fn export_item_from_event(event: &EventEnvelope) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "insert".into(),
+        object_type: "event".into(),
+        tenant_id: event.tenant_id.clone(),
+        agent_id: Some(event.agent_id.clone()),
+        session_id: Some(event.session_id.clone()),
+        object_id: event.event_id.as_str().to_string(),
+        seq: Some(event.seq),
+        created_at_ms: event.created_at_ms,
+        data: serde_json::to_value(event).expect("event serializes"),
+        tombstone: None,
+    }
+}
+
+fn export_item_from_value(
+    object_type: &str,
+    tenant_id: crate::Id,
+    agent_id: Option<crate::Id>,
+    session_id: Option<crate::Id>,
+    object_id: String,
+    created_at_ms: u64,
+    deleted_at_ms: Option<u64>,
+    data: serde_json::Value,
+) -> ExportLedgerItem {
+    let tombstone = deleted_at_ms.map(|deleted_at_ms| {
+        serde_json::json!({
+            "deleted_at_ms": deleted_at_ms,
+            "reason": "soft_delete"
+        })
+    });
+    ExportLedgerItem {
+        op: if tombstone.is_some() {
+            "delete".into()
+        } else {
+            "upsert".into()
+        },
+        object_type: object_type.into(),
+        tenant_id,
+        agent_id,
+        session_id,
+        object_id,
+        seq: None,
+        created_at_ms: deleted_at_ms.unwrap_or(created_at_ms),
+        data,
+        tombstone,
+    }
 }
 
 static APPEND_PERSIST_PROFILE: OnceLock<Option<AppendPersistProfile>> = OnceLock::new();
@@ -664,6 +813,19 @@ impl Persist {
         }
     }
 
+    fn export_ledger_context<'a>(
+        &self,
+        tenant_id: &'a str,
+        object_id: &'a str,
+    ) -> MetadataCryptoContext<'a> {
+        MetadataCryptoContext {
+            tenant_id,
+            object_kind: MetadataObjectKind::Event,
+            object_id,
+            key: None,
+        }
+    }
+
     // ----- single-record writes -----
     //
     // Each `put_*` writes the primary record AND, if an alias / external_key
@@ -672,7 +834,7 @@ impl Persist {
     // the in-memory uniqueness map reflects on-disk state.
 
     pub fn put_tenant(&self, t: &Tenant) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: tenant_record_key(t.tenant_id.as_str()).into_bytes(),
             value: serde_json::to_vec(t).expect("tenant serializes"),
@@ -683,6 +845,16 @@ impl Persist {
                 value: t.tenant_id.as_str().as_bytes().to_vec(),
             });
         }
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "tenant",
+            t.tenant_id.clone(),
+            None,
+            None,
+            t.tenant_id.as_str().to_string(),
+            t.created_at_ms,
+            t.deleted_at_ms,
+            serde_json::to_value(t).expect("tenant serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -700,7 +872,7 @@ impl Persist {
     }
 
     pub fn put_agent(&self, a: &Agent) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: agent_record_key(a.tenant_id.as_str(), a.agent_id.as_str()).into_bytes(),
             value: serde_json::to_vec(a).expect("agent serializes"),
@@ -713,6 +885,16 @@ impl Persist {
                 });
             }
         }
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "agent",
+            a.tenant_id.clone(),
+            Some(a.agent_id.clone()),
+            None,
+            a.agent_id.as_str().to_string(),
+            a.created_at_ms,
+            a.deleted_at_ms,
+            serde_json::to_value(a).expect("agent serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -749,7 +931,7 @@ impl Persist {
             &artifact_context,
             &serde_json::to_vec(a).expect("artifact serializes"),
         )?;
-        Ok(vec![
+        let mut ops = vec![
             WriteOp::Put {
                 key: artifact_record_key(a.tenant_id.as_str(), a.artifact_id.as_str()).into_bytes(),
                 value: artifact_value,
@@ -758,7 +940,18 @@ impl Persist {
                 key: artifact_by_sha256_key(a.tenant_id.as_str(), &a.sha256).into_bytes(),
                 value: a.artifact_id.as_str().as_bytes().to_vec(),
             },
-        ])
+        ];
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "artifact",
+            a.tenant_id.clone(),
+            None,
+            None,
+            a.artifact_id.as_str().to_string(),
+            a.created_at_ms,
+            a.deleted_at_ms,
+            serde_json::to_value(a).expect("artifact serializes"),
+        ))?);
+        Ok(ops)
     }
 
     pub fn delete_artifact(&self, a: &Artifact) -> KvResult<()> {
@@ -774,7 +967,7 @@ impl Persist {
     }
 
     pub fn put_session(&self, s: &Session) -> KvResult<()> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(2);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
             value: serde_json::to_vec(s).expect("session serializes"),
@@ -787,6 +980,16 @@ impl Persist {
                 });
             }
         }
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "session",
+            s.tenant_id.clone(),
+            Some(s.agent_id.clone()),
+            Some(s.session_id.clone()),
+            s.session_id.as_str().to_string(),
+            s.created_at_ms,
+            s.deleted_at_ms,
+            serde_json::to_value(s).expect("session serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -1045,7 +1248,8 @@ impl Persist {
             .first()
             .expect("append_many_log_ref_ops requires non-empty events");
         let batch = AppendLogBatchRefs { events, session };
-        Ok(vec![WriteOp::Put {
+        let mut ops = Vec::with_capacity(events.len() * 4 + 1);
+        ops.push(WriteOp::Put {
             key: append_log_key(
                 first.tenant_id.as_str(),
                 first.session_id.as_str(),
@@ -1057,7 +1261,13 @@ impl Persist {
                 first.session_id.as_str(),
                 &batch,
             )?,
-        }])
+        });
+        for event in events {
+            ops.push(self.export_ledger_event_put_op(event)?);
+            ops.extend(self.export_ledger_index_put_ops(event));
+            ops.push(self.export_ledger_high_watermark_put_op(event));
+        }
+        Ok(ops)
     }
 
     pub(crate) fn append_batch_ops(
@@ -1066,7 +1276,7 @@ impl Persist {
         session: Option<&Session>,
         idem: Option<(&str, &IdempotencyRecord)>,
     ) -> KvResult<Vec<WriteOp>> {
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(4);
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(7);
         let ek = event_key(
             event.tenant_id.as_str(),
             event.session_id.as_str(),
@@ -1081,6 +1291,9 @@ impl Persist {
             key: ek.into_bytes(),
             value: event_value,
         });
+        ops.push(self.export_ledger_event_put_op(event)?);
+        ops.extend(self.export_ledger_index_put_ops(event));
+        ops.push(self.export_ledger_high_watermark_put_op(event));
         if let Some(session) = session {
             let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
             ops.push(WriteOp::Put {
@@ -1108,6 +1321,90 @@ impl Persist {
             ops.push(WriteOp::Put {
                 key: key.into_bytes(),
                 value: serde_json::to_vec(rec).expect("idempotency record serializes"),
+            });
+        }
+        Ok(ops)
+    }
+
+    fn export_ledger_event_put_op(&self, event: &EventEnvelope) -> KvResult<WriteOp> {
+        let item = export_item_from_event(event);
+        let event_context =
+            self.export_ledger_context(event.tenant_id.as_str(), event.event_id.as_str());
+        let value = self.encrypt_metadata(
+            &event_context,
+            &serde_json::to_vec(&item).expect("export ledger item serializes"),
+        )?;
+        Ok(WriteOp::Put {
+            key: export_ledger_event_key(event).into_bytes(),
+            value,
+        })
+    }
+
+    fn export_ledger_high_watermark_put_op(&self, event: &EventEnvelope) -> WriteOp {
+        let key = export_ledger_event_key(event);
+        let cursor = format!("ledger:{}", key.trim_start_matches("export_ledger/"));
+        WriteOp::Put {
+            key: export_ledger_high_watermark_key(event.tenant_id.as_str()).into_bytes(),
+            value: cursor.into_bytes(),
+        }
+    }
+
+    fn export_ledger_index_put_ops(&self, event: &EventEnvelope) -> Vec<WriteOp> {
+        let ledger_key = export_ledger_event_key(event).into_bytes();
+        vec![
+            WriteOp::Put {
+                key: export_ledger_session_index_key(event).into_bytes(),
+                value: ledger_key.clone(),
+            },
+            WriteOp::Put {
+                key: export_ledger_agent_index_key(event).into_bytes(),
+                value: ledger_key,
+            },
+        ]
+    }
+
+    fn export_ledger_item_put_ops(&self, item: ExportLedgerItem) -> KvResult<Vec<WriteOp>> {
+        let key = export_ledger_object_key(&item);
+        let cursor = format!("ledger:{}", key.trim_start_matches("export_ledger/"));
+        let context = self.export_ledger_context(item.tenant_id.as_str(), &item.object_id);
+        let value = self.encrypt_metadata(
+            &context,
+            &serde_json::to_vec(&item).expect("export ledger item serializes"),
+        )?;
+        let mut ops = vec![
+            WriteOp::Put {
+                key: key.as_bytes().to_vec(),
+                value,
+            },
+            WriteOp::Put {
+                key: export_ledger_high_watermark_key(item.tenant_id.as_str()).into_bytes(),
+                value: cursor.into_bytes(),
+            },
+        ];
+        if let Some(session_id) = item.session_id.as_ref() {
+            ops.push(WriteOp::Put {
+                key: format!(
+                    "export_ledger_by_session/{}/{}/{:020}/{}",
+                    item.tenant_id,
+                    session_id,
+                    item.created_at_ms,
+                    key.trim_start_matches("export_ledger/")
+                )
+                .into_bytes(),
+                value: key.as_bytes().to_vec(),
+            });
+        }
+        if let Some(agent_id) = item.agent_id.as_ref() {
+            ops.push(WriteOp::Put {
+                key: format!(
+                    "export_ledger_by_agent/{}/{}/{:020}/{}",
+                    item.tenant_id,
+                    agent_id,
+                    item.created_at_ms,
+                    key.trim_start_matches("export_ledger/")
+                )
+                .into_bytes(),
+                value: key.into_bytes(),
             });
         }
         Ok(ops)
@@ -1264,6 +1561,126 @@ impl Persist {
         }
 
         Ok(merged.into_values().take(limit).collect())
+    }
+
+    pub fn scan_export_ledger_items(
+        &self,
+        tenant_id: &str,
+        from_cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
+        let prefix = export_ledger_tenant_prefix(tenant_id);
+        let mut out = Vec::new();
+        let start_key =
+            from_cursor.and_then(|cursor| export_ledger_key_from_item_cursor(tenant_id, cursor));
+        let iter = match start_key.as_deref() {
+            Some(start) => self
+                .kv
+                .scan_prefix_from(prefix.as_bytes(), start.as_bytes())?,
+            None => self.kv.scan_prefix(prefix.as_bytes())?,
+        };
+        for res in iter {
+            let (key, value) = res?;
+            let cursor = export_ledger_item_cursor_from_key(&key);
+            if export_ledger_cursor_at_or_before(&cursor, from_cursor) {
+                continue;
+            }
+            let Some(object_id) = export_ledger_object_id_from_key(&key) else {
+                continue;
+            };
+            let context = self.export_ledger_context(tenant_id, object_id);
+            let plaintext = self.decrypt_metadata(&context, &value)?;
+            let item: ExportLedgerItem =
+                serde_json::from_slice(&plaintext).expect("export ledger item decodes");
+            out.push((cursor, item));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn scan_export_ledger_session_items(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        from_cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
+        let prefix = export_ledger_session_index_prefix(tenant_id, session_id);
+        self.scan_export_ledger_index(tenant_id, prefix, from_cursor, limit)
+    }
+
+    pub fn scan_export_ledger_agent_items(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        from_cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
+        let prefix = export_ledger_agent_index_prefix(tenant_id, agent_id);
+        self.scan_export_ledger_index(tenant_id, prefix, from_cursor, limit)
+    }
+
+    fn scan_export_ledger_index(
+        &self,
+        tenant_id: &str,
+        prefix: String,
+        from_cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
+        let mut out = Vec::new();
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        for res in iter {
+            let (_index_key, ledger_key) = res?;
+            let cursor = export_ledger_item_cursor_from_key(&ledger_key);
+            if export_ledger_cursor_at_or_before(&cursor, from_cursor) {
+                continue;
+            }
+            let Some(value) = self.kv.get(&ledger_key)? else {
+                continue;
+            };
+            let Some(object_id) = export_ledger_object_id_from_key(&ledger_key) else {
+                continue;
+            };
+            let Some(ledger_tenant_id) = export_ledger_tenant_from_key(&ledger_key) else {
+                continue;
+            };
+            if ledger_tenant_id != tenant_id {
+                continue;
+            }
+            let context = self.export_ledger_context(tenant_id, object_id);
+            let plaintext = self.decrypt_metadata(&context, &value)?;
+            let item: ExportLedgerItem =
+                serde_json::from_slice(&plaintext).expect("export ledger item decodes");
+            out.push((cursor, item));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn export_ledger_high_watermark(&self, tenant_id: &str) -> KvResult<Option<String>> {
+        let Some(value) = self
+            .kv
+            .get(export_ledger_high_watermark_key(tenant_id).as_bytes())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            String::from_utf8(value).expect("export ledger high watermark is utf8"),
+        ))
+    }
+
+    pub fn export_ledger_oldest_cursor(&self, tenant_id: &str) -> KvResult<Option<String>> {
+        let prefix = export_ledger_tenant_prefix(tenant_id);
+        let mut iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let Some(first) = iter.next() else {
+            return Ok(None);
+        };
+        let (key, _) = first?;
+        Ok(Some(export_ledger_item_cursor_from_key(&key)))
     }
 
     /// Return the highest persisted event seq for `(tenant_id, session_id)`,
@@ -1440,6 +1857,28 @@ impl Persist {
         Ok(out)
     }
 
+    pub async fn put_export_consumer_async(&self, consumer: &ExportConsumer) -> KvResult<()> {
+        self.write_ops_async(vec![WriteOp::Put {
+            key: export_consumer_key(consumer.tenant_id.as_str(), consumer.consumer_name.as_str())
+                .into_bytes(),
+            value: serde_json::to_vec(consumer).expect("export consumer serializes"),
+        }])
+        .await
+    }
+
+    pub fn scan_all_export_consumers(&self) -> KvResult<Vec<ExportConsumer>> {
+        let prefix = b"record/export_consumer/";
+        let iter = self.kv.scan_prefix(prefix)?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let consumer: ExportConsumer =
+                serde_json::from_slice(&v).expect("export consumer decodes");
+            out.push(consumer);
+        }
+        Ok(out)
+    }
+
     /// Atomic write of a V2.2 searchable record's primary row plus the
     /// `record_by_namespace` secondary index entry. Both rows are written
     /// in one batch so a crash either reveals the new record + index
@@ -1467,7 +1906,7 @@ impl Persist {
         r: &SearchableRecord,
         commit_seq: Option<u64>,
     ) -> KvResult<Vec<WriteOp>> {
-        let ops: Vec<WriteOp> = vec![
+        let mut ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: record_key(r.tenant_id.as_str(), r.record_id.as_str()).into_bytes(),
                 value: serde_json::to_vec(r).expect("record serializes"),
@@ -1508,6 +1947,16 @@ impl Persist {
             ]
         }))
         .collect();
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "record",
+            r.tenant_id.clone(),
+            None,
+            None,
+            r.record_id.as_str().to_string(),
+            r.created_at_ms,
+            r.deleted_at_ms,
+            serde_json::to_value(r).expect("record serializes"),
+        ))?);
         Ok(ops)
     }
 
@@ -1547,7 +1996,7 @@ impl Persist {
     /// Atomic write of a V2.3 skill record plus its
     /// `(tenant_id, name, version)` uniqueness index.
     pub fn put_skill(&self, skill: &Skill) -> KvResult<()> {
-        let ops: Vec<WriteOp> = vec![
+        let mut ops: Vec<WriteOp> = vec![
             WriteOp::Put {
                 key: skill_record_key(skill.tenant_id.as_str(), skill.skill_id.as_str())
                     .into_bytes(),
@@ -1559,6 +2008,16 @@ impl Persist {
                 value: skill.skill_id.as_str().as_bytes().to_vec(),
             },
         ];
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "skill",
+            skill.tenant_id.clone(),
+            None,
+            None,
+            skill.skill_id.as_str().to_string(),
+            skill.created_at_ms,
+            skill.deleted_at_ms,
+            serde_json::to_value(skill).expect("skill serializes"),
+        ))?);
         self.write_ops(ops)
     }
 
@@ -1577,7 +2036,7 @@ impl Persist {
     }
 
     pub fn put_agent_skill_binding(&self, binding: &AgentSkillBinding) -> KvResult<()> {
-        let ops: Vec<WriteOp> = vec![WriteOp::Put {
+        let mut ops: Vec<WriteOp> = vec![WriteOp::Put {
             key: agent_skill_binding_key(
                 binding.tenant_id.as_str(),
                 binding.agent_id.as_str(),
@@ -1586,6 +2045,16 @@ impl Persist {
             .into_bytes(),
             value: serde_json::to_vec(binding).expect("agent skill binding serializes"),
         }];
+        ops.extend(self.export_ledger_item_put_ops(export_item_from_value(
+            "skill_binding",
+            binding.tenant_id.clone(),
+            Some(binding.agent_id.clone()),
+            None,
+            format!("{}:{}", binding.agent_id, binding.skill_id),
+            binding.bound_at_ms,
+            binding.deleted_at_ms,
+            serde_json::to_value(binding).expect("agent skill binding serializes"),
+        ))?);
         self.write_ops(ops)
     }
 

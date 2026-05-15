@@ -64,5 +64,18 @@ AGENTDB_META_URL=${meta_url}
 %{ endif }
 EOF
 
+%{ if clickhouse_url != "" && clickhouse_export_tenant_id != "" }
+cat >/home/ec2-user/clickhouse-export.env <<EOF
+AGENTDB_URL=http://$${PRIVATE_IP}:${http_port}
+CLICKHOUSE_URL=${clickhouse_url}
+AGENTDB_EXPORT_TENANT_ID=${clickhouse_export_tenant_id}
+AGENTDB_EXPORT_CONSUMER=${clickhouse_export_consumer}
+AGENTDB_EXPORT_LEASE_MS=${clickhouse_export_lease_ms}
+EOF
+%{ endif }
+
 chown ec2-user:ec2-user /home/ec2-user/agentdb.toml
 chown ec2-user:ec2-user /home/ec2-user/agentdb.env
+if [[ -f /home/ec2-user/clickhouse-export.env ]]; then
+  chown ec2-user:ec2-user /home/ec2-user/clickhouse-export.env
+fi

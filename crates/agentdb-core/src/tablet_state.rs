@@ -649,6 +649,26 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
             })?;
         return placement(tenant_id, Some(session_id));
     }
+    if let Some(rest) = key.strip_prefix("export_ledger/") {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        if parts.len() == 6 && parts[4] == "event" {
+            return placement(parts[0], Some(parts[2]));
+        }
+        if parts.len() == 5 && parts[3] == "session" {
+            return placement(parts[0], Some(parts[4]));
+        }
+        return placement(first_segment(rest)?, None);
+    }
+    if let Some(rest) = key.strip_prefix("export_ledger_by_session/") {
+        let (tenant_id, session_id) = first_two_segments(rest)?;
+        return placement(tenant_id, Some(session_id));
+    }
+    if let Some(rest) = key.strip_prefix("export_ledger_by_agent/") {
+        return placement(first_segment(rest)?, None);
+    }
+    if let Some(rest) = key.strip_prefix("export_ledger_high_watermark/") {
+        return placement(first_segment(rest)?, None);
+    }
     if let Some(rest) = key.strip_prefix("record/idempotency/") {
         let mut parts = rest.splitn(4, "::");
         let tenant_id = parts.next().unwrap_or_default();
@@ -664,6 +684,7 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
         "record/searchable_by_namespace/",
         "record/searchable_commit/",
         "record/searchable_index_outbox/",
+        "record/export_consumer/",
         "record/skill/",
         "record/skill_unique/",
         "record/agent_skill/",

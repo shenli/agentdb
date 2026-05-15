@@ -147,3 +147,28 @@ variable "tablet_store_domain_max_open_files" {
   description = "Maximum open files per local RocksDB tablet-store domain."
   default     = 128
 }
+
+variable "clickhouse_url" {
+  type        = string
+  description = "Optional ClickHouse HTTP URL for AgentDB observability export. Leave empty to skip exporter setup."
+  default     = ""
+  sensitive   = true
+}
+
+variable "clickhouse_export_tenant_id" {
+  type        = string
+  description = "Tenant id to export to ClickHouse when clickhouse_url is set."
+  default     = ""
+}
+
+variable "clickhouse_export_consumer" {
+  type        = string
+  description = "Managed export consumer name used by ClickHouse exporter workers."
+  default     = "prod-clickhouse"
+}
+
+variable "clickhouse_export_lease_ms" {
+  type        = number
+  description = "Managed export consumer lease duration for ClickHouse exporter workers."
+  default     = 30000
+}

@@ -866,26 +866,32 @@ impl RaftRsGroup {
         }
         let node = self.node_mut(node_id)?;
         let applied_index = node.last_applied_index.min(node.raw.raft.raft_log.applied);
-        let up_to_index = if up_to_index >= applied_index {
-            applied_index.saturating_sub(1)
-        } else {
-            up_to_index
-        };
-        if up_to_index == 0 {
+        let requested_up_to_index = up_to_index.min(applied_index);
+        if requested_up_to_index == 0 {
             return Ok(0);
         }
-        let snapshot = node
-            .storage
-            .snapshot(up_to_index, node_id)
-            .map_err(map_raft_error)?;
-        node.persist_snapshot(&snapshot)?;
-        node.storage
-            .wl()
-            .compact(up_to_index)
-            .map_err(map_raft_error)?;
-        let persisted_deleted = node.compact_engine_entries(up_to_index)?;
+        let storage_up_to_index = if requested_up_to_index >= applied_index {
+            applied_index.saturating_sub(1)
+        } else {
+            requested_up_to_index
+        };
+        let persisted_deleted = if storage_up_to_index == 0 {
+            0
+        } else {
+            let snapshot = node
+                .storage
+                .snapshot(storage_up_to_index, node_id)
+                .map_err(map_raft_error)?;
+            node.persist_snapshot(&snapshot)?;
+            node.storage
+                .wl()
+                .compact(storage_up_to_index)
+                .map_err(map_raft_error)?;
+            node.compact_engine_entries(storage_up_to_index)?
+        };
         let retained_before = node.committed.len();
-        node.committed.retain(|entry| entry.index > up_to_index);
+        node.committed
+            .retain(|entry| entry.index > requested_up_to_index);
         let retained_deleted = retained_before.saturating_sub(node.committed.len());
         Ok(persisted_deleted.max(retained_deleted))
     }

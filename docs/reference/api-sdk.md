@@ -281,7 +281,92 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
+GET  /api/tenants/{tenant_id}/exports/watch
+POST /api/tenants/{tenant_id}/exports/backfill
+GET  /api/tenants/{tenant_id}/exports/status
+POST /api/tenants/{tenant_id}/exports/consumers
+GET  /api/tenants/{tenant_id}/exports/consumers/{name}
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
+GET  /api/admin/exports
 ```
+
+`exports/watch` returns stable export envelopes for observability sinks.
+Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
+metadata object mutations; in-memory/dev runtimes fall back to current event
+watch cursors (`v2:...`). Use the optional comma-separated `include` query
+parameter, for example `include=events,records,skills`, to filter object types:
+
+```json
+{
+  "items": [
+    {
+      "export_version": "2026-05-14",
+      "cursor": "ledger:ten_...",
+      "op": "insert",
+      "object_type": "event",
+      "tenant_id": "ten_...",
+      "agent_id": "agt_...",
+      "session_id": "ses_...",
+      "object_id": "evt_...",
+      "seq": 0,
+      "created_at_ms": 1778780000000,
+      "observed_at_ms": 1778780000001,
+      "event_id": "evt_...",
+      "kind": "model_call",
+      "model": "gpt-...",
+      "duration_ms": 123,
+      "data": {}
+    }
+  ],
+  "next_cursor": "ledger:ten_...",
+  "high_watermark": "ledger:ten_..."
+}
+```
+
+Use `agentdbctl export clickhouse ...` for the first-party ClickHouse path.
+`exports/backfill` supports event snapshots plus tenant-scope metadata
+snapshots:
+
+```json
+{
+  "scope": "tenant",
+  "include": ["events"],
+  "from_cursor": "ledger:ten_...",
+  "limit": 1000
+}
+```
+
+Metadata snapshot includes use `snapshot:...` cursors and currently support
+`["tenants", "agents", "sessions", "artifacts", "records", "skills",
+"skill_bindings"]`. Do not mix `events` with metadata includes in one backfill
+request; run metadata backfill first, then event backfill/tail.
+
+Managed export consumers provide durable checkpoints and leases. Official
+ClickHouse event exporters usually use `include=["events"]`; generic consumers
+can include any supported object types:
+
+```json
+{
+  "name": "prod-clickhouse",
+  "scope": "tenant",
+  "include": ["events"]
+}
+```
+
+Use `claim` with `lease_owner` and `lease_ms`, `ack` with the durable sink
+cursor after the sink accepts a batch, and `rewind` to replay from an older
+cursor or from the beginning. `GET /exports/consumers/{name}` and
+`GET /api/admin/exports` include derived status fields such as
+`pending_items`, `high_watermark`, `pending_oldest_created_at_ms`, `lag_ms`, and
+`lease_active`.
+
+For high availability, run at least two connector processes with the same
+consumer name and different `lease_owner` values. Only the active lease holder
+can ack. If it dies, another process claims the lease after expiry and resumes
+from the last durable acked cursor. To avoid data loss, connectors must insert
+into the sink before acking AgentDB.
 
 Artifacts:
 

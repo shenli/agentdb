@@ -26,8 +26,9 @@ echo "==> building and starting agentdb-server on ${SSH_TARGET}"
 ssh "${SSH_TARGET}" <<'EOF'
 set -euo pipefail
 cd ~/agentdb-src
-cargo build -p agentdb-server
+cargo build -p agentdb-server -p agentdbctl
 pkill -f "agentdb serve" || true
+pkill -f "agentdbctl export clickhouse run" || true
 if [[ -f ~/agentdb-deploy/agentdb.env ]]; then
   set -a
   source ~/agentdb-deploy/agentdb.env
@@ -44,6 +45,33 @@ for _ in $(seq 1 30); do
   fi
   sleep 2
 done
+
+echo "==> starting ClickHouse exporter when configured"
+ssh "${SSH_TARGET}" <<'EOF'
+set -euo pipefail
+if [[ -f ~/agentdb-deploy/clickhouse-export.env ]]; then
+  cd ~/agentdb-src
+  set -a
+  source ~/agentdb-deploy/clickhouse-export.env
+  set +a
+  AGENTDB_EXPORT_LEASE_OWNER="${AGENTDB_EXPORT_LEASE_OWNER:-$(hostname)-clickhouse-export}"
+  target/debug/agentdbctl export clickhouse init --apply
+  target/debug/agentdbctl export clickhouse run \
+    --tenant-id "$AGENTDB_EXPORT_TENANT_ID" \
+    --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
+    --backfill \
+    --max-batches 1000
+  nohup target/debug/agentdbctl export clickhouse run \
+    --tenant-id "$AGENTDB_EXPORT_TENANT_ID" \
+    --consumer "${AGENTDB_EXPORT_CONSUMER:-prod-clickhouse}" \
+    --lease-owner "$AGENTDB_EXPORT_LEASE_OWNER" \
+    --lease-ms "${AGENTDB_EXPORT_LEASE_MS:-30000}" \
+    --include events \
+    --backfill \
+    --tail \
+    > ~/agentdb-deploy/logs/clickhouse-export.log 2>&1 &
+fi
+EOF
 
 echo "==> running smoke flow"
 infra/aws/scripts/run-tiered-storage-smoke.sh "http://${SERVER_HOST}:7878"

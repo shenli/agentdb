@@ -129,9 +129,188 @@ pub struct WatchQuery {
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
+    pub include: Option<String>,
+    #[serde(default)]
     pub from_cursor: Option<String>,
     #[serde(default = "default_fetch_limit")]
     pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ExportBackfillBody {
+    #[serde(default = "default_watch_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub from_cursor: Option<String>,
+    #[serde(default = "default_fetch_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateExportConsumerBody {
+    pub name: String,
+    #[serde(default = "default_watch_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ClaimExportConsumerBody {
+    pub lease_owner: String,
+    #[serde(default = "default_export_lease_ms")]
+    pub lease_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AckExportConsumerBody {
+    pub cursor: String,
+    #[serde(default)]
+    pub snapshot_high_watermark: Option<String>,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RewindExportConsumerBody {
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportWatchResponse {
+    pub items: Vec<ExportEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_available_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_watermark: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportBackfillResponse {
+    pub items: Vec<ExportEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_available_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_high_watermark: Option<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportStatusResponse {
+    pub export_version: &'static str,
+    pub tenant_id: String,
+    pub mode: &'static str,
+    pub durable_ledger: bool,
+    pub managed_consumers: bool,
+    pub supported_object_types: Vec<&'static str>,
+    pub oldest_available_cursor: Option<String>,
+    pub high_watermark: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportEnvelope {
+    pub export_version: &'static str,
+    pub cursor: String,
+    pub op: &'static str,
+    pub object_type: &'static str,
+    pub tenant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    pub created_at_ms: u64,
+    pub observed_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_index: Option<u64>,
+    #[serde(flatten)]
+    pub observability: ExportObservabilityFields,
+    pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ExportObservabilityFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_refs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_refs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -154,6 +333,10 @@ fn default_max_bytes() -> usize {
 
 fn default_fetch_limit() -> usize {
     100
+}
+
+fn default_export_lease_ms() -> u64 {
+    30_000
 }
 
 fn default_restore_target() -> String {

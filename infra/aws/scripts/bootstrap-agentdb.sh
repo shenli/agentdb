@@ -20,6 +20,9 @@ fi
 if ssh "${SSH_TARGET}" 'test -f ~/agentdb.env'; then
   ssh "${SSH_TARGET}" 'cp ~/agentdb.env ~/agentdb-deploy/agentdb.env'
 fi
+if ssh "${SSH_TARGET}" 'test -f ~/clickhouse-export.env'; then
+  ssh "${SSH_TARGET}" 'cp ~/clickhouse-export.env ~/agentdb-deploy/clickhouse-export.env'
+fi
 
 echo "==> ensuring Rust build prerequisites exist on ${SSH_TARGET}"
 ssh "${SSH_TARGET}" <<'EOF'

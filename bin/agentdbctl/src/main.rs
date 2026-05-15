@@ -13,6 +13,110 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
+const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_schema_migrations (
+    version String,
+    applied_at DateTime64(3) DEFAULT now64(3)
+) ENGINE = MergeTree
+ORDER BY version
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_export_checkpoints (
+    consumer String,
+    tenant_id String,
+    cursor String,
+    updated_at_ms UInt64,
+    updated_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(updated_at_ms))
+) ENGINE = ReplacingMergeTree(updated_at_ms)
+ORDER BY (consumer, tenant_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_export_items_raw (
+    export_version LowCardinality(String),
+    cursor String,
+    op LowCardinality(String),
+    object_type LowCardinality(String),
+    tenant_id String,
+    agent_id Nullable(String),
+    session_id Nullable(String),
+    object_id String,
+    seq Nullable(UInt64),
+    created_at_ms UInt64,
+    created_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(created_at_ms)),
+    observed_at_ms UInt64,
+    observed_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(observed_at_ms)),
+    cell_id Nullable(String),
+    placement_scope_id Nullable(String),
+    tablet_id Nullable(Int64),
+    tablet_epoch Nullable(Int64),
+    applied_index Nullable(UInt64),
+    payload_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, created_at, object_type, object_id, cursor)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_events (
+    tenant_id String,
+    agent_id String,
+    session_id String,
+    event_id String,
+    seq UInt64,
+    kind LowCardinality(String),
+    created_at_ms UInt64,
+    created_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(created_at_ms)),
+    observed_at_ms UInt64,
+    observed_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(observed_at_ms)),
+    cell_id Nullable(String),
+    placement_scope_id Nullable(String),
+    tablet_id Nullable(Int64),
+    tablet_epoch Nullable(Int64),
+    applied_index Nullable(UInt64),
+    parent_event_id Nullable(String),
+    status Nullable(String),
+    model Nullable(String),
+    provider Nullable(String),
+    finish_reason Nullable(String),
+    tool_name Nullable(String),
+    tool_call_id Nullable(String),
+    duration_ms Nullable(UInt64),
+    timeout_ms Nullable(UInt64),
+    input_tokens Nullable(UInt64),
+    output_tokens Nullable(UInt64),
+    total_tokens Nullable(UInt64),
+    cost_micros Nullable(UInt64),
+    error_kind Nullable(String),
+    error_message Nullable(String),
+    retryable Nullable(Bool),
+    exit_code Nullable(Int64),
+    approval_id Nullable(String),
+    approval_decision Nullable(String),
+    context_pack_id Nullable(String),
+    source_refs_json String,
+    artifact_refs_json String,
+    tags_json String,
+    metadata_json String,
+    payload_json String,
+    envelope_json String
+) ENGINE = ReplacingMergeTree(observed_at_ms)
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, session_id, seq, event_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_tombstones (
+    tenant_id String,
+    object_type LowCardinality(String),
+    object_id String,
+    reason LowCardinality(String),
+    deleted_at_ms UInt64,
+    deleted_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(deleted_at_ms)),
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(deleted_at)
+ORDER BY (tenant_id, object_type, object_id, deleted_at)
+"#,
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -94,6 +198,11 @@ enum Command {
     TabletStore {
         #[command(subcommand)]
         command: TabletStoreCommand,
+    },
+    /// Observability export operations.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
     },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
@@ -425,6 +534,87 @@ enum TabletStoreCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum ExportCommand {
+    /// ClickHouse observability export golden path.
+    Clickhouse {
+        #[command(subcommand)]
+        command: ClickHouseCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClickHouseCommand {
+    /// Check AgentDB export and optional ClickHouse reachability.
+    Doctor(ClickHouseDoctorArgs),
+    /// Print or apply the first-party ClickHouse schema.
+    Init(ClickHouseInitArgs),
+    /// Show AgentDB export status for one tenant.
+    Status(ClickHouseStatusArgs),
+    /// Copy one or more export-watch batches into ClickHouse.
+    Run(ClickHouseRunArgs),
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseDoctorArgs {
+    #[arg(long)]
+    tenant_id: Option<String>,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseInitArgs {
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseStatusArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long)]
+    consumer: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseRunArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: String,
+    #[arg(long, default_value = "tenant")]
+    scope: String,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    consumer: Option<String>,
+    #[arg(long, default_value = "agentdbctl")]
+    lease_owner: String,
+    #[arg(long, default_value_t = 30_000)]
+    lease_ms: u64,
+    #[arg(long)]
+    from_cursor: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    #[arg(long = "include", value_delimiter = ',')]
+    include: Vec<String>,
+    #[arg(long)]
+    backfill: bool,
+    #[arg(long)]
+    tail: bool,
+    #[arg(long)]
+    max_batches: Option<u64>,
+    #[arg(long, default_value_t = 1000)]
+    poll_interval_ms: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
 enum RawCommand {
     /// GET a raw API path.
     Get { path: String },
@@ -583,6 +773,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 .await
             }
         },
+        Command::Export { command } => export(api, command).await,
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
             RawCommand::Post { path, body } => {
@@ -647,6 +838,477 @@ async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
             .await
         }
     }
+}
+
+async fn export(api: &Api, command: ExportCommand) -> Result<Value> {
+    match command {
+        ExportCommand::Clickhouse { command } => clickhouse(api, command).await,
+    }
+}
+
+async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
+    match command {
+        ClickHouseCommand::Doctor(args) => clickhouse_doctor(api, args).await,
+        ClickHouseCommand::Init(args) => clickhouse_init(args).await,
+        ClickHouseCommand::Status(args) => {
+            if let Some(consumer) = args.consumer {
+                api.get(&format!(
+                    "/api/tenants/{}/exports/consumers/{}",
+                    query_component(&args.tenant_id),
+                    query_component(&consumer)
+                ))
+                .await
+            } else {
+                api.get(&format!(
+                    "/api/tenants/{}/exports/status",
+                    query_component(&args.tenant_id)
+                ))
+                .await
+            }
+        }
+        ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
+    }
+}
+
+async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Value> {
+    let agentdb_ready = match api.get("/health/ready").await {
+        Ok(_) => json!({
+            "check_id": "agentdb_reachable",
+            "status": "ok"
+        }),
+        Err(error) => json!({
+            "check_id": "agentdb_reachable",
+            "status": "error",
+            "message": error.to_string()
+        }),
+    };
+    let export_status = if let Some(tenant_id) = args.tenant_id {
+        match api
+            .get(&format!(
+                "/api/tenants/{}/exports/status",
+                query_component(&tenant_id)
+            ))
+            .await
+        {
+            Ok(value) => json!({
+                "check_id": "agentdb_export_status",
+                "status": "ok",
+                "details": value
+            }),
+            Err(error) => json!({
+                "check_id": "agentdb_export_status",
+                "status": "error",
+                "message": error.to_string()
+            }),
+        }
+    } else {
+        json!({
+            "check_id": "agentdb_export_status",
+            "status": "skipped",
+            "message": "--tenant-id not supplied"
+        })
+    };
+    let clickhouse = if let Some(url) = args.clickhouse_url {
+        match clickhouse_query(&url, "SELECT 1").await {
+            Ok(text) => json!({
+                "check_id": "clickhouse_reachable",
+                "status": "ok",
+                "response": text.trim()
+            }),
+            Err(error) => json!({
+                "check_id": "clickhouse_reachable",
+                "status": "error",
+                "message": error.to_string()
+            }),
+        }
+    } else {
+        json!({
+            "check_id": "clickhouse_reachable",
+            "status": "skipped",
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
+        })
+    };
+    let checks = vec![agentdb_ready, export_status, clickhouse];
+    let ok = checks
+        .iter()
+        .all(|check| check.get("status").and_then(Value::as_str) != Some("error"));
+    Ok(json!({
+        "status": if ok { "ok" } else { "error" },
+        "checks": checks
+    }))
+}
+
+async fn clickhouse_init(args: ClickHouseInitArgs) -> Result<Value> {
+    if !args.apply {
+        return Ok(json!({
+            "status": "dry_run",
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+    }
+    let url = args
+        .clickhouse_url
+        .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    let mut applied = Vec::new();
+    for statement in CLICKHOUSE_SCHEMA_DDL {
+        clickhouse_query(&url, statement).await?;
+        applied.push(json!({
+            "statement": statement.lines().next().unwrap_or(statement).trim(),
+            "status": "ok"
+        }));
+    }
+    Ok(json!({
+        "status": "ok",
+        "applied": applied
+    }))
+}
+
+async fn ensure_claimed_export_consumer(
+    api: &Api,
+    args: &ClickHouseRunArgs,
+    consumer: &str,
+) -> Result<Value> {
+    api.post(
+        &format!(
+            "/api/tenants/{}/exports/consumers",
+            query_component(&args.tenant_id)
+        ),
+        json!({
+            "name": consumer,
+            "scope": args.scope.clone(),
+            "agent_id": args.agent_id.clone(),
+            "session_id": args.session_id.clone(),
+            "include": ["events"]
+        }),
+    )
+    .await?;
+    api.post(
+        &format!(
+            "/api/tenants/{}/exports/consumers/{}/claim",
+            query_component(&args.tenant_id),
+            query_component(consumer)
+        ),
+        json!({
+            "lease_owner": args.lease_owner.clone(),
+            "lease_ms": args.lease_ms
+        }),
+    )
+    .await
+}
+
+async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
+    let mut cursor = args.from_cursor.clone();
+    if let Some(consumer) = &args.consumer {
+        let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
+        if cursor.is_none() {
+            cursor = claimed
+                .get("last_acked_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let mut batches = 0_u64;
+    let mut rows = 0_u64;
+    let max_batches = args.max_batches.unwrap_or(if args.tail || args.backfill {
+        u64::MAX
+    } else {
+        1
+    });
+    let mut phase = if args.backfill {
+        ExportRunPhase::Backfill
+    } else {
+        ExportRunPhase::Watch
+    };
+    loop {
+        if batches >= max_batches {
+            break;
+        }
+        let response = match phase {
+            ExportRunPhase::Backfill => {
+                let include = if args.include.is_empty() {
+                    vec!["events".to_string()]
+                } else {
+                    args.include.clone()
+                };
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/backfill",
+                        query_component(&args.tenant_id)
+                    ),
+                    json!({
+                        "scope": args.scope.clone(),
+                        "agent_id": args.agent_id.clone(),
+                        "session_id": args.session_id.clone(),
+                        "include": include,
+                        "from_cursor": cursor.clone(),
+                        "limit": args.limit
+                    }),
+                )
+                .await?
+            }
+            ExportRunPhase::Watch => {
+                api.get(&export_watch_path(&args, cursor.as_deref()))
+                    .await?
+            }
+        };
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            if phase == ExportRunPhase::Backfill {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            if args.tail {
+                tokio::time::sleep(std::time::Duration::from_millis(args.poll_interval_ms)).await;
+                continue;
+            }
+            break;
+        }
+        batches = batches.saturating_add(1);
+        rows = rows.saturating_add(items.len() as u64);
+        if !args.dry_run {
+            clickhouse_insert_json_each_row(
+                &args.clickhouse_url,
+                "agentdb_export_items_raw",
+                &clickhouse_raw_rows(&items)?,
+            )
+            .await?;
+            clickhouse_insert_json_each_row(
+                &args.clickhouse_url,
+                "agentdb_events",
+                &clickhouse_event_rows(&items)?,
+            )
+            .await?;
+        }
+        cursor = response
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if phase == ExportRunPhase::Backfill
+            && args.tail
+            && !args.include.is_empty()
+            && !args.include.iter().any(|item| item == "events")
+        {
+            cursor = None;
+        }
+        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+            if !args.dry_run {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/consumers/{}/ack",
+                        query_component(&args.tenant_id),
+                        query_component(consumer)
+                    ),
+                    json!({
+                        "cursor": cursor,
+                        "snapshot_high_watermark": response
+                            .get("snapshot_high_watermark")
+                            .and_then(Value::as_str),
+                        "lease_owner": args.lease_owner.clone()
+                    }),
+                )
+                .await?;
+            }
+        }
+        if phase == ExportRunPhase::Backfill {
+            let complete = response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        if !args.tail {
+            break;
+        }
+    }
+    Ok(json!({
+        "status": "ok",
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "backfill": args.backfill,
+        "tail": args.tail,
+        "batches": batches,
+        "rows": rows,
+        "last_cursor": cursor,
+        "dry_run": args.dry_run
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportRunPhase {
+    Backfill,
+    Watch,
+}
+
+fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
+    let limit = args.limit.to_string();
+    let include = if args.include.is_empty() {
+        "events".to_string()
+    } else {
+        args.include.join(",")
+    };
+    let pairs = [
+        ("scope", Some(args.scope.as_str())),
+        ("agent_id", args.agent_id.as_deref()),
+        ("session_id", args.session_id.as_deref()),
+        ("include", Some(include.as_str())),
+        ("from_cursor", cursor),
+        ("limit", Some(limit.as_str())),
+    ];
+    format!(
+        "/api/tenants/{}/exports/watch{}",
+        query_component(&args.tenant_id),
+        query_pairs_encoded(&pairs)
+    )
+}
+
+fn clickhouse_raw_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .map(|item| {
+            Ok(json!({
+                "export_version": item.get("export_version").cloned().unwrap_or(Value::Null),
+                "cursor": item.get("cursor").cloned().unwrap_or(Value::Null),
+                "op": item.get("op").cloned().unwrap_or(Value::Null),
+                "object_type": item.get("object_type").cloned().unwrap_or(Value::Null),
+                "tenant_id": item.get("tenant_id").cloned().unwrap_or(Value::Null),
+                "agent_id": item.get("agent_id").cloned().unwrap_or(Value::Null),
+                "session_id": item.get("session_id").cloned().unwrap_or(Value::Null),
+                "object_id": item.get("object_id").cloned().unwrap_or(Value::Null),
+                "seq": item.get("seq").cloned().unwrap_or(Value::Null),
+                "created_at_ms": item.get("created_at_ms").cloned().unwrap_or(Value::Null),
+                "observed_at_ms": item.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+                "cell_id": item.get("cell_id").cloned().unwrap_or(Value::Null),
+                "placement_scope_id": item.get("placement_scope_id").cloned().unwrap_or(Value::Null),
+                "tablet_id": item.get("tablet_id").cloned().unwrap_or(Value::Null),
+                "tablet_epoch": item.get("tablet_epoch").cloned().unwrap_or(Value::Null),
+                "applied_index": item.get("applied_index").cloned().unwrap_or(Value::Null),
+                "payload_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn clickhouse_event_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let data = item.get("data").unwrap_or(&Value::Null);
+            Ok(json!({
+                "tenant_id": item.get("tenant_id").cloned().unwrap_or(Value::Null),
+                "agent_id": item.get("agent_id").cloned().unwrap_or(Value::Null),
+                "session_id": item.get("session_id").cloned().unwrap_or(Value::Null),
+                "event_id": item.get("event_id").or_else(|| item.get("object_id")).cloned().unwrap_or(Value::Null),
+                "seq": item.get("seq").cloned().unwrap_or(Value::Null),
+                "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                "created_at_ms": item.get("created_at_ms").cloned().unwrap_or(Value::Null),
+                "observed_at_ms": item.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+                "cell_id": item.get("cell_id").cloned().unwrap_or(Value::Null),
+                "placement_scope_id": item.get("placement_scope_id").cloned().unwrap_or(Value::Null),
+                "tablet_id": item.get("tablet_id").cloned().unwrap_or(Value::Null),
+                "tablet_epoch": item.get("tablet_epoch").cloned().unwrap_or(Value::Null),
+                "applied_index": item.get("applied_index").cloned().unwrap_or(Value::Null),
+                "parent_event_id": item.get("parent_event_id").cloned().unwrap_or(Value::Null),
+                "status": item.get("status").cloned().unwrap_or(Value::Null),
+                "model": item.get("model").cloned().unwrap_or(Value::Null),
+                "provider": item.get("provider").cloned().unwrap_or(Value::Null),
+                "finish_reason": item.get("finish_reason").cloned().unwrap_or(Value::Null),
+                "tool_name": item.get("tool_name").cloned().unwrap_or(Value::Null),
+                "tool_call_id": item.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "duration_ms": item.get("duration_ms").cloned().unwrap_or(Value::Null),
+                "timeout_ms": item.get("timeout_ms").cloned().unwrap_or(Value::Null),
+                "input_tokens": item.get("input_tokens").cloned().unwrap_or(Value::Null),
+                "output_tokens": item.get("output_tokens").cloned().unwrap_or(Value::Null),
+                "total_tokens": item.get("total_tokens").cloned().unwrap_or(Value::Null),
+                "cost_micros": item.get("cost_micros").cloned().unwrap_or(Value::Null),
+                "error_kind": item.get("error_kind").cloned().unwrap_or(Value::Null),
+                "error_message": item.get("error_message").cloned().unwrap_or(Value::Null),
+                "retryable": item.get("retryable").cloned().unwrap_or(Value::Null),
+                "exit_code": item.get("exit_code").cloned().unwrap_or(Value::Null),
+                "approval_id": item.get("approval_id").cloned().unwrap_or(Value::Null),
+                "approval_decision": item.get("approval_decision").cloned().unwrap_or(Value::Null),
+                "context_pack_id": item.get("context_pack_id").cloned().unwrap_or(Value::Null),
+                "source_refs_json": item.get("source_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "artifact_refs_json": item.get("artifact_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "tags_json": item.get("tags").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "metadata_json": item.get("metadata").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "payload_json": serde_json::to_string(data.get("payload").unwrap_or(&Value::Null))?,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+async fn clickhouse_insert_json_each_row(url: &str, table: &str, rows: &[Value]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut body = format!("INSERT INTO {table} FORMAT JSONEachRow\n");
+    for row in rows {
+        body.push_str(&serde_json::to_string(row)?);
+        body.push('\n');
+    }
+    clickhouse_query(url, &body).await?;
+    Ok(())
+}
+
+async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
+    let redacted_url = redact_clickhouse_url(url);
+    let response = Client::new()
+        .post(url)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(sql.to_string())
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "ClickHouse request to {redacted_url} failed: {}",
+                sanitize_clickhouse_error(url, &error.to_string())
+            )
+        })?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("read ClickHouse response failed")?;
+    if !status.is_success() {
+        return Err(anyhow!("ClickHouse returned {status}: {text}"));
+    }
+    Ok(text)
+}
+
+fn sanitize_clickhouse_error(url: &str, message: &str) -> String {
+    message.replace(url, &redact_clickhouse_url(url))
+}
+
+fn redact_clickhouse_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}://***{}",
+        &url[..scheme_end],
+        &after_scheme[userinfo_end..]
+    )
 }
 
 fn install_tablet_checkpoint(
@@ -986,6 +1648,31 @@ fn query_pairs(pairs: &[(&str, Option<String>)]) -> String {
     }
 }
 
+fn query_pairs_encoded(pairs: &[(&str, Option<&str>)]) -> String {
+    let values = pairs
+        .iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}={}", query_component(value))))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", values.join("&"))
+    }
+}
+
+fn query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => write!(out, "%{byte:02X}").unwrap(),
+        }
+    }
+    out
+}
+
 fn join_url(base: &str, path: &str) -> String {
     if path.starts_with('/') {
         format!("{base}{path}")
@@ -1173,6 +1860,8 @@ fn render_rows(rows: &[Value]) -> String {
 fn columns_for(rows: &[Value]) -> Vec<String> {
     let preferred = [
         "node_id",
+        "tenant_id",
+        "consumer_name",
         "tablet_id",
         "state",
         "status",
@@ -1197,6 +1886,11 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "from_raft_node_id",
         "to_raft_node_id",
         "lag",
+        "pending_items",
+        "lag_ms",
+        "lease_active",
+        "high_watermark",
+        "last_acked_cursor",
         "snapshot_index",
         "snapshot_id",
         "target_raft_node_id",
@@ -1352,5 +2046,116 @@ mod tests {
             "?status=pending&limit=10"
         );
         assert_eq!(query_pairs(&[("status", None)]), "");
+    }
+
+    #[test]
+    fn builds_encoded_export_watch_path() {
+        let args = ClickHouseRunArgs {
+            tenant_id: "ten_1".into(),
+            clickhouse_url: "http://clickhouse:8123/agentdb".into(),
+            scope: "session".into(),
+            agent_id: None,
+            session_id: Some("ses_1".into()),
+            consumer: None,
+            lease_owner: "agentdbctl".into(),
+            lease_ms: 30_000,
+            from_cursor: Some("v2:0001:ses_1:0002:cell=cell-a".into()),
+            limit: 500,
+            include: vec![],
+            backfill: false,
+            tail: false,
+            max_batches: None,
+            poll_interval_ms: 1000,
+            dry_run: false,
+        };
+        assert_eq!(
+            export_watch_path(&args, args.from_cursor.as_deref()),
+            "/api/tenants/ten_1/exports/watch?scope=session&session_id=ses_1&include=events&from_cursor=v2%3A0001%3Ases_1%3A0002%3Acell%3Dcell-a&limit=500"
+        );
+    }
+
+    #[test]
+    fn clickhouse_schema_contains_event_and_raw_tables() {
+        let ddl = CLICKHOUSE_SCHEMA_DDL.join("\n");
+        assert!(ddl.contains("agentdb_export_items_raw"));
+        assert!(ddl.contains("agentdb_events"));
+        assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
+    }
+
+    #[test]
+    fn redacts_clickhouse_url_credentials() {
+        let url = "https://agentdb:secret@clickhouse.example.com:8443/agentdb";
+        assert_eq!(
+            redact_clickhouse_url(url),
+            "https://***@clickhouse.example.com:8443/agentdb"
+        );
+        assert_eq!(
+            sanitize_clickhouse_error(url, &format!("request failed for {url}")),
+            "request failed for https://***@clickhouse.example.com:8443/agentdb"
+        );
+    }
+
+    #[test]
+    fn clickhouse_rows_project_export_envelopes() {
+        let items = vec![json!({
+            "export_version": "2026-05-14",
+            "cursor": "v2:0001:ses_1:0000",
+            "op": "insert",
+            "object_type": "event",
+            "tenant_id": "ten_1",
+            "agent_id": "agt_1",
+            "session_id": "ses_1",
+            "object_id": "evt_1",
+            "event_id": "evt_1",
+            "seq": 0,
+            "kind": "model_call",
+            "created_at_ms": 1000,
+            "observed_at_ms": 1001,
+            "cell_id": "cell-a",
+            "placement_scope_id": "scope-a",
+            "tablet_id": 7,
+            "tablet_epoch": 2,
+            "applied_index": 99,
+            "model": "gpt-test",
+            "provider": "openai",
+            "duration_ms": 123,
+            "total_tokens": 18,
+            "metadata": {"trace": "abc"},
+            "tags": ["golden-path"],
+            "data": {
+                "payload": {
+                    "model": "gpt-test",
+                    "metadata": {"trace": "abc"}
+                }
+            }
+        })];
+
+        let raw = clickhouse_raw_rows(&items).unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0]["cursor"], "v2:0001:ses_1:0000");
+        assert_eq!(raw[0]["object_type"], "event");
+        assert!(raw[0]["payload_json"]
+            .as_str()
+            .unwrap()
+            .contains("\"event_id\":\"evt_1\""));
+
+        let events = clickhouse_event_rows(&items).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["tenant_id"], "ten_1");
+        assert_eq!(events[0]["event_id"], "evt_1");
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[0]["kind"], "model_call");
+        assert_eq!(events[0]["model"], "gpt-test");
+        assert_eq!(events[0]["duration_ms"], 123);
+        assert_eq!(events[0]["total_tokens"], 18);
+        assert_eq!(events[0]["tablet_id"], 7);
+        assert_eq!(
+            events[0]["metadata_json"].as_str().unwrap(),
+            "{\"trace\":\"abc\"}"
+        );
+        assert!(events[0]["payload_json"]
+            .as_str()
+            .unwrap()
+            .contains("\"model\":\"gpt-test\""));
     }
 }

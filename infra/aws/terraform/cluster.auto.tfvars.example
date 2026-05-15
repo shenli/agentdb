@@ -32,3 +32,11 @@ tablet_store_domain_write_buffer_size_mib = 16
 tablet_store_domain_max_write_buffers     = 2
 tablet_store_domain_max_background_jobs   = 1
 tablet_store_domain_max_open_files        = 128
+
+# Optional ClickHouse observability export. Leave clickhouse_url and
+# clickhouse_export_tenant_id empty until a tenant exists and ClickHouse is
+# reachable from the EC2 nodes.
+clickhouse_url              = ""
+clickhouse_export_tenant_id = ""
+clickhouse_export_consumer  = "prod-clickhouse"
+clickhouse_export_lease_ms  = 30000

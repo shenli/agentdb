@@ -1,6 +1,7 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
-    AppendRequest, ContextInclude, ContextRequest, ForkSessionRequest, Runtime,
+    AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
+    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, ForkSessionRequest, Runtime,
     RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
@@ -313,4 +314,338 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
     assert!(items[0].cursor.contains("tablet=1"));
     assert!(items[0].cursor.contains("epoch=9"));
     assert!(items[0].cursor.contains("applied="));
+
+    let resumed_without_route_context = rt
+        .watch(WatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(session.session_id.clone()),
+            agent_id: Some(agent.agent_id.clone()),
+            from_cursor: Some(items[0].cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(resumed_without_route_context.is_empty());
+}
+
+#[tokio::test]
+async fn export_consumers_survive_kv_rehydrate() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv.clone(), content.clone());
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-consumer".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let consumer = rt
+        .create_export_consumer(CreateExportConsumerRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            consumer_name: "clickhouse".into(),
+            scope: WatchScope::Tenant,
+            agent_id: None,
+            session_id: None,
+            include: vec!["events".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(consumer.consumer_name, "clickhouse");
+
+    rt.claim_export_consumer(ClaimExportConsumerRequest {
+        tenant_id: tenant.tenant_id.clone(),
+        consumer_name: "clickhouse".into(),
+        lease_owner: "worker-a".into(),
+        lease_ms: 60_000,
+    })
+    .await
+    .unwrap();
+    rt.ack_export_consumer(AckExportConsumerRequest {
+        tenant_id: tenant.tenant_id.clone(),
+        consumer_name: "clickhouse".into(),
+        cursor: "v2:0001".into(),
+        snapshot_high_watermark: Some("v2:0001".into()),
+        lease_owner: Some("worker-a".into()),
+    })
+    .await
+    .unwrap();
+
+    let hydrated = Runtime::with_kv(kv, content);
+    let loaded = hydrated
+        .get_export_consumer(&tenant.tenant_id, "clickhouse")
+        .await
+        .unwrap();
+    assert_eq!(loaded.scope, WatchScope::Tenant);
+    assert_eq!(loaded.last_acked_cursor.as_deref(), Some("v2:0001"));
+    assert_eq!(loaded.snapshot_high_watermark.as_deref(), Some("v2:0001"));
+    assert_eq!(loaded.lease_owner.as_deref(), Some("worker-a"));
+}
+
+#[tokio::test]
+async fn export_watch_uses_durable_ledger_cursors_with_persistent_kv() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv.clone(), content.clone());
+    assert!(rt.durable_export_ledger_enabled());
+
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-ledger".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "first",
+        serde_json::json!({"n": 1}),
+    ))
+    .await
+    .unwrap();
+    let other_agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let other_session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: other_agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &other_agent,
+        &other_session,
+        "other-agent",
+        serde_json::json!({"n": 99}),
+    ))
+    .await
+    .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "second",
+        serde_json::json!({"n": 2}),
+    ))
+    .await
+    .unwrap();
+
+    let first_page = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["events".into()],
+            from_cursor: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].item.data["kind"], "first");
+    assert!(first_page[0].cursor.starts_with("ledger:"));
+
+    let hydrated = Runtime::with_kv(kv, content);
+    let second_page = hydrated
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(session.session_id.clone()),
+            agent_id: None,
+            include: vec!["events".into()],
+            from_cursor: Some(first_page[0].cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].item.data["kind"], "second");
+    assert!(second_page[0].cursor.starts_with("ledger:"));
+
+    let agent_page = hydrated
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Agent,
+            session_id: None,
+            agent_id: Some(agent.agent_id.clone()),
+            include: vec!["events".into()],
+            from_cursor: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let agent_kinds = agent_page
+        .iter()
+        .map(|item| item.item.data["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(agent_kinds, vec!["first", "second"]);
+
+    assert_eq!(
+        hydrated
+            .export_high_watermark(&tenant.tenant_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(second_page[0].cursor.as_str())
+    );
+    let oldest = hydrated
+        .export_oldest_available_cursor(&tenant.tenant_id)
+        .await
+        .unwrap()
+        .expect("oldest export cursor exists");
+    assert!(oldest.starts_with("ledger:"));
+
+    let malformed = hydrated
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["events".into()],
+            from_cursor: Some("v2:00000000000000000000".into()),
+            limit: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code, agentdb_core::ErrorCode::InvalidCursor);
+
+    let wrong_session = hydrated
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(other_session.session_id.clone()),
+            agent_id: None,
+            include: vec!["events".into()],
+            from_cursor: Some(first_page[0].cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_session.code, agentdb_core::ErrorCode::InvalidCursor);
+}
+
+#[tokio::test]
+async fn export_watch_emits_metadata_updates_and_tombstones_with_persistent_kv() {
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv, content);
+
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "export-metadata".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: Some("metadata-agent".into()),
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: Some("metadata-session".into()),
+        })
+        .await
+        .unwrap();
+    let record = rt
+        .write_record(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            namespace: vec!["mem".into()],
+            scope: serde_json::json!({}),
+            text: Some("exported memory".into()),
+            metadata: serde_json::json!({"k": "v"}),
+            tags: vec!["export".into()],
+            source: None,
+            embedding: None,
+            policy: IndexingPolicy::default(),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    rt.delete_record(&tenant.tenant_id, &record.record_id)
+        .await
+        .unwrap();
+
+    let tenant_items = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec![
+                "tenants".into(),
+                "agents".into(),
+                "sessions".into(),
+                "records".into(),
+            ],
+            from_cursor: None,
+            limit: 20,
+        })
+        .await
+        .unwrap();
+    let object_types = tenant_items
+        .iter()
+        .map(|item| item.item.object_type.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        object_types,
+        ["agent", "record", "session", "tenant"]
+            .into_iter()
+            .collect()
+    );
+    assert!(tenant_items
+        .iter()
+        .any(|item| item.item.object_id == record.record_id.as_str()
+            && item.item.op == "delete"
+            && item.item.tombstone.is_some()));
+
+    let session_items = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(session.session_id.clone()),
+            agent_id: None,
+            include: vec!["sessions".into()],
+            from_cursor: None,
+            limit: 20,
+        })
+        .await
+        .unwrap();
+    assert_eq!(session_items.len(), 1);
+    assert_eq!(session_items[0].item.object_id, session.session_id.as_str());
 }
