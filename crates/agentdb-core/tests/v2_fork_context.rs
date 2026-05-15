@@ -6,7 +6,7 @@ use agentdb_core::runtime::{
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
-    InMemoryContentBackend, InMemoryKvStore, PrefixScopedTabletStore, ReplicatedLog,
+    InMemoryContentBackend, InMemoryKvStore, KvStore, PrefixScopedTabletStore, ReplicatedLog,
     SingleNodeReplicatedLog,
 };
 use std::{
@@ -478,7 +478,7 @@ async fn export_watch_uses_durable_ledger_cursors_with_persistent_kv() {
     assert_eq!(first_page[0].item.data["kind"], "first");
     assert!(first_page[0].cursor.starts_with("ledger:"));
 
-    let hydrated = Runtime::with_kv(kv, content);
+    let hydrated = Runtime::with_kv(kv.clone(), content);
     let second_page = hydrated
         .export_watch(ExportWatchRequest {
             tenant_id: tenant.tenant_id.clone(),
@@ -555,6 +555,40 @@ async fn export_watch_uses_durable_ledger_cursors_with_persistent_kv() {
         .await
         .unwrap_err();
     assert_eq!(wrong_session.code, agentdb_core::ErrorCode::InvalidCursor);
+
+    let first_ledger_key = format!(
+        "export_ledger/{}",
+        first_page[0].cursor.trim_start_matches("ledger:")
+    );
+    let tenant_ledger_prefix = format!("export_ledger/{}/", tenant.tenant_id.as_str());
+    let primary_tablet_prefix = format!("tablet_state/{RUNTIME_PRIMARY_TABLET_ID:020}/");
+    let first_ledger_key = format!("{primary_tablet_prefix}{first_ledger_key}");
+    let tenant_ledger_prefix = format!("{primary_tablet_prefix}{tenant_ledger_prefix}");
+    let pruned_keys = kv
+        .scan_prefix(tenant_ledger_prefix.as_bytes())
+        .unwrap()
+        .map(|item| item.unwrap().0)
+        .filter(|key| key.as_slice() <= first_ledger_key.as_bytes())
+        .collect::<Vec<_>>();
+    assert!(!pruned_keys.is_empty());
+    for key in pruned_keys {
+        kv.delete(&key).unwrap();
+    }
+
+    let expired_cursor = hydrated
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["events".into()],
+            from_cursor: Some(first_page[0].cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(expired_cursor.code, agentdb_core::ErrorCode::InvalidCursor);
+    assert!(expired_cursor.message.contains("oldest_available_cursor="));
 }
 
 #[tokio::test]

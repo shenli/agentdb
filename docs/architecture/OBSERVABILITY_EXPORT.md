@@ -822,6 +822,9 @@ Response:
 - Implemented: persisted export watch can drain retained ledger rows after a
   tenant has been physically purged, so final tenant-purge tombstones remain
   observable.
+- Implemented: retention-aware cursor validation. A consumer resuming from a
+  pruned durable-ledger cursor receives `InvalidCursor` with the current
+  `oldest_available_cursor`.
 - Implemented: tablet movement snapshot classification for export ledger,
   scoped ledger indexes, high-watermark rows, and managed consumer rows.
 - Implemented: restore/conformance coverage proving tablet snapshot restore
@@ -829,6 +832,8 @@ Response:
 - Implemented: `GET /api/admin/exports` visibility for managed consumers and
   current export capability, including pending item count, high watermark,
   oldest pending item timestamp, lag, and lease-active state.
+- Implemented: aggregate admin export metrics for total pending items, max
+  lag, oldest pending timestamp, lease counts, and oldest retained cursors.
 - Implemented: normalized event observability fields for common convention
   payload keys.
 - Implemented: `agentdbctl export clickhouse doctor/init/run/status`, including
@@ -868,8 +873,9 @@ consumer lease expiry plus the worker poll interval and ClickHouse insert time.
 
 ### Phase 3: Retention And Metrics
 
-- Add retention-aware export cursor policy.
-- Add metrics for export lag and oldest retained cursor.
+Implemented in the durable-ledger phase for the first-party admin/API surface.
+Future work is Prometheus/OTel scraping once the broader metrics subsystem is
+formalized.
 
 ### Phase 4: OTel / ClickStack Projection
 

@@ -354,6 +354,36 @@ async fn health_ready() -> StatusCode {
 
 async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let consumers = s.runtime.list_export_consumer_statuses().await?;
+    let pending_items_total: usize = consumers
+        .iter()
+        .map(|consumer| consumer.pending_items)
+        .sum();
+    let max_lag_ms = consumers
+        .iter()
+        .filter_map(|consumer| consumer.lag_ms)
+        .max();
+    let oldest_pending_created_at_ms = consumers
+        .iter()
+        .filter_map(|consumer| consumer.pending_oldest_created_at_ms)
+        .min();
+    let leased_consumer_count = consumers
+        .iter()
+        .filter(|consumer| consumer.lease_active)
+        .count();
+    let mut tenant_ids = BTreeMap::new();
+    for consumer in &consumers {
+        tenant_ids
+            .entry(consumer.consumer.tenant_id.as_str().to_string())
+            .or_insert_with(|| consumer.consumer.tenant_id.clone());
+    }
+    let mut oldest_retained_cursors = Vec::new();
+    for (tenant_id_string, tenant_id) in tenant_ids {
+        oldest_retained_cursors.push(serde_json::json!({
+            "tenant_id": tenant_id_string,
+            "oldest_available_cursor": s.runtime.export_oldest_available_cursor(&tenant_id).await?,
+            "high_watermark": s.runtime.export_high_watermark(&tenant_id).await?
+        }));
+    }
     Ok(Json(serde_json::json!({
         "export_version": "2026-05-14",
         "mode": "durable_ledger",
@@ -370,6 +400,15 @@ async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json:
             "skill_binding"
         ],
         "consumer_count": consumers.len(),
+        "metrics": {
+            "consumer_count": consumers.len(),
+            "leased_consumer_count": leased_consumer_count,
+            "unleased_consumer_count": consumers.len().saturating_sub(leased_consumer_count),
+            "pending_items_total": pending_items_total,
+            "max_lag_ms": max_lag_ms,
+            "oldest_pending_created_at_ms": oldest_pending_created_at_ms,
+            "oldest_retained_cursors": oldest_retained_cursors
+        },
         "consumers": consumers
     })))
 }

@@ -364,7 +364,9 @@ cursor after the sink accepts a batch, and `rewind` to replay from an older
 cursor or from the beginning. `GET /exports/consumers/{name}` and
 `GET /api/admin/exports` include derived status fields such as
 `pending_items`, `high_watermark`, `pending_oldest_created_at_ms`, `lag_ms`, and
-`lease_active`.
+`lease_active`. The admin response also includes an aggregate `metrics` object
+with total pending export items, max consumer lag, oldest pending timestamp,
+lease counts, and per-tenant oldest retained cursor/high-watermark entries.
 
 For high availability, run at least two connector processes with the same
 consumer name and different `lease_owner` values. Only the active lease holder

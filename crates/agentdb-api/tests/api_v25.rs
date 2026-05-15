@@ -770,4 +770,13 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
     assert_eq!(admin["consumer_count"], 1);
     assert_eq!(admin["consumers"][0]["consumer_name"], "clickhouse");
     assert_eq!(admin["consumers"][0]["pending_items"], 2);
+    assert_eq!(admin["metrics"]["consumer_count"], 1);
+    assert_eq!(admin["metrics"]["leased_consumer_count"], 1);
+    assert_eq!(admin["metrics"]["pending_items_total"], 2);
+    assert!(admin["metrics"]["max_lag_ms"].is_u64());
+    assert!(admin["metrics"]["oldest_pending_created_at_ms"].is_u64());
+    assert_eq!(
+        admin["metrics"]["oldest_retained_cursors"][0]["tenant_id"],
+        tid
+    );
 }
