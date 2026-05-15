@@ -29,6 +29,8 @@ Agent platforms repeatedly need the same primitives:
 - skill registry and exact-version replay
 - fork and replay for branchable runs
 - subscriptions and watch cursors for observers and dashboards
+- durable observability export for ClickHouse, ClickStack, JSONL, and archive
+  pipelines
 - policy, quota, retention, lifecycle, and garbage collection per tenant
 
 AgentDB makes those primitives first-class so framework adapters are mostly
@@ -142,6 +144,14 @@ Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant, session, and agent watch returns changefeed items with cursors for
 higher-level consumers.
 
+Observability export is the durable sink boundary. Export endpoints serve
+tenant-scoped envelopes for events and runtime metadata, support backfill plus
+tail, and let named managed consumers claim leases and ack only after an
+external sink accepts a batch. The first supported sink is ClickHouse over HTTP,
+with native AgentDB tables and optional OTel-shaped ClickStack views. JSONL and
+Parquet paths provide archive/lakehouse handoff without adding sink-specific
+semantics to the runtime.
+
 Record indexes follow local/global semantics. A search with `sharding_key` uses
 the owner-local index and is the strong read-after-write boundary. A search
 without `sharding_key` uses the global index, which is GSI-like and eventually
@@ -177,6 +187,18 @@ append tool calls, tool results, model outputs, approvals, and artifacts
 repeat or sleep
 ```
 
+The canonical observability flow is:
+
+```text
+runtime mutation commits
+append export envelope to durable ledger
+connector claims a managed consumer lease
+connector backfills or tails export envelopes
+sink accepts batch: ClickHouse, ClickStack view tables, JSONL, or Parquet
+connector acks the durable export cursor
+dashboards and alerting query the external sink
+```
+
 ## Configuration And Operation
 
 AgentDB is config-file first:
@@ -206,6 +228,11 @@ purge in a policy-controlled order.
 Runtime metadata is stored through the existing KV abstraction. Local persistent
 mode uses RocksDB. Artifact content uses a separate content backend so metadata
 and blob bytes can be placed, retained, and purged independently.
+
+Observability export deliberately uses committed runtime truth, but external
+sink failure must not block ordinary appends. Connectors replay from durable
+export cursors and apply sink-specific schema, privacy, retry, and dashboard
+logic outside the hot runtime path.
 
 SlateDB is allowed as an optional `KvStore` backend to validate the abstraction
 and evaluate object-store-backed runtime metadata. It should not be treated as

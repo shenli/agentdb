@@ -15,6 +15,7 @@ bin/agentdb-server
         v
 crates/agentdb-api        native tenant-scoped /api/... HTTP routes
         |                 optional MongoDB wire listener maps to runtime calls
+        |                 export/watch/backfill/consumer admin routes
         |
         v
 crates/agentdb-core       multi-tenant runtime semantics
@@ -22,6 +23,7 @@ crates/agentdb-core       multi-tenant runtime semantics
                           artifacts, records, skills, policy,
                           lifecycle, fork/replay, context
                           watch/changefeed cursors
+                          export ledger and managed consumer cursors
                           record index outbox
         |
         +--> crates/agentdb-storage   KV + artifact content backends
@@ -31,6 +33,10 @@ crates/agentdb-core       multi-tenant runtime semantics
         |                             text/vector helper indexes
         |
         +--> crates/agentdb-meta      control-plane metadata helpers
+
+bin/agentdbctl            operations CLI
+                          cluster/tablet administration
+                          ClickHouse, ClickStack, JSONL, Parquet export flows
 ```
 
 Runtime data is always tenant-scoped. Tenant IDs are the server-side boundary
@@ -104,6 +110,14 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
+GET  /api/tenants/{tenant_id}/exports/watch
+POST /api/tenants/{tenant_id}/exports/backfill
+GET  /api/tenants/{tenant_id}/exports/status
+POST /api/tenants/{tenant_id}/exports/consumers
+GET  /api/tenants/{tenant_id}/exports/consumers/{name}
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/claim
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/ack
+POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 POST /api/tenants/{tenant_id}/artifacts
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
@@ -115,6 +129,7 @@ POST /api/tenants/{tenant_id}/agents/{agent_id}/skills/bind
 POST /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST /api/tenants/{tenant_id}/policy/gc-sweep
 POST /api/policy/worker/run
+GET  /api/admin/exports
 GET  /health/ready
 ```
 
@@ -221,6 +236,51 @@ append / lifecycle / record mutation
 
 The current subscribe endpoint is deterministic replay-style SSE. Long-held
 live push can be layered onto the same watch cursor model.
+
+## Observability Export
+
+The export surface is separate from the hot append path. Runtime mutations first
+commit to AgentDB; durable export envelopes are then available to external
+sinks through backfill/watch APIs. Named managed consumers store claim leases,
+last acked cursors, include filters, and lag status. Connectors must write the
+sink batch before acking AgentDB, so a crashed worker can replay the last
+unacked cursor range.
+
+```text
+runtime mutation commits
+        |
+        v
+ durable export envelope
+        |
+        +--> exports/backfill for snapshots and historical event ranges
+        |
+        +--> exports/watch for tailing committed changes
+                 |
+                 v
+          managed consumer lease
+          last_acked_cursor
+                 |
+                 v
+      agentdbctl export connectors
+          |          |             |
+          v          v             v
+   ClickHouse   ClickStack      JSONL / Parquet
+   native rows  OTel views      archives / lakehouse
+```
+
+`agentdbctl export clickhouse migrate --apply` installs the current
+ClickHouse schema stamp, native raw/event/tombstone tables, OTel-shaped
+projection tables, and ClickStack-compatible views. `run --mode native,otel`
+copies export envelopes with retry-safe ClickHouse deduplication tokens.
+`doctor`, `status`, `queries`, and `clickstack-config` provide operational
+inspection and setup templates.
+
+`agentdbctl export jsonl run` writes the same export envelopes to local files,
+stdout, or object-store URIs. `agentdbctl export parquet from-jsonl` converts
+JSONL archives through DuckDB for warehouse and lakehouse ingestion. Both
+ClickHouse and JSONL exporters support connector-side object/event filters,
+field redaction, payload hash/drop modes, and a local status JSON file refreshed
+after each processed batch.
 
 ## Storage
 
@@ -333,6 +393,10 @@ session lifecycle, storage, and restore endpoints.
   content, configured by `agentdb.toml`.
 - **Docker and Compose**: containerized single-node server with a mounted config
   file and data volume.
+- **Observability export workers**: `agentdbctl` processes that tail managed
+  export consumers into ClickHouse/ClickStack or JSONL/Parquet archives. They
+  can run as systemd services or AWS deployment helpers and fail over through
+  consumer lease expiry.
 - **Helm**: evaluation-oriented Kubernetes deployment that mounts config through
   a ConfigMap and uses the same health endpoints as the binary.
 

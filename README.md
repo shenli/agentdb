@@ -39,8 +39,8 @@ to rebuild session semantics on top of a generic database.
   while the optional MongoDB listener lets existing drivers and tools inspect
   and write AgentDB runtime collections
 - **Operate and debug agent runs** — dashboard, watch streams, structured
-  errors, runbooks, health checks, and deployment docs make runtime state
-  inspectable
+  errors, observability export, runbooks, health checks, and deployment docs
+  make runtime state inspectable
 - **SDK and adapter surfaces** — Python and TypeScript clients plus LangGraph,
   OpenAI Agents SDK, MCP, and Vercel AI SDK integration paths
 
@@ -50,34 +50,35 @@ tool call, tool result, artifact, policy decision, and lifecycle transition to
 AgentDB, then reads it back to resume, replay, fork, inspect, or stream a run.
 
 ```text
-                 AI agent platform
+                         AI agent platform
 
-  tenant A / workspace A             tenant B / workspace B
-  support agents, sessions           research agents, sessions
-             |                                  |
-             | append/read/replay/search/watch |
-             v                                  v
-      +--------------------------------------------------+
-      |                    AgentDB                       |
-      | multi-tenant runtime boundary                    |
-      |                                                  |
-      |  tenants -> agents -> sessions -> events         |
-      |      |          |          |          |           |
-      |      |          |          +--> artifacts         |
-      |      |          |          +--> records           |
-      |      |          |                 |               |
-      |      |          |                 +--> local index |
-      |      |          |                 |    sharding_key|
-      |      |          |                 +--> global index|
-      |      |          |                      async/GSI   |
-      |      |          |                                  |
-      |      +--> policy, quota, lifecycle, storage       |
-      |      +--> watch/changefeed cursors                |
-      +--------------------------------------------------+
-             |                                  |
-             v                                  v
-   dashboards, supervisors,          tools, sandboxes, MCP,
-   evaluators, replay viewers        application systems
+  tenant A / workspace A                         tenant B / workspace B
+  support agents, sessions                       research agents, sessions
+             |                                              |
+             | native SDK / HTTP: append, fetch, search     |
+             | replay, fork, context, subscribe, watch      |
+             v                                              v
+      +------------------------------------------------------------------+
+      |                              AgentDB                             |
+      | multi-tenant runtime, policy, routing, and storage boundary      |
+      |                                                                  |
+      |  tenants -> agents -> sessions -> ordered events                 |
+      |      |          |          |                                      |
+      |      |          |          +--> artifacts -> content backend      |
+      |      |          |          +--> records   -> local/global indexes |
+      |      |          |          +--> skills, lifecycle, policy         |
+      |      |                                                         |
+      |      +--> watch cursors for live dashboards and supervisors      |
+      |      +--> managed export consumers with durable ack cursors      |
+      |                                                                  |
+      |  single node: RocksDB runtime store                              |
+      |  cluster path: cells -> shards -> tablets -> Raft/local LSM      |
+      +------------------------------------------------------------------+
+          |                     |                         |
+          | read/replay/watch   | export backfill/tail    | tool outputs
+          v                     v                         v
+   dashboard, replay     ClickHouse / ClickStack     tools, sandboxes,
+   viewers, evaluators   JSONL / Parquet archives    MCP, app systems
 ```
 
 ## Project Status
@@ -93,6 +94,8 @@ Supported developer surfaces:
 
 - Rust runtime and HTTP API crates in `crates/`
 - Server binary in `bin/agentdb-server`
+- Operational CLI in `bin/agentdbctl`, including cluster operations and
+  observability export
 - Python SDK in `clients/python`
 - TypeScript SDK in `clients/typescript`
 - Framework adapters and templates in `adapters/`
