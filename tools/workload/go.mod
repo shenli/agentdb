@@ -1,4 +1,4 @@
-module github.com/shenli/agentdb/workload
+module github.com/shenli/agentdb/tools/workload
 
 go 1.22
 

@@ -13,6 +13,7 @@ LABEL="${1:-run}"
 DURATION="${2:-60}"
 
 PORT_HTTP=${PORT_HTTP:-7878}
+WORKLOAD_DIR="tools/workload"
 DATA_DIR=$(mktemp -d -t agentdb-perf-XXXXXX)
 OBJ_DIR=$(mktemp -d -t agentdb-perf-obj-XXXXXX)
 OUT_DIR="perf-out"
@@ -46,8 +47,8 @@ for i in $(seq 1 30); do
     sleep 0.3
 done
 
-pushd workload > /dev/null
-./agentdb-workload -config config.yaml > "../$OUT_DIR/${LABEL}.workload.log" 2>&1 &
+pushd "$WORKLOAD_DIR" > /dev/null
+./agentdb-workload -config config.yaml > "../../$OUT_DIR/${LABEL}.workload.log" 2>&1 &
 WORKLOAD_PID=$!
 popd > /dev/null
 

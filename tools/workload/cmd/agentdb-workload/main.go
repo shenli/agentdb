@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shenli/agentdb/workload/internal/client"
-	"github.com/shenli/agentdb/workload/internal/control"
-	"github.com/shenli/agentdb/workload/internal/persona"
+	"github.com/shenli/agentdb/tools/workload/internal/client"
+	"github.com/shenli/agentdb/tools/workload/internal/control"
+	"github.com/shenli/agentdb/tools/workload/internal/persona"
 
 	"gopkg.in/yaml.v3"
 )

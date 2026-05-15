@@ -10,7 +10,7 @@ running `agentdb-server`.
 cargo run -p agentdb-server
 
 # 2. Run the workload:
-cd workload
+cd tools/workload
 go run ./cmd/agentdb-workload -config config.yaml
 ```
 

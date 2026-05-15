@@ -4,6 +4,7 @@
 set -euo pipefail
 
 PORT_HTTP=${PORT_HTTP:-7878}
+WORKLOAD_DIR="tools/workload"
 DATA_DIR=$(mktemp -d -t agentdb-perf-XXXXXX)
 OBJ_DIR=$(mktemp -d -t agentdb-perf-obj-XXXXXX)
 OUT_DIR="perf-out"
@@ -37,7 +38,7 @@ echo "server ready, pid=$SERVER_PID"
 DURATION=${DURATION:-20}
 for C in 1 4 16 64; do
     echo "--- c=$C duration=${DURATION}s ---"
-    workload/perf-probe \
+    "$WORKLOAD_DIR/perf-probe" \
         -base "http://127.0.0.1:$PORT_HTTP" \
         -c "$C" \
         -tenants 8 \

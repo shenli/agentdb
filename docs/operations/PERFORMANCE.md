@@ -22,7 +22,7 @@ numbers include loopback TCP round-trip (~50 µs on this box).
 
 ## Throughput scaling
 
-`workload/cmd/perf-probe` spins N workers that each loop
+`tools/workload/cmd/perf-probe` spins N workers that each loop
 `append_and_fetch` against one of 8 tenants (worker `i` uses tenant
 `t-perf-{i mod 8}` and session `s-w{i}`). 15-second runs, warm
 server, no faults or tier transitions.
@@ -78,7 +78,7 @@ read and a few batched KV puts.
 ## Session lifecycle — end-to-end
 
 A 90-second run of the built-in Go workload
-(`workload/config.yaml`, 2 personas at 6 and 3 tickets/min) with
+(`tools/workload/config.yaml`, 2 personas at 6 and 3 tickets/min) with
 `AGENTDB_T_COLD_SECS=3 AGENTDB_TICK_SECS=1` — aggressive tiering that
 flushes any session idle for ≥ 3 s.
 
@@ -261,9 +261,11 @@ accidentally reuse state.
 ```bash
 # Build everything
 cargo build --release -p agentdb-server
-cd workload && go build -o perf-probe ./cmd/perf-probe
-cd workload && go build -o agentdb-workload ./cmd/agentdb-workload
-cd ..
+(
+  cd tools/workload
+  go build -o perf-probe ./cmd/perf-probe
+  go build -o agentdb-workload ./cmd/agentdb-workload
+)
 
 # Throughput suite (c=1,4,16,64, 15 s each)
 DURATION=15 bash ops/perf/scripts/perf_suite.sh
