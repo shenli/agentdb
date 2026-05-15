@@ -227,6 +227,133 @@ agentdbctl cells list
 agentdbctl nodes delete node-a
 ```
 
+## Observability Export
+
+The first supported observability sink is ClickHouse over HTTP. The initial
+implementation exports event and runtime metadata envelopes, supports event
+backfill, supports tenant-scope metadata snapshot backfill, and provides
+managed consumer checkpoints. Persistent AgentDB runtimes use durable ledger
+cursors for export; in-memory/dev runtimes fall back to current event watch
+cursors. Runtime soft deletes are exported as tombstone envelopes.
+
+Start a local ClickHouse with the helper compose file:
+
+```bash
+docker compose -f ops/observability/clickhouse-compose.yml up -d
+```
+
+Initialize the schema:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse init --apply
+```
+
+Check AgentDB and ClickHouse reachability:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl -o json export clickhouse doctor --tenant-id ten_...
+```
+
+Export one batch:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse
+```
+
+Backfill current events and then tail continuously:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse --backfill --tail
+```
+
+Export OTel-shaped ClickStack-friendly projections in addition to the native
+tables:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... --consumer prod-clickhouse \
+    --mode native,otel --backfill --tail
+```
+
+Backfill metadata snapshots before the event tail:
+
+```bash
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/agentdb \
+  agentdbctl export clickhouse run --tenant-id ten_... \
+    --include tenants,agents,sessions,artifacts,records,skills,skill_bindings \
+    --backfill
+```
+
+Write durable export envelopes to JSONL:
+
+```bash
+agentdbctl export jsonl run --tenant-id ten_... --output ./agentdb-events.jsonl
+```
+
+For object-store archival, use an object-store URI. S3-compatible destinations
+use the standard AWS environment variables supported by the Rust object-store
+stack:
+
+```bash
+AWS_REGION=us-east-1 \
+agentdbctl export jsonl run --tenant-id ten_... \
+  --output s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --backfill --max-batches 100
+```
+
+Continuous `--tail` is supported for local files and stdout. Object-store
+outputs are uploaded as a completed object, so use `--max-batches` with
+`--tail` for bounded archival batches.
+
+Use `ops/observability/duckdb-jsonl-demo.sql` to inspect local or S3 JSONL
+archives with DuckDB:
+
+```bash
+duckdb -cmd ".param set jsonl_path './agentdb-events.jsonl'" \
+  -init ops/observability/duckdb-jsonl-demo.sql
+```
+
+Convert a JSONL archive to Parquet using DuckDB:
+
+```bash
+agentdbctl export parquet from-jsonl \
+  --input ./agentdb-events.jsonl \
+  --output ./agentdb-events.parquet
+
+AWS_REGION=us-east-1 \
+agentdbctl export parquet from-jsonl \
+  --input s3://agentdb-exports/tenants/ten_.../events.jsonl \
+  --output s3://agentdb-exports/tenants/ten_.../events.parquet \
+  --s3-region us-east-1
+```
+
+Inspect AgentDB export capability for a tenant:
+
+```bash
+agentdbctl export clickhouse status --tenant-id ten_...
+agentdbctl export clickhouse status --tenant-id ten_... --consumer prod-clickhouse
+```
+
+The underlying HTTP API also exposes
+`POST /api/tenants/{tenant_id}/exports/backfill` for event and tenant-scope
+metadata snapshot paging before a tailing export loop. Managed export consumers
+are available through `/api/tenants/{tenant_id}/exports/consumers`; they store
+durable checkpoints, include filters, lease ownership, and rewind state for
+official connectors. Use `agentdbctl raw get /api/admin/exports` to inspect all
+export consumers on a node, including pending item count, high watermark, lag,
+and lease-active state.
+
+For HA connector deployment, run two or more `run --tail` processes with the
+same `--consumer` and distinct `--lease-owner` values. The process holding the
+lease writes to ClickHouse and acks only after ClickHouse accepts the batch. A
+standby process can claim the lease after `--lease-ms` expires and resumes from
+the last acked cursor. Use `status --consumer` or `/api/admin/exports` to watch
+lag, pending item count, high watermark, active lease state, and lease owner.
+
 ## Raw Escape Hatch
 
 Use `raw` for endpoints that the CLI does not model yet:

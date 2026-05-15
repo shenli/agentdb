@@ -4,15 +4,169 @@
 //! small operator surface on top: concise commands, table output by default,
 //! JSON output for automation, and no requirement to hand-write curl payloads.
 
-use std::{fmt::Write as _, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    fs::OpenOptions,
+    io::{self, Write as IoWrite},
+    path::PathBuf,
+    process::Command as ProcessCommand,
+};
 
 use agentdb_storage::{GroupedRocksDbTabletStore, TabletStoreLifecycle};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use url::Url;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7878";
+const CLICKHOUSE_SCHEMA_DDL: &[&str] = &[
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_schema_migrations (
+    version String,
+    applied_at DateTime64(3) DEFAULT now64(3)
+) ENGINE = MergeTree
+ORDER BY version
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_export_checkpoints (
+    consumer String,
+    tenant_id String,
+    cursor String,
+    updated_at_ms UInt64,
+    updated_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(updated_at_ms))
+) ENGINE = ReplacingMergeTree(updated_at_ms)
+ORDER BY (consumer, tenant_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_export_items_raw (
+    export_version LowCardinality(String),
+    cursor String,
+    op LowCardinality(String),
+    object_type LowCardinality(String),
+    tenant_id String,
+    agent_id Nullable(String),
+    session_id Nullable(String),
+    object_id String,
+    seq Nullable(UInt64),
+    created_at_ms UInt64,
+    created_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(created_at_ms)),
+    observed_at_ms UInt64,
+    observed_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(observed_at_ms)),
+    cell_id Nullable(String),
+    placement_scope_id Nullable(String),
+    tablet_id Nullable(Int64),
+    tablet_epoch Nullable(Int64),
+    applied_index Nullable(UInt64),
+    payload_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, created_at, object_type, object_id, cursor)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_events (
+    tenant_id String,
+    agent_id String,
+    session_id String,
+    event_id String,
+    seq UInt64,
+    kind LowCardinality(String),
+    created_at_ms UInt64,
+    created_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(created_at_ms)),
+    observed_at_ms UInt64,
+    observed_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(observed_at_ms)),
+    cell_id Nullable(String),
+    placement_scope_id Nullable(String),
+    tablet_id Nullable(Int64),
+    tablet_epoch Nullable(Int64),
+    applied_index Nullable(UInt64),
+    parent_event_id Nullable(String),
+    status Nullable(String),
+    model Nullable(String),
+    provider Nullable(String),
+    finish_reason Nullable(String),
+    tool_name Nullable(String),
+    tool_call_id Nullable(String),
+    duration_ms Nullable(UInt64),
+    timeout_ms Nullable(UInt64),
+    input_tokens Nullable(UInt64),
+    output_tokens Nullable(UInt64),
+    total_tokens Nullable(UInt64),
+    cost_micros Nullable(UInt64),
+    error_kind Nullable(String),
+    error_message Nullable(String),
+    retryable Nullable(Bool),
+    exit_code Nullable(Int64),
+    approval_id Nullable(String),
+    approval_decision Nullable(String),
+    context_pack_id Nullable(String),
+    source_refs_json String,
+    artifact_refs_json String,
+    tags_json String,
+    metadata_json String,
+    payload_json String,
+    envelope_json String
+) ENGINE = ReplacingMergeTree(observed_at_ms)
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (tenant_id, session_id, seq, event_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_otel_logs (
+    trace_id String,
+    span_id String,
+    timestamp_unix_nano UInt64,
+    timestamp DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(timestamp_unix_nano)),
+    severity_text LowCardinality(String),
+    body String,
+    resource_attributes Map(String, String),
+    log_attributes Map(String, String),
+    tenant_id String,
+    session_id String,
+    event_id String,
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (tenant_id, session_id, timestamp, event_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_otel_traces (
+    trace_id String,
+    span_id String,
+    parent_span_id Nullable(String),
+    span_name String,
+    span_kind LowCardinality(String),
+    start_time_unix_nano UInt64,
+    end_time_unix_nano UInt64,
+    start_time DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(start_time_unix_nano)),
+    end_time DateTime64(9) MATERIALIZED fromUnixTimestamp64Nano(toInt64(end_time_unix_nano)),
+    duration_ms Nullable(UInt64),
+    status_code LowCardinality(String),
+    resource_attributes Map(String, String),
+    span_attributes Map(String, String),
+    links_json String,
+    tenant_id String,
+    session_id String,
+    event_id String,
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (tenant_id, session_id, start_time, span_id)
+"#,
+    r#"
+CREATE TABLE IF NOT EXISTS agentdb_tombstones (
+    tenant_id String,
+    object_type LowCardinality(String),
+    object_id String,
+    reason LowCardinality(String),
+    deleted_at_ms UInt64,
+    deleted_at DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(toInt64(deleted_at_ms)),
+    envelope_json String
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(deleted_at)
+ORDER BY (tenant_id, object_type, object_id, deleted_at)
+"#,
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -94,6 +248,11 @@ enum Command {
     TabletStore {
         #[command(subcommand)]
         command: TabletStoreCommand,
+    },
+    /// Observability export operations.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
     },
     /// Low-level escape hatch for endpoints not yet modeled by the CLI.
     Raw {
@@ -425,6 +584,168 @@ enum TabletStoreCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum ExportCommand {
+    /// ClickHouse observability export golden path.
+    Clickhouse {
+        #[command(subcommand)]
+        command: ClickHouseCommand,
+    },
+    /// Export durable envelopes as newline-delimited JSON.
+    Jsonl {
+        #[command(subcommand)]
+        command: JsonlCommand,
+    },
+    /// Convert JSONL export archives into Parquet files.
+    Parquet {
+        #[command(subcommand)]
+        command: ParquetCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClickHouseCommand {
+    /// Check AgentDB export and optional ClickHouse reachability.
+    Doctor(ClickHouseDoctorArgs),
+    /// Print or apply the first-party ClickHouse schema.
+    Init(ClickHouseInitArgs),
+    /// Show AgentDB export status for one tenant.
+    Status(ClickHouseStatusArgs),
+    /// Copy one or more export-watch batches into ClickHouse.
+    Run(ClickHouseRunArgs),
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseDoctorArgs {
+    #[arg(long)]
+    tenant_id: Option<String>,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseInitArgs {
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
+    #[arg(long)]
+    apply: bool,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseStatusArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long)]
+    consumer: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseRunArgs {
+    #[arg(long)]
+    tenant_id: String,
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: String,
+    #[arg(long, default_value = "tenant")]
+    scope: String,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    consumer: Option<String>,
+    #[arg(long, default_value = "agentdbctl")]
+    lease_owner: String,
+    #[arg(long, default_value_t = 30_000)]
+    lease_ms: u64,
+    #[arg(long)]
+    from_cursor: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    #[arg(long = "include", value_delimiter = ',')]
+    include: Vec<String>,
+    #[arg(long = "mode", value_delimiter = ',', default_value = "native")]
+    mode: Vec<String>,
+    #[arg(long)]
+    backfill: bool,
+    #[arg(long)]
+    tail: bool,
+    #[arg(long)]
+    max_batches: Option<u64>,
+    #[arg(long, default_value_t = 1000)]
+    poll_interval_ms: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum JsonlCommand {
+    /// Copy one or more export-watch batches into a JSONL file or object.
+    Run(JsonlRunArgs),
+}
+
+#[derive(Args, Debug)]
+struct JsonlRunArgs {
+    #[arg(long)]
+    tenant_id: String,
+    /// Local path, "-", file:// URI, or object-store URI such as s3://bucket/path.jsonl.
+    #[arg(long)]
+    output: String,
+    #[arg(long, default_value = "tenant")]
+    scope: String,
+    #[arg(long)]
+    agent_id: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[arg(long)]
+    consumer: Option<String>,
+    #[arg(long, default_value = "agentdbctl-jsonl")]
+    lease_owner: String,
+    #[arg(long, default_value_t = 30_000)]
+    lease_ms: u64,
+    #[arg(long)]
+    from_cursor: Option<String>,
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    #[arg(long = "include", value_delimiter = ',')]
+    include: Vec<String>,
+    #[arg(long)]
+    backfill: bool,
+    #[arg(long)]
+    tail: bool,
+    #[arg(long)]
+    max_batches: Option<u64>,
+    #[arg(long, default_value_t = 1000)]
+    poll_interval_ms: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ParquetCommand {
+    /// Convert a JSONL export archive to Parquet using DuckDB.
+    FromJsonl(ParquetFromJsonlArgs),
+}
+
+#[derive(Args, Debug)]
+struct ParquetFromJsonlArgs {
+    /// Local path or object-store URI for the JSONL input.
+    #[arg(long)]
+    input: String,
+    /// Local path or object-store URI for the Parquet output.
+    #[arg(long)]
+    output: String,
+    /// DuckDB executable to invoke.
+    #[arg(long, default_value = "duckdb")]
+    duckdb_bin: String,
+    /// Optional S3 region for DuckDB httpfs.
+    #[arg(long)]
+    s3_region: Option<String>,
+    #[arg(long, default_value = "zstd")]
+    compression: String,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Subcommand, Debug)]
 enum RawCommand {
     /// GET a raw API path.
     Get { path: String },
@@ -583,6 +904,7 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 .await
             }
         },
+        Command::Export { command } => export(api, command).await,
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
             RawCommand::Post { path, body } => {
@@ -647,6 +969,1163 @@ async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
             .await
         }
     }
+}
+
+async fn export(api: &Api, command: ExportCommand) -> Result<Value> {
+    match command {
+        ExportCommand::Clickhouse { command } => clickhouse(api, command).await,
+        ExportCommand::Jsonl { command } => jsonl(api, command).await,
+        ExportCommand::Parquet { command } => parquet(command).await,
+    }
+}
+
+async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
+    match command {
+        ClickHouseCommand::Doctor(args) => clickhouse_doctor(api, args).await,
+        ClickHouseCommand::Init(args) => clickhouse_init(args).await,
+        ClickHouseCommand::Status(args) => {
+            if let Some(consumer) = args.consumer {
+                api.get(&format!(
+                    "/api/tenants/{}/exports/consumers/{}",
+                    query_component(&args.tenant_id),
+                    query_component(&consumer)
+                ))
+                .await
+            } else {
+                api.get(&format!(
+                    "/api/tenants/{}/exports/status",
+                    query_component(&args.tenant_id)
+                ))
+                .await
+            }
+        }
+        ClickHouseCommand::Run(args) => clickhouse_run(api, args).await,
+    }
+}
+
+async fn clickhouse_doctor(api: &Api, args: ClickHouseDoctorArgs) -> Result<Value> {
+    let agentdb_ready = match api.get("/health/ready").await {
+        Ok(_) => json!({
+            "check_id": "agentdb_reachable",
+            "status": "ok"
+        }),
+        Err(error) => json!({
+            "check_id": "agentdb_reachable",
+            "status": "error",
+            "message": error.to_string()
+        }),
+    };
+    let export_status = if let Some(tenant_id) = args.tenant_id {
+        match api
+            .get(&format!(
+                "/api/tenants/{}/exports/status",
+                query_component(&tenant_id)
+            ))
+            .await
+        {
+            Ok(value) => json!({
+                "check_id": "agentdb_export_status",
+                "status": "ok",
+                "details": value
+            }),
+            Err(error) => json!({
+                "check_id": "agentdb_export_status",
+                "status": "error",
+                "message": error.to_string()
+            }),
+        }
+    } else {
+        json!({
+            "check_id": "agentdb_export_status",
+            "status": "skipped",
+            "message": "--tenant-id not supplied"
+        })
+    };
+    let clickhouse = if let Some(url) = args.clickhouse_url {
+        match clickhouse_query(&url, "SELECT 1").await {
+            Ok(text) => json!({
+                "check_id": "clickhouse_reachable",
+                "status": "ok",
+                "response": text.trim()
+            }),
+            Err(error) => json!({
+                "check_id": "clickhouse_reachable",
+                "status": "error",
+                "message": error.to_string()
+            }),
+        }
+    } else {
+        json!({
+            "check_id": "clickhouse_reachable",
+            "status": "skipped",
+            "message": "--clickhouse-url or CLICKHOUSE_URL not supplied"
+        })
+    };
+    let checks = vec![agentdb_ready, export_status, clickhouse];
+    let ok = checks
+        .iter()
+        .all(|check| check.get("status").and_then(Value::as_str) != Some("error"));
+    Ok(json!({
+        "status": if ok { "ok" } else { "error" },
+        "checks": checks
+    }))
+}
+
+async fn clickhouse_init(args: ClickHouseInitArgs) -> Result<Value> {
+    if !args.apply {
+        return Ok(json!({
+            "status": "dry_run",
+            "statements": CLICKHOUSE_SCHEMA_DDL
+        }));
+    }
+    let url = args
+        .clickhouse_url
+        .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    let mut applied = Vec::new();
+    for statement in CLICKHOUSE_SCHEMA_DDL {
+        clickhouse_query(&url, statement).await?;
+        applied.push(json!({
+            "statement": statement.lines().next().unwrap_or(statement).trim(),
+            "status": "ok"
+        }));
+    }
+    Ok(json!({
+        "status": "ok",
+        "applied": applied
+    }))
+}
+
+async fn ensure_claimed_export_consumer(
+    api: &Api,
+    args: &ClickHouseRunArgs,
+    consumer: &str,
+) -> Result<Value> {
+    let include = vec!["events".to_string()];
+    ensure_claimed_export_consumer_for(
+        api,
+        &args.tenant_id,
+        consumer,
+        &args.scope,
+        args.agent_id.as_deref(),
+        args.session_id.as_deref(),
+        &include,
+        &args.lease_owner,
+        args.lease_ms,
+    )
+    .await
+}
+
+async fn ensure_claimed_export_consumer_for(
+    api: &Api,
+    tenant_id: &str,
+    consumer: &str,
+    scope: &str,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    include: &[String],
+    lease_owner: &str,
+    lease_ms: u64,
+) -> Result<Value> {
+    let include = if include.is_empty() {
+        vec!["events".to_string()]
+    } else {
+        include.to_vec()
+    };
+    api.post(
+        &format!(
+            "/api/tenants/{}/exports/consumers",
+            query_component(tenant_id)
+        ),
+        json!({
+            "name": consumer,
+            "scope": scope,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "include": include
+        }),
+    )
+    .await?;
+    api.post(
+        &format!(
+            "/api/tenants/{}/exports/consumers/{}/claim",
+            query_component(tenant_id),
+            query_component(consumer)
+        ),
+        json!({
+            "lease_owner": lease_owner,
+            "lease_ms": lease_ms
+        }),
+    )
+    .await
+}
+
+async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
+    let modes = export_modes(&args.mode)?;
+    let mut cursor = args.from_cursor.clone();
+    if let Some(consumer) = &args.consumer {
+        let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
+        if cursor.is_none() {
+            cursor = claimed
+                .get("last_acked_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let mut batches = 0_u64;
+    let mut rows = 0_u64;
+    let max_batches = args.max_batches.unwrap_or(if args.tail || args.backfill {
+        u64::MAX
+    } else {
+        1
+    });
+    let mut phase = if args.backfill {
+        ExportRunPhase::Backfill
+    } else {
+        ExportRunPhase::Watch
+    };
+    loop {
+        if batches >= max_batches {
+            break;
+        }
+        let response = match phase {
+            ExportRunPhase::Backfill => {
+                let include = if args.include.is_empty() {
+                    vec!["events".to_string()]
+                } else {
+                    args.include.clone()
+                };
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/backfill",
+                        query_component(&args.tenant_id)
+                    ),
+                    json!({
+                        "scope": args.scope.clone(),
+                        "agent_id": args.agent_id.clone(),
+                        "session_id": args.session_id.clone(),
+                        "include": include.clone(),
+                        "from_cursor": cursor.clone(),
+                        "limit": args.limit
+                    }),
+                )
+                .await?
+            }
+            ExportRunPhase::Watch => {
+                api.get(&export_watch_path(&args, cursor.as_deref()))
+                    .await?
+            }
+        };
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            if phase == ExportRunPhase::Backfill {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            if args.tail {
+                tokio::time::sleep(std::time::Duration::from_millis(args.poll_interval_ms)).await;
+                continue;
+            }
+            break;
+        }
+        batches = batches.saturating_add(1);
+        rows = rows.saturating_add(items.len() as u64);
+        if !args.dry_run {
+            if modes.native {
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_export_items_raw",
+                    &clickhouse_raw_rows(&items)?,
+                )
+                .await?;
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_events",
+                    &clickhouse_event_rows(&items)?,
+                )
+                .await?;
+            }
+            if modes.otel {
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_otel_logs",
+                    &clickhouse_otel_log_rows(&items)?,
+                )
+                .await?;
+                clickhouse_insert_json_each_row(
+                    &args.clickhouse_url,
+                    "agentdb_otel_traces",
+                    &clickhouse_otel_trace_rows(&items)?,
+                )
+                .await?;
+            }
+        }
+        cursor = response
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if phase == ExportRunPhase::Backfill
+            && args.tail
+            && !args.include.is_empty()
+            && !args.include.iter().any(|item| item == "events")
+        {
+            cursor = None;
+        }
+        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+            if !args.dry_run {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/consumers/{}/ack",
+                        query_component(&args.tenant_id),
+                        query_component(consumer)
+                    ),
+                    json!({
+                        "cursor": cursor,
+                        "snapshot_high_watermark": response
+                            .get("snapshot_high_watermark")
+                            .and_then(Value::as_str),
+                        "lease_owner": args.lease_owner.clone()
+                    }),
+                )
+                .await?;
+            }
+        }
+        if phase == ExportRunPhase::Backfill {
+            let complete = response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        if !args.tail {
+            break;
+        }
+    }
+    Ok(json!({
+        "status": "ok",
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "mode": args.mode,
+        "backfill": args.backfill,
+        "tail": args.tail,
+        "batches": batches,
+        "rows": rows,
+        "last_cursor": cursor,
+        "dry_run": args.dry_run
+    }))
+}
+
+async fn jsonl(api: &Api, command: JsonlCommand) -> Result<Value> {
+    match command {
+        JsonlCommand::Run(args) => jsonl_run(api, args).await,
+    }
+}
+
+async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
+    let mut output = JsonlOutput::new(
+        &args.output,
+        args.tail && args.max_batches.is_none(),
+        args.dry_run,
+    )
+    .await?;
+    let include = if args.include.is_empty() {
+        vec!["events".to_string()]
+    } else {
+        args.include.clone()
+    };
+    let mut cursor = args.from_cursor.clone();
+    if let Some(consumer) = &args.consumer {
+        let claimed = ensure_claimed_export_consumer_for(
+            api,
+            &args.tenant_id,
+            consumer,
+            &args.scope,
+            args.agent_id.as_deref(),
+            args.session_id.as_deref(),
+            &include,
+            &args.lease_owner,
+            args.lease_ms,
+        )
+        .await?;
+        if cursor.is_none() {
+            cursor = claimed
+                .get("last_acked_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let mut batches = 0_u64;
+    let mut rows = 0_u64;
+    let max_batches = args.max_batches.unwrap_or(if args.tail || args.backfill {
+        u64::MAX
+    } else {
+        1
+    });
+    let mut phase = if args.backfill {
+        ExportRunPhase::Backfill
+    } else {
+        ExportRunPhase::Watch
+    };
+    loop {
+        if batches >= max_batches {
+            break;
+        }
+        let response = match phase {
+            ExportRunPhase::Backfill => {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/backfill",
+                        query_component(&args.tenant_id)
+                    ),
+                    json!({
+                        "scope": args.scope.clone(),
+                        "agent_id": args.agent_id.clone(),
+                        "session_id": args.session_id.clone(),
+                        "include": include.clone(),
+                        "from_cursor": cursor.clone(),
+                        "limit": args.limit
+                    }),
+                )
+                .await?
+            }
+            ExportRunPhase::Watch => {
+                api.get(&jsonl_export_watch_path(&args, cursor.as_deref()))
+                    .await?
+            }
+        };
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            if phase == ExportRunPhase::Backfill {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            if args.tail {
+                tokio::time::sleep(std::time::Duration::from_millis(args.poll_interval_ms)).await;
+                continue;
+            }
+            break;
+        }
+        batches = batches.saturating_add(1);
+        rows = rows.saturating_add(items.len() as u64);
+        output.write_items(&items).await?;
+        cursor = response
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+            if !args.dry_run {
+                api.post(
+                    &format!(
+                        "/api/tenants/{}/exports/consumers/{}/ack",
+                        query_component(&args.tenant_id),
+                        query_component(consumer)
+                    ),
+                    json!({
+                        "cursor": cursor,
+                        "snapshot_high_watermark": response
+                            .get("snapshot_high_watermark")
+                            .and_then(Value::as_str),
+                        "lease_owner": args.lease_owner.clone()
+                    }),
+                )
+                .await?;
+            }
+        }
+        if phase == ExportRunPhase::Backfill {
+            let complete = response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if complete {
+                if args.tail {
+                    phase = ExportRunPhase::Watch;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        if !args.tail {
+            break;
+        }
+    }
+    let output = output.finish().await?;
+    Ok(json!({
+        "status": "ok",
+        "tenant_id": args.tenant_id,
+        "consumer": args.consumer,
+        "output": output,
+        "backfill": args.backfill,
+        "tail": args.tail,
+        "batches": batches,
+        "rows": rows,
+        "last_cursor": cursor,
+        "dry_run": args.dry_run
+    }))
+}
+
+async fn parquet(command: ParquetCommand) -> Result<Value> {
+    match command {
+        ParquetCommand::FromJsonl(args) => parquet_from_jsonl(args).await,
+    }
+}
+
+async fn parquet_from_jsonl(args: ParquetFromJsonlArgs) -> Result<Value> {
+    let sql = parquet_from_jsonl_sql(
+        &args.input,
+        &args.output,
+        args.s3_region.as_deref(),
+        &args.compression,
+    )?;
+    if args.dry_run {
+        return Ok(json!({
+            "status": "dry_run",
+            "input": args.input,
+            "output": args.output,
+            "sql": sql
+        }));
+    }
+    let status = ProcessCommand::new(&args.duckdb_bin)
+        .arg("-c")
+        .arg(&sql)
+        .status()
+        .with_context(|| format!("run DuckDB binary `{}`", args.duckdb_bin))?;
+    if !status.success() {
+        return Err(anyhow!("DuckDB parquet conversion failed with {status}"));
+    }
+    Ok(json!({
+        "status": "ok",
+        "input": args.input,
+        "output": args.output,
+        "compression": args.compression
+    }))
+}
+
+fn parquet_from_jsonl_sql(
+    input: &str,
+    output: &str,
+    s3_region: Option<&str>,
+    compression: &str,
+) -> Result<String> {
+    let compression = compression.trim().to_ascii_uppercase();
+    if !matches!(
+        compression.as_str(),
+        "UNCOMPRESSED" | "SNAPPY" | "GZIP" | "ZSTD"
+    ) {
+        return Err(anyhow!(
+            "unsupported parquet compression `{compression}`; use uncompressed, snappy, gzip, or zstd"
+        ));
+    }
+    let mut sql = String::new();
+    if uses_object_store_uri(input) || uses_object_store_uri(output) || s3_region.is_some() {
+        sql.push_str("INSTALL httpfs; LOAD httpfs;\n");
+    }
+    if let Some(region) = s3_region {
+        writeln!(sql, "SET s3_region={};", sql_string(region))?;
+    }
+    writeln!(
+        sql,
+        "COPY (SELECT * FROM read_json_auto({}, format='newline_delimited')) TO {} (FORMAT PARQUET, COMPRESSION {});",
+        sql_string(input),
+        sql_string(output),
+        compression
+    )?;
+    Ok(sql)
+}
+
+fn uses_object_store_uri(value: &str) -> bool {
+    Url::parse(value)
+        .map(|url| url.scheme() != "file")
+        .unwrap_or(false)
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportRunPhase {
+    Backfill,
+    Watch,
+}
+
+fn export_watch_path(args: &ClickHouseRunArgs, cursor: Option<&str>) -> String {
+    let limit = args.limit.to_string();
+    let include = if args.include.is_empty() {
+        "events".to_string()
+    } else {
+        args.include.join(",")
+    };
+    let pairs = [
+        ("scope", Some(args.scope.as_str())),
+        ("agent_id", args.agent_id.as_deref()),
+        ("session_id", args.session_id.as_deref()),
+        ("include", Some(include.as_str())),
+        ("from_cursor", cursor),
+        ("limit", Some(limit.as_str())),
+    ];
+    format!(
+        "/api/tenants/{}/exports/watch{}",
+        query_component(&args.tenant_id),
+        query_pairs_encoded(&pairs)
+    )
+}
+
+fn jsonl_export_watch_path(args: &JsonlRunArgs, cursor: Option<&str>) -> String {
+    let limit = args.limit.to_string();
+    let include = if args.include.is_empty() {
+        "events".to_string()
+    } else {
+        args.include.join(",")
+    };
+    let pairs = [
+        ("scope", Some(args.scope.as_str())),
+        ("agent_id", args.agent_id.as_deref()),
+        ("session_id", args.session_id.as_deref()),
+        ("include", Some(include.as_str())),
+        ("from_cursor", cursor),
+        ("limit", Some(limit.as_str())),
+    ];
+    format!(
+        "/api/tenants/{}/exports/watch{}",
+        query_component(&args.tenant_id),
+        query_pairs_encoded(&pairs)
+    )
+}
+
+enum JsonlOutput {
+    DryRun {
+        target: String,
+        rows: u64,
+    },
+    Stdout {
+        rows: u64,
+    },
+    Local {
+        path: PathBuf,
+        rows: u64,
+    },
+    ObjectStore {
+        uri: String,
+        store: Box<dyn object_store::ObjectStore>,
+        path: object_store::path::Path,
+        body: Vec<u8>,
+        rows: u64,
+    },
+}
+
+impl JsonlOutput {
+    async fn new(target: &str, infinite_tail: bool, dry_run: bool) -> Result<Self> {
+        if dry_run {
+            return Ok(Self::DryRun {
+                target: target.to_string(),
+                rows: 0,
+            });
+        }
+        if target == "-" {
+            return Ok(Self::Stdout { rows: 0 });
+        }
+        if let Ok(url) = Url::parse(target) {
+            if url.scheme() == "file" {
+                let path = url
+                    .to_file_path()
+                    .map_err(|_| anyhow!("file output URI must be an absolute file:// path"))?;
+                return Ok(Self::Local { path, rows: 0 });
+            }
+            if infinite_tail {
+                return Err(anyhow!(
+                    "object-store JSONL output requires --max-batches when --tail is set"
+                ));
+            }
+            let (store, path) = object_store::parse_url(&url)
+                .map_err(|error| anyhow!("parse JSONL object-store output URI: {error}"))?;
+            return Ok(Self::ObjectStore {
+                uri: target.to_string(),
+                store,
+                path,
+                body: Vec::new(),
+                rows: 0,
+            });
+        }
+        Ok(Self::Local {
+            path: PathBuf::from(target),
+            rows: 0,
+        })
+    }
+
+    async fn write_items(&mut self, items: &[Value]) -> Result<()> {
+        let mut batch = Vec::new();
+        for item in items {
+            serde_json::to_writer(&mut batch, item)?;
+            batch.push(b'\n');
+        }
+        match self {
+            Self::DryRun { rows, .. } => {
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::Stdout { rows } => {
+                io::stdout().write_all(&batch)?;
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::Local { path, rows } => {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&*path)
+                    .with_context(|| format!("open JSONL output {}", path.display()))?;
+                file.write_all(&batch)
+                    .with_context(|| format!("write JSONL output {}", path.display()))?;
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+            Self::ObjectStore { body, rows, .. } => {
+                body.extend_from_slice(&batch);
+                *rows = rows.saturating_add(items.len() as u64);
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<Value> {
+        match self {
+            Self::DryRun { target, rows } => Ok(json!({
+                "type": "dry_run",
+                "target": target,
+                "rows": rows
+            })),
+            Self::Stdout { rows } => Ok(json!({
+                "type": "stdout",
+                "rows": rows
+            })),
+            Self::Local { path, rows } => Ok(json!({
+                "type": "local",
+                "path": path,
+                "rows": rows
+            })),
+            Self::ObjectStore {
+                uri,
+                store,
+                path,
+                body,
+                rows,
+            } => {
+                store
+                    .put(&path, body.into())
+                    .await
+                    .map_err(|error| anyhow!("write JSONL object {uri}: {error}"))?;
+                Ok(json!({
+                    "type": "object_store",
+                    "uri": uri,
+                    "path": path.as_ref(),
+                    "rows": rows
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportModes {
+    native: bool,
+    otel: bool,
+}
+
+fn export_modes(raw_modes: &[String]) -> Result<ExportModes> {
+    let mut modes = ExportModes {
+        native: false,
+        otel: false,
+    };
+    let requested = if raw_modes.is_empty() {
+        vec!["native".to_string()]
+    } else {
+        raw_modes.to_vec()
+    };
+    for mode in requested {
+        match mode.trim() {
+            "native" => modes.native = true,
+            "otel" => modes.otel = true,
+            "" => {}
+            other => return Err(anyhow!("unsupported ClickHouse export mode `{other}`")),
+        }
+    }
+    if !modes.native && !modes.otel {
+        return Err(anyhow!("at least one ClickHouse export mode is required"));
+    }
+    Ok(modes)
+}
+
+fn clickhouse_raw_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .map(|item| {
+            Ok(json!({
+                "export_version": item.get("export_version").cloned().unwrap_or(Value::Null),
+                "cursor": item.get("cursor").cloned().unwrap_or(Value::Null),
+                "op": item.get("op").cloned().unwrap_or(Value::Null),
+                "object_type": item.get("object_type").cloned().unwrap_or(Value::Null),
+                "tenant_id": item.get("tenant_id").cloned().unwrap_or(Value::Null),
+                "agent_id": item.get("agent_id").cloned().unwrap_or(Value::Null),
+                "session_id": item.get("session_id").cloned().unwrap_or(Value::Null),
+                "object_id": item.get("object_id").cloned().unwrap_or(Value::Null),
+                "seq": item.get("seq").cloned().unwrap_or(Value::Null),
+                "created_at_ms": item.get("created_at_ms").cloned().unwrap_or(Value::Null),
+                "observed_at_ms": item.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+                "cell_id": item.get("cell_id").cloned().unwrap_or(Value::Null),
+                "placement_scope_id": item.get("placement_scope_id").cloned().unwrap_or(Value::Null),
+                "tablet_id": item.get("tablet_id").cloned().unwrap_or(Value::Null),
+                "tablet_epoch": item.get("tablet_epoch").cloned().unwrap_or(Value::Null),
+                "applied_index": item.get("applied_index").cloned().unwrap_or(Value::Null),
+                "payload_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn clickhouse_event_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let data = item.get("data").unwrap_or(&Value::Null);
+            Ok(json!({
+                "tenant_id": item.get("tenant_id").cloned().unwrap_or(Value::Null),
+                "agent_id": item.get("agent_id").cloned().unwrap_or(Value::Null),
+                "session_id": item.get("session_id").cloned().unwrap_or(Value::Null),
+                "event_id": item.get("event_id").or_else(|| item.get("object_id")).cloned().unwrap_or(Value::Null),
+                "seq": item.get("seq").cloned().unwrap_or(Value::Null),
+                "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                "created_at_ms": item.get("created_at_ms").cloned().unwrap_or(Value::Null),
+                "observed_at_ms": item.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+                "cell_id": item.get("cell_id").cloned().unwrap_or(Value::Null),
+                "placement_scope_id": item.get("placement_scope_id").cloned().unwrap_or(Value::Null),
+                "tablet_id": item.get("tablet_id").cloned().unwrap_or(Value::Null),
+                "tablet_epoch": item.get("tablet_epoch").cloned().unwrap_or(Value::Null),
+                "applied_index": item.get("applied_index").cloned().unwrap_or(Value::Null),
+                "parent_event_id": item.get("parent_event_id").cloned().unwrap_or(Value::Null),
+                "status": item.get("status").cloned().unwrap_or(Value::Null),
+                "model": item.get("model").cloned().unwrap_or(Value::Null),
+                "provider": item.get("provider").cloned().unwrap_or(Value::Null),
+                "finish_reason": item.get("finish_reason").cloned().unwrap_or(Value::Null),
+                "tool_name": item.get("tool_name").cloned().unwrap_or(Value::Null),
+                "tool_call_id": item.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "duration_ms": item.get("duration_ms").cloned().unwrap_or(Value::Null),
+                "timeout_ms": item.get("timeout_ms").cloned().unwrap_or(Value::Null),
+                "input_tokens": item.get("input_tokens").cloned().unwrap_or(Value::Null),
+                "output_tokens": item.get("output_tokens").cloned().unwrap_or(Value::Null),
+                "total_tokens": item.get("total_tokens").cloned().unwrap_or(Value::Null),
+                "cost_micros": item.get("cost_micros").cloned().unwrap_or(Value::Null),
+                "error_kind": item.get("error_kind").cloned().unwrap_or(Value::Null),
+                "error_message": item.get("error_message").cloned().unwrap_or(Value::Null),
+                "retryable": item.get("retryable").cloned().unwrap_or(Value::Null),
+                "exit_code": item.get("exit_code").cloned().unwrap_or(Value::Null),
+                "approval_id": item.get("approval_id").cloned().unwrap_or(Value::Null),
+                "approval_decision": item.get("approval_decision").cloned().unwrap_or(Value::Null),
+                "context_pack_id": item.get("context_pack_id").cloned().unwrap_or(Value::Null),
+                "source_refs_json": item.get("source_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "artifact_refs_json": item.get("artifact_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "tags_json": item.get("tags").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "metadata_json": item.get("metadata").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "payload_json": serde_json::to_string(data.get("payload").unwrap_or(&Value::Null))?,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn clickhouse_otel_log_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let tenant_id = item_string(item, "tenant_id");
+            let session_id = item_string(item, "session_id");
+            let event_id = event_id(item);
+            let trace_id = otel_trace_id(&tenant_id, &session_id);
+            let span_id = otel_span_id("log", &event_id);
+            Ok(json!({
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "timestamp_unix_nano": timestamp_unix_nano(item),
+                "severity_text": otel_severity_text(item),
+                "body": otel_log_body(item)?,
+                "resource_attributes": otel_resource_attributes(item),
+                "log_attributes": otel_event_attributes(item),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn clickhouse_otel_trace_rows(items: &[Value]) -> Result<Vec<Value>> {
+    items
+        .iter()
+        .filter(|item| item.get("object_type").and_then(Value::as_str) == Some("event"))
+        .map(|item| {
+            let tenant_id = item_string(item, "tenant_id");
+            let session_id = item_string(item, "session_id");
+            let event_id = event_id(item);
+            let duration_ms = item.get("duration_ms").and_then(Value::as_u64);
+            let start_time_unix_nano = timestamp_unix_nano(item);
+            let end_time_unix_nano = duration_ms
+                .and_then(|duration| duration.checked_mul(1_000_000))
+                .and_then(|duration_ns| start_time_unix_nano.checked_add(duration_ns))
+                .unwrap_or(start_time_unix_nano);
+            Ok(json!({
+                "trace_id": otel_trace_id(&tenant_id, &session_id),
+                "span_id": otel_span_id("span", &event_id),
+                "parent_span_id": item.get("parent_event_id").and_then(Value::as_str).map(|parent| otel_span_id("span", parent)),
+                "span_name": item.get("kind").and_then(Value::as_str).unwrap_or("agentdb.event"),
+                "span_kind": otel_span_kind(item),
+                "start_time_unix_nano": start_time_unix_nano,
+                "end_time_unix_nano": end_time_unix_nano,
+                "duration_ms": duration_ms,
+                "status_code": otel_status_code(item),
+                "resource_attributes": otel_resource_attributes(item),
+                "span_attributes": otel_event_attributes(item),
+                "links_json": item.get("source_refs").map(serde_json::to_string).transpose()?.unwrap_or_default(),
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "event_id": event_id,
+                "envelope_json": serde_json::to_string(item)?
+            }))
+        })
+        .collect()
+}
+
+fn item_string(item: &Value, field: &str) -> String {
+    item.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn event_id(item: &Value) -> String {
+    item.get("event_id")
+        .or_else(|| item.get("object_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn timestamp_unix_nano(item: &Value) -> u64 {
+    item.get("created_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000)
+}
+
+fn otel_trace_id(tenant_id: &str, session_id: &str) -> String {
+    sha256_hex_128(&format!("agentdb.trace:{tenant_id}:{session_id}"))
+}
+
+fn otel_span_id(kind: &str, id: &str) -> String {
+    sha256_hex_64(&format!("agentdb.{kind}:{id}"))
+}
+
+fn sha256_hex_128(input: &str) -> String {
+    hex_prefix(input, 16)
+}
+
+fn sha256_hex_64(input: &str) -> String {
+    hex_prefix(input, 8)
+}
+
+fn hex_prefix(input: &str, bytes: usize) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(bytes * 2);
+    for byte in digest.iter().take(bytes) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn otel_resource_attributes(item: &Value) -> Value {
+    let mut attrs = serde_json::Map::new();
+    insert_attr(&mut attrs, "service.name", "agentdb");
+    for field in [
+        "tenant_id",
+        "agent_id",
+        "session_id",
+        "cell_id",
+        "placement_scope_id",
+    ] {
+        if let Some(value) = item.get(field).and_then(Value::as_str) {
+            insert_attr(&mut attrs, &format!("agentdb.{field}"), value);
+        }
+    }
+    Value::Object(attrs)
+}
+
+fn otel_event_attributes(item: &Value) -> Value {
+    let mut attrs = serde_json::Map::new();
+    for field in [
+        "cursor",
+        "object_id",
+        "event_id",
+        "kind",
+        "status",
+        "model",
+        "provider",
+        "finish_reason",
+        "tool_name",
+        "tool_call_id",
+        "error_kind",
+        "approval_id",
+        "approval_decision",
+        "context_pack_id",
+    ] {
+        if let Some(value) = item.get(field).and_then(Value::as_str) {
+            insert_attr(&mut attrs, &format!("agentdb.{field}"), value);
+        }
+    }
+    for field in [
+        "seq",
+        "created_at_ms",
+        "observed_at_ms",
+        "tablet_id",
+        "tablet_epoch",
+        "applied_index",
+        "duration_ms",
+        "timeout_ms",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_micros",
+        "exit_code",
+    ] {
+        if let Some(value) = item.get(field) {
+            if value.is_number() || value.is_boolean() {
+                insert_attr(&mut attrs, &format!("agentdb.{field}"), &value.to_string());
+            }
+        }
+    }
+    Value::Object(attrs)
+}
+
+fn insert_attr(attrs: &mut serde_json::Map<String, Value>, key: &str, value: &str) {
+    attrs.insert(key.to_string(), Value::String(value.to_string()));
+}
+
+fn otel_log_body(item: &Value) -> Result<String> {
+    if let Some(value) = item
+        .get("data")
+        .and_then(|data| data.get("payload"))
+        .and_then(Value::as_str)
+    {
+        return Ok(value.to_string());
+    }
+    if let Some(value) = item.get("kind").and_then(Value::as_str) {
+        return Ok(value.to_string());
+    }
+    Ok(serde_json::to_string(
+        item.get("data").unwrap_or(&Value::Null),
+    )?)
+}
+
+fn otel_severity_text(item: &Value) -> &'static str {
+    match item.get("status").and_then(Value::as_str) {
+        Some("error" | "failed" | "failure") => "ERROR",
+        Some("warn" | "warning") => "WARN",
+        _ if item.get("error_kind").is_some() || item.get("error_message").is_some() => "ERROR",
+        _ => "INFO",
+    }
+}
+
+fn otel_status_code(item: &Value) -> &'static str {
+    match item.get("status").and_then(Value::as_str) {
+        Some("error" | "failed" | "failure") => "ERROR",
+        Some("ok" | "success" | "completed") => "OK",
+        _ if item.get("error_kind").is_some() || item.get("error_message").is_some() => "ERROR",
+        _ => "UNSET",
+    }
+}
+
+fn otel_span_kind(item: &Value) -> &'static str {
+    match item.get("kind").and_then(Value::as_str) {
+        Some("model_call" | "tool_call" | "approval_request") => "CLIENT",
+        _ => "INTERNAL",
+    }
+}
+
+async fn clickhouse_insert_json_each_row(url: &str, table: &str, rows: &[Value]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut body = format!("INSERT INTO {table} FORMAT JSONEachRow\n");
+    for row in rows {
+        body.push_str(&serde_json::to_string(row)?);
+        body.push('\n');
+    }
+    clickhouse_query(url, &body).await?;
+    Ok(())
+}
+
+async fn clickhouse_query(url: &str, sql: &str) -> Result<String> {
+    let redacted_url = redact_clickhouse_url(url);
+    let response = Client::new()
+        .post(url)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(sql.to_string())
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "ClickHouse request to {redacted_url} failed: {}",
+                sanitize_clickhouse_error(url, &error.to_string())
+            )
+        })?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("read ClickHouse response failed")?;
+    if !status.is_success() {
+        return Err(anyhow!("ClickHouse returned {status}: {text}"));
+    }
+    Ok(text)
+}
+
+fn sanitize_clickhouse_error(url: &str, message: &str) -> String {
+    message.replace(url, &redact_clickhouse_url(url))
+}
+
+fn redact_clickhouse_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let Some(userinfo_end) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}://***{}",
+        &url[..scheme_end],
+        &after_scheme[userinfo_end..]
+    )
 }
 
 fn install_tablet_checkpoint(
@@ -986,6 +2465,31 @@ fn query_pairs(pairs: &[(&str, Option<String>)]) -> String {
     }
 }
 
+fn query_pairs_encoded(pairs: &[(&str, Option<&str>)]) -> String {
+    let values = pairs
+        .iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name}={}", query_component(value))))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", values.join("&"))
+    }
+}
+
+fn query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => write!(out, "%{byte:02X}").unwrap(),
+        }
+    }
+    out
+}
+
 fn join_url(base: &str, path: &str) -> String {
     if path.starts_with('/') {
         format!("{base}{path}")
@@ -1173,6 +2677,8 @@ fn render_rows(rows: &[Value]) -> String {
 fn columns_for(rows: &[Value]) -> Vec<String> {
     let preferred = [
         "node_id",
+        "tenant_id",
+        "consumer_name",
         "tablet_id",
         "state",
         "status",
@@ -1197,6 +2703,11 @@ fn columns_for(rows: &[Value]) -> Vec<String> {
         "from_raft_node_id",
         "to_raft_node_id",
         "lag",
+        "pending_items",
+        "lag_ms",
+        "lease_active",
+        "high_watermark",
+        "last_acked_cursor",
         "snapshot_index",
         "snapshot_id",
         "target_raft_node_id",
@@ -1352,5 +2863,271 @@ mod tests {
             "?status=pending&limit=10"
         );
         assert_eq!(query_pairs(&[("status", None)]), "");
+    }
+
+    #[test]
+    fn builds_encoded_export_watch_path() {
+        let args = ClickHouseRunArgs {
+            tenant_id: "ten_1".into(),
+            clickhouse_url: "http://clickhouse:8123/agentdb".into(),
+            scope: "session".into(),
+            agent_id: None,
+            session_id: Some("ses_1".into()),
+            consumer: None,
+            lease_owner: "agentdbctl".into(),
+            lease_ms: 30_000,
+            from_cursor: Some("v2:0001:ses_1:0002:cell=cell-a".into()),
+            limit: 500,
+            include: vec![],
+            mode: vec!["native".into()],
+            backfill: false,
+            tail: false,
+            max_batches: None,
+            poll_interval_ms: 1000,
+            dry_run: false,
+        };
+        assert_eq!(
+            export_watch_path(&args, args.from_cursor.as_deref()),
+            "/api/tenants/ten_1/exports/watch?scope=session&session_id=ses_1&include=events&from_cursor=v2%3A0001%3Ases_1%3A0002%3Acell%3Dcell-a&limit=500"
+        );
+    }
+
+    #[test]
+    fn builds_encoded_jsonl_export_watch_path() {
+        let args = JsonlRunArgs {
+            tenant_id: "ten_1".into(),
+            output: "s3://agentdb-exports/ten_1/events.jsonl".into(),
+            scope: "agent".into(),
+            agent_id: Some("agt_1".into()),
+            session_id: None,
+            consumer: None,
+            lease_owner: "agentdbctl-jsonl".into(),
+            lease_ms: 30_000,
+            from_cursor: Some("ledger:ten_1/0001/event/evt_1".into()),
+            limit: 250,
+            include: vec!["events".into(), "sessions".into()],
+            backfill: false,
+            tail: false,
+            max_batches: None,
+            poll_interval_ms: 1000,
+            dry_run: false,
+        };
+        assert_eq!(
+            jsonl_export_watch_path(&args, args.from_cursor.as_deref()),
+            "/api/tenants/ten_1/exports/watch?scope=agent&agent_id=agt_1&include=events%2Csessions&from_cursor=ledger%3Aten_1%2F0001%2Fevent%2Fevt_1&limit=250"
+        );
+    }
+
+    #[test]
+    fn clickhouse_schema_contains_event_and_raw_tables() {
+        let ddl = CLICKHOUSE_SCHEMA_DDL.join("\n");
+        assert!(ddl.contains("agentdb_export_items_raw"));
+        assert!(ddl.contains("agentdb_events"));
+        assert!(ddl.contains("agentdb_otel_logs"));
+        assert!(ddl.contains("agentdb_otel_traces"));
+        assert!(ddl.contains("ReplacingMergeTree(observed_at_ms)"));
+    }
+
+    #[test]
+    fn redacts_clickhouse_url_credentials() {
+        let url = "https://agentdb:secret@clickhouse.example.com:8443/agentdb";
+        assert_eq!(
+            redact_clickhouse_url(url),
+            "https://***@clickhouse.example.com:8443/agentdb"
+        );
+        assert_eq!(
+            sanitize_clickhouse_error(url, &format!("request failed for {url}")),
+            "request failed for https://***@clickhouse.example.com:8443/agentdb"
+        );
+    }
+
+    #[test]
+    fn clickhouse_rows_project_export_envelopes() {
+        let items = vec![json!({
+            "export_version": "2026-05-14",
+            "cursor": "v2:0001:ses_1:0000",
+            "op": "insert",
+            "object_type": "event",
+            "tenant_id": "ten_1",
+            "agent_id": "agt_1",
+            "session_id": "ses_1",
+            "object_id": "evt_1",
+            "event_id": "evt_1",
+            "seq": 0,
+            "kind": "model_call",
+            "created_at_ms": 1000,
+            "observed_at_ms": 1001,
+            "cell_id": "cell-a",
+            "placement_scope_id": "scope-a",
+            "tablet_id": 7,
+            "tablet_epoch": 2,
+            "applied_index": 99,
+            "model": "gpt-test",
+            "provider": "openai",
+            "duration_ms": 123,
+            "total_tokens": 18,
+            "metadata": {"trace": "abc"},
+            "tags": ["golden-path"],
+            "data": {
+                "payload": {
+                    "model": "gpt-test",
+                    "metadata": {"trace": "abc"}
+                }
+            }
+        })];
+
+        let raw = clickhouse_raw_rows(&items).unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0]["cursor"], "v2:0001:ses_1:0000");
+        assert_eq!(raw[0]["object_type"], "event");
+        assert!(raw[0]["payload_json"]
+            .as_str()
+            .unwrap()
+            .contains("\"event_id\":\"evt_1\""));
+
+        let events = clickhouse_event_rows(&items).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["tenant_id"], "ten_1");
+        assert_eq!(events[0]["event_id"], "evt_1");
+        assert_eq!(events[0]["seq"], 0);
+        assert_eq!(events[0]["kind"], "model_call");
+        assert_eq!(events[0]["model"], "gpt-test");
+        assert_eq!(events[0]["duration_ms"], 123);
+        assert_eq!(events[0]["total_tokens"], 18);
+        assert_eq!(events[0]["tablet_id"], 7);
+        assert_eq!(
+            events[0]["metadata_json"].as_str().unwrap(),
+            "{\"trace\":\"abc\"}"
+        );
+        assert!(events[0]["payload_json"]
+            .as_str()
+            .unwrap()
+            .contains("\"model\":\"gpt-test\""));
+
+        let otel_logs = clickhouse_otel_log_rows(&items).unwrap();
+        assert_eq!(otel_logs.len(), 1);
+        assert_eq!(otel_logs[0]["tenant_id"], "ten_1");
+        assert_eq!(otel_logs[0]["session_id"], "ses_1");
+        assert_eq!(otel_logs[0]["event_id"], "evt_1");
+        assert_eq!(otel_logs[0]["timestamp_unix_nano"], 1_000_000_000_u64);
+        assert_eq!(otel_logs[0]["severity_text"], "INFO");
+        assert_eq!(
+            otel_logs[0]["resource_attributes"]["agentdb.tenant_id"],
+            "ten_1"
+        );
+        assert_eq!(otel_logs[0]["log_attributes"]["agentdb.kind"], "model_call");
+
+        let otel_traces = clickhouse_otel_trace_rows(&items).unwrap();
+        assert_eq!(otel_traces.len(), 1);
+        assert_eq!(otel_traces[0]["trace_id"], otel_logs[0]["trace_id"]);
+        assert_eq!(otel_traces[0]["span_name"], "model_call");
+        assert_eq!(otel_traces[0]["span_kind"], "CLIENT");
+        assert_eq!(otel_traces[0]["duration_ms"], 123);
+        assert_eq!(otel_traces[0]["status_code"], "UNSET");
+    }
+
+    #[test]
+    fn parses_clickhouse_export_modes() {
+        let native = export_modes(&["native".into()]).unwrap();
+        assert_eq!(
+            native,
+            ExportModes {
+                native: true,
+                otel: false
+            }
+        );
+        let both = export_modes(&["native".into(), "otel".into()]).unwrap();
+        assert_eq!(
+            both,
+            ExportModes {
+                native: true,
+                otel: true
+            }
+        );
+        assert!(export_modes(&["unknown".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_writes_local_file() {
+        let path = std::env::temp_dir().join(format!(
+            "agentdbctl-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            "writer"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut output = JsonlOutput::new(path.to_str().unwrap(), false, false)
+            .await
+            .unwrap();
+        output
+            .write_items(&[json!({"cursor": "ledger:1", "object_type": "event"})])
+            .await
+            .unwrap();
+        output
+            .write_items(&[json!({"cursor": "ledger:2", "object_type": "session"})])
+            .await
+            .unwrap();
+        let summary = output.finish().await.unwrap();
+        assert_eq!(summary["type"], "local");
+        assert_eq!(summary["rows"], 2);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines = body.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"cursor\":\"ledger:1\""));
+        assert!(lines[1].contains("\"object_type\":\"session\""));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_dry_run_does_not_create_target() {
+        let path = std::env::temp_dir().join(format!(
+            "agentdbctl-jsonl-{}-{}.jsonl",
+            std::process::id(),
+            "dry-run"
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut output = JsonlOutput::new(path.to_str().unwrap(), true, true)
+            .await
+            .unwrap();
+        output
+            .write_items(&[json!({"cursor": "ledger:dry", "object_type": "event"})])
+            .await
+            .unwrap();
+        let summary = output.finish().await.unwrap();
+        assert_eq!(summary["type"], "dry_run");
+        assert_eq!(summary["rows"], 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn jsonl_output_rejects_unbounded_object_store_tail() {
+        let err =
+            match JsonlOutput::new("s3://agentdb-exports/path/events.jsonl", true, false).await {
+                Ok(_) => panic!("expected unbounded object-store tail to be rejected"),
+                Err(err) => err,
+            };
+        assert!(err
+            .to_string()
+            .contains("requires --max-batches when --tail is set"));
+    }
+
+    #[test]
+    fn builds_parquet_from_jsonl_sql() {
+        let sql = parquet_from_jsonl_sql(
+            "s3://agentdb-exports/tenant/events.jsonl",
+            "s3://agentdb-exports/tenant/events.parquet",
+            Some("us-east-1"),
+            "zstd",
+        )
+        .unwrap();
+        assert!(sql.contains("INSTALL httpfs; LOAD httpfs;"));
+        assert!(sql.contains("SET s3_region='us-east-1';"));
+        assert!(sql.contains("read_json_auto('s3://agentdb-exports/tenant/events.jsonl'"));
+        assert!(sql.contains("COMPRESSION ZSTD"));
+
+        let escaped =
+            parquet_from_jsonl_sql("agent's.jsonl", "agent's.parquet", None, "snappy").unwrap();
+        assert!(escaped.contains("'agent''s.jsonl'"));
+        assert!(escaped.contains("'agent''s.parquet'"));
+        assert!(parquet_from_jsonl_sql("in.jsonl", "out.parquet", None, "brotli").is_err());
     }
 }

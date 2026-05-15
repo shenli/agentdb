@@ -32,3 +32,23 @@ tablet_store_domain_write_buffer_size_mib = 16
 tablet_store_domain_max_write_buffers     = 2
 tablet_store_domain_max_background_jobs   = 1
 tablet_store_domain_max_open_files        = 128
+
+# Optional ClickHouse observability export. Leave clickhouse_url and
+# clickhouse_export_tenant_id empty until a tenant exists and ClickHouse is
+# reachable from the EC2 nodes.
+clickhouse_url              = ""
+clickhouse_export_tenant_id = ""
+clickhouse_export_consumer  = "prod-clickhouse"
+clickhouse_export_mode      = "native"
+clickhouse_export_lease_ms  = 30000
+
+# Optional JSONL/S3 observability archive. Leave jsonl_export_uri and
+# jsonl_export_tenant_id empty to skip exporter setup. For S3 outputs, use a
+# bounded max batch count because object-store JSONL output is uploaded as a
+# completed object.
+jsonl_export_tenant_id   = ""
+jsonl_export_uri         = ""
+jsonl_export_consumer    = "prod-jsonl"
+jsonl_export_include     = "events"
+jsonl_export_lease_ms    = 30000
+jsonl_export_max_batches = 1000

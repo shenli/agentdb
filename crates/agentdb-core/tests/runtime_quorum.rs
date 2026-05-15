@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use agentdb_core::runtime::Runtime;
+use agentdb_core::runtime::{
+    AckExportConsumerRequest, AppendRequest, CreateExportConsumerRequest, ExportWatchRequest,
+    Runtime, WatchScope,
+};
 use agentdb_core::tenant::NewTenant;
-use agentdb_core::RUNTIME_PRIMARY_TABLET_ID;
+use agentdb_core::{NewAgent, NewSession, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
     ContentBackend, InMemoryContentBackend, KvStore, RaftAppendEntriesRequest,
     RaftAppendEntriesResponse, RaftLogTransport, RaftQuorumReplicatedLog, RaftRsNodeConfig,
@@ -701,6 +704,193 @@ async fn runtime_tablet_context_routes_writes_and_snapshots_by_tablet() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "tablet-seven-tenant");
+}
+
+#[tokio::test]
+async fn runtime_tablet_snapshot_preserves_export_ledger_high_watermark_and_consumers() {
+    let source_dir = TempDir::new().unwrap();
+    let source_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(source_dir.path()).unwrap());
+    let source_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(source_kv.clone()));
+    let source_runtime = Runtime::with_kv_and_replicated_logs(
+        source_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, source_primary_log),
+            (7, source_tablet_log),
+        ]),
+    );
+
+    let seed_runtime = source_runtime.clone();
+    let (tenant, event_cursor, source_high_watermark) = source_runtime
+        .with_tablet_context(7, async move {
+            let tenant = seed_runtime
+                .create_tenant(NewTenant {
+                    external_key: "export-snapshot-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let agent = seed_runtime
+                .create_agent(NewAgent {
+                    tenant_id: tenant.tenant_id.clone(),
+                    alias: None,
+                    config: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let session = seed_runtime
+                .create_session(NewSession {
+                    tenant_id: tenant.tenant_id.clone(),
+                    agent_id: agent.agent_id.clone(),
+                    alias: None,
+                })
+                .await
+                .unwrap();
+            seed_runtime
+                .append(AppendRequest::simple(
+                    &tenant,
+                    &agent,
+                    &session,
+                    "snapshot-event",
+                    serde_json::json!({"value": 1}),
+                ))
+                .await
+                .unwrap();
+
+            let feed = seed_runtime
+                .export_watch(ExportWatchRequest {
+                    tenant_id: tenant.tenant_id.clone(),
+                    scope: WatchScope::Tenant,
+                    session_id: None,
+                    agent_id: None,
+                    include: vec!["events".into()],
+                    from_cursor: None,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            assert_eq!(feed.len(), 1);
+            assert_eq!(feed[0].item.data["kind"], "snapshot-event");
+
+            seed_runtime
+                .create_export_consumer(CreateExportConsumerRequest {
+                    tenant_id: tenant.tenant_id.clone(),
+                    consumer_name: "clickhouse".into(),
+                    scope: WatchScope::Tenant,
+                    agent_id: None,
+                    session_id: None,
+                    include: vec!["events".into()],
+                })
+                .await
+                .unwrap();
+            seed_runtime
+                .ack_export_consumer(AckExportConsumerRequest {
+                    tenant_id: tenant.tenant_id.clone(),
+                    consumer_name: "clickhouse".into(),
+                    cursor: feed[0].cursor.clone(),
+                    snapshot_high_watermark: Some(feed[0].cursor.clone()),
+                    lease_owner: None,
+                })
+                .await
+                .unwrap();
+            let status = seed_runtime
+                .get_export_consumer_status(&tenant.tenant_id, "clickhouse")
+                .await
+                .unwrap();
+            assert_eq!(status.pending_items, 0);
+            assert_eq!(
+                status.high_watermark.as_deref(),
+                Some(feed[0].cursor.as_str())
+            );
+
+            let high_watermark = seed_runtime
+                .export_high_watermark(&tenant.tenant_id)
+                .await
+                .unwrap()
+                .expect("source export high watermark");
+            (tenant, feed[0].cursor.clone(), high_watermark)
+        })
+        .await;
+    assert_eq!(source_high_watermark, event_cursor);
+
+    let payload = source_runtime.export_tablet_snapshot_payload(7).unwrap();
+
+    let target_dir = TempDir::new().unwrap();
+    let target_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(target_dir.path()).unwrap());
+    let target_primary_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_tablet_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(target_kv.clone()));
+    let target_runtime = Runtime::with_kv_and_replicated_logs(
+        target_kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, target_primary_log),
+            (7, target_tablet_log),
+        ]),
+    );
+    assert!(target_runtime
+        .install_tablet_snapshot_payload_and_rehydrate(7, &payload)
+        .await
+        .unwrap());
+
+    let restored_runtime = target_runtime.clone();
+    target_runtime
+        .with_tablet_context(7, async move {
+            let restored_high_watermark = restored_runtime
+                .export_high_watermark(&tenant.tenant_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                restored_high_watermark.as_deref(),
+                Some(event_cursor.as_str())
+            );
+
+            let restored_feed = restored_runtime
+                .export_watch(ExportWatchRequest {
+                    tenant_id: tenant.tenant_id.clone(),
+                    scope: WatchScope::Tenant,
+                    session_id: None,
+                    agent_id: None,
+                    include: vec!["events".into()],
+                    from_cursor: None,
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            assert_eq!(restored_feed.len(), 1);
+            assert_eq!(restored_feed[0].cursor, event_cursor);
+            assert_eq!(restored_feed[0].item.data["kind"], "snapshot-event");
+
+            let restored_consumer = restored_runtime
+                .get_export_consumer(&tenant.tenant_id, "clickhouse")
+                .await
+                .unwrap();
+            assert_eq!(
+                restored_consumer.last_acked_cursor.as_deref(),
+                Some(event_cursor.as_str())
+            );
+            assert_eq!(
+                restored_consumer.snapshot_high_watermark.as_deref(),
+                Some(event_cursor.as_str())
+            );
+
+            let restored_status = restored_runtime
+                .get_export_consumer_status(&tenant.tenant_id, "clickhouse")
+                .await
+                .unwrap();
+            assert_eq!(restored_status.pending_items, 0);
+            assert_eq!(
+                restored_status.high_watermark.as_deref(),
+                Some(event_cursor.as_str())
+            );
+        })
+        .await;
 }
 
 #[tokio::test]

@@ -147,3 +147,75 @@ variable "tablet_store_domain_max_open_files" {
   description = "Maximum open files per local RocksDB tablet-store domain."
   default     = 128
 }
+
+variable "clickhouse_url" {
+  type        = string
+  description = "Optional ClickHouse HTTP URL for AgentDB observability export. Leave empty to skip exporter setup."
+  default     = ""
+  sensitive   = true
+}
+
+variable "clickhouse_export_tenant_id" {
+  type        = string
+  description = "Tenant id to export to ClickHouse when clickhouse_url is set."
+  default     = ""
+}
+
+variable "clickhouse_export_consumer" {
+  type        = string
+  description = "Managed export consumer name used by ClickHouse exporter workers."
+  default     = "prod-clickhouse"
+}
+
+variable "clickhouse_export_mode" {
+  type        = string
+  description = "Comma-separated ClickHouse export modes: native, otel, or native,otel."
+  default     = "native"
+
+  validation {
+    condition     = contains(["native", "otel", "native,otel"], var.clickhouse_export_mode)
+    error_message = "clickhouse_export_mode must be native, otel, or native,otel."
+  }
+}
+
+variable "clickhouse_export_lease_ms" {
+  type        = number
+  description = "Managed export consumer lease duration for ClickHouse exporter workers."
+  default     = 30000
+}
+
+variable "jsonl_export_tenant_id" {
+  type        = string
+  description = "Tenant id to export to JSONL when jsonl_export_uri is set."
+  default     = ""
+}
+
+variable "jsonl_export_uri" {
+  type        = string
+  description = "Optional JSONL export output path or object-store URI such as s3://bucket/prefix/events.jsonl. Leave empty to skip JSONL exporter setup."
+  default     = ""
+}
+
+variable "jsonl_export_consumer" {
+  type        = string
+  description = "Managed export consumer name used by JSONL exporter workers."
+  default     = "prod-jsonl"
+}
+
+variable "jsonl_export_include" {
+  type        = string
+  description = "Comma-separated JSONL export include list."
+  default     = "events"
+}
+
+variable "jsonl_export_lease_ms" {
+  type        = number
+  description = "Managed export consumer lease duration for JSONL exporter workers."
+  default     = 30000
+}
+
+variable "jsonl_export_max_batches" {
+  type        = number
+  description = "Maximum JSONL export batches for bounded object-store archive runs."
+  default     = 1000
+}

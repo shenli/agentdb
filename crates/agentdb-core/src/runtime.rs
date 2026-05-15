@@ -501,7 +501,8 @@ pub struct ContextResponse {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WatchScope {
     Session,
     Tenant,
@@ -514,6 +515,17 @@ pub struct WatchRequest {
     pub scope: WatchScope,
     pub session_id: Option<Id>,
     pub agent_id: Option<Id>,
+    pub from_cursor: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportWatchRequest {
+    pub tenant_id: Id,
+    pub scope: WatchScope,
+    pub session_id: Option<Id>,
+    pub agent_id: Option<Id>,
+    pub include: Vec<String>,
     pub from_cursor: Option<String>,
     pub limit: usize,
 }
@@ -532,6 +544,111 @@ pub struct ChangefeedItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_index: Option<u64>,
     pub event: EventEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportLedgerItem {
+    pub op: String,
+    pub object_type: String,
+    pub tenant_id: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Id>,
+    pub object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    pub created_at_ms: u64,
+    pub data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportFeedItem {
+    pub cursor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tablet_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_index: Option<u64>,
+    pub item: ExportLedgerItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportConsumer {
+    pub tenant_id: Id,
+    pub consumer_name: String,
+    pub scope: WatchScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Id>,
+    pub include: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_acked_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_high_watermark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_ms: Option<u64>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportConsumerStatus {
+    #[serde(flatten)]
+    pub consumer: ExportConsumer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_watermark: Option<String>,
+    pub pending_items: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_oldest_created_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag_ms: Option<u64>,
+    pub lease_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateExportConsumerRequest {
+    pub tenant_id: Id,
+    pub consumer_name: String,
+    pub scope: WatchScope,
+    pub agent_id: Option<Id>,
+    pub session_id: Option<Id>,
+    pub include: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimExportConsumerRequest {
+    pub tenant_id: Id,
+    pub consumer_name: String,
+    pub lease_owner: String,
+    pub lease_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AckExportConsumerRequest {
+    pub tenant_id: Id,
+    pub consumer_name: String,
+    pub cursor: String,
+    pub snapshot_high_watermark: Option<String>,
+    pub lease_owner: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindExportConsumerRequest {
+    pub tenant_id: Id,
+    pub consumer_name: String,
+    pub cursor: Option<String>,
+    pub lease_owner: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -669,6 +786,8 @@ struct State {
     skill_uniques: BTreeMap<String, String>,
     /// Agent skill bindings keyed by `(agent_id, skill_id)`.
     agent_skill_bindings: BTreeMap<(String, String), AgentSkillBinding>,
+    /// Managed export consumers keyed by `(tenant_id, consumer_name)`.
+    export_consumers: BTreeMap<(String, String), ExportConsumer>,
     /// V2.2 searchable records, keyed by `record_id` string. Hydrated at
     /// startup from `Persist::scan_all_records`; updated on every
     /// `write_record` / `delete_record`.
@@ -1491,6 +1610,18 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
             );
         }
     }
+    for consumer in persist
+        .scan_all_export_consumers()
+        .expect("hydrate export consumers")
+    {
+        state.export_consumers.insert(
+            (
+                consumer.tenant_id.as_str().to_string(),
+                consumer.consumer_name.clone(),
+            ),
+            consumer,
+        );
+    }
 
     let idempotency_records = persist
         .scan_all_idempotency()
@@ -1916,6 +2047,58 @@ impl Runtime {
             Arc::new(IdentityContentCryptoAdapter),
             Arc::new(IdentityMetadataCryptoAdapter),
         )
+    }
+
+    pub fn durable_export_ledger_enabled(&self) -> bool {
+        self.persist.is_some()
+    }
+
+    pub async fn export_high_watermark(&self, tenant_id: &Id) -> Result<Option<String>> {
+        if let Some(persist) = &self.persist {
+            {
+                let s = self.state.lock().await;
+                validate_tenant_live_in_state(&s, tenant_id)?;
+            }
+            return persist
+                .export_ledger_high_watermark(tenant_id.as_str())
+                .map_err(internal);
+        }
+
+        let items = self
+            .watch(WatchRequest {
+                tenant_id: tenant_id.clone(),
+                scope: WatchScope::Tenant,
+                session_id: None,
+                agent_id: None,
+                from_cursor: None,
+                limit: usize::MAX,
+            })
+            .await?;
+        Ok(items.last().map(|item| item.cursor.clone()))
+    }
+
+    pub async fn export_oldest_available_cursor(&self, tenant_id: &Id) -> Result<Option<String>> {
+        if let Some(persist) = &self.persist {
+            {
+                let s = self.state.lock().await;
+                validate_tenant_live_in_state(&s, tenant_id)?;
+            }
+            return persist
+                .export_ledger_oldest_cursor(tenant_id.as_str())
+                .map_err(internal);
+        }
+
+        let items = self
+            .watch(WatchRequest {
+                tenant_id: tenant_id.clone(),
+                scope: WatchScope::Tenant,
+                session_id: None,
+                agent_id: None,
+                from_cursor: None,
+                limit: 1,
+            })
+            .await?;
+        Ok(items.first().map(|item| item.cursor.clone()))
     }
 
     pub fn with_kv_kms_and_content_crypto(
@@ -3703,6 +3886,36 @@ impl Runtime {
             .collect())
     }
 
+    pub async fn list_skill_bindings(&self, tenant_id: &Id) -> Result<Vec<AgentSkillBinding>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut bindings = s
+            .agent_skill_bindings
+            .values()
+            .filter(|binding| {
+                binding.deleted_at_ms.is_none() && binding.tenant_id.as_str() == tenant_id.as_str()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        bindings.sort_by(|a, b| {
+            a.agent_id
+                .as_str()
+                .cmp(b.agent_id.as_str())
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.version.cmp(&b.version))
+        });
+        Ok(bindings)
+    }
+
     pub async fn resolve_policy_for_tenant(&self, tenant_id: &Id) -> Result<RuntimePolicy> {
         let s = self.state.lock().await;
         let tenant = s
@@ -4559,14 +4772,30 @@ impl Runtime {
                     let Some(session) = s.sessions.get(&session_id).cloned() else {
                         continue;
                     };
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(session.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms = first_deletion_ms(
+                        now_ms,
+                        &[
+                            session.deleted_at_ms,
+                            agent.deleted_at_ms,
+                            tenant_deleted_at,
+                        ],
+                    );
+                    let reason = gc_tombstone_reason(session.deleted_at_ms, tenant_deleted_at);
                     if let Some(p) = &self.persist {
                         report.events_purged += p
-                            .delete_session_events(
+                            .purge_session_events(
                                 session.tenant_id.as_str(),
                                 session.session_id.as_str(),
+                                reason,
+                                deleted_at_ms,
                             )
                             .map_err(internal)?;
-                        p.delete_session(&session).map_err(internal)?;
+                        p.purge_session(&session, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     } else {
                         let lo = (session.session_id.as_str().to_string(), 0);
                         let hi = (session.session_id.as_str().to_string(), u64::MAX);
@@ -4593,7 +4822,15 @@ impl Runtime {
                     report.work_units += 1;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_agent(&agent).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(agent.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[agent.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(agent.deleted_at_ms, tenant_deleted_at);
+                    p.purge_agent(&agent, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 let binding_keys: Vec<(String, String)> = s
                     .agent_skill_bindings
@@ -4609,7 +4846,21 @@ impl Runtime {
                         continue;
                     };
                     if let Some(p) = &self.persist {
-                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                        let tenant_deleted_at = s
+                            .tenants
+                            .get(binding.tenant_id.as_str())
+                            .and_then(|tenant| tenant.deleted_at_ms);
+                        let deleted_at_ms = first_deletion_ms(
+                            now_ms,
+                            &[
+                                binding.deleted_at_ms,
+                                agent.deleted_at_ms,
+                                tenant_deleted_at,
+                            ],
+                        );
+                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
+                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     }
                     s.agent_skill_bindings.remove(&key);
                     report.skill_bindings_purged += 1;
@@ -4659,18 +4910,34 @@ impl Runtime {
                 let Some(session) = s.sessions.get(&session_id).cloned() else {
                     continue;
                 };
+                let tenant_deleted_at = s
+                    .tenants
+                    .get(session.tenant_id.as_str())
+                    .and_then(|tenant| tenant.deleted_at_ms);
+                let agent_deleted_at = s
+                    .agents
+                    .get(session.agent_id.as_str())
+                    .and_then(|agent| agent.deleted_at_ms);
+                let deleted_at_ms = first_deletion_ms(
+                    now_ms,
+                    &[session.deleted_at_ms, agent_deleted_at, tenant_deleted_at],
+                );
+                let reason = gc_tombstone_reason(session.deleted_at_ms, tenant_deleted_at);
                 let policy = policy_for_tenant_in_state(&s, &session.tenant_id);
                 if !gc_work_allowed(&mut report, &policy) {
                     break;
                 }
                 if let Some(p) = &self.persist {
                     report.events_purged += p
-                        .delete_session_events(
+                        .purge_session_events(
                             session.tenant_id.as_str(),
                             session.session_id.as_str(),
+                            reason,
+                            deleted_at_ms,
                         )
                         .map_err(internal)?;
-                    p.delete_session(&session).map_err(internal)?;
+                    p.purge_session(&session, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 } else {
                     let lo = (session.session_id.as_str().to_string(), 0);
                     let hi = (session.session_id.as_str().to_string(), u64::MAX);
@@ -4743,13 +5010,35 @@ impl Runtime {
                         continue;
                     };
                     if let Some(p) = &self.persist {
-                        p.delete_agent_skill_binding(&binding).map_err(internal)?;
+                        let tenant_deleted_at = s
+                            .tenants
+                            .get(binding.tenant_id.as_str())
+                            .and_then(|tenant| tenant.deleted_at_ms);
+                        let deleted_at_ms = first_deletion_ms(
+                            now_ms,
+                            &[
+                                binding.deleted_at_ms,
+                                skill.deleted_at_ms,
+                                tenant_deleted_at,
+                            ],
+                        );
+                        let reason = gc_tombstone_reason(binding.deleted_at_ms, tenant_deleted_at);
+                        p.purge_agent_skill_binding(&binding, reason, deleted_at_ms)
+                            .map_err(internal)?;
                     }
                     s.agent_skill_bindings.remove(&key);
                     report.skill_bindings_purged += 1;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_skill(&skill).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(skill.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[skill.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(skill.deleted_at_ms, tenant_deleted_at);
+                    p.purge_skill(&skill, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.skill_uniques.remove(&skill_unique_state_key(
                     skill.tenant_id.as_str(),
@@ -4795,7 +5084,15 @@ impl Runtime {
                     break;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_record(&record).map_err(internal)?;
+                    let tenant_deleted_at = s
+                        .tenants
+                        .get(record.tenant_id.as_str())
+                        .and_then(|tenant| tenant.deleted_at_ms);
+                    let deleted_at_ms =
+                        first_deletion_ms(now_ms, &[record.deleted_at_ms, tenant_deleted_at]);
+                    let reason = gc_tombstone_reason(record.deleted_at_ms, tenant_deleted_at);
+                    p.purge_record(&record, reason, deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.records.remove(&record_id);
                 if let Some(doc) = s.record_to_doc.remove(&record_id) {
@@ -4860,7 +5157,15 @@ impl Runtime {
                 continue;
             }
             if let Some(p) = &self.persist {
-                p.delete_artifact(&current).map_err(internal)?;
+                let tenant_deleted_at = s
+                    .tenants
+                    .get(current.tenant_id.as_str())
+                    .and_then(|tenant| tenant.deleted_at_ms);
+                let deleted_at_ms =
+                    first_deletion_ms(now_ms, &[current.deleted_at_ms, tenant_deleted_at]);
+                let reason = gc_tombstone_reason(current.deleted_at_ms, tenant_deleted_at);
+                p.purge_artifact(&current, reason, deleted_at_ms)
+                    .map_err(internal)?;
             }
             s.artifacts.remove(artifact.artifact_id.as_str());
             report.artifacts_purged += 1;
@@ -4918,7 +5223,9 @@ impl Runtime {
                     continue;
                 }
                 if let Some(p) = &self.persist {
-                    p.delete_tenant(&tenant).map_err(internal)?;
+                    let deleted_at_ms = tenant.deleted_at_ms.unwrap_or(now_ms);
+                    p.purge_tenant(&tenant, "tenant_purge", deleted_at_ms)
+                        .map_err(internal)?;
                 }
                 s.tenants.remove(&tenant_id);
                 if !tenant.external_key.is_empty() {
@@ -6140,13 +6447,10 @@ impl Runtime {
 
         let mut out = Vec::new();
         let cursor_context = self.changefeed_cursor_context()?;
+        let from_cursor_key = req.from_cursor.as_deref().map(event_cursor_order_key);
         for event in events {
             let cursor = event_cursor(&event, &cursor_context);
-            if req
-                .from_cursor
-                .as_ref()
-                .is_some_and(|from| cursor.as_str() <= from.as_str())
-            {
+            if from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
                 continue;
             }
             out.push(ChangefeedItem {
@@ -6163,6 +6467,465 @@ impl Runtime {
             }
         }
         Ok(out)
+    }
+
+    pub async fn export_watch(&self, req: ExportWatchRequest) -> Result<Vec<ExportFeedItem>> {
+        validate_export_include(&req.include)?;
+        if let Some(persist) = &self.persist {
+            let scope_validation = {
+                let s = self.state.lock().await;
+                validate_export_consumer_scope_in_state(
+                    &s,
+                    &req.tenant_id,
+                    req.scope,
+                    req.agent_id.as_ref(),
+                    req.session_id.as_ref(),
+                )
+            };
+            if let Err(error) = scope_validation {
+                let has_retained_ledger = persist
+                    .export_ledger_high_watermark(req.tenant_id.as_str())
+                    .map_err(internal)?
+                    .is_some();
+                if !has_retained_ledger || !export_scope_has_required_ids(&req) {
+                    return Err(error);
+                }
+            }
+            self.validate_persistent_export_cursor(&req).await?;
+            let mut out = Vec::new();
+            let cursor_context = self.changefeed_cursor_context()?;
+            let ledger_items = match req.scope {
+                WatchScope::Tenant => persist.scan_export_ledger_items(
+                    req.tenant_id.as_str(),
+                    req.from_cursor.as_deref(),
+                    usize::MAX,
+                ),
+                WatchScope::Agent => persist.scan_export_ledger_agent_items(
+                    req.tenant_id.as_str(),
+                    req.agent_id
+                        .as_ref()
+                        .expect("validated export agent scope has agent_id")
+                        .as_str(),
+                    req.from_cursor.as_deref(),
+                    usize::MAX,
+                ),
+                WatchScope::Session => persist.scan_export_ledger_session_items(
+                    req.tenant_id.as_str(),
+                    req.session_id
+                        .as_ref()
+                        .expect("validated export session scope has session_id")
+                        .as_str(),
+                    req.from_cursor.as_deref(),
+                    usize::MAX,
+                ),
+            }
+            .map_err(internal)?;
+            for (cursor, item) in ledger_items {
+                if !export_item_matches_scope(
+                    &item,
+                    req.scope,
+                    req.agent_id.as_ref(),
+                    req.session_id.as_ref(),
+                ) || !export_item_matches_include(&item, &req.include)
+                {
+                    continue;
+                }
+                out.push(ExportFeedItem {
+                    cursor,
+                    cell_id: cursor_context.cell_id.clone(),
+                    placement_scope_id: cursor_context.placement_scope_id.clone(),
+                    tablet_id: cursor_context.tablet_id,
+                    tablet_epoch: cursor_context.tablet_epoch,
+                    applied_index: cursor_context.applied_index,
+                    item,
+                });
+                if out.len() >= req.limit {
+                    break;
+                }
+            }
+            return Ok(out);
+        }
+
+        {
+            let s = self.state.lock().await;
+            validate_export_consumer_scope_in_state(
+                &s,
+                &req.tenant_id,
+                req.scope,
+                req.agent_id.as_ref(),
+                req.session_id.as_ref(),
+            )?;
+        }
+        let events = self
+            .watch(WatchRequest {
+                tenant_id: req.tenant_id,
+                scope: req.scope,
+                session_id: req.session_id,
+                agent_id: req.agent_id,
+                from_cursor: req.from_cursor,
+                limit: req.limit,
+            })
+            .await?;
+        Ok(events
+            .into_iter()
+            .filter_map(|item| {
+                let ledger_item = export_ledger_item_from_event(item.event);
+                export_item_matches_include(&ledger_item, &req.include).then_some(ExportFeedItem {
+                    cursor: item.cursor,
+                    cell_id: item.cell_id,
+                    placement_scope_id: item.placement_scope_id,
+                    tablet_id: item.tablet_id,
+                    tablet_epoch: item.tablet_epoch,
+                    applied_index: item.applied_index,
+                    item: ledger_item,
+                })
+            })
+            .collect())
+    }
+
+    async fn validate_persistent_export_cursor(&self, req: &ExportWatchRequest) -> Result<()> {
+        let Some(cursor) = req.from_cursor.as_deref() else {
+            return Ok(());
+        };
+        let Some(parts) = parse_export_ledger_cursor_for_runtime(cursor) else {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "persistent export cursor must use the ledger: format",
+            ));
+        };
+        if parts.tenant_id != req.tenant_id.as_str() {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor belongs to a different tenant",
+            ));
+        }
+        if req.scope == WatchScope::Session
+            && req.session_id.as_ref().is_some_and(|session_id| {
+                parts
+                    .session_id
+                    .is_some_and(|cursor_session_id| cursor_session_id != session_id.as_str())
+            })
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor belongs to a different session",
+            ));
+        }
+        if let Some(oldest) = self.export_oldest_available_cursor(&req.tenant_id).await? {
+            if cursor < oldest.as_str() {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    format!(
+                        "export cursor is older than the retained export ledger; oldest_available_cursor={oldest}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn create_export_consumer(
+        &self,
+        req: CreateExportConsumerRequest,
+    ) -> Result<ExportConsumer> {
+        validate_consumer_name(&req.consumer_name)?;
+        validate_export_include(&req.include)?;
+        let now_ms = crate::now_ms();
+        let consumer = {
+            let s = self.state.lock().await;
+            validate_export_consumer_scope_in_state(
+                &s,
+                &req.tenant_id,
+                req.scope,
+                req.agent_id.as_ref(),
+                req.session_id.as_ref(),
+            )?;
+            let existing = s.export_consumers.get(&(
+                req.tenant_id.as_str().to_string(),
+                req.consumer_name.clone(),
+            ));
+            ExportConsumer {
+                tenant_id: req.tenant_id.clone(),
+                consumer_name: req.consumer_name.clone(),
+                scope: req.scope,
+                agent_id: req.agent_id.clone(),
+                session_id: req.session_id.clone(),
+                include: if req.include.is_empty() {
+                    vec!["events".into()]
+                } else {
+                    req.include.clone()
+                },
+                last_acked_cursor: existing.and_then(|consumer| consumer.last_acked_cursor.clone()),
+                snapshot_high_watermark: existing
+                    .and_then(|consumer| consumer.snapshot_high_watermark.clone()),
+                lease_owner: existing.and_then(|consumer| consumer.lease_owner.clone()),
+                lease_expires_at_ms: existing.and_then(|consumer| consumer.lease_expires_at_ms),
+                created_at_ms: existing.map_or(now_ms, |consumer| consumer.created_at_ms),
+                updated_at_ms: now_ms,
+            }
+        };
+        if let Some(persist) = &self.persist {
+            persist
+                .put_export_consumer_async(&consumer)
+                .await
+                .map_err(internal)?;
+        }
+        let mut s = self.state.lock().await;
+        s.export_consumers.insert(
+            (
+                consumer.tenant_id.as_str().to_string(),
+                consumer.consumer_name.clone(),
+            ),
+            consumer.clone(),
+        );
+        Ok(consumer)
+    }
+
+    pub async fn get_export_consumer(
+        &self,
+        tenant_id: &Id,
+        consumer_name: &str,
+    ) -> Result<ExportConsumer> {
+        validate_consumer_name(consumer_name)?;
+        let s = self.state.lock().await;
+        validate_tenant_live_in_state(&s, tenant_id)?;
+        s.export_consumers
+            .get(&(tenant_id.as_str().to_string(), consumer_name.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::PolicyNotFound,
+                    format!("export consumer {consumer_name} not found"),
+                )
+            })
+    }
+
+    pub async fn get_export_consumer_status(
+        &self,
+        tenant_id: &Id,
+        consumer_name: &str,
+    ) -> Result<ExportConsumerStatus> {
+        let consumer = self.get_export_consumer(tenant_id, consumer_name).await?;
+        self.export_consumer_status(consumer).await
+    }
+
+    pub async fn list_export_consumers(&self) -> Vec<ExportConsumer> {
+        let s = self.state.lock().await;
+        s.export_consumers.values().cloned().collect()
+    }
+
+    pub async fn list_export_consumer_statuses(&self) -> Result<Vec<ExportConsumerStatus>> {
+        let consumers = self.list_export_consumers().await;
+        let mut statuses = Vec::with_capacity(consumers.len());
+        for consumer in consumers {
+            statuses.push(self.export_consumer_status(consumer).await?);
+        }
+        Ok(statuses)
+    }
+
+    async fn export_consumer_status(
+        &self,
+        consumer: ExportConsumer,
+    ) -> Result<ExportConsumerStatus> {
+        let now_ms = crate::now_ms();
+        let items = self
+            .export_watch(ExportWatchRequest {
+                tenant_id: consumer.tenant_id.clone(),
+                scope: consumer.scope,
+                session_id: consumer.session_id.clone(),
+                agent_id: consumer.agent_id.clone(),
+                include: consumer.include.clone(),
+                from_cursor: consumer.last_acked_cursor.clone(),
+                limit: usize::MAX,
+            })
+            .await?;
+        let high_watermark = items.last().map(|item| item.cursor.clone()).or_else(|| {
+            consumer
+                .last_acked_cursor
+                .clone()
+                .or_else(|| consumer.snapshot_high_watermark.clone())
+        });
+        let pending_oldest_created_at_ms = items.first().map(|item| item.item.created_at_ms);
+        let lag_ms = pending_oldest_created_at_ms.map(|created| now_ms.saturating_sub(created));
+        let lease_active = consumer
+            .lease_expires_at_ms
+            .is_some_and(|expires_at| expires_at > now_ms);
+        Ok(ExportConsumerStatus {
+            consumer,
+            high_watermark,
+            pending_items: items.len(),
+            pending_oldest_created_at_ms,
+            lag_ms,
+            lease_active,
+        })
+    }
+
+    pub async fn claim_export_consumer(
+        &self,
+        req: ClaimExportConsumerRequest,
+    ) -> Result<ExportConsumer> {
+        validate_consumer_name(&req.consumer_name)?;
+        if req.lease_owner.trim().is_empty() {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "export consumer lease_owner is required",
+            ));
+        }
+        if req.lease_ms == 0 {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "export consumer lease_ms must be greater than zero",
+            ));
+        }
+        let now_ms = crate::now_ms();
+        let mut consumer = {
+            let s = self.state.lock().await;
+            validate_tenant_live_in_state(&s, &req.tenant_id)?;
+            let consumer = s
+                .export_consumers
+                .get(&(
+                    req.tenant_id.as_str().to_string(),
+                    req.consumer_name.clone(),
+                ))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::PolicyNotFound,
+                        format!("export consumer {} not found", req.consumer_name),
+                    )
+                })?;
+            if consumer
+                .lease_expires_at_ms
+                .is_some_and(|expires| expires > now_ms)
+                && consumer.lease_owner.as_deref() != Some(req.lease_owner.as_str())
+            {
+                return Err(Error::new(
+                    ErrorCode::PolicyDenied,
+                    format!(
+                        "export consumer {} is leased by {} until {}",
+                        req.consumer_name,
+                        consumer.lease_owner.as_deref().unwrap_or("unknown"),
+                        consumer.lease_expires_at_ms.unwrap_or_default()
+                    ),
+                ));
+            }
+            consumer
+        };
+        consumer.lease_owner = Some(req.lease_owner);
+        consumer.lease_expires_at_ms = Some(now_ms.saturating_add(req.lease_ms));
+        consumer.updated_at_ms = now_ms;
+        self.persist_export_consumer_and_update_state(consumer)
+            .await
+    }
+
+    pub async fn ack_export_consumer(
+        &self,
+        req: AckExportConsumerRequest,
+    ) -> Result<ExportConsumer> {
+        validate_consumer_name(&req.consumer_name)?;
+        if req.cursor.trim().is_empty() {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export consumer ack cursor is required",
+            ));
+        }
+        let mut consumer = self
+            .load_export_consumer_for_update(
+                &req.tenant_id,
+                &req.consumer_name,
+                req.lease_owner.as_deref(),
+            )
+            .await?;
+        if let Some(previous) = &consumer.last_acked_cursor {
+            if event_cursor_order_key(&req.cursor) < event_cursor_order_key(previous) {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    "export consumer ack cursor is behind the last acked cursor; use rewind to move backward",
+                ));
+            }
+        }
+        consumer.last_acked_cursor = Some(req.cursor);
+        if let Some(high_watermark) = req.snapshot_high_watermark {
+            consumer.snapshot_high_watermark = Some(high_watermark);
+        }
+        consumer.updated_at_ms = crate::now_ms();
+        self.persist_export_consumer_and_update_state(consumer)
+            .await
+    }
+
+    pub async fn rewind_export_consumer(
+        &self,
+        req: RewindExportConsumerRequest,
+    ) -> Result<ExportConsumer> {
+        validate_consumer_name(&req.consumer_name)?;
+        let mut consumer = self
+            .load_export_consumer_for_update(
+                &req.tenant_id,
+                &req.consumer_name,
+                req.lease_owner.as_deref(),
+            )
+            .await?;
+        consumer.last_acked_cursor = req.cursor;
+        consumer.updated_at_ms = crate::now_ms();
+        self.persist_export_consumer_and_update_state(consumer)
+            .await
+    }
+
+    async fn load_export_consumer_for_update(
+        &self,
+        tenant_id: &Id,
+        consumer_name: &str,
+        lease_owner: Option<&str>,
+    ) -> Result<ExportConsumer> {
+        let now_ms = crate::now_ms();
+        let s = self.state.lock().await;
+        validate_tenant_live_in_state(&s, tenant_id)?;
+        let consumer = s
+            .export_consumers
+            .get(&(tenant_id.as_str().to_string(), consumer_name.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::PolicyNotFound,
+                    format!("export consumer {consumer_name} not found"),
+                )
+            })?;
+        if consumer
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires > now_ms)
+            && consumer.lease_owner.as_deref() != lease_owner
+        {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "export consumer {consumer_name} is leased by {} until {}",
+                    consumer.lease_owner.as_deref().unwrap_or("unknown"),
+                    consumer.lease_expires_at_ms.unwrap_or_default()
+                ),
+            ));
+        }
+        Ok(consumer)
+    }
+
+    async fn persist_export_consumer_and_update_state(
+        &self,
+        consumer: ExportConsumer,
+    ) -> Result<ExportConsumer> {
+        if let Some(persist) = &self.persist {
+            persist
+                .put_export_consumer_async(&consumer)
+                .await
+                .map_err(internal)?;
+        }
+        let mut s = self.state.lock().await;
+        s.export_consumers.insert(
+            (
+                consumer.tenant_id.as_str().to_string(),
+                consumer.consumer_name.clone(),
+            ),
+            consumer.clone(),
+        );
+        Ok(consumer)
     }
 
     /// Resolve an `event_id` to its `(session_id, seq)` location.
@@ -6670,6 +7433,36 @@ impl Runtime {
             .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", record_id)))
     }
 
+    pub async fn list_records(&self, tenant_id: &Id) -> Result<Vec<SearchableRecord>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut records = s
+            .records
+            .values()
+            .filter(|record| {
+                record.tenant_id.as_str() == tenant_id.as_str()
+                    && record.deleted_at_ms.is_none()
+                    && !record.is_expired()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.record_id.as_str().cmp(b.record_id.as_str()))
+        });
+        Ok(records)
+    }
+
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn simulate_record_index_lag_for_test(&self, record_id: &Id, watermark: u64) {
@@ -7072,6 +7865,26 @@ fn usage_percent(usage: u64, soft_limit: u64) -> Option<u64> {
     Some(usage.saturating_mul(100).saturating_div(soft_limit))
 }
 
+fn first_deletion_ms(now_ms: u64, candidates: &[Option<u64>]) -> u64 {
+    candidates
+        .iter()
+        .copied()
+        .flatten()
+        .next()
+        .unwrap_or(now_ms)
+}
+
+fn gc_tombstone_reason(
+    object_deleted_at: Option<u64>,
+    tenant_deleted_at: Option<u64>,
+) -> &'static str {
+    if object_deleted_at.is_none() && tenant_deleted_at.is_some() {
+        "tenant_purge"
+    } else {
+        "retention_gc"
+    }
+}
+
 fn resolve_policy_for_agent_in_state(
     s: &State,
     tenant_id: &Id,
@@ -7458,6 +8271,210 @@ fn event_cursor(event: &EventEnvelope, context: &ChangefeedCursorContext) -> Str
         epoch,
         applied
     )
+}
+
+fn event_cursor_order_key(cursor: &str) -> &str {
+    cursor
+        .split_once(":cell=")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(cursor)
+}
+
+fn validate_consumer_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.contains('/') {
+        return Err(Error::new(
+            ErrorCode::PolicyDenied,
+            "export consumer name must be non-empty and must not contain '/'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_export_include(include: &[String]) -> Result<()> {
+    for item in include {
+        if !matches!(
+            item.as_str(),
+            "events"
+                | "event"
+                | "tenants"
+                | "tenant"
+                | "agents"
+                | "agent"
+                | "sessions"
+                | "session"
+                | "artifacts"
+                | "artifact"
+                | "records"
+                | "record"
+                | "skills"
+                | "skill"
+                | "skill_bindings"
+                | "skill_binding"
+        ) {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                format!("unsupported export include: {item}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tenant_live_in_state(state: &State, tenant_id: &Id) -> Result<()> {
+    let live = state
+        .tenants
+        .get(tenant_id.as_str())
+        .is_some_and(|tenant| tenant.deleted_at_ms.is_none());
+    if live {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCode::TenantNotFound,
+            format!("{tenant_id}"),
+        ))
+    }
+}
+
+fn validate_export_consumer_scope_in_state(
+    state: &State,
+    tenant_id: &Id,
+    scope: WatchScope,
+    agent_id: Option<&Id>,
+    session_id: Option<&Id>,
+) -> Result<()> {
+    validate_tenant_live_in_state(state, tenant_id)?;
+    match scope {
+        WatchScope::Tenant => Ok(()),
+        WatchScope::Agent => {
+            let Some(agent_id) = agent_id else {
+                return Err(Error::new(
+                    ErrorCode::AgentNotFound,
+                    "export consumer agent scope requires agent_id",
+                ));
+            };
+            let live = state.agents.get(agent_id.as_str()).is_some_and(|agent| {
+                agent.deleted_at_ms.is_none() && agent.tenant_id.as_str() == tenant_id.as_str()
+            });
+            if live {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorCode::AgentNotFound, format!("{agent_id}")))
+            }
+        }
+        WatchScope::Session => {
+            let Some(session_id) = session_id else {
+                return Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    "export consumer session scope requires session_id",
+                ));
+            };
+            let live = state
+                .sessions
+                .get(session_id.as_str())
+                .is_some_and(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session.tenant_id.as_str() == tenant_id.as_str()
+                });
+            if live {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    ErrorCode::SessionNotFound,
+                    format!("{session_id}"),
+                ))
+            }
+        }
+    }
+}
+
+fn export_ledger_item_from_event(event: EventEnvelope) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "insert".into(),
+        object_type: "event".into(),
+        tenant_id: event.tenant_id.clone(),
+        agent_id: Some(event.agent_id.clone()),
+        session_id: Some(event.session_id.clone()),
+        object_id: event.event_id.as_str().to_string(),
+        seq: Some(event.seq),
+        created_at_ms: event.created_at_ms,
+        data: serde_json::to_value(&event).expect("event serializes"),
+        tombstone: None,
+    }
+}
+
+fn export_item_matches_scope(
+    item: &ExportLedgerItem,
+    scope: WatchScope,
+    agent_id: Option<&Id>,
+    session_id: Option<&Id>,
+) -> bool {
+    match scope {
+        WatchScope::Tenant => true,
+        WatchScope::Agent => agent_id.is_some_and(|agent_id| {
+            item.agent_id
+                .as_ref()
+                .is_some_and(|item_agent_id| item_agent_id.as_str() == agent_id.as_str())
+        }),
+        WatchScope::Session => session_id.is_some_and(|session_id| {
+            item.session_id
+                .as_ref()
+                .is_some_and(|item_session_id| item_session_id.as_str() == session_id.as_str())
+        }),
+    }
+}
+
+fn export_scope_has_required_ids(req: &ExportWatchRequest) -> bool {
+    match req.scope {
+        WatchScope::Tenant => true,
+        WatchScope::Agent => req.agent_id.is_some(),
+        WatchScope::Session => req.session_id.is_some(),
+    }
+}
+
+fn export_item_matches_include(item: &ExportLedgerItem, include: &[String]) -> bool {
+    include.is_empty()
+        || include
+            .iter()
+            .any(|include| export_include_matches_type(include, &item.object_type))
+}
+
+fn export_include_matches_type(include: &str, object_type: &str) -> bool {
+    match include {
+        "events" => object_type == "event",
+        "tenants" => object_type == "tenant",
+        "agents" => object_type == "agent",
+        "sessions" => object_type == "session",
+        "artifacts" => object_type == "artifact",
+        "records" => object_type == "record",
+        "skills" => object_type == "skill",
+        "skill_bindings" => object_type == "skill_binding",
+        other => other == object_type,
+    }
+}
+
+struct RuntimeExportLedgerCursorParts<'a> {
+    tenant_id: &'a str,
+    session_id: Option<&'a str>,
+}
+
+fn parse_export_ledger_cursor_for_runtime(
+    cursor: &str,
+) -> Option<RuntimeExportLedgerCursorParts<'_>> {
+    let raw = cursor.strip_prefix("ledger:")?;
+    let parts = raw.split('/').collect::<Vec<_>>();
+    if parts.len() == 6 && parts[4] == "event" && parts[3].parse::<u64>().is_ok() {
+        return Some(RuntimeExportLedgerCursorParts {
+            tenant_id: parts[0],
+            session_id: Some(parts[2]),
+        });
+    }
+    if parts.len() == 5 && parts[2].parse::<u64>().is_ok() {
+        return Some(RuntimeExportLedgerCursorParts {
+            tenant_id: parts[0],
+            session_id: None,
+        });
+    }
+    None
 }
 
 /// Compare a record's `source` against a search filter. The filter

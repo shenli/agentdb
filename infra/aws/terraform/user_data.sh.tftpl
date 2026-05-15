@@ -64,5 +64,35 @@ AGENTDB_META_URL=${meta_url}
 %{ endif }
 EOF
 
+%{ if clickhouse_url != "" && clickhouse_export_tenant_id != "" }
+cat >/home/ec2-user/clickhouse-export.env <<EOF
+AGENTDB_URL=http://$${PRIVATE_IP}:${http_port}
+CLICKHOUSE_URL=${clickhouse_url}
+AGENTDB_EXPORT_TENANT_ID=${clickhouse_export_tenant_id}
+AGENTDB_EXPORT_CONSUMER=${clickhouse_export_consumer}
+AGENTDB_EXPORT_MODE=${clickhouse_export_mode}
+AGENTDB_EXPORT_LEASE_MS=${clickhouse_export_lease_ms}
+EOF
+%{ endif }
+
+%{ if jsonl_export_uri != "" && jsonl_export_tenant_id != "" }
+cat >/home/ec2-user/jsonl-export.env <<EOF
+AGENTDB_URL=http://$${PRIVATE_IP}:${http_port}
+AGENTDB_JSONL_EXPORT_TENANT_ID=${jsonl_export_tenant_id}
+AGENTDB_JSONL_EXPORT_URI=${jsonl_export_uri}
+AGENTDB_JSONL_EXPORT_CONSUMER=${jsonl_export_consumer}
+AGENTDB_JSONL_EXPORT_INCLUDE=${jsonl_export_include}
+AGENTDB_JSONL_EXPORT_LEASE_MS=${jsonl_export_lease_ms}
+AGENTDB_JSONL_EXPORT_MAX_BATCHES=${jsonl_export_max_batches}
+AWS_REGION=${region}
+EOF
+%{ endif }
+
 chown ec2-user:ec2-user /home/ec2-user/agentdb.toml
 chown ec2-user:ec2-user /home/ec2-user/agentdb.env
+if [[ -f /home/ec2-user/clickhouse-export.env ]]; then
+  chown ec2-user:ec2-user /home/ec2-user/clickhouse-export.env
+fi
+if [[ -f /home/ec2-user/jsonl-export.env ]]; then
+  chown ec2-user:ec2-user /home/ec2-user/jsonl-export.env
+fi
