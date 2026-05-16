@@ -86,23 +86,31 @@ Coverage:
 - Writes while one node is down and after restart.
 - Final raft convergence and minimum event-count validation.
 
-## Current Blocking Failure
+## Current Results
 
-The expanded suite currently exposes a correctness failure before later
-hardening phases run:
+Validated on `li-dev` from `~/work/agentdb` on branch `stability-test`:
 
-- Scenario: append with `Idempotency-Key` returns retryable
-  `"raft-rs command did not commit ... before timeout"`.
-- Retry: same session, same idempotency key, same payload.
-- Expected: retry replays the originally committed event id and seq, or the
-  first attempt did not commit and retry commits the expected next seq.
-- Observed on `li-dev` with `--nodes 6 --two-cell --full-hardening`: retry
-  returned seq `2` while the harness expected seq `1` for the secondary-cell
-  session.
+- `deterministic-surface` passed on a real six-node, two-cell cluster using
+  work directories under `~/work`.
+- The suite exposed and this branch fixed durable idempotency replay after a
+  raft timeout. A retry now consults the persisted idempotency row when the
+  in-process cache missed the committed result.
+- The suite exposed and this branch fixed global record-index outbox catch-up
+  when a record write committed durably but timed out before the runtime
+  updated in-memory record state.
 
-This is a data-consistency blocker: clients can duplicate an append after a
-retryable timeout unless the idempotency record and event commit become
-atomically replayable across the raft/persistence path.
+Remaining hardening failure:
+
+- Scenario: `deterministic-hardening` reaches split/merge after restart,
+  checkpoint replacement, AZ failure, rolling restart, and tablet replacement.
+- Observed on `li-dev`: append seq `15` during split prepare retried after
+  `"raft-rs command did not commit ... before timeout"` and returned seq `14`.
+- Expected: retry for the seq `15` idempotency key must replay seq `15` if the
+  first attempt committed, or commit seq `15` if it did not. Returning seq `14`
+  indicates stale session sequence state or incorrect idempotency replay around
+  split/merge/ownership transition.
+
+This remains a data-consistency blocker for the full hardening suite.
 
 ## Next Coverage To Add
 
