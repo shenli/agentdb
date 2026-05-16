@@ -23,7 +23,7 @@ services:
       timeout: 5s
       retries: 30
     volumes:
-      - agentdb-cluster-smoke-postgres:/var/lib/postgresql/data
+      - ${AGENTDB_CLUSTER_SMOKE_POSTGRES_DATA_DIR:-agentdb-cluster-smoke-postgres}:/var/lib/postgresql/data
 
   minio:
     image: quay.io/minio/minio:latest
@@ -35,7 +35,7 @@ services:
       - "${AGENTDB_CLUSTER_SMOKE_MINIO_PORT:-19000}:9000"
       - "${AGENTDB_CLUSTER_SMOKE_MINIO_CONSOLE_PORT:-19001}:9001"
     volumes:
-      - agentdb-cluster-smoke-minio:/data
+      - ${AGENTDB_CLUSTER_SMOKE_MINIO_DATA_DIR:-agentdb-cluster-smoke-minio}:/data
 
   minio-init:
     image: quay.io/minio/mc:latest

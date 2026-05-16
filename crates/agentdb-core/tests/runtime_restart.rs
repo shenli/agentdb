@@ -1193,6 +1193,68 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
 }
 
 #[tokio::test]
+async fn record_index_outbox_reloads_record_after_commit_state_gap() {
+    let dir = TempDir::new().unwrap();
+    let kv = open_kv(dir.path());
+    let rt = Runtime::with_kv(kv, in_memory_content());
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "rec-global-state-gap".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let written = rt
+        .write_record_with_commit(NewRecord {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            scope: serde_json::json!({}),
+            text: None,
+            metadata: serde_json::json!({"title": "state gap token"}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy: IndexingPolicy {
+                mode: IndexingMode::MetadataOnly,
+                fields: vec![],
+                vector_allowed: false,
+            },
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    rt.simulate_record_state_gap_for_test(&written.record.record_id, written.commit_token.seq, 0)
+        .await;
+
+    assert_eq!(rt.apply_record_index_outbox_once().await.unwrap(), 1);
+
+    let stats = rt.record_index_stats().await;
+    assert_eq!(stats.global_index_lag_tokens, 0);
+    assert_eq!(stats.global_index_watermark, written.commit_token.seq);
+
+    let hits = rt
+        .search_records(SearchRequest {
+            tenant_id: t.tenant_id.clone(),
+            namespace: vec!["kb".into()],
+            sharding_key: None,
+            text: Some("state gap".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].record_id.as_str(),
+        written.record.record_id.as_str()
+    );
+}
+
+#[tokio::test]
 async fn skills_and_bindings_survive_restart() {
     let dir = TempDir::new().unwrap();
     let kv = open_kv(dir.path());
