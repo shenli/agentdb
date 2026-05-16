@@ -1710,6 +1710,32 @@ fn reconcile_session_next_seq_from_persisted_events(
     Ok(())
 }
 
+fn advance_session_next_seq_past_persisted_collision(
+    state: &mut State,
+    persist: &Persist,
+    tenant_id: &Id,
+    session_id: &Id,
+) -> Result<()> {
+    loop {
+        let Some(next_seq) = state
+            .sessions
+            .get(session_id.as_str())
+            .filter(|session| session.tenant_id.as_str() == tenant_id.as_str())
+            .map(|session| session.next_seq)
+        else {
+            return Ok(());
+        };
+        if persist
+            .get_event(tenant_id.as_str(), session_id.as_str(), next_seq)
+            .map_err(internal)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        reconcile_session_next_seq_from_persisted_events(state, tenant_id, session_id, next_seq)?;
+    }
+}
+
 impl Runtime {
     fn bump_lifecycle_counts(counts: &mut LifecycleCounts, lifecycle: Lifecycle) {
         match lifecycle {
@@ -2618,6 +2644,59 @@ impl Runtime {
         };
         self.idem.put(full_key.to_string(), rec.clone());
         Ok(Some(rec))
+    }
+
+    fn replay_append_idempotency_record(
+        &self,
+        rec: &IdempotencyRecord,
+        req: &AppendRequest,
+    ) -> Result<AppendCommitResponse> {
+        let appended = verify_idem_replay(rec, req)?;
+        self.verify_append_replay_event_visible(req, &appended)?;
+        Ok(AppendCommitResponse {
+            appended,
+            recent: Vec::new(),
+            recent_complete: false,
+            backpressure: BackpressureReport::default(),
+            backpressure_complete: false,
+        })
+    }
+
+    fn verify_append_replay_event_visible(
+        &self,
+        req: &AppendRequest,
+        appended: &AppendResponse,
+    ) -> Result<()> {
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        let Some(event) = persist
+            .get_event(
+                req.tenant_id.as_str(),
+                req.session_id.as_str(),
+                appended.seq,
+            )
+            .map_err(internal)?
+        else {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "idempotency replay for session {} seq {} is not yet visible",
+                    req.session_id, appended.seq
+                ),
+            )
+            .with_suggestion("retry the append with the same Idempotency-Key"));
+        };
+        if event.event_id != appended.event_id {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "idempotency replay for session {} seq {} resolved event {}, expected {}",
+                    req.session_id, appended.seq, event.event_id, appended.event_id
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {
@@ -5813,13 +5892,7 @@ impl Runtime {
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return Ok(AppendCommitResponse {
-                    appended: verify_idem_replay(&rec, &req)?,
-                    recent: Vec::new(),
-                    recent_complete: false,
-                    backpressure: BackpressureReport::default(),
-                    backpressure_complete: false,
-                });
+                return self.replay_append_idempotency_record(&rec, &req);
             }
         }
 
@@ -5839,13 +5912,7 @@ impl Runtime {
         }
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return Ok(AppendCommitResponse {
-                    appended: verify_idem_replay(&rec, &req)?,
-                    recent: Vec::new(),
-                    recent_complete: false,
-                    backpressure: BackpressureReport::default(),
-                    backpressure_complete: false,
-                });
+                return self.replay_append_idempotency_record(&rec, &req);
             }
         }
         let persisted_session_max_seq = self
@@ -5868,13 +5935,7 @@ impl Runtime {
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
                 drop(s);
-                return Ok(AppendCommitResponse {
-                    appended: verify_idem_replay(&rec, &req)?,
-                    recent: Vec::new(),
-                    recent_complete: false,
-                    backpressure: BackpressureReport::default(),
-                    backpressure_complete: false,
-                });
+                return self.replay_append_idempotency_record(&rec, &req);
             }
         }
         if let Some(max_seq) = persisted_session_max_seq {
@@ -5883,6 +5944,14 @@ impl Runtime {
                 &req.tenant_id,
                 &req.session_id,
                 max_seq,
+            )?;
+        }
+        if let Some(persist) = self.persist.as_ref() {
+            advance_session_next_seq_past_persisted_collision(
+                &mut s,
+                persist,
+                &req.tenant_id,
+                &req.session_id,
             )?;
         }
 
@@ -8885,6 +8954,122 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, 0);
+    }
+
+    #[tokio::test]
+    async fn append_idempotency_replay_requires_visible_event() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+        let mut req = AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "idempotent",
+            serde_json::json!({"v": 1}),
+        );
+        req.idempotency_key = Some("durable-retry-not-visible".into());
+
+        let first = rt.append(req.clone()).await.unwrap();
+        assert_eq!(first.seq, 0);
+        let full_key = format!(
+            "{}::append::{}::durable-retry-not-visible",
+            tenant.tenant_id, session.session_id
+        );
+        rt.idem.remove(&full_key);
+        assert_eq!(
+            rt.persist
+                .as_ref()
+                .unwrap()
+                .delete_events_from_seq(tenant.tenant_id.as_str(), session.session_id.as_str(), 0)
+                .unwrap(),
+            1
+        );
+
+        let err = rt.append(req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("is not yet visible"));
+    }
+
+    #[tokio::test]
+    async fn append_does_not_reuse_persisted_seq_after_stale_session_state() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({"seq": 0}),
+        ))
+        .await
+        .unwrap();
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({"seq": 1}),
+        ))
+        .await
+        .unwrap();
+
+        {
+            let mut state = rt.state.lock().await;
+            state
+                .sessions
+                .get_mut(session.session_id.as_str())
+                .unwrap()
+                .next_seq = 1;
+        }
+
+        let mut req = AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "message",
+            serde_json::json!({"seq": 2}),
+        );
+        req.idempotency_key = Some("after-stale-state".into());
+        let appended = rt.append(req.clone()).await.unwrap();
+        assert_eq!(appended.seq, 2);
+
+        rt.idem.remove(&format!(
+            "{}::append::{}::after-stale-state",
+            tenant.tenant_id, session.session_id
+        ));
+        {
+            let mut state = rt.state.lock().await;
+            state
+                .sessions
+                .get_mut(session.session_id.as_str())
+                .unwrap()
+                .next_seq = 2;
+        }
+        let replay = rt.append(req).await.unwrap();
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.event_id, appended.event_id);
+
+        let events = rt
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant.tenant_id,
+                session_id: session.session_id,
+                from_seq: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(events[2].payload, serde_json::json!({"seq": 2}));
     }
 }
 

@@ -2368,7 +2368,39 @@ async fn append_and_verify(
                     {
                         return Ok(());
                     }
-                    bail!("expected appended seq {expected_seq} to become visible");
+                    let _ = force_raft_catch_up(client, nodes, tablet_id).await;
+                    if session_has_exact_event_seq_with_convergence_retry(
+                        client,
+                        nodes,
+                        tablet_id,
+                        tenant_id,
+                        session_id,
+                        expected_seq,
+                        10,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    if attempt + 1 < APPEND_RECOVERY_ATTEMPTS {
+                        eprintln!(
+                            "smoke: append seq {expected_seq} returned success before read visibility; retrying with same idempotency key"
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    let observed = session_events_from_base(
+                        client,
+                        &owner.url,
+                        tenant_id,
+                        session_id,
+                        expected_seq.saturating_add(10),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    bail!(
+                        "expected appended seq {expected_seq} to become visible; observed={observed:?}"
+                    );
                 }
                 bail!("expected appended seq {expected_seq}, got {seq}");
             }
