@@ -7500,6 +7500,24 @@ impl Runtime {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub async fn simulate_record_state_gap_for_test(
+        &self,
+        record_id: &Id,
+        local_watermark: u64,
+        global_watermark: u64,
+    ) {
+        let mut s = self.state.lock().await;
+        s.records.remove(record_id.as_str());
+        s.record_commit_seq.remove(record_id.as_str());
+        if let Some(doc) = s.record_to_doc.remove(record_id.as_str()) {
+            s.doc_to_record.remove(&doc);
+        }
+        s.local_record_index_watermark = local_watermark;
+        s.global_record_index_watermark = global_watermark;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub fn record_index_outbox_counts_for_test(&self) -> Result<(usize, usize)> {
         let Some(p) = &self.persist else {
             return Ok((0, 0));
@@ -7541,7 +7559,23 @@ impl Runtime {
 
         let mut applied = 0usize;
         for mutation in mutations {
+            let persisted_record = if matches!(mutation.op, RecordIndexMutationOp::Upsert) {
+                p.get_record(&mutation.tenant_id, &mutation.record_id)
+                    .map_err(internal)?
+            } else {
+                None
+            };
             let mut s = self.state.lock().await;
+            if matches!(mutation.op, RecordIndexMutationOp::Upsert)
+                && !s.records.contains_key(&mutation.record_id)
+            {
+                let Some(record) = persisted_record.clone() else {
+                    return Ok(applied);
+                };
+                s.record_commit_seq
+                    .insert(mutation.record_id.clone(), mutation.commit_seq);
+                s.records.insert(mutation.record_id.clone(), record);
+            }
             let mut advanced = false;
             if mutation.commit_seq > s.global_record_index_watermark {
                 let global_mutation = match mutation.op {
