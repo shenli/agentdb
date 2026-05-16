@@ -1684,6 +1684,25 @@ impl Persist {
         Ok(merged.into_values().take(limit).collect())
     }
 
+    pub fn get_event(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        seq: u64,
+    ) -> KvResult<Option<EventEnvelope>> {
+        let Some(value) = self
+            .kv
+            .get(event_key(tenant_id, session_id, seq).as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let context = self.event_context_from_key(tenant_id, session_id, 0);
+        let plaintext = self.decrypt_metadata(&context, &value)?;
+        let event: EventEnvelope =
+            serde_json::from_slice(&plaintext).expect("event envelope decodes");
+        Ok(Some(event))
+    }
+
     pub fn scan_export_ledger_items(
         &self,
         tenant_id: &str,
