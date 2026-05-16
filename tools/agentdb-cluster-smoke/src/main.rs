@@ -100,6 +100,18 @@ struct Args {
     #[arg(long)]
     full_hardening: bool,
 
+    /// Verify idempotent append, gap-free session order, and replica convergence.
+    #[arg(long)]
+    consistency: bool,
+
+    /// Verify record write/search visibility and record-index watermarks.
+    #[arg(long)]
+    record_index: bool,
+
+    /// Verify tenant/session watch and durable export changefeed cursor replay.
+    #[arg(long)]
+    changefeed: bool,
+
     /// Kill and restart the current owner with the same data directories.
     #[arg(long)]
     restart_persistence: bool,
@@ -660,6 +672,64 @@ async fn run_smoke(
         None
     };
 
+    if args.full_hardening || args.consistency {
+        run_data_consistency_probe(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            &tenant_id,
+            &agent_id,
+            &session_id,
+            &mut next_seq,
+        )
+        .await?;
+        if let Some((tenant_id, agent_id, session_id, next_secondary_seq)) = secondary.as_mut() {
+            run_data_consistency_probe(
+                client,
+                nodes,
+                SECONDARY_TABLET_ID,
+                tenant_id,
+                agent_id,
+                session_id,
+                next_secondary_seq,
+            )
+            .await?;
+        }
+    }
+
+    if args.full_hardening || args.record_index {
+        run_record_index_probe(client, nodes, PRIMARY_TABLET_ID, &tenant_id, &session_id).await?;
+        if let Some((tenant_id, _agent_id, session_id, _next_secondary_seq)) = secondary.as_ref() {
+            run_record_index_probe(client, nodes, SECONDARY_TABLET_ID, tenant_id, session_id)
+                .await?;
+        }
+    }
+
+    if args.full_hardening || args.changefeed {
+        run_changefeed_probe(
+            client,
+            nodes,
+            PRIMARY_TABLET_ID,
+            &tenant_id,
+            &agent_id,
+            &session_id,
+            &mut next_seq,
+        )
+        .await?;
+        if let Some((tenant_id, agent_id, session_id, next_secondary_seq)) = secondary.as_mut() {
+            run_changefeed_probe(
+                client,
+                nodes,
+                SECONDARY_TABLET_ID,
+                tenant_id,
+                agent_id,
+                session_id,
+                next_secondary_seq,
+            )
+            .await?;
+        }
+    }
+
     eprintln!("smoke: forcing raft catch-up snapshot after setup writes");
     let catch_up_started = Instant::now();
     let catch_up = force_raft_catch_up(client, nodes, PRIMARY_TABLET_ID).await?;
@@ -853,6 +923,397 @@ async fn run_smoke(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn run_data_consistency_probe(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    next_seq: &mut u64,
+) -> Result<()> {
+    eprintln!("consistency: verifying idempotent append and gap-free session order");
+    let expected_seq = *next_seq;
+    let idempotency_key = format!("cluster-smoke-consistency-{session_id}-seq-{expected_seq}");
+    let path = format!("/api/tenants/{tenant_id}/sessions/{session_id}/events");
+    let body = json!({
+        "agent_id": agent_id,
+        "kind": "message",
+        "payload": {"seq": expected_seq, "source": "cluster-smoke-consistency"},
+        "artifact_refs": [],
+        "source_refs": []
+    });
+    let first = post_json_with_idempotency_key_retry(
+        client,
+        nodes,
+        tablet_id,
+        &path,
+        body.clone(),
+        &idempotency_key,
+        expected_seq,
+    )
+    .await?;
+    let replay = post_json_with_idempotency_key_retry(
+        client,
+        nodes,
+        tablet_id,
+        &path,
+        body.clone(),
+        &idempotency_key,
+        expected_seq,
+    )
+    .await?;
+    let first_seq = first
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("idempotent append response missing seq: {first}"))?;
+    let replay_seq = replay
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("idempotent append replay missing seq: {replay}"))?;
+    if first_seq != expected_seq || replay_seq != expected_seq {
+        bail!(
+            "idempotent append expected seq {expected_seq}, got first={first_seq} replay={replay_seq}"
+        );
+    }
+    if first["event_id"] != replay["event_id"] {
+        bail!(
+            "idempotent append replay returned a different event id: first={first} replay={replay}"
+        );
+    }
+    expect_idempotency_conflict_retry(
+        client,
+        nodes,
+        tablet_id,
+        &path,
+        json!({
+            "agent_id": agent_id,
+            "kind": "message",
+            "payload": {"seq": expected_seq + 10_000, "source": "cluster-smoke-consistency-conflict"},
+            "artifact_refs": [],
+            "source_refs": []
+        }),
+        &idempotency_key,
+    )
+    .await?;
+    *next_seq += 1;
+
+    let _ = force_raft_catch_up(client, nodes, tablet_id).await?;
+    wait_raft_ready(client, nodes, Duration::from_secs(120)).await?;
+    assert_session_converged_on_all_nodes(client, nodes, tenant_id, session_id, *next_seq).await?;
+    Ok(())
+}
+
+async fn run_record_index_probe(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    eprintln!("record-index: writing records and verifying local/global search visibility");
+    let token = format!("stability-index-{}", now_ms());
+    let (target, commit_seq) = create_record_with_commit_retry(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        json!({
+            "namespace": ["cluster-smoke", "stability"],
+            "text": format!("{token} primary searchable text"),
+            "tags": ["stability", "primary"],
+            "metadata": {"title": token, "probe": "record-index"},
+            "policy": {"mode": "selected_fields", "fields": ["title"], "vector_allowed": false}
+        }),
+    )
+    .await?;
+    let target_id = string_field(&target, "record_id")?;
+    let (control, control_commit_seq) = create_record_with_commit_retry(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        json!({
+            "namespace": ["cluster-smoke", "stability"],
+            "text": format!("{token} control searchable text"),
+            "tags": ["stability", "control"],
+            "metadata": {"title": format!("{token} control"), "probe": "record-index"},
+            "policy": {"mode": "selected_fields", "fields": ["title"], "vector_allowed": false}
+        }),
+    )
+    .await?;
+    let control_id = string_field(&control, "record_id")?;
+    let (source_child, source_commit_seq) = create_record_with_commit_retry(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        json!({
+            "namespace": ["cluster-smoke", "source"],
+            "text": format!("{token} child source searchable text"),
+            "tags": ["stability", "source-child"],
+            "source": {"record_id": target_id.clone()},
+            "metadata": {"title": format!("{token} child"), "probe": "record-index-source"},
+            "policy": {"mode": "selected_fields", "fields": ["title"], "vector_allowed": false}
+        }),
+    )
+    .await?;
+    let source_child_id = string_field(&source_child, "record_id")?;
+    let (vector_east, vector_east_commit_seq) = create_record_with_commit_retry(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        json!({
+            "namespace": ["cluster-smoke", "vectors"],
+            "text": "east-vector",
+            "embedding": [1.0, 0.0, 0.0],
+            "tags": ["stability", "vector"],
+            "metadata": {"title": format!("{token} east vector")},
+            "policy": {"mode": "metadata_only", "fields": [], "vector_allowed": true}
+        }),
+    )
+    .await?;
+    let (vector_north, vector_north_commit_seq) = create_record_with_commit_retry(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        json!({
+            "namespace": ["cluster-smoke", "vectors"],
+            "text": "north-vector",
+            "embedding": [0.0, 1.0, 0.0],
+            "tags": ["stability", "vector"],
+            "metadata": {"title": format!("{token} north vector")},
+            "policy": {"mode": "metadata_only", "fields": [], "vector_allowed": true}
+        }),
+    )
+    .await?;
+    let vector_east_id = string_field(&vector_east, "record_id")?;
+    let vector_north_id = string_field(&vector_north, "record_id")?;
+    let max_commit_seq = [
+        commit_seq,
+        control_commit_seq,
+        source_commit_seq,
+        vector_east_commit_seq,
+        vector_north_commit_seq,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(commit_seq);
+
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+    let global_path = format!(
+        "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&min_visible_record_commit_seq={commit_seq}",
+        query_encode(&token)
+    );
+    assert_search_finds_record(client, &owner.url, &global_path, &target_id).await?;
+
+    let local_path = format!(
+        "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&sharding_key={}&min_visible_record_commit_seq={commit_seq}",
+        query_encode(&token),
+        query_encode(session_id)
+    );
+    assert_search_finds_record(client, &owner.url, &local_path, &target_id).await?;
+
+    let control_path = format!(
+        "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=control&min_visible_record_commit_seq={commit_seq}",
+        query_encode(&token)
+    );
+    assert_search_finds_record(client, &owner.url, &control_path, &control_id).await?;
+
+    let source_path = format!(
+        "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=source&source_record={}&min_visible_record_commit_seq={source_commit_seq}",
+        query_encode(&token),
+        query_encode(&target_id)
+    );
+    assert_search_finds_record(client, &owner.url, &source_path, &source_child_id).await?;
+
+    let vector_response = post_json(
+        client,
+        &owner.url,
+        &format!("/api/tenants/{tenant_id}/records/search"),
+        json!({
+            "namespace": ["cluster-smoke", "vectors"],
+            "embedding": [0.0, 1.0, 0.0],
+            "limit": 2,
+            "min_visible_record_commit_seq": max_commit_seq
+        }),
+    )
+    .await?;
+    let vector_hits = vector_response["records"]
+        .as_array()
+        .ok_or_else(|| anyhow!("vector search response missing records: {vector_response}"))?;
+    if vector_hits.len() < 2
+        || vector_hits[0]["record_id"].as_str() != Some(vector_north_id.as_str())
+        || !vector_hits
+            .iter()
+            .any(|record| record["record_id"].as_str() == Some(vector_east_id.as_str()))
+    {
+        bail!("vector search expected north first and east in top two: {vector_response}");
+    }
+
+    delete_record_retry(client, nodes, tablet_id, tenant_id, &control_id).await?;
+    wait_search_missing_record(
+        client,
+        nodes,
+        tablet_id,
+        &control_path,
+        &control_id,
+        Duration::from_secs(30),
+    )
+    .await?;
+    wait_record_index_watermark(client, &owner.url, max_commit_seq, Duration::from_secs(60))
+        .await?;
+    Ok(())
+}
+
+async fn run_changefeed_probe(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    agent_id: &str,
+    session_id: &str,
+    next_seq: &mut u64,
+) -> Result<()> {
+    eprintln!("changefeed: verifying watch and export cursor replay");
+    let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+    let before_watch = watch_session(client, &owner.url, tenant_id, session_id).await?;
+    let watch_cursor = before_watch
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|item| item["cursor"].as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("changefeed setup watch response missing cursor: {before_watch}"))?;
+    let before_tenant_watch = watch_tenant(client, &owner.url, tenant_id).await?;
+    let tenant_watch_cursor = before_tenant_watch
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|item| item["cursor"].as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            anyhow!("changefeed setup tenant watch response missing cursor: {before_tenant_watch}")
+        })?;
+    let before_export =
+        export_watch_session(client, &owner.url, tenant_id, session_id, None, 100).await?;
+    let export_cursor = before_export["items"]
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|item| item["cursor"].as_str())
+        .map(ToString::to_string);
+
+    let first_seq = *next_seq;
+    append_and_verify(
+        client, nodes, tablet_id, tenant_id, agent_id, session_id, first_seq,
+    )
+    .await?;
+    *next_seq += 1;
+    let second_seq = *next_seq;
+    append_and_verify(
+        client, nodes, tablet_id, tenant_id, agent_id, session_id, second_seq,
+    )
+    .await?;
+    *next_seq += 1;
+
+    let second_session_id = create_session_for_agent(client, nodes, tablet_id, tenant_id, agent_id)
+        .await
+        .context("create second session for tenant changefeed fanout")?;
+    append_and_verify(
+        client,
+        nodes,
+        tablet_id,
+        tenant_id,
+        agent_id,
+        &second_session_id,
+        0,
+    )
+    .await?;
+
+    let first_page = watch_session_from_cursor_limit(
+        client,
+        &owner.url,
+        tenant_id,
+        session_id,
+        &watch_cursor,
+        1,
+    )
+    .await?;
+    let first_items = first_page
+        .as_array()
+        .ok_or_else(|| anyhow!("watch page was not an array: {first_page}"))?;
+    if first_items.len() != 1 || watch_item_seq(&first_items[0]) != Some(first_seq) {
+        bail!("watch first page expected seq {first_seq}: {first_page}");
+    }
+    let next_watch_cursor = first_items[0]["cursor"]
+        .as_str()
+        .ok_or_else(|| anyhow!("watch first page missing cursor: {first_page}"))?;
+    let second_page = watch_session_from_cursor_limit(
+        client,
+        &owner.url,
+        tenant_id,
+        session_id,
+        next_watch_cursor,
+        10,
+    )
+    .await?;
+    let second_items = second_page
+        .as_array()
+        .ok_or_else(|| anyhow!("watch second page was not an array: {second_page}"))?;
+    if !second_items
+        .iter()
+        .any(|item| watch_item_seq(item) == Some(second_seq))
+    {
+        bail!("watch replay did not include seq {second_seq}: {second_page}");
+    }
+
+    let tenant_page =
+        watch_tenant_from_cursor_limit(client, &owner.url, tenant_id, &tenant_watch_cursor, 10)
+            .await?;
+    let tenant_items = tenant_page
+        .as_array()
+        .ok_or_else(|| anyhow!("tenant watch page was not an array: {tenant_page}"))?;
+    for expected_session in [session_id, second_session_id.as_str()] {
+        if !tenant_items
+            .iter()
+            .any(|item| watch_item_session_id(item) == Some(expected_session))
+        {
+            bail!("tenant watch did not include session {expected_session}: {tenant_page}");
+        }
+    }
+
+    let export_page = export_watch_session(
+        client,
+        &owner.url,
+        tenant_id,
+        session_id,
+        export_cursor.as_deref(),
+        10,
+    )
+    .await?;
+    let export_items = export_page["items"]
+        .as_array()
+        .ok_or_else(|| anyhow!("export watch response missing items: {export_page}"))?;
+    for expected in [first_seq, second_seq] {
+        let Some(item) = export_items
+            .iter()
+            .find(|item| item["seq"].as_u64() == Some(expected))
+        else {
+            bail!("export watch did not include seq {expected}: {export_page}");
+        };
+        if item["object_type"] != "event" || item["op"] != "insert" {
+            bail!("export watch item for seq {expected} had unexpected shape: {item}");
+        }
+        let cursor = item["cursor"]
+            .as_str()
+            .ok_or_else(|| anyhow!("export watch item missing cursor: {item}"))?;
+        if !cursor.starts_with("ledger:") {
+            bail!("export watch cursor should use durable ledger format: {cursor}");
+        }
+    }
     Ok(())
 }
 
@@ -1765,6 +2226,25 @@ async fn create_agent_with_convergence_retry(
         .unwrap_or_else(|| anyhow!("create agent {alias} failed without a captured error")))
 }
 
+async fn create_session_for_agent(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    agent_id: &str,
+) -> Result<String> {
+    let session = post_json_with_convergence_retry(
+        client,
+        nodes,
+        tablet_id,
+        &format!("/api/tenants/{tenant_id}/agents/{agent_id}/sessions"),
+        json!({"alias": null}),
+        10,
+    )
+    .await?;
+    string_field(&session, "session_id")
+}
+
 async fn find_agent_by_alias(
     client: &Client,
     nodes: &[NodeSpec],
@@ -1961,6 +2441,100 @@ async fn event_count_from_base(
         .len())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventObservation {
+    seq: u64,
+    payload_seq: Option<u64>,
+    event_id: String,
+}
+
+async fn session_events_from_base(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    session_id: &str,
+    limit: u64,
+) -> Result<Vec<EventObservation>> {
+    let events = get_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit={limit}"),
+    )
+    .await?;
+    events
+        .as_array()
+        .ok_or_else(|| anyhow!("events response is not an array: {events}"))?
+        .iter()
+        .map(|event| {
+            let seq = event
+                .get("seq")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("event missing seq: {event}"))?;
+            let event_id = string_field(event, "event_id")?;
+            let payload_seq = event
+                .get("payload")
+                .and_then(|payload| payload.get("seq"))
+                .and_then(Value::as_u64);
+            Ok(EventObservation {
+                seq,
+                payload_seq,
+                event_id,
+            })
+        })
+        .collect()
+}
+
+async fn assert_session_converged_on_all_nodes(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tenant_id: &str,
+    session_id: &str,
+    expected_next_seq: u64,
+) -> Result<()> {
+    let limit = expected_next_seq.saturating_add(10);
+    let expected: Vec<u64> = (0..expected_next_seq).collect();
+    let mut baseline = None;
+    for node in nodes {
+        let observed =
+            session_events_from_base(client, &node.url, tenant_id, session_id, limit).await?;
+        let seqs = observed.iter().map(|event| event.seq).collect::<Vec<_>>();
+        if seqs != expected {
+            bail!(
+                "node {} observed non-gap-free session seqs; expected {:?}, got {:?}",
+                node.id,
+                expected,
+                seqs
+            );
+        }
+        for event in &observed {
+            if let Some(payload_seq) = event.payload_seq {
+                if payload_seq != event.seq {
+                    bail!(
+                        "node {} event {} has seq {} but payload.seq {}",
+                        node.id,
+                        event.event_id,
+                        event.seq,
+                        payload_seq
+                    );
+                }
+            }
+        }
+        if let Some(baseline) = &baseline {
+            if baseline != &observed {
+                bail!(
+                    "node {} session events differ from baseline; baseline={:?} observed={:?}",
+                    node.id,
+                    baseline,
+                    observed
+                );
+            }
+        } else {
+            baseline = Some(observed);
+        }
+    }
+    Ok(())
+}
+
 async fn session_has_exact_event_seq_from_base(
     client: &Client,
     base: &str,
@@ -2074,6 +2648,15 @@ async fn watch_session(
     .await
 }
 
+async fn watch_tenant(client: &Client, base: &str, tenant_id: &str) -> Result<Value> {
+    get_json(
+        client,
+        base,
+        &format!("/api/tenants/{tenant_id}/watch?scope=tenant&limit=100"),
+    )
+    .await
+}
+
 async fn watch_session_from_cursor(
     client: &Client,
     base: &str,
@@ -2090,6 +2673,72 @@ async fn watch_session_from_cursor(
         ),
     )
     .await
+}
+
+async fn watch_tenant_from_cursor_limit(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    cursor: &str,
+    limit: usize,
+) -> Result<Value> {
+    get_json(
+        client,
+        base,
+        &format!(
+            "/api/tenants/{tenant_id}/watch?scope=tenant&from_cursor={}&limit={limit}",
+            query_encode(cursor)
+        ),
+    )
+    .await
+}
+
+async fn watch_session_from_cursor_limit(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    session_id: &str,
+    cursor: &str,
+    limit: usize,
+) -> Result<Value> {
+    get_json(
+        client,
+        base,
+        &format!(
+            "/api/tenants/{tenant_id}/watch?scope=session&session_id={session_id}&from_cursor={}&limit={limit}",
+            query_encode(cursor)
+        ),
+    )
+    .await
+}
+
+fn watch_item_seq(item: &Value) -> Option<u64> {
+    item.get("seq")
+        .and_then(Value::as_u64)
+        .or_else(|| item.get("event")?.get("seq")?.as_u64())
+}
+
+fn watch_item_session_id(item: &Value) -> Option<&str> {
+    item.get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("event")?.get("session_id")?.as_str())
+}
+
+async fn export_watch_session(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    session_id: &str,
+    from_cursor: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let mut path =
+        format!("/api/tenants/{tenant_id}/exports/watch?scope=session&session_id={session_id}&include=events&limit={limit}");
+    if let Some(cursor) = from_cursor {
+        path.push_str("&from_cursor=");
+        path.push_str(&query_encode(cursor));
+    }
+    get_json(client, base, &path).await
 }
 
 fn query_encode(value: &str) -> String {
@@ -2623,6 +3272,234 @@ async fn get_json(client: &Client, base: &str, path: &str) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
+async fn create_record_with_commit(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    body: Value,
+) -> Result<(Value, u64)> {
+    let response = client
+        .post(format!("{base}/api/tenants/{tenant_id}/records"))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let commit_seq = response
+        .headers()
+        .get("X-AgentDB-Record-Commit-Seq")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} for {base}/api/tenants/{tenant_id}/records: {text}");
+    }
+    let record = serde_json::from_str(&text)?;
+    let commit_seq = commit_seq.ok_or_else(|| {
+        anyhow!("record create response missing X-AgentDB-Record-Commit-Seq header: {record}")
+    })?;
+    Ok((record, commit_seq))
+}
+
+async fn create_record_with_commit_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    body: Value,
+) -> Result<(Value, u64)> {
+    let mut last_error = None;
+    for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "record-index: create record attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match create_record_with_commit(client, &owner.url, tenant_id, body.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_retryable_cluster_convergence_error(&error)
+                    && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>
+            {
+                eprintln!(
+                    "record-index: create record retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("create record failed without a captured error")))
+}
+
+async fn assert_search_finds_record(
+    client: &Client,
+    base: &str,
+    path: &str,
+    expected_record_id: &str,
+) -> Result<()> {
+    let response = get_json(client, base, path).await?;
+    let records = response["records"]
+        .as_array()
+        .ok_or_else(|| anyhow!("record search response missing records array: {response}"))?;
+    if !records
+        .iter()
+        .any(|record| record["record_id"].as_str() == Some(expected_record_id))
+    {
+        bail!("record search did not find {expected_record_id}: {response}");
+    }
+    Ok(())
+}
+
+async fn assert_search_missing_record(
+    client: &Client,
+    base: &str,
+    path: &str,
+    record_id: &str,
+) -> Result<()> {
+    let response = get_json(client, base, path).await?;
+    let records = response["records"]
+        .as_array()
+        .ok_or_else(|| anyhow!("record search response missing records array: {response}"))?;
+    if records
+        .iter()
+        .any(|record| record["record_id"].as_str() == Some(record_id))
+    {
+        bail!("record search still found deleted record {record_id}: {response}");
+    }
+    Ok(())
+}
+
+async fn wait_search_missing_record(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    path: &str,
+    record_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut last = anyhow!("record {record_id} remained visible after delete");
+    loop {
+        if start.elapsed() > timeout {
+            return Err(last);
+        }
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        match assert_search_missing_record(client, &owner.url, path, record_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn delete_record(
+    client: &Client,
+    base: &str,
+    tenant_id: &str,
+    record_id: &str,
+) -> Result<()> {
+    let response = client
+        .delete(format!(
+            "{base}/api/tenants/{tenant_id}/records/{record_id}"
+        ))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("HTTP {status} deleting record {record_id}: {text}");
+    }
+    Ok(())
+}
+
+async fn delete_record_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    tenant_id: &str,
+    record_id: &str,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "record-index: delete record attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match delete_record(client, &owner.url, tenant_id, record_id).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_retryable_cluster_convergence_error(&error)
+                    && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>
+            {
+                eprintln!(
+                    "record-index: delete record retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("delete record failed without a captured error")))
+}
+
+async fn wait_record_index_watermark(
+    client: &Client,
+    base: &str,
+    commit_seq: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut last = None;
+    loop {
+        if start.elapsed() > timeout {
+            bail!(
+                "record indexes did not reach commit_seq {commit_seq} within {timeout:?}; last={}",
+                last.unwrap_or_else(|| json!(null))
+            );
+        }
+        match get_json(client, base, "/api/admin/indexes/records").await {
+            Ok(status) => {
+                let local = status["local_index_watermark"].as_u64().unwrap_or(0);
+                let global = status["global_index_watermark"].as_u64().unwrap_or(0);
+                let local_lag = status["local_index_lag_tokens"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+                let global_lag = status["global_index_lag_tokens"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+                let worker_failures = status["record_index_worker_failures_total"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+                let apply_failures = status["global_index_apply_failures_total"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX);
+                if local >= commit_seq
+                    && global >= commit_seq
+                    && local_lag == 0
+                    && global_lag == 0
+                    && worker_failures == 0
+                    && apply_failures == 0
+                {
+                    return Ok(());
+                }
+                last = Some(status);
+            }
+            Err(error) => last = Some(json!({"error": error.to_string()})),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn post_json_with_route_headers(
     client: &Client,
     base: &str,
@@ -2682,6 +3559,132 @@ async fn post_json_with_idempotency_key(
         bail!("HTTP {status} for {base}{path}: {text}");
     }
     Ok(serde_json::from_str(&text)?)
+}
+
+async fn post_json_with_idempotency_key_expect_error(
+    client: &Client,
+    base: &str,
+    path: &str,
+    body: Value,
+    idempotency_key: &str,
+) -> Result<String> {
+    let response = client
+        .post(format!("{base}{path}"))
+        .header("Idempotency-Key", idempotency_key)
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if status.is_success() {
+        bail!("expected idempotency conflict for {base}{path}, got HTTP {status}: {text}");
+    }
+    Ok(format!("HTTP {status} for {base}{path}: {text}"))
+}
+
+async fn post_json_with_idempotency_key_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    path: &str,
+    body: Value,
+    idempotency_key: &str,
+    expected_seq: u64,
+) -> Result<Value> {
+    let mut last_error = None;
+    for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: idempotent POST {path} seq {expected_seq} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match post_json_with_idempotency_key(
+            client,
+            &owner.url,
+            path,
+            body.clone(),
+            idempotency_key,
+        )
+        .await
+        {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_retryable_cluster_convergence_error(&error)
+                    && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>
+            {
+                eprintln!(
+                    "smoke: idempotent POST {path} seq {expected_seq} retry {} after convergence error: {error:?}",
+                    attempt + 1
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("idempotent POST {path} failed without a captured error")))
+}
+
+async fn expect_idempotency_conflict_retry(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    path: &str,
+    body: Value,
+    idempotency_key: &str,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        eprintln!(
+            "smoke: idempotency conflict check {path} attempt {} via {}",
+            attempt + 1,
+            owner.id
+        );
+        match post_json_with_idempotency_key_expect_error(
+            client,
+            &owner.url,
+            path,
+            body.clone(),
+            idempotency_key,
+        )
+        .await
+        {
+            Ok(message)
+                if message.contains("\"code\":\"IDEMPOTENCY_CONFLICT\"")
+                    || message.contains("IdempotencyConflict")
+                    || message.contains("IDEMPOTENCY_CONFLICT") =>
+            {
+                return Ok(());
+            }
+            Ok(message)
+                if is_retryable_cluster_convergence_error(&anyhow!(message.clone()))
+                    && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>
+            {
+                eprintln!(
+                    "smoke: idempotency conflict check retry {} after convergence error: {message}",
+                    attempt + 1
+                );
+                last_error = Some(anyhow!(message));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok(message) => bail!("expected idempotency conflict, got {message}"),
+            Err(error)
+                if is_retryable_cluster_convergence_error(&error)
+                    && attempt + 1 < APPEND_RECOVERY_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("idempotency conflict check failed without a captured error")))
 }
 
 fn string_field(value: &Value, field: &str) -> Result<String> {
