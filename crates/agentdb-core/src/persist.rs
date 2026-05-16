@@ -1978,6 +1978,18 @@ impl Persist {
         Ok(out)
     }
 
+    pub fn get_idempotency(&self, full_key: &str) -> KvResult<Option<IdempotencyRecord>> {
+        let Some(raw) = self
+            .kv
+            .get(format!("record/idempotency/{full_key}").as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let rec: IdempotencyRecord = serde_json::from_slice(&raw)
+            .map_err(|err| StorageError::Other(format!("idempotency record decodes: {err}")))?;
+        Ok(Some(rec))
+    }
+
     pub async fn put_export_consumer_async(&self, consumer: &ExportConsumer) -> KvResult<()> {
         self.write_ops_async(vec![WriteOp::Put {
             key: export_consumer_key(consumer.tenant_id.as_str(), consumer.consumer_name.as_str())

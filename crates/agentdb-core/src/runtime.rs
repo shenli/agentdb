@@ -2606,6 +2606,20 @@ impl Runtime {
         Ok(())
     }
 
+    fn lookup_idempotency_record(&self, full_key: &str) -> Result<Option<IdempotencyRecord>> {
+        if let Some(rec) = self.idem.lookup(full_key) {
+            return Ok(Some(rec));
+        }
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(None);
+        };
+        let Some(rec) = persist.get_idempotency(full_key).map_err(internal)? else {
+            return Ok(None);
+        };
+        self.idem.put(full_key.to_string(), rec.clone());
+        Ok(Some(rec))
+    }
+
     fn resolve_key(&self, tenant_id: &Id, operation: KeyOperation) -> Result<KeyResolution> {
         self.kms
             .resolve_tenant_key(tenant_id.as_str(), operation)
@@ -5798,7 +5812,7 @@ impl Runtime {
         // Optimistic check before locking — fast path for retries that find a
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.idem.lookup(full) {
+            if let Some(rec) = self.lookup_idempotency_record(full)? {
                 return Ok(AppendCommitResponse {
                     appended: verify_idem_replay(&rec, &req)?,
                     recent: Vec::new(),
@@ -5823,6 +5837,17 @@ impl Runtime {
         if let Some(started) = session_lock_wait_started {
             path_sample.session_lock_wait_nanos = started.elapsed().as_nanos();
         }
+        if let Some(ref full) = idem_full_key {
+            if let Some(rec) = self.lookup_idempotency_record(full)? {
+                return Ok(AppendCommitResponse {
+                    appended: verify_idem_replay(&rec, &req)?,
+                    recent: Vec::new(),
+                    recent_complete: false,
+                    backpressure: BackpressureReport::default(),
+                    backpressure_complete: false,
+                });
+            }
+        }
         let persisted_session_max_seq = self
             .persist
             .as_ref()
@@ -5841,7 +5866,7 @@ impl Runtime {
         // another task could have committed our key between the optimistic check
         // and the lock acquisition above.
         if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.idem.lookup(full) {
+            if let Some(rec) = self.lookup_idempotency_record(full)? {
                 drop(s);
                 return Ok(AppendCommitResponse {
                     appended: verify_idem_replay(&rec, &req)?,
@@ -8763,6 +8788,70 @@ fn extract_selected_fields(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use agentdb_storage::{InMemoryContentBackend, InMemoryKvStore};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn append_replays_persisted_idempotency_after_cache_miss() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+        let mut req = AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "idempotent",
+            serde_json::json!({"v": 1}),
+        );
+        req.idempotency_key = Some("durable-retry".into());
+
+        let first = rt.append(req.clone()).await.unwrap();
+        assert_eq!(first.seq, 0);
+
+        let full_key = format!(
+            "{}::append::{}::durable-retry",
+            tenant.tenant_id, session.session_id
+        );
+        assert!(rt
+            .persist
+            .as_ref()
+            .unwrap()
+            .get_idempotency(&full_key)
+            .unwrap()
+            .is_some());
+        rt.idem.remove(&full_key);
+
+        let replay = rt.append(req.clone()).await.unwrap();
+        assert_eq!(replay.seq, first.seq);
+        assert_eq!(replay.event_id, first.event_id);
+
+        rt.idem.remove(&full_key);
+        let mut conflict = req;
+        conflict.payload = serde_json::json!({"v": 2});
+        let err = rt.append(conflict).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+
+        let events = rt
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant.tenant_id,
+                session_id: session.session_id,
+                from_seq: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 0);
+    }
 }
 
 /// Verify a stored idempotency record matches the incoming request and replay
