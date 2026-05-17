@@ -819,6 +819,12 @@ struct State {
     record_index_repair_candidates_total: u64,
     record_index_worker_failures_total: u64,
     global_record_index_apply_failures_total: u64,
+    /// Outbox mutations skipped because the referenced record row is missing
+    /// from both state.records and the persist layer (typically GC purged
+    /// it). Incrementing this avoids head-of-line-blocking the entire queue
+    /// behind one unreparable mutation; operators should alert on non-zero
+    /// values to detect the underlying state divergence.
+    record_index_outbox_skipped_total: u64,
     /// Counter behind [`mint_doc_id`]. Lives in `State` so the same
     /// state mutex serializes counter increments alongside record
     /// inserts.
@@ -3655,7 +3661,7 @@ impl Runtime {
         });
         let req_hash = hash_skill_register_request(&req);
         if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.idem.lookup(full) {
+            if let Some(rec) = self.lookup_idempotency_record(full)? {
                 return verify_json_replay(&rec, req_hash);
             }
         }
@@ -3663,7 +3669,7 @@ impl Runtime {
         let skill = {
             let mut s = self.state.lock().await;
             if let Some(ref full) = idem_full_key {
-                if let Some(rec) = self.idem.lookup(full) {
+                if let Some(rec) = self.lookup_idempotency_record(full)? {
                     drop(s);
                     return verify_json_replay(&rec, req_hash);
                 }
@@ -3870,7 +3876,7 @@ impl Runtime {
         });
         let req_hash = hash_skill_bind_request(&req);
         if let Some(ref full) = idem_full_key {
-            if let Some(rec) = self.idem.lookup(full) {
+            if let Some(rec) = self.lookup_idempotency_record(full)? {
                 return verify_json_replay(&rec, req_hash);
             }
         }
@@ -3878,7 +3884,7 @@ impl Runtime {
         let binding = {
             let mut s = self.state.lock().await;
             if let Some(ref full) = idem_full_key {
-                if let Some(rec) = self.idem.lookup(full) {
+                if let Some(rec) = self.lookup_idempotency_record(full)? {
                     drop(s);
                     return verify_json_replay(&rec, req_hash);
                 }
@@ -7375,6 +7381,7 @@ pub struct RecordIndexStats {
     pub local_index_repair_candidates_total: u64,
     pub record_index_worker_failures_total: u64,
     pub global_index_apply_failures_total: u64,
+    pub record_index_outbox_skipped_total: u64,
 }
 
 impl Runtime {
@@ -7585,6 +7592,33 @@ impl Runtime {
         s.global_record_index_watermark = global_watermark;
     }
 
+    /// Like [`simulate_record_state_gap_for_test`] but also purges the
+    /// persisted record row, modelling the case where GC removed the
+    /// record entirely while outbox mutations are still pending. Used by
+    /// the regression test that pins the head-of-line-blocking fix for
+    /// `apply_record_index_outbox_once`.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn simulate_record_full_purge_for_test(
+        &self,
+        record_id: &Id,
+        local_watermark: u64,
+        global_watermark: u64,
+    ) -> Result<()> {
+        let snapshot = {
+            let s = self.state.lock().await;
+            s.records.get(record_id.as_str()).cloned()
+        };
+        self.simulate_record_state_gap_for_test(record_id, local_watermark, global_watermark)
+            .await;
+        if let (Some(record), Some(persist)) = (snapshot, self.persist.as_ref()) {
+            persist
+                .purge_record(&record, "test-simulated-purge", 0)
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn record_index_outbox_counts_for_test(&self) -> Result<(usize, usize)> {
@@ -7616,6 +7650,7 @@ impl Runtime {
             local_index_repair_candidates_total: s.record_index_repair_candidates_total,
             record_index_worker_failures_total: s.record_index_worker_failures_total,
             global_index_apply_failures_total: s.global_record_index_apply_failures_total,
+            record_index_outbox_skipped_total: s.record_index_outbox_skipped_total,
         }
     }
 
@@ -7639,7 +7674,20 @@ impl Runtime {
                 && !s.records.contains_key(&mutation.record_id)
             {
                 let Some(record) = persisted_record.clone() else {
-                    return Ok(applied);
+                    // Record is gone from both state.records and persist
+                    // (typically purged by GC out from under the queue).
+                    // Skip past this mutation rather than head-of-line-block
+                    // every subsequent record's index visibility. Advance
+                    // both watermarks past the broken commit_seq so we do
+                    // not re-encounter it on every wake. Bump a counter so
+                    // operators can detect the underlying divergence.
+                    s.record_index_outbox_skipped_total += 1;
+                    let skipped_seq = mutation.commit_seq;
+                    s.local_record_index_watermark =
+                        s.local_record_index_watermark.max(skipped_seq);
+                    s.global_record_index_watermark =
+                        s.global_record_index_watermark.max(skipped_seq);
+                    continue;
                 };
                 s.record_commit_seq
                     .insert(mutation.record_id.clone(), mutation.commit_seq);
@@ -7654,7 +7702,19 @@ impl Runtime {
                             mutation.commit_seq,
                             GlobalIndexMutationOp::Upsert,
                         )),
-                        None => return Ok(applied),
+                        None => {
+                            // Defensive: hydration above either inserted the
+                            // record or skipped+continued. Reaching None here
+                            // means state diverged under the lock — treat as
+                            // the same unreparable case rather than stall.
+                            s.record_index_outbox_skipped_total += 1;
+                            let skipped_seq = mutation.commit_seq;
+                            s.local_record_index_watermark =
+                                s.local_record_index_watermark.max(skipped_seq);
+                            s.global_record_index_watermark =
+                                s.global_record_index_watermark.max(skipped_seq);
+                            continue;
+                        }
                     },
                     RecordIndexMutationOp::Delete => Some(GlobalIndexMutation {
                         tenant_id: mutation.tenant_id.clone(),
@@ -7687,7 +7747,16 @@ impl Runtime {
             match mutation.op {
                 RecordIndexMutationOp::Upsert => {
                     let Some(record) = s.records.get(&mutation.record_id).cloned() else {
-                        return Ok(applied);
+                        // Defensive: state diverged under the lock. Skip
+                        // rather than stall, advance both watermarks so we
+                        // do not retry, and signal via the counter.
+                        s.record_index_outbox_skipped_total += 1;
+                        let skipped_seq = mutation.commit_seq;
+                        s.local_record_index_watermark =
+                            s.local_record_index_watermark.max(skipped_seq);
+                        s.global_record_index_watermark =
+                            s.global_record_index_watermark.max(skipped_seq);
+                        continue;
                     };
                     if record.deleted_at_ms.is_some() || record.is_expired() {
                         s.local_record_index_watermark = mutation.commit_seq;
