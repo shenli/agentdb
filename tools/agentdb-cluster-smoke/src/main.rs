@@ -554,13 +554,19 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "32")
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
-        .env("AGENTDB_SCHEDULER_LEASE_MS", "30000")
+        // Lease + reaper margin raised to absorb the 60s meta-query stalls
+        // observed under SQL contention on compose Postgres (see
+        // docs/stability-findings-2026-05.md F_postgres_pool_starvation /
+        // F_LEUSS). Renewal cadence stays at 500ms so genuine ownership
+        // changes still propagate quickly; only the lease/expiry window
+        // grows to tolerate transient meta slowness.
+        .env("AGENTDB_SCHEDULER_LEASE_MS", "120000")
         .env(
             "AGENTDB_STALE_NODE_THRESHOLD_MS",
             SMOKE_STALE_NODE_THRESHOLD_MS.to_string(),
         )
         .env("AGENTDB_REAPER_TICK_MS", "500")
-        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "5000")
+        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "60000")
         .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
         .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")

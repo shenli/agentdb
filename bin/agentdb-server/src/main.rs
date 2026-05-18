@@ -30,11 +30,19 @@ const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
 const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
-const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
+// Scheduler lease + reaper safety margin sized so a transient meta-query
+// stall (observed up to 60s in compose smoke under SQL contention,
+// docs/stability-findings-2026-05.md F_postgres_pool_starvation) does not
+// expire the tablet ownership lease and trigger the reaper to clear it
+// (F_LEUSS). Headroom is 2× the worst observed stall on each side. This
+// is a tactical mitigation; the structural fix is to bound the renewal
+// path with per-query timeouts so the lease never depends on Postgres
+// availability.
+const DEFAULT_SCHEDULER_LEASE_MS: i64 = 120_000;
 const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
-const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
+const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 60_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
