@@ -213,21 +213,15 @@ pub async fn run(
         let changed = if request.dry_run {
             true
         } else {
-            let assigned = tablets::assign_to(pool, tablet.tablet_id, &target).await?;
+            let lease_expires_at_ms = assignment_lease_expires_at_ms(&request, now_ms);
+            let assigned =
+                tablets::assign_to_with_lease(pool, tablet.tablet_id, &target, lease_expires_at_ms)
+                    .await?;
             if assigned {
                 let target_replica = tablet_replicas::list_by_tablet(pool, tablet.tablet_id)
                     .await?
                     .into_iter()
                     .find(|replica| replica.node_id == target);
-                let lease_expires_at_ms = assignment_lease_expires_at_ms(&request, now_ms);
-                tablets::assume_ownership(
-                    pool,
-                    tablet.tablet_id,
-                    tablet.epoch,
-                    &target,
-                    lease_expires_at_ms,
-                )
-                .await?;
                 tablet_replicas::upsert(
                     pool,
                     tablet.tablet_id,
@@ -1061,6 +1055,7 @@ mod tests {
             .any(|replica| replica.role == "voter" && replica.health == "healthy"));
         let assigned = tablets::get(&p, 4).await.unwrap().unwrap();
         assert!(assigned.lease_expires_at_ms > 2_000);
+        assert_eq!(assigned.epoch, 1);
     }
 
     #[tokio::test]
@@ -1099,6 +1094,8 @@ mod tests {
         }));
         let tablet = tablets::get(&p, 7).await.unwrap().unwrap();
         assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert!(tablet.lease_expires_at_ms > 2_000);
+        assert_eq!(tablet.epoch, 1);
         let owner_replica = tablet_replicas::list_by_tablet(&p, 7)
             .await
             .unwrap()
