@@ -24,4 +24,13 @@ pub enum MetaError {
     /// length. Should never happen absent DB tampering.
     #[error("invariant violation: {0}")]
     Invariant(String),
+
+    /// A meta-layer query exceeded its caller-supplied timeout.
+    /// Distinguishes "the meta layer is contended and we should
+    /// retry on the next tick" from "the query returned an actual
+    /// error". Used by the scheduler's renewal path to bound the
+    /// worst-case lease-refresh wall-clock so a sustained Postgres
+    /// stall does not expire tablet ownership leases under load.
+    #[error("meta query timed out: {0}")]
+    Timeout(String),
 }

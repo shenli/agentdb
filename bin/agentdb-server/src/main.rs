@@ -30,11 +30,24 @@ const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
 const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
-const DEFAULT_SCHEDULER_LEASE_MS: i64 = 30_000;
+// Scheduler lease + reaper safety margin sized so a transient meta-query
+// stall (observed up to 60s in compose smoke under SQL contention,
+// docs/stability-findings-2026-05.md F_postgres_pool_starvation) does not
+// expire the tablet ownership lease and trigger the reaper to clear it
+// (F_LEUSS). Headroom is 2× the worst observed stall on each side. This
+// is a tactical mitigation; the structural fix is to bound the renewal
+// path with per-query timeouts so the lease never depends on Postgres
+// availability.
+const DEFAULT_SCHEDULER_LEASE_MS: i64 = 120_000;
 const DEFAULT_SCHEDULER_RENEW_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_REAPER_TICK_MS: u64 = 10_000;
-const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 5_000;
+const DEFAULT_REAPER_SAFETY_MARGIN_MS: i64 = 60_000;
+// Wall-clock cap on each renewal-critical meta query. Set well below the
+// scheduler renewal interval so a contended meta layer cannot stall the
+// lease-refresh path long enough to lose ownership. Tuneable via env so
+// operators on slow-link Postgres can raise it without rebuilding.
+const DEFAULT_RENEWAL_QUERY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_REBALANCE_MAX_MOVEMENTS: usize = 8;
 const DEFAULT_TABLET_MOVEMENT_BATCH_SIZE: i64 = 64;
 const DEFAULT_TABLET_MOVEMENT_EXECUTOR_INTERVAL_MS: u64 = 5_000;
@@ -787,6 +800,7 @@ struct ClusterWorkerConfig {
     stale_node_threshold_ms: i64,
     reaper_tick_ms: u64,
     reaper_safety_margin_ms: i64,
+    renewal_query_timeout_ms: u64,
     rebalance_max_movements: usize,
     tablet_movement_batch_size: i64,
     tablet_movement_executor_interval_ms: u64,
@@ -829,6 +843,11 @@ impl ClusterWorkerConfig {
                 DEFAULT_REAPER_SAFETY_MARGIN_MS,
             )
             .max(0),
+            renewal_query_timeout_ms: env_u64(
+                "AGENTDB_RENEWAL_QUERY_TIMEOUT_MS",
+                DEFAULT_RENEWAL_QUERY_TIMEOUT_MS,
+            )
+            .max(100),
             rebalance_max_movements: env_usize(
                 "AGENTDB_REBALANCE_MAX_MOVEMENTS",
                 DEFAULT_REBALANCE_MAX_MOVEMENTS,
@@ -3752,8 +3771,14 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
-    let renewed_local =
-        renew_local_tablet_ownership(meta, node_id, now_ms, config.scheduler_lease_ms).await?;
+    let renewed_local = renew_local_tablet_ownership(
+        meta,
+        node_id,
+        now_ms,
+        config.scheduler_lease_ms,
+        config.renewal_query_timeout_ms,
+    )
+    .await?;
     if renewed_local > 0 {
         tracing::debug!(
             node_id = %node_id,
@@ -4058,32 +4083,82 @@ async fn reconcile_raft_leader_tablet_ownership(
     Ok(aligned)
 }
 
+/// Bound a renewal-critical meta query so a contended Postgres cannot
+/// stall lease refresh. Returns `MetaError::Timeout` when the budget is
+/// exceeded so callers can treat that distinctly from real query errors.
+async fn with_renewal_timeout<F, T>(
+    timeout_ms: u64,
+    label: &'static str,
+    fut: F,
+) -> agentdb_meta::MetaResult<T>
+where
+    F: std::future::Future<Output = agentdb_meta::MetaResult<T>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
+        Ok(result) => result,
+        Err(_) => Err(agentdb_meta::MetaError::Timeout(format!(
+            "{label} exceeded {timeout_ms}ms; meta layer likely contended"
+        ))),
+    }
+}
+
 async fn renew_local_tablet_ownership(
     meta: &agentdb_meta::MetaStore,
     node_id: &str,
     now_ms: i64,
     lease_ms: i64,
+    query_timeout_ms: u64,
 ) -> agentdb_meta::MetaResult<usize> {
     let mut renewed = 0usize;
     let renew_threshold_ms = now_ms.saturating_add(lease_ms / 2);
-    for tablet in agentdb_meta::tablets::list_owned_by(meta.pool(), node_id).await? {
+    // List the tablets we own. Bounded so a stalled meta layer cannot
+    // hold the whole renewal path open until the lease expires.
+    let owned = match with_renewal_timeout(
+        query_timeout_ms,
+        "tablets::list_owned_by",
+        agentdb_meta::tablets::list_owned_by(meta.pool(), node_id),
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(agentdb_meta::MetaError::Timeout(reason)) => {
+            tracing::warn!(node_id = %node_id, reason, "renewal list_owned_by timed out");
+            return Ok(0);
+        }
+        Err(other) => return Err(other),
+    };
+    for tablet in owned {
         if !tablet_state_keeps_raft_owner(&tablet.state) {
             continue;
         }
         if tablet.lease_expires_at_ms > renew_threshold_ms {
             continue;
         }
-        match agentdb_meta::tablets::assume_ownership(
-            meta.pool(),
-            tablet.tablet_id,
-            tablet.epoch,
-            node_id,
-            now_ms + lease_ms,
+        // Per-tablet renewal also bounded. A stall on one tablet must not
+        // block renewal of the others; on Timeout we keep going.
+        match with_renewal_timeout(
+            query_timeout_ms,
+            "tablets::assume_ownership",
+            agentdb_meta::tablets::assume_ownership(
+                meta.pool(),
+                tablet.tablet_id,
+                tablet.epoch,
+                node_id,
+                now_ms + lease_ms,
+            ),
         )
         .await
         {
             Ok(_) => renewed += 1,
             Err(agentdb_meta::MetaError::Conflict(_)) => {}
+            Err(agentdb_meta::MetaError::Timeout(reason)) => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    tablet_id = tablet.tablet_id,
+                    reason,
+                    "renewal assume_ownership timed out for this tablet"
+                );
+            }
             Err(error) => return Err(error),
         }
     }
@@ -5375,6 +5450,64 @@ mod tests {
     };
     use agentdb_storage::ReplicatedLog;
 
+    /// Pins the structural fix for F_postgres_pool_starvation /
+    /// F_LEUSS. A meta query that hangs longer than the renewal
+    /// budget must surface as `MetaError::Timeout` rather than
+    /// blocking the future indefinitely. Without this bound the
+    /// scheduler tick would await the slow query, the lease would
+    /// expire, and the reaper would clear tablet ownership.
+    #[tokio::test(start_paused = true)]
+    async fn with_renewal_timeout_returns_timeout_on_slow_query() {
+        let result: agentdb_meta::MetaResult<()> = with_renewal_timeout(
+            10,
+            "test::hang_forever",
+            async {
+                // Future never resolves; we rely on the timeout
+                // wrapper to abort it.
+                std::future::pending::<agentdb_meta::MetaResult<()>>().await
+            },
+        )
+        .await;
+        match result {
+            Err(agentdb_meta::MetaError::Timeout(msg)) => {
+                assert!(msg.contains("test::hang_forever"));
+                assert!(msg.contains("10ms"));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    /// A query that completes within budget must pass through
+    /// unchanged — the timeout wrapper is fail-fast under contention,
+    /// not a delay or transform on the happy path.
+    #[tokio::test(start_paused = true)]
+    async fn with_renewal_timeout_passes_through_fast_query() {
+        let result: agentdb_meta::MetaResult<u32> = with_renewal_timeout(
+            5_000,
+            "test::fast",
+            async { Ok(42u32) },
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    /// A query that returns a non-timeout error must surface that
+    /// error unchanged. The wrapper must not convert real errors
+    /// into Timeout — operators need to distinguish them.
+    #[tokio::test(start_paused = true)]
+    async fn with_renewal_timeout_preserves_real_errors() {
+        let result: agentdb_meta::MetaResult<()> = with_renewal_timeout(
+            5_000,
+            "test::conflict",
+            async { Err(agentdb_meta::MetaError::Conflict("bad".into())) },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(agentdb_meta::MetaError::Conflict(_))
+        ));
+    }
+
     fn base_opts() -> ServeOpts {
         ServeOpts {
             config: None,
@@ -5410,6 +5543,7 @@ mod tests {
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 0,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -5973,6 +6107,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -6044,6 +6179,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -6094,6 +6230,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -6413,6 +6550,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -6477,6 +6615,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
@@ -6560,6 +6699,7 @@ region = "us-west-2"
             stale_node_threshold_ms: 1_000,
             reaper_tick_ms: 10_000,
             reaper_safety_margin_ms: 0,
+            renewal_query_timeout_ms: 5_000,
             rebalance_max_movements: 8,
             tablet_movement_batch_size: 64,
             tablet_movement_executor_interval_ms: 5_000,
