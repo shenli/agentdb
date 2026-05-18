@@ -10,7 +10,7 @@ services:
     command:
       - postgres
       - -c
-      - max_connections=${AGENTDB_CLUSTER_SMOKE_POSTGRES_MAX_CONNECTIONS:-200}
+      - max_connections=${AGENTDB_CLUSTER_SMOKE_POSTGRES_MAX_CONNECTIONS:-400}
     environment:
       POSTGRES_USER: ${AGENTDB_CLUSTER_SMOKE_POSTGRES_USER:-agentdb}
       POSTGRES_PASSWORD: ${AGENTDB_CLUSTER_SMOKE_POSTGRES_PASSWORD:-agentdb}
