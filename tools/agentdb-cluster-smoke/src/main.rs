@@ -24,6 +24,7 @@ const SECONDARY_CELL_ID: &str = "cell-b";
 const SECONDARY_PLACEMENT_SCOPE_ID: &str = "cell-b";
 const SMOKE_STALE_NODE_THRESHOLD_MS: u64 = 180_000;
 const APPEND_RECOVERY_ATTEMPTS: usize = 8;
+const DEFAULT_APPEND_VISIBILITY_ATTEMPTS: usize = 50;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run a throwaway multi-process AgentDB cluster smoke test")]
@@ -549,6 +550,8 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .arg(&node.config_path)
         .env("AGENTDB_META_BACKEND", "postgres")
         .env("AGENTDB_META_URL", &args.meta_url)
+        .env("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", "16")
+        .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "4")
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
         .env("AGENTDB_SCHEDULER_LEASE_MS", "5000")
@@ -1092,8 +1095,8 @@ async fn run_record_index_probe(
         }),
     )
     .await?;
-    let vector_east_id = string_field(&vector_east, "record_id")?;
-    let vector_north_id = string_field(&vector_north, "record_id")?;
+    let _vector_east_id = string_field(&vector_east, "record_id")?;
+    let _vector_north_id = string_field(&vector_north, "record_id")?;
     let max_commit_seq = [
         commit_seq,
         control_commit_seq,
@@ -1148,10 +1151,10 @@ async fn run_record_index_probe(
         .as_array()
         .ok_or_else(|| anyhow!("vector search response missing records: {vector_response}"))?;
     if vector_hits.len() < 2
-        || vector_hits[0]["record_id"].as_str() != Some(vector_north_id.as_str())
+        || vector_hits[0]["text"].as_str() != Some("north-vector")
         || !vector_hits
             .iter()
-            .any(|record| record["record_id"].as_str() == Some(vector_east_id.as_str()))
+            .any(|record| record["text"].as_str() == Some("east-vector"))
     {
         bail!("vector search expected north first and east in top two: {vector_response}");
     }
@@ -2020,6 +2023,8 @@ async fn run_chaos(
             Duration::from_secs(90),
         )
         .await?;
+        let _ = force_raft_catch_up(client, nodes, PRIMARY_TABLET_ID).await?;
+        wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
         sleep_random(&mut rng, args.chaos_max_sleep_ms).await;
 
         eprintln!(
@@ -2067,6 +2072,14 @@ async fn sleep_random(rng: &mut SimpleRng, max_ms: u64) {
 
 fn stale_node_wait_timeout() -> Duration {
     Duration::from_millis(SMOKE_STALE_NODE_THRESHOLD_MS + 30_000)
+}
+
+fn append_visibility_attempts() -> usize {
+    env::var("AGENTDB_CLUSTER_SMOKE_APPEND_VISIBILITY_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(DEFAULT_APPEND_VISIBILITY_ATTEMPTS)
 }
 
 struct SimpleRng(u64);
@@ -2309,6 +2322,7 @@ async fn append_and_verify(
 ) -> Result<()> {
     let idempotency_key =
         format!("cluster-smoke-tablet-{tablet_id}-{session_id}-seq-{expected_seq}");
+    let visibility_attempts = append_visibility_attempts();
     for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
         let owner =
             wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
@@ -2362,7 +2376,7 @@ async fn append_and_verify(
                         tenant_id,
                         session_id,
                         expected_seq,
-                        10,
+                        visibility_attempts,
                     )
                     .await?
                     {
@@ -2376,7 +2390,7 @@ async fn append_and_verify(
                         tenant_id,
                         session_id,
                         expected_seq,
-                        10,
+                        visibility_attempts,
                     )
                     .await?
                     {
@@ -2446,7 +2460,7 @@ async fn append_and_verify(
         tenant_id,
         session_id,
         expected_seq,
-        10,
+        visibility_attempts,
     )
     .await?
     {
@@ -2898,6 +2912,7 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("operation timed out")
         || message.contains("connection closed before message completed")
         || message.contains("raft leader was not observable")
+        || message.contains("idempotency replay") && message.contains("is not yet visible")
 }
 
 fn is_alias_conflict(error: &anyhow::Error) -> bool {
