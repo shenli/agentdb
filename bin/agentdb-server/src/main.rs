@@ -3752,6 +3752,23 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
+    if let Some(registry) = raft_registry {
+        let renewed = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+            false,
+        )
+        .await?;
+        if renewed > 0 {
+            tracing::debug!(
+                node_id = %node_id,
+                renewed,
+                "renewed local tablet ownership with matching raft leaders"
+            );
+        }
+    }
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
         Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
             agentdb_meta::scheduler::renew(
@@ -3804,6 +3821,7 @@ async fn run_cluster_scheduler_tick(
             registry,
             now_ms,
             config.scheduler_lease_ms,
+            true,
         )
         .await?;
         if aligned > 0 {
@@ -3955,6 +3973,7 @@ async fn reconcile_raft_leader_tablet_ownership(
     registry: &agentdb_api::raft_ingress::RaftRsGroupRegistry,
     now_ms: i64,
     lease_ms: i64,
+    allow_owner_transfer: bool,
 ) -> agentdb_meta::MetaResult<usize> {
     let mut aligned = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
@@ -3988,6 +4007,9 @@ async fn reconcile_raft_leader_tablet_ownership(
             continue;
         }
         let same_owner = tablet.owner_node_id.as_deref() == Some(leader_replica.node_id.as_str());
+        if !allow_owner_transfer && !same_owner {
+            continue;
+        }
         let renew_threshold_ms = now_ms.saturating_add(lease_ms / 2);
         if same_owner && tablet.lease_expires_at_ms > renew_threshold_ms {
             continue;
@@ -6111,6 +6133,79 @@ region = "us-west-2"
     }
 
     #[tokio::test]
+    async fn scheduler_follower_renews_matching_local_raft_owner() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            1_000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 2_500)
+            .await
+            .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(local_raft_node_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        run_cluster_scheduler_tick(
+            &meta,
+            "node-b",
+            2_000,
+            lifecycle_config(0, 0),
+            &status,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.lease_expires_at_ms, 32_000);
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_leader);
+        assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
     async fn scheduler_leader_reconciles_local_raft_leader_ownership() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -6875,7 +6970,7 @@ region = "us-west-2"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
 
-        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000, true)
             .await
             .unwrap();
 
@@ -6956,7 +7051,7 @@ region = "us-west-2"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
 
-        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000, true)
             .await
             .unwrap();
 
@@ -7012,7 +7107,7 @@ region = "us-west-2"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
 
-        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+        let aligned = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000, true)
             .await
             .unwrap();
 
@@ -7071,7 +7166,7 @@ region = "us-west-2"
         let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
         registry.register(7, group).unwrap();
 
-        let renewed = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000)
+        let renewed = reconcile_raft_leader_tablet_ownership(&meta, &registry, 2_000, 30_000, true)
             .await
             .unwrap();
 
