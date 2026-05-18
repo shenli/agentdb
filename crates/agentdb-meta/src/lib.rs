@@ -97,7 +97,7 @@ fn install_any_drivers() {
     });
 }
 
-fn env_usize(name: &str, default: u32) -> u32 {
+fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|raw| raw.parse::<u32>().ok())
@@ -171,8 +171,8 @@ impl MetaStore {
     /// open.
     pub async fn open_postgres(url: &str) -> MetaResult<Self> {
         install_any_drivers();
-        let any_max_connections = env_usize("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", 6);
-        let pg_max_connections = env_usize("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", 2);
+        let any_max_connections = env_u32("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", 16);
+        let pg_max_connections = env_u32("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", 4);
         let postgres = PgPoolOptions::new()
             .max_connections(pg_max_connections)
             .connect(url)

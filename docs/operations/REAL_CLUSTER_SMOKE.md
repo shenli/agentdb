@@ -111,8 +111,8 @@ mc mb --ignore-existing agentdb-smoke/agentdb-smoke
 
 ```bash
 export AGENTDB_META_URL=postgres://agentdb:agentdb@127.0.0.1:5432/agentdb_smoke
-export AGENTDB_META_ANY_POOL_MAX_CONNECTIONS=6
-export AGENTDB_META_PG_POOL_MAX_CONNECTIONS=2
+export AGENTDB_META_ANY_POOL_MAX_CONNECTIONS=16
+export AGENTDB_META_PG_POOL_MAX_CONNECTIONS=4
 export AGENTDB_S3_ENDPOINT=http://127.0.0.1:9000
 export AGENTDB_S3_BUCKET=agentdb-smoke
 export AWS_ACCESS_KEY_ID=minioadmin
