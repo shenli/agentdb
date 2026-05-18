@@ -3921,6 +3921,24 @@ async fn run_cluster_scheduler_tick(
                     "scheduler converged raft membership for rebalance"
                 );
             }
+            if changed_count > 0 {
+                let aligned = reconcile_raft_leader_tablet_ownership(
+                    meta,
+                    registry,
+                    now_ms,
+                    config.scheduler_lease_ms,
+                    true,
+                )
+                .await?;
+                if aligned > 0 {
+                    status.add_tablet_reassignments(aligned as u64);
+                    tracing::info!(
+                        node_id = %node_id,
+                        aligned,
+                        "scheduler realigned rebalance ownership with raft leaders"
+                    );
+                }
+            }
         }
         if changed_count > 0 {
             status.add_tablet_reassignments(changed_count as u64);
