@@ -2478,7 +2478,7 @@ async fn event_count_from_base(
     let events = get_json(
         client,
         base,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=100"),
     )
     .await?;
     Ok(events
