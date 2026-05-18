@@ -1095,8 +1095,8 @@ async fn run_record_index_probe(
         }),
     )
     .await?;
-    let vector_east_id = string_field(&vector_east, "record_id")?;
-    let vector_north_id = string_field(&vector_north, "record_id")?;
+    let _vector_east_id = string_field(&vector_east, "record_id")?;
+    let _vector_north_id = string_field(&vector_north, "record_id")?;
     let max_commit_seq = [
         commit_seq,
         control_commit_seq,
@@ -1151,10 +1151,10 @@ async fn run_record_index_probe(
         .as_array()
         .ok_or_else(|| anyhow!("vector search response missing records: {vector_response}"))?;
     if vector_hits.len() < 2
-        || vector_hits[0]["record_id"].as_str() != Some(vector_north_id.as_str())
+        || vector_hits[0]["text"].as_str() != Some("north-vector")
         || !vector_hits
             .iter()
-            .any(|record| record["record_id"].as_str() == Some(vector_east_id.as_str()))
+            .any(|record| record["text"].as_str() == Some("east-vector"))
     {
         bail!("vector search expected north first and east in top two: {vector_response}");
     }
