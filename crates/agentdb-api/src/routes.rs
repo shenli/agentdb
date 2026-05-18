@@ -3589,6 +3589,25 @@ async fn complete_admin_tablet_replacement(
                     "failed to observe raft membership promotion: {err}"
                 ))
             })?;
+            let mut statuses_after_promote = statuses_after_promote;
+            if statuses_after_promote
+                .iter()
+                .any(|status| status.pending_conf_change)
+                && wait_for_raft_membership_idle(
+                    &s,
+                    meta,
+                    registry,
+                    tablet_id,
+                    Duration::from_secs(5),
+                )
+                .await?
+            {
+                statuses_after_promote = registry.status_for(tablet_id).map_err(|err| {
+                    internal_error(format!(
+                        "failed to observe raft membership promotion: {err}"
+                    ))
+                })?;
+            }
             if statuses_after_promote
                 .iter()
                 .any(|status| status.pending_conf_change)
@@ -3695,6 +3714,23 @@ async fn complete_admin_tablet_replacement(
             let statuses_after_transfer = registry.status_for(tablet_id).map_err(|err| {
                 internal_error(format!("failed to observe raft membership transfer: {err}"))
             })?;
+            let mut statuses_after_transfer = statuses_after_transfer;
+            if statuses_after_transfer
+                .iter()
+                .any(|status| status.pending_conf_change)
+                && wait_for_raft_membership_idle(
+                    &s,
+                    meta,
+                    registry,
+                    tablet_id,
+                    Duration::from_secs(5),
+                )
+                .await?
+            {
+                statuses_after_transfer = registry.status_for(tablet_id).map_err(|err| {
+                    internal_error(format!("failed to observe raft membership transfer: {err}"))
+                })?;
+            }
             if statuses_after_transfer
                 .iter()
                 .any(|status| status.pending_conf_change)
@@ -3726,6 +3762,32 @@ async fn complete_admin_tablet_replacement(
                     {
                         match registry.remove_node(tablet_id, leader_id, source_raft_node_id) {
                             Ok(()) => {
+                                if !wait_for_raft_membership_idle(
+                                    &s,
+                                    meta,
+                                    registry,
+                                    tablet_id,
+                                    Duration::from_secs(5),
+                                )
+                                .await?
+                                {
+                                    raft_membership_operations.push(
+                                        RaftMembershipOperationStatus {
+                                            tablet_id,
+                                            operation: "remove_node",
+                                            node_id: source_node_id.clone(),
+                                            raft_node_id: Some(source_raft_node_id),
+                                            status: "pending",
+                                            error: Some(
+                                                "raft membership change is still committing; retry replacement complete"
+                                                    .into(),
+                                            ),
+                                        },
+                                    );
+                                    return Err(internal_error(
+                                        "raft membership change is still pending; retry replacement complete",
+                                    ));
+                                }
                                 raft_membership_operations.push(RaftMembershipOperationStatus {
                                     tablet_id,
                                     operation: "remove_node",
@@ -3829,6 +3891,43 @@ async fn complete_admin_tablet_replacement(
         target_replica: tablet_replica_view(target_replica),
         catch_up: catch_up_response,
     }))
+}
+
+async fn wait_for_raft_membership_idle(
+    state: &AppState,
+    meta: &agentdb_meta::MetaStore,
+    registry: &crate::raft_ingress::RaftRsGroupRegistry,
+    tablet_id: i64,
+    timeout: Duration,
+) -> Result<bool, ApiError> {
+    let mut outbox = None;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let statuses = registry.status_for(tablet_id).map_err(|err| {
+            internal_error(format!("failed to observe raft membership change: {err}"))
+        })?;
+        if !statuses.iter().any(|status| status.pending_conf_change) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        if outbox.is_none() {
+            if let Some(token) = state.internal_auth_token.clone() {
+                let configured_by_tablet = load_configured_raft_replicas(Some(meta)).await?;
+                let candidate = RaftRsHttpOutbox::new(token);
+                candidate
+                    .replace_peer_urls(load_raft_peer_urls(meta, &configured_by_tablet).await?);
+                outbox = Some(candidate);
+            }
+        }
+        if let Some(outbox) = outbox.as_ref() {
+            outbox.flush_registry_once(registry).await.map_err(|err| {
+                internal_error(format!("failed to flush raft membership messages: {err}"))
+            })?;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn rebalance_admin_tablets(
