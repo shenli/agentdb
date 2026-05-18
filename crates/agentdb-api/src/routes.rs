@@ -60,8 +60,8 @@ use crate::internal_raft_http::{
 };
 use crate::routing_http::{
     route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_CELL_ID, HDR_FORWARDED_BY,
-    HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID,
-    HDR_TABLET_EPOCH, HDR_TABLET_ID,
+    HDR_OWNER_ADDRESS, HDR_OWNER_NODE, HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID,
+    HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_EPOCH, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -5753,22 +5753,28 @@ async fn append_event(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let (resp, backpressure) =
-        with_route_tablet_context(runtime.clone(), &route_headers, async move {
-            runtime
-                .append_with_backpressure(AppendRequest {
-                    tenant_id: append_tid,
-                    agent_id: aid,
-                    session_id: append_sid,
-                    kind: body.kind,
-                    payload: body.payload,
-                    artifact_refs: body.artifact_refs,
-                    source_refs: body.source_refs,
-                    idempotency_key: idem_key,
-                })
-                .await
-        })
-        .await?;
+    let append_result = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_with_backpressure(AppendRequest {
+                tenant_id: append_tid,
+                agent_id: aid,
+                session_id: append_sid,
+                kind: body.kind,
+                payload: body.payload,
+                artifact_refs: body.artifact_refs,
+                source_refs: body.source_refs,
+                idempotency_key: idem_key,
+            })
+            .await
+    })
+    .await;
+    let (resp, backpressure) = match append_result {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::RaftNotLeader => {
+            return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+        }
+        Err(error) => return Err(ApiError(error)),
+    };
     Ok(with_headers(
         json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
@@ -5820,26 +5826,32 @@ async fn append_and_fetch(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let (resp, backpressure) =
-        with_route_tablet_context(runtime.clone(), &route_headers, async move {
-            runtime
-                .append_and_fetch_with_backpressure(
-                    AppendRequest {
-                        tenant_id: append_tid,
-                        agent_id: aid,
-                        session_id: append_sid,
-                        kind: body.kind,
-                        payload: body.payload,
-                        artifact_refs: body.artifact_refs,
-                        source_refs: body.source_refs,
-                        idempotency_key: idem_key,
-                    },
-                    body.last,
-                    body.max_bytes,
-                )
-                .await
-        })
-        .await?;
+    let append_result = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_and_fetch_with_backpressure(
+                AppendRequest {
+                    tenant_id: append_tid,
+                    agent_id: aid,
+                    session_id: append_sid,
+                    kind: body.kind,
+                    payload: body.payload,
+                    artifact_refs: body.artifact_refs,
+                    source_refs: body.source_refs,
+                    idempotency_key: idem_key,
+                },
+                body.last,
+                body.max_bytes,
+            )
+            .await
+    })
+    .await;
+    let (resp, backpressure) = match append_result {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::RaftNotLeader => {
+            return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+        }
+        Err(error) => return Err(ApiError(error)),
+    };
     Ok(with_headers(
         json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
@@ -7169,6 +7181,66 @@ fn validate_forwarded_mutation(state: &AppState, headers: &HeaderMap) -> Result<
         .routing
         .validate_forwarded_epoch(headers)
         .map_err(|rejection| route_rejection_response(&rejection))
+}
+
+async fn raft_not_leader_response(
+    state: &AppState,
+    route_headers: &HeaderMap,
+    error: agentdb_core::Error,
+) -> Response {
+    let tablet_id = route_tablet_id(route_headers);
+    let mut leader_raft_node_id = None;
+    let mut owner_node_id = None;
+    let mut owner_address = None;
+    if let (Some(meta), Some(registry), Some(tablet_id)) =
+        (state.meta.as_ref(), state.raft_registry.as_ref(), tablet_id)
+    {
+        if let Ok(statuses) = registry.status_for(tablet_id) {
+            leader_raft_node_id = raft_leader_id_from_statuses(&statuses);
+        }
+        if let Some(leader_id) = leader_raft_node_id {
+            if let Ok(Some(node_id)) =
+                resolve_control_plane_node_id(meta, tablet_id, leader_id).await
+            {
+                owner_node_id = Some(node_id.clone());
+                if let Ok(Some(node)) = nodes::get(meta.pool(), &node_id).await {
+                    owner_address = Some(node.address);
+                }
+            }
+        }
+    }
+    let owner_node_header = owner_node_id
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok());
+    let owner_address_header = owner_address
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok());
+    let body = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": true,
+        "suggestion": error.suggestion
+            .unwrap_or_else(|| "retry the request against the raft leader advertised by the API".to_string()),
+        "tablet_id": tablet_id,
+        "leader_raft_node_id": leader_raft_node_id,
+        "owner_node_id": owner_node_id,
+        "owner_address": owner_address,
+    });
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    response.headers_mut().extend(route_headers.clone());
+    response.headers_mut().insert(
+        HDR_ROUTE_REASON,
+        HeaderValue::from_static("RAFT_NOT_LEADER"),
+    );
+    if let Some(owner_node_id) = owner_node_header {
+        response.headers_mut().insert(HDR_OWNER_NODE, owner_node_id);
+    }
+    if let Some(owner_address) = owner_address_header {
+        response
+            .headers_mut()
+            .insert(HDR_OWNER_ADDRESS, owner_address);
+    }
+    response
 }
 
 fn with_headers(mut response: Response, headers: HeaderMap) -> Response {

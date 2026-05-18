@@ -22,6 +22,7 @@ pub enum ErrorCode {
     PolicyDenied,
     NodeDraining,
     KeyUnavailable,
+    RaftNotLeader,
     InvalidCursor,
     RateLimited,
     Internal,
@@ -34,6 +35,7 @@ impl ErrorCode {
             ErrorCode::RateLimited
                 | ErrorCode::Internal
                 | ErrorCode::KeyUnavailable
+                | ErrorCode::RaftNotLeader
                 | ErrorCode::NodeDraining
         )
     }

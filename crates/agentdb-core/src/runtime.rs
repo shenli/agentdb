@@ -9260,9 +9260,15 @@ where
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the
-/// Error code surface stable.
+/// Most storage errors surface as `Internal`; Raft leadership misses are
+/// retry-routing signals, not generic server faults.
 fn internal(e: agentdb_storage::Error) -> Error {
-    Error::new(ErrorCode::Internal, e.to_string())
+    let message = e.to_string();
+    if message.contains("not leader for tablet") {
+        return Error::new(ErrorCode::RaftNotLeader, message)
+            .with_suggestion("retry the request against the raft leader advertised by the API");
+    }
+    Error::new(ErrorCode::Internal, message)
 }
 
 fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {
