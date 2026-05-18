@@ -551,16 +551,16 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .env("AGENTDB_META_BACKEND", "postgres")
         .env("AGENTDB_META_URL", &args.meta_url)
         .env("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", "16")
-        .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "4")
+        .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "16")
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
-        .env("AGENTDB_SCHEDULER_LEASE_MS", "5000")
+        .env("AGENTDB_SCHEDULER_LEASE_MS", "30000")
         .env(
             "AGENTDB_STALE_NODE_THRESHOLD_MS",
             SMOKE_STALE_NODE_THRESHOLD_MS.to_string(),
         )
         .env("AGENTDB_REAPER_TICK_MS", "500")
-        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "0")
+        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "5000")
         .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
         .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")

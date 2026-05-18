@@ -172,7 +172,7 @@ impl MetaStore {
     pub async fn open_postgres(url: &str) -> MetaResult<Self> {
         install_any_drivers();
         let any_max_connections = env_u32("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", 16);
-        let pg_max_connections = env_u32("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", 4);
+        let pg_max_connections = env_u32("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", 16);
         let postgres = PgPoolOptions::new()
             .max_connections(pg_max_connections)
             .connect(url)
