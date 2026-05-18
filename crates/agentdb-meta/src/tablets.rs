@@ -302,6 +302,35 @@ pub async fn assign_to(pool: &AnyPool, tablet_id: i64, node_id: &str) -> MetaRes
     Ok(rows > 0)
 }
 
+/// Atomically assign an unowned tablet to `node_id` with an initial live lease.
+/// Returns `true` when this call changed the row, or `false` when the tablet was
+/// already owned or absent.
+///
+/// Scheduler failover/rebalance paths use this instead of `assign_to` followed
+/// by `assume_ownership` so routing never observes an intermediate row with an
+/// owner but `lease_expires_at_ms = 0`.
+pub async fn assign_to_with_lease(
+    pool: &AnyPool,
+    tablet_id: i64,
+    node_id: &str,
+    lease_expires_at_ms: i64,
+) -> MetaResult<bool> {
+    let rows = sqlx::query(
+        "UPDATE tablets
+            SET owner_node_id = $1,
+                lease_expires_at_ms = $2,
+                epoch = epoch + 1
+          WHERE tablet_id = $3 AND owner_node_id IS NULL",
+    )
+    .bind(node_id)
+    .bind(lease_expires_at_ms)
+    .bind(tablet_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 /// Every tablet currently owned by `node_id`. Used by the
 /// per-node reconciler to discover tablets it should be running
 /// (see `agentdb_core::tablet_reconciler`).
@@ -843,6 +872,34 @@ mod tests {
         // race deleted the row between list and assign.
         let p = pool().await;
         assert!(!assign_to(&p, 999, "node-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn assign_to_with_lease_claims_unowned_and_makes_owner_live() {
+        let p = pool().await;
+        get_or_create(&p, 1, 100).await.unwrap();
+
+        assert!(assign_to_with_lease(&p, 1, "node-a", 30_000).await.unwrap());
+        let tablet = get(&p, 1).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(tablet.lease_expires_at_ms, 30_000);
+        assert_eq!(tablet.epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn assign_to_with_lease_skips_owned_or_unknown() {
+        let p = pool().await;
+        get_or_create(&p, 1, 100).await.unwrap();
+        assume_ownership(&p, 1, 0, "node-a", 5_000).await.unwrap();
+
+        assert!(!assign_to_with_lease(&p, 1, "node-b", 30_000).await.unwrap());
+        assert!(!assign_to_with_lease(&p, 999, "node-b", 30_000)
+            .await
+            .unwrap());
+        let tablet = get(&p, 1).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(tablet.lease_expires_at_ms, 5_000);
+        assert_eq!(tablet.epoch, 1);
     }
 
     #[tokio::test]

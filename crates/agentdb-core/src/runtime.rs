@@ -2652,13 +2652,14 @@ impl Runtime {
         Ok(Some(rec))
     }
 
-    fn replay_append_idempotency_record(
+    async fn replay_append_idempotency_record(
         &self,
         rec: &IdempotencyRecord,
         req: &AppendRequest,
     ) -> Result<AppendCommitResponse> {
         let appended = verify_idem_replay(rec, req)?;
-        self.verify_append_replay_event_visible(req, &appended)?;
+        self.verify_append_replay_event_visible(req, &appended)
+            .await?;
         Ok(AppendCommitResponse {
             appended,
             recent: Vec::new(),
@@ -2668,7 +2669,7 @@ impl Runtime {
         })
     }
 
-    fn verify_append_replay_event_visible(
+    async fn verify_append_replay_event_visible(
         &self,
         req: &AppendRequest,
         appended: &AppendResponse,
@@ -2676,14 +2677,17 @@ impl Runtime {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
-        let Some(event) = persist
-            .get_event(
+        let event = persist
+            .scan_events(
                 req.tenant_id.as_str(),
                 req.session_id.as_str(),
                 appended.seq,
+                1,
             )
             .map_err(internal)?
-        else {
+            .into_iter()
+            .find(|event| event.seq == appended.seq);
+        let Some(event) = event else {
             return Err(Error::new(
                 ErrorCode::Internal,
                 format!(
@@ -2702,6 +2706,14 @@ impl Runtime {
                 ),
             ));
         }
+        let mut state = self.state.lock().await;
+        reconcile_session_next_seq_from_persisted_events(
+            &mut state,
+            &req.tenant_id,
+            &req.session_id,
+            appended.seq,
+        )?;
+        insert_runtime_event_cache(&mut state, true, req.session_id.as_str(), event);
         Ok(())
     }
 
@@ -5898,7 +5910,7 @@ impl Runtime {
         // committed result without contending on the state mutex.
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return self.replay_append_idempotency_record(&rec, &req);
+                return self.replay_append_idempotency_record(&rec, &req).await;
             }
         }
 
@@ -5918,7 +5930,7 @@ impl Runtime {
         }
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
-                return self.replay_append_idempotency_record(&rec, &req);
+                return self.replay_append_idempotency_record(&rec, &req).await;
             }
         }
         let persisted_session_max_seq = self
@@ -5941,7 +5953,7 @@ impl Runtime {
         if let Some(ref full) = idem_full_key {
             if let Some(rec) = self.lookup_idempotency_record(full)? {
                 drop(s);
-                return self.replay_append_idempotency_record(&rec, &req);
+                return self.replay_append_idempotency_record(&rec, &req).await;
             }
         }
         if let Some(max_seq) = persisted_session_max_seq {
@@ -9063,6 +9075,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_idempotency_replay_repairs_session_visibility_gap() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+        let mut req = AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "idempotent",
+            serde_json::json!({"v": 1}),
+        );
+        req.idempotency_key = Some("durable-retry-state-gap".into());
+
+        let first = rt.append(req.clone()).await.unwrap();
+        assert_eq!(first.seq, 0);
+        let full_key = format!(
+            "{}::append::{}::durable-retry-state-gap",
+            tenant.tenant_id, session.session_id
+        );
+        rt.idem.remove(&full_key);
+        {
+            let mut state = rt.state.lock().await;
+            state
+                .events
+                .remove(&(session.session_id.as_str().to_string(), 0));
+            state
+                .sessions
+                .get_mut(session.session_id.as_str())
+                .unwrap()
+                .next_seq = 0;
+        }
+
+        let replay = rt.append(req).await.unwrap();
+        assert_eq!(replay.seq, 0);
+        let events = rt
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                session_id: session.session_id.clone(),
+                from_seq: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 0);
+    }
+
+    #[tokio::test]
     async fn append_does_not_reuse_persisted_seq_after_stale_session_state() {
         let kv = Arc::new(InMemoryKvStore::new());
         let content = Arc::new(InMemoryContentBackend::default());
@@ -9198,9 +9260,15 @@ where
 
 /// Map a storage-layer error into a V2 `Internal` error. The persist layer
 /// returns `agentdb_storage::Error`; surfacing it as `Internal` keeps the
-/// Error code surface stable.
+/// Most storage errors surface as `Internal`; Raft leadership misses are
+/// retry-routing signals, not generic server faults.
 fn internal(e: agentdb_storage::Error) -> Error {
-    Error::new(ErrorCode::Internal, e.to_string())
+    let message = e.to_string();
+    if message.contains("not leader for tablet") {
+        return Error::new(ErrorCode::RaftNotLeader, message)
+            .with_suggestion("retry the request against the raft leader advertised by the API");
+    }
+    Error::new(ErrorCode::Internal, message)
 }
 
 fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Option<KeyResolution> {

@@ -60,8 +60,8 @@ use crate::internal_raft_http::{
 };
 use crate::routing_http::{
     route_rejection_response, ForwardRequest, RouteGuardOutcome, HDR_CELL_ID, HDR_FORWARDED_BY,
-    HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID, HDR_ROUTE_REASON, HDR_SHARD_ID,
-    HDR_TABLET_EPOCH, HDR_TABLET_ID,
+    HDR_OWNER_ADDRESS, HDR_OWNER_NODE, HDR_PLACEMENT_SCOPE_ID, HDR_PREALLOCATED_SESSION_ID,
+    HDR_ROUTE_REASON, HDR_SHARD_ID, HDR_TABLET_EPOCH, HDR_TABLET_ID,
 };
 use crate::state::AppState;
 
@@ -3589,6 +3589,25 @@ async fn complete_admin_tablet_replacement(
                     "failed to observe raft membership promotion: {err}"
                 ))
             })?;
+            let mut statuses_after_promote = statuses_after_promote;
+            if statuses_after_promote
+                .iter()
+                .any(|status| status.pending_conf_change)
+                && wait_for_raft_membership_idle(
+                    &s,
+                    meta,
+                    registry,
+                    tablet_id,
+                    Duration::from_secs(5),
+                )
+                .await?
+            {
+                statuses_after_promote = registry.status_for(tablet_id).map_err(|err| {
+                    internal_error(format!(
+                        "failed to observe raft membership promotion: {err}"
+                    ))
+                })?;
+            }
             if statuses_after_promote
                 .iter()
                 .any(|status| status.pending_conf_change)
@@ -3695,6 +3714,23 @@ async fn complete_admin_tablet_replacement(
             let statuses_after_transfer = registry.status_for(tablet_id).map_err(|err| {
                 internal_error(format!("failed to observe raft membership transfer: {err}"))
             })?;
+            let mut statuses_after_transfer = statuses_after_transfer;
+            if statuses_after_transfer
+                .iter()
+                .any(|status| status.pending_conf_change)
+                && wait_for_raft_membership_idle(
+                    &s,
+                    meta,
+                    registry,
+                    tablet_id,
+                    Duration::from_secs(5),
+                )
+                .await?
+            {
+                statuses_after_transfer = registry.status_for(tablet_id).map_err(|err| {
+                    internal_error(format!("failed to observe raft membership transfer: {err}"))
+                })?;
+            }
             if statuses_after_transfer
                 .iter()
                 .any(|status| status.pending_conf_change)
@@ -3726,6 +3762,32 @@ async fn complete_admin_tablet_replacement(
                     {
                         match registry.remove_node(tablet_id, leader_id, source_raft_node_id) {
                             Ok(()) => {
+                                if !wait_for_raft_membership_idle(
+                                    &s,
+                                    meta,
+                                    registry,
+                                    tablet_id,
+                                    Duration::from_secs(5),
+                                )
+                                .await?
+                                {
+                                    raft_membership_operations.push(
+                                        RaftMembershipOperationStatus {
+                                            tablet_id,
+                                            operation: "remove_node",
+                                            node_id: source_node_id.clone(),
+                                            raft_node_id: Some(source_raft_node_id),
+                                            status: "pending",
+                                            error: Some(
+                                                "raft membership change is still committing; retry replacement complete"
+                                                    .into(),
+                                            ),
+                                        },
+                                    );
+                                    return Err(internal_error(
+                                        "raft membership change is still pending; retry replacement complete",
+                                    ));
+                                }
                                 raft_membership_operations.push(RaftMembershipOperationStatus {
                                     tablet_id,
                                     operation: "remove_node",
@@ -3829,6 +3891,43 @@ async fn complete_admin_tablet_replacement(
         target_replica: tablet_replica_view(target_replica),
         catch_up: catch_up_response,
     }))
+}
+
+async fn wait_for_raft_membership_idle(
+    state: &AppState,
+    meta: &agentdb_meta::MetaStore,
+    registry: &crate::raft_ingress::RaftRsGroupRegistry,
+    tablet_id: i64,
+    timeout: Duration,
+) -> Result<bool, ApiError> {
+    let mut outbox = None;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let statuses = registry.status_for(tablet_id).map_err(|err| {
+            internal_error(format!("failed to observe raft membership change: {err}"))
+        })?;
+        if !statuses.iter().any(|status| status.pending_conf_change) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        if outbox.is_none() {
+            if let Some(token) = state.internal_auth_token.clone() {
+                let configured_by_tablet = load_configured_raft_replicas(Some(meta)).await?;
+                let candidate = RaftRsHttpOutbox::new(token);
+                candidate
+                    .replace_peer_urls(load_raft_peer_urls(meta, &configured_by_tablet).await?);
+                outbox = Some(candidate);
+            }
+        }
+        if let Some(outbox) = outbox.as_ref() {
+            outbox.flush_registry_once(registry).await.map_err(|err| {
+                internal_error(format!("failed to flush raft membership messages: {err}"))
+            })?;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn rebalance_admin_tablets(
@@ -5654,22 +5753,28 @@ async fn append_event(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let (resp, backpressure) =
-        with_route_tablet_context(runtime.clone(), &route_headers, async move {
-            runtime
-                .append_with_backpressure(AppendRequest {
-                    tenant_id: append_tid,
-                    agent_id: aid,
-                    session_id: append_sid,
-                    kind: body.kind,
-                    payload: body.payload,
-                    artifact_refs: body.artifact_refs,
-                    source_refs: body.source_refs,
-                    idempotency_key: idem_key,
-                })
-                .await
-        })
-        .await?;
+    let append_result = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_with_backpressure(AppendRequest {
+                tenant_id: append_tid,
+                agent_id: aid,
+                session_id: append_sid,
+                kind: body.kind,
+                payload: body.payload,
+                artifact_refs: body.artifact_refs,
+                source_refs: body.source_refs,
+                idempotency_key: idem_key,
+            })
+            .await
+    })
+    .await;
+    let (resp, backpressure) = match append_result {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::RaftNotLeader => {
+            return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+        }
+        Err(error) => return Err(ApiError(error)),
+    };
     Ok(with_headers(
         json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
@@ -5721,26 +5826,32 @@ async fn append_and_fetch(
     let runtime = s.runtime.clone();
     let append_tid = tid.clone();
     let append_sid = sid.clone();
-    let (resp, backpressure) =
-        with_route_tablet_context(runtime.clone(), &route_headers, async move {
-            runtime
-                .append_and_fetch_with_backpressure(
-                    AppendRequest {
-                        tenant_id: append_tid,
-                        agent_id: aid,
-                        session_id: append_sid,
-                        kind: body.kind,
-                        payload: body.payload,
-                        artifact_refs: body.artifact_refs,
-                        source_refs: body.source_refs,
-                        idempotency_key: idem_key,
-                    },
-                    body.last,
-                    body.max_bytes,
-                )
-                .await
-        })
-        .await?;
+    let append_result = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .append_and_fetch_with_backpressure(
+                AppendRequest {
+                    tenant_id: append_tid,
+                    agent_id: aid,
+                    session_id: append_sid,
+                    kind: body.kind,
+                    payload: body.payload,
+                    artifact_refs: body.artifact_refs,
+                    source_refs: body.source_refs,
+                    idempotency_key: idem_key,
+                },
+                body.last,
+                body.max_bytes,
+            )
+            .await
+    })
+    .await;
+    let (resp, backpressure) = match append_result {
+        Ok(value) => value,
+        Err(error) if error.code == ErrorCode::RaftNotLeader => {
+            return Ok(raft_not_leader_response(&s, &route_headers, error).await);
+        }
+        Err(error) => return Err(ApiError(error)),
+    };
     Ok(with_headers(
         json_with_backpressure(&s, StatusCode::OK, Json(resp), backpressure),
         route_headers,
@@ -7070,6 +7181,66 @@ fn validate_forwarded_mutation(state: &AppState, headers: &HeaderMap) -> Result<
         .routing
         .validate_forwarded_epoch(headers)
         .map_err(|rejection| route_rejection_response(&rejection))
+}
+
+async fn raft_not_leader_response(
+    state: &AppState,
+    route_headers: &HeaderMap,
+    error: agentdb_core::Error,
+) -> Response {
+    let tablet_id = route_tablet_id(route_headers);
+    let mut leader_raft_node_id = None;
+    let mut owner_node_id = None;
+    let mut owner_address = None;
+    if let (Some(meta), Some(registry), Some(tablet_id)) =
+        (state.meta.as_ref(), state.raft_registry.as_ref(), tablet_id)
+    {
+        if let Ok(statuses) = registry.status_for(tablet_id) {
+            leader_raft_node_id = raft_leader_id_from_statuses(&statuses);
+        }
+        if let Some(leader_id) = leader_raft_node_id {
+            if let Ok(Some(node_id)) =
+                resolve_control_plane_node_id(meta, tablet_id, leader_id).await
+            {
+                owner_node_id = Some(node_id.clone());
+                if let Ok(Some(node)) = nodes::get(meta.pool(), &node_id).await {
+                    owner_address = Some(node.address);
+                }
+            }
+        }
+    }
+    let owner_node_header = owner_node_id
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok());
+    let owner_address_header = owner_address
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok());
+    let body = serde_json::json!({
+        "code": error.code,
+        "message": error.message,
+        "retryable": true,
+        "suggestion": error.suggestion
+            .unwrap_or_else(|| "retry the request against the raft leader advertised by the API".to_string()),
+        "tablet_id": tablet_id,
+        "leader_raft_node_id": leader_raft_node_id,
+        "owner_node_id": owner_node_id,
+        "owner_address": owner_address,
+    });
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    response.headers_mut().extend(route_headers.clone());
+    response.headers_mut().insert(
+        HDR_ROUTE_REASON,
+        HeaderValue::from_static("RAFT_NOT_LEADER"),
+    );
+    if let Some(owner_node_id) = owner_node_header {
+        response.headers_mut().insert(HDR_OWNER_NODE, owner_node_id);
+    }
+    if let Some(owner_address) = owner_address_header {
+        response
+            .headers_mut()
+            .insert(HDR_OWNER_ADDRESS, owner_address);
+    }
+    response
 }
 
 fn with_headers(mut response: Response, headers: HeaderMap) -> Response {

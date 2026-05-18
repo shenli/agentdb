@@ -550,17 +550,17 @@ fn spawn_node(args: &Args, node: &NodeSpec) -> Result<Child> {
         .arg(&node.config_path)
         .env("AGENTDB_META_BACKEND", "postgres")
         .env("AGENTDB_META_URL", &args.meta_url)
-        .env("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", "16")
-        .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "4")
+        .env("AGENTDB_META_ANY_POOL_MAX_CONNECTIONS", "64")
+        .env("AGENTDB_META_PG_POOL_MAX_CONNECTIONS", "32")
         .env("AGENTDB_NODE_HEARTBEAT_MS", "500")
         .env("AGENTDB_SCHEDULER_RENEW_INTERVAL_MS", "500")
-        .env("AGENTDB_SCHEDULER_LEASE_MS", "5000")
+        .env("AGENTDB_SCHEDULER_LEASE_MS", "30000")
         .env(
             "AGENTDB_STALE_NODE_THRESHOLD_MS",
             SMOKE_STALE_NODE_THRESHOLD_MS.to_string(),
         )
         .env("AGENTDB_REAPER_TICK_MS", "500")
-        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "0")
+        .env("AGENTDB_REAPER_SAFETY_MARGIN_MS", "5000")
         .env("AGENTDB_REBALANCE_MAX_MOVEMENTS", "0")
         .env("AGENTDB_TABLET_MOVEMENT_BATCH_SIZE", "0")
         .env("AGENTDB_TABLET_LIFECYCLE_MAX_ACTIONS", "0")
@@ -2287,9 +2287,13 @@ async fn post_json_with_convergence_retry(
     attempts: usize,
 ) -> Result<Value> {
     let mut last_error = None;
+    let mut owner_hint = None;
     for attempt in 0..attempts.max(1) {
-        let owner =
-            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        let owner = if let Some(owner) = owner_hint.take() {
+            owner
+        } else {
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?
+        };
         eprintln!(
             "smoke: POST {path} attempt {} via {}",
             attempt + 1,
@@ -2302,6 +2306,7 @@ async fn post_json_with_convergence_retry(
                     "smoke: POST {path} retry {} after convergence error: {error:?}",
                     attempt + 1
                 );
+                owner_hint = retry_owner_hint_from_error(&error, nodes);
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -2323,9 +2328,13 @@ async fn append_and_verify(
     let idempotency_key =
         format!("cluster-smoke-tablet-{tablet_id}-{session_id}-seq-{expected_seq}");
     let visibility_attempts = append_visibility_attempts();
+    let mut owner_hint = None;
     for attempt in 0..APPEND_RECOVERY_ATTEMPTS {
-        let owner =
-            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        let owner = if let Some(owner) = owner_hint.take() {
+            owner
+        } else {
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?
+        };
         eprintln!(
             "smoke: append seq {expected_seq} attempt {} via {}",
             attempt + 1,
@@ -2426,6 +2435,7 @@ async fn append_and_verify(
                     "smoke: append seq {expected_seq} retry {} after convergence error: {error:?}",
                     attempt + 1
                 );
+                owner_hint = retry_owner_hint_from_error(&error, nodes);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if session_has_exact_event_seq_from_base_allow_convergence_error(
                     client,
@@ -2478,7 +2488,7 @@ async fn event_count_from_base(
     let events = get_json(
         client,
         base,
-        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=10"),
+        &format!("/api/tenants/{tenant_id}/sessions/{session_id}/events?from_seq=0&limit=100"),
     )
     .await?;
     Ok(events
@@ -2904,6 +2914,7 @@ fn is_retryable_raft_error(error: &anyhow::Error) -> bool {
 fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:?}");
     is_retryable_raft_error(error)
+        || message.contains("\"code\":\"RAFT_NOT_LEADER\"")
         || message.contains("\"code\":\"TENANT_NOT_FOUND\"")
         || message.contains("\"code\":\"AGENT_NOT_FOUND\"")
         || message.contains("\"code\":\"SESSION_NOT_FOUND\"")
@@ -2913,6 +2924,20 @@ fn is_retryable_cluster_convergence_error(error: &anyhow::Error) -> bool {
         || message.contains("connection closed before message completed")
         || message.contains("raft leader was not observable")
         || message.contains("idempotency replay") && message.contains("is not yet visible")
+}
+
+fn retry_owner_hint_from_error(error: &anyhow::Error, nodes: &[NodeSpec]) -> Option<NodeSpec> {
+    let message = error.to_string();
+    let json_start = message.find('{')?;
+    let value: Value = serde_json::from_str(&message[json_start..]).ok()?;
+    let body = value.get("error").unwrap_or(&value);
+    let owner_node_id = body.get("owner_node_id")?.as_str()?;
+    let owner = nodes.iter().find(|node| node.id == owner_node_id)?.clone();
+    eprintln!(
+        "smoke: retrying with raft leader hint owner_node_id={}",
+        owner.id
+    );
+    Some(owner)
 }
 
 fn is_alias_conflict(error: &anyhow::Error) -> bool {
