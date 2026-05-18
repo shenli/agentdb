@@ -3752,23 +3752,6 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
-    if let Some(registry) = raft_registry {
-        let aligned = reconcile_raft_leader_tablet_ownership(
-            meta,
-            registry,
-            now_ms,
-            config.scheduler_lease_ms,
-        )
-        .await?;
-        if aligned > 0 {
-            status.add_tablet_reassignments(aligned as u64);
-            tracing::info!(
-                node_id = %node_id,
-                aligned,
-                "aligned local tablet ownership with raft leaders"
-            );
-        }
-    }
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
         Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
             agentdb_meta::scheduler::renew(
@@ -3813,6 +3796,24 @@ async fn run_cluster_scheduler_tick(
     );
     if !is_leader {
         return Ok(());
+    }
+
+    if let Some(registry) = raft_registry {
+        let aligned = reconcile_raft_leader_tablet_ownership(
+            meta,
+            registry,
+            now_ms,
+            config.scheduler_lease_ms,
+        )
+        .await?;
+        if aligned > 0 {
+            status.add_tablet_reassignments(aligned as u64);
+            tracing::info!(
+                node_id = %node_id,
+                aligned,
+                "aligned local tablet ownership with raft leaders"
+            );
+        }
     }
 
     let dead_nodes =
@@ -6040,7 +6041,7 @@ region = "us-west-2"
     }
 
     #[tokio::test]
-    async fn scheduler_follower_still_reconciles_local_raft_leader_ownership() {
+    async fn scheduler_follower_does_not_reconcile_local_raft_leader_ownership() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
@@ -6102,10 +6103,80 @@ region = "us-west-2"
         .unwrap();
 
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
-        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert!(tablet.owner_node_id.is_none());
         let snapshot = status.snapshot();
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("scheduler-a"));
+        assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_leader_reconciles_local_raft_leader_ownership() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "node-b", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            1_000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablet_replicas::upsert(meta.pool(), 7, "node-b", "voter", "healthy", 0, 0, 1_000)
+            .await
+            .unwrap();
+
+        let local_raft_node_id = agentdb_storage::stable_raft_node_id("node-b").unwrap();
+        let configs = vec![
+            agentdb_storage::RaftRsNodeConfig::from_control_plane_replica(
+                7,
+                "node-b",
+                "voter",
+                dir.path(),
+            )
+            .unwrap(),
+        ];
+        let (group, _logs) = agentdb_storage::RaftRsSharedGroup::open(7, configs).unwrap();
+        group.elect(local_raft_node_id).unwrap();
+        let registry = agentdb_api::raft_ingress::RaftRsGroupRegistry::shared();
+        registry.register(7, group).unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        run_cluster_scheduler_tick(
+            &meta,
+            "node-b",
+            2_000,
+            lifecycle_config(0, 0),
+            &status,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        let snapshot = status.snapshot();
+        assert!(snapshot.is_leader);
+        assert_eq!(snapshot.leader_node_id.as_deref(), Some("node-b"));
         assert_eq!(snapshot.tablet_reassignments_total, 1);
     }
 
