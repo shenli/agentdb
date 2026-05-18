@@ -2023,6 +2023,8 @@ async fn run_chaos(
             Duration::from_secs(90),
         )
         .await?;
+        let _ = force_raft_catch_up(client, nodes, PRIMARY_TABLET_ID).await?;
+        wait_raft_ready(client, nodes, Duration::from_secs(90)).await?;
         sleep_random(&mut rng, args.chaos_max_sleep_ms).await;
 
         eprintln!(
