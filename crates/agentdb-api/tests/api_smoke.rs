@@ -2140,6 +2140,31 @@ async fn admin_tablet_replacement_requires_caught_up_target() {
     );
     assert_eq!(completed["target_replica"]["role"], "voter");
     assert_eq!(completed["source_replica"], serde_json::Value::Null);
+
+    let replayed: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/admin/tablets/9/replacement/complete",
+            app.base
+        ))
+        .json(&json!({
+            "target_node_id": "node-b",
+            "source_node_id": "node-a",
+            "min_applied_index": 42,
+            "retire_source": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replayed["changed"], false);
+    assert_eq!(replayed["new_owner_node_id"], "node-b");
+    assert_eq!(replayed["tablet"]["owner_node_id"], "node-b");
+    assert_eq!(replayed["target_replica"]["role"], "voter");
 }
 
 #[tokio::test]

@@ -3302,9 +3302,31 @@ async fn complete_admin_tablet_replacement(
     let target_node_id = body.target_node_id.clone();
     let require_healthy = body.require_healthy.unwrap_or(true);
     if tablet.owner_node_id.as_deref() == Some(target_node_id.as_str()) {
-        return Err(invalid_admin_request(
-            "replacement target already owns the tablet",
-        ));
+        let target_replica = get_tablet_replica(meta, tablet_id, &target_node_id)
+            .await?
+            .ok_or_else(|| {
+                invalid_admin_request(format!(
+                    "target replica {} does not exist for tablet {tablet_id}",
+                    target_node_id
+                ))
+            })?;
+        return Ok(Json(AdminTabletReplacementCompleteResponse {
+            action: "complete_replacement",
+            changed: false,
+            new_owner_node_id: tablet.owner_node_id.clone(),
+            source_node_id: body.source_node_id.clone(),
+            target_node_id,
+            required_applied_index: body
+                .min_applied_index
+                .unwrap_or(target_replica.applied_index),
+            raft_membership_changed: false,
+            raft_membership_operations: Vec::new(),
+            retired_source: body.retire_source.unwrap_or(false),
+            tablet: tablet_view(tablet),
+            source_replica: None,
+            target_replica: tablet_replica_view(target_replica),
+            catch_up: None,
+        }));
     }
     let source_node_id = body.source_node_id.clone().or(tablet.owner_node_id.clone());
     if source_node_id.is_none() {
@@ -3513,31 +3535,81 @@ async fn complete_admin_tablet_replacement(
                 .ok_or_else(|| invalid_admin_request("tablet raft group has no known leader"))?;
             let target_raft_node_id =
                 agentdb_storage::stable_raft_node_id(&target_node_id).map_err(internal_error)?;
-            match registry.promote_to_voter(tablet_id, leader_id, target_raft_node_id) {
-                Ok(()) => {
-                    raft_membership_changed = true;
-                    raft_membership_operations.push(RaftMembershipOperationStatus {
-                        tablet_id,
-                        operation: "promote_to_voter",
-                        node_id: target_node_id.clone(),
-                        raft_node_id: Some(target_raft_node_id),
-                        status: "applied",
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    raft_membership_operations.push(RaftMembershipOperationStatus {
-                        tablet_id,
-                        operation: "promote_to_voter",
-                        node_id: target_node_id.clone(),
-                        raft_node_id: Some(target_raft_node_id),
-                        status: "failed",
-                        error: Some(message.clone()),
-                    });
-                    return Err(internal_error(message));
+            if target_replica.role == "voter" {
+                raft_membership_operations.push(RaftMembershipOperationStatus {
+                    tablet_id,
+                    operation: "promote_to_voter",
+                    node_id: target_node_id.clone(),
+                    raft_node_id: Some(target_raft_node_id),
+                    status: "already_applied",
+                    error: None,
+                });
+            } else {
+                match registry.promote_to_voter(tablet_id, leader_id, target_raft_node_id) {
+                    Ok(()) => {
+                        raft_membership_changed = true;
+                        target_replica.role = "voter".to_string();
+                        tablet_replicas::upsert(
+                            meta.pool(),
+                            tablet_id,
+                            &target_node_id,
+                            "voter",
+                            &target_replica.health,
+                            target_replica.applied_index,
+                            target_replica.match_index,
+                            now_ms_i64(),
+                        )
+                        .await
+                        .map_err(internal_error)?;
+                        raft_membership_operations.push(RaftMembershipOperationStatus {
+                            tablet_id,
+                            operation: "promote_to_voter",
+                            node_id: target_node_id.clone(),
+                            raft_node_id: Some(target_raft_node_id),
+                            status: "applied",
+                            error: None,
+                        });
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        raft_membership_operations.push(RaftMembershipOperationStatus {
+                            tablet_id,
+                            operation: "promote_to_voter",
+                            node_id: target_node_id.clone(),
+                            raft_node_id: Some(target_raft_node_id),
+                            status: "failed",
+                            error: Some(message.clone()),
+                        });
+                        return Err(internal_error(message));
+                    }
                 }
             }
+            let statuses_after_promote = registry.status_for(tablet_id).map_err(|err| {
+                internal_error(format!(
+                    "failed to observe raft membership promotion: {err}"
+                ))
+            })?;
+            if statuses_after_promote
+                .iter()
+                .any(|status| status.pending_conf_change)
+            {
+                raft_membership_operations.push(RaftMembershipOperationStatus {
+                    tablet_id,
+                    operation: "promote_to_voter",
+                    node_id: target_node_id.clone(),
+                    raft_node_id: Some(target_raft_node_id),
+                    status: "pending",
+                    error: Some(
+                        "raft membership change is still committing; retry replacement complete"
+                            .into(),
+                    ),
+                });
+                return Err(internal_error(
+                    "raft membership promotion is still pending; retry replacement complete",
+                ));
+            }
+            let leader_id =
+                raft_leader_id_from_statuses(&statuses_after_promote).unwrap_or(leader_id);
             if let Some(source_node_id) = source_node_id.as_ref() {
                 let source_raft_node_id =
                     agentdb_storage::stable_raft_node_id(source_node_id).map_err(internal_error)?;
@@ -3613,38 +3685,78 @@ async fn complete_admin_tablet_replacement(
                                 status: "failed",
                                 error: Some(message.clone()),
                             });
-                            return Err(internal_error(message));
+                            return Err(internal_error(format!(
+                                "raft leader transfer is not ready after promotion; retry replacement complete: {message}"
+                            )));
                         }
                     }
                 }
             }
+            let statuses_after_transfer = registry.status_for(tablet_id).map_err(|err| {
+                internal_error(format!("failed to observe raft membership transfer: {err}"))
+            })?;
+            if statuses_after_transfer
+                .iter()
+                .any(|status| status.pending_conf_change)
+            {
+                raft_membership_operations.push(RaftMembershipOperationStatus {
+                    tablet_id,
+                    operation: "transfer_leader",
+                    node_id: target_node_id.clone(),
+                    raft_node_id: Some(target_raft_node_id),
+                    status: "pending",
+                    error: Some(
+                        "raft membership change is still committing; retry replacement complete"
+                            .into(),
+                    ),
+                });
+                return Err(internal_error(
+                    "raft membership change is still pending; retry replacement complete",
+                ));
+            }
+            let leader_id =
+                raft_leader_id_from_statuses(&statuses_after_transfer).unwrap_or(leader_id);
             if retire_source {
                 if let Some(source_node_id) = source_node_id.as_ref() {
                     let source_raft_node_id = agentdb_storage::stable_raft_node_id(source_node_id)
                         .map_err(internal_error)?;
-                    match registry.remove_node(tablet_id, leader_id, source_raft_node_id) {
-                        Ok(()) => {
-                            raft_membership_operations.push(RaftMembershipOperationStatus {
-                                tablet_id,
-                                operation: "remove_node",
-                                node_id: source_node_id.clone(),
-                                raft_node_id: Some(source_raft_node_id),
-                                status: "applied",
-                                error: None,
-                            });
+                    if get_tablet_replica(meta, tablet_id, source_node_id)
+                        .await?
+                        .is_some()
+                    {
+                        match registry.remove_node(tablet_id, leader_id, source_raft_node_id) {
+                            Ok(()) => {
+                                raft_membership_operations.push(RaftMembershipOperationStatus {
+                                    tablet_id,
+                                    operation: "remove_node",
+                                    node_id: source_node_id.clone(),
+                                    raft_node_id: Some(source_raft_node_id),
+                                    status: "applied",
+                                    error: None,
+                                });
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                raft_membership_operations.push(RaftMembershipOperationStatus {
+                                    tablet_id,
+                                    operation: "remove_node",
+                                    node_id: source_node_id.clone(),
+                                    raft_node_id: Some(source_raft_node_id),
+                                    status: "failed",
+                                    error: Some(message.clone()),
+                                });
+                                return Err(internal_error(message));
+                            }
                         }
-                        Err(error) => {
-                            let message = error.to_string();
-                            raft_membership_operations.push(RaftMembershipOperationStatus {
-                                tablet_id,
-                                operation: "remove_node",
-                                node_id: source_node_id.clone(),
-                                raft_node_id: Some(source_raft_node_id),
-                                status: "failed",
-                                error: Some(message.clone()),
-                            });
-                            return Err(internal_error(message));
-                        }
+                    } else {
+                        raft_membership_operations.push(RaftMembershipOperationStatus {
+                            tablet_id,
+                            operation: "remove_node",
+                            node_id: source_node_id.clone(),
+                            raft_node_id: Some(source_raft_node_id),
+                            status: "already_applied",
+                            error: None,
+                        });
                     }
                 }
             }

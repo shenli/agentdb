@@ -94,7 +94,8 @@ docker run --rm --name agentdb-smoke-postgres \
   -e POSTGRES_USER=agentdb \
   -e POSTGRES_PASSWORD=agentdb \
   -e POSTGRES_DB=agentdb_smoke \
-  -p 5432:5432 postgres:16
+  -p 5432:5432 postgres:16 \
+  -c max_connections=200
 
 docker run --rm --name agentdb-smoke-minio \
   -e MINIO_ROOT_USER=minioadmin \
@@ -110,6 +111,8 @@ mc mb --ignore-existing agentdb-smoke/agentdb-smoke
 
 ```bash
 export AGENTDB_META_URL=postgres://agentdb:agentdb@127.0.0.1:5432/agentdb_smoke
+export AGENTDB_META_ANY_POOL_MAX_CONNECTIONS=6
+export AGENTDB_META_PG_POOL_MAX_CONNECTIONS=2
 export AGENTDB_S3_ENDPOINT=http://127.0.0.1:9000
 export AGENTDB_S3_BUCKET=agentdb-smoke
 export AWS_ACCESS_KEY_ID=minioadmin

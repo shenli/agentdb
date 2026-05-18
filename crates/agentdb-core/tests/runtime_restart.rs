@@ -1372,9 +1372,18 @@ async fn record_index_outbox_skips_fully_purged_record_without_blocking_queue() 
         expires_at_ms: None,
     };
 
-    let r1 = rt.write_record_with_commit(new_record("alpha")).await.unwrap();
-    let r2 = rt.write_record_with_commit(new_record("beta")).await.unwrap();
-    let r3 = rt.write_record_with_commit(new_record("gamma")).await.unwrap();
+    let r1 = rt
+        .write_record_with_commit(new_record("alpha"))
+        .await
+        .unwrap();
+    let r2 = rt
+        .write_record_with_commit(new_record("beta"))
+        .await
+        .unwrap();
+    let r3 = rt
+        .write_record_with_commit(new_record("gamma"))
+        .await
+        .unwrap();
 
     // Simulate the "GC purged r1 out from under the queue" case: clear r1
     // from in-memory state AND remove its persisted row, reset both
@@ -1471,7 +1480,11 @@ async fn register_and_bind_skill_replay_via_persist_after_cache_drop() {
         })
         .await
         .unwrap();
-        (t.tenant_id.clone(), a.agent_id.clone(), skill.skill_id.clone())
+        (
+            t.tenant_id.clone(),
+            a.agent_id.clone(),
+            skill.skill_id.clone(),
+        )
     };
 
     // Reopen the same KV with a fresh runtime — the in-memory `idem` cache
