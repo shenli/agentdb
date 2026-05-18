@@ -3752,6 +3752,15 @@ async fn run_cluster_scheduler_tick(
 ) -> agentdb_meta::MetaResult<()> {
     status.set_last_tick_at_ms(now_ms);
     let pool = meta.pool();
+    let renewed_local =
+        renew_local_tablet_ownership(meta, node_id, now_ms, config.scheduler_lease_ms).await?;
+    if renewed_local > 0 {
+        tracing::debug!(
+            node_id = %node_id,
+            renewed = renewed_local,
+            "renewed locally owned tablet leases"
+        );
+    }
     if let Some(registry) = raft_registry {
         let renewed = reconcile_raft_leader_tablet_ownership(
             meta,
@@ -4029,6 +4038,38 @@ async fn reconcile_raft_leader_tablet_ownership(
         }
     }
     Ok(aligned)
+}
+
+async fn renew_local_tablet_ownership(
+    meta: &agentdb_meta::MetaStore,
+    node_id: &str,
+    now_ms: i64,
+    lease_ms: i64,
+) -> agentdb_meta::MetaResult<usize> {
+    let mut renewed = 0usize;
+    let renew_threshold_ms = now_ms.saturating_add(lease_ms / 2);
+    for tablet in agentdb_meta::tablets::list_owned_by(meta.pool(), node_id).await? {
+        if !tablet_state_keeps_raft_owner(&tablet.state) {
+            continue;
+        }
+        if tablet.lease_expires_at_ms > renew_threshold_ms {
+            continue;
+        }
+        match agentdb_meta::tablets::assume_ownership(
+            meta.pool(),
+            tablet.tablet_id,
+            tablet.epoch,
+            node_id,
+            now_ms + lease_ms,
+        )
+        .await
+        {
+            Ok(_) => renewed += 1,
+            Err(agentdb_meta::MetaError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(renewed)
 }
 
 fn tablet_state_keeps_raft_owner(state: &str) -> bool {
@@ -6129,6 +6170,60 @@ region = "us-west-2"
         let snapshot = status.snapshot();
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("scheduler-a"));
+        assert_eq!(snapshot.tablet_reassignments_total, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_follower_renews_locally_owned_tablet_without_raft_leader() {
+        let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
+        agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:30101",
+            None,
+            "alive",
+            1_000,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, 0, "node-b", 2_500)
+            .await
+            .unwrap();
+
+        let status = agentdb_api::state::SchedulerStatus::new();
+        run_cluster_scheduler_tick(
+            &meta,
+            "node-b",
+            2_000,
+            lifecycle_config(0, 0),
+            &status,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.lease_expires_at_ms, 32_000);
+        let snapshot = status.snapshot();
+        assert!(!snapshot.is_leader);
         assert_eq!(snapshot.tablet_reassignments_total, 0);
     }
 
