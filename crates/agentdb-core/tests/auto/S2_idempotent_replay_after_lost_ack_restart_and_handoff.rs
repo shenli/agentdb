@@ -1,0 +1,91 @@
+// AUTO-GENERATED from test plan: testing-plans/agentdb-project-wide-distributed-tests.md
+// Scenario: S2 idempotent_replay_after_lost_ack_restart_and_handoff
+// Falsifies: C3, C4, C15, C17, C20
+//
+// REVIEW BEFORE TREATING AS A PERMANENT REGRESSION.
+
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+
+use agentdb_core::{
+    errors::ErrorCode,
+    runtime::{AppendRequest, FetchRequest, Runtime},
+};
+use agentdb_storage::{ContentBackend, InMemoryContentBackend, KvStore, RocksKvStore};
+use tempfile::TempDir;
+
+fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
+    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<dyn KvStore + Send + Sync>>>> =
+        OnceLock::new();
+    let stores = STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut stores = stores.lock().expect("kv registry poisoned");
+    if let Some(kv) = stores.get(path) {
+        return kv.clone();
+    }
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(path).unwrap());
+    stores.insert(path.to_path_buf(), kv.clone());
+    kv
+}
+
+fn content() -> Arc<dyn ContentBackend> {
+    Arc::new(InMemoryContentBackend::default())
+}
+
+#[tokio::test]
+async fn idempotent_replay_after_lost_ack_restart_and_handoff() {
+    let dir = TempDir::new().unwrap();
+    let rt = Runtime::with_kv(open_kv(dir.path()), content());
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+    let mut append = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_result",
+        serde_json::json!({ "call_id": "call-1", "result": "ok" }),
+    );
+    append.idempotency_key = Some("lost-ack-append".into());
+    let first = rt.append(append.clone()).await.unwrap();
+
+    let fetched = rt
+        .append_and_fetch(
+            AppendRequest::simple(&tenant, &agent, &session, "tail", serde_json::json!({})),
+            10,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.seq, 1);
+    drop(rt);
+
+    let reopened = Runtime::with_kv(open_kv(dir.path()), content());
+    let replay = reopened.append(append.clone()).await.unwrap();
+    assert_eq!(replay.event_id, first.event_id);
+    assert_eq!(replay.seq, first.seq);
+
+    let mut conflicting = append;
+    conflicting.payload = serde_json::json!({ "call_id": "call-1", "result": "different" });
+    let err = reopened.append(conflicting).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+
+    let events = reopened
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id,
+            session_id: session.session_id,
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "tool_result")
+            .count(),
+        1,
+        "idempotent retry after restart must not create a second effect"
+    );
+}

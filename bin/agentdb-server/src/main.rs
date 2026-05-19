@@ -3792,7 +3792,7 @@ async fn run_cluster_scheduler_tick(
             registry,
             now_ms,
             config.scheduler_lease_ms,
-            false,
+            true,
         )
         .await?;
         if renewed > 0 {
@@ -5270,18 +5270,10 @@ async fn run_local_tablet_movement_executor_tick(
                 serde_json::from_slice(&payload)?;
             let installed = match movement_type {
                 "split" | "manual_split" => runtime
-                    .install_tablet_snapshot_payload_and_rehydrate(
-                        movement.destination_tablet_id,
-                        &payload,
-                    )
-                    .await
+                    .install_tablet_snapshot_payload(movement.destination_tablet_id, &payload)
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?,
                 "merge" | "manual_merge" => runtime
-                    .install_tablet_snapshot_payload_merge_and_rehydrate(
-                        movement.destination_tablet_id,
-                        &payload,
-                    )
-                    .await
+                    .install_tablet_snapshot_payload_merge(movement.destination_tablet_id, &payload)
                     .map_err(|error| anyhow::anyhow!("{error:?}"))?,
                 other => {
                     tracing::warn!(
@@ -5292,6 +5284,10 @@ async fn run_local_tablet_movement_executor_tick(
                     false
                 }
             };
+            // Split/merge destination snapshots are pre-cutover copies. Do not
+            // globally rehydrate from them while the source tablet is still the
+            // active writer; doing so can regress in-memory session state from
+            // a stale destination snapshot and cause sequence reuse.
             if installed {
                 installed_count += 1;
                 max_installed_index = max_installed_index.max(snapshot.applied_index as i64);
@@ -6259,7 +6255,7 @@ region = "us-west-2"
     }
 
     #[tokio::test]
-    async fn scheduler_follower_does_not_reconcile_local_raft_leader_ownership() {
+    async fn scheduler_follower_reconciles_local_raft_leader_ownership() {
         let meta = MetaStore::open_sqlite(":memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         agentdb_meta::scheduler::try_acquire(meta.pool(), "scheduler-a", 30_000, 1_000)
@@ -6321,7 +6317,9 @@ region = "us-west-2"
         .unwrap();
 
         let tablet = tablets::get(meta.pool(), 7).await.unwrap().unwrap();
-        assert!(tablet.owner_node_id.is_none());
+        assert_eq!(tablet.owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(tablet.epoch, 1);
+        assert!(tablet.lease_expires_at_ms > 2_000);
         let snapshot = status.snapshot();
         assert!(!snapshot.is_leader);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("scheduler-a"));

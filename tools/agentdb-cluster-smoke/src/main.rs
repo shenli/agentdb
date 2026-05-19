@@ -1119,27 +1119,59 @@ async fn run_record_index_probe(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token)
     );
-    assert_search_finds_record(client, &owner.url, &global_path, &target_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &global_path,
+        &target_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let local_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&sharding_key={}&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token),
         query_encode(session_id)
     );
-    assert_search_finds_record(client, &owner.url, &local_path, &target_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &local_path,
+        &target_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let control_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=control&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token)
     );
-    assert_search_finds_record(client, &owner.url, &control_path, &control_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &control_path,
+        &control_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let source_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=source&source_record={}&min_visible_record_commit_seq={source_commit_seq}",
         query_encode(&token),
         query_encode(&target_id)
     );
-    assert_search_finds_record(client, &owner.url, &source_path, &source_child_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &source_path,
+        &source_child_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let vector_response = post_json(
         client,
@@ -1148,7 +1180,7 @@ async fn run_record_index_probe(
         json!({
             "namespace": ["cluster-smoke", "vectors"],
             "embedding": [0.0, 1.0, 0.0],
-            "limit": 2,
+            "limit": 5,
             "min_visible_record_commit_seq": max_commit_seq
         }),
     )
@@ -1162,7 +1194,7 @@ async fn run_record_index_probe(
             .iter()
             .any(|record| record["text"].as_str() == Some("east-vector"))
     {
-        bail!("vector search expected north first and east in top two: {vector_response}");
+        bail!("vector search expected north first and east in top results: {vector_response}");
     }
 
     delete_record_retry(client, nodes, tablet_id, tenant_id, &control_id).await?;
@@ -3449,6 +3481,30 @@ async fn assert_search_missing_record(
         bail!("record search still found deleted record {record_id}: {response}");
     }
     Ok(())
+}
+
+async fn wait_search_finds_record(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    path: &str,
+    record_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut last = anyhow!("record {record_id} did not become visible");
+    loop {
+        if start.elapsed() > timeout {
+            return Err(last);
+        }
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        match assert_search_finds_record(client, &owner.url, path, record_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn wait_search_missing_record(

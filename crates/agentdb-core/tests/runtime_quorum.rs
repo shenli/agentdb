@@ -958,6 +958,110 @@ async fn runtime_exports_retargeted_shard_snapshot_for_split_install() {
 }
 
 #[tokio::test]
+async fn split_destination_snapshot_install_does_not_regress_source_session_sequence() {
+    let dir = TempDir::new().unwrap();
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(dir.path()).unwrap());
+    let source_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(kv.clone()));
+    let destination_log: Arc<dyn ReplicatedLog + Send + Sync> =
+        Arc::new(SingleNodeReplicatedLog::new(kv.clone()));
+    let runtime = Runtime::with_kv_and_replicated_logs(
+        kv,
+        content(),
+        BTreeMap::from([
+            (RUNTIME_PRIMARY_TABLET_ID, source_log),
+            (8, destination_log),
+        ]),
+    );
+
+    let seed_runtime = runtime.clone();
+    let (tenant, agent, session) = runtime
+        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async move {
+            let tenant = seed_runtime
+                .create_tenant(NewTenant {
+                    external_key: "split-source-seq-tenant".into(),
+                    policy: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let agent = seed_runtime
+                .create_agent(NewAgent {
+                    tenant_id: tenant.tenant_id.clone(),
+                    alias: None,
+                    config: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            let session = seed_runtime
+                .create_session(NewSession {
+                    tenant_id: tenant.tenant_id.clone(),
+                    agent_id: agent.agent_id.clone(),
+                    alias: None,
+                })
+                .await
+                .unwrap();
+            let first = seed_runtime
+                .append(AppendRequest::simple(
+                    &tenant,
+                    &agent,
+                    &session,
+                    "before-snapshot",
+                    serde_json::json!({"seq": 0}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(first.seq, 0);
+            (tenant, agent, session)
+        })
+        .await;
+
+    let stale_destination_payload = runtime
+        .export_tablet_snapshot_payload_for_shard_range(RUNTIME_PRIMARY_TABLET_ID, 8, 0, 63, 64)
+        .unwrap();
+
+    let source_runtime = runtime.clone();
+    let second_tenant = tenant.clone();
+    let second_agent = agent.clone();
+    let second_session = session.clone();
+    runtime
+        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async move {
+            let second = source_runtime
+                .append(AppendRequest::simple(
+                    &second_tenant,
+                    &second_agent,
+                    &second_session,
+                    "after-snapshot-export",
+                    serde_json::json!({"seq": 1}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(second.seq, 1);
+        })
+        .await;
+
+    assert!(runtime
+        .install_tablet_snapshot_payload(8, &stale_destination_payload)
+        .unwrap());
+
+    let append_runtime = runtime.clone();
+    runtime
+        .with_tablet_context(RUNTIME_PRIMARY_TABLET_ID, async move {
+            let third = append_runtime
+                .append(AppendRequest::simple(
+                    &tenant,
+                    &agent,
+                    &session,
+                    "after-destination-install",
+                    serde_json::json!({"seq": 2}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(third.seq, 2);
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn runtime_merge_installs_snapshot_without_deleting_existing_target_rows() {
     let source_dir = TempDir::new().unwrap();
     let source_kv: Arc<dyn KvStore + Send + Sync> =
