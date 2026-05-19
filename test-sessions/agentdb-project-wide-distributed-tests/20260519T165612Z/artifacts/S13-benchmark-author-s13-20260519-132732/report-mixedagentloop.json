@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "run_id": "author-s13-20260519-132732",
+  "backend": "agentdb-native-rocksdb",
+  "workload": "mixed_agent_loop",
+  "generated_at_ms": 1779222502282,
+  "host_manifest": {
+    "captured_at_ms": 1779222502282,
+    "hostname": "li-dev",
+    "kernel": "Linux li-dev 6.8.0-90-generic #91~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Nov 20 15:20:45 UTC 2 x86_64 x86_64 x86_64 GNU/Linux",
+    "os_release": "PRETTY_NAME=\"Ubuntu 22.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nVERSION=\"22.04.5 LTS (Jammy Jellyfish)\"\nVERSION_CODENAME=jammy\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=jammy",
+    "cpu": "Architecture:                         x86_64\nCPU op-mode(s):                       32-bit, 64-bit\nAddress sizes:                        39 bits physical, 48 bits virtual\nByte Order:                           Little Endian\nCPU(s):                               28\nOn-line CPU(s) list:                  0-27\nVendor ID:                            GenuineIntel\nModel name:                           Intel(R) Core(TM) i7-14700KF\nCPU family:                           6\nModel:                                183\nThread(s) per core:                   2\nCore(s) per socket:                   20\nSocket(s):                            1\nStepping:                             1\nCPU max MHz:                          5600.0000\nCPU min MHz:                          800.0000\nBogoMIPS:                             6835.20\nFlags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\nVirtualization:                       VT-x\nL1d cache:                            768 KiB (20 instances)\nL1i cache:                            1 MiB (20 instances)\nL2 cache:                             28 MiB (11 instances)\nL3 cache:                             33 MiB (1 instance)\nNUMA node(s):                         1\nNUMA node0 CPU(s):                    0-27\nVulnerability Gather data sampling:   Not affected\nVulnerability Itlb multihit:          Not affected\nVulnerability L1tf:                   Not affected\nVulnerability Mds:                    Not affected\nVulnerability Meltdown:               Not affected\nVulnerability Mmio stale data:        Not affected\nVulnerability Reg file data sampling: Mitigation; Clear Register File\nVulnerability Retbleed:               Not affected\nVulnerability Spec rstack overflow:   Not affected\nVulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                  Not affected\nVulnerability Tsx async abort:        Not affected\nVulnerability Vmscape:                Mitigation; IBPB before exit to userspace",
+    "memory": "total        used        free      shared  buff/cache   available\nMem:            31Gi       7.0Gi       5.8Gi       2.9Gi        18Gi        20Gi\nSwap:          2.0Gi       2.0Gi       1.0Mi",
+    "disk": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p5  281G  254G   13G  96% /\n/dev/nvme0n1p6  961G  812G  101G  89% /media/54943193-d308-4802-b135-7293aec29a1b"
+  },
+  "software_manifest": {
+    "captured_at_ms": 1779222502294,
+    "agentdb_bench_version": "0.1.0",
+    "git_sha": "ee0e3396b262f36fc8045e6309e40af1b47dd9a5",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "docker": "Docker version 29.5.0, build 98f1464",
+    "docker_compose": "Docker Compose version v5.1.3"
+  },
+  "database_config": {
+    "backend": "agentdb-native-rocksdb",
+    "storage_engine": "rocksdb",
+    "content_engine": "localfs",
+    "data_dir": "/home/lishen/work/agentdb-finish-s13-bench/state/author-s13-20260519-132732/rocksdb",
+    "content_dir": "/home/lishen/work/agentdb-finish-s13-bench/state/author-s13-20260519-132732/content",
+    "durability_profile": "single-node-wal",
+    "note": "For agentdb-native-rocksdb, RocksDB stores metadata/indexes; artifact bytes are stored by the content engine."
+  },
+  "config": {
+    "base_url": "http://127.0.0.1:7890",
+    "pg_dsn": null,
+    "mongo_uri": null,
+    "mongo_db": null,
+    "concurrency": "1,4",
+    "warmup": "2s",
+    "duration": "10s",
+    "fetch_last_n": 20,
+    "session_selection": "uniform",
+    "zipf_exponent": 1.2,
+    "raw_jsonl": true,
+    "seed": 43
+  },
+  "cells": [
+    {
+      "concurrency": 1,
+      "warmup_secs": 2.0,
+      "duration_secs": 10.0,
+      "successful_ops": 2288,
+      "errors": 0,
+      "ops_per_sec": 228.8,
+      "latency": {
+        "count": 2288,
+        "p50_ms": 4.3713679999999995,
+        "p90_ms": 9.559378,
+        "p95_ms": 10.100116,
+        "p99_ms": 12.281768999999999,
+        "max_ms": 17.92081
+      },
+      "operations": [
+        {
+          "operation": "append_fetch",
+          "successful_ops": 1132,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 1132,
+            "p50_ms": 7.569092,
+            "p90_ms": 10.099394,
+            "p95_ms": 10.577100000000002,
+            "p99_ms": 13.666242,
+            "max_ms": 17.92081
+          }
+        },
+        {
+          "operation": "fetch_recent",
+          "successful_ops": 557,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 557,
+            "p50_ms": 0.918973,
+            "p90_ms": 1.025537,
+            "p95_ms": 1.16382,
+            "p99_ms": 1.69425,
+            "max_ms": 2.0878799999999997
+          }
+        },
+        {
+          "operation": "record_write",
+          "successful_ops": 192,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 192,
+            "p50_ms": 0.697331,
+            "p90_ms": 0.779359,
+            "p95_ms": 0.797431,
+            "p99_ms": 0.918615,
+            "max_ms": 1.633093
+          }
+        },
+        {
+          "operation": "record_search",
+          "successful_ops": 166,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 166,
+            "p50_ms": 0.759446,
+            "p90_ms": 0.852426,
+            "p95_ms": 0.919715,
+            "p99_ms": 1.535687,
+            "max_ms": 2.42089
+          }
+        },
+        {
+          "operation": "fork",
+          "successful_ops": 171,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 171,
+            "p50_ms": 0.593993,
+            "p90_ms": 0.6715169999999999,
+            "p95_ms": 0.716097,
+            "p99_ms": 1.0240589999999998,
+            "max_ms": 5.735967
+          }
+        },
+        {
+          "operation": "artifact",
+          "successful_ops": 70,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 70,
+            "p50_ms": 6.732213,
+            "p90_ms": 9.334591,
+            "p95_ms": 9.750126,
+            "p99_ms": 11.615639,
+            "max_ms": 14.020531
+          }
+        }
+      ]
+    },
+    {
+      "concurrency": 4,
+      "warmup_secs": 2.0,
+      "duration_secs": 10.0,
+      "successful_ops": 2415,
+      "errors": 0,
+      "ops_per_sec": 241.5,
+      "latency": {
+        "count": 2415,
+        "p50_ms": 15.399536,
+        "p90_ms": 35.595791,
+        "p95_ms": 44.704988,
+        "p99_ms": 73.443987,
+        "max_ms": 140.53344
+      },
+      "operations": [
+        {
+          "operation": "append_fetch",
+          "successful_ops": 1213,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 1213,
+            "p50_ms": 27.779671,
+            "p90_ms": 43.738267,
+            "p95_ms": 52.868047000000004,
+            "p99_ms": 86.065911,
+            "max_ms": 140.53344
+          }
+        },
+        {
+          "operation": "fetch_recent",
+          "successful_ops": 565,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 565,
+            "p50_ms": 1.003065,
+            "p90_ms": 2.063405,
+            "p95_ms": 14.761878000000001,
+            "p99_ms": 17.83076,
+            "max_ms": 19.545308000000002
+          }
+        },
+        {
+          "operation": "record_write",
+          "successful_ops": 222,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 222,
+            "p50_ms": 0.792036,
+            "p90_ms": 1.140166,
+            "p95_ms": 8.201728000000001,
+            "p99_ms": 17.233963000000003,
+            "max_ms": 18.771587999999998
+          }
+        },
+        {
+          "operation": "record_search",
+          "successful_ops": 165,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 165,
+            "p50_ms": 0.863566,
+            "p90_ms": 13.083048999999999,
+            "p95_ms": 16.404562000000002,
+            "p99_ms": 17.924503,
+            "max_ms": 19.393418999999998
+          }
+        },
+        {
+          "operation": "fork",
+          "successful_ops": 178,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 178,
+            "p50_ms": 0.702541,
+            "p90_ms": 1.392682,
+            "p95_ms": 13.871851,
+            "p99_ms": 16.502616,
+            "max_ms": 18.014985
+          }
+        },
+        {
+          "operation": "artifact",
+          "successful_ops": 72,
+          "errors": 0,
+          "first_error": null,
+          "latency": {
+            "count": 72,
+            "p50_ms": 28.854845,
+            "p90_ms": 46.697608,
+            "p95_ms": 55.252532,
+            "p99_ms": 86.18322500000001,
+            "max_ms": 87.233428
+          }
+        }
+      ]
+    }
+  ]
+}

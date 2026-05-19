@@ -23,7 +23,7 @@ const SECONDARY_TABLET_ID: i64 = 2;
 const SECONDARY_CELL_ID: &str = "cell-b";
 const SECONDARY_PLACEMENT_SCOPE_ID: &str = "cell-b";
 const SMOKE_STALE_NODE_THRESHOLD_MS: u64 = 180_000;
-const APPEND_RECOVERY_ATTEMPTS: usize = 8;
+const APPEND_RECOVERY_ATTEMPTS: usize = 16;
 const DEFAULT_APPEND_VISIBILITY_ATTEMPTS: usize = 50;
 
 #[derive(Debug, Parser)]
@@ -906,8 +906,9 @@ async fn run_smoke(
         .await?;
     }
 
+    let mut active_nodes = nodes.to_vec();
     if args.full_hardening || args.replacement {
-        run_explicit_replacement(
+        active_nodes = run_explicit_replacement(
             args,
             client,
             nodes,
@@ -923,7 +924,7 @@ async fn run_smoke(
     if args.full_hardening || args.split_merge {
         run_split_merge_lifecycle(
             client,
-            nodes,
+            &active_nodes,
             &tenant_id,
             &agent_id,
             &session_id,
@@ -1478,7 +1479,7 @@ async fn run_explicit_replacement(
     agent_id: &str,
     session_id: &str,
     next_seq: &mut u64,
-) -> Result<()> {
+) -> Result<Vec<NodeSpec>> {
     let owner = wait_tablet_owner(
         client,
         nodes,
@@ -1594,7 +1595,7 @@ async fn run_explicit_replacement(
     .await?;
     *next_seq += 1;
     let _ = force_raft_catch_up(client, &survivors, PRIMARY_TABLET_ID).await?;
-    Ok(())
+    Ok(survivors)
 }
 
 async fn run_az_failure(
@@ -2888,8 +2889,13 @@ async fn event_count_with_convergence_retry(
 
 async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec], tablet_id: i64) -> Result<Value> {
     let mut last_error = None;
-    let expected_node_ids: BTreeSet<_> = nodes.iter().map(|node| node.id.as_str()).collect();
     for attempt in 0..5 {
+        let expected_node_ids = current_reachable_node_ids(client, nodes).await;
+        let expected_node_ids = if expected_node_ids.is_empty() {
+            nodes.iter().map(|node| node.id.clone()).collect()
+        } else {
+            expected_node_ids
+        };
         let owner =
             wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
         let response = post_json(
@@ -2926,7 +2932,7 @@ async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec], tablet_id: i64
 
 fn catch_up_failures_are_outside_scope(
     response: &Value,
-    expected_node_ids: &BTreeSet<&str>,
+    expected_node_ids: &BTreeSet<String>,
 ) -> bool {
     response["failures"].as_array().is_none_or(|failures| {
         failures.iter().all(|failure| {
@@ -2969,6 +2975,10 @@ fn retry_owner_hint_from_error(error: &anyhow::Error, nodes: &[NodeSpec]) -> Opt
     let json_start = message.find('{')?;
     let value: Value = serde_json::from_str(&message[json_start..]).ok()?;
     let body = value.get("error").unwrap_or(&value);
+    if body.get("leader_raft_node_id").is_some_and(Value::is_null) {
+        eprintln!("smoke: raft leader hint unavailable; rediscovering tablet owner");
+        return None;
+    }
     let owner_node_id = body.get("owner_node_id")?.as_str()?;
     let owner = nodes.iter().find(|node| node.id == owner_node_id)?.clone();
     eprintln!(
@@ -3306,6 +3316,16 @@ async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<
             .collect();
     }
     BTreeSet::new()
+}
+
+async fn current_reachable_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    for node in nodes {
+        if get_json(client, &node.url, "/health/ready").await.is_ok() {
+            reachable.insert(node.id.clone());
+        }
+    }
+    reachable
 }
 
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {

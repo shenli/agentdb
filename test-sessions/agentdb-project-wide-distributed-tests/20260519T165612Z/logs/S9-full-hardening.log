@@ -1,0 +1,162 @@
+ Network agentdb-finish-s9-cycle-5_default Creating 
+ Network agentdb-finish-s9-cycle-5_default Created 
+ Container agentdb-finish-s9-cycle-5-minio-1 Creating 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Creating 
+ Container agentdb-finish-s9-cycle-5-minio-1 Created 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Created 
+ Container agentdb-finish-s9-cycle-5-minio-1 Starting 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Starting 
+ Container agentdb-finish-s9-cycle-5-minio-1 Started 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Started 
+ Container agentdb-finish-s9-cycle-5-minio-1 Running 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Creating 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Created 
+Attaching to minio-init-1
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Starting 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Started 
+minio-init-1  | Added `agentdb-smoke` successfully.
+minio-init-1  | Bucket created successfully `agentdb-smoke/agentdb-smoke`.
+[Kminio-init-1 exited with code 0
+Postgres: postgres://agentdb:agentdb@127.0.0.1:55432/agentdb_smoke
+MinIO:    http://127.0.0.1:19000 bucket=agentdb-smoke
+Work dir: /home/lishen/work/agentdb-finish-s9-cycle-5
+smoke: waiting for node health
+smoke: waiting for raft readiness
+smoke: resolving initial tablet writer
+smoke: initial tablet writer node-a
+smoke: creating tenant/agent/session
+smoke: create session attempt 1
+smoke: creating tenant via node-a
+smoke: create session retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30100/api/tenants: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+smoke: create session attempt 2
+smoke: creating tenant via node-a
+smoke: creating agent for tenant ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425
+smoke: POST /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/agents attempt 1 via node-a
+smoke: creating session for agent agt_019e41e1-63ca-7ad2-b284-6d75c0347c64
+smoke: POST /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/agents/agt_019e41e1-63ca-7ad2-b284-6d75c0347c64/sessions attempt 1 via node-a
+smoke: appending event 0
+smoke: append seq 0 attempt 1 via node-a
+smoke: appending event 1
+smoke: append seq 1 attempt 1 via node-a
+smoke: creating tenant/agent/session in cell-b
+smoke: create session attempt 1
+smoke: creating tenant via node-d
+smoke: creating agent for tenant ten_019e41e1-801e-7923-969c-e10bd061f86b
+smoke: POST /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/agents attempt 1 via node-d
+smoke: creating session for agent agt_019e41e1-806e-7bb2-83c3-0bcb0e3655cb
+smoke: POST /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/agents/agt_019e41e1-806e-7bb2-83c3-0bcb0e3655cb/sessions attempt 1 via node-d
+smoke: appending secondary cell event 0
+smoke: append seq 0 attempt 1 via node-d
+smoke: appending secondary cell event 1
+smoke: append seq 1 attempt 1 via node-d
+consistency: verifying idempotent append and gap-free session order
+smoke: idempotent POST /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events seq 2 attempt 1 via node-a
+smoke: idempotent POST /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events seq 2 attempt 1 via node-a
+smoke: idempotency conflict check /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events attempt 1 via node-a
+consistency: verifying idempotent append and gap-free session order
+smoke: idempotent POST /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/sessions/ses_019e41e1-810c-7981-b356-5101cc1af596/events seq 2 attempt 1 via node-d
+smoke: idempotent POST /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/sessions/ses_019e41e1-810c-7981-b356-5101cc1af596/events seq 2 attempt 1 via node-d
+smoke: idempotency conflict check /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/sessions/ses_019e41e1-810c-7981-b356-5101cc1af596/events attempt 1 via node-d
+record-index: writing records and verifying local/global search visibility
+record-index: create record attempt 1 via node-a
+record-index: create record attempt 1 via node-a
+record-index: create record attempt 1 via node-a
+record-index: create record attempt 1 via node-a
+record-index: create record attempt 1 via node-a
+record-index: delete record attempt 1 via node-a
+record-index: writing records and verifying local/global search visibility
+record-index: create record attempt 1 via node-d
+record-index: create record attempt 1 via node-d
+record-index: create record attempt 1 via node-d
+record-index: create record attempt 1 via node-d
+record-index: create record attempt 1 via node-d
+record-index: delete record attempt 1 via node-d
+changefeed: verifying watch and export cursor replay
+smoke: append seq 3 attempt 1 via node-a
+smoke: append seq 4 attempt 1 via node-a
+smoke: POST /api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/agents/agt_019e41e1-63ca-7ad2-b284-6d75c0347c64/sessions attempt 1 via node-a
+smoke: append seq 0 attempt 1 via node-a
+changefeed: verifying watch and export cursor replay
+smoke: append seq 3 attempt 1 via node-d
+smoke: append seq 3 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30103/api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/sessions/ses_019e41e1-810c-7981-b356-5101cc1af596/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 2 before timeout","retryable":true}
+smoke: append seq 4 attempt 1 via node-d
+smoke: append seq 4 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30103/api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/sessions/ses_019e41e1-810c-7981-b356-5101cc1af596/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 2 before timeout","retryable":true}
+smoke: append seq 4 attempt 2 via node-d
+smoke: POST /api/tenants/ten_019e41e1-801e-7923-969c-e10bd061f86b/agents/agt_019e41e1-806e-7bb2-83c3-0bcb0e3655cb/sessions attempt 1 via node-d
+smoke: append seq 0 attempt 1 via node-d
+smoke: forcing raft catch-up snapshot after setup writes
+smoke: raft catch-up request completed in 0.349s attempted=2 sent=2 skipped=1
+smoke: secondary raft catch-up attempted=2 sent=2 skipped=1
+smoke: waiting for raft convergence after setup writes
+smoke: raft convergence after catch-up completed in 7.704s
+node-a health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033686,"is_leader":true,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913686,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-a/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":1,"tablet_start":1,"tablet_end":1,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-a/tablet-store/domain-00000000000000000001","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":118}}]}}
+node-b health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033686,"is_leader":false,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913710,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-b/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":1,"tablet_start":1,"tablet_end":1,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-b/tablet-store/domain-00000000000000000001","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":116}}]}}
+node-c health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033186,"is_leader":false,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913687,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-c/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":1,"tablet_start":1,"tablet_end":1,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-c/tablet-store/domain-00000000000000000001","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":116}}]}}
+node-d health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033186,"is_leader":false,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913688,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-d/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":2,"tablet_start":2,"tablet_end":2,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-d/tablet-store/domain-00000000000000000002","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":121}}]}}
+node-e health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033686,"is_leader":false,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913715,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-e/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":2,"tablet_start":2,"tablet_end":2,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-e/tablet-store/domain-00000000000000000002","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":109}}]}}
+node-f health="ok" raft_summary={"leaderless_tablet_count":0,"multi_leader_tablet_count":0,"commit_index_drift_tablet_count":0,"applied_index_drift_tablet_count":0,"max_commit_index_gap":0,"max_applied_index_gap":0,"catch_up_required_replica_count":0,"lagging_replica_count":0,"unreachable_replica_count":0,"snapshot_absent_for_catch_up_count":0,"expired_snapshot_count":0} scheduler={"leader_node_id":"node-a","leader_epoch":1,"leader_expires_at_ms":1779222033686,"is_leader":false,"dead_nodes_marked_total":0,"tablet_reassignments_total":0,"local_tablet_log_compactions_total":0,"local_tablet_log_compaction_failures_total":0,"local_tablet_log_compaction_last_tick_at_ms":0,"last_tick_at_ms":1779221913699,"tablet_store":{"layout":"grouped_rocksdb","root_dir":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-f/tablet-store","tablets_per_domain":1,"max_open_domains":4,"domain_write_buffer_size_mib":4,"domain_max_write_buffers":2,"domain_parallelism":1,"domain_max_background_jobs":1,"domain_max_open_files":64,"domains":[{"domain_id":2,"tablet_start":2,"tablet_end":2,"path":"/home/lishen/work/agentdb-finish-s9-cycle-5/node-f/tablet-store/domain-00000000000000000002","open":true,"metrics":{"live_data_size_bytes":0,"total_sst_file_size_bytes":0,"active_memtable_bytes":526336,"all_memtables_bytes":526336,"immutable_memtables":0,"level0_files":0,"pending_compaction_bytes":0,"compaction_pending":false,"memtable_flush_pending":false,"running_compactions":0,"running_flushes":0,"background_errors":0,"estimated_keys":111}}]}}
+restart-persistence: restarting owner node-a with existing data dirs
+smoke: append seq 5 attempt 1 via node-a
+smoke: append seq 5 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30100/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+smoke: append seq 5 attempt 2 via node-a
+checkpoint-replacement: creating tablet-store checkpoint via node-a
+checkpoint-replacement: installed tablet 1 checkpoint size=22170 checksum=c3d21951da07647b97014e258c5b0392cad8415ab60afcc5a6ecce018da189e7
+az-failure: stopping AZ local-a nodes ["node-a", "node-d"]
+smoke: append seq 6 attempt 1 via node-c
+smoke: append seq 5 attempt 1 via node-f
+az-failure: restarting AZ local-a
+rolling-restart: restarting node-a
+smoke: append seq 7 attempt 1 via node-c
+smoke: append seq 7 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+rolling-restart: restarting node-b
+smoke: append seq 8 attempt 1 via node-c
+rolling-restart: restarting node-c
+smoke: append seq 9 attempt 1 via node-c
+rolling-restart: restarting node-d
+smoke: append seq 10 attempt 1 via node-c
+rolling-restart: restarting node-e
+smoke: append seq 11 attempt 1 via node-c
+smoke: append seq 11 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+smoke: append seq 11 attempt 2 via node-c
+smoke: append seq 11 retry 2 after convergence error: HTTP 503 Service Unavailable for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"RAFT_NOT_LEADER","message":"raft-rs local node 661138414602118264 is not leader for tablet 1","retryable":true,"suggestion":"retry the request against the raft leader advertised by the API","tablet_id":1,"leader_raft_node_id":null,"owner_node_id":"node-c","owner_address":"http://127.0.0.1:30102"}
+smoke: raft leader hint unavailable; rediscovering tablet owner
+smoke: append seq 11 attempt 3 via node-c
+smoke: append seq 11 retry 3 after convergence error: HTTP 503 Service Unavailable for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"RAFT_NOT_LEADER","message":"raft-rs local node 661138414602118264 is not leader for tablet 1","retryable":true,"suggestion":"retry the request against the raft leader advertised by the API","tablet_id":1,"leader_raft_node_id":null,"owner_node_id":"node-c","owner_address":"http://127.0.0.1:30102"}
+smoke: raft leader hint unavailable; rediscovering tablet owner
+rolling-restart: restarting node-f
+smoke: append seq 12 attempt 1 via node-c
+smoke: append seq 12 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+smoke: append seq 12 attempt 2 via node-c
+smoke: append seq 12 retry 2 after convergence error: HTTP 503 Service Unavailable for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"RAFT_NOT_LEADER","message":"raft-rs local node 661138414602118264 is not leader for tablet 1","retryable":true,"suggestion":"retry the request against the raft leader advertised by the API","tablet_id":1,"leader_raft_node_id":null,"owner_node_id":"node-c","owner_address":"http://127.0.0.1:30102"}
+smoke: raft leader hint unavailable; rediscovering tablet owner
+smoke: append seq 12 attempt 3 via node-c
+smoke: append seq 12 retry 3 after convergence error: HTTP 503 Service Unavailable for http://127.0.0.1:30102/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"RAFT_NOT_LEADER","message":"raft-rs local node 661138414602118264 is not leader for tablet 1","retryable":true,"suggestion":"retry the request against the raft leader advertised by the API","tablet_id":1,"leader_raft_node_id":null,"owner_node_id":"node-c","owner_address":"http://127.0.0.1:30102"}
+smoke: raft leader hint unavailable; rediscovering tablet owner
+replacement: preparing tablet 1 handoff from node-a to node-b
+replacement: completing tablet 1 handoff to node-b at applied_index 33
+replacement: complete retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30100/api/admin/tablets/1/replacement/complete: {"code":"INTERNAL","message":"raft-rs node 1436428130057271330 not found","retryable":true}
+replacement: stopping source node-a so target node-b can take ownership
+smoke: append seq 13 attempt 1 via node-b
+smoke: append seq 13 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30101/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+split-merge: appending event 14 before split prepare
+smoke: append seq 14 attempt 1 via node-b
+split-merge: appending event 15 while split is prepared
+smoke: append seq 15 attempt 1 via node-b
+smoke: append seq 15 retry 1 after convergence error: HTTP 500 Internal Server Error for http://127.0.0.1:30101/api/tenants/ten_019e41e1-4e7b-7fa1-a7ef-cc3cb4bf3425/sessions/ses_019e41e1-78f3-7112-a851-e2f252818c70/events: {"code":"INTERNAL","message":"raft-rs command did not commit for tablet 1 before timeout","retryable":true}
+smoke: append seq 15 attempt 2 via node-b
+split-merge: completed metadata split and merge cutover
+real cluster smoke passed; diagnostics kept under /home/lishen/work/agentdb-finish-s9-cycle-5
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Stopping 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Stopping 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Stopped 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Removing 
+ Container agentdb-finish-s9-cycle-5-minio-init-1 Removed 
+ Container agentdb-finish-s9-cycle-5-minio-1 Stopping 
+ Container agentdb-finish-s9-cycle-5-minio-1 Stopped 
+ Container agentdb-finish-s9-cycle-5-minio-1 Removing 
+ Container agentdb-finish-s9-cycle-5-minio-1 Removed 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Stopped 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Removing 
+ Container agentdb-finish-s9-cycle-5-postgres-1 Removed 
+ Network agentdb-finish-s9-cycle-5_default Removing 
+ Network agentdb-finish-s9-cycle-5_default Removed 

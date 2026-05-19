@@ -1,0 +1,15 @@
+{
+  "profile": "smoke",
+  "tenants": 1,
+  "agents_per_tenant": 1,
+  "sessions_per_agent": 2,
+  "events_per_session": 5,
+  "records_per_session": 2,
+  "payload_bytes": 256,
+  "artifact_rate": 0.2,
+  "artifact_small_bytes": 1024,
+  "artifact_large_bytes": 1048576,
+  "artifact_mode": "reference",
+  "forks_per_parent": 1,
+  "seed": 42
+}
