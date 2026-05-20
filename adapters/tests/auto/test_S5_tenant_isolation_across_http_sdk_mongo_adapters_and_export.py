@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_BIN = REPO_ROOT / "target" / "debug" / "agentdb"
 PYTHON_CLIENT_ROOT = REPO_ROOT / "clients" / "python"
+TYPESCRIPT_CLIENT_ENTRY = REPO_ROOT / "clients" / "typescript" / "dist" / "index.js"
 sys.path.insert(0, str(PYTHON_CLIENT_ROOT))
 
 from agentdb import AgentDB, AgentDBError, Client  # noqa: E402
@@ -61,7 +63,9 @@ def live_server():
     if os.environ.get("AGENTDB_AUTHOR_LIVE") != "1":
         pytest.skip("set AGENTDB_AUTHOR_LIVE=1 to run this author-mode live HTTP test")
     if not SERVER_BIN.exists():
-        pytest.skip(f"server binary not found at {SERVER_BIN}; run cargo build -p agentdb-server")
+        pytest.skip(
+            f"server binary not found at {SERVER_BIN}; run cargo build -p agentdb-server"
+        )
     port = _free_port()
     mongo_port = _free_port()
     proc = subprocess.Popen(
@@ -107,7 +111,9 @@ def live_server():
 
 
 def _seed(base_url: str, key: str) -> tuple[str, str, str]:
-    _, tenant = _json("POST", f"{base_url}/api/tenants", {"external_key": key, "policy": {}})
+    _, tenant = _json(
+        "POST", f"{base_url}/api/tenants", {"external_key": key, "policy": {}}
+    )
     tid = tenant["tenant_id"]
     _, agent = _json(
         "POST",
@@ -121,6 +127,89 @@ def _seed(base_url: str, key: str) -> tuple[str, str, str]:
         {"alias": f"{key}-session"},
     )
     return tid, aid, session["session_id"]
+
+
+def _run_typescript_sdk_isolation(base_url: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the TypeScript SDK isolation check")
+    if not TYPESCRIPT_CLIENT_ENTRY.exists():
+        pytest.skip(
+            f"TypeScript SDK build output missing at {TYPESCRIPT_CLIENT_ENTRY}; "
+            "run npm test in clients/typescript"
+        )
+
+    script = r"""
+import { pathToFileURL } from "node:url";
+
+const [clientPath, baseUrl] = process.argv.slice(2);
+const { AgentDB, Client, AgentDBError } = await import(pathToFileURL(clientPath).href);
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+const db = new AgentDB({ baseUrl });
+const workspaceA = await db.workspace("tenant-a-ts-auto");
+const workspaceB = await db.workspace("tenant-b-ts-auto");
+const agentA = await workspaceA.agent("tenant-a-ts-agent");
+const agentB = await workspaceB.agent("tenant-b-ts-agent");
+const sessionA = await agentA.session("tenant-a-ts-session");
+const sessionB = await agentB.session("tenant-b-ts-session");
+
+const appendedA = await sessionA.append({ label: "ts-a-only" });
+const appendedB = await sessionB.append({ label: "ts-b-only" });
+assert(appendedA.seq === 0, `expected tenant A first seq 0, got ${appendedA.seq}`);
+assert(appendedB.seq === 0, `expected tenant B first seq 0, got ${appendedB.seq}`);
+
+const wrongSession = new Client({ baseUrl }).session(workspaceA.id, sessionB.id);
+try {
+  await wrongSession.fetch({ fromSeq: 0, limit: 10 });
+  throw new Error("cross-tenant TypeScript fetch unexpectedly succeeded");
+} catch (err) {
+  if (!(err instanceof AgentDBError)) throw err;
+  assert([400, 404].includes(err.statusCode), `unexpected cross-tenant status ${err.statusCode}`);
+  assert(!JSON.stringify(err.body ?? {}).includes("ts-b-only"), "error body leaked tenant B marker");
+}
+
+const watchedA = await workspaceA.watch({ scope: "tenant", limit: 100 });
+const watchedPayloadsA = JSON.stringify(watchedA.map((item) => item.event.payload));
+assert(watchedPayloadsA.includes("ts-a-only"), "TypeScript tenant A watch missed own marker");
+assert(!watchedPayloadsA.includes("ts-b-only"), "TypeScript tenant A watch leaked tenant B marker");
+
+const exportResp = await fetch(
+  `${baseUrl}/api/tenants/${encodeURIComponent(workspaceA.id)}/exports/watch?include=events&limit=100`
+);
+assert(exportResp.ok, `tenant A export failed HTTP ${exportResp.status}`);
+const exportBody = await exportResp.json();
+const encodedExport = JSON.stringify(exportBody);
+assert(encodedExport.includes("ts-a-only"), "tenant A export missed TypeScript marker");
+assert(!encodedExport.includes("ts-b-only"), "tenant A export leaked tenant B TypeScript marker");
+
+console.log(JSON.stringify({
+  tenantA: workspaceA.id,
+  tenantB: workspaceB.id,
+  sessionA: sessionA.id,
+  sessionB: sessionB.id,
+  watchedA: watchedA.length,
+}));
+"""
+    proc = subprocess.run(
+        [node, "--input-type=module", "-", str(TYPESCRIPT_CLIENT_ENTRY), base_url],
+        input=script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            "TypeScript SDK isolation script failed\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
 
 
 def test_tenant_isolation_across_http_sdk_and_export_surfaces(live_server: LiveServer):
@@ -174,7 +263,9 @@ def test_tenant_isolation_across_http_sdk_and_export_surfaces(live_server: LiveS
     sdk_session_a.append({"label": "sdk-a-only"})
     sdk_session_b.append({"label": "sdk-b-only"})
 
-    wrong_session = Client(live_server.base_url).session(sdk_workspace_a.id, sdk_session_b.id)
+    wrong_session = Client(live_server.base_url).session(
+        sdk_workspace_a.id, sdk_session_b.id
+    )
     with pytest.raises(AgentDBError) as exc:
         wrong_session.fetch(from_seq=0, limit=10)
     assert exc.value.status_code in {400, 404}
@@ -206,6 +297,15 @@ def test_tenant_isolation_across_http_sdk_and_export_surfaces(live_server: LiveS
     assert "sdk-b-only" not in encoded_sdk_export
 
 
+def test_tenant_isolation_across_typescript_sdk_and_export_surfaces(
+    live_server: LiveServer,
+):
+    result = _run_typescript_sdk_isolation(live_server.base_url)
+    assert result["tenantA"] != result["tenantB"]
+    assert result["sessionA"] != result["sessionB"]
+    assert result["watchedA"] >= 1
+
+
 def test_tenant_isolation_across_mongo_database_mapping(live_server: LiveServer):
     pymongo = pytest.importorskip("pymongo")
 
@@ -214,7 +314,9 @@ def test_tenant_isolation_across_mongo_database_mapping(live_server: LiveServer)
     marker_a = "mongo-a-only"
     marker_b = "mongo-b-only"
 
-    mongo_client = pymongo.MongoClient(live_server.mongo_uri, serverSelectionTimeoutMS=2000)
+    mongo_client = pymongo.MongoClient(
+        live_server.mongo_uri, serverSelectionTimeoutMS=2000
+    )
     try:
         mongo_client[key_a].events.insert_one(
             {
@@ -245,7 +347,9 @@ def test_tenant_isolation_across_mongo_database_mapping(live_server: LiveServer)
 
     status, tenants = _json("GET", f"{live_server.base_url}/api/tenants")
     assert status == 200
-    tenants_by_key = {tenant["external_key"]: tenant["tenant_id"] for tenant in tenants["tenants"]}
+    tenants_by_key = {
+        tenant["external_key"]: tenant["tenant_id"] for tenant in tenants["tenants"]
+    }
     tenant_a = tenants_by_key[key_a]
     tenant_b = tenants_by_key[key_b]
 
