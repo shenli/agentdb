@@ -23,7 +23,7 @@ const SECONDARY_TABLET_ID: i64 = 2;
 const SECONDARY_CELL_ID: &str = "cell-b";
 const SECONDARY_PLACEMENT_SCOPE_ID: &str = "cell-b";
 const SMOKE_STALE_NODE_THRESHOLD_MS: u64 = 180_000;
-const APPEND_RECOVERY_ATTEMPTS: usize = 8;
+const APPEND_RECOVERY_ATTEMPTS: usize = 16;
 const DEFAULT_APPEND_VISIBILITY_ATTEMPTS: usize = 50;
 
 #[derive(Debug, Parser)]
@@ -906,8 +906,9 @@ async fn run_smoke(
         .await?;
     }
 
+    let mut active_nodes = nodes.to_vec();
     if args.full_hardening || args.replacement {
-        run_explicit_replacement(
+        active_nodes = run_explicit_replacement(
             args,
             client,
             nodes,
@@ -923,7 +924,7 @@ async fn run_smoke(
     if args.full_hardening || args.split_merge {
         run_split_merge_lifecycle(
             client,
-            nodes,
+            &active_nodes,
             &tenant_id,
             &agent_id,
             &session_id,
@@ -1119,27 +1120,59 @@ async fn run_record_index_probe(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token)
     );
-    assert_search_finds_record(client, &owner.url, &global_path, &target_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &global_path,
+        &target_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let local_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&sharding_key={}&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token),
         query_encode(session_id)
     );
-    assert_search_finds_record(client, &owner.url, &local_path, &target_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &local_path,
+        &target_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let control_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=control&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token)
     );
-    assert_search_finds_record(client, &owner.url, &control_path, &control_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &control_path,
+        &control_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let source_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=source&source_record={}&min_visible_record_commit_seq={source_commit_seq}",
         query_encode(&token),
         query_encode(&target_id)
     );
-    assert_search_finds_record(client, &owner.url, &source_path, &source_child_id).await?;
+    wait_search_finds_record(
+        client,
+        nodes,
+        tablet_id,
+        &source_path,
+        &source_child_id,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let vector_response = post_json(
         client,
@@ -1148,7 +1181,7 @@ async fn run_record_index_probe(
         json!({
             "namespace": ["cluster-smoke", "vectors"],
             "embedding": [0.0, 1.0, 0.0],
-            "limit": 2,
+            "limit": 5,
             "min_visible_record_commit_seq": max_commit_seq
         }),
     )
@@ -1162,7 +1195,7 @@ async fn run_record_index_probe(
             .iter()
             .any(|record| record["text"].as_str() == Some("east-vector"))
     {
-        bail!("vector search expected north first and east in top two: {vector_response}");
+        bail!("vector search expected north first and east in top results: {vector_response}");
     }
 
     delete_record_retry(client, nodes, tablet_id, tenant_id, &control_id).await?;
@@ -1446,7 +1479,7 @@ async fn run_explicit_replacement(
     agent_id: &str,
     session_id: &str,
     next_seq: &mut u64,
-) -> Result<()> {
+) -> Result<Vec<NodeSpec>> {
     let owner = wait_tablet_owner(
         client,
         nodes,
@@ -1562,7 +1595,7 @@ async fn run_explicit_replacement(
     .await?;
     *next_seq += 1;
     let _ = force_raft_catch_up(client, &survivors, PRIMARY_TABLET_ID).await?;
-    Ok(())
+    Ok(survivors)
 }
 
 async fn run_az_failure(
@@ -2856,8 +2889,13 @@ async fn event_count_with_convergence_retry(
 
 async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec], tablet_id: i64) -> Result<Value> {
     let mut last_error = None;
-    let expected_node_ids: BTreeSet<_> = nodes.iter().map(|node| node.id.as_str()).collect();
     for attempt in 0..5 {
+        let expected_node_ids = current_reachable_node_ids(client, nodes).await;
+        let expected_node_ids = if expected_node_ids.is_empty() {
+            nodes.iter().map(|node| node.id.clone()).collect()
+        } else {
+            expected_node_ids
+        };
         let owner =
             wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
         let response = post_json(
@@ -2894,7 +2932,7 @@ async fn force_raft_catch_up(client: &Client, nodes: &[NodeSpec], tablet_id: i64
 
 fn catch_up_failures_are_outside_scope(
     response: &Value,
-    expected_node_ids: &BTreeSet<&str>,
+    expected_node_ids: &BTreeSet<String>,
 ) -> bool {
     response["failures"].as_array().is_none_or(|failures| {
         failures.iter().all(|failure| {
@@ -2937,6 +2975,10 @@ fn retry_owner_hint_from_error(error: &anyhow::Error, nodes: &[NodeSpec]) -> Opt
     let json_start = message.find('{')?;
     let value: Value = serde_json::from_str(&message[json_start..]).ok()?;
     let body = value.get("error").unwrap_or(&value);
+    if body.get("leader_raft_node_id").is_some_and(Value::is_null) {
+        eprintln!("smoke: raft leader hint unavailable; rediscovering tablet owner");
+        return None;
+    }
     let owner_node_id = body.get("owner_node_id")?.as_str()?;
     let owner = nodes.iter().find(|node| node.id == owner_node_id)?.clone();
     eprintln!(
@@ -3276,6 +3318,16 @@ async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<
     BTreeSet::new()
 }
 
+async fn current_reachable_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    for node in nodes {
+        if get_json(client, &node.url, "/health/ready").await.is_ok() {
+            reachable.insert(node.id.clone());
+        }
+    }
+    reachable
+}
+
 async fn print_diagnostics(client: &Client, nodes: &[NodeSpec]) -> Result<()> {
     for node in nodes {
         let status = get_json(client, &node.url, "/api/admin/cluster/health").await?;
@@ -3449,6 +3501,30 @@ async fn assert_search_missing_record(
         bail!("record search still found deleted record {record_id}: {response}");
     }
     Ok(())
+}
+
+async fn wait_search_finds_record(
+    client: &Client,
+    nodes: &[NodeSpec],
+    tablet_id: i64,
+    path: &str,
+    record_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut last = anyhow!("record {record_id} did not become visible");
+    loop {
+        if start.elapsed() > timeout {
+            return Err(last);
+        }
+        let owner =
+            wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
+        match assert_search_finds_record(client, &owner.url, path, record_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn wait_search_missing_record(

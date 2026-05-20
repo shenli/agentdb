@@ -7190,11 +7190,20 @@ async fn raft_not_leader_response(
 ) -> Response {
     let tablet_id = route_tablet_id(route_headers);
     let mut leader_raft_node_id = None;
-    let mut owner_node_id = None;
-    let mut owner_address = None;
+    let (mut owner_node_id, mut owner_address) =
+        raft_not_leader_owner_hint_from_headers(route_headers);
     if let (Some(meta), Some(registry), Some(tablet_id)) =
         (state.meta.as_ref(), state.raft_registry.as_ref(), tablet_id)
     {
+        if let Ok((node_id, address)) = raft_not_leader_owner_hint_from_meta(meta, tablet_id).await
+        {
+            apply_raft_not_leader_owner_hint(
+                &mut owner_node_id,
+                &mut owner_address,
+                node_id,
+                address,
+            );
+        }
         if let Ok(statuses) = registry.status_for(tablet_id) {
             leader_raft_node_id = raft_leader_id_from_statuses(&statuses);
         }
@@ -7202,10 +7211,16 @@ async fn raft_not_leader_response(
             if let Ok(Some(node_id)) =
                 resolve_control_plane_node_id(meta, tablet_id, leader_id).await
             {
-                owner_node_id = Some(node_id.clone());
+                let mut address = None;
                 if let Ok(Some(node)) = nodes::get(meta.pool(), &node_id).await {
-                    owner_address = Some(node.address);
+                    address = Some(node.address);
                 }
+                apply_raft_not_leader_owner_hint(
+                    &mut owner_node_id,
+                    &mut owner_address,
+                    Some(node_id),
+                    address,
+                );
             }
         }
     }
@@ -7241,6 +7256,50 @@ async fn raft_not_leader_response(
             .insert(HDR_OWNER_ADDRESS, owner_address);
     }
     response
+}
+
+fn raft_not_leader_owner_hint_from_headers(
+    headers: &HeaderMap,
+) -> (Option<String>, Option<String>) {
+    (
+        route_string_header(headers, HDR_OWNER_NODE),
+        route_string_header(headers, HDR_OWNER_ADDRESS),
+    )
+}
+
+async fn raft_not_leader_owner_hint_from_meta(
+    meta: &agentdb_meta::MetaStore,
+    tablet_id: i64,
+) -> agentdb_meta::MetaResult<(Option<String>, Option<String>)> {
+    let Some(tablet) = tablets::get(meta.pool(), tablet_id).await? else {
+        return Ok((None, None));
+    };
+    let Some(owner_node_id) = tablet.owner_node_id else {
+        return Ok((None, None));
+    };
+    let owner_address = nodes::get(meta.pool(), &owner_node_id)
+        .await?
+        .map(|node| node.address);
+    Ok((Some(owner_node_id), owner_address))
+}
+
+fn apply_raft_not_leader_owner_hint(
+    owner_node_id: &mut Option<String>,
+    owner_address: &mut Option<String>,
+    candidate_owner_node_id: Option<String>,
+    candidate_owner_address: Option<String>,
+) {
+    let Some(candidate_owner_node_id) = candidate_owner_node_id else {
+        if candidate_owner_address.is_some() {
+            *owner_address = candidate_owner_address;
+        }
+        return;
+    };
+    let owner_changed = owner_node_id.as_deref() != Some(candidate_owner_node_id.as_str());
+    *owner_node_id = Some(candidate_owner_node_id);
+    if owner_changed || candidate_owner_address.is_some() {
+        *owner_address = candidate_owner_address;
+    }
 }
 
 fn with_headers(mut response: Response, headers: HeaderMap) -> Response {
@@ -7696,5 +7755,81 @@ fn parse_opt_id(s: Option<&str>, kind: IdKind) -> Result<Option<Id>, ApiError> {
     match s {
         None => Ok(None),
         Some(raw) => Ok(Id::parse_kind(raw, kind).ok()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raft_not_leader_owner_hint_uses_route_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HDR_OWNER_NODE, HeaderValue::from_static("node-a"));
+        headers.insert(
+            HDR_OWNER_ADDRESS,
+            HeaderValue::from_static("http://127.0.0.1:18080"),
+        );
+
+        let (owner_node_id, owner_address) = raft_not_leader_owner_hint_from_headers(&headers);
+
+        assert_eq!(owner_node_id.as_deref(), Some("node-a"));
+        assert_eq!(owner_address.as_deref(), Some("http://127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn raft_not_leader_owner_hint_clears_stale_address_when_owner_changes() {
+        let mut owner_node_id = Some("node-a".to_string());
+        let mut owner_address = Some("http://127.0.0.1:18080".to_string());
+
+        apply_raft_not_leader_owner_hint(
+            &mut owner_node_id,
+            &mut owner_address,
+            Some("node-b".to_string()),
+            None,
+        );
+
+        assert_eq!(owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(owner_address, None);
+    }
+
+    #[tokio::test]
+    async fn raft_not_leader_owner_hint_loads_current_meta_owner() {
+        let meta = agentdb_meta::MetaStore::open_sqlite(":memory:")
+            .await
+            .unwrap();
+        nodes::upsert(
+            meta.pool(),
+            "node-b",
+            "http://127.0.0.1:18081",
+            None,
+            "alive",
+            100,
+            Some("us-west-2b"),
+            Some("us-west-2"),
+        )
+        .await
+        .unwrap();
+        let tablet = tablets::create_with_placement(
+            meta.pool(),
+            7,
+            "default",
+            "serving",
+            Some("raft/7"),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        tablets::assume_ownership(meta.pool(), 7, tablet.epoch, "node-b", i64::MAX)
+            .await
+            .unwrap();
+
+        let (owner_node_id, owner_address) = raft_not_leader_owner_hint_from_meta(&meta, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(owner_node_id.as_deref(), Some("node-b"));
+        assert_eq!(owner_address.as_deref(), Some("http://127.0.0.1:18081"));
     }
 }

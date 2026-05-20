@@ -1,0 +1,9 @@
+{
+  "captured_at_ms": 1779207907035,
+  "agentdb_bench_version": "0.1.0",
+  "git_sha": "3c291f6f3264352b7fd549be6c60774883a21b44",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+  "docker": "Docker version 29.5.0, build 98f1464",
+  "docker_compose": "Docker Compose version v5.1.3"
+}

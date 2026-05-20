@@ -1,0 +1,23 @@
+{
+  "new-verify": {
+    "after": 3,
+    "before": 2,
+    "verified_seqs": [
+      0,
+      1,
+      2
+    ]
+  },
+  "old-write": {
+    "fetched": 2,
+    "verified_seqs": [
+      0,
+      1
+    ]
+  },
+  "state": {
+    "agent_id": "agt_019e40ee-ace2-7de0-8f96-141f0c87fa76",
+    "session_id": "ses_019e40ee-ace2-7de0-8f96-1420c6cff6df",
+    "tenant_id": "ten_019e40ee-ace0-7ab0-883f-c18e97232dcd"
+  }
+}

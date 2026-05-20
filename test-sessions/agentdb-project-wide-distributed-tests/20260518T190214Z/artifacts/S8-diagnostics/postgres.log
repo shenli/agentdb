@@ -1,0 +1,64 @@
+postgres-1  | The files belonging to this database system will be owned by user "postgres".
+postgres-1  | This user must also own the server process.
+postgres-1  | 
+postgres-1  | The database cluster will be initialized with locale "en_US.utf8".
+postgres-1  | The default database encoding has accordingly been set to "UTF8".
+postgres-1  | The default text search configuration will be set to "english".
+postgres-1  | 
+postgres-1  | Data page checksums are disabled.
+postgres-1  | 
+postgres-1  | fixing permissions on existing directory /var/lib/postgresql/data ... ok
+postgres-1  | creating subdirectories ... ok
+postgres-1  | selecting dynamic shared memory implementation ... posix
+postgres-1  | selecting default max_connections ... 100
+postgres-1  | selecting default shared_buffers ... 128MB
+postgres-1  | selecting default time zone ... Etc/UTC
+postgres-1  | creating configuration files ... ok
+postgres-1  | running bootstrap script ... ok
+postgres-1  | performing post-bootstrap initialization ... ok
+postgres-1  | syncing data to disk ... ok
+postgres-1  | 
+postgres-1  | 
+postgres-1  | Success. You can now start the database server using:
+postgres-1  | 
+postgres-1  |     pg_ctl -D /var/lib/postgresql/data -l logfile start
+postgres-1  | 
+postgres-1  | initdb: warning: enabling "trust" authentication for local connections
+postgres-1  | initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+postgres-1  | waiting for server to start....2026-05-18 19:15:23.587 UTC [61] LOG:  starting PostgreSQL 16.13 (Debian 16.13-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+postgres-1  | 2026-05-18 19:15:23.593 UTC [61] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-05-18 19:15:23.617 UTC [64] LOG:  database system was shut down at 2026-05-18 19:15:22 UTC
+postgres-1  | 2026-05-18 19:15:23.638 UTC [61] LOG:  database system is ready to accept connections
+postgres-1  |  done
+postgres-1  | server started
+postgres-1  | 2026-05-18 19:15:23.769 UTC [80] FATAL:  database "agentdb_smoke" does not exist
+postgres-1  | CREATE DATABASE
+postgres-1  | 
+postgres-1  | 
+postgres-1  | /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+postgres-1  | 
+postgres-1  | waiting for server to shut down....2026-05-18 19:15:23.772 UTC [61] LOG:  received fast shutdown request
+postgres-1  | 2026-05-18 19:15:23.778 UTC [61] LOG:  aborting any active transactions
+postgres-1  | 2026-05-18 19:15:23.779 UTC [61] LOG:  background worker "logical replication launcher" (PID 67) exited with exit code 1
+postgres-1  | 2026-05-18 19:15:23.779 UTC [62] LOG:  shutting down
+postgres-1  | 2026-05-18 19:15:23.785 UTC [62] LOG:  checkpoint starting: shutdown immediate
+postgres-1  | 2026-05-18 19:15:24.021 UTC [62] LOG:  checkpoint complete: wrote 926 buffers (5.7%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.035 s, sync=0.180 s, total=0.243 s; sync files=301, longest=0.007 s, average=0.001 s; distance=4273 kB, estimate=4273 kB; lsn=0/191F120, redo lsn=0/191F120
+postgres-1  | 2026-05-18 19:15:24.034 UTC [61] LOG:  database system is shut down
+postgres-1  |  done
+postgres-1  | server stopped
+postgres-1  | 
+postgres-1  | PostgreSQL init process complete; ready for start up.
+postgres-1  | 
+postgres-1  | 2026-05-18 19:15:24.104 UTC [1] LOG:  starting PostgreSQL 16.13 (Debian 16.13-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+postgres-1  | 2026-05-18 19:15:24.104 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+postgres-1  | 2026-05-18 19:15:24.104 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+postgres-1  | 2026-05-18 19:15:24.117 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+postgres-1  | 2026-05-18 19:15:24.133 UTC [91] LOG:  database system was shut down at 2026-05-18 19:15:24 UTC
+postgres-1  | 2026-05-18 19:15:24.147 UTC [1] LOG:  database system is ready to accept connections
+postgres-1  | 2026-05-18 19:15:37.331 UTC [187] ERROR:  duplicate key value violates unique constraint "scheduler_leader_pkey"
+postgres-1  | 2026-05-18 19:15:37.331 UTC [187] DETAIL:  Key (id)=(1) already exists.
+postgres-1  | 2026-05-18 19:15:37.331 UTC [187] STATEMENT:  INSERT INTO scheduler_leader
+postgres-1  | 	                   (id, node_id, epoch, expires_at_ms, acquired_at_ms)
+postgres-1  | 	                 VALUES (1, $1, 1, $2, $3)
+postgres-1  | 2026-05-18 19:20:24.232 UTC [89] LOG:  checkpoint starting: time
+postgres-1  | 2026-05-18 19:20:54.976 UTC [89] LOG:  checkpoint complete: wrote 329 buffers (2.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=30.581 s, sync=0.110 s, total=30.744 s; sync files=185, longest=0.007 s, average=0.001 s; distance=8725 kB, estimate=8725 kB; lsn=0/22814C0, redo lsn=0/21A4520
