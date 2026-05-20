@@ -3321,7 +3321,14 @@ async fn current_live_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<
 async fn current_reachable_node_ids(client: &Client, nodes: &[NodeSpec]) -> BTreeSet<String> {
     let mut reachable = BTreeSet::new();
     for node in nodes {
-        if get_json(client, &node.url, "/health/ready").await.is_ok() {
+        let Ok(response) = client
+            .get(format!("{}/health/ready", node.url))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if response.status().is_success() {
             reachable.insert(node.id.clone());
         }
     }
