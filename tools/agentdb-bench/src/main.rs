@@ -396,6 +396,7 @@ struct CellReport {
     ops_per_sec: f64,
     latency: LatencyReport,
     operations: Vec<OperationReport>,
+    tenants: Vec<TenantLatencyReport>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -417,8 +418,17 @@ struct OperationReport {
     latency: LatencyReport,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TenantLatencyReport {
+    tenant_id: String,
+    successful_ops: u64,
+    errors: u64,
+    latency: LatencyReport,
+}
+
 #[derive(Clone, Debug)]
 struct OperationSample {
+    tenant_id: Option<String>,
     operation: Operation,
     latency_ms: f64,
     success: bool,
@@ -433,6 +443,7 @@ struct OperationRecord {
     workload: Workload,
     concurrency: usize,
     worker_id: usize,
+    tenant_id: Option<String>,
     operation: String,
     started_at_ms: u64,
     latency_ms: f64,
@@ -1630,9 +1641,14 @@ async fn run_cell(
                 )
                 .await;
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                let tenant_id = result
+                    .as_ref()
+                    .ok()
+                    .map(|outcome| outcome.tenant_id.clone());
                 let error = result.err().map(|err| err.to_string());
                 let success = error.is_none();
                 let sample = OperationSample {
+                    tenant_id: tenant_id.clone(),
                     operation,
                     latency_ms: elapsed,
                     success,
@@ -1648,6 +1664,7 @@ async fn run_cell(
                         workload: args.workload,
                         concurrency,
                         worker_id,
+                        tenant_id,
                         operation: operation.as_str().into(),
                         started_at_ms,
                         latency_ms: elapsed,
@@ -1684,7 +1701,13 @@ async fn run_cell(
         ops_per_sec: successful_ops as f64 / duration.as_secs_f64(),
         latency: summarize_latency(successful_latencies),
         operations: summarize_operations(&samples),
+        tenants: summarize_tenants(&samples),
     })
+}
+
+#[derive(Clone, Debug)]
+struct OperationOutcome {
+    tenant_id: String,
 }
 
 async fn run_one_operation(
@@ -1699,14 +1722,14 @@ async fn run_one_operation(
     operation: Operation,
     mongo_db: Option<&MongoDatabase>,
     agentdb_mongo_client: Option<&MongoClient>,
-) -> Result<()> {
+) -> Result<OperationOutcome> {
     if fixtures.is_empty() {
         return Err(anyhow!("dataset has no sessions"));
     }
     let fixture = fixture_selector.choose(fixtures, rng);
-    if args.backend == "postgres-event-log" {
+    let result = if args.backend == "postgres-event-log" {
         let pool = pg_pool.ok_or_else(|| anyhow!("postgres backend missing pool"))?;
-        return run_one_postgres_operation(
+        run_one_postgres_operation(
             pool,
             args,
             config,
@@ -1715,25 +1738,15 @@ async fn run_one_operation(
             rng,
             operation,
         )
-        .await;
-    }
-    if args.backend == "mongodb-event-log" {
+        .await
+    } else if args.backend == "mongodb-event-log" {
         let db = mongo_db.ok_or_else(|| anyhow!("mongodb backend missing database"))?;
-        return run_one_mongodb_operation(
-            db,
-            args,
-            config,
-            fixture,
-            fork_alias_prefix,
-            rng,
-            operation,
-        )
-        .await;
-    }
-    if args.backend == "agentdb-mongodb-api" {
+        run_one_mongodb_operation(db, args, config, fixture, fork_alias_prefix, rng, operation)
+            .await
+    } else if args.backend == "agentdb-mongodb-api" {
         let mongo = agentdb_mongo_client
             .ok_or_else(|| anyhow!("agentdb mongodb-api backend missing client"))?;
-        return run_one_agentdb_mongodb_operation(
+        run_one_agentdb_mongodb_operation(
             mongo,
             args,
             config,
@@ -1742,99 +1755,103 @@ async fn run_one_operation(
             rng,
             operation,
         )
-        .await;
-    }
-    match operation {
-        Operation::AppendOnly => append_event(
-            client,
-            &args.base_url,
-            &fixture.tenant_id,
-            &fixture.agent_id,
-            &fixture.session_id,
-            "message",
-            json!({
-                "role": "assistant",
-                "content": deterministic_string(128, rng),
-                "bench_op": "append_only"
-            }),
-            Vec::new(),
-            Vec::new(),
-        )
         .await
-        .map(|_| ()),
-        Operation::AppendFetch => {
-            append_and_fetch(
+    } else {
+        match operation {
+            Operation::AppendOnly => append_event(
                 client,
                 &args.base_url,
                 &fixture.tenant_id,
                 &fixture.agent_id,
                 &fixture.session_id,
-                args.fetch_last_n,
+                "message",
                 json!({
                     "role": "assistant",
                     "content": deterministic_string(128, rng),
-                    "bench_op": "append_fetch"
+                    "bench_op": "append_only"
                 }),
+                Vec::new(),
+                Vec::new(),
             )
             .await
-        }
-        Operation::FetchRecent => get_ok(
-            client,
-            &args.base_url,
-            &format!(
-                "/api/tenants/{}/sessions/{}/events?latest=true&limit={}",
-                fixture.tenant_id, fixture.session_id, args.fetch_last_n
-            ),
-        )
-        .await
-        .map(|_| ()),
-        Operation::RecordWrite => {
-            create_record(
-                client,
-                &args.base_url,
-                &fixture.tenant_id,
-                &fixture.session_id,
-                rng.gen_range(0..1_000_000),
-                &DatasetConfig::small_runtime(args.seed),
-            )
-            .await
-        }
-        Operation::RecordSearch => post_json(
-            client,
-            &args.base_url,
-            &format!("/api/tenants/{}/records/search", fixture.tenant_id),
-            &json!({
-                "namespace": ["bench", "session"],
-                "tags": ["bench"],
-                "limit": 10
-            }),
-        )
-        .await
-        .map(|_| ()),
-        Operation::Fork => {
-            let alias = format!(
-                "bench-runtime-fork-{fork_alias_prefix}-{}",
-                rng.gen::<u64>()
-            );
-            post_json(
+            .map(|_| ()),
+            Operation::AppendFetch => {
+                append_and_fetch(
+                    client,
+                    &args.base_url,
+                    &fixture.tenant_id,
+                    &fixture.agent_id,
+                    &fixture.session_id,
+                    args.fetch_last_n,
+                    json!({
+                        "role": "assistant",
+                        "content": deterministic_string(128, rng),
+                        "bench_op": "append_fetch"
+                    }),
+                )
+                .await
+            }
+            Operation::FetchRecent => get_ok(
                 client,
                 &args.base_url,
                 &format!(
-                    "/api/tenants/{}/sessions/{}/fork",
-                    fixture.tenant_id, fixture.session_id
+                    "/api/tenants/{}/sessions/{}/events?latest=true&limit={}",
+                    fixture.tenant_id, fixture.session_id, args.fetch_last_n
                 ),
+            )
+            .await
+            .map(|_| ()),
+            Operation::RecordWrite => {
+                create_record(
+                    client,
+                    &args.base_url,
+                    &fixture.tenant_id,
+                    &fixture.session_id,
+                    rng.gen_range(0..1_000_000),
+                    &DatasetConfig::small_runtime(args.seed),
+                )
+                .await
+            }
+            Operation::RecordSearch => post_json(
+                client,
+                &args.base_url,
+                &format!("/api/tenants/{}/records/search", fixture.tenant_id),
                 &json!({
-                    "at_seq": fixture.events_written.saturating_sub(1) as u64,
-                    "alias": alias
+                    "namespace": ["bench", "session"],
+                    "tags": ["bench"],
+                    "limit": 10
                 }),
             )
             .await
-            .map(|_| ())
+            .map(|_| ()),
+            Operation::Fork => {
+                let alias = format!(
+                    "bench-runtime-fork-{fork_alias_prefix}-{}",
+                    rng.gen::<u64>()
+                );
+                post_json(
+                    client,
+                    &args.base_url,
+                    &format!(
+                        "/api/tenants/{}/sessions/{}/fork",
+                        fixture.tenant_id, fixture.session_id
+                    ),
+                    &json!({
+                        "at_seq": fixture.events_written.saturating_sub(1) as u64,
+                        "alias": alias
+                    }),
+                )
+                .await
+                .map(|_| ())
+            }
+            Operation::Artifact => {
+                run_one_agentdb_artifact_operation(client, args, config, fixture, rng).await
+            }
         }
-        Operation::Artifact => {
-            run_one_agentdb_artifact_operation(client, args, config, fixture, rng).await
-        }
-    }
+    };
+    result.map(|_| OperationOutcome {
+        tenant_id: fixture.tenant_id.clone(),
+    })
 }
 
 #[derive(Clone)]
@@ -3995,6 +4012,24 @@ fn write_markdown_report(
             ));
         }
     }
+    out.push_str("\n## Tenant Breakdown\n\n");
+    out.push_str("| concurrency | tenant | ops | errors | p50 ms | p95 ms | p99 ms | max ms |\n");
+    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    for cell in &report.cells {
+        for tenant in &cell.tenants {
+            out.push_str(&format!(
+                "| {} | `{}` | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+                cell.concurrency,
+                tenant.tenant_id,
+                tenant.successful_ops,
+                tenant.errors,
+                tenant.latency.p50_ms,
+                tenant.latency.p95_ms,
+                tenant.latency.p99_ms,
+                tenant.latency.max_ms
+            ));
+        }
+    }
     fs::write(path, out)?;
     Ok(())
 }
@@ -4289,6 +4324,34 @@ fn summarize_operations(samples: &[OperationSample]) -> Vec<OperationReport> {
                 successful_ops,
                 errors,
                 first_error: samples.iter().find_map(|sample| sample.error.clone()),
+                latency: summarize_latency(latencies),
+            }
+        })
+        .collect()
+}
+
+fn summarize_tenants(samples: &[OperationSample]) -> Vec<TenantLatencyReport> {
+    let mut grouped: BTreeMap<String, Vec<&OperationSample>> = BTreeMap::new();
+    for sample in samples {
+        if let Some(tenant_id) = &sample.tenant_id {
+            grouped.entry(tenant_id.clone()).or_default().push(sample);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(tenant_id, samples)| {
+            let successful_ops = samples.iter().filter(|sample| sample.success).count() as u64;
+            let errors = samples.len() as u64 - successful_ops;
+            let latencies = samples
+                .iter()
+                .filter(|sample| sample.success)
+                .map(|sample| sample.latency_ms)
+                .collect();
+            TenantLatencyReport {
+                tenant_id,
+                successful_ops,
+                errors,
                 latency: summarize_latency(latencies),
             }
         })
