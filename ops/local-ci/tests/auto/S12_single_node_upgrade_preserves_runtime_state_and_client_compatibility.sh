@@ -29,6 +29,9 @@ fi
 
 BIND="${AGENTDB_S12_BIND:-127.0.0.1:32120}"
 BASE_URL="http://${BIND}"
+MONGO_MODE="${AGENTDB_S12_MONGO:-auto}"
+MONGO_BIND="${AGENTDB_S12_MONGO_BIND:-127.0.0.1:32121}"
+MONGO_URI="mongodb://${MONGO_BIND}/?directConnection=true"
 WORK_DIR="${AGENTDB_S12_WORK_DIR:-${SESSION_DIR}/artifacts/S12-upgrade}"
 DATA_DIR="${WORK_DIR}/data"
 CONTENT_DIR="${WORK_DIR}/content"
@@ -84,15 +87,18 @@ PY
 
 run_client_phase() {
   local phase="$1"
-  python3 - "${BASE_URL}" "${STATE_FILE}" "${METRICS_FILE}" "${phase}" <<'PY' 2>&1 | tee -a "${CLIENT_LOG}"
+  python3 - "${BASE_URL}" "${STATE_FILE}" "${METRICS_FILE}" "${phase}" "${ROOT}" "${MONGO_URI}" "${MONGO_MODE}" <<'PY' 2>&1 | tee -a "${CLIENT_LOG}"
 import json
+import os
+import pathlib
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-base, state_path, metrics_path, phase = sys.argv[1:5]
+base, state_path, metrics_path, phase, root, mongo_uri, mongo_mode = sys.argv[1:8]
+sys.path.insert(0, str(pathlib.Path(root) / "clients" / "python"))
 
 def request(method, path, body=None, headers=None):
     data = None
@@ -195,8 +201,86 @@ def write_metrics(state, phase_result):
         json.dump(metrics, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
+def assert_python_sdk_compat(state, expected_before):
+    from agentdb import Client
+
+    client = Client(base)
+    session = client.session(
+        state["tenant_id"],
+        state["session_id"],
+        agent_id=state["agent_id"],
+    )
+    before = session.fetch(from_seq=0, limit=100)
+    before_seqs = [event.seq for event in before]
+    if before_seqs != expected_before:
+        raise AssertionError(f"Python SDK expected seqs {expected_before}, got {before_seqs}")
+    result = session.append(
+        {"seq": 3, "marker": "new-python-sdk"},
+        idempotency_key=f"s12-python-sdk-{state['session_id']}-3",
+    )
+    if result.seq != 3:
+        raise AssertionError(f"Python SDK append expected seq 3, got {result.seq}")
+    after = session.fetch(from_seq=0, limit=100)
+    after_seqs = [event.seq for event in after]
+    if after_seqs != [0, 1, 2, 3]:
+        raise AssertionError(f"Python SDK expected seqs [0,1,2,3], got {after_seqs}")
+    return {"before": before_seqs, "after": after_seqs}
+
+def assert_mongo_compat(state, required):
+    if mongo_mode == "0":
+        return {"status": "skipped", "reason": "AGENTDB_S12_MONGO=0"}
+    try:
+        from pymongo import MongoClient
+    except ImportError as exc:
+        if mongo_mode == "1":
+            raise AssertionError("pymongo is required when AGENTDB_S12_MONGO=1") from exc
+        return {"status": "skipped", "reason": "pymongo not installed"}
+
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+    try:
+        db = client[state["tenant_external_key"]]
+        session = db.sessions.find_one({"session_id": state["session_id"]})
+        if not session:
+            raise AssertionError("Mongo compatibility could not find upgraded session")
+        existing = list(db.events.find({"kind": "message"}))
+        observed_seqs = set()
+        for event in existing:
+            if isinstance(event.get("seq"), int):
+                observed_seqs.add(event["seq"])
+            payload = event.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("seq"), int):
+                observed_seqs.add(payload["seq"])
+        for seq in required:
+            if seq not in observed_seqs:
+                raise AssertionError(
+                    f"Mongo compatibility did not observe seq {seq}; "
+                    f"observed={sorted(observed_seqs)} events={existing}"
+                )
+        appended = db.command(
+            {
+                "agentdbAppendAndFetch": "events",
+                "agent_id": state["agent_id"],
+                "session_id": state["session_id"],
+                "kind": "message",
+                "payload": {"seq": 4, "marker": "new-mongo"},
+                "idempotency_key": f"s12-mongo-{state['session_id']}-4",
+                "fetch_last_n": 10,
+            }
+        )
+        if appended.get("seq") != 4:
+            raise AssertionError(f"Mongo append expected seq 4, got {appended}")
+        return {
+            "status": "verified",
+            "session_id": session.get("session_id"),
+            "observed_events": len(existing),
+            "appended_seq": appended.get("seq"),
+        }
+    finally:
+        client.close()
+
 if phase == "old-write":
-    tenant = request("POST", "/api/tenants", {"external_key": f"s12-upgrade-{int(time.time())}", "policy": {}})
+    tenant_external_key = f"s12-upgrade-{int(time.time())}"
+    tenant = request("POST", "/api/tenants", {"external_key": tenant_external_key, "policy": {}})
     tenant_id = tenant["tenant_id"]
     agent = request("POST", f"/api/tenants/{tenant_id}/agents", {"alias": "s12-agent", "config": {}})
     agent_id = agent["agent_id"]
@@ -211,7 +295,12 @@ if phase == "old-write":
     events = assert_events(tenant_id, session_id, [0, 1])
     assert_watch_contains(tenant_id, session_id, [0, 1])
     assert_export_contains(tenant_id, session_id, [0, 1])
-    state = {"tenant_id": tenant_id, "agent_id": agent_id, "session_id": session_id}
+    state = {
+        "tenant_external_key": tenant_external_key,
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "session_id": session_id,
+    }
     with open(state_path, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -230,8 +319,29 @@ elif phase == "new-verify":
     after = assert_events(tenant_id, session_id, [0, 1, 2])
     assert_watch_contains(tenant_id, session_id, [0, 1, 2])
     assert_export_contains(tenant_id, session_id, [0, 1, 2])
-    write_metrics(state, {"before": len(before), "after": len(after), "verified_seqs": [0, 1, 2]})
-    print(f"new-verify verified tenant={tenant_id} session={session_id} seqs=[0,1,2]")
+    sdk_result = assert_python_sdk_compat(state, [0, 1, 2])
+    assert_events(tenant_id, session_id, [0, 1, 2, 3])
+    assert_watch_contains(tenant_id, session_id, [0, 1, 2, 3])
+    assert_export_contains(tenant_id, session_id, [0, 1, 2, 3])
+    mongo_result = assert_mongo_compat(state, [0, 1, 2, 3])
+    final_expected = [0, 1, 2, 3]
+    if mongo_result.get("status") == "verified":
+        final_expected.append(4)
+    final_events = assert_events(tenant_id, session_id, final_expected)
+    assert_watch_contains(tenant_id, session_id, final_expected)
+    assert_export_contains(tenant_id, session_id, final_expected)
+    write_metrics(
+        state,
+        {
+            "before": len(before),
+            "after": len(after),
+            "final": len(final_events),
+            "verified_seqs": final_expected,
+            "python_sdk": sdk_result,
+            "mongo": mongo_result,
+        },
+    )
+    print(f"new-verify verified tenant={tenant_id} session={session_id} seqs={final_expected}")
 else:
     raise SystemExit(f"unknown phase {phase}")
 PY
@@ -249,14 +359,19 @@ run_client_phase old-write
 stop_server
 
 echo "S12: starting new server ${NEW_SERVER_BIN} on ${BIND}" | tee -a "${CLIENT_LOG}"
-"${NEW_SERVER_BIN}" serve \
+new_server_args=(
+  serve
   --bind "${BIND}" \
   --data-dir "${DATA_DIR}" \
-  --content-dir "${CONTENT_DIR}" \
-  >"${NEW_LOG}" 2>&1 &
+  --content-dir "${CONTENT_DIR}"
+)
+if [[ "${MONGO_MODE}" != "0" ]]; then
+  new_server_args+=(--mongo-bind "${MONGO_BIND}")
+fi
+"${NEW_SERVER_BIN}" "${new_server_args[@]}" >"${NEW_LOG}" 2>&1 &
 PID="$!"
 wait_ready "${BASE_URL}"
 run_client_phase new-verify
 stop_server
 
-echo "PASS: single-node upgrade preserved fetch/watch/export state and accepted a post-upgrade append" | tee -a "${CLIENT_LOG}"
+echo "PASS: single-node upgrade preserved fetch/watch/export state and accepted post-upgrade Python SDK/Mongo-compatible appends" | tee -a "${CLIENT_LOG}"
