@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::command::{command_name, CommandContext, CommandOptions};
 use crate::error::WireResult;
-use crate::opmsg::{read_op_msg, write_op_msg};
+use crate::opmsg::{read_op_msg, write_response};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthConfig {
@@ -54,7 +54,14 @@ async fn handle_connection(
                     "codeName": "UnknownError",
                 }
             });
-        write_op_msg(&mut stream, next_response_id, message.request_id, response).await?;
+        write_response(
+            &mut stream,
+            message.response_protocol,
+            next_response_id,
+            message.request_id,
+            response,
+        )
+        .await?;
         next_response_id = next_response_id.wrapping_add(1);
     }
     Ok(())

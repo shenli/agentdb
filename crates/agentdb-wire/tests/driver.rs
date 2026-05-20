@@ -1,6 +1,11 @@
+use std::io::Cursor;
+
 use bson::{doc, Document};
 use mongodb::{options::ClientOptions, Client};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 #[tokio::test]
 async fn mongodb_driver_can_insert_and_find_agentdb_events() -> anyhow::Result<()> {
@@ -161,6 +166,68 @@ async fn mongodb_driver_can_insert_and_find_agentdb_events() -> anyhow::Result<(
         .starts_with("ses_"));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn legacy_op_query_hello_gets_op_reply() -> anyhow::Result<()> {
+    let runtime = agentdb_core::Runtime::in_memory();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = agentdb_wire::server::serve(listener, runtime).await;
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    let request_id = 41_i32;
+    stream
+        .write_all(&op_query_message(
+            request_id,
+            "admin.$cmd",
+            doc! { "ismaster": 1_i32, "helloOk": true },
+        )?)
+        .await?;
+
+    let mut header = [0_u8; 16];
+    stream.read_exact(&mut header).await?;
+    let message_len = i32::from_le_bytes(header[0..4].try_into()?);
+    let response_to = i32::from_le_bytes(header[8..12].try_into()?);
+    let op_code = i32::from_le_bytes(header[12..16].try_into()?);
+    assert_eq!(response_to, request_id);
+    assert_eq!(op_code, 1);
+
+    let mut payload = vec![0_u8; message_len as usize - 16];
+    stream.read_exact(&mut payload).await?;
+    assert_eq!(i32::from_le_bytes(payload[0..4].try_into()?), 0);
+    assert_eq!(i64::from_le_bytes(payload[4..12].try_into()?), 0);
+    assert_eq!(i32::from_le_bytes(payload[12..16].try_into()?), 0);
+    assert_eq!(i32::from_le_bytes(payload[16..20].try_into()?), 1);
+
+    let mut doc_cursor = Cursor::new(&payload[20..]);
+    let response = Document::from_reader(&mut doc_cursor)?;
+    assert_eq!(response.get_f64("ok")?, 1.0);
+    assert_eq!(response.get_bool("isWritablePrimary")?, true);
+    assert!(response.get_i32("maxWireVersion")? >= 17);
+
+    Ok(())
+}
+
+fn op_query_message(request_id: i32, namespace: &str, query: Document) -> anyhow::Result<Vec<u8>> {
+    let mut query_bytes = Vec::new();
+    query.to_writer(&mut query_bytes)?;
+    let message_len = 16 + 4 + namespace.len() + 1 + 4 + 4 + query_bytes.len();
+
+    let mut out = Vec::with_capacity(message_len);
+    out.extend_from_slice(&(message_len as i32).to_le_bytes());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    out.extend_from_slice(&2004_i32.to_le_bytes());
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    out.extend_from_slice(namespace.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&0_i32.to_le_bytes());
+    out.extend_from_slice(&1_i32.to_le_bytes());
+    out.extend_from_slice(&query_bytes);
+    Ok(out)
 }
 
 #[tokio::test]
