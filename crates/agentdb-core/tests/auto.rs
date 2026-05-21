@@ -1,0 +1,12 @@
+#![allow(non_snake_case)]
+
+#[path = "auto/S1_contiguous_session_seq_and_append_fetch_under_high_concurrency.rs"]
+mod s1_contiguous_session_seq_and_append_fetch_under_high_concurrency;
+#[path = "auto/S2_idempotent_replay_after_lost_ack_restart_and_handoff.rs"]
+mod s2_idempotent_replay_after_lost_ack_restart_and_handoff;
+#[path = "auto/S3_acknowledged_runtime_state_survives_crash_at_metadata_content_index_boundaries.rs"]
+mod s3_acknowledged_runtime_state_survives_crash_at_metadata_content_index_boundaries;
+#[path = "auto/S4_fork_and_tiered_session_history_remains_ordered_across_lifecycle_faults.rs"]
+mod s4_fork_and_tiered_session_history_remains_ordered_across_lifecycle_faults;
+#[path = "auto/S6_record_visibility_and_policy_gc_match_committed_model_under_lag.rs"]
+mod s6_record_visibility_and_policy_gc_match_committed_model_under_lag;
