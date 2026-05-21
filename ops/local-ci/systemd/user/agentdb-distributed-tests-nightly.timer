@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AgentDB distributed test plan nightly gates
+
+[Timer]
+OnCalendar=*-*-* 02:17:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=agentdb-distributed-tests-nightly.service
+
+[Install]
+WantedBy=timers.target

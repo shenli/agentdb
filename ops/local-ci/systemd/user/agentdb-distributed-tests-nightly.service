@@ -1,0 +1,10 @@
+[Unit]
+Description=AgentDB distributed test plan nightly gates
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/work/agentdb-nightly
+Environment=PATH=%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AGENTDB_DISTRIBUTED_RUN_ROOT=%h/agentdb-distributed-test-runs
+Environment=AGENTDB_DISTRIBUTED_BRANCH=main
+ExecStart=%h/work/agentdb-nightly/ops/local-ci/scripts/distributed-test-runner.sh --profile nightly

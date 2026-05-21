@@ -143,6 +143,51 @@ Run immediately:
 systemctl --user start agentdb-local-ci-nightly.service
 ```
 
+## Distributed Test Plan Gates
+
+The distributed test plan gates run from the same clean
+`~/work/agentdb-nightly` checkout. Install the user timer on `li-dev`:
+
+```bash
+mkdir -p ~/work
+test -d ~/work/agentdb-nightly || git clone https://github.com/shenli/agentdb.git ~/work/agentdb-nightly
+mkdir -p ~/.config/systemd/user
+cp ops/local-ci/systemd/user/agentdb-distributed-tests-nightly.service ~/.config/systemd/user/
+cp ops/local-ci/systemd/user/agentdb-distributed-tests-nightly.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now agentdb-distributed-tests-nightly.timer
+```
+
+The distributed timer runs nightly at 02:17 with up to 20 minutes of randomized
+delay. It stores Markdown reports, status, logs, and per-scenario artifacts in:
+
+```bash
+~/agentdb-distributed-test-runs
+```
+
+Inspect the latest distributed run:
+
+```bash
+systemctl --user status agentdb-distributed-tests-nightly.service
+systemctl --user list-timers agentdb-distributed-tests-nightly.timer
+cat ~/agentdb-distributed-test-runs/latest/status.env
+cat ~/agentdb-distributed-test-runs/latest/report.md
+find ~/agentdb-distributed-test-runs/latest/logs -maxdepth 1 -type f -print | sort
+```
+
+Run the distributed profile immediately:
+
+```bash
+systemctl --user start agentdb-distributed-tests-nightly.service
+```
+
+For a one-off quick check from the repository checkout:
+
+```bash
+AGENTDB_DISTRIBUTED_RUN_ROOT=~/agentdb-distributed-test-runs \
+  ops/local-ci/scripts/distributed-test-runner.sh --profile quick --no-pull
+```
+
 ## Retention
 
 `ops/local-ci/scripts/local-ci.sh` prunes old run directories after each run. The default is
