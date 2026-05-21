@@ -169,6 +169,81 @@ async fn mongodb_driver_can_insert_and_find_agentdb_events() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn mongodb_driver_rejects_unsupported_mutations_without_side_effects() -> anyhow::Result<()> {
+    let runtime = agentdb_core::Runtime::in_memory();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server_runtime = runtime.clone();
+    tokio::spawn(async move {
+        let _ = agentdb_wire::server::serve(listener, server_runtime).await;
+    });
+
+    let mut options =
+        ClientOptions::parse(format!("mongodb://{addr}/?directConnection=true")).await?;
+    options.app_name = Some("agentdb-wire-negative-test".to_string());
+    let client = Client::with_options(options)?;
+    let db = client.database("driver_negative");
+
+    assert!(db
+        .run_command(doc! { "create": "users" }, None)
+        .await
+        .is_err());
+    assert!(db
+        .collection::<Document>("users")
+        .insert_one(doc! { "name": "not-agentdb" }, None)
+        .await
+        .is_err());
+    assert!(db
+        .run_command(
+            doc! {
+                "update": "events",
+                "updates": [{
+                    "q": { "kind": "message" },
+                    "u": { "$set": { "kind": "mutated" } }
+                }],
+            },
+            None,
+        )
+        .await
+        .is_err());
+    assert!(db
+        .run_command(
+            doc! {
+                "delete": "events",
+                "deletes": [{
+                    "q": { "kind": "message" },
+                    "limit": 0_i32,
+                }],
+            },
+            None,
+        )
+        .await
+        .is_err());
+
+    let names = db.list_collection_names(None).await?;
+    assert!(names.contains(&"events".to_string()));
+    assert!(!names.contains(&"users".to_string()));
+
+    let events = db.collection::<Document>("events");
+    events
+        .insert_one(
+            doc! {
+                "session_alias": "negative-session",
+                "kind": "message",
+                "payload": { "content": "still supported" },
+            },
+            None,
+        )
+        .await?;
+    let count = db
+        .run_command(doc! { "count": "events", "query": {} }, None)
+        .await?;
+    assert_eq!(count.get_i64("n")?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_op_query_hello_gets_op_reply() -> anyhow::Result<()> {
     let runtime = agentdb_core::Runtime::in_memory();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
