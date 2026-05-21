@@ -10,6 +10,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+agentdb-wire = { path = ".." }
 bson = "2"
 libfuzzer-sys = "0.4"
 serde_json = "1"
