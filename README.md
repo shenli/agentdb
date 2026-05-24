@@ -33,11 +33,12 @@ runtime surface.
 General databases can store agent data. AgentDB focuses on the runtime semantics
 that agent platforms usually have to build around those stores.
 
-| Store | Good at | What AgentDB adds for agents |
-|---|---|---|
-| Postgres / RDBMS | Transactions, relational queries, operational schemas | Session-native append/fetch, replay, fork, context lineage |
-| MongoDB / DynamoDB / NoSQL | Flexible documents, key-value access, managed scale patterns | Ordered agent events, idempotent appends, hot-tail reads, lifecycle |
-| Log and stream stores | Durable event transport, fan-out, replay by offset | Agent sessions, artifacts, records, skills, SDKs, dashboard-friendly state |
+| AI agent need | Postgres / RDBMS | MongoDB / DynamoDB / NoSQL | Log and stream stores | AgentDB |
+|---|---|---|---|---|
+| Append an event and fetch the recent session tail | Strong transactions and queries; app owns the session schema | Fast document/key writes; app owns ordering and tail reads | Strong append path; recent context reads need another layer | Native append-and-fetch |
+| Replay or fork a run | Durable history if modeled carefully | Durable documents; branch semantics are app code | Replay by offset; session forks are app code | Native replay and fork |
+| Link events, artifacts, records, and context | Possible with joins and schema discipline | Flexible documents; cross-object consistency is app code | Events can reference blobs; state is usually scattered | First-class runtime references |
+| Manage agent lifecycle and inspection | Mature ops; agent lifecycle is custom | Managed scale options; lifecycle is custom | Retention is strong; inspection needs external state | Session lifecycle, SDKs, and dashboard-friendly state |
 
 AgentDB is not a vector database, memory platform, agent framework, workflow
 engine, or general MongoDB replacement. It is the runtime-state database those
