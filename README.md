@@ -30,11 +30,14 @@ runtime surface.
   packs, skills, and lifecycle transitions.
 - **Stream live state** to dashboards, supervisors, evaluators, and tools.
 
-RDBMS and NoSQL databases such as Postgres, MongoDB, and DynamoDB can store
-agent events, but teams still have to design the agent-specific layer:
-append/fetch semantics, ordering, idempotency, replay, fork, artifact linkage,
-context provenance, lifecycle, and hot-tail reads. AgentDB makes those runtime
-primitives the default shape instead of application glue.
+General databases can store agent data. AgentDB focuses on the runtime semantics
+that agent platforms usually have to build around those stores.
+
+| Store | Good at | What AgentDB adds for agents |
+|---|---|---|
+| Postgres / RDBMS | Transactions, relational queries, operational schemas | Session-native append/fetch, replay, fork, context lineage |
+| MongoDB / DynamoDB / NoSQL | Flexible documents, key-value access, managed scale patterns | Ordered agent events, idempotent appends, hot-tail reads, lifecycle |
+| Log and stream stores | Durable event transport, fan-out, replay by offset | Agent sessions, artifacts, records, skills, SDKs, dashboard-friendly state |
 
 AgentDB is not a vector database, memory platform, agent framework, workflow
 engine, or general MongoDB replacement. It is the runtime-state database those
