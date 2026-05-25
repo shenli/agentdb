@@ -30,15 +30,18 @@ runtime surface.
   packs, skills, and lifecycle transitions.
 - **Stream live state** to dashboards, supervisors, evaluators, and tools.
 
-General databases can store agent data. AgentDB focuses on the runtime semantics
-that agent platforms usually have to build around those stores.
+General databases can store agent data. AgentDB focuses on the workload shape
+described in [docs/architecture/agent-db.md](docs/architecture/agent-db.md):
+large semi-structured events, sharp hot-to-cold lifecycle changes, large total
+history, recent session-tail reads, and agent-native primitives.
 
-| AI agent need | Postgres / RDBMS | MongoDB / DynamoDB / NoSQL | Log and stream stores | AgentDB |
+| AI agent workload need | Postgres / RDBMS | MongoDB / DynamoDB / NoSQL | Log and stream stores | AgentDB |
 |---|---|---|---|---|
-| Append an event and fetch the recent session tail | Strong transactions and queries; app owns the session schema | Fast document/key writes; app owns ordering and tail reads | Strong append path; recent context reads need another layer | Native append-and-fetch |
-| Replay or fork a run | Durable history if modeled carefully | Durable documents; branch semantics are app code | Replay by offset; session forks are app code | Native replay and fork |
-| Link events, artifacts, records, and context | Possible with joins and schema discipline | Flexible documents; cross-object consistency is app code | Events can reference blobs; state is usually scattered | First-class runtime references |
-| Manage agent lifecycle and inspection | Mature ops; agent lifecycle is custom | Managed scale options; lifecycle is custom | Retention is strong; inspection needs external state | Session lifecycle, SDKs, and dashboard-friendly state |
+| Large records, context, logs, and files | JSON/blob columns work, but indexes and row growth become costly | Flexible documents, but item/document limits push blobs elsewhere | Handles large event flow, but files and metadata need another store | Artifacts and refs are part of the runtime model |
+| Hot sessions, idle sessions, archived runs | Partitions and retention jobs are app design | TTL and table design help; lifecycle semantics stay custom | Retention is strong; reactivation state lives elsewhere | Lifecycle is explicit on sessions and policy |
+| Large total retained history | Scales with careful schema, indexes, and storage tuning | Scales by key design, with secondary-index tradeoffs | Scales for event transport and archives | Separates hot runtime state, records, and artifacts |
+| Recent session-tail access | Needs purpose-built indexes and queries | Range queries can work if keys match the session path | Offsets replay streams, not context-ready session state | Native append-and-fetch and recent replay |
+| Agent primitives | Replay, fork, idempotency, watch, and refs are app protocols | Same primitives become app-side conventions | Replay exists, but fork/watch/source refs are not session-native | Replay, fork, watch, idempotency, refs, and SDKs are first class |
 
 AgentDB is not a vector database, memory platform, agent framework, workflow
 engine, or general MongoDB replacement. It is the runtime-state database those
