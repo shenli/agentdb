@@ -60,6 +60,45 @@ where
     }
 }
 
+pub fn parse_message_frame(frame: &[u8]) -> WireResult<Option<OpMsg>> {
+    if frame.is_empty() {
+        return Ok(None);
+    }
+    if frame.len() < 16 {
+        return Err(WireError::Protocol(format!(
+            "Mongo message too short: {}",
+            frame.len()
+        )));
+    }
+
+    let mut cur = Cursor::new(frame);
+    let message_len = ReadBytesExt::read_i32::<LittleEndian>(&mut cur)?;
+    let request_id = ReadBytesExt::read_i32::<LittleEndian>(&mut cur)?;
+    let response_to = ReadBytesExt::read_i32::<LittleEndian>(&mut cur)?;
+    let op_code = ReadBytesExt::read_i32::<LittleEndian>(&mut cur)?;
+
+    if message_len < 16 {
+        return Err(WireError::Protocol(format!(
+            "Mongo message too short: {message_len}"
+        )));
+    }
+    if message_len as usize != frame.len() {
+        return Err(WireError::Protocol(format!(
+            "Mongo message length mismatch: header={message_len} actual={}",
+            frame.len()
+        )));
+    }
+
+    let payload = frame[16..].to_vec();
+    match op_code {
+        OP_MSG => read_op_msg_payload(request_id, response_to, payload),
+        OP_QUERY => read_op_query_payload(request_id, response_to, payload),
+        _ => Err(WireError::Protocol(format!(
+            "unsupported Mongo opcode: {op_code}"
+        ))),
+    }
+}
+
 fn read_op_msg_payload(
     request_id: i32,
     response_to: i32,

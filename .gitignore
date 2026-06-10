@@ -5,6 +5,7 @@
 __pycache__/
 .pytest_cache/
 target/
+crates/agentdb-wire/fuzz/Cargo.lock
 data/
 .worktrees/
 tools/workload/agentdb-workload
