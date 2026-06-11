@@ -7315,6 +7315,35 @@ impl Runtime {
 /// `embedding`, or both may be set; if both are absent, the runtime
 /// returns every live record under the `(tenant_id, namespace)` scope
 /// up to `limit`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataFilterOp {
+    Eq,
+    Neq,
+    In,
+    Exists,
+    Gte,
+    Lte,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetadataFilterCondition {
+    pub path: String,
+    pub op: MetadataFilterOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MetadataFilter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all: Vec<MetadataFilterCondition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any: Vec<MetadataFilterCondition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub none: Vec<MetadataFilterCondition>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
     pub tenant_id: Id,
@@ -7333,6 +7362,9 @@ pub struct SearchRequest {
     /// is `Some(s)` and `s` matches every populated field of the
     /// filter (unset fields don't constrain).
     pub source_filter: Option<SourceRef>,
+    /// Optional post-index metadata filter. This intentionally supports a small
+    /// scalar predicate subset rather than becoming a general JSON query engine.
+    pub metadata_filter: Option<MetadataFilter>,
     pub limit: usize,
     /// Tenant-scoped searchable-record commit sequence that this read must
     /// observe. If the local index watermark is behind, `search_records`
@@ -7356,8 +7388,67 @@ impl SearchRequest {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit,
             min_visible_record_commit_seq: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecordSearchScoreComponents {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordSearchMatch {
+    pub record: SearchableRecord,
+    pub score: f32,
+    pub rank: usize,
+    pub components: RecordSearchScoreComponents,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateScore {
+    score: f32,
+    text: Option<f32>,
+    vector: Option<f32>,
+}
+
+impl CandidateScore {
+    fn with_text(score: f32) -> Self {
+        Self {
+            score,
+            text: Some(score),
+            vector: None,
+        }
+    }
+
+    fn with_vector(score: f32) -> Self {
+        Self {
+            score,
+            text: None,
+            vector: Some(score),
+        }
+    }
+
+    fn merge_text(&mut self, score: f32) {
+        self.text = Some(self.text.map_or(score, |old| old.max(score)));
+        self.score = self.score.max(score);
+    }
+
+    fn merge_vector(&mut self, score: f32) {
+        self.vector = Some(self.vector.map_or(score, |old| old.max(score)));
+        self.score = self.score.max(score);
+    }
+
+    fn components(&self) -> RecordSearchScoreComponents {
+        RecordSearchScoreComponents {
+            text: self.text,
+            vector: self.vector,
         }
     }
 }
@@ -7818,22 +7909,40 @@ impl Runtime {
         })
     }
 
+    /// Search the (tenant, namespace) scope and return records only. Call
+    /// [`Runtime::search_record_matches`] when ranking/debug metadata is needed.
+    pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+        Ok(self
+            .search_record_matches(req)
+            .await?
+            .into_iter()
+            .map(|m| m.record)
+            .collect())
+    }
+
     /// Search the (tenant, namespace) scope. If `text` is set, run a
     /// BM25 text search; if `embedding` is set, run a cosine
     /// nearest-neighbor search; if both, run both and union by record
     /// (keeping the higher score per record_id). If neither is set,
     /// return every live record in the namespace, capped at `limit`.
     ///
-    /// Tag and source post-filters are applied after the index step.
-    /// Soft-deleted and expired records are filtered out.
-    pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+    /// Tag, source, and metadata post-filters are applied after the index step.
+    /// Soft-deleted and expired records are filtered out. Scores are query-local
+    /// ranking aids; callers should not treat them as stable durable values.
+    pub async fn search_record_matches(
+        &self,
+        req: SearchRequest,
+    ) -> Result<Vec<RecordSearchMatch>> {
         if req.sharding_key.is_none() {
-            return self.search_records_global(req).await;
+            return self.search_record_matches_global(req).await;
         }
-        self.search_records_local(req).await
+        self.search_record_matches_local(req).await
     }
 
-    async fn search_records_global(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+    async fn search_record_matches_global(
+        &self,
+        req: SearchRequest,
+    ) -> Result<Vec<RecordSearchMatch>> {
         {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -7848,16 +7957,17 @@ impl Runtime {
             }
         }
         let terms = req.text.as_deref().map(repair_tokens).unwrap_or_default();
+        let index_limit = search_index_candidate_limit(&req);
         let result = self.global_record_index.search(GlobalIndexQuery {
             tenant_id: req.tenant_id.as_str().to_string(),
             namespace: req.namespace.clone(),
             terms,
             min_visible_commit_seq: req.min_visible_record_commit_seq,
-            limit: req.limit.max(1),
+            limit: index_limit,
         })?;
 
         if result.stale {
-            return self.search_records_local(req).await;
+            return self.search_record_matches_local(req).await;
         }
 
         let s = self.state.lock().await;
@@ -7872,12 +7982,19 @@ impl Runtime {
             candidates.push((record.clone(), repair_score(&record, &req)));
         }
         drop(s);
-        candidates.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|(_, a), (_, b)| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(filter_search_candidates(candidates, &req))
     }
 
-    async fn search_records_local(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+    async fn search_record_matches_local(
+        &self,
+        req: SearchRequest,
+    ) -> Result<Vec<RecordSearchMatch>> {
         // Validate tenant exists. Tenant scope leaks would defeat the
         // (tenant, namespace) isolation the index `path` already
         // provides, so reject upfront.
@@ -7901,27 +8018,27 @@ impl Runtime {
         // produce `limit` matches even when a few top hits get filtered
         // out. Capped to avoid a denial-of-service vector via huge
         // search limits.
-        let slack = req.limit.saturating_mul(2).clamp(req.limit, 1024);
+        let slack = search_index_candidate_limit(&req);
 
         // Collect index hits as (doc_id, score). When neither text
         // nor embedding is supplied we skip the indexes and return
         // every live record in the namespace (subject to filters and
         // limit) by walking the in-memory record cache directly.
-        let mut hits: BTreeMap<DocId, f32> = BTreeMap::new();
+        let mut hits: BTreeMap<DocId, CandidateScore> = BTreeMap::new();
         if let Some(query) = req.text.as_deref() {
             let text = self.text_index.lock().expect("text index lock");
             for (doc, score) in text.search(&path, query, slack) {
                 hits.entry(doc)
-                    .and_modify(|s| *s = s.max(score))
-                    .or_insert(score);
+                    .and_modify(|s| s.merge_text(score))
+                    .or_insert_with(|| CandidateScore::with_text(score));
             }
         }
         if let Some(emb) = req.embedding.as_deref() {
             let vec = self.vector_index.lock().expect("vector index lock");
             for (doc, score) in vec.knn(&path, emb, slack) {
                 hits.entry(doc)
-                    .and_modify(|s| *s = s.max(score))
-                    .or_insert(score);
+                    .and_modify(|s| s.merge_vector(score))
+                    .or_insert_with(|| CandidateScore::with_vector(score));
             }
         }
 
@@ -7935,11 +8052,15 @@ impl Runtime {
         // descending-score order and resolve each DocId to a record.
         // Brute-force path: walk every record in the namespace. We
         // distinguish the two by whether `text` or `embedding` was set.
-        let mut candidates: Vec<(SearchableRecord, f32)> = if req.text.is_some()
+        let mut candidates: Vec<(SearchableRecord, CandidateScore)> = if req.text.is_some()
             || req.embedding.is_some()
         {
-            let mut ranked: Vec<(DocId, f32)> = hits.into_iter().collect();
-            ranked.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let mut ranked: Vec<(DocId, CandidateScore)> = hits.into_iter().collect();
+            ranked.sort_by(|(_, a), (_, b)| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             ranked
                 .into_iter()
                 .filter_map(|(doc, score)| {
@@ -7954,7 +8075,7 @@ impl Runtime {
                 .filter(|r| {
                     r.tenant_id.as_str() == req.tenant_id.as_str() && r.namespace == req.namespace
                 })
-                .map(|r| (r.clone(), 0.0))
+                .map(|r| (r.clone(), CandidateScore::default()))
                 .collect()
         };
         if let Some((applied, required)) = repair_range {
@@ -7980,8 +8101,11 @@ impl Runtime {
                 }
             }
             s.record_index_repair_candidates_total += repaired_candidates;
-            candidates
-                .sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.sort_by(|(_, a), (_, b)| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         drop(s);
 
@@ -8712,12 +8836,23 @@ fn source_ref_matches(rec: &SourceRef, filter: &SourceRef) -> bool {
         && match_id(&rec.skill_id, &filter.skill_id)
 }
 
+fn search_index_candidate_limit(req: &SearchRequest) -> usize {
+    let base = req.limit.max(1);
+    let has_post_filter =
+        !req.tags.is_empty() || req.source_filter.is_some() || req.metadata_filter.is_some();
+    if has_post_filter {
+        base.saturating_mul(10).clamp(base, 1024)
+    } else {
+        base
+    }
+}
+
 fn filter_search_candidates(
-    candidates: Vec<(SearchableRecord, f32)>,
+    candidates: Vec<(SearchableRecord, CandidateScore)>,
     req: &SearchRequest,
-) -> Vec<SearchableRecord> {
+) -> Vec<RecordSearchMatch> {
     let mut out = Vec::new();
-    for (r, _score) in candidates {
+    for (r, score) in candidates {
         if r.tenant_id.as_str() != req.tenant_id.as_str() {
             continue;
         }
@@ -8738,7 +8873,17 @@ fn filter_search_candidates(
                 continue;
             }
         }
-        out.push(r);
+        if let Some(filter) = &req.metadata_filter {
+            if !metadata_filter_matches(&r.metadata, filter) {
+                continue;
+            }
+        }
+        out.push(RecordSearchMatch {
+            record: r,
+            score: score.score,
+            rank: out.len() + 1,
+            components: score.components(),
+        });
         if out.len() >= req.limit {
             break;
         }
@@ -8855,24 +9000,141 @@ fn record_matches_repair_query(r: &SearchableRecord, req: &SearchRequest) -> boo
             return false;
         }
     }
+    if let Some(filter) = &req.metadata_filter {
+        if !metadata_filter_matches(&r.metadata, filter) {
+            return false;
+        }
+    }
     true
 }
 
-fn repair_score(r: &SearchableRecord, req: &SearchRequest) -> f32 {
-    let mut score = 0.0f32;
+fn repair_score(r: &SearchableRecord, req: &SearchRequest) -> CandidateScore {
+    let mut score = CandidateScore::default();
     if let Some(query) = req.text.as_deref() {
         if let Some(text) = record_indexable_text(r) {
-            score = score.max(repair_text_score(&text, query));
+            score.merge_text(repair_text_score(&text, query));
         }
     }
     if let Some(query) = req.embedding.as_deref() {
         if r.policy.vector_allowed {
             if let Some(embedding) = r.embedding.as_ref() {
-                score = score.max(cosine_similarity(embedding, query));
+                score.merge_vector(cosine_similarity(embedding, query));
             }
         }
     }
     score
+}
+
+fn metadata_filter_matches(metadata: &serde_json::Value, filter: &MetadataFilter) -> bool {
+    filter
+        .all
+        .iter()
+        .all(|condition| metadata_condition_matches(metadata, condition))
+        && (filter.any.is_empty()
+            || filter
+                .any
+                .iter()
+                .any(|condition| metadata_condition_matches(metadata, condition)))
+        && filter
+            .none
+            .iter()
+            .all(|condition| !metadata_condition_matches(metadata, condition))
+}
+
+fn metadata_condition_matches(
+    metadata: &serde_json::Value,
+    condition: &MetadataFilterCondition,
+) -> bool {
+    let value = metadata_path_value(metadata, &condition.path);
+    match condition.op {
+        MetadataFilterOp::Exists => {
+            let expected = condition
+                .value
+                .as_ref()
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            value.is_some() == expected
+        }
+        MetadataFilterOp::Eq => value.is_some_and(|v| {
+            condition
+                .value
+                .as_ref()
+                .is_some_and(|expected| json_scalar_eq(v, expected))
+        }),
+        MetadataFilterOp::Neq => value.is_some_and(|v| {
+            condition
+                .value
+                .as_ref()
+                .is_some_and(|expected| !json_scalar_eq(v, expected))
+        }),
+        MetadataFilterOp::In => {
+            let Some(actual) = value else {
+                return false;
+            };
+            condition
+                .value
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|expected| json_scalar_eq(actual, expected))
+                })
+        }
+        MetadataFilterOp::Gte => value.is_some_and(|v| {
+            condition.value.as_ref().is_some_and(|expected| {
+                json_scalar_cmp(v, expected).is_some_and(|ord| {
+                    matches!(ord, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                })
+            })
+        }),
+        MetadataFilterOp::Lte => value.is_some_and(|v| {
+            condition.value.as_ref().is_some_and(|expected| {
+                json_scalar_cmp(v, expected).is_some_and(|ord| {
+                    matches!(ord, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                })
+            })
+        }),
+    }
+}
+
+fn metadata_path_value<'a>(
+    metadata: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut current = metadata;
+    for part in path.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn json_scalar_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => {
+            match (an.as_f64(), bn.as_f64()) {
+                (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,
+                _ => an == bn,
+            }
+        }
+        _ => a == b,
+    }
+}
+
+fn json_scalar_cmp(a: &serde_json::Value, b: &serde_json::Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => {
+            an.as_f64()?.partial_cmp(&bn.as_f64()?)
+        }
+        (serde_json::Value::String(a), serde_json::Value::String(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
 }
 
 fn repair_text_matches_query(text: &str, query: &str) -> bool {

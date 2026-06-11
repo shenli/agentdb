@@ -247,6 +247,7 @@ async fn acknowledged_runtime_state_survives_crash_at_metadata_content_index_bou
             embedding: None,
             tags: vec!["probe".into()],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: Some(record.commit_token.seq),
         })

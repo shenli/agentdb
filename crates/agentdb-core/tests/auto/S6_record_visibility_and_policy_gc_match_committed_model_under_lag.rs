@@ -56,6 +56,7 @@ async fn record_visibility_and_policy_gc_match_committed_model_under_lag() {
             embedding: None,
             tags: vec!["visible".into()],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: Some(first.commit_token.seq),
         })

@@ -127,6 +127,7 @@ async fn search_repairs_same_client_visibility_when_local_index_lags() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: Some(written.commit_token.seq),
         })
@@ -469,6 +470,7 @@ async fn search_without_query_returns_namespace_records() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 100,
             min_visible_record_commit_seq: None,
         })
@@ -509,6 +511,7 @@ async fn vector_search_finds_nearest_when_policy_allows() {
             embedding: Some(vec![0.0, 1.0, 0.0]),
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 3,
             min_visible_record_commit_seq: None,
         })
@@ -542,6 +545,7 @@ async fn vector_denied_policy_skips_vector_index() {
             embedding: Some(vec![1.0, 0.0, 0.0]),
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 5,
             min_visible_record_commit_seq: None,
         })
@@ -586,6 +590,7 @@ async fn search_filters_by_tag() {
             embedding: None,
             tags: vec!["red".into()],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -645,6 +650,7 @@ async fn search_filters_by_source_event_id() {
             embedding: None,
             tags: vec![],
             source_filter: Some(filter),
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })

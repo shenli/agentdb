@@ -919,6 +919,7 @@ async fn records_and_indexes_survive_restart() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 100,
             min_visible_record_commit_seq: None,
         })
@@ -979,6 +980,7 @@ async fn record_commit_token_survives_restart_for_visible_search() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: Some(commit_seq),
         })
@@ -1075,6 +1077,7 @@ async fn record_index_outbox_replay_catches_up_lagging_local_index() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1094,6 +1097,7 @@ async fn record_index_outbox_replay_catches_up_lagging_local_index() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1147,6 +1151,7 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1163,6 +1168,7 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: Some(written.commit_token.seq),
         })
@@ -1180,6 +1186,7 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1242,6 +1249,7 @@ async fn record_index_outbox_reloads_record_after_commit_state_gap() {
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1421,6 +1429,7 @@ async fn record_index_outbox_skips_fully_purged_record_without_blocking_queue() 
             embedding: None,
             tags: vec![],
             source_filter: None,
+            metadata_filter: None,
             limit: 10,
             min_visible_record_commit_seq: None,
         })

@@ -1035,7 +1035,14 @@ async fn run_record_index_probe(
             "namespace": ["cluster-smoke", "stability"],
             "text": format!("{token} primary searchable text"),
             "tags": ["stability", "primary"],
-            "metadata": {"title": token, "probe": "record-index"},
+            "metadata": {
+                "title": token,
+                "probe": "record-index",
+                "component": "runtime",
+                "status": "passed",
+                "confidence": 0.92,
+                "source": {"commit": "cluster-smoke"}
+            },
             "policy": {"mode": "selected_fields", "fields": ["title"], "vector_allowed": false}
         }),
     )
@@ -1050,7 +1057,14 @@ async fn run_record_index_probe(
             "namespace": ["cluster-smoke", "stability"],
             "text": format!("{token} control searchable text"),
             "tags": ["stability", "control"],
-            "metadata": {"title": format!("{token} control"), "probe": "record-index"},
+            "metadata": {
+                "title": format!("{token} control"),
+                "probe": "record-index",
+                "component": "runtime",
+                "status": "failed",
+                "confidence": 0.10,
+                "source": {"commit": "cluster-smoke"}
+            },
             "policy": {"mode": "selected_fields", "fields": ["title"], "vector_allowed": false}
         }),
     )
@@ -1130,6 +1144,41 @@ async fn run_record_index_probe(
     )
     .await?;
 
+    let metadata_filter_response = post_json(
+        client,
+        &owner.url,
+        &format!("/api/tenants/{tenant_id}/records/search"),
+        json!({
+            "namespace": ["cluster-smoke", "stability"],
+            "text": token,
+            "metadata_filter": {
+                "all": [
+                    {"path": "probe", "op": "eq", "value": "record-index"},
+                    {"path": "component", "op": "in", "value": ["runtime", "wire"]},
+                    {"path": "confidence", "op": "gte", "value": 0.9},
+                    {"path": "source.commit", "op": "exists", "value": true}
+                ],
+                "none": [
+                    {"path": "status", "op": "eq", "value": "failed"}
+                ]
+            },
+            "limit": 5,
+            "min_visible_record_commit_seq": commit_seq
+        }),
+    )
+    .await?;
+    assert_record_search_match(
+        &metadata_filter_response,
+        &target_id,
+        "metadata-filter search",
+    )?;
+    assert_record_search_missing(
+        &metadata_filter_response,
+        &control_id,
+        "metadata-filter search",
+    )?;
+    assert_ranked_scores(&metadata_filter_response, "metadata-filter search")?;
+
     let local_path = format!(
         "/api/tenants/{tenant_id}/records/search?text={}&namespace=cluster-smoke&namespace=stability&tag=primary&sharding_key={}&min_visible_record_commit_seq={commit_seq}",
         query_encode(&token),
@@ -1186,16 +1235,18 @@ async fn run_record_index_probe(
         }),
     )
     .await?;
-    let vector_hits = vector_response["records"]
-        .as_array()
-        .ok_or_else(|| anyhow!("vector search response missing records: {vector_response}"))?;
+    let vector_hits = record_search_matches(&vector_response, "vector search")?;
     if vector_hits.len() < 2
-        || vector_hits[0]["text"].as_str() != Some("north-vector")
+        || vector_hits[0]["record"]["text"].as_str() != Some("north-vector")
         || !vector_hits
             .iter()
-            .any(|record| record["text"].as_str() == Some("east-vector"))
+            .any(|matched| matched["record"]["text"].as_str() == Some("east-vector"))
     {
         bail!("vector search expected north first and east in top results: {vector_response}");
+    }
+    assert_ranked_scores(&vector_response, "vector search")?;
+    if vector_hits[0]["components"]["vector"].as_f64().is_none() {
+        bail!("vector search first match missing vector score component: {vector_response}");
     }
 
     delete_record_retry(client, nodes, tablet_id, tenant_id, &control_id).await?;
@@ -3479,16 +3530,7 @@ async fn assert_search_finds_record(
     expected_record_id: &str,
 ) -> Result<()> {
     let response = get_json(client, base, path).await?;
-    let records = response["records"]
-        .as_array()
-        .ok_or_else(|| anyhow!("record search response missing records array: {response}"))?;
-    if !records
-        .iter()
-        .any(|record| record["record_id"].as_str() == Some(expected_record_id))
-    {
-        bail!("record search did not find {expected_record_id}: {response}");
-    }
-    Ok(())
+    assert_record_search_match(&response, expected_record_id, "record search")
 }
 
 async fn assert_search_missing_record(
@@ -3498,14 +3540,62 @@ async fn assert_search_missing_record(
     record_id: &str,
 ) -> Result<()> {
     let response = get_json(client, base, path).await?;
-    let records = response["records"]
+    assert_record_search_missing(&response, record_id, "record search")
+}
+
+fn record_search_matches<'a>(response: &'a Value, context: &str) -> Result<&'a Vec<Value>> {
+    response["matches"]
         .as_array()
-        .ok_or_else(|| anyhow!("record search response missing records array: {response}"))?;
-    if records
+        .ok_or_else(|| anyhow!("{context} response missing matches array: {response}"))
+}
+
+fn assert_record_search_match(
+    response: &Value,
+    expected_record_id: &str,
+    context: &str,
+) -> Result<()> {
+    let matches = record_search_matches(response, context)?;
+    if !matches
         .iter()
-        .any(|record| record["record_id"].as_str() == Some(record_id))
+        .any(|matched| matched["record"]["record_id"].as_str() == Some(expected_record_id))
     {
-        bail!("record search still found deleted record {record_id}: {response}");
+        bail!("{context} did not find {expected_record_id}: {response}");
+    }
+    Ok(())
+}
+
+fn assert_record_search_missing(response: &Value, record_id: &str, context: &str) -> Result<()> {
+    let matches = record_search_matches(response, context)?;
+    if matches
+        .iter()
+        .any(|matched| matched["record"]["record_id"].as_str() == Some(record_id))
+    {
+        bail!("{context} still found deleted or filtered record {record_id}: {response}");
+    }
+    Ok(())
+}
+
+fn assert_ranked_scores(response: &Value, context: &str) -> Result<()> {
+    let matches = record_search_matches(response, context)?;
+    let mut previous_score = f64::INFINITY;
+    for (idx, matched) in matches.iter().enumerate() {
+        let rank = matched["rank"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("{context} match missing rank: {matched}"))?;
+        let expected_rank = (idx + 1) as u64;
+        if rank != expected_rank {
+            bail!("{context} expected rank {expected_rank}, got {rank}: {response}");
+        }
+        let score = matched["score"]
+            .as_f64()
+            .ok_or_else(|| anyhow!("{context} match missing score: {matched}"))?;
+        if score > previous_score {
+            bail!("{context} scores are not descending: {response}");
+        }
+        previous_score = score;
+        if matched["components"].as_object().is_none() {
+            bail!("{context} match missing score components: {matched}");
+        }
     }
     Ok(())
 }

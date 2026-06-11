@@ -45,7 +45,7 @@ def capture(client):
         if url.endswith("/artifacts"):
             return response(body={"artifact_id": "art_1"})
         if "/records/search" in url:
-            return response(body={"records": []})
+            return response(body={"matches": []})
         if url.endswith("/records"):
             return response(body={"record_id": "rec_1"})
         if url.endswith("/skills"):
@@ -138,7 +138,7 @@ def test_record_search_carries_last_tenant_commit_sequence():
                 headers={"X-AgentDB-Record-Commit-Seq": "17"},
             )
         if url.endswith("/records/search"):
-            return response(body={"records": []})
+            return response(body={"matches": []})
         return response()
 
     with patch.object(c._http, "request", side_effect=fake):

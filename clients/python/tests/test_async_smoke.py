@@ -183,7 +183,7 @@ def test_async_record_search_carries_last_tenant_commit_sequence():
                     headers={"X-AgentDB-Record-Commit-Seq": "17"},
                 )
             if request.url.path.endswith("/records/search"):
-                return httpx.Response(200, json={"records": []})
+                return httpx.Response(200, json={"matches": []})
             return httpx.Response(200, json={})
 
         transport = httpx.MockTransport(handler)

@@ -7402,11 +7402,12 @@ async fn search_records(
         embedding: None,
         tags: parsed.tags,
         source_filter,
+        metadata_filter: None,
         limit,
         min_visible_record_commit_seq: parsed.min_visible_record_commit_seq,
     };
-    let records = s.runtime.search_records(req).await?;
-    Ok(Json(SearchRecordsResponse { records }))
+    let matches = s.runtime.search_record_matches(req).await?;
+    Ok(Json(SearchRecordsResponse { matches }))
 }
 
 /// `POST /api/tenants/:tenant_id/records/search`
@@ -7421,8 +7422,8 @@ async fn search_records_json(
 ) -> Result<Json<SearchRecordsResponse>, ApiError> {
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let req = search_body_to_request(tid, body);
-    let records = s.runtime.search_records(req).await?;
-    Ok(Json(SearchRecordsResponse { records }))
+    let matches = s.runtime.search_record_matches(req).await?;
+    Ok(Json(SearchRecordsResponse { matches }))
 }
 
 /// `DELETE /api/tenants/:tenant_id/records/:record_id`
@@ -7705,6 +7706,7 @@ fn search_body_to_request(tenant_id: Id, body: SearchRecordsBody) -> SearchReque
         embedding: body.embedding,
         tags: body.tags,
         source_filter: body.source,
+        metadata_filter: body.metadata_filter,
         limit: body.limit.clamp(1, 100),
         min_visible_record_commit_seq: body.min_visible_record_commit_seq,
     }

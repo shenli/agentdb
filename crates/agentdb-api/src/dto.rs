@@ -7,7 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use agentdb_core::record::{IndexingPolicy, SearchableRecord};
+use agentdb_core::record::IndexingPolicy;
+use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
 use agentdb_core::{AgentSkillBinding, ArtifactRef, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -438,6 +439,8 @@ pub struct SearchRecordsBody {
     pub tags: Vec<String>,
     #[serde(default)]
     pub source: Option<SourceRef>,
+    #[serde(default)]
+    pub metadata_filter: Option<MetadataFilter>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -470,7 +473,7 @@ fn default_context_include() -> Vec<String> {
 /// a later milestone without breaking the wire shape.
 #[derive(Debug, Serialize)]
 pub struct SearchRecordsResponse {
-    pub records: Vec<SearchableRecord>,
+    pub matches: Vec<RecordSearchMatch>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -184,7 +184,7 @@ class AsyncClient:
         data = await self._request(
             "POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body
         )
-        return data.get("records", [])
+        return data.get("matches", [])
 
     async def register_skill(
         self,

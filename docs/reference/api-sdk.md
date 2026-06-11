@@ -412,15 +412,41 @@ GET    /api/tenants/{tenant_id}/records/search
 POST   /api/tenants/{tenant_id}/records/search
 ```
 
-`POST /records` returns `X-AgentDB-Record-Commit-Seq`. Record search accepts
-`sharding_key` and `min_visible_record_commit_seq` in both GET query and POST
-JSON forms. With `sharding_key`, search uses the owner-local LSI-like index.
-Without it, search uses the GSI-like global index, which is eventually
-consistent. If `min_visible_record_commit_seq` is ahead of the global index
-watermark, the runtime falls back to committed base records to preserve
-same-client read-after-write visibility. `GET /api/admin/indexes/records`
-returns local/global index watermarks, lag tokens, repair counters, and async
-apply failures.
+`POST /records` returns `X-AgentDB-Record-Commit-Seq`. Record search returns
+`matches`, not bare records. Each match contains `record`, `score`, `rank`, and
+per-mode `components` such as `text` and `vector`. Scores are query-local
+ranking metadata; do not store them as durable business values.
+
+Record search accepts `sharding_key` and `min_visible_record_commit_seq` in both
+GET query and POST JSON forms. POST search also accepts `metadata_filter`, a
+small scalar predicate language for record metadata:
+
+```json
+{
+  "namespace": ["db0", "memory"],
+  "text": "mongo regression",
+  "metadata_filter": {
+    "all": [
+      { "path": "repo", "op": "eq", "value": "agentdb" },
+      { "path": "component", "op": "eq", "value": "wire" },
+      { "path": "confidence", "op": "gte", "value": 0.8 }
+    ],
+    "none": [
+      { "path": "status", "op": "eq", "value": "stale" }
+    ]
+  }
+}
+```
+
+Supported metadata operators are `eq`, `neq`, `in`, `exists`, `gte`, and `lte`.
+`path` is a dotted object path into the metadata JSON object. With
+`sharding_key`, search uses the owner-local LSI-like index. Without it, search
+uses the GSI-like global index, which is eventually consistent. If
+`min_visible_record_commit_seq` is ahead of the global index watermark, the
+runtime falls back to committed base records to preserve same-client
+read-after-write visibility. `GET /api/admin/indexes/records` returns
+local/global index watermarks, lag tokens, repair counters, and async apply
+failures.
 
 Skills and policy:
 

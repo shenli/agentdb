@@ -712,6 +712,7 @@ impl CommandContext {
                 embedding: None,
                 tags: get_string_array(filter, "tags").unwrap_or_default(),
                 source_filter: None,
+                metadata_filter: None,
                 limit,
                 min_visible_record_commit_seq: None,
             })

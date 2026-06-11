@@ -591,7 +591,7 @@ export class Client {
       `/api/tenants/${enc(tenantId)}/records/search`,
       this._withRecordCommitSeq(tenantId, body)
     );
-    return Array.isArray(data.records) ? data.records : [];
+    return Array.isArray(data.matches) ? data.matches : [];
   }
 
   async registerSkill(
