@@ -19,6 +19,9 @@ pub enum ErrorCode {
     /// `IdempotencyConflict` (which is about retry semantics) — this is a
     /// hard constraint failure on a fresh create.
     AliasConflict,
+    /// Optimistic compare-and-set failed because the caller's expected version
+    /// did not match the current row version.
+    VersionConflict,
     PolicyDenied,
     NodeDraining,
     KeyUnavailable,

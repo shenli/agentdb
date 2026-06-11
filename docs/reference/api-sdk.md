@@ -406,16 +406,38 @@ Records:
 
 ```text
 POST   /api/tenants/{tenant_id}/records
+POST   /api/tenants/{tenant_id}/records/upsert
 GET    /api/tenants/{tenant_id}/records/{record_id}
+PATCH  /api/tenants/{tenant_id}/records/{record_id}
+POST   /api/tenants/{tenant_id}/records/{record_id}/touch
 DELETE /api/tenants/{tenant_id}/records/{record_id}
 GET    /api/tenants/{tenant_id}/records/search
 POST   /api/tenants/{tenant_id}/records/search
+POST   /api/tenants/{tenant_id}/records/edges
+GET    /api/tenants/{tenant_id}/records/{record_id}/edges
+DELETE /api/tenants/{tenant_id}/records/edges/{edge_id}
+GET    /api/tenants/{tenant_id}/meta/{key}
+PUT    /api/tenants/{tenant_id}/meta/{key}
 ```
 
-`POST /records` returns `X-AgentDB-Record-Commit-Seq`. Record search returns
-`matches`, not bare records. Each match contains `record`, `score`, `rank`, and
-per-mode `components` such as `text` and `vector`. Scores are query-local
-ranking metadata; do not store them as durable business values.
+`POST /records`, `POST /records/upsert`, and `PATCH /records/{record_id}`
+return `X-AgentDB-Record-Commit-Seq`. A record body may include
+`external_id`; it is unique per tenant. Repeating `POST /records` with the same
+`external_id` is idempotent and returns the existing record. `POST
+/records/upsert` updates the existing row for that `external_id` or creates a
+new row when none exists.
+
+Records have logical `status` (`active` or `superseded`), monotonic `version`,
+`access_count`, and `updated_at_ms`. `PATCH /records/{record_id}` accepts
+`expected_version` for optimistic compare-and-set updates and returns
+`VERSION_CONFLICT` with HTTP 409 when the current version differs. `POST
+/records/{record_id}/touch` increments `access_count` without bumping
+`version`.
+
+Record search returns `matches`, not bare records. Each match contains
+`record`, `score`, `rank`, and per-mode `components` such as `text` and
+`vector`. Scores are query-local ranking metadata; do not store them as durable
+business values.
 
 Record search accepts `sharding_key` and `min_visible_record_commit_seq` in both
 GET query and POST JSON forms. POST search also accepts `metadata_filter`, a
@@ -439,14 +461,22 @@ small scalar predicate language for record metadata:
 ```
 
 Supported metadata operators are `eq`, `neq`, `in`, `exists`, `gte`, and `lte`.
-`path` is a dotted object path into the metadata JSON object. With
-`sharding_key`, search uses the owner-local LSI-like index. Without it, search
-uses the GSI-like global index, which is eventually consistent. If
+`path` is a dotted object path into the metadata JSON object. Search also
+accepts `include_superseded`, `min_score`, `created_after_ms`,
+`created_before_ms`, and `touch`. Superseded records are excluded by default;
+set `include_superseded=true` to retrieve memory history. With `sharding_key`,
+search uses the owner-local LSI-like index. Without it, search uses the
+GSI-like global index, which is eventually consistent. If
 `min_visible_record_commit_seq` is ahead of the global index watermark, the
 runtime falls back to committed base records to preserve same-client
 read-after-write visibility. `GET /api/admin/indexes/records` returns
 local/global index watermarks, lag tokens, repair counters, and async apply
 failures.
+
+Record edges connect two records with an `edge_type` of `related`, `derived`,
+`contradicts`, `supports`, or `supersedes` plus optional metadata. Tenant meta
+is a small JSON KV surface for adapter cursors and runtime-local configuration,
+not a replacement for application tables.
 
 Skills and policy:
 

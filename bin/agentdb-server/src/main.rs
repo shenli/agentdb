@@ -5454,16 +5454,13 @@ mod tests {
     /// expire, and the reaper would clear tablet ownership.
     #[tokio::test(start_paused = true)]
     async fn with_renewal_timeout_returns_timeout_on_slow_query() {
-        let result: agentdb_meta::MetaResult<()> = with_renewal_timeout(
-            10,
-            "test::hang_forever",
-            async {
+        let result: agentdb_meta::MetaResult<()> =
+            with_renewal_timeout(10, "test::hang_forever", async {
                 // Future never resolves; we rely on the timeout
                 // wrapper to abort it.
                 std::future::pending::<agentdb_meta::MetaResult<()>>().await
-            },
-        )
-        .await;
+            })
+            .await;
         match result {
             Err(agentdb_meta::MetaError::Timeout(msg)) => {
                 assert!(msg.contains("test::hang_forever"));
@@ -5478,12 +5475,8 @@ mod tests {
     /// not a delay or transform on the happy path.
     #[tokio::test(start_paused = true)]
     async fn with_renewal_timeout_passes_through_fast_query() {
-        let result: agentdb_meta::MetaResult<u32> = with_renewal_timeout(
-            5_000,
-            "test::fast",
-            async { Ok(42u32) },
-        )
-        .await;
+        let result: agentdb_meta::MetaResult<u32> =
+            with_renewal_timeout(5_000, "test::fast", async { Ok(42u32) }).await;
         assert_eq!(result.unwrap(), 42);
     }
 
@@ -5492,16 +5485,12 @@ mod tests {
     /// into Timeout — operators need to distinguish them.
     #[tokio::test(start_paused = true)]
     async fn with_renewal_timeout_preserves_real_errors() {
-        let result: agentdb_meta::MetaResult<()> = with_renewal_timeout(
-            5_000,
-            "test::conflict",
-            async { Err(agentdb_meta::MetaError::Conflict("bad".into())) },
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(agentdb_meta::MetaError::Conflict(_))
-        ));
+        let result: agentdb_meta::MetaResult<()> =
+            with_renewal_timeout(5_000, "test::conflict", async {
+                Err(agentdb_meta::MetaError::Conflict("bad".into()))
+            })
+            .await;
+        assert!(matches!(result, Err(agentdb_meta::MetaError::Conflict(_))));
     }
 
     fn base_opts() -> ServeOpts {

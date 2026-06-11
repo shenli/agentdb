@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus};
 use agentdb_core::runtime::{
     AckExportConsumerRequest, AppendRequest, CreateExportConsumerRequest, ExportWatchRequest,
-    Runtime, WatchScope,
+    NewRecordEdge, RecordEdgeType, RecordUpdate, Runtime, SearchRequest, WatchScope,
 };
 use agentdb_core::tenant::NewTenant;
 use agentdb_core::{NewAgent, NewSession, RUNTIME_PRIMARY_TABLET_ID};
@@ -246,6 +247,150 @@ async fn runtime_persisted_writes_replicate_with_raft_rs_quorum() {
         .await
         .unwrap();
     assert_eq!(hydrated.external_key, "raft-rs-tenant");
+}
+
+#[tokio::test]
+async fn runtime_raft_rs_replicates_record_memory_primitives() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(1, raft_configs).unwrap();
+    group.elect(1).unwrap();
+
+    let leader_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let follower_kv: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n2")).unwrap());
+
+    let leader_runtime = Runtime::with_kv_and_replicated_log(leader_kv, content(), logs[0].clone());
+    let tenant = leader_runtime
+        .create_tenant(NewTenant {
+            external_key: "raft-rs-record-memory".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let policy = IndexingPolicy {
+        mode: IndexingMode::SummaryOnly,
+        fields: vec![],
+        vector_allowed: false,
+    };
+    let old = leader_runtime
+        .write_record_with_commit(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            external_id: Some("memory-old".into()),
+            namespace: vec!["memory".into()],
+            scope: serde_json::json!({"agent_id": "agent-a"}),
+            text: Some("replicated old memory".into()),
+            metadata: serde_json::json!({"kind": "memory"}),
+            tags: vec!["memory".into()],
+            source: None,
+            embedding: None,
+            policy: policy.clone(),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    let new = leader_runtime
+        .write_record(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            external_id: Some("memory-new".into()),
+            namespace: vec!["memory".into()],
+            scope: serde_json::json!({"agent_id": "agent-a"}),
+            text: Some("replicated new memory".into()),
+            metadata: serde_json::json!({"kind": "memory"}),
+            tags: vec!["memory".into()],
+            source: None,
+            embedding: None,
+            policy,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    leader_runtime
+        .update_record_with_commit(RecordUpdate {
+            tenant_id: tenant.tenant_id.clone(),
+            record_id: old.record.record_id.clone(),
+            expected_version: Some(old.record.version),
+            namespace: None,
+            scope: None,
+            text: None,
+            metadata: None,
+            tags: None,
+            source: None,
+            embedding: None,
+            policy: None,
+            status: Some(RecordStatus::Superseded),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    let edge = leader_runtime
+        .create_record_edge(NewRecordEdge {
+            tenant_id: tenant.tenant_id.clone(),
+            source_record_id: new.record_id.clone(),
+            target_record_id: old.record.record_id.clone(),
+            edge_type: RecordEdgeType::Supersedes,
+            metadata: serde_json::json!({"reason": "raft-test"}),
+        })
+        .await
+        .unwrap();
+    leader_runtime
+        .set_tenant_meta(
+            &tenant.tenant_id,
+            "db0.cursor",
+            serde_json::json!({"offset": 9}),
+        )
+        .await
+        .unwrap();
+
+    let follower_runtime =
+        Runtime::with_kv_and_replicated_log(follower_kv, content(), logs[1].clone());
+    let replicated_old = follower_runtime
+        .get_record(&tenant.tenant_id, &old.record.record_id)
+        .await
+        .unwrap();
+    assert_eq!(replicated_old.external_id.as_deref(), Some("memory-old"));
+    assert_eq!(replicated_old.status, RecordStatus::Superseded);
+
+    let history = follower_runtime
+        .search_record_matches(SearchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            namespace: vec!["memory".into()],
+            sharding_key: Some("memory".into()),
+            text: Some("old".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            metadata_filter: None,
+            include_superseded: true,
+            min_score: Some(0.0),
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
+            limit: 10,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].record.record_id, old.record.record_id);
+
+    let edges = follower_runtime
+        .record_edges(&tenant.tenant_id, &old.record.record_id)
+        .await
+        .unwrap();
+    assert_eq!(edges, vec![edge]);
+    let meta = follower_runtime
+        .get_tenant_meta(&tenant.tenant_id, "db0.cursor")
+        .await
+        .unwrap();
+    assert_eq!(meta.value, serde_json::json!({"offset": 9}));
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ use agentdb_core::{
 fn record(tenant_id: agentdb_core::Id, text: &str, tag: &str) -> NewRecord {
     NewRecord {
         tenant_id,
+        external_id: None,
         namespace: vec!["policy".into(), "records".into()],
         scope: serde_json::json!({}),
         text: Some(text.into()),
@@ -57,6 +58,11 @@ async fn record_visibility_and_policy_gc_match_committed_model_under_lag() {
             tags: vec!["visible".into()],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: Some(first.commit_token.seq),
         })

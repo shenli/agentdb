@@ -37,6 +37,7 @@ async fn session(rt: &Runtime, tenant: &Tenant) -> agentdb_core::Session {
 fn record(tenant: &Tenant) -> NewRecord {
     NewRecord {
         tenant_id: tenant.tenant_id.clone(),
+        external_id: None,
         namespace: vec!["worker".into()],
         scope: serde_json::json!({}),
         text: Some("purge".into()),

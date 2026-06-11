@@ -31,6 +31,7 @@ fn empty_source_ref() -> SourceRef {
 fn default_new_record(tenant_id: Id) -> NewRecord {
     NewRecord {
         tenant_id,
+        external_id: None,
         namespace: vec!["test".into()],
         scope: serde_json::json!({}),
         text: Some("hello".into()),

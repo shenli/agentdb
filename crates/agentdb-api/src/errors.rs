@@ -40,7 +40,7 @@ fn status_for(code: ErrorCode) -> StatusCode {
         EventTooLarge | ArtifactTooLarge | HashMismatch | PolicyDenied | InvalidCursor => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        IdempotencyConflict | AliasConflict => StatusCode::CONFLICT,
+        IdempotencyConflict | AliasConflict | VersionConflict => StatusCode::CONFLICT,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         NodeDraining | KeyUnavailable | RaftNotLeader => StatusCode::SERVICE_UNAVAILABLE,
         Internal => StatusCode::INTERNAL_SERVER_ERROR,

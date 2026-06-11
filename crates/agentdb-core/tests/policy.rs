@@ -165,6 +165,7 @@ async fn record_count_quota_is_enforced() {
 
     let make_record = || NewRecord {
         tenant_id: t.tenant_id.clone(),
+        external_id: None,
         namespace: vec!["n".into()],
         scope: serde_json::json!({}),
         text: Some("x".into()),
@@ -336,6 +337,7 @@ async fn backpressure_reports_soft_record_quota() {
 
     let req = NewRecord {
         tenant_id: t.tenant_id.clone(),
+        external_id: None,
         namespace: vec!["n".into()],
         scope: serde_json::json!({}),
         text: Some("x".into()),

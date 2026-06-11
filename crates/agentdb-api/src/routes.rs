@@ -33,8 +33,8 @@ use agentdb_core::{
     runtime::{
         AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
         ContextRequest, CreateExportConsumerRequest, ExportFeedItem, ExportWatchRequest,
-        FetchRequest, ForkSessionRequest, RewindExportConsumerRequest, SearchRequest, WatchRequest,
-        WatchScope,
+        FetchRequest, ForkSessionRequest, NewRecordEdge, RecordUpdate, RewindExportConsumerRequest,
+        SearchRequest, WatchRequest, WatchScope,
     },
     Agent, AgentSkillBinding, Artifact, BindSkillRequest, ChangefeedItem, ErrorCode, Id, IdKind,
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
@@ -47,12 +47,13 @@ use agentdb_meta::{
 
 use crate::dto::{
     AckExportConsumerBody, AppendAndFetchBody, AppendBody, BindSkillBody, ClaimExportConsumerBody,
-    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody, CreateSessionBody,
-    CreateSkillBody, CreateTenantBody, ExportBackfillBody, ExportBackfillResponse, ExportEnvelope,
-    ExportObservabilityFields, ExportStatusResponse, ExportWatchResponse, FetchQuery,
-    ForkSessionBody, IncludeDeletedQuery, ListAgentSkillsResponse, PolicyWorkerRunBody,
-    ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody, SearchRecordsBody,
-    SearchRecordsResponse, SweepBody, TransitionSessionLifecycleBody, WatchQuery,
+    ContextBody, CreateAgentBody, CreateExportConsumerBody, CreateRecordBody, CreateRecordEdgeBody,
+    CreateSessionBody, CreateSkillBody, CreateTenantBody, ExportBackfillBody,
+    ExportBackfillResponse, ExportEnvelope, ExportObservabilityFields, ExportStatusResponse,
+    ExportWatchResponse, FetchQuery, ForkSessionBody, IncludeDeletedQuery, ListAgentSkillsResponse,
+    PolicyWorkerRunBody, ReplayQuery, RestoreSessionStorageBody, RewindExportConsumerBody,
+    SearchRecordsBody, SearchRecordsResponse, SweepBody, TenantMetaBody,
+    TransitionSessionLifecycleBody, UpdateRecordBody, WatchQuery,
 };
 use crate::errors::{parse_id_or, ApiError};
 use crate::internal_raft_http::{
@@ -327,10 +328,34 @@ pub fn routes() -> Router<AppState> {
             "/api/tenants/:tenant_id/records/search",
             get(search_records).post(search_records_json),
         )
+        .route(
+            "/api/tenants/:tenant_id/records/upsert",
+            post(upsert_record),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records/edges",
+            post(create_record_edge),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records/edges/:edge_id",
+            delete(delete_record_edge),
+        )
         .route("/api/tenants/:tenant_id/records", post(create_record))
         .route(
             "/api/tenants/:tenant_id/records/:record_id",
-            get(get_record).delete(delete_record),
+            get(get_record).patch(update_record).delete(delete_record),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records/:record_id/touch",
+            post(touch_record),
+        )
+        .route(
+            "/api/tenants/:tenant_id/records/:record_id/edges",
+            get(list_record_edges),
+        )
+        .route(
+            "/api/tenants/:tenant_id/meta/:key",
+            get(get_tenant_meta).put(set_tenant_meta),
         )
         .route("/api/tenants/:tenant_id/skills", post(create_skill))
         .route(
@@ -7323,6 +7348,7 @@ async fn create_record(
         .runtime
         .write_record_with_commit(NewRecord {
             tenant_id: tid.clone(),
+            external_id: body.external_id,
             namespace: body.namespace,
             scope: body.scope,
             text: body.text,
@@ -7341,6 +7367,151 @@ async fn create_record(
         resp.headers_mut().insert(RECORD_COMMIT_SEQ_HEADER, value);
     }
     Ok(resp)
+}
+
+async fn upsert_record(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<CreateRecordBody>,
+) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let written = s
+        .runtime
+        .upsert_record_with_commit(NewRecord {
+            tenant_id: tid.clone(),
+            external_id: body.external_id,
+            namespace: body.namespace,
+            scope: body.scope,
+            text: body.text,
+            metadata: body.metadata,
+            tags: body.tags,
+            source: body.source,
+            embedding: body.embedding,
+            policy: body.policy.unwrap_or_default(),
+            expires_at_ms: body.expires_at_ms,
+        })
+        .await?;
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    let mut resp = json_with_backpressure(&s, StatusCode::OK, Json(written.record), backpressure);
+    if let Ok(value) = HeaderValue::from_str(&written.commit_token.seq.to_string()) {
+        resp.headers_mut().insert(RECORD_COMMIT_SEQ_HEADER, value);
+    }
+    Ok(resp)
+}
+
+async fn update_record(
+    State(s): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+    Json(body): Json<UpdateRecordBody>,
+) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
+    let written = s
+        .runtime
+        .update_record_with_commit(RecordUpdate {
+            tenant_id: tid.clone(),
+            record_id: rid,
+            expected_version: body.expected_version,
+            namespace: body.namespace,
+            scope: body.scope,
+            text: body.text,
+            metadata: body.metadata,
+            tags: body.tags,
+            source: body.source,
+            embedding: body.embedding,
+            policy: body.policy,
+            status: body.status,
+            expires_at_ms: body.expires_at_ms,
+        })
+        .await?;
+    let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;
+    let mut resp = json_with_backpressure(&s, StatusCode::OK, Json(written.record), backpressure);
+    if let Ok(value) = HeaderValue::from_str(&written.commit_token.seq.to_string()) {
+        resp.headers_mut().insert(RECORD_COMMIT_SEQ_HEADER, value);
+    }
+    Ok(resp)
+}
+
+async fn touch_record(
+    State(s): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+) -> Result<Json<SearchableRecord>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
+    Ok(Json(s.runtime.touch_record(&tid, &rid).await?))
+}
+
+async fn create_record_edge(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<CreateRecordEdgeBody>,
+) -> Result<(StatusCode, Json<agentdb_core::RecordEdge>), ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let source_record_id = parse_id_or(
+        &body.source_record_id,
+        IdKind::Record,
+        ErrorCode::RecordNotFound,
+    )?;
+    let target_record_id = parse_id_or(
+        &body.target_record_id,
+        IdKind::Record,
+        ErrorCode::RecordNotFound,
+    )?;
+    let edge = s
+        .runtime
+        .create_record_edge(NewRecordEdge {
+            tenant_id: tid,
+            source_record_id,
+            target_record_id,
+            edge_type: body.edge_type,
+            metadata: body.metadata,
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(edge)))
+}
+
+async fn list_record_edges(
+    State(s): State<AppState>,
+    Path((tenant_id, record_id)): Path<(String, String)>,
+) -> Result<Json<Vec<agentdb_core::RecordEdge>>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let rid = parse_id_or(&record_id, IdKind::Record, ErrorCode::RecordNotFound)?;
+    Ok(Json(s.runtime.record_edges(&tid, &rid).await?))
+}
+
+async fn delete_record_edge(
+    State(s): State<AppState>,
+    Path((tenant_id, edge_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let eid = parse_id_or(&edge_id, IdKind::RecordEdge, ErrorCode::RecordNotFound)?;
+    s.runtime.delete_record_edge(&tid, &eid).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_tenant_meta(
+    State(s): State<AppState>,
+    Path((tenant_id, key)): Path<(String, String)>,
+    Json(body): Json<TenantMetaBody>,
+) -> Result<Json<agentdb_core::TenantMetaEntry>, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    Ok(Json(
+        s.runtime.set_tenant_meta(&tid, key, body.value).await?,
+    ))
+}
+
+async fn get_tenant_meta(
+    State(s): State<AppState>,
+    Path((tenant_id, key)): Path<(String, String)>,
+) -> Result<Json<agentdb_core::TenantMetaEntry>, ApiError> {
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    Ok(Json(s.runtime.get_tenant_meta(&tid, &key).await?))
 }
 
 /// `GET /api/tenants/:tenant_id/records/:record_id`
@@ -7403,6 +7574,11 @@ async fn search_records(
         tags: parsed.tags,
         source_filter,
         metadata_filter: None,
+        include_superseded: parsed.include_superseded,
+        min_score: parsed.min_score,
+        created_after_ms: parsed.created_after_ms,
+        created_before_ms: parsed.created_before_ms,
+        touch: parsed.touch,
         limit,
         min_visible_record_commit_seq: parsed.min_visible_record_commit_seq,
     };
@@ -7582,6 +7758,11 @@ struct ParsedSearchQuery {
     source_event: Option<String>,
     limit: usize,
     min_visible_record_commit_seq: Option<u64>,
+    include_superseded: bool,
+    min_score: Option<f32>,
+    created_after_ms: Option<u64>,
+    created_before_ms: Option<u64>,
+    touch: bool,
 }
 
 fn parse_search_query(raw: &str) -> ParsedSearchQuery {
@@ -7598,6 +7779,11 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
         source_event: None,
         limit: 20,
         min_visible_record_commit_seq: None,
+        include_superseded: false,
+        min_score: None,
+        created_after_ms: None,
+        created_before_ms: None,
+        touch: false,
     };
     if raw.is_empty() {
         return out;
@@ -7631,10 +7817,22 @@ fn parse_search_query(raw: &str) -> ParsedSearchQuery {
             "min_visible_record_commit_seq" => {
                 out.min_visible_record_commit_seq = val.parse().ok();
             }
+            "include_superseded" => out.include_superseded = parse_boolish(&val),
+            "min_score" => out.min_score = val.parse().ok(),
+            "created_after_ms" => out.created_after_ms = val.parse().ok(),
+            "created_before_ms" => out.created_before_ms = val.parse().ok(),
+            "touch" => out.touch = parse_boolish(&val),
             _ => {} // unknown keys are silently ignored
         }
     }
     out
+}
+
+fn parse_boolish(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes"
+    )
 }
 
 /// Lightweight URL-decoder for query string values: handles `+` → space and
@@ -7707,6 +7905,11 @@ fn search_body_to_request(tenant_id: Id, body: SearchRecordsBody) -> SearchReque
         tags: body.tags,
         source_filter: body.source,
         metadata_filter: body.metadata_filter,
+        include_superseded: body.include_superseded,
+        min_score: body.min_score,
+        created_after_ms: body.created_after_ms,
+        created_before_ms: body.created_before_ms,
+        touch: body.touch,
         limit: body.limit.clamp(1, 100),
         min_visible_record_commit_seq: body.min_visible_record_commit_seq,
     }
