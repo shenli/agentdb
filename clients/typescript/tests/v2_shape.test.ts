@@ -25,7 +25,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
     if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
     if (raw.includes("/watch")) return json([]);
     if (raw.endsWith("/artifacts")) return json({ artifact_id: "art_1" });
-    if (raw.endsWith("/records/search")) return json({ records: [] });
+    if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
     if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
     if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
@@ -101,7 +101,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
     if (raw.endsWith("/artifacts")) {
       return json({ artifact_id: "art_1", content_type: "text/plain", bytes: 4, sha256: "abcd" });
     }
-    if (raw.endsWith("/records/search")) return json({ records: [] });
+    if (raw.endsWith("/records/search")) return json({ matches: [] });
     if (raw.endsWith("/records")) return json({ record_id: "rec_1" });
     if (raw.endsWith("/skills")) return json({ skill_id: "skl_1" });
     if (raw.endsWith("/skills/bind")) return json({ skill_id: "skl_1" });
@@ -211,7 +211,7 @@ test("record search carries the last tenant commit sequence", async () => {
     if (raw.endsWith("/records")) {
       return json({ record_id: "rec_1" }, 201, { "x-agentdb-record-commit-seq": "17" });
     }
-    if (raw.endsWith("/records/search")) return json({ records: [] });
+    if (raw.endsWith("/records/search")) return json({ matches: [] });
     return json({});
   };
 

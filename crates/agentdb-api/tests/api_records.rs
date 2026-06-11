@@ -100,9 +100,9 @@ async fn record_create_returns_commit_seq_accepted_by_search() {
         .json()
         .await
         .unwrap();
-    let recs = searched["records"].as_array().unwrap();
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["record_id"], created["record_id"]);
+    let matches = searched["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["record"]["record_id"], created["record_id"]);
 }
 
 #[tokio::test]
@@ -207,14 +207,14 @@ async fn search_records_by_namespace_and_text() {
         .json()
         .await
         .unwrap();
-    let recs = resp["records"].as_array().unwrap();
+    let recs = resp["matches"].as_array().unwrap();
     assert_eq!(
         recs.len(),
         2,
         "expected 2 matches in namespace=test, got {recs:?}"
     );
     for r in recs {
-        assert_eq!(r["namespace"], json!(["test"]));
+        assert_eq!(r["record"]["namespace"], json!(["test"]));
     }
 }
 
@@ -255,7 +255,7 @@ async fn search_records_with_no_text_returns_namespace_listing() {
         .json()
         .await
         .unwrap();
-    assert_eq!(resp["records"].as_array().unwrap().len(), 3);
+    assert_eq!(resp["matches"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -304,9 +304,11 @@ async fn post_search_records_supports_vector_embedding() {
         .await
         .unwrap();
 
-    let recs = resp["records"].as_array().unwrap();
+    let recs = resp["matches"].as_array().unwrap();
     assert_eq!(recs.len(), 3);
-    assert_eq!(recs[0]["text"], "north");
+    assert_eq!(recs[0]["record"]["text"], "north");
+    assert!(recs[0]["score"].as_f64().unwrap() > recs[1]["score"].as_f64().unwrap());
+    assert_eq!(recs[0]["components"]["vector"], recs[0]["score"]);
 }
 
 #[tokio::test]
@@ -348,7 +350,145 @@ async fn post_vector_search_skips_records_when_policy_denies_vector() {
         .json()
         .await
         .unwrap();
-    assert!(resp["records"].as_array().unwrap().is_empty());
+    assert!(resp["matches"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn post_search_records_filters_by_metadata() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    for (text, metadata) in [
+        (
+            "wire mongo test passed",
+            json!({
+                "repo": "agentdb",
+                "component": "wire",
+                "kind": "test_result",
+                "status": "passed",
+                "confidence": 0.95,
+                "source": {"commit": "abc123"}
+            }),
+        ),
+        (
+            "api smoke test passed",
+            json!({
+                "repo": "agentdb",
+                "component": "api",
+                "kind": "test_result",
+                "status": "passed",
+                "confidence": 0.90,
+                "source": {"commit": "def456"}
+            }),
+        ),
+        (
+            "wire mongo test failed",
+            json!({
+                "repo": "agentdb",
+                "component": "wire",
+                "kind": "test_result",
+                "status": "failed",
+                "confidence": 0.40
+            }),
+        ),
+    ] {
+        app.client
+            .post(format!("{}/api/tenants/{tid}/records", app.base))
+            .json(&json!({
+                "namespace": ["db0", "memory"],
+                "text": text,
+                "metadata": metadata,
+                "tags": ["test"],
+                "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let resp: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/search", app.base))
+        .json(&json!({
+            "namespace": ["db0", "memory"],
+            "text": "wire test",
+            "metadata_filter": {
+                "all": [
+                    {"path": "repo", "op": "eq", "value": "agentdb"},
+                    {"path": "component", "op": "eq", "value": "wire"},
+                    {"path": "confidence", "op": "gte", "value": 0.8},
+                    {"path": "source.commit", "op": "exists", "value": true}
+                ],
+                "none": [
+                    {"path": "status", "op": "eq", "value": "failed"}
+                ]
+            },
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let matches = resp["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1, "matches: {matches:?}");
+    assert_eq!(matches[0]["record"]["metadata"]["component"], "wire");
+    assert_eq!(matches[0]["record"]["metadata"]["status"], "passed");
+}
+
+#[tokio::test]
+async fn post_search_records_returns_ranked_score_components() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    for (text, embedding) in [("alpha beta", vec![1.0, 0.0]), ("alpha", vec![0.0, 1.0])] {
+        app.client
+            .post(format!("{}/api/tenants/{tid}/records", app.base))
+            .json(&json!({
+                "namespace": ["scores"],
+                "text": text,
+                "embedding": embedding,
+                "policy": {"mode": "summary_only", "fields": [], "vector_allowed": true}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let resp: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/search", app.base))
+        .json(&json!({
+            "namespace": ["scores"],
+            "text": "alpha",
+            "embedding": [1.0, 0.0],
+            "limit": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let matches = resp["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0]["rank"], 1);
+    assert_eq!(matches[1]["rank"], 2);
+    assert!(matches[0]["score"].as_f64().unwrap() >= matches[1]["score"].as_f64().unwrap());
+    assert!(matches[0]["components"]["text"].as_f64().is_some());
+    assert!(matches[0]["components"]["vector"].as_f64().is_some());
+    assert_eq!(matches[0]["record"]["text"], "alpha beta");
 }
 
 #[tokio::test]
@@ -368,7 +508,7 @@ async fn search_route_beats_dynamic_record_id_route() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "got {}", resp.status());
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["records"].as_array().unwrap().is_empty());
+    assert!(body["matches"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -437,7 +577,7 @@ async fn delete_record_removes_from_search() {
         .json()
         .await
         .unwrap();
-    assert_eq!(pre["records"].as_array().unwrap().len(), 1);
+    assert_eq!(pre["matches"].as_array().unwrap().len(), 1);
 
     // DELETE.
     let resp = app
@@ -463,7 +603,7 @@ async fn delete_record_removes_from_search() {
         .json()
         .await
         .unwrap();
-    assert!(post["records"].as_array().unwrap().is_empty());
+    assert!(post["matches"].as_array().unwrap().is_empty());
 
     // GET on the deleted id is now a 404.
     let resp = app

@@ -48,9 +48,10 @@ pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
     ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
-    LifecycleSweepReport, PolicyWorkerReport, RecordIndexStats, ReplayResponse, Runtime,
-    SessionStorageSummary, TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
-    RUNTIME_PRIMARY_TABLET_ID,
+    LifecycleSweepReport, MetadataFilter, MetadataFilterCondition, MetadataFilterOp,
+    PolicyWorkerReport, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents,
+    ReplayResponse, Runtime, SessionStorageSummary, TenantStorageSummary, TenantWorkerReport,
+    WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
 };
 pub use segment::{SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile};
 pub use session::{Lifecycle, NewSession, Session};

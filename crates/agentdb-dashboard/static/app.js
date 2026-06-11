@@ -477,7 +477,7 @@ async function searchRecords() {
       method: "POST",
       body: JSON.stringify(recordQuery()),
     });
-    renderRows("records", data.records || []);
+    renderRows("records", data.matches || []);
   } catch (err) {
     fail(err);
   }

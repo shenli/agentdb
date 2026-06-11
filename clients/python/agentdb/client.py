@@ -677,7 +677,7 @@ class Client:
     def search_records(self, tenant_id: TenantId, **body: Any) -> list:
         body = self._with_record_commit_seq(tenant_id, body)
         data = self._request("POST", f"/api/tenants/{_quote(tenant_id)}/records/search", json=body)
-        return data.get("records", [])
+        return data.get("matches", [])
 
     def register_skill(
         self,
