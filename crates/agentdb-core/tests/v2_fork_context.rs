@@ -116,6 +116,7 @@ async fn context_builder_respects_includes_and_byte_budget() {
     }
     rt.write_record(NewRecord {
         tenant_id: tenant.tenant_id.clone(),
+        external_id: None,
         namespace: vec!["mem".into()],
         scope: serde_json::json!({}),
         text: Some("renewal memory".into()),
@@ -713,6 +714,7 @@ async fn export_watch_emits_metadata_updates_and_tombstones_with_persistent_kv()
     let record = rt
         .write_record(NewRecord {
             tenant_id: tenant.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["mem".into()],
             scope: serde_json::json!({}),
             text: Some("exported memory".into()),
@@ -819,6 +821,7 @@ async fn export_watch_emits_retention_gc_tombstones_with_persistent_kv() {
     let record = rt
         .write_record(NewRecord {
             tenant_id: tenant.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["mem".into()],
             scope: serde_json::json!({}),
             text: Some("retention memory".into()),

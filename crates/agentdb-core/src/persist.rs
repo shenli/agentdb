@@ -46,7 +46,7 @@ use crate::artifact::Artifact;
 use crate::event::EventEnvelope;
 use crate::idempotency::IdempotencyRecord;
 use crate::record::SearchableRecord;
-use crate::runtime::{ExportConsumer, ExportLedgerItem};
+use crate::runtime::{ExportConsumer, ExportLedgerItem, RecordEdge, TenantMetaEntry};
 use crate::segment::SessionSegment;
 use crate::session::Session;
 use crate::skill::{AgentSkillBinding, Skill};
@@ -152,6 +152,14 @@ fn export_ledger_agent_index_prefix(tenant_id: &str, agent_id: &str) -> String {
 
 fn export_ledger_high_watermark_key(tenant_id: &str) -> String {
     format!("export_ledger_high_watermark/{tenant_id}")
+}
+
+fn record_edge_key(tenant_id: &str, edge_id: &str) -> String {
+    format!("record/searchable_edge/{tenant_id}/{edge_id}")
+}
+
+fn tenant_meta_key(tenant_id: &str, key: &str) -> String {
+    format!("record/tenant_meta/{tenant_id}/{key}")
 }
 
 fn export_ledger_cursor_at_or_before(cursor: &str, from_cursor: Option<&str>) -> bool {
@@ -2340,6 +2348,43 @@ impl Persist {
             let mutation: RecordIndexMutation =
                 serde_json::from_slice(&v).expect("record index mutation decodes");
             out.push(mutation);
+        }
+        Ok(out)
+    }
+
+    pub fn put_record_edge(&self, edge: &RecordEdge) -> KvResult<()> {
+        self.write_ops(vec![WriteOp::Put {
+            key: record_edge_key(edge.tenant_id.as_str(), edge.edge_id.as_str()).into_bytes(),
+            value: serde_json::to_vec(edge).expect("record edge serializes"),
+        }])
+    }
+
+    pub fn scan_all_record_edges(&self) -> KvResult<Vec<RecordEdge>> {
+        let iter = self.kv.scan_prefix(b"record/searchable_edge/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let edge: RecordEdge = serde_json::from_slice(&v).expect("record edge decodes");
+            out.push(edge);
+        }
+        Ok(out)
+    }
+
+    pub fn put_tenant_meta(&self, entry: &TenantMetaEntry) -> KvResult<()> {
+        self.write_ops(vec![WriteOp::Put {
+            key: tenant_meta_key(entry.tenant_id.as_str(), &entry.key).into_bytes(),
+            value: serde_json::to_vec(entry).expect("tenant meta entry serializes"),
+        }])
+    }
+
+    pub fn scan_all_tenant_meta(&self) -> KvResult<Vec<TenantMetaEntry>> {
+        let iter = self.kv.scan_prefix(b"record/tenant_meta/")?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            let entry: TenantMetaEntry =
+                serde_json::from_slice(&v).expect("tenant meta entry decodes");
+            out.push(entry);
         }
         Ok(out)
     }

@@ -46,7 +46,7 @@ use crate::id::{Id, IdKind};
 use crate::idempotency::{hash_json, hash_request, IdempotencyRecord, IdempotencyStore};
 use crate::persist::{Persist, RecordIndexMutationOp};
 use crate::policy::{Priority, RuntimePolicy};
-use crate::record::{IndexingMode, NewRecord, SearchableRecord};
+use crate::record::{IndexingMode, NewRecord, RecordStatus, SearchableRecord};
 use crate::segment::{
     SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
 };
@@ -751,6 +751,64 @@ pub struct PolicyWorkerReport {
     pub tenants: Vec<TenantWorkerReport>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordUpdate {
+    pub tenant_id: Id,
+    pub record_id: Id,
+    pub expected_version: Option<u64>,
+    pub namespace: Option<Vec<String>>,
+    pub scope: Option<serde_json::Value>,
+    pub text: Option<Option<String>>,
+    pub metadata: Option<serde_json::Value>,
+    pub tags: Option<Vec<String>>,
+    pub source: Option<Option<SourceRef>>,
+    pub embedding: Option<Option<Vec<f32>>>,
+    pub policy: Option<crate::record::IndexingPolicy>,
+    pub status: Option<RecordStatus>,
+    pub expires_at_ms: Option<Option<u64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordEdgeType {
+    Related,
+    Derived,
+    Contradicts,
+    Supports,
+    Supersedes,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRecordEdge {
+    pub tenant_id: Id,
+    pub source_record_id: Id,
+    pub target_record_id: Id,
+    pub edge_type: RecordEdgeType,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordEdge {
+    pub edge_id: Id,
+    pub tenant_id: Id,
+    pub source_record_id: Id,
+    pub target_record_id: Id,
+    pub edge_type: RecordEdgeType,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TenantMetaEntry {
+    pub tenant_id: Id,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Default, Debug)]
 struct State {
     tenants: BTreeMap<String, Tenant>,
@@ -792,6 +850,12 @@ struct State {
     /// startup from `Persist::scan_all_records`; updated on every
     /// `write_record` / `delete_record`.
     records: BTreeMap<String, SearchableRecord>,
+    /// Tenant-local uniqueness map for caller-stable record external ids.
+    record_external_ids: BTreeMap<String, String>,
+    /// Record graph edges keyed by edge_id.
+    record_edges: BTreeMap<String, RecordEdge>,
+    /// Tenant-scoped small metadata KV, keyed as `{tenant_id}::{key}`.
+    tenant_meta: BTreeMap<String, TenantMetaEntry>,
     /// Reverse mapping `DocId -> record_id_str`. Search hits come back
     /// from the text + vector indexes as `DocId`s; we walk this map to
     /// recover the record_id and post-filter from `records`. The
@@ -1628,6 +1692,21 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
             consumer,
         );
     }
+    for edge in persist
+        .scan_all_record_edges()
+        .expect("hydrate record edges")
+    {
+        if edge.deleted_at_ms.is_none() {
+            state
+                .record_edges
+                .insert(edge.edge_id.as_str().to_string(), edge);
+        }
+    }
+    for entry in persist.scan_all_tenant_meta().expect("hydrate tenant meta") {
+        state
+            .tenant_meta
+            .insert(tenant_meta_key(&entry.tenant_id, &entry.key), entry);
+    }
 
     let idempotency_records = persist
         .scan_all_idempotency()
@@ -1652,6 +1731,12 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
     for r in persist.scan_all_records().expect("hydrate records") {
         if r.deleted_at_ms.is_some() || r.is_expired() {
             continue;
+        }
+        if let Some(external_id) = r.external_id.as_deref() {
+            state.record_external_ids.insert(
+                record_external_key(&r.tenant_id, external_id),
+                r.record_id.as_str().to_string(),
+            );
         }
         let doc_id = mint_doc_id(&mut state.next_doc_seq);
         index_record_into(&mut text_index, &mut vector_index, &r, doc_id);
@@ -7365,6 +7450,17 @@ pub struct SearchRequest {
     /// Optional post-index metadata filter. This intentionally supports a small
     /// scalar predicate subset rather than becoming a general JSON query engine.
     pub metadata_filter: Option<MetadataFilter>,
+    /// Include logically superseded records. Search excludes them by default
+    /// while preserving direct reads for audit/history workflows.
+    pub include_superseded: bool,
+    /// Drop matches below this query-local score.
+    pub min_score: Option<f32>,
+    /// Inclusive lower bound on record creation time.
+    pub created_after_ms: Option<u64>,
+    /// Inclusive upper bound on record creation time.
+    pub created_before_ms: Option<u64>,
+    /// Increment access counters for returned matches after ranking.
+    pub touch: bool,
     pub limit: usize,
     /// Tenant-scoped searchable-record commit sequence that this read must
     /// observe. If the local index watermark is behind, `search_records`
@@ -7389,6 +7485,11 @@ impl SearchRequest {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit,
             min_visible_record_commit_seq: None,
         }
@@ -7517,6 +7618,28 @@ impl Runtime {
                     format!("{}", record.tenant_id),
                 ));
             }
+            if let Some(external_id) = record.external_id.as_deref() {
+                if let Some(existing_id) = s
+                    .record_external_ids
+                    .get(&record_external_key(&record.tenant_id, external_id))
+                {
+                    if let Some(existing) = s.records.get(existing_id).filter(|r| {
+                        r.deleted_at_ms.is_none()
+                            && !r.is_expired()
+                            && r.tenant_id.as_str() == record.tenant_id.as_str()
+                    }) {
+                        let seq = s.record_commit_seq.get(existing_id).copied().unwrap_or(0);
+                        return Ok(WriteRecordResult {
+                            record: existing.clone(),
+                            commit_token: CommitToken {
+                                placement_id: None,
+                                scope: CommitScope::Tenant(record.tenant_id.clone()),
+                                seq,
+                            },
+                        });
+                    }
+                }
+            }
             if let Some(max) = policy.quota.max_records {
                 let live_count = s
                     .records
@@ -7577,6 +7700,12 @@ impl Runtime {
             .insert(record.record_id.as_str().to_string(), doc_id);
         s.record_commit_seq
             .insert(record.record_id.as_str().to_string(), commit_seq);
+        if let Some(external_id) = record.external_id.as_deref() {
+            s.record_external_ids.insert(
+                record_external_key(&record.tenant_id, external_id),
+                record.record_id.as_str().to_string(),
+            );
+        }
         s.local_record_index_watermark = s.local_record_index_watermark.max(commit_seq);
         if self.persist.is_none() {
             if let Err(error) = self
@@ -7656,6 +7785,7 @@ impl Runtime {
                 record.tenant_id.as_str() == tenant_id.as_str()
                     && record.deleted_at_ms.is_none()
                     && !record.is_expired()
+                    && record.status == RecordStatus::Active
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7755,6 +7885,424 @@ impl Runtime {
             global_index_apply_failures_total: s.global_record_index_apply_failures_total,
             record_index_outbox_skipped_total: s.record_index_outbox_skipped_total,
         }
+    }
+
+    pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
+        let existing_id = if let Some(external_id) = req.external_id.as_deref() {
+            let s = self.state.lock().await;
+            s.record_external_ids
+                .get(&record_external_key(&req.tenant_id, external_id))
+                .filter(|record_id| {
+                    s.records.get(*record_id).is_some_and(|record| {
+                        record.tenant_id.as_str() == req.tenant_id.as_str()
+                            && record.deleted_at_ms.is_none()
+                            && !record.is_expired()
+                    })
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let Some(existing_id) = existing_id else {
+            return self.write_record_with_commit(req).await;
+        };
+        let record_id = Id::parse_kind(&existing_id, IdKind::Record)
+            .map_err(|e| Error::new(ErrorCode::RecordNotFound, e.to_string()))?;
+        self.update_record_with_commit(RecordUpdate {
+            tenant_id: req.tenant_id,
+            record_id,
+            expected_version: None,
+            namespace: Some(req.namespace),
+            scope: Some(req.scope),
+            text: Some(req.text),
+            metadata: Some(req.metadata),
+            tags: Some(req.tags),
+            source: Some(req.source),
+            embedding: Some(req.embedding),
+            policy: Some(req.policy),
+            status: Some(RecordStatus::Active),
+            expires_at_ms: Some(req.expires_at_ms),
+        })
+        .await
+    }
+
+    pub async fn update_record_with_commit(
+        &self,
+        update: RecordUpdate,
+    ) -> Result<WriteRecordResult> {
+        let mut s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(update.tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", update.tenant_id),
+            ));
+        }
+        let current = s
+            .records
+            .get(update.record_id.as_str())
+            .filter(|r| {
+                r.tenant_id.as_str() == update.tenant_id.as_str()
+                    && r.deleted_at_ms.is_none()
+                    && !r.is_expired()
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(ErrorCode::RecordNotFound, format!("{}", update.record_id))
+            })?;
+        if let Some(expected) = update.expected_version {
+            if current.version != expected {
+                return Err(Error::new(
+                    ErrorCode::VersionConflict,
+                    format!(
+                        "record {} version mismatch: expected {}, got {}",
+                        update.record_id, expected, current.version
+                    ),
+                ));
+            }
+        }
+
+        let mut updated = current.clone();
+        if let Some(namespace) = update.namespace {
+            updated.namespace = namespace;
+        }
+        if let Some(scope) = update.scope {
+            updated.scope = scope;
+        }
+        if let Some(text) = update.text {
+            updated.text = text;
+        }
+        if let Some(metadata) = update.metadata {
+            updated.metadata = metadata;
+        }
+        if let Some(tags) = update.tags {
+            updated.tags = tags;
+        }
+        if let Some(source) = update.source {
+            updated.source = source;
+        }
+        if let Some(embedding) = update.embedding {
+            updated.embedding = embedding;
+        }
+        if let Some(policy) = update.policy {
+            updated.policy = policy;
+        }
+        if let Some(status) = update.status {
+            updated.status = status;
+        }
+        if let Some(expires_at_ms) = update.expires_at_ms {
+            updated.expires_at_ms = expires_at_ms;
+        }
+        updated.version = updated
+            .version
+            .checked_add(1)
+            .ok_or_else(|| Error::new(ErrorCode::Internal, "record version overflow"))?;
+        updated.updated_at_ms = crate::now_ms();
+
+        let commit_seq = next_record_commit_seq(&mut s);
+        if let Some(p) = &self.persist {
+            p.put_record_with_commit_seq(&updated, Some(commit_seq))
+                .map_err(internal)?;
+        } else if let Err(error) = self
+            .global_record_index
+            .apply(global_index_mutation_for_record(
+                &updated,
+                commit_seq,
+                if updated.deleted_at_ms.is_none() {
+                    GlobalIndexMutationOp::Upsert
+                } else {
+                    GlobalIndexMutationOp::Delete
+                },
+            ))
+        {
+            s.global_record_index_apply_failures_total += 1;
+            return Err(error);
+        } else {
+            s.global_record_index_watermark = s.global_record_index_watermark.max(commit_seq);
+        }
+
+        if let Some(doc) = s.record_to_doc.remove(updated.record_id.as_str()) {
+            s.doc_to_record.remove(&doc);
+        }
+        if updated.deleted_at_ms.is_none() && !updated.is_expired() {
+            let doc_id = mint_doc_id(&mut s.next_doc_seq);
+            {
+                let mut text = self.text_index.lock().expect("text index lock");
+                let mut vec = self.vector_index.lock().expect("vector index lock");
+                index_record_into(&mut text, &mut vec, &updated, doc_id);
+            }
+            s.doc_to_record
+                .insert(doc_id, updated.record_id.as_str().to_string());
+            s.record_to_doc
+                .insert(updated.record_id.as_str().to_string(), doc_id);
+        }
+        s.record_commit_seq
+            .insert(updated.record_id.as_str().to_string(), commit_seq);
+        s.local_record_index_watermark = s.local_record_index_watermark.max(commit_seq);
+        s.records
+            .insert(updated.record_id.as_str().to_string(), updated.clone());
+        let commit_token = CommitToken {
+            placement_id: None,
+            scope: CommitScope::Tenant(updated.tenant_id.clone()),
+            seq: commit_seq,
+        };
+        Ok(WriteRecordResult {
+            record: updated,
+            commit_token,
+        })
+    }
+
+    pub async fn touch_record(&self, tenant_id: &Id, record_id: &Id) -> Result<SearchableRecord> {
+        let mut touched = self
+            .touch_records_by_ids(tenant_id, &[record_id.as_str().to_string()])
+            .await?;
+        touched
+            .pop()
+            .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", record_id)))
+    }
+
+    async fn touch_records_by_ids(
+        &self,
+        tenant_id: &Id,
+        record_ids: &[String],
+    ) -> Result<Vec<SearchableRecord>> {
+        let mut s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut out = Vec::with_capacity(record_ids.len());
+        for record_id in record_ids {
+            let record = s
+                .records
+                .get(record_id)
+                .filter(|r| {
+                    r.tenant_id.as_str() == tenant_id.as_str()
+                        && r.deleted_at_ms.is_none()
+                        && !r.is_expired()
+                })
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, record_id.clone()))?;
+            let mut updated = record;
+            updated.access_count = updated
+                .access_count
+                .checked_add(1)
+                .ok_or_else(|| Error::new(ErrorCode::Internal, "record access_count overflow"))?;
+            updated.updated_at_ms = crate::now_ms();
+            if let Some(p) = &self.persist {
+                p.put_record_with_commit_seq(&updated, None)
+                    .map_err(internal)?;
+            }
+            s.records.insert(record_id.clone(), updated.clone());
+            out.push(updated);
+        }
+        Ok(out)
+    }
+
+    async fn maybe_touch_search_matches(
+        &self,
+        req: &SearchRequest,
+        matches: Vec<RecordSearchMatch>,
+    ) -> Result<Vec<RecordSearchMatch>> {
+        if !req.touch || matches.is_empty() {
+            return Ok(matches);
+        }
+        let ids = matches
+            .iter()
+            .map(|m| m.record.record_id.as_str().to_string())
+            .collect::<Vec<_>>();
+        let touched = self.touch_records_by_ids(&req.tenant_id, &ids).await?;
+        let by_id = touched
+            .into_iter()
+            .map(|record| (record.record_id.as_str().to_string(), record))
+            .collect::<BTreeMap<_, _>>();
+        Ok(matches
+            .into_iter()
+            .map(|mut m| {
+                if let Some(record) = by_id.get(m.record.record_id.as_str()) {
+                    m.record = record.clone();
+                }
+                m
+            })
+            .collect())
+    }
+
+    pub async fn create_record_edge(&self, req: NewRecordEdge) -> Result<RecordEdge> {
+        let edge = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(req.tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", req.tenant_id),
+                ));
+            }
+            for record_id in [&req.source_record_id, &req.target_record_id] {
+                let live = s.records.get(record_id.as_str()).is_some_and(|r| {
+                    r.tenant_id.as_str() == req.tenant_id.as_str()
+                        && r.deleted_at_ms.is_none()
+                        && !r.is_expired()
+                });
+                if !live {
+                    return Err(Error::new(
+                        ErrorCode::RecordNotFound,
+                        format!("{}", record_id),
+                    ));
+                }
+            }
+            RecordEdge {
+                edge_id: Id::new(IdKind::RecordEdge),
+                tenant_id: req.tenant_id,
+                source_record_id: req.source_record_id,
+                target_record_id: req.target_record_id,
+                edge_type: req.edge_type,
+                metadata: req.metadata,
+                created_at_ms: crate::now_ms(),
+                deleted_at_ms: None,
+            }
+        };
+        if let Some(p) = &self.persist {
+            p.put_record_edge(&edge).map_err(internal)?;
+        }
+        let mut s = self.state.lock().await;
+        s.record_edges
+            .insert(edge.edge_id.as_str().to_string(), edge.clone());
+        Ok(edge)
+    }
+
+    pub async fn record_edges(&self, tenant_id: &Id, record_id: &Id) -> Result<Vec<RecordEdge>> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let record_live = s.records.get(record_id.as_str()).is_some_and(|r| {
+            r.tenant_id.as_str() == tenant_id.as_str()
+                && r.deleted_at_ms.is_none()
+                && !r.is_expired()
+        });
+        if !record_live {
+            return Err(Error::new(
+                ErrorCode::RecordNotFound,
+                format!("{}", record_id),
+            ));
+        }
+        let mut edges = s
+            .record_edges
+            .values()
+            .filter(|edge| {
+                edge.tenant_id.as_str() == tenant_id.as_str()
+                    && edge.deleted_at_ms.is_none()
+                    && (edge.source_record_id.as_str() == record_id.as_str()
+                        || edge.target_record_id.as_str() == record_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        edges.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.edge_id.as_str().cmp(b.edge_id.as_str()))
+        });
+        Ok(edges)
+    }
+
+    pub async fn delete_record_edge(&self, tenant_id: &Id, edge_id: &Id) -> Result<()> {
+        let mut s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        let mut edge = s
+            .record_edges
+            .get(edge_id.as_str())
+            .filter(|edge| {
+                edge.tenant_id.as_str() == tenant_id.as_str() && edge.deleted_at_ms.is_none()
+            })
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, format!("{}", edge_id)))?;
+        edge.deleted_at_ms = Some(crate::now_ms());
+        if let Some(p) = &self.persist {
+            p.put_record_edge(&edge).map_err(internal)?;
+        }
+        s.record_edges.remove(edge_id.as_str());
+        Ok(())
+    }
+
+    pub async fn set_tenant_meta(
+        &self,
+        tenant_id: &Id,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<TenantMetaEntry> {
+        let key = key.into();
+        let entry = {
+            let s = self.state.lock().await;
+            let tenant_live = s
+                .tenants
+                .get(tenant_id.as_str())
+                .is_some_and(|t| t.deleted_at_ms.is_none());
+            if !tenant_live {
+                return Err(Error::new(
+                    ErrorCode::TenantNotFound,
+                    format!("{}", tenant_id),
+                ));
+            }
+            TenantMetaEntry {
+                tenant_id: tenant_id.clone(),
+                key,
+                value,
+                updated_at_ms: crate::now_ms(),
+            }
+        };
+        if let Some(p) = &self.persist {
+            p.put_tenant_meta(&entry).map_err(internal)?;
+        }
+        let mut s = self.state.lock().await;
+        s.tenant_meta
+            .insert(tenant_meta_key(&entry.tenant_id, &entry.key), entry.clone());
+        Ok(entry)
+    }
+
+    pub async fn get_tenant_meta(&self, tenant_id: &Id, key: &str) -> Result<TenantMetaEntry> {
+        let s = self.state.lock().await;
+        let tenant_live = s
+            .tenants
+            .get(tenant_id.as_str())
+            .is_some_and(|t| t.deleted_at_ms.is_none());
+        if !tenant_live {
+            return Err(Error::new(
+                ErrorCode::TenantNotFound,
+                format!("{}", tenant_id),
+            ));
+        }
+        s.tenant_meta
+            .get(&tenant_meta_key(tenant_id, key))
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::RecordNotFound, key.to_string()))
     }
 
     pub async fn apply_record_index_outbox_once(&self) -> Result<usize> {
@@ -7862,6 +8410,9 @@ impl Runtime {
                         continue;
                     };
                     if record.deleted_at_ms.is_some() || record.is_expired() {
+                        if let Some(doc) = s.record_to_doc.remove(&mutation.record_id) {
+                            s.doc_to_record.remove(&doc);
+                        }
                         s.local_record_index_watermark = mutation.commit_seq;
                         applied += 1;
                         continue;
@@ -7988,7 +8539,8 @@ impl Runtime {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(filter_search_candidates(candidates, &req))
+        let matches = filter_search_candidates(candidates, &req);
+        self.maybe_touch_search_matches(&req, matches).await
     }
 
     async fn search_record_matches_local(
@@ -8075,7 +8627,11 @@ impl Runtime {
                 .filter(|r| {
                     r.tenant_id.as_str() == req.tenant_id.as_str() && r.namespace == req.namespace
                 })
-                .map(|r| (r.clone(), CandidateScore::default()))
+                .map(|r| {
+                    let mut score = CandidateScore::default();
+                    score.score = 1.0;
+                    (r.clone(), score)
+                })
                 .collect()
         };
         if let Some((applied, required)) = repair_range {
@@ -8109,7 +8665,8 @@ impl Runtime {
         }
         drop(s);
 
-        Ok(filter_search_candidates(candidates, &req))
+        let matches = filter_search_candidates(candidates, &req);
+        self.maybe_touch_search_matches(&req, matches).await
     }
 
     /// Soft-delete a record: set `deleted_at_ms = now`, persist the
@@ -8183,6 +8740,10 @@ impl Runtime {
 
         if let Some(doc) = s.record_to_doc.remove(record_id.as_str()) {
             s.doc_to_record.remove(&doc);
+        }
+        if let Some(external_id) = updated.external_id.as_deref() {
+            s.record_external_ids
+                .remove(&record_external_key(&updated.tenant_id, external_id));
         }
         Ok(())
     }
@@ -8838,8 +9399,11 @@ fn source_ref_matches(rec: &SourceRef, filter: &SourceRef) -> bool {
 
 fn search_index_candidate_limit(req: &SearchRequest) -> usize {
     let base = req.limit.max(1);
-    let has_post_filter =
-        !req.tags.is_empty() || req.source_filter.is_some() || req.metadata_filter.is_some();
+    let has_post_filter = !req.tags.is_empty()
+        || req.source_filter.is_some()
+        || req.metadata_filter.is_some()
+        || req.created_after_ms.is_some()
+        || req.created_before_ms.is_some();
     if has_post_filter {
         base.saturating_mul(10).clamp(base, 1024)
     } else {
@@ -8862,6 +9426,19 @@ fn filter_search_candidates(
         if r.deleted_at_ms.is_some() || r.is_expired() {
             continue;
         }
+        if !req.include_superseded && r.status == RecordStatus::Superseded {
+            continue;
+        }
+        if let Some(after) = req.created_after_ms {
+            if r.created_at_ms < after {
+                continue;
+            }
+        }
+        if let Some(before) = req.created_before_ms {
+            if r.created_at_ms > before {
+                continue;
+            }
+        }
         if !req.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)) {
             continue;
         }
@@ -8875,6 +9452,11 @@ fn filter_search_candidates(
         }
         if let Some(filter) = &req.metadata_filter {
             if !metadata_filter_matches(&r.metadata, filter) {
+                continue;
+            }
+        }
+        if let Some(min_score) = req.min_score {
+            if score.score < min_score {
                 continue;
             }
         }
@@ -8910,6 +9492,14 @@ fn next_record_commit_seq(state: &mut State) -> u64 {
         .checked_add(1)
         .expect("record commit sequence overflow");
     state.next_record_commit_seq
+}
+
+fn record_external_key(tenant_id: &Id, external_id: &str) -> String {
+    format!("{}::{external_id}", tenant_id.as_str())
+}
+
+fn tenant_meta_key(tenant_id: &Id, key: &str) -> String {
+    format!("{}::{key}", tenant_id.as_str())
 }
 
 /// Index a record's text + (optional) embedding into the per-path
@@ -8983,6 +9573,22 @@ fn global_index_mutation_for_record(
 fn record_matches_repair_query(r: &SearchableRecord, req: &SearchRequest) -> bool {
     if r.tenant_id.as_str() != req.tenant_id.as_str() || r.namespace != req.namespace {
         return false;
+    }
+    if r.deleted_at_ms.is_some() || r.is_expired() {
+        return false;
+    }
+    if !req.include_superseded && r.status == RecordStatus::Superseded {
+        return false;
+    }
+    if let Some(after) = req.created_after_ms {
+        if r.created_at_ms < after {
+            return false;
+        }
+    }
+    if let Some(before) = req.created_before_ms {
+        if r.created_at_ms > before {
+            return false;
+        }
     }
     if let Some(query) = req.text.as_deref() {
         let Some(text) = record_indexable_text(r) else {
@@ -9463,6 +10069,239 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(events[2].payload, serde_json::json!({"seq": 2}));
+    }
+
+    fn test_record(tenant_id: Id, external_id: Option<&str>, text: &str) -> NewRecord {
+        NewRecord {
+            tenant_id,
+            external_id: external_id.map(str::to_string),
+            namespace: vec!["memory".into()],
+            scope: serde_json::json!({"agent_id": "agent-a"}),
+            text: Some(text.into()),
+            metadata: serde_json::json!({"kind": "memory"}),
+            tags: vec!["memory".into()],
+            source: None,
+            embedding: None,
+            policy: crate::record::IndexingPolicy {
+                mode: crate::record::IndexingMode::SummaryOnly,
+                fields: vec![],
+                vector_allowed: false,
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_external_id_is_idempotent_and_upsert_updates_existing_row() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, _, _) = rt.bootstrap_test_session().await;
+
+        let first = rt
+            .write_record_with_commit(test_record(
+                tenant.tenant_id.clone(),
+                Some("mem-1"),
+                "first value",
+            ))
+            .await
+            .unwrap();
+        let replay = rt
+            .write_record_with_commit(test_record(
+                tenant.tenant_id.clone(),
+                Some("mem-1"),
+                "ignored duplicate",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.record.record_id, first.record.record_id);
+        assert_eq!(replay.record.text.as_deref(), Some("first value"));
+        assert_eq!(replay.commit_token.seq, first.commit_token.seq);
+
+        let updated = rt
+            .upsert_record_with_commit(test_record(
+                tenant.tenant_id.clone(),
+                Some("mem-1"),
+                "updated value",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.record.record_id, first.record.record_id);
+        assert_eq!(updated.record.text.as_deref(), Some("updated value"));
+        assert_eq!(updated.record.version, first.record.version + 1);
+    }
+
+    #[tokio::test]
+    async fn record_update_version_status_search_and_touch_support_memory_semantics() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv, content);
+        let (tenant, _, _) = rt.bootstrap_test_session().await;
+        let written = rt
+            .write_record_with_commit(test_record(
+                tenant.tenant_id.clone(),
+                Some("mem-2"),
+                "active memory",
+            ))
+            .await
+            .unwrap();
+
+        let touched = rt
+            .search_record_matches(SearchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                namespace: vec!["memory".into()],
+                sharding_key: Some("local".into()),
+                text: Some("active".into()),
+                embedding: None,
+                tags: vec![],
+                source_filter: None,
+                metadata_filter: None,
+                include_superseded: false,
+                min_score: Some(0.0),
+                created_after_ms: None,
+                created_before_ms: None,
+                touch: true,
+                limit: 10,
+                min_visible_record_commit_seq: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].record.access_count, 1);
+
+        let err = rt
+            .update_record_with_commit(RecordUpdate {
+                tenant_id: tenant.tenant_id.clone(),
+                record_id: written.record.record_id.clone(),
+                expected_version: Some(99),
+                namespace: None,
+                scope: None,
+                text: None,
+                metadata: None,
+                tags: None,
+                source: None,
+                embedding: None,
+                policy: None,
+                status: Some(RecordStatus::Superseded),
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::VersionConflict);
+
+        let superseded = rt
+            .update_record_with_commit(RecordUpdate {
+                tenant_id: tenant.tenant_id.clone(),
+                record_id: written.record.record_id.clone(),
+                expected_version: Some(written.record.version),
+                namespace: None,
+                scope: None,
+                text: None,
+                metadata: None,
+                tags: None,
+                source: None,
+                embedding: None,
+                policy: None,
+                status: Some(RecordStatus::Superseded),
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(superseded.record.status, RecordStatus::Superseded);
+
+        let default_search = rt
+            .search_record_matches(SearchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                namespace: vec!["memory".into()],
+                sharding_key: Some("local".into()),
+                text: Some("active".into()),
+                embedding: None,
+                tags: vec![],
+                source_filter: None,
+                metadata_filter: None,
+                include_superseded: false,
+                min_score: Some(0.0),
+                created_after_ms: None,
+                created_before_ms: None,
+                touch: false,
+                limit: 10,
+                min_visible_record_commit_seq: None,
+            })
+            .await
+            .unwrap();
+        assert!(default_search.is_empty());
+
+        let history_search = rt
+            .search_record_matches(SearchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                namespace: vec!["memory".into()],
+                sharding_key: Some("local".into()),
+                text: None,
+                embedding: None,
+                tags: vec![],
+                source_filter: None,
+                metadata_filter: None,
+                include_superseded: true,
+                min_score: Some(1.0),
+                created_after_ms: Some(written.record.created_at_ms),
+                created_before_ms: Some(crate::now_ms()),
+                touch: false,
+                limit: 10,
+                min_visible_record_commit_seq: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(history_search.len(), 1);
+        assert_eq!(history_search[0].record.status, RecordStatus::Superseded);
+    }
+
+    #[tokio::test]
+    async fn record_edges_and_tenant_meta_are_persisted() {
+        let kv = Arc::new(InMemoryKvStore::new());
+        let content = Arc::new(InMemoryContentBackend::default());
+        let rt = Runtime::with_kv(kv.clone(), content.clone());
+        let (tenant, _, _) = rt.bootstrap_test_session().await;
+        let left = rt
+            .write_record(test_record(tenant.tenant_id.clone(), Some("left"), "left"))
+            .await
+            .unwrap();
+        let right = rt
+            .write_record(test_record(
+                tenant.tenant_id.clone(),
+                Some("right"),
+                "right",
+            ))
+            .await
+            .unwrap();
+        let edge = rt
+            .create_record_edge(NewRecordEdge {
+                tenant_id: tenant.tenant_id.clone(),
+                source_record_id: left.record_id.clone(),
+                target_record_id: right.record_id.clone(),
+                edge_type: RecordEdgeType::Supersedes,
+                metadata: serde_json::json!({"reason": "test"}),
+            })
+            .await
+            .unwrap();
+        rt.set_tenant_meta(
+            &tenant.tenant_id,
+            "db0.cursor",
+            serde_json::json!({"offset": 42}),
+        )
+        .await
+        .unwrap();
+
+        let restarted = Runtime::with_kv(kv, content);
+        let edges = restarted
+            .record_edges(&tenant.tenant_id, &left.record_id)
+            .await
+            .unwrap();
+        assert_eq!(edges, vec![edge]);
+        let meta = restarted
+            .get_tenant_meta(&tenant.tenant_id, "db0.cursor")
+            .await
+            .unwrap();
+        assert_eq!(meta.value, serde_json::json!({"offset": 42}));
     }
 }
 

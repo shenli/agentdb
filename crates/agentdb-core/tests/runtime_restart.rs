@@ -869,6 +869,7 @@ async fn records_and_indexes_survive_restart() {
         for title in &titles {
             rt.write_record(NewRecord {
                 tenant_id: t.tenant_id.clone(),
+                external_id: None,
                 namespace: vec!["kb".into()],
                 scope: serde_json::json!({}),
                 text: None,
@@ -920,6 +921,11 @@ async fn records_and_indexes_survive_restart() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 100,
             min_visible_record_commit_seq: None,
         })
@@ -945,6 +951,7 @@ async fn record_commit_token_survives_restart_for_visible_search() {
         let written = rt
             .write_record_with_commit(NewRecord {
                 tenant_id: t.tenant_id.clone(),
+                external_id: None,
                 namespace: vec!["kb".into()],
                 scope: serde_json::json!({}),
                 text: None,
@@ -981,6 +988,11 @@ async fn record_commit_token_survives_restart_for_visible_search() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: Some(commit_seq),
         })
@@ -1008,6 +1020,7 @@ async fn record_index_outbox_persists_delete_mutation() {
         let written = rt
             .write_record_with_commit(NewRecord {
                 tenant_id: t.tenant_id.clone(),
+                external_id: None,
                 namespace: vec!["kb".into()],
                 scope: serde_json::json!({}),
                 text: None,
@@ -1049,6 +1062,7 @@ async fn record_index_outbox_replay_catches_up_lagging_local_index() {
     let written = rt
         .write_record_with_commit(NewRecord {
             tenant_id: t.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["kb".into()],
             scope: serde_json::json!({}),
             text: None,
@@ -1078,6 +1092,11 @@ async fn record_index_outbox_replay_catches_up_lagging_local_index() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1098,6 +1117,11 @@ async fn record_index_outbox_replay_catches_up_lagging_local_index() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1125,6 +1149,7 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
     let written = rt
         .write_record_with_commit(NewRecord {
             tenant_id: t.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["kb".into()],
             scope: serde_json::json!({}),
             text: None,
@@ -1152,6 +1177,11 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1169,6 +1199,11 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: Some(written.commit_token.seq),
         })
@@ -1187,6 +1222,11 @@ async fn global_record_index_is_eventually_consistent_with_token_fallback() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1214,6 +1254,7 @@ async fn record_index_outbox_reloads_record_after_commit_state_gap() {
     let written = rt
         .write_record_with_commit(NewRecord {
             tenant_id: t.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["kb".into()],
             scope: serde_json::json!({}),
             text: None,
@@ -1250,6 +1291,11 @@ async fn record_index_outbox_reloads_record_after_commit_state_gap() {
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })
@@ -1365,6 +1411,7 @@ async fn record_index_outbox_skips_fully_purged_record_without_blocking_queue() 
 
     let new_record = |title: &str| NewRecord {
         tenant_id: t.tenant_id.clone(),
+        external_id: None,
         namespace: vec!["kb".into()],
         scope: serde_json::json!({}),
         text: None,
@@ -1430,6 +1477,11 @@ async fn record_index_outbox_skips_fully_purged_record_without_blocking_queue() 
             tags: vec![],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: None,
         })

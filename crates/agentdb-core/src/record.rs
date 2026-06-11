@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::event::SourceRef;
 use crate::id::{Id, IdKind};
 
+fn default_record_status() -> RecordStatus {
+    RecordStatus::Active
+}
+
+fn default_record_version() -> u64 {
+    1
+}
+
 /// What the runtime is allowed to index for a record.
 ///
 /// The runtime supports four modes; "selected fields" is the precise option for
@@ -57,6 +65,16 @@ pub struct IndexingPolicy {
     pub vector_allowed: bool,
 }
 
+/// Logical record validity. `deleted_at_ms` remains the physical/lifecycle
+/// tombstone. `Superseded` is a live audit row that search excludes by default
+/// but callers may include explicitly for memory-history use cases.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordStatus {
+    Active,
+    Superseded,
+}
+
 impl Default for IndexingPolicy {
     fn default() -> Self {
         // Conservative default: index metadata and tags but not free
@@ -79,6 +97,11 @@ impl Default for IndexingPolicy {
 pub struct SearchableRecord {
     pub record_id: Id,
     pub tenant_id: Id,
+    /// Optional caller-stable identifier, unique per tenant. This lets SDKs
+    /// preserve their own memory/checkpoint ids while AgentDB keeps canonical
+    /// typed record ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
     /// Namespace path, e.g. `["agent", "support", "kb"]`. Stored as a
     /// `Vec` and joined to a slash-separated string for index path /
     /// KV key encoding via [`Self::namespace_path`].
@@ -106,7 +129,19 @@ pub struct SearchableRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
     pub policy: IndexingPolicy,
+    /// Logical validity used by memory systems. Defaults to active for rows
+    /// written before this field existed.
+    #[serde(default = "default_record_status")]
+    pub status: RecordStatus,
+    /// Monotonic version for optimistic compare-and-set updates.
+    #[serde(default = "default_record_version")]
+    pub version: u64,
+    /// Number of explicit touch/read-result events.
+    #[serde(default)]
+    pub access_count: u64,
     pub created_at_ms: u64,
+    #[serde(default)]
+    pub updated_at_ms: u64,
     /// See `Tenant::deleted_at_ms` for the soft-delete contract that
     /// applies uniformly to every runtime object.
     pub deleted_at_ms: Option<u64>,
@@ -120,6 +155,7 @@ pub struct SearchableRecord {
 #[derive(Debug, Clone)]
 pub struct NewRecord {
     pub tenant_id: Id,
+    pub external_id: Option<String>,
     pub namespace: Vec<String>,
     pub scope: serde_json::Value,
     pub text: Option<String>,
@@ -133,9 +169,11 @@ pub struct NewRecord {
 
 impl SearchableRecord {
     pub fn create(req: NewRecord) -> Self {
+        let now = super::now_ms();
         Self {
             record_id: Id::new(IdKind::Record),
             tenant_id: req.tenant_id,
+            external_id: req.external_id,
             namespace: req.namespace,
             scope: req.scope,
             text: req.text,
@@ -144,7 +182,11 @@ impl SearchableRecord {
             source: req.source,
             embedding: req.embedding,
             policy: req.policy,
-            created_at_ms: super::now_ms(),
+            status: RecordStatus::Active,
+            version: 1,
+            access_count: 0,
+            created_at_ms: now,
+            updated_at_ms: now,
             deleted_at_ms: None,
             expires_at_ms: req.expires_at_ms,
         }

@@ -7,9 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use agentdb_core::record::IndexingPolicy;
+use agentdb_core::record::{IndexingPolicy, RecordStatus};
 use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
-use agentdb_core::{AgentSkillBinding, ArtifactRef, SourceRef};
+use agentdb_core::{AgentSkillBinding, ArtifactRef, RecordEdgeType, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTenantBody {
@@ -356,6 +356,8 @@ fn default_watch_scope() -> String {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateRecordBody {
     #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
     pub namespace: Vec<String>,
     #[serde(default = "default_policy")]
     pub scope: serde_json::Value,
@@ -375,6 +377,47 @@ pub struct CreateRecordBody {
     pub policy: Option<IndexingPolicy>,
     #[serde(default)]
     pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpdateRecordBody {
+    #[serde(default)]
+    pub expected_version: Option<u64>,
+    #[serde(default)]
+    pub namespace: Option<Vec<String>>,
+    #[serde(default)]
+    pub scope: Option<serde_json::Value>,
+    #[serde(default)]
+    pub text: Option<Option<String>>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub source: Option<Option<SourceRef>>,
+    #[serde(default)]
+    pub embedding: Option<Option<Vec<f32>>>,
+    #[serde(default)]
+    pub policy: Option<IndexingPolicy>,
+    #[serde(default)]
+    pub status: Option<RecordStatus>,
+    #[serde(default)]
+    pub expires_at_ms: Option<Option<u64>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateRecordEdgeBody {
+    pub source_record_id: String,
+    pub target_record_id: String,
+    pub edge_type: RecordEdgeType,
+    #[serde(default = "default_policy")]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TenantMetaBody {
+    #[serde(default = "default_policy")]
+    pub value: serde_json::Value,
 }
 
 /// Query params for `GET /api/tenants/:tenant_id/records/search`.
@@ -414,6 +457,16 @@ pub struct SearchRecordsQuery {
     pub limit: usize,
     #[serde(default)]
     pub min_visible_record_commit_seq: Option<u64>,
+    #[serde(default)]
+    pub include_superseded: bool,
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub created_after_ms: Option<u64>,
+    #[serde(default)]
+    pub created_before_ms: Option<u64>,
+    #[serde(default)]
+    pub touch: bool,
 }
 
 fn default_search_limit() -> usize {
@@ -445,6 +498,16 @@ pub struct SearchRecordsBody {
     pub limit: usize,
     #[serde(default)]
     pub min_visible_record_commit_seq: Option<u64>,
+    #[serde(default)]
+    pub include_superseded: bool,
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    #[serde(default)]
+    pub created_after_ms: Option<u64>,
+    #[serde(default)]
+    pub created_before_ms: Option<u64>,
+    #[serde(default)]
+    pub touch: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

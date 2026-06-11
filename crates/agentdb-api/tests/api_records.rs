@@ -492,6 +492,314 @@ async fn post_search_records_returns_ranked_score_components() {
 }
 
 #[tokio::test]
+async fn record_external_id_create_is_idempotent_and_upsert_updates() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    let create_body = json!({
+        "external_id": "mem-http-1",
+        "namespace": ["memory"],
+        "text": "original memory",
+        "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+    });
+    let first_resp = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&create_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_resp.status().as_u16(), 201);
+    let first_commit = first_resp
+        .headers()
+        .get("X-AgentDB-Record-Commit-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let first: serde_json::Value = first_resp.json().await.unwrap();
+    let rid = first["record_id"].as_str().unwrap().to_string();
+    assert_eq!(first["external_id"], "mem-http-1");
+    assert_eq!(first["version"], 1);
+
+    let duplicate_resp = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "external_id": "mem-http-1",
+            "namespace": ["memory"],
+            "text": "duplicate should not replace",
+            "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_resp.status().as_u16(), 201);
+    let duplicate_commit = duplicate_resp
+        .headers()
+        .get("X-AgentDB-Record-Commit-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let duplicate: serde_json::Value = duplicate_resp.json().await.unwrap();
+    assert_eq!(duplicate["record_id"], rid);
+    assert_eq!(duplicate["text"], "original memory");
+    assert_eq!(duplicate_commit, first_commit);
+
+    let upsert_resp = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/upsert", app.base))
+        .json(&json!({
+            "external_id": "mem-http-1",
+            "namespace": ["memory"],
+            "text": "updated memory",
+            "metadata": {"source": "upsert"},
+            "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upsert_resp.status().as_u16(), 200);
+    let upserted: serde_json::Value = upsert_resp.json().await.unwrap();
+    assert_eq!(upserted["record_id"], rid);
+    assert_eq!(upserted["text"], "updated memory");
+    assert_eq!(upserted["version"], 2);
+    assert_eq!(upserted["metadata"]["source"], "upsert");
+}
+
+#[tokio::test]
+async fn record_patch_version_status_search_filters_and_touch() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "namespace": ["memory"],
+            "text": "durable memory",
+            "tags": ["memory"],
+            "metadata": {"kind": "memory"},
+            "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rid = created["record_id"].as_str().unwrap();
+    let version = created["version"].as_u64().unwrap();
+
+    let touched: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/search", app.base))
+        .json(&json!({
+            "namespace": ["memory"],
+            "text": "durable",
+            "touch": true,
+            "min_score": 0.0,
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let matches = touched["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["record"]["record_id"], rid);
+    assert_eq!(matches[0]["record"]["access_count"], 1);
+    assert_eq!(matches[0]["record"]["version"], version);
+
+    let conflict = app
+        .client
+        .patch(format!("{}/api/tenants/{tid}/records/{rid}", app.base))
+        .json(&json!({"expected_version": 99, "status": "superseded"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status().as_u16(), 409);
+    let err: serde_json::Value = conflict.json().await.unwrap();
+    assert_eq!(err["code"], "VERSION_CONFLICT");
+
+    let superseded: serde_json::Value = app
+        .client
+        .patch(format!("{}/api/tenants/{tid}/records/{rid}", app.base))
+        .json(&json!({"expected_version": version, "status": "superseded"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(superseded["status"], "superseded");
+    assert_eq!(superseded["version"], version + 1);
+
+    let default_search: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/search?namespace=memory",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(default_search["matches"].as_array().unwrap().is_empty());
+
+    let history_search: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/search?namespace=memory&text=durable&include_superseded=true&min_score=0&created_after_ms=0&created_before_ms={}",
+            app.base,
+            superseded["updated_at_ms"].as_u64().unwrap() + 1
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let matches = history_search["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["record"]["status"], "superseded");
+}
+
+#[tokio::test]
+async fn record_edges_and_tenant_meta_routes_round_trip() {
+    let app = spawn_app().await;
+    let (tid, _, _) = bootstrap_session(&app).await;
+
+    let mut ids = Vec::new();
+    for label in ["old", "new"] {
+        let record: serde_json::Value = app
+            .client
+            .post(format!("{}/api/tenants/{tid}/records", app.base))
+            .json(&json!({
+                "namespace": ["memory"],
+                "text": label,
+                "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        ids.push(record["record_id"].as_str().unwrap().to_string());
+    }
+
+    let edge: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/records/edges", app.base))
+        .json(&json!({
+            "source_record_id": ids[1],
+            "target_record_id": ids[0],
+            "edge_type": "supersedes",
+            "metadata": {"reason": "replacement"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let edge_id = edge["edge_id"].as_str().unwrap().to_string();
+    assert!(edge_id.starts_with("edg_"));
+    assert_eq!(edge["edge_type"], "supersedes");
+
+    let edges: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/{}/edges",
+            app.base, ids[0]
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edges.as_array().unwrap().len(), 1);
+    assert_eq!(edges[0]["edge_id"], edge_id);
+
+    let meta: serde_json::Value = app
+        .client
+        .put(format!("{}/api/tenants/{tid}/meta/db0.cursor", app.base))
+        .json(&json!({"value": {"offset": 7}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(meta["value"], json!({"offset": 7}));
+
+    let got_meta: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/meta/db0.cursor", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got_meta["value"], json!({"offset": 7}));
+
+    let delete = app
+        .client
+        .delete(format!(
+            "{}/api/tenants/{tid}/records/edges/{edge_id}",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status().as_u16(), 204);
+
+    let edges_after_delete: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/records/{}/edges",
+            app.base, ids[0]
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(edges_after_delete.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn search_route_beats_dynamic_record_id_route() {
     // Route-ordering regression: `/records/search` must be matched as the
     // static path even though `/records/:record_id` would otherwise eat

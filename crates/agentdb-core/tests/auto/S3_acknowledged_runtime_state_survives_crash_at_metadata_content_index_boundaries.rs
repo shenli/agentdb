@@ -189,6 +189,7 @@ async fn acknowledged_runtime_state_survives_crash_at_metadata_content_index_bou
     let record = rt
         .write_record_with_commit(NewRecord {
             tenant_id: tenant.tenant_id.clone(),
+            external_id: None,
             namespace: vec!["atomicity".into()],
             scope: serde_json::json!({}),
             text: Some("boundary needle".into()),
@@ -248,6 +249,11 @@ async fn acknowledged_runtime_state_survives_crash_at_metadata_content_index_bou
             tags: vec!["probe".into()],
             source_filter: None,
             metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
             limit: 10,
             min_visible_record_commit_seq: Some(record.commit_token.seq),
         })

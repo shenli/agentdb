@@ -44,14 +44,15 @@ pub use idempotency::{IdempotencyRecord, IdempotencyStore};
 pub use policy::{
     ArtifactSizePolicy, LifecyclePolicy, Priority, QuotaPolicy, RetentionPolicy, RuntimePolicy,
 };
-pub use record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRecord};
+pub use record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
     ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
-    LifecycleSweepReport, MetadataFilter, MetadataFilterCondition, MetadataFilterOp,
-    PolicyWorkerReport, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents,
-    ReplayResponse, Runtime, SessionStorageSummary, TenantStorageSummary, TenantWorkerReport,
-    WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
+    LifecycleSweepReport, MetadataFilter, MetadataFilterCondition, MetadataFilterOp, NewRecordEdge,
+    PolicyWorkerReport, RecordEdge, RecordEdgeType, RecordIndexStats, RecordSearchMatch,
+    RecordSearchScoreComponents, RecordUpdate, ReplayResponse, Runtime, SessionStorageSummary,
+    TenantMetaEntry, TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
+    RUNTIME_PRIMARY_TABLET_ID,
 };
 pub use segment::{SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile};
 pub use session::{Lifecycle, NewSession, Session};

@@ -11,6 +11,7 @@ use agentdb_core::record::{IndexingMode, IndexingPolicy, NewRecord, SearchableRe
 fn fresh_new_record() -> NewRecord {
     NewRecord {
         tenant_id: Id::new(IdKind::Tenant),
+        external_id: None,
         namespace: vec!["agent".into(), "support".into()],
         scope: serde_json::json!({}),
         text: Some("hello world".into()),
