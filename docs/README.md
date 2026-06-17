@@ -12,6 +12,9 @@ public docs path.
   readiness checklist
 - [architecture/agent-db.md](architecture/agent-db.md) - product thesis,
   workload requirements, positioning, and systems rationale
+- [architecture/AGENT_RUNTIME_ARCHITECTURE.md](architecture/AGENT_RUNTIME_ARCHITECTURE.md)
+  - the emerging brains/hands/sessions stack, the three storage tiers and trust
+  boundary, and why AgentDB is a runtime store (not observability)
 - [architecture/DESIGN.md](architecture/DESIGN.md) - durable design commitments,
   constraints, and non-goals
 - [architecture/TRADEOFFS.md](architecture/TRADEOFFS.md) - what AgentDB is
