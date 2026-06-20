@@ -179,6 +179,25 @@ def test_session_append_requires_agent_id():
         Client("http://x").session("ten_1", "ses_1").append({"x": 1})
 
 
+def test_append_rejects_raw_secret_payload_fields_before_request():
+    c = Client("http://x")
+    calls, patched = capture(c)
+    session = c.session("ten_1", "ses_1", agent_id="agt_1")
+
+    with patched:
+        with pytest.raises(ValueError, match=r"input\[0\]\.access_token"):
+            session.append({"input": [{"access_token": "raw"}]})
+
+        session.append(
+            {"input": [{"repo": "agentdb"}]},
+            credential_refs=[{"cred_ref": "vault://agent/acme/github"}],
+        )
+
+    assert len(calls) == 1
+    body = calls[0][2]["json"]
+    assert body["credential_refs"] == [{"cred_ref": "vault://agent/acme/github"}]
+
+
 def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
     event = Event.from_dict(
         {

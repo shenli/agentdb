@@ -574,7 +574,10 @@ SessionHandle / Session
 
 `append` and `append_and_fetch` accept `artifact_refs`, `source_refs`, and
 `credential_refs`. Credential refs carry opaque `cred_ref` values resolved by a
-vault or broker outside AgentDB; do not put credential values in `payload`.
+vault or broker outside AgentDB; do not put credential values in `payload`. The
+Python SDK rejects append payload keys shaped like raw credentials, such as
+`api_key`, `access_token`, `password`, and `private_key`, before sending the
+request.
 
 Lower-level sync `Client` methods:
 
@@ -678,6 +681,9 @@ SessionHandle / Session
 
 `AppendOptions` supports `artifactRefs`, `sourceRefs`, and `credentialRefs`.
 `credentialRefs` are refs only; real secrets stay in the control plane / vault.
+The TypeScript SDK rejects append payload keys shaped like raw credentials, such
+as `api_key`, `access_token`, `password`, and `private_key`, before sending the
+request.
 
 Lower-level `Client` methods:
 

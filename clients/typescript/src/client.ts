@@ -932,6 +932,7 @@ export class Session {
   private appendBody(payload: unknown, opts: AppendOptions): Record<string, unknown> {
     const agentId = opts.agentId ?? this.agentId;
     if (!agentId) throw new Error("agentId is required for append");
+    validateNoRawSecretFields(payload);
     return {
       agent_id: agentId,
       kind: opts.kind ?? "message",
@@ -941,6 +942,74 @@ export class Session {
       credential_refs: opts.credentialRefs ?? [],
     };
   }
+}
+
+const RAW_SECRET_FIELD_NAMES = new Set([
+  "accesstoken",
+  "apikey",
+  "authtoken",
+  "authorization",
+  "bearertoken",
+  "clientsecret",
+  "openaiapikey",
+  "password",
+  "passwd",
+  "personalaccesstoken",
+  "privatekey",
+  "pwd",
+  "refreshtoken",
+  "secret",
+  "secretaccesskey",
+  "token",
+]);
+
+function validateNoRawSecretFields(payload: unknown): void {
+  const path = firstRawSecretFieldPath(payload, [], new WeakSet<object>());
+  if (path !== undefined) {
+    throw new Error(
+      `append payload field \`${path}\` looks like a raw secret; use credentialRefs for opaque vault / broker references`
+    );
+  }
+}
+
+function firstRawSecretFieldPath(value: unknown, path: string[], seen: WeakSet<object>): string | undefined {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+    for (let idx = 0; idx < value.length; idx += 1) {
+      path.push(`[${idx}]`);
+      const found = firstRawSecretFieldPath(value[idx], path, seen);
+      if (found !== undefined) return found;
+      path.pop();
+    }
+    return undefined;
+  }
+  if (value === null || typeof value !== "object") return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    path.push(key);
+    if (isRawSecretFieldName(key)) return formatSecretPath(path);
+    const found = firstRawSecretFieldPath(child, path, seen);
+    if (found !== undefined) return found;
+    path.pop();
+  }
+  return undefined;
+}
+
+function formatSecretPath(path: string[]): string {
+  let out = "";
+  for (const part of path) {
+    if (part.startsWith("[")) out += part;
+    else if (out) out += `.${part}`;
+    else out = part;
+  }
+  return out;
+}
+
+function isRawSecretFieldName(key: string): boolean {
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  return RAW_SECRET_FIELD_NAMES.has(normalized);
 }
 
 function eventFromDict(d: unknown): Event {

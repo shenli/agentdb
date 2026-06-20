@@ -244,6 +244,31 @@ test("append requires an agent id", async () => {
   await assert.rejects(() => c.session("ten_1", "ses_1").append({ x: 1 }), /agentId/);
 });
 
+test("append rejects raw secret payload fields before request", async () => {
+  const calls: unknown[] = [];
+  const mockFetch = async (_url: string | URL, init?: RequestInit) => {
+    calls.push(typeof init?.body === "string" ? JSON.parse(init.body) : undefined);
+    return json({ event_id: "evt_1", seq: 0 });
+  };
+
+  const c = new Client({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const session = c.session("ten_1", "ses_1", { agentId: "agt_1" });
+
+  await assert.rejects(
+    () => session.append({ input: [{ access_token: "raw" }] }),
+    /input\[0\]\.access_token/
+  );
+  await session.append(
+    { input: [{ repo: "agentdb" }] },
+    { credentialRefs: [{ cred_ref: "vault://agent/acme/github" }] }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual((calls[0] as Record<string, unknown>).credential_refs, [
+    { cred_ref: "vault://agent/acme/github" },
+  ]);
+});
+
 test("constructor rejects token + getToken combined", () => {
   assert.throws(
     () => new Client({ baseUrl: "http://x", token: "x", getToken: () => "y" }),

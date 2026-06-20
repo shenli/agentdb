@@ -16,6 +16,7 @@ except ImportError as e:
     ) from e
 
 from ._sse import parse_lines_async
+from ._secrets import validate_no_raw_secret_fields
 from .client import (
     AgentId,
     AppendResult,
@@ -467,6 +468,7 @@ class AsyncSession:
         aid = agent_id or self.agent_id
         if aid is None:
             raise ValueError("agent_id is required for append")
+        validate_no_raw_secret_fields(payload)
         return {
             "agent_id": aid,
             "kind": kind,

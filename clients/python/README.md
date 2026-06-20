@@ -140,6 +140,10 @@ session.tool_result("call_1", "Generated report.", source_refs=[event_ref(call)]
 Helpers are intentionally client-side only. They do not prevent custom event
 kinds or adapter-specific payload fields.
 
+Append payloads reject raw credential-shaped field names such as `api_key`,
+`access_token`, `password`, and `private_key` before sending the request. Pass
+opaque vault or broker references through `credential_refs` instead.
+
 ## Context Provenance
 
 Context is a derived view over the durable session log. When a harness builds

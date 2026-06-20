@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import requests
 
+from ._secrets import validate_no_raw_secret_fields
 from ._sse import parse_lines
 from .conventions import (
     SessionEventKind,
@@ -1002,6 +1003,7 @@ class Session:
         aid = agent_id or self.agent_id
         if aid is None:
             raise ValueError("agent_id is required for append")
+        validate_no_raw_secret_fields(payload)
         return {
             "agent_id": aid,
             "kind": kind,

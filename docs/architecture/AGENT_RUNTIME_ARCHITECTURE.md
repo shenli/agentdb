@@ -133,11 +133,13 @@ Applied to AgentDB's data-plane SDK:
    argument that would be logged into a session event; AgentDB records the call
    with args reduced to a `cred_ref`.
 4. **Defense in depth on the write path.** Because AgentDB sits below the trust
-   line, add a backstop: an SDK-level "no raw secrets" validator, an optional
+   line, add a backstop: SDK-level "no raw secrets" validators, an optional
    server-side raw-secret field reject policy on event append, and a tool-output
-   sanitization hook before output re-enters context. The server-side append
-   backstop is implemented as `secret_handling.deny_raw_secret_fields`; primary
-   control is still "secrets never reach here."
+   sanitization hook before output re-enters context. The native Python and
+   TypeScript SDK validators reject secret-shaped payload keys by default; the
+   server-side append backstop is implemented as
+   `secret_handling.deny_raw_secret_fields`. Primary control is still "secrets
+   never reach here."
 5. **Short-lived, audience-bound, least-privilege tokens** scoped per task rather
    than host-inherited environment credentials, so a leak has minimal blast
    radius. This is vault / control-plane policy.
@@ -488,9 +490,9 @@ That is a real and sufficient market, but it means the positioning must target
   independent per-branch positions instead of the current total-order item
   cursor.
 - The credential boundary has an event-level `credential_refs` / `cred_ref`
-  surface plus an opt-in server-side append backstop
-  (`secret_handling.deny_raw_secret_fields`) that rejects payload keys shaped
-  like raw secrets. The residual defense-in-depth work is SDK raw-secret
-  validators and tool-output sanitization before output re-enters context.
+  surface, native SDK raw-secret validators, and an opt-in server-side append
+  backstop (`secret_handling.deny_raw_secret_fields`) that rejects payload keys
+  shaped like raw secrets. The residual defense-in-depth work is tool-output
+  sanitization before output re-enters context.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?
