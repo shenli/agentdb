@@ -234,6 +234,32 @@ fn export_item_from_value(
     }
 }
 
+fn export_fork_edge_item(
+    child: &Session,
+    parent_session_id: crate::Id,
+    fork_point_seq: u64,
+) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "insert".into(),
+        object_type: "fork_edge".into(),
+        tenant_id: child.tenant_id.clone(),
+        agent_id: Some(child.agent_id.clone()),
+        // Index by the parent session so a parent-scoped export consumer can
+        // discover the child branch without subscribing to every child session.
+        session_id: Some(parent_session_id.clone()),
+        object_id: child.session_id.as_str().to_string(),
+        seq: None,
+        created_at_ms: child.created_at_ms,
+        data: serde_json::json!({
+            "parent_session_id": parent_session_id,
+            "child_session_id": child.session_id,
+            "fork_point_seq": fork_point_seq,
+            "created_at_ms": child.created_at_ms,
+        }),
+        tombstone: None,
+    }
+}
+
 fn export_tombstone_item(
     object_type: &str,
     tenant_id: crate::Id,
@@ -1055,7 +1081,7 @@ impl Persist {
         self.write_ops(ops)
     }
 
-    pub fn put_session(&self, s: &Session) -> KvResult<()> {
+    fn put_session_ops(&self, s: &Session) -> KvResult<Vec<WriteOp>> {
         let mut ops: Vec<WriteOp> = Vec::with_capacity(5);
         ops.push(WriteOp::Put {
             key: session_record_key(s.tenant_id.as_str(), s.session_id.as_str()).into_bytes(),
@@ -1079,6 +1105,22 @@ impl Persist {
             s.deleted_at_ms,
             serde_json::to_value(s).expect("session serializes"),
         ))?);
+        Ok(ops)
+    }
+
+    pub fn put_session(&self, s: &Session) -> KvResult<()> {
+        self.write_ops(self.put_session_ops(s)?)
+    }
+
+    pub fn put_forked_session(&self, s: &Session) -> KvResult<()> {
+        let mut ops = self.put_session_ops(s)?;
+        if let Some(parent) = s.forked_from.as_ref() {
+            ops.extend(self.export_ledger_item_put_ops(export_fork_edge_item(
+                s,
+                parent.session_id.clone(),
+                parent.at_seq,
+            ))?);
+        }
         self.write_ops(ops)
     }
 

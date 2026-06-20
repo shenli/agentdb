@@ -547,3 +547,107 @@ async fn export_watch_in_memory_skips_fork_edges_without_stalling_small_pages() 
         Some(child.session_id.as_str())
     );
 }
+
+#[tokio::test]
+async fn export_watch_persistent_ledger_emits_fork_edge_control_item() {
+    use agentdb_storage::{InMemoryContentBackend, InMemoryKvStore};
+
+    let kv = Arc::new(InMemoryKvStore::new());
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv, content);
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "fork-edge-export".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let parent = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+    append_n(&rt, &tenant, &agent, &parent, 2).await;
+
+    let child = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: parent.session_id.clone(),
+            at_seq: 1,
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let tenant_edges = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["fork_edges".into()],
+            from_cursor: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(tenant_edges.len(), 1);
+    assert_eq!(tenant_edges[0].item.object_type, "fork_edge");
+    assert_eq!(
+        tenant_edges[0]
+            .item
+            .data
+            .get("parent_session_id")
+            .and_then(|value| value.as_str()),
+        Some(parent.session_id.as_str())
+    );
+    assert_eq!(
+        tenant_edges[0]
+            .item
+            .data
+            .get("child_session_id")
+            .and_then(|value| value.as_str()),
+        Some(child.session_id.as_str())
+    );
+    assert_eq!(
+        tenant_edges[0]
+            .item
+            .data
+            .get("fork_point_seq")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+
+    let parent_edges = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(parent.session_id.clone()),
+            agent_id: None,
+            include: vec!["fork_edges".into()],
+            from_cursor: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(parent_edges.len(), 1);
+    assert_eq!(
+        parent_edges[0]
+            .item
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some(parent.session_id.as_str())
+    );
+}

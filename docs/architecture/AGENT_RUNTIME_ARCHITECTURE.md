@@ -156,8 +156,8 @@ The convergence narrows AgentDB's job rather than widening it.
 - fork structure and fork-aware replay **(implemented)**
 - session lifecycle: warm -> cold -> archive -> restore, with policy-driven
   sweep and archive-manifest restore **(implemented)**
-- references to external state: sandbox snapshots and artifact blobs
-  **(designed)**
+- references to external state: artifact blobs and sandbox snapshot refs
+  **(implemented for refs; sandbox snapshot lifecycle/integration designed)**
 - a records / retrieval substrate derived from events: searchable, scored, with
   per-session (read-after-write) and global (async, eventually consistent)
   indexes that a memory system writes into and queries **(partially
@@ -188,8 +188,9 @@ Forcing sandbox bytes into the event log is the same category error as putting
 blobs in a relational database.
 
 So the division of labor is: **the filesystem stores the bytes; AgentDB stores a
-durable reference to a snapshot of them at a given seq.** The session log records
-"at seq N, sandbox snapshot = `<object-store-key>`."
+durable reference to a snapshot of them at a given seq.** A session carries
+layered snapshot refs (`SnapshotRef` / `SnapshotLayer`) that say "at seq N,
+sandbox snapshot layers = `<object-store-keys>`" **(implemented)**.
 
 This makes fork and resume lightweight in *both* stores, because each store only
 does what it is good at:
@@ -197,8 +198,10 @@ does what it is good at:
 - **Fork.** AgentDB does the O(1) pointer-fork of the log: a child session stores
   only `ForkRef { session_id, at_seq }` and copies no events **(implemented)**.
   The sandbox does a filesystem snapshot / copy-on-write fork, which overlayfs,
-  btrfs, and zfs do natively. The fork point carries the snapshot ref so the
-  branch starts from the right filesystem state **(designed)**.
+  btrfs, and zfs do natively. AgentDB resolves the newest non-expired snapshot
+  at or before the fork point across the fork chain, so resume can restore the
+  right ancestor filesystem state and replay the child branch **(implemented for
+  refs; sandbox restore still external)**.
 - **Resume.** Restore the sandbox filesystem from the ref'd snapshot, then replay
   the session tail from AgentDB. Two stores, stitched by the ref.
 
@@ -385,10 +388,13 @@ OLTP-shaped stores (yes) from OLAP-shaped ones like ClickHouse (no).
 ## The Changefeed Over A Forked Log
 
 Once sessions fork, the log is no longer a single line; it is a DAG of
-per-session sub-streams. The open design question is what cursor semantics a
-changefeed should expose across a fork boundary. There is no published
-"branched CDC" standard, but the two mature models for *position in a branched
-history* agree on the essentials:
+per-session sub-streams. AgentDB now emits each physical event once on its
+session sub-stream and emits fork creation as a first-class `fork_edge` control
+item in `watch` and durable `export_watch` **(implemented)**. The remaining
+cursor-design question is whether to graduate from the current opaque total-order
+cursor to a true encoded frontier. There is no published "branched CDC" standard,
+but the two mature models for *position in a branched history* agree on the
+essentials:
 
 - **Git / Dolt** represent history as a commit DAG. A position is a
   content-addressed pointer that carries lineage, not a linear offset, and
@@ -403,9 +409,10 @@ The recommended model follows directly:
 1. **Each session, including each fork child, is its own ordered sub-stream**
    keyed by `session_id` and ordered by `seq`. A fork creates a *new* sub-stream,
    exactly like a new Kafka partition or a new git branch. The changefeed cursor
-   is logically a frontier `{session_id -> high-water seq}`, opaquely encoded.
-   A single global integer cursor cannot work across a fork; a frontier can,
-   because a newly created child has an implicit high-water mark of 0.
+   should eventually be a frontier `{session_id -> high-water seq}`, opaquely
+   encoded. The current implementation uses collision-free opaque item cursors
+   and preserves gap-free delivery across forks; a true frontier cursor remains
+   future hardening.
 2. **Emit each physical event exactly once, on the session where it was written.**
    The child's *replay* stitches `parent[0..fork_point] + child` (already
    implemented), but the *changefeed* carries new mutations only. Parent pre-fork
@@ -422,11 +429,10 @@ The recommended model follows directly:
    announces it. A consumer needing the child's full logical history follows
    lineage (parent up to `fork_point`, then child), the same stitch the replay
    API already performs.
-4. **Extend the gap-free guarantee across forks.** The existing
-   `S7_export_and_watch_cursors_are_gap_free_and_sink_ack_safe` test should assert
+4. **Extend the gap-free guarantee across forks.** The v2 fork-edge tests assert
    that across a fork no parent event is dropped or duplicated, the fork-edge is
    delivered exactly once, child events are resumable, and an old cursor from
-   before the fork still discovers the child on resume.
+   before the fork still discovers the child on resume **(implemented)**.
 
 The headline: a fork-aware feed is a feed over a DAG of per-session sub-streams
 with a frontier cursor; fork is a pointer event, not a re-emission.
@@ -440,8 +446,10 @@ Two goals follow from the convergence:
    new features, is the priority. The changefeed family (`subscribe` / `watch` /
    durable `export_watch`) that lets an external harness or system attach to the
    log is **already implemented (Phase 1)**, so the work here is positioning and
-   hardening it as the integration backbone, not building it. The contract still
-   to define is the **snapshot-ref protocol** with the sandbox filesystem.
+   hardening it as the integration backbone, not building it. The core
+   **snapshot-ref protocol** exists in AgentDB; the remaining contract is with
+   the sandbox filesystem: trigger policy, byte lifecycle, and restore/fork
+   handoff.
 2. **A reference architecture.** AgentDB wins as a reference by being the
    clearest articulation of the standard, not the most featureful product. The
    load-bearing artifact is this taxonomy plus its invariants, codified below.
@@ -468,15 +476,16 @@ That is a real and sufficient market, but it means the positioning must target
 
 ## Open Questions
 
-- What is the minimum viable snapshot-ref protocol between AgentDB and a sandbox
-  filesystem? Industry practice points to *layered* refs (base / deps / code /
-  artifacts) rather than a single opaque image, and to *tiered retention* where
-  snapshot refs expire faster than the log and may dangle. The open part is who
-  triggers snapshots, who owns their lifecycle, and how AgentDB represents a
-  dangling ref so resume can fall back to an earlier snapshot plus replay.
-- The fork-aware changefeed model is settled in principle (frontier cursor +
-  `fork-edge` item, see above). The residual work is implementation: the opaque
-  cursor encoding for a frontier, and extending the gap-free test across forks.
+- Who triggers sandbox snapshots, who owns their byte lifecycle, and what
+  operational policy chooses snapshot frequency / retention? AgentDB now stores
+  layered refs, tracks expiry, tolerates dangling refs, and resolves fallback to
+  earlier snapshots plus replay; the sandbox service still has to implement the
+  actual filesystem snapshot/restore contract.
+- The fork-aware changefeed model is implemented with first-class `fork_edge`
+  items and gap-free tests. The residual cursor hardening is an opaque encoded
+  frontier `{session_id -> high-water seq}` if deep branched CDC consumers need
+  independent per-branch positions instead of the current total-order item
+  cursor.
 - The credential boundary is settled in principle (refs-only SDK + broker at
   egress, see above). The residual work is the `cred_ref` type and the
   write-path redaction backstop.

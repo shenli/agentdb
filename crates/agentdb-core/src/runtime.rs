@@ -3749,7 +3749,7 @@ impl Runtime {
             child
         };
         if let Some(p) = &self.persist {
-            p.put_session(&child).map_err(internal)?;
+            p.put_forked_session(&child).map_err(internal)?;
         }
         Ok(child)
     }
@@ -6987,10 +6987,13 @@ impl Runtime {
             }
             for item in items {
                 from_cursor = Some(item.cursor.clone());
-                let Some(event) = item.event else {
+                let ledger_item = if let Some(event) = item.event {
+                    export_ledger_item_from_event(event)
+                } else if let Some(edge) = item.fork_edge {
+                    export_ledger_item_from_fork_edge(&req.tenant_id, req.agent_id.clone(), edge)
+                } else {
                     continue;
                 };
-                let ledger_item = export_ledger_item_from_event(event);
                 if !export_item_matches_include(&ledger_item, &req.include) {
                     continue;
                 }
@@ -9460,6 +9463,8 @@ fn validate_export_include(include: &[String]) -> Result<()> {
                 | "skill"
                 | "skill_bindings"
                 | "skill_binding"
+                | "fork_edges"
+                | "fork_edge"
         ) {
             return Err(Error::new(
                 ErrorCode::PolicyDenied,
@@ -9552,6 +9557,25 @@ fn export_ledger_item_from_event(event: EventEnvelope) -> ExportLedgerItem {
     }
 }
 
+fn export_ledger_item_from_fork_edge(
+    tenant_id: &Id,
+    agent_id: Option<Id>,
+    edge: ForkEdge,
+) -> ExportLedgerItem {
+    ExportLedgerItem {
+        op: "insert".into(),
+        object_type: "fork_edge".into(),
+        tenant_id: tenant_id.clone(),
+        agent_id,
+        session_id: Some(edge.parent_session_id.clone()),
+        object_id: edge.child_session_id.as_str().to_string(),
+        seq: None,
+        created_at_ms: edge.created_at_ms,
+        data: serde_json::to_value(&edge).expect("fork edge serializes"),
+        tombstone: None,
+    }
+}
+
 fn export_item_matches_scope(
     item: &ExportLedgerItem,
     scope: WatchScope,
@@ -9598,6 +9622,7 @@ fn export_include_matches_type(include: &str, object_type: &str) -> bool {
         "records" => object_type == "record",
         "skills" => object_type == "skill",
         "skill_bindings" => object_type == "skill_binding",
+        "fork_edges" => object_type == "fork_edge",
         other => other == object_type,
     }
 }
