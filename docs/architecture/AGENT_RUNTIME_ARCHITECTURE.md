@@ -154,8 +154,8 @@ The convergence narrows AgentDB's job rather than widening it.
 - the ordered session / execution log (idempotent append-and-fetch)
   **(implemented)**
 - fork structure and fork-aware replay **(implemented)**
-- session lifecycle: warm -> cold -> archive -> restore **(designed; warm path
-  implemented)**
+- session lifecycle: warm -> cold -> archive -> restore, with policy-driven
+  sweep and archive-manifest restore **(implemented)**
 - references to external state: sandbox snapshots and artifact blobs
   **(designed)**
 - a records / retrieval substrate derived from events: searchable, scored, with

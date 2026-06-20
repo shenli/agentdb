@@ -229,7 +229,14 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
         .await
         .unwrap();
     assert_eq!(after_first.len(), 1);
-    assert_eq!(after_first[0].event.kind, "second");
+    assert_eq!(
+        after_first[0]
+            .event
+            .as_ref()
+            .expect("watch item carries event")
+            .kind,
+        "second"
+    );
 }
 
 #[tokio::test]

@@ -50,7 +50,7 @@ use crate::record::{IndexingMode, NewRecord, RecordStatus, SearchableRecord};
 use crate::segment::{
     SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
 };
-use crate::session::{ForkRef, Lifecycle, NewSession, Session};
+use crate::session::{ForkRef, Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 use crate::tablet_state::{
     LoggedTabletStateMachine, TabletCommand, TabletSnapshotShardFilter, TabletStateMachine,
@@ -428,6 +428,35 @@ pub struct ReplayResponse {
     pub events: Vec<EventEnvelope>,
 }
 
+/// Request to record a sandbox snapshot reference at a session `seq`. AgentDB
+/// stores the reference only; the bytes live in the sandbox filesystem / object
+/// store. See `docs/architecture/AGENT_RUNTIME_ARCHITECTURE.md`.
+#[derive(Debug, Clone)]
+pub struct NewSnapshotRef {
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub at_seq: u64,
+    pub layers: Vec<SnapshotLayer>,
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Result of resolving which snapshot to restore when resuming a session.
+/// `replay_from_seq` is the leaf-session seq from which to replay the event tail
+/// after restoring `snapshot`: when the snapshot belongs to the leaf session it
+/// is the snapshot's `at_seq`; when it is inherited from an ancestor across a
+/// fork boundary it is `0` (restore the ancestor base, then replay the whole
+/// child branch). `dangling_skipped` is true when a newer snapshot existed but
+/// was expired and we fell back to an older one (or to a clean start).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotResolution {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owning_session_id: Option<Id>,
+    pub replay_from_seq: u64,
+    pub dangling_skipped: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStorageSummary {
     pub session_id: Id,
@@ -530,6 +559,19 @@ pub struct ExportWatchRequest {
     pub limit: usize,
 }
 
+/// A fork-edge control item in the changefeed. It announces that `child_session_id`
+/// was forked from `parent_session_id` at `fork_point_seq`, so a consumer
+/// following the parent can discover the child sub-stream. It carries no events:
+/// fork is a pointer, not a re-emission of ancestor history. See
+/// `docs/architecture/AGENT_RUNTIME_ARCHITECTURE.md` (changefeed over a forked log).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkEdge {
+    pub parent_session_id: Id,
+    pub child_session_id: Id,
+    pub fork_point_seq: u64,
+    pub created_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangefeedItem {
     pub cursor: String,
@@ -543,7 +585,12 @@ pub struct ChangefeedItem {
     pub tablet_epoch: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_index: Option<u64>,
-    pub event: EventEnvelope,
+    /// The event for a normal changefeed item. `None` for a fork-edge item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<EventEnvelope>,
+    /// Set for a fork-edge control item; mutually exclusive with `event`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_edge: Option<ForkEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3707,6 +3754,119 @@ impl Runtime {
         Ok(child)
     }
 
+    /// Record a sandbox snapshot reference at a session `seq`. The reference is
+    /// stored on the session and travels with it; AgentDB never holds the bytes.
+    /// `at_seq` must be within the session's committed range (`<= next_seq`).
+    pub async fn record_session_snapshot(&self, req: NewSnapshotRef) -> Result<SnapshotRef> {
+        if req.layers.is_empty() {
+            return Err(Error::new(
+                ErrorCode::PolicyDenied,
+                "snapshot must reference at least one layer",
+            ));
+        }
+        let session_commit_lock = self.session_commit_lock(&req.session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
+        let snapshot = SnapshotRef {
+            snapshot_id: Id::new(IdKind::Snapshot),
+            at_seq: req.at_seq,
+            layers: req.layers,
+            created_at_ms: crate::now_ms(),
+            expires_at_ms: req.expires_at_ms,
+        };
+        let updated = {
+            let mut s = self.state.lock().await;
+            let session = s
+                .sessions
+                .get_mut(req.session_id.as_str())
+                .filter(|sess| {
+                    sess.deleted_at_ms.is_none()
+                        && sess.tenant_id.as_str() == req.tenant_id.as_str()
+                })
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::SessionNotFound, format!("{}", req.session_id))
+                })?;
+            if req.at_seq > session.next_seq {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    format!(
+                        "snapshot at_seq {} is beyond session next_seq {}",
+                        req.at_seq, session.next_seq
+                    ),
+                ));
+            }
+            session.snapshots.push(snapshot.clone());
+            session.snapshots.sort_by(|a, b| {
+                a.at_seq
+                    .cmp(&b.at_seq)
+                    .then(a.created_at_ms.cmp(&b.created_at_ms))
+            });
+            session.clone()
+        };
+        if let Some(p) = &self.persist {
+            p.put_session(&updated).map_err(internal)?;
+        }
+        Ok(snapshot)
+    }
+
+    /// Resolve which snapshot to restore to resume `session_id` at `now_ms`.
+    /// Walks the fork chain so a freshly forked child inherits the parent's
+    /// snapshot taken at or before the fork point. Expired (dangling) snapshots
+    /// are skipped and reported via `dangling_skipped` so the caller can fall
+    /// back to an earlier snapshot plus replay, or a clean start.
+    pub async fn resolve_resume_snapshot(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        now_ms: u64,
+    ) -> Result<SnapshotResolution> {
+        let mut current_id = session_id.clone();
+        // For the leaf session every snapshot is eligible; for an ancestor only
+        // snapshots at or before the fork point matter (later ancestor state is
+        // not on this branch).
+        let mut cutoff: Option<u64> = None;
+        let mut is_leaf = true;
+        let mut dangling_skipped = false;
+        loop {
+            let session = self.get_session(tenant_id, &current_id).await?;
+            let mut eligible: Vec<&SnapshotRef> = session
+                .snapshots
+                .iter()
+                .filter(|snap| cutoff.is_none_or(|max| snap.at_seq <= max))
+                .collect();
+            // Newest first.
+            eligible.sort_by(|a, b| {
+                b.at_seq
+                    .cmp(&a.at_seq)
+                    .then(b.created_at_ms.cmp(&a.created_at_ms))
+            });
+            for snap in eligible {
+                if snap.is_expired_at(now_ms) {
+                    dangling_skipped = true;
+                    continue;
+                }
+                let replay_from_seq = if is_leaf { snap.at_seq } else { 0 };
+                return Ok(SnapshotResolution {
+                    snapshot: Some(snap.clone()),
+                    owning_session_id: Some(session.session_id.clone()),
+                    replay_from_seq,
+                    dangling_skipped,
+                });
+            }
+            let Some(parent) = session.forked_from else {
+                break;
+            };
+            current_id = parent.session_id.clone();
+            cutoff = Some(parent.at_seq);
+            is_leaf = false;
+        }
+        Ok(SnapshotResolution {
+            snapshot: None,
+            owning_session_id: None,
+            replay_from_seq: 0,
+            dangling_skipped,
+        })
+    }
+
     pub async fn replay_session(&self, tenant_id: &Id, session_id: &Id) -> Result<ReplayResponse> {
         let mut segments: Vec<(Id, Option<u64>)> = Vec::new();
         let mut current_id = session_id.clone();
@@ -6558,7 +6718,7 @@ impl Runtime {
     }
 
     pub async fn watch(&self, req: WatchRequest) -> Result<Vec<ChangefeedItem>> {
-        let session_ids: Vec<Id> = {
+        let (session_ids, fork_edges): (Vec<Id>, Vec<ForkEdge>) = {
             let s = self.state.lock().await;
             let tenant_live = s
                 .tenants
@@ -6570,7 +6730,7 @@ impl Runtime {
                     format!("{}", req.tenant_id),
                 ));
             }
-            match req.scope {
+            let session_ids: Vec<Id> = match req.scope {
                 WatchScope::Session => {
                     let session_id = req.session_id.clone().ok_or_else(|| {
                         Error::new(ErrorCode::SessionNotFound, "watch session_id is required")
@@ -6620,45 +6780,96 @@ impl Runtime {
                         .map(|session| session.session_id.clone())
                         .collect()
                 }
-            }
+            };
+            // Fork-edge discovery: a child is announced in the feed whenever its
+            // parent is in scope, so a consumer following the parent learns the
+            // child sub-stream exists. The child knows its own origin, so we do
+            // not announce when only the child (not the parent) is in scope.
+            let scoped: std::collections::HashSet<&str> =
+                session_ids.iter().map(|id| id.as_str()).collect();
+            let fork_edges: Vec<ForkEdge> = s
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.deleted_at_ms.is_none()
+                        && session.tenant_id.as_str() == req.tenant_id.as_str()
+                })
+                .filter_map(|session| {
+                    let parent = session.forked_from.as_ref()?;
+                    if !scoped.contains(parent.session_id.as_str()) {
+                        return None;
+                    }
+                    Some(ForkEdge {
+                        parent_session_id: parent.session_id.clone(),
+                        child_session_id: session.session_id.clone(),
+                        fork_point_seq: parent.at_seq,
+                        created_at_ms: session.created_at_ms,
+                    })
+                })
+                .collect();
+            (session_ids, fork_edges)
         };
 
-        let mut events = Vec::new();
+        let cursor_context = self.changefeed_cursor_context()?;
+
+        // Build a unified, totally-ordered feed of per-session event sub-streams
+        // plus fork-edge control items. Each physical event is emitted exactly
+        // once on the session where it was written (no re-emission of ancestor
+        // history across a fork). Entry = (order_key-bearing cursor, item).
+        let mut entries: Vec<(String, ChangefeedItem)> = Vec::new();
         for session_id in session_ids {
-            events.extend(
-                self.fetch_from_seq(FetchRequest {
+            let events = self
+                .fetch_from_seq(FetchRequest {
                     tenant_id: req.tenant_id.clone(),
                     session_id,
                     from_seq: 0,
                     limit: usize::MAX,
                 })
-                .await?,
-            );
+                .await?;
+            for event in events {
+                let cursor = event_cursor(&event, &cursor_context);
+                entries.push((
+                    cursor.clone(),
+                    ChangefeedItem {
+                        cursor,
+                        cell_id: cursor_context.cell_id.clone(),
+                        placement_scope_id: cursor_context.placement_scope_id.clone(),
+                        tablet_id: cursor_context.tablet_id,
+                        tablet_epoch: cursor_context.tablet_epoch,
+                        applied_index: cursor_context.applied_index,
+                        event: Some(event),
+                        fork_edge: None,
+                    },
+                ));
+            }
         }
-        events.sort_by(|left, right| {
-            left.created_at_ms
-                .cmp(&right.created_at_ms)
-                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-                .then_with(|| left.seq.cmp(&right.seq))
+        for edge in fork_edges {
+            let cursor = fork_edge_cursor(&edge, &cursor_context);
+            entries.push((
+                cursor.clone(),
+                ChangefeedItem {
+                    cursor,
+                    cell_id: cursor_context.cell_id.clone(),
+                    placement_scope_id: cursor_context.placement_scope_id.clone(),
+                    tablet_id: cursor_context.tablet_id,
+                    tablet_epoch: cursor_context.tablet_epoch,
+                    applied_index: cursor_context.applied_index,
+                    event: None,
+                    fork_edge: Some(edge),
+                },
+            ));
+        }
+        entries.sort_by(|left, right| {
+            event_cursor_order_key(&left.0).cmp(event_cursor_order_key(&right.0))
         });
 
         let mut out = Vec::new();
-        let cursor_context = self.changefeed_cursor_context()?;
         let from_cursor_key = req.from_cursor.as_deref().map(event_cursor_order_key);
-        for event in events {
-            let cursor = event_cursor(&event, &cursor_context);
+        for (cursor, item) in entries {
             if from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
                 continue;
             }
-            out.push(ChangefeedItem {
-                cursor,
-                cell_id: cursor_context.cell_id.clone(),
-                placement_scope_id: cursor_context.placement_scope_id.clone(),
-                tablet_id: cursor_context.tablet_id,
-                tablet_epoch: cursor_context.tablet_epoch,
-                applied_index: cursor_context.applied_index,
-                event,
-            });
+            out.push(item);
             if out.len() >= req.limit {
                 break;
             }
@@ -6668,6 +6879,9 @@ impl Runtime {
 
     pub async fn export_watch(&self, req: ExportWatchRequest) -> Result<Vec<ExportFeedItem>> {
         validate_export_include(&req.include)?;
+        if req.limit == 0 {
+            return Ok(Vec::new());
+        }
         if let Some(persist) = &self.persist {
             let scope_validation = {
                 let s = self.state.lock().await;
@@ -6753,21 +6967,34 @@ impl Runtime {
                 req.session_id.as_ref(),
             )?;
         }
-        let events = self
-            .watch(WatchRequest {
-                tenant_id: req.tenant_id,
-                scope: req.scope,
-                session_id: req.session_id,
-                agent_id: req.agent_id,
-                from_cursor: req.from_cursor,
-                limit: req.limit,
-            })
-            .await?;
-        Ok(events
-            .into_iter()
-            .filter_map(|item| {
-                let ledger_item = export_ledger_item_from_event(item.event);
-                export_item_matches_include(&ledger_item, &req.include).then_some(ExportFeedItem {
+        let mut out = Vec::new();
+        let mut from_cursor = req.from_cursor.clone();
+        let page_limit = req.limit.max(64);
+        loop {
+            let items = self
+                .watch(WatchRequest {
+                    tenant_id: req.tenant_id.clone(),
+                    scope: req.scope,
+                    session_id: req.session_id.clone(),
+                    agent_id: req.agent_id.clone(),
+                    from_cursor: from_cursor.clone(),
+                    limit: page_limit,
+                })
+                .await?;
+            let fetched = items.len();
+            if fetched == 0 {
+                break;
+            }
+            for item in items {
+                from_cursor = Some(item.cursor.clone());
+                let Some(event) = item.event else {
+                    continue;
+                };
+                let ledger_item = export_ledger_item_from_event(event);
+                if !export_item_matches_include(&ledger_item, &req.include) {
+                    continue;
+                }
+                out.push(ExportFeedItem {
                     cursor: item.cursor,
                     cell_id: item.cell_id,
                     placement_scope_id: item.placement_scope_id,
@@ -6775,9 +7002,16 @@ impl Runtime {
                     tablet_epoch: item.tablet_epoch,
                     applied_index: item.applied_index,
                     item: ledger_item,
-                })
-            })
-            .collect())
+                });
+                if out.len() >= req.limit {
+                    return Ok(out);
+                }
+            }
+            if fetched < page_limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn validate_persistent_export_cursor(&self, req: &ExportWatchRequest) -> Result<()> {
@@ -9172,6 +9406,28 @@ fn event_cursor_order_key(cursor: &str) -> &str {
         .split_once(":cell=")
         .map(|(prefix, _)| prefix)
         .unwrap_or(cursor)
+}
+
+/// Cursor for a fork-edge control item. Keyed by the child's creation time and
+/// id with a `:fork` discriminator so it slots into the same total order as
+/// event cursors yet can never collide with a real event's order key. One
+/// fork-edge per child makes this unique.
+fn fork_edge_cursor(edge: &ForkEdge, context: &ChangefeedCursorContext) -> String {
+    let cell = context.cell_id.as_deref().unwrap_or("none");
+    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
+    let tablet = context
+        .tablet_id
+        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
+    let epoch = context
+        .tablet_epoch
+        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
+    let applied = context
+        .applied_index
+        .map_or_else(|| "none".to_string(), |index| index.to_string());
+    format!(
+        "v2:{:020}:{}:{:020}:fork:cell={}:scope={}:tablet={}:epoch={}:applied={}",
+        edge.created_at_ms, edge.child_session_id, 0, cell, placement_scope, tablet, epoch, applied
+    )
 }
 
 fn validate_consumer_name(name: &str) -> Result<()> {
