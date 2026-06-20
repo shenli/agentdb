@@ -1073,6 +1073,88 @@ fn lifecycle_target(current: Lifecycle, idle_ms: u64, policy: &RuntimePolicy) ->
     }
 }
 
+fn validate_append_secret_handling_policy(
+    payload: &serde_json::Value,
+    policy: &RuntimePolicy,
+) -> Result<()> {
+    if !policy.secret_handling.deny_raw_secret_fields {
+        return Ok(());
+    }
+    if let Some(path) = first_raw_secret_field_path(payload) {
+        return Err(Error::new(
+            ErrorCode::PolicyDenied,
+            format!(
+                "policy_version {} denies append: payload field `{path}` looks like a raw secret",
+                policy.version
+            ),
+        )
+        .with_suggestion(
+            "store credentials in the control-plane vault and reference them with credential_refs",
+        ));
+    }
+    Ok(())
+}
+
+fn first_raw_secret_field_path(payload: &serde_json::Value) -> Option<String> {
+    fn visit(value: &serde_json::Value, path: &mut Vec<String>) -> Option<String> {
+        match value {
+            serde_json::Value::Object(obj) => {
+                for (key, child) in obj {
+                    path.push(key.clone());
+                    if is_raw_secret_field_name(key) {
+                        return Some(path.join("."));
+                    }
+                    if let Some(found) = visit(child, path) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    path.push(format!("[{idx}]"));
+                    if let Some(found) = visit(child, path) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    visit(payload, &mut Vec::new())
+}
+
+fn is_raw_secret_field_name(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "accesstoken"
+            | "apikey"
+            | "authtoken"
+            | "authorization"
+            | "bearertoken"
+            | "clientsecret"
+            | "openaiapikey"
+            | "password"
+            | "passwd"
+            | "personalaccesstoken"
+            | "privatekey"
+            | "pwd"
+            | "refreshtoken"
+            | "secret"
+            | "secretaccesskey"
+            | "token"
+    )
+}
+
 fn priority_rank(p: Priority) -> u8 {
     match p {
         Priority::Low => 0,
@@ -6017,6 +6099,8 @@ impl Runtime {
                 }
             }
         }
+        validate_append_secret_handling_policy(&req.payload, &policy)
+            .map_err(|err| (err, prior_session_snapshot.clone()))?;
         if payload_len > policy.artifact_size.max_inline_event_bytes {
             return Err((
                 Error::new(
@@ -6238,6 +6322,7 @@ impl Runtime {
                 }
             }
         }
+        validate_append_secret_handling_policy(&req.payload, &policy)?;
         if payload_len > policy.artifact_size.max_inline_event_bytes {
             return Err(Error::new(
                 ErrorCode::EventTooLarge,

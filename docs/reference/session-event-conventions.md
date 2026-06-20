@@ -59,7 +59,9 @@ Rules:
   caused or informed this event.
 - `credential_refs` records opaque vault / broker references such as
   `cred_ref`, never credential values. The harness or control plane resolves
-  these refs outside AgentDB and injects real auth at egress.
+  these refs outside AgentDB and injects real auth at egress. Tenants or agents
+  can also opt into `secret_handling.deny_raw_secret_fields` to reject payload
+  keys shaped like raw credentials on append.
 - `runtime_version` is the release identifier of the runtime that wrote the
   event. Treat it as opaque provenance, not as a compatibility contract.
 - Payloads that need their own independent version should include

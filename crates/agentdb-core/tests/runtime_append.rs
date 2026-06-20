@@ -362,6 +362,89 @@ async fn append_preserves_credential_refs_and_idempotency_hashes_them() {
 }
 
 #[tokio::test]
+async fn append_secret_field_policy_rejects_raw_secret_payload_keys() {
+    let rt = Runtime::in_memory();
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "secret-policy".into(),
+            policy: serde_json::json!({
+                "secret_handling": {
+                    "deny_raw_secret_fields": true
+                }
+            }),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let err = rt
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "tool_call",
+            serde_json::json!({
+                "input": {
+                    "api_key": "sk-raw-secret"
+                }
+            }),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert!(err.message.contains("input.api_key"));
+
+    let mut allowed = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_call",
+        serde_json::json!({
+            "input": {
+                "repo": "agentdb"
+            }
+        }),
+    );
+    allowed.credential_refs = vec![agentdb_core::CredentialRef {
+        cred_ref: "vault://agent/acme/github".into(),
+        provider: Some("github".into()),
+        scope: Some("repo:read".into()),
+        expires_at_ms: None,
+    }];
+    rt.append(allowed).await.unwrap();
+}
+
+#[tokio::test]
+async fn append_secret_field_policy_is_opt_in() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "legacy",
+        serde_json::json!({ "api_key": "legacy-test-value" }),
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();

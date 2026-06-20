@@ -134,9 +134,10 @@ Applied to AgentDB's data-plane SDK:
    with args reduced to a `cred_ref`.
 4. **Defense in depth on the write path.** Because AgentDB sits below the trust
    line, add a backstop: an SDK-level "no raw secrets" validator, an optional
-   server-side secret-pattern redaction hook on event append, and a tool-output
-   sanitization hook before output re-enters context. Primary control is "secrets
-   never reach here"; this is the seatbelt.
+   server-side raw-secret field reject policy on event append, and a tool-output
+   sanitization hook before output re-enters context. The server-side append
+   backstop is implemented as `secret_handling.deny_raw_secret_fields`; primary
+   control is still "secrets never reach here."
 5. **Short-lived, audience-bound, least-privilege tokens** scoped per task rather
    than host-inherited environment credentials, so a leak has minimal blast
    radius. This is vault / control-plane policy.
@@ -487,8 +488,9 @@ That is a real and sufficient market, but it means the positioning must target
   independent per-branch positions instead of the current total-order item
   cursor.
 - The credential boundary has an event-level `credential_refs` / `cred_ref`
-  surface. The residual work is defense in depth: SDK raw-secret validators,
-  optional server-side secret-pattern redaction on append, and tool-output
-  sanitization before output re-enters context.
+  surface plus an opt-in server-side append backstop
+  (`secret_handling.deny_raw_secret_fields`) that rejects payload keys shaped
+  like raw secrets. The residual defense-in-depth work is SDK raw-secret
+  validators and tool-output sanitization before output re-enters context.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?

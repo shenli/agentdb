@@ -490,6 +490,13 @@ POST   /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST   /api/tenants/{tenant_id}/policy/gc-sweep
 ```
 
+Tenant and agent policy may include `secret_handling`. Setting
+`secret_handling.deny_raw_secret_fields` to `true` makes event append reject JSON
+payload keys shaped like raw credential fields, including `api_key`, `password`,
+`token`, `access_token`, `authorization`, `client_secret`, `refresh_token`,
+`secret_access_key`, and `private_key`. Use `credential_refs` for opaque vault /
+broker references instead of putting credential values in `payload`.
+
 Common headers:
 
 ```text
