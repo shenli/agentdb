@@ -486,14 +486,11 @@ That is a real and sufficient market, but it means the positioning must target
   layered refs, tracks expiry, tolerates dangling refs, and resolves fallback to
   earlier snapshots plus replay; the sandbox service still has to implement the
   actual filesystem snapshot/restore contract.
-- The fork-aware changefeed model is implemented with first-class `fork_edge`
-  items, gap-free tests, and `watch` frontier cursors that encode
-  `{session_id -> next seq}` while still accepting legacy `v2:` item cursors.
-- The credential boundary has an event-level `credential_refs` / `cred_ref`
-  surface, native SDK raw-secret validators, native SDK plus server-side
-  `tool_result` output sanitization, and an opt-in server-side append backstop
-  (`secret_handling.deny_raw_secret_fields`) that rejects payload keys shaped
-  like raw secrets. The residual defense-in-depth work is adapter convention
-  parity for non-native integration paths.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?
+
+High-priority runtime/security items from this architecture pass are now
+implemented: lifecycle policy enforcement, snapshot refs, fork-aware watch and
+export feeds, `watch` frontier cursors, event-level credential refs, SDK
+raw-secret validators, SDK/runtime `tool_result` output sanitization, and the
+opt-in server-side raw-secret field reject policy.
