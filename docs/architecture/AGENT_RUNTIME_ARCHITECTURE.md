@@ -134,9 +134,10 @@ Applied to AgentDB's data-plane SDK:
    with args reduced to a `cred_ref`.
 4. **Defense in depth on the write path.** Because AgentDB sits below the trust
    line, add a backstop: SDK-level "no raw secrets" validators, an optional
-   server-side raw-secret field reject policy on event append, and a tool-output
-   sanitization hook before output re-enters context. The native Python and
-   TypeScript SDK validators reject secret-shaped payload keys by default; the
+   server-side raw-secret field reject policy on event append, and tool-output
+   sanitization before output re-enters context. The native Python and TypeScript
+   SDK validators reject secret-shaped payload keys by default and their
+   `tool_result` helpers redact common credential tokens from inline output; the
    server-side append backstop is implemented as
    `secret_handling.deny_raw_secret_fields`. Primary control is still "secrets
    never reach here."
@@ -490,9 +491,10 @@ That is a real and sufficient market, but it means the positioning must target
   independent per-branch positions instead of the current total-order item
   cursor.
 - The credential boundary has an event-level `credential_refs` / `cred_ref`
-  surface, native SDK raw-secret validators, and an opt-in server-side append
-  backstop (`secret_handling.deny_raw_secret_fields`) that rejects payload keys
-  shaped like raw secrets. The residual defense-in-depth work is tool-output
-  sanitization before output re-enters context.
+  surface, native SDK raw-secret validators, native SDK `tool_result` output
+  sanitization, and an opt-in server-side append backstop
+  (`secret_handling.deny_raw_secret_fields`) that rejects payload keys shaped
+  like raw secrets. The residual defense-in-depth work is parity for custom
+  clients and non-native adapters that bypass the SDK helper path.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?

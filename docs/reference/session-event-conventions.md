@@ -354,6 +354,10 @@ Optional payload fields:
 | `exit_code` | number | Process exit code when relevant. |
 | `metadata` | object | Adapter-specific details. |
 
+Native SDK `tool_result` helpers sanitize obvious credential tokens in
+`summary`, `output`, and `metadata` string values before append. Large raw
+stdout/stderr still belongs in artifacts, not inline payloads.
+
 Example:
 
 ```json

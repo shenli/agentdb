@@ -151,7 +151,9 @@ kinds or adapter-specific payload fields.
 
 Append payloads reject raw credential-shaped field names such as `api_key`,
 `access_token`, `password`, and `private_key` before sending the request. Pass
-opaque vault or broker references through `credentialRefs` instead.
+opaque vault or broker references through `credentialRefs` instead. The
+`toolResult` helper also redacts common credential tokens from inline summary,
+output, and metadata strings; put large raw stdout/stderr in artifacts.
 
 ## Context Provenance
 
