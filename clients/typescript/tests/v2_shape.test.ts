@@ -91,6 +91,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
             payload: { tool_call_id: "call_1" },
             artifact_refs: [{ artifact_id: "art_1" }],
             source_refs: [{ event_id: "evt_call" }],
+            credential_refs: [{ cred_ref: "vault://agent/acme/github" }],
             metadata_key_id: "tenant:ten_1:default",
             metadata_key_version: "v1",
           },
@@ -117,6 +118,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   const user = await session.appendUser("hello", { fetchLastN: 5 });
   const call = await session.toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }, {
     sourceRefs: [eventRef(user)],
+    credentialRefs: [{ cred_ref: "vault://agent/acme/github", provider: "github" }],
   });
   const artifact = await session.artifacts.put(new Blob(["blob"]), { contentType: "text/plain" });
   await session.toolResult("call_1", "Generated report.", {
@@ -148,7 +150,16 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   });
   assert.deepEqual(replayed[0]?.artifactRefs, [{ artifact_id: "art_1" }]);
   assert.deepEqual(replayed[0]?.sourceRefs, [{ event_id: "evt_call" }]);
+  assert.deepEqual(replayed[0]?.credentialRefs, [{ cred_ref: "vault://agent/acme/github" }]);
   assert.equal(replayed[0]?.metadataKeyId, "tenant:ten_1:default");
+  assert.ok(
+    calls.some((call) => {
+      const body = call.body as Record<string, unknown> | undefined;
+      return Array.isArray(body?.credential_refs)
+        && (body.credential_refs[0] as Record<string, unknown> | undefined)?.cred_ref
+          === "vault://agent/acme/github";
+    })
+  );
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/agents/agt_1/sessions")));
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
 });

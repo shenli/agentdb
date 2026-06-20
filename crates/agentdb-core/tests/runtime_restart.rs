@@ -264,6 +264,7 @@ async fn concurrent_append_and_fetch_same_session_survives_restart() {
                         payload: serde_json::json!({ "i": i }),
                         artifact_refs: Vec::new(),
                         source_refs: Vec::new(),
+                        credential_refs: Vec::new(),
                         idempotency_key: None,
                     },
                     8,

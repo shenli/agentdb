@@ -319,6 +319,49 @@ async fn idempotent_conflict_on_artifact_refs_change() {
 }
 
 #[tokio::test]
+async fn append_preserves_credential_refs_and_idempotency_hashes_them() {
+    use agentdb_core::event::CredentialRef;
+
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let mut req = AppendRequest::simple(&t, &a, &s, "tool_call", serde_json::json!({}));
+    req.credential_refs = vec![CredentialRef {
+        cred_ref: "vault://agent/acme/github".into(),
+        provider: Some("github".into()),
+        scope: Some("repo:read".into()),
+        expires_at_ms: Some(1_000_000),
+    }];
+    req.idempotency_key = Some("cred-k1".into());
+    rt.append(req).await.unwrap();
+
+    let fetched = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fetched[0].credential_refs.len(), 1);
+    assert_eq!(
+        fetched[0].credential_refs[0].cred_ref,
+        "vault://agent/acme/github"
+    );
+
+    let mut retry = AppendRequest::simple(&t, &a, &s, "tool_call", serde_json::json!({}));
+    retry.credential_refs = vec![CredentialRef {
+        cred_ref: "vault://agent/acme/slack".into(),
+        provider: Some("slack".into()),
+        scope: Some("chat:write".into()),
+        expires_at_ms: None,
+    }];
+    retry.idempotency_key = Some("cred-k1".into());
+    let err = rt.append(retry).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();
@@ -332,6 +375,7 @@ async fn append_rejects_unknown_session() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     };
     let err = rt.append(req).await.unwrap_err();

@@ -43,6 +43,7 @@ All conventions use the existing event envelope:
   "payload": {},
   "artifact_refs": [],
   "source_refs": [],
+  "credential_refs": [],
   "policy_version": 1
 }
 ```
@@ -56,6 +57,9 @@ Rules:
   `payload`.
 - `source_refs` points to the session events, artifacts, records, or skills that
   caused or informed this event.
+- `credential_refs` records opaque vault / broker references such as
+  `cred_ref`, never credential values. The harness or control plane resolves
+  these refs outside AgentDB and injects real auth at egress.
 - `runtime_version` is the release identifier of the runtime that wrote the
   event. Treat it as opaque provenance, not as a compatibility contract.
 - Payloads that need their own independent version should include

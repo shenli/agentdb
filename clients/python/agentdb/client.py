@@ -44,6 +44,7 @@ class Event:
     runtime_version: str = ""
     artifact_refs: List[dict] = dataclasses.field(default_factory=list)
     source_refs: List[dict] = dataclasses.field(default_factory=list)
+    credential_refs: List[dict] = dataclasses.field(default_factory=list)
     metadata_key_id: Optional[str] = None
     metadata_key_version: Optional[str] = None
     created_at_ms: int = 0
@@ -61,6 +62,7 @@ class Event:
             runtime_version=_runtime_version_from_dict(d),
             artifact_refs=list(d.get("artifact_refs") or []),
             source_refs=list(d.get("source_refs") or []),
+            credential_refs=list(d.get("credential_refs") or []),
             metadata_key_id=d.get("metadata_key_id"),
             metadata_key_version=d.get("metadata_key_version"),
             created_at_ms=d.get("created_at_ms", 0),
@@ -857,6 +859,7 @@ class Session:
         fetch_last_n: int = 0,
         artifact_refs: Optional[list] = None,
         source_refs: Optional[list] = None,
+        credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
         if fetch_last_n > 0:
@@ -867,12 +870,15 @@ class Session:
                 last=fetch_last_n,
                 artifact_refs=artifact_refs,
                 source_refs=source_refs,
+                credential_refs=credential_refs,
                 idempotency_key=idempotency_key,
             )
         data = self._client._request(
             "POST",
             self._events_path(),
-            json=self._append_body(kind, payload, agent_id, artifact_refs, source_refs),
+            json=self._append_body(
+                kind, payload, agent_id, artifact_refs, source_refs, credential_refs
+            ),
             headers=_idem_header(idempotency_key),
         )
         return AppendResult(event_id=data["event_id"], seq=data["seq"], recent=[])
@@ -887,9 +893,12 @@ class Session:
         max_bytes: int = 1_000_000,
         artifact_refs: Optional[list] = None,
         source_refs: Optional[list] = None,
+        credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
-        body = self._append_body(kind, payload, agent_id, artifact_refs, source_refs)
+        body = self._append_body(
+            kind, payload, agent_id, artifact_refs, source_refs, credential_refs
+        )
         body["last"] = last
         body["max_bytes"] = max_bytes
         data = self._client._request(
@@ -988,6 +997,7 @@ class Session:
         agent_id: Optional[AgentId],
         artifact_refs: Optional[list],
         source_refs: Optional[list],
+        credential_refs: Optional[list],
     ) -> dict:
         aid = agent_id or self.agent_id
         if aid is None:
@@ -998,6 +1008,7 @@ class Session:
             "payload": payload,
             "artifact_refs": artifact_refs or [],
             "source_refs": source_refs or [],
+            "credential_refs": credential_refs or [],
         }
 
     def _events_path(self) -> str:

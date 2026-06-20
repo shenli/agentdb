@@ -41,6 +41,7 @@ export interface Event {
   runtimeVersion?: string;
   artifactRefs: Record<string, unknown>[];
   sourceRefs: Record<string, unknown>[];
+  credentialRefs: Record<string, unknown>[];
   metadataKeyId?: string;
   metadataKeyVersion?: string;
   createdAtMs: number;
@@ -63,6 +64,7 @@ export interface AppendOptions {
   agentId?: AgentId;
   artifactRefs?: unknown[];
   sourceRefs?: unknown[];
+  credentialRefs?: unknown[];
   idempotencyKey?: string;
   fetchLastN?: number;
   actorId?: number;
@@ -96,6 +98,7 @@ export interface ModelMessageOptions {
 
 export interface ToolCallOptions {
   sourceRefs?: Record<string, unknown>[];
+  credentialRefs?: Record<string, unknown>[];
   idempotencyKey?: string;
   handId?: string;
   timeoutMs?: number;
@@ -806,6 +809,7 @@ export class Session {
       {
         kind: SessionEventKind.ToolCall,
         sourceRefs: opts.sourceRefs,
+        credentialRefs: opts.credentialRefs,
         idempotencyKey: opts.idempotencyKey,
       }
     );
@@ -934,6 +938,7 @@ export class Session {
       payload,
       artifact_refs: opts.artifactRefs ?? [],
       source_refs: opts.sourceRefs ?? [],
+      credential_refs: opts.credentialRefs ?? [],
     };
   }
 }
@@ -952,6 +957,7 @@ function eventFromDict(d: unknown): Event {
     runtimeVersion: stringOrUndefined(rec.runtime_version),
     artifactRefs: arrayRecords(rec.artifact_refs),
     sourceRefs: arrayRecords(rec.source_refs),
+    credentialRefs: arrayRecords(rec.credential_refs),
     metadataKeyId: stringOrUndefined(rec.metadata_key_id),
     metadataKeyVersion: stringOrUndefined(rec.metadata_key_version),
     createdAtMs: Number(rec.created_at_ms ?? 0),

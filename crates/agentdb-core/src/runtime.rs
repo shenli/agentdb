@@ -37,7 +37,7 @@ use agentdb_storage::{
 use crate::agent::{Agent, NewAgent};
 use crate::artifact::{Artifact, NewArtifact};
 use crate::errors::{Error, ErrorCode, Result};
-use crate::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+use crate::event::{ArtifactRef, CredentialRef, EventEnvelope, NewEvent, SourceRef};
 use crate::global_index::{
     GlobalIndexMutation, GlobalIndexMutationOp, GlobalIndexQuery, GlobalRecordIndex,
     InMemoryGlobalRecordIndex,
@@ -359,6 +359,7 @@ pub struct AppendRequest {
     pub payload: serde_json::Value,
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_refs: Vec<SourceRef>,
+    pub credential_refs: Vec<CredentialRef>,
     pub idempotency_key: Option<String>,
 }
 
@@ -380,6 +381,7 @@ impl AppendRequest {
             payload,
             artifact_refs: vec![],
             source_refs: vec![],
+            credential_refs: vec![],
             idempotency_key: None,
         }
     }
@@ -6104,6 +6106,7 @@ impl Runtime {
             payload: req.payload,
             artifact_refs: Vec::new(),
             source_refs: Vec::new(),
+            credential_refs: Vec::new(),
             idempotency_key: None,
             policy_version: policy.version,
             metadata_key_id: Some(metadata_key.key_id),
@@ -6424,6 +6427,7 @@ impl Runtime {
             payload: req.payload.clone(),
             artifact_refs: req.artifact_refs.clone(),
             source_refs: req.source_refs.clone(),
+            credential_refs: req.credential_refs.clone(),
             idempotency_key: req.idempotency_key.clone(),
             policy_version: policy.version,
             metadata_key_id: Some(metadata_key.key_id),
@@ -6447,6 +6451,7 @@ impl Runtime {
                 &req.payload,
                 &req.artifact_refs,
                 &req.source_refs,
+                &req.credential_refs,
             ),
             result_json: serde_json::to_string(&resp).unwrap(),
             created_at_ms: crate::now_ms(),
@@ -10598,6 +10603,7 @@ fn verify_idem_replay(rec: &IdempotencyRecord, req: &AppendRequest) -> Result<Ap
         &req.payload,
         &req.artifact_refs,
         &req.source_refs,
+        &req.credential_refs,
     );
     if rec.payload_hash != h {
         return Err(Error::new(

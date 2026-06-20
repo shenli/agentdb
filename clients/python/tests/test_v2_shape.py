@@ -192,6 +192,7 @@ def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
             "runtime_version": "2026-04-28",
             "artifact_refs": [{"artifact_id": "art_1", "bytes": 4}],
             "source_refs": [{"event_id": "evt_call"}],
+            "credential_refs": [{"cred_ref": "vault://agent/acme/github"}],
             "metadata_key_id": "tenant:ten_1:default",
             "metadata_key_version": "v3",
             "created_at_ms": 123,
@@ -200,6 +201,7 @@ def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
 
     assert event.artifact_refs == [{"artifact_id": "art_1", "bytes": 4}]
     assert event.source_refs == [{"event_id": "evt_call"}]
+    assert event.credential_refs == [{"cred_ref": "vault://agent/acme/github"}]
     assert event.runtime_version == "2026-04-28"
     assert event.metadata_key_id == "tenant:ten_1:default"
     assert event.metadata_key_version == "v3"

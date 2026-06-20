@@ -5788,6 +5788,7 @@ async fn append_event(
                 payload: body.payload,
                 artifact_refs: body.artifact_refs,
                 source_refs: body.source_refs,
+                credential_refs: body.credential_refs,
                 idempotency_key: idem_key,
             })
             .await
@@ -5862,6 +5863,7 @@ async fn append_and_fetch(
                     payload: body.payload,
                     artifact_refs: body.artifact_refs,
                     source_refs: body.source_refs,
+                    credential_refs: body.credential_refs,
                     idempotency_key: idem_key,
                 },
                 body.last,

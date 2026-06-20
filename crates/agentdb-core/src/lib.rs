@@ -38,7 +38,7 @@ pub mod tenant;
 pub use agent::{Agent, NewAgent};
 pub use artifact::{Artifact, NewArtifact};
 pub use errors::{Error, ErrorCode};
-pub use event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+pub use event::{ArtifactRef, CredentialRef, EventEnvelope, NewEvent, SourceRef};
 pub use id::{Id, IdKind};
 pub use idempotency::{IdempotencyRecord, IdempotencyStore};
 pub use policy::{

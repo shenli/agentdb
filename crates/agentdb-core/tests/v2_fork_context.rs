@@ -83,6 +83,7 @@ async fn forked_session_replay_merges_parent_cutoff_then_child_events() {
         payload: serde_json::json!({"n": 10}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     })
     .await

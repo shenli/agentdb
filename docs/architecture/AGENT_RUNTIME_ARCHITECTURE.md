@@ -123,8 +123,8 @@ Applied to AgentDB's data-plane SDK:
    values. Event / record / artifact types carry no secret-shaped fields. An
    event that records "which credential was used" stores an opaque `cred_ref` that
    resolves in the agent-metadata DB / vault. This is the same pattern as
-   snapshot-refs, and it turns the invariant from a rule into a type-level
-   guarantee.
+   snapshot-refs, and the event-level `credential_refs` field makes this a
+   typed reference surface **(implemented for events)**.
 2. **Separate clients, no cross-wiring.** The SDK object that talks to AgentDB
    (data plane) has no vault capability. The vault / agent-metadata DB is reached
    by the harness / control plane through a different client.
@@ -486,8 +486,9 @@ That is a real and sufficient market, but it means the positioning must target
   frontier `{session_id -> high-water seq}` if deep branched CDC consumers need
   independent per-branch positions instead of the current total-order item
   cursor.
-- The credential boundary is settled in principle (refs-only SDK + broker at
-  egress, see above). The residual work is the `cred_ref` type and the
-  write-path redaction backstop.
+- The credential boundary has an event-level `credential_refs` / `cred_ref`
+  surface. The residual work is defense in depth: SDK raw-secret validators,
+  optional server-side secret-pattern redaction on append, and tool-output
+  sanitization before output re-enters context.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?

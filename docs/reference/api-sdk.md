@@ -565,6 +565,10 @@ SessionHandle / Session
   context(max_events=None, max_bytes=None, include=None, record_query=None)
 ```
 
+`append` and `append_and_fetch` accept `artifact_refs`, `source_refs`, and
+`credential_refs`. Credential refs carry opaque `cred_ref` values resolved by a
+vault or broker outside AgentDB; do not put credential values in `payload`.
+
 Lower-level sync `Client` methods:
 
 ```text
@@ -664,6 +668,9 @@ SessionHandle / Session
   subscribe(opts?)
   context(opts?)
 ```
+
+`AppendOptions` supports `artifactRefs`, `sourceRefs`, and `credentialRefs`.
+`credentialRefs` are refs only; real secrets stay in the control plane / vault.
 
 Lower-level `Client` methods:
 

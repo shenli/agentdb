@@ -306,6 +306,7 @@ async fn tenant_watch_emits_fork_edge_and_does_not_reemit_parent_events() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     })
     .await
@@ -423,6 +424,7 @@ async fn fork_edge_is_gap_free_across_resume_and_pagination() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     })
     .await
@@ -522,6 +524,7 @@ async fn export_watch_in_memory_skips_fork_edges_without_stalling_small_pages() 
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     })
     .await
