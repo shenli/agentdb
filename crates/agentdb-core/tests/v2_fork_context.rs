@@ -99,6 +99,54 @@ async fn forked_session_replay_merges_parent_cutoff_then_child_events() {
         .map(|event| (event.kind.as_str(), event.seq))
         .collect();
     assert_eq!(seqs, vec![("parent", 0), ("parent", 1), ("child", 0)]);
+    assert_eq!(replay.fork_depth, 1);
+    assert_eq!(replay.segments_scanned, 2);
+    assert_eq!(replay.events_scanned, 3);
+}
+
+#[tokio::test]
+async fn fork_replay_bounds_ancestor_reads_to_fork_point() {
+    let (rt, tenant, agent, parent) = seed().await;
+    for n in 0..8 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &parent,
+            "parent",
+            serde_json::json!({"n": n}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let child = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: parent.session_id.clone(),
+            at_seq: 1,
+            alias: Some("bounded-child".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &child,
+        "child",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+
+    let replay = rt
+        .replay_session(&tenant.tenant_id, &child.session_id)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 3);
+    assert_eq!(
+        replay.events_scanned, 3,
+        "replay scans parent[0..=fork_point] plus child, not the full parent tail"
+    );
 }
 
 #[tokio::test]

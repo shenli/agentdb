@@ -292,6 +292,11 @@ POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 GET  /api/admin/exports
 ```
 
+`replay` returns the stitched logical session history plus scan stats:
+`fork_depth`, `segments_scanned`, and `events_scanned`. Fork ancestor reads are
+bounded to the fork point (`at_seq + 1`) instead of scanning the full ancestor
+tail.
+
 `exports/watch` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event

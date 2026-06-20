@@ -428,6 +428,12 @@ pub struct ForkSessionRequest {
 pub struct ReplayResponse {
     pub session_id: Id,
     pub events: Vec<EventEnvelope>,
+    #[serde(default)]
+    pub fork_depth: usize,
+    #[serde(default)]
+    pub segments_scanned: usize,
+    #[serde(default)]
+    pub events_scanned: usize,
 }
 
 /// Request to record a sandbox snapshot reference at a session `seq`. AgentDB
@@ -4107,17 +4113,24 @@ impl Runtime {
             current_cutoff = Some(parent.at_seq);
         }
 
+        let fork_depth = segments.len().saturating_sub(1);
+        let segments_scanned = segments.len();
         segments.reverse();
         let mut events = Vec::new();
+        let mut events_scanned = 0;
         for (sid, cutoff) in segments {
+            let limit = cutoff
+                .map(|max_seq| usize::try_from(max_seq.saturating_add(1)).unwrap_or(usize::MAX))
+                .unwrap_or(usize::MAX);
             let mut segment = self
                 .fetch_from_seq(FetchRequest {
                     tenant_id: tenant_id.clone(),
                     session_id: sid,
                     from_seq: 0,
-                    limit: usize::MAX,
+                    limit,
                 })
                 .await?;
+            events_scanned += segment.len();
             if let Some(max_seq) = cutoff {
                 segment.retain(|event| event.seq <= max_seq);
             }
@@ -4126,6 +4139,9 @@ impl Runtime {
         Ok(ReplayResponse {
             session_id: session_id.clone(),
             events,
+            fork_depth,
+            segments_scanned,
+            events_scanned,
         })
     }
 

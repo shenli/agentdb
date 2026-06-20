@@ -251,14 +251,17 @@ three-store separation.
 
 - Fork *creation* is O(1) metadata: one new session record with a parent
   reference and fork point; no events copied.
-- Fork *read* is O(total ancestor events): replay walks the fork chain backward
-  to the root and stitches each segment truncated at its fork point.
+- Fork *read* walks the fork chain backward to the root and stitches each
+  segment truncated at its fork point. Ancestor reads are bounded to
+  `fork_point + 1` events rather than scanning the full ancestor tail
+  **(implemented)**.
 - Nested forks (fork of a fork) work via recursive chain walk, linear in depth.
 
-The open scaling concern is that replay currently re-stitches on every read with
-no materialization. If forking becomes a headline behavior, the durable moat is
-*cheap replay over deep chains* (segment caching, or compaction that collapses a
-fork point into a sealed segment), not the already-cheap create path.
+The remaining scaling concern is that replay still re-stitches on every read
+with no durable materialized replay prefix. If forking becomes a headline
+behavior, the durable moat is *cheap replay over deep chains* via segment
+caching or compaction that collapses a fork point into a sealed segment, not the
+already-cheap create path.
 
 ## Memory Is A Derived Retrieval Tier
 
@@ -486,11 +489,12 @@ That is a real and sufficient market, but it means the positioning must target
   layered refs, tracks expiry, tolerates dangling refs, and resolves fallback to
   earlier snapshots plus replay; the sandbox service still has to implement the
   actual filesystem snapshot/restore contract.
-- What replay materialization or compaction makes deep fork chains cheap enough
-  to make fork a headline behavior?
+- What durable replay-prefix materialization or segment compaction makes very
+  deep fork chains cheap enough to make fork a headline behavior?
 
 High-priority runtime/security items from this architecture pass are now
 implemented: lifecycle policy enforcement, snapshot refs, fork-aware watch and
 export feeds, `watch` frontier cursors, event-level credential refs, SDK
 raw-secret validators, SDK/runtime `tool_result` output sanitization, and the
-opt-in server-side raw-secret field reject policy.
+opt-in server-side raw-secret field reject policy. Fork replay also now bounds
+ancestor reads to each fork point and reports replay scan stats.
