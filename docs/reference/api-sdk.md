@@ -297,6 +297,11 @@ GET  /api/admin/exports
 bounded to the fork point (`at_seq + 1`) instead of scanning the full ancestor
 tail.
 
+Sandbox filesystem snapshots are coordinated through AgentDB snapshot refs and
+an external sandbox service. See
+`docs/reference/sandbox-snapshot-contract.md` for trigger ownership, restore,
+fork, retention, and dangling-ref behavior.
+
 `exports/watch` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event

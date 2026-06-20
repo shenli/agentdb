@@ -161,7 +161,8 @@ The convergence narrows AgentDB's job rather than widening it.
 - session lifecycle: warm -> cold -> archive -> restore, with policy-driven
   sweep and archive-manifest restore **(implemented)**
 - references to external state: artifact blobs and sandbox snapshot refs
-  **(implemented for refs; sandbox snapshot lifecycle/integration designed)**
+  **(implemented for refs; sandbox snapshot lifecycle/integration contract
+  defined in `docs/reference/sandbox-snapshot-contract.md`)**
 - a records / retrieval substrate derived from events: searchable, scored, with
   per-session (read-after-write) and global (async, eventually consistent)
   indexes that a memory system writes into and queries **(partially
@@ -205,7 +206,7 @@ does what it is good at:
   btrfs, and zfs do natively. AgentDB resolves the newest non-expired snapshot
   at or before the fork point across the fork chain, so resume can restore the
   right ancestor filesystem state and replay the child branch **(implemented for
-  refs; sandbox restore still external)**.
+  refs; sandbox restore remains external by design)**.
 - **Resume.** Restore the sandbox filesystem from the ref'd snapshot, then replay
   the session tail from AgentDB. Two stores, stitched by the ref.
 
@@ -455,9 +456,9 @@ Two goals follow from the convergence:
    durable `export_watch`) that lets an external harness or system attach to the
    log is **already implemented (Phase 1)**, so the work here is positioning and
    hardening it as the integration backbone, not building it. The core
-   **snapshot-ref protocol** exists in AgentDB; the remaining contract is with
-   the sandbox filesystem: trigger policy, byte lifecycle, and restore/fork
-   handoff.
+   **snapshot-ref protocol** exists in AgentDB and the sandbox filesystem
+   trigger policy, byte lifecycle, and restore/fork handoff are defined in
+   `docs/reference/sandbox-snapshot-contract.md`.
 2. **A reference architecture.** AgentDB wins as a reference by being the
    clearest articulation of the standard, not the most featureful product. The
    load-bearing artifact is this taxonomy plus its invariants, codified below.
@@ -484,11 +485,6 @@ That is a real and sufficient market, but it means the positioning must target
 
 ## Open Questions
 
-- Who triggers sandbox snapshots, who owns their byte lifecycle, and what
-  operational policy chooses snapshot frequency / retention? AgentDB now stores
-  layered refs, tracks expiry, tolerates dangling refs, and resolves fallback to
-  earlier snapshots plus replay; the sandbox service still has to implement the
-  actual filesystem snapshot/restore contract.
 - What durable replay-prefix materialization or segment compaction makes very
   deep fork chains cheap enough to make fork a headline behavior?
 
@@ -497,4 +493,6 @@ implemented: lifecycle policy enforcement, snapshot refs, fork-aware watch and
 export feeds, `watch` frontier cursors, event-level credential refs, SDK
 raw-secret validators, SDK/runtime `tool_result` output sanitization, and the
 opt-in server-side raw-secret field reject policy. Fork replay also now bounds
-ancestor reads to each fork point and reports replay scan stats.
+ancestor reads to each fork point and reports replay scan stats. The sandbox
+snapshot ownership/restore/retention contract is defined, with implementation
+remaining in the external sandbox service by design.
