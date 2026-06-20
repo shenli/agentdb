@@ -136,11 +136,11 @@ Applied to AgentDB's data-plane SDK:
    line, add a backstop: SDK-level "no raw secrets" validators, an optional
    server-side raw-secret field reject policy on event append, and tool-output
    sanitization before output re-enters context. The native Python and TypeScript
-   SDK validators reject secret-shaped payload keys by default and their
-   `tool_result` helpers redact common credential tokens from inline output; the
-   server-side append backstop is implemented as
-   `secret_handling.deny_raw_secret_fields`. Primary control is still "secrets
-   never reach here."
+   SDK validators reject secret-shaped payload keys by default; SDK helpers and
+   the runtime append path redact common credential tokens from inline
+   `tool_result` output. The optional server-side raw-field reject backstop is
+   implemented as `secret_handling.deny_raw_secret_fields`. Primary control is
+   still "secrets never reach here."
 5. **Short-lived, audience-bound, least-privilege tokens** scoped per task rather
    than host-inherited environment credentials, so a leak has minimal blast
    radius. This is vault / control-plane policy.
@@ -490,10 +490,10 @@ That is a real and sufficient market, but it means the positioning must target
   items, gap-free tests, and `watch` frontier cursors that encode
   `{session_id -> next seq}` while still accepting legacy `v2:` item cursors.
 - The credential boundary has an event-level `credential_refs` / `cred_ref`
-  surface, native SDK raw-secret validators, native SDK `tool_result` output
-  sanitization, and an opt-in server-side append backstop
+  surface, native SDK raw-secret validators, native SDK plus server-side
+  `tool_result` output sanitization, and an opt-in server-side append backstop
   (`secret_handling.deny_raw_secret_fields`) that rejects payload keys shaped
-  like raw secrets. The residual defense-in-depth work is parity for custom
-  clients and non-native adapters that bypass the SDK helper path.
+  like raw secrets. The residual defense-in-depth work is adapter convention
+  parity for non-native integration paths.
 - What replay materialization or compaction makes deep fork chains cheap enough
   to make fork a headline behavior?

@@ -62,7 +62,8 @@ Rules:
   these refs outside AgentDB and injects real auth at egress. Native SDKs reject
   payload keys shaped like raw credentials before append; tenants or agents can
   also opt into `secret_handling.deny_raw_secret_fields` for the same server-side
-  backstop.
+  backstop. The runtime always sanitizes common credential tokens from inline
+  `tool_result` output string values before storing the event.
 - `runtime_version` is the release identifier of the runtime that wrote the
   event. Treat it as opaque provenance, not as a compatibility contract.
 - Payloads that need their own independent version should include
@@ -354,9 +355,10 @@ Optional payload fields:
 | `exit_code` | number | Process exit code when relevant. |
 | `metadata` | object | Adapter-specific details. |
 
-Native SDK `tool_result` helpers sanitize obvious credential tokens in
-`summary`, `output`, and `metadata` string values before append. Large raw
-stdout/stderr still belongs in artifacts, not inline payloads.
+Native SDK `tool_result` helpers and the runtime append path sanitize obvious
+credential tokens in `summary`, `output`, and `metadata` string values before
+storage. Large raw stdout/stderr still belongs in artifacts, not inline
+payloads.
 
 Example:
 

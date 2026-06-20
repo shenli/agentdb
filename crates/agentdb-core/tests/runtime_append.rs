@@ -445,6 +445,72 @@ async fn append_secret_field_policy_is_opt_in() {
 }
 
 #[tokio::test]
+async fn append_tool_result_sanitizes_inline_secret_output() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_result",
+        serde_json::json!({
+            "tool_call_id": "call_1",
+            "status": "ok",
+            "summary": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz12345",
+            "output": {
+                "stdout": "password=hunter2 sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz123456 AKIA1234567890ABCDEF"
+            },
+            "metadata": {
+                "trace": ["client_secret=raw"]
+            }
+        }),
+    ))
+    .await
+    .unwrap();
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let payload = &events[0].payload;
+    assert_eq!(payload["summary"], "Authorization: Bearer [REDACTED]");
+    assert_eq!(
+        payload["output"]["stdout"],
+        "password=[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    );
+    assert_eq!(payload["metadata"]["trace"][0], "client_secret=[REDACTED]");
+}
+
+#[tokio::test]
+async fn idempotent_tool_result_retry_hashes_sanitized_payload() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+    let mut req = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_result",
+        serde_json::json!({
+            "tool_call_id": "call_1",
+            "status": "ok",
+            "summary": "sk-abcdefghijklmnopqrstuvwxyz",
+        }),
+    );
+    req.idempotency_key = Some("tool-result-secret".into());
+
+    let first = rt.append(req.clone()).await.unwrap();
+    let second = rt.append(req).await.unwrap();
+    assert_eq!(first.seq, second.seq);
+    assert_eq!(first.event_id, second.event_id);
+}
+
+#[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();

@@ -1095,6 +1095,152 @@ fn validate_append_secret_handling_policy(
     Ok(())
 }
 
+fn sanitize_append_payload(kind: &str, payload: &mut serde_json::Value) {
+    if kind != "tool_result" {
+        return;
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    for field in ["summary", "output", "metadata"] {
+        if let Some(value) = obj.get_mut(field) {
+            sanitize_tool_output_value(value);
+        }
+    }
+}
+
+fn sanitize_tool_output_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = sanitize_secret_text(text);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_tool_output_value(item);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for child in obj.values_mut() {
+                sanitize_tool_output_value(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_secret_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut segment = String::new();
+    let mut segment_is_space = None;
+    let mut redact_after_bearer = false;
+    for ch in text.chars() {
+        let is_space = ch.is_whitespace();
+        match segment_is_space {
+            Some(current) if current == is_space => segment.push(ch),
+            Some(current) => {
+                flush_sanitized_segment(&mut out, &segment, current, &mut redact_after_bearer);
+                segment.clear();
+                segment.push(ch);
+                segment_is_space = Some(is_space);
+            }
+            None => {
+                segment.push(ch);
+                segment_is_space = Some(is_space);
+            }
+        }
+    }
+    if let Some(is_space) = segment_is_space {
+        flush_sanitized_segment(&mut out, &segment, is_space, &mut redact_after_bearer);
+    }
+    out
+}
+
+fn flush_sanitized_segment(
+    out: &mut String,
+    segment: &str,
+    is_space: bool,
+    redact_after_bearer: &mut bool,
+) {
+    if is_space {
+        out.push_str(segment);
+        return;
+    }
+    if *redact_after_bearer && looks_like_bearer_secret(segment) {
+        out.push_str("[REDACTED]");
+        *redact_after_bearer = false;
+        return;
+    }
+    let sanitized = sanitize_secret_token(segment);
+    if normalized_secret_key(segment) == "bearer" {
+        *redact_after_bearer = true;
+    }
+    out.push_str(&sanitized);
+}
+
+fn sanitize_secret_token(token: &str) -> String {
+    if let Some((idx, sep)) = token
+        .char_indices()
+        .find(|(_, ch)| *ch == '=' || *ch == ':')
+        .map(|(idx, ch)| (idx, ch))
+    {
+        let key = &token[..idx];
+        let value_start = idx + sep.len_utf8();
+        if value_start < token.len() && is_secret_assignment_key(key) {
+            return format!("{}{}[REDACTED]", key, sep);
+        }
+    }
+    if looks_like_secret_token(token) {
+        "[REDACTED]".into()
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_secret_assignment_key(key: &str) -> bool {
+    matches!(
+        normalized_secret_key(key).as_str(),
+        "accesstoken"
+            | "apikey"
+            | "authtoken"
+            | "authorization"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "privatekey"
+            | "refreshtoken"
+            | "secretaccesskey"
+    )
+}
+
+fn looks_like_secret_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';'));
+    (trimmed.starts_with("sk-") && trimmed.len() >= 19)
+        || (trimmed.starts_with("ghp_") && trimmed.len() >= 24)
+        || (trimmed.starts_with("gho_") && trimmed.len() >= 24)
+        || (trimmed.starts_with("ghu_") && trimmed.len() >= 24)
+        || (trimmed.starts_with("ghs_") && trimmed.len() >= 24)
+        || (trimmed.starts_with("ghr_") && trimmed.len() >= 24)
+        || (trimmed.starts_with("github_pat_") && trimmed.len() >= 31)
+        || ((trimmed.starts_with("AKIA") || trimmed.starts_with("ASIA"))
+            && trimmed.len() == 20
+            && trimmed.chars().all(|ch| ch.is_ascii_alphanumeric()))
+}
+
+fn looks_like_bearer_secret(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';'));
+    trimmed.len() >= 20
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '~' | '+' | '/' | '=' | '-')
+        })
+}
+
+fn normalized_secret_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
 fn first_raw_secret_field_path(payload: &serde_json::Value) -> Option<String> {
     fn visit(value: &serde_json::Value, path: &mut Vec<String>) -> Option<String> {
         match value {
@@ -1129,11 +1275,7 @@ fn first_raw_secret_field_path(payload: &serde_json::Value) -> Option<String> {
 }
 
 fn is_raw_secret_field_name(key: &str) -> bool {
-    let normalized: String = key
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect();
+    let normalized = normalized_secret_key(key);
     matches!(
         normalized.as_str(),
         "accesstoken"
@@ -6060,13 +6202,14 @@ impl Runtime {
     fn prepare_simple_append_under_state(
         &self,
         s: &State,
-        req: AppendRequest,
+        mut req: AppendRequest,
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
         prior_session_snapshot: Option<Session>,
         policy_cache: &mut BTreeMap<(String, String), RuntimePolicy>,
         metadata_key_cache: &mut BTreeMap<String, KeyResolution>,
     ) -> std::result::Result<(PreparedSimpleAppend, Session, bool), (Error, Option<Session>)> {
+        sanitize_append_payload(&req.kind, &mut req.payload);
         let payload_len = serde_json::to_vec(&req.payload)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
@@ -6216,7 +6359,7 @@ impl Runtime {
 
     async fn append_with_policy_direct(
         &self,
-        req: AppendRequest,
+        mut req: AppendRequest,
         resolved_policy: Option<RuntimePolicy>,
         fetch_recent: Option<usize>,
         context_max_bytes: Option<usize>,
@@ -6224,6 +6367,7 @@ impl Runtime {
         let path_profile = append_path_profile();
         let total_started = path_profile.map(|_| Instant::now());
         let mut path_sample = AppendPathSample::default();
+        sanitize_append_payload(&req.kind, &mut req.payload);
 
         let refresh_started = path_profile.map(|_| Instant::now());
         self.refresh_replicated_state().await?;
