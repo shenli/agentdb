@@ -449,6 +449,9 @@ class SessionHandle:
     def replay(self, **kwargs: Any) -> List[Event]:
         return self._session.replay(**kwargs)
 
+    def materialize_replay_prefix(self, **kwargs: Any) -> List[Event]:
+        return self._session.materialize_replay_prefix(**kwargs)
+
     def fork(self, child_session_id: Optional[str] = None, **kwargs: Any) -> "SessionHandle":
         return SessionHandle(self.workspace, self._session.fork(child_session_id, **kwargs), agent=self.agent)
 
@@ -923,6 +926,17 @@ class Session:
         data = self._client._request(
             "GET",
             f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/replay",
+            params=params,
+        )
+        return [Event.from_dict(e) for e in data.get("events", [])]
+
+    def materialize_replay_prefix(self, *, from_seq: Optional[int] = None, limit: int = 100) -> List[Event]:
+        params = {"limit": str(limit)}
+        if from_seq is not None:
+            params["from_seq"] = str(from_seq)
+        data = self._client._request(
+            "POST",
+            f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/replay-prefix",
             params=params,
         )
         return [Event.from_dict(e) for e in data.get("events", [])]

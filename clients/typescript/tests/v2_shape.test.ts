@@ -21,6 +21,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
     if (raw.endsWith("/events")) return json({ event_id: "evt_1", seq: 0 });
     if (raw.endsWith("/append-and-fetch")) return json({ event_id: "evt_2", seq: 1, recent: [] });
     if (raw.endsWith("/fork")) return json({ session_id: "ses_child", agent_id: "agt_1" });
+    if (raw.includes("/replay-prefix")) return json({ events: [] });
     if (raw.includes("/replay")) return json({ events: [] });
     if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
     if (raw.includes("/watch")) return json([]);
@@ -40,6 +41,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   await session.appendAndFetch({ hello: "again" });
   await session.fork({ atSeq: 0, alias: "branch" });
   await session.replay();
+  await session.materializeReplayPrefix();
   await session.context({ include: ["recent_events", "records"] });
   await c.watch(String(tenant.tenant_id));
   await c.putArtifact(String(tenant.tenant_id), new Blob(["blob"]));
@@ -53,6 +55,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   assert.ok(calls.some((url) => url.includes("/append-and-fetch")));
   assert.ok(calls.some((url) => url.includes("/fork")));
   assert.ok(calls.some((url) => url.includes("/replay")));
+  assert.ok(calls.some((url) => url.includes("/replay-prefix")));
   assert.ok(calls.some((url) => url.includes("/context")));
   assert.ok(calls.some((url) => url.includes("/watch")));
 });

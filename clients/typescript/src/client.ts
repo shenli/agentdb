@@ -418,6 +418,10 @@ export class SessionHandle {
     return await this.session.replay(opts);
   }
 
+  async materializeReplayPrefix(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    return await this.session.materializeReplayPrefix(opts);
+  }
+
   async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<SessionHandle> {
     return new SessionHandle(this.workspace, await this.session.fork(opts), this.opts);
   }
@@ -885,6 +889,14 @@ export class Session {
     if (opts.fromSeq !== undefined) url.searchParams.set("from_seq", String(opts.fromSeq));
     url.searchParams.set("limit", String(opts.limit ?? 100));
     const data = await (this._client as unknown as { _requestAbsolute(method: string, url: URL): Promise<Record<string, unknown>> })._requestAbsolute("GET", url);
+    return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
+  }
+
+  async materializeReplayPrefix(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    const url = new URL(`${this._client.baseUrl}/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/replay-prefix`);
+    if (opts.fromSeq !== undefined) url.searchParams.set("from_seq", String(opts.fromSeq));
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    const data = await (this._client as unknown as { _requestAbsolute(method: string, url: URL): Promise<Record<string, unknown>> })._requestAbsolute("POST", url);
     return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
   }
 

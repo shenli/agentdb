@@ -278,6 +278,7 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
 POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
+POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
@@ -296,8 +297,9 @@ GET  /api/admin/exports
 `fork_depth`, `segments_scanned`, `events_scanned`, and
 `materialized_prefix`. Fork ancestor reads are bounded to the fork point
 (`at_seq + 1`) instead of scanning the full ancestor tail. The core runtime can
-also materialize a forked session's non-leaf replay prefix so later replay reads
-a compact prefix object plus the leaf session tail.
+also materialize a forked session's non-leaf replay prefix via
+`POST /replay-prefix`, so later replay reads a compact prefix object plus the
+leaf session tail.
 
 Sandbox filesystem snapshots are coordinated through AgentDB snapshot refs and
 an external sandbox service. See
@@ -581,6 +583,7 @@ SessionHandle / Session
   fetch(from_seq=0, limit=100)
   fetch_recent(last_n=10)
   replay(from_seq=None, limit=100)
+  materialize_replay_prefix(from_seq=None, limit=100)
   fork(child_session_id=None, at_seq=0, alias=None)
   subscribe(from_seq=0, limit=100)
   context(max_events=None, max_bytes=None, include=None, record_query=None)
@@ -688,6 +691,7 @@ SessionHandle / Session
   fetch(opts?)
   fetchRecent(n)
   replay(opts?)
+  materializeReplayPrefix(opts?)
   fork(opts)
   subscribe(opts?)
   context(opts?)

@@ -261,13 +261,17 @@ three-store separation.
   segment truncated at its fork point. Ancestor reads are bounded to
   `fork_point + 1` events rather than scanning the full ancestor tail
   **(implemented)**.
-- Nested forks (fork of a fork) work via recursive chain walk, linear in depth.
+- Nested forks (fork of a fork) work via recursive chain walk, linear in depth
+  until a replay prefix is materialized.
+- Fork *prefix materialization* stores the non-leaf replay prefix in durable
+  content and records a `ReplayPrefixManifest` on the leaf session
+  **(implemented; exposed through the core runtime and HTTP/SDK surfaces)**.
+  After that, replay reads one compact prefix object plus the leaf session tail
+  instead of re-stitching the full fork chain on every read.
 
-The remaining scaling concern is that replay still re-stitches on every read
-with no durable materialized replay prefix. If forking becomes a headline
-behavior, the durable moat is *cheap replay over deep chains* via segment
-caching or compaction that collapses a fork point into a sealed segment, not the
-already-cheap create path.
+The remaining scaling policy question is when to materialize automatically:
+fork depth, replay scan count, byte threshold, explicit caller request, lifecycle
+sweep budget, or a combination.
 
 ## Memory Is A Derived Retrieval Tier
 

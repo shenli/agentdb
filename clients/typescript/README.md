@@ -59,7 +59,7 @@ canonical session ID without exposing `tenantId` to normal app code.
 - `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
 - `AgentHandle.session`, `AgentHandle.sessionById`, `AgentHandle.bindSkill`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
-- `SessionHandle.fetch`, `fetchRecent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
 - `SessionHandle.artifacts`, `records`, `skills`
 - `eventRef`, `artifactRef`
 
@@ -67,7 +67,7 @@ The low-level tenant-scoped API remains available:
 
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
 - `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
-- `Session.replay`, `fork`, `subscribe`, `context`
+- `Session.replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
 - `Client.watch`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
 - `Client.writeRecord`, `searchRecords`

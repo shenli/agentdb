@@ -36,6 +36,8 @@ def capture(client):
             return response(body={"event_id": "evt_2", "seq": 1, "recent": []})
         if url.endswith("/fork"):
             return response(body={"session_id": "ses_child", "agent_id": "agt_1"})
+        if url.endswith("/replay-prefix"):
+            return response(body={"events": []})
         if url.endswith("/replay"):
             return response(body={"events": []})
         if url.endswith("/context"):
@@ -68,6 +70,7 @@ def test_v2_urls_cover_core_flow():
         session.append_and_fetch({"hello": "again"})
         session.fork(at_seq=0, alias="branch")
         session.replay()
+        session.materialize_replay_prefix()
         session.context(include=["recent_events", "records"])
         c.watch(tenant["tenant_id"], scope="tenant")
         c.put_artifact(tenant["tenant_id"], b"blob")
@@ -83,6 +86,7 @@ def test_v2_urls_cover_core_flow():
     assert any("/append-and-fetch" in url for url in urls)
     assert any("/fork" in url for url in urls)
     assert any("/replay" in url for url in urls)
+    assert any("/replay-prefix" in url for url in urls)
     assert any("/context" in url for url in urls)
     assert any("/watch" in url for url in urls)
 

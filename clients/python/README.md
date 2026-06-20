@@ -66,7 +66,7 @@ asyncio.run(main())
 - `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
 - `AgentHandle.session`, `AgentHandle.session_by_id`, `AgentHandle.bind_skill`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
-- `SessionHandle.fetch`, `fetch_recent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `subscribe`, `context`
 - `SessionHandle.artifacts`, `records`, `skills`
 - `event_ref`, `artifact_ref`
 
