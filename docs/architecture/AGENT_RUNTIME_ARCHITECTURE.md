@@ -394,11 +394,13 @@ OLTP-shaped stores (yes) from OLAP-shaped ones like ClickHouse (no).
 Once sessions fork, the log is no longer a single line; it is a DAG of
 per-session sub-streams. AgentDB now emits each physical event once on its
 session sub-stream and emits fork creation as a first-class `fork_edge` control
-item in `watch` and durable `export_watch` **(implemented)**. The remaining
-cursor-design question is whether to graduate from the current opaque total-order
-cursor to a true encoded frontier. There is no published "branched CDC" standard,
-but the two mature models for *position in a branched history* agree on the
-essentials:
+item in `watch` and durable `export_watch` **(implemented)**. `watch` cursors
+are now opaque `frontier:v1` cursors that encode per-session next-seq positions
+and still accept legacy `v2:` item cursors for resume compatibility. Durable
+`export_watch` uses its persistent `ledger:` cursor because export consumers need
+retention/ack accounting over a stored export ledger. There is no published
+"branched CDC" standard, but the two mature models for *position in a branched
+history* agree on the essentials:
 
 - **Git / Dolt** represent history as a commit DAG. A position is a
   content-addressed pointer that carries lineage, not a linear offset, and
@@ -413,10 +415,9 @@ The recommended model follows directly:
 1. **Each session, including each fork child, is its own ordered sub-stream**
    keyed by `session_id` and ordered by `seq`. A fork creates a *new* sub-stream,
    exactly like a new Kafka partition or a new git branch. The changefeed cursor
-   should eventually be a frontier `{session_id -> high-water seq}`, opaquely
-   encoded. The current implementation uses collision-free opaque item cursors
-   and preserves gap-free delivery across forks; a true frontier cursor remains
-   future hardening.
+   is an opaque frontier `{session_id -> next seq}` so a consumer can advance
+   independently across parent and child sub-streams **(implemented for
+   `watch`)**.
 2. **Emit each physical event exactly once, on the session where it was written.**
    The child's *replay* stitches `parent[0..fork_point] + child` (already
    implemented), but the *changefeed* carries new mutations only. Parent pre-fork
@@ -486,10 +487,8 @@ That is a real and sufficient market, but it means the positioning must target
   earlier snapshots plus replay; the sandbox service still has to implement the
   actual filesystem snapshot/restore contract.
 - The fork-aware changefeed model is implemented with first-class `fork_edge`
-  items and gap-free tests. The residual cursor hardening is an opaque encoded
-  frontier `{session_id -> high-water seq}` if deep branched CDC consumers need
-  independent per-branch positions instead of the current total-order item
-  cursor.
+  items, gap-free tests, and `watch` frontier cursors that encode
+  `{session_id -> next seq}` while still accepting legacy `v2:` item cursors.
 - The credential boundary has an event-level `credential_refs` / `cred_ref`
   surface, native SDK raw-secret validators, native SDK `tool_result` output
   sanitization, and an opt-in server-side append backstop

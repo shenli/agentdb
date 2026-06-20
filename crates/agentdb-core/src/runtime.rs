@@ -6950,15 +6950,34 @@ impl Runtime {
             ));
         }
         entries.sort_by(|left, right| {
-            event_cursor_order_key(&left.0).cmp(event_cursor_order_key(&right.0))
+            watch_entry_order_key(&left.1).cmp(&watch_entry_order_key(&right.1))
         });
 
+        if req.limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
-        let from_cursor_key = req.from_cursor.as_deref().map(event_cursor_order_key);
-        for (cursor, item) in entries {
-            if from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
+        let mut frontier = req
+            .from_cursor
+            .as_deref()
+            .and_then(parse_watch_frontier_cursor)
+            .unwrap_or_default();
+        let legacy_from_cursor_key = req
+            .from_cursor
+            .as_deref()
+            .filter(|cursor| parse_watch_frontier_cursor(cursor).is_none())
+            .map(event_cursor_order_key);
+        for (cursor, mut item) in entries {
+            if legacy_from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
                 continue;
             }
+            if legacy_from_cursor_key.is_none()
+                && watch_item_delivered_by_frontier(&item, &frontier)
+            {
+                continue;
+            }
+            advance_watch_frontier(&mut frontier, &item);
+            item.cursor = watch_frontier_cursor(&frontier, &cursor_context);
             out.push(item);
             if out.len() >= req.limit {
                 break;
@@ -9499,6 +9518,98 @@ fn event_cursor_order_key(cursor: &str) -> &str {
         .split_once(":cell=")
         .map(|(prefix, _)| prefix)
         .unwrap_or(cursor)
+}
+
+fn watch_entry_order_key(item: &ChangefeedItem) -> (u64, String, u8, u64) {
+    if let Some(edge) = &item.fork_edge {
+        return (
+            edge.created_at_ms,
+            edge.child_session_id.as_str().to_string(),
+            0,
+            0,
+        );
+    }
+    if let Some(event) = &item.event {
+        return (
+            event.created_at_ms,
+            event.session_id.as_str().to_string(),
+            1,
+            event.seq,
+        );
+    }
+    (u64::MAX, String::new(), u8::MAX, u64::MAX)
+}
+
+fn watch_frontier_cursor(
+    frontier: &BTreeMap<String, u64>,
+    context: &ChangefeedCursorContext,
+) -> String {
+    let cell = context.cell_id.as_deref().unwrap_or("none");
+    let placement_scope = context.placement_scope_id.as_deref().unwrap_or("none");
+    let tablet = context
+        .tablet_id
+        .map_or_else(|| "none".to_string(), |tablet_id| tablet_id.to_string());
+    let epoch = context
+        .tablet_epoch
+        .map_or_else(|| "none".to_string(), |epoch| epoch.to_string());
+    let applied = context
+        .applied_index
+        .map_or_else(|| "none".to_string(), |index| index.to_string());
+    let sessions = frontier
+        .iter()
+        .map(|(session_id, next_seq)| format!("{session_id}@{next_seq}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "frontier:v1:sessions={}:cell={}:scope={}:tablet={}:epoch={}:applied={}",
+        sessions, cell, placement_scope, tablet, epoch, applied
+    )
+}
+
+fn parse_watch_frontier_cursor(cursor: &str) -> Option<BTreeMap<String, u64>> {
+    let raw = cursor.strip_prefix("frontier:v1:sessions=")?;
+    let (sessions, _) = raw.split_once(":cell=").unwrap_or((raw, ""));
+    let mut frontier = BTreeMap::new();
+    if sessions.is_empty() {
+        return Some(frontier);
+    }
+    for entry in sessions.split(',') {
+        let (session_id, next_seq) = entry.rsplit_once('@')?;
+        if session_id.is_empty() {
+            return None;
+        }
+        frontier.insert(session_id.to_string(), next_seq.parse().ok()?);
+    }
+    Some(frontier)
+}
+
+fn watch_item_delivered_by_frontier(
+    item: &ChangefeedItem,
+    frontier: &BTreeMap<String, u64>,
+) -> bool {
+    if let Some(event) = &item.event {
+        return frontier
+            .get(event.session_id.as_str())
+            .is_some_and(|next_seq| event.seq < *next_seq);
+    }
+    if let Some(edge) = &item.fork_edge {
+        return frontier.contains_key(edge.child_session_id.as_str());
+    }
+    false
+}
+
+fn advance_watch_frontier(frontier: &mut BTreeMap<String, u64>, item: &ChangefeedItem) {
+    if let Some(event) = &item.event {
+        let next_seq = event.seq.saturating_add(1);
+        let entry = frontier
+            .entry(event.session_id.as_str().to_string())
+            .or_insert(0);
+        *entry = (*entry).max(next_seq);
+    } else if let Some(edge) = &item.fork_edge {
+        frontier
+            .entry(edge.child_session_id.as_str().to_string())
+            .or_insert(0);
+    }
 }
 
 /// Cursor for a fork-edge control item. Keyed by the child's creation time and

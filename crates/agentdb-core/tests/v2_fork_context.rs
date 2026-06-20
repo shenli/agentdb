@@ -1,8 +1,8 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
     AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
-    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, ForkSessionRequest, Runtime,
-    RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
+    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, FetchRequest,
+    ForkSessionRequest, Runtime, RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
@@ -241,6 +241,62 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
 }
 
 #[tokio::test]
+async fn watch_accepts_legacy_v2_item_cursor_after_frontier_upgrade() {
+    let (rt, tenant, agent, session) = seed().await;
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "first",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "second",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let legacy_cursor = format!(
+        "v2:{:020}:{}:{:020}:cell=none:scope=none:tablet=none:epoch=none:applied=none",
+        events[0].created_at_ms, events[0].session_id, events[0].seq
+    );
+
+    let resumed = rt
+        .watch(WatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(session.session_id.clone()),
+            agent_id: Some(agent.agent_id.clone()),
+            from_cursor: Some(legacy_cursor),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].event.as_ref().unwrap().kind, "second");
+    assert!(resumed[0].cursor.starts_with("frontier:v1:"));
+    assert!(resumed[0]
+        .cursor
+        .contains(&format!("{}@2", session.session_id)));
+}
+
+#[tokio::test]
 async fn watch_cursor_includes_tablet_context_and_applied_index() {
     let kv = Arc::new(InMemoryKvStore::new());
     let lifecycle = Arc::new(PrefixScopedTabletStore::new(kv.clone()));
@@ -321,7 +377,10 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
     assert_eq!(items[0].tablet_id, Some(RUNTIME_PRIMARY_TABLET_ID));
     assert_eq!(items[0].tablet_epoch, Some(9));
     assert!(items[0].applied_index.unwrap_or_default() > 0);
-    assert!(items[0].cursor.starts_with("v2:"));
+    assert!(items[0].cursor.starts_with("frontier:v1:"));
+    assert!(items[0]
+        .cursor
+        .contains(&format!("{}@1", session.session_id)));
     assert!(items[0].cursor.contains("cell=cell-a"));
     assert!(items[0].cursor.contains("scope=tenant/tablet-watch"));
     assert!(items[0].cursor.contains("tablet=1"));

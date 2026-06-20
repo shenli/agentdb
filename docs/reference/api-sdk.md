@@ -295,8 +295,10 @@ GET  /api/admin/exports
 `exports/watch` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event
-watch cursors (`v2:...`). Use the optional comma-separated `include` query
-parameter, for example `include=events,records,skills`, to filter object types:
+watch cursors (`frontier:v1:...`). Runtime `watch` accepts both frontier cursors
+and older `v2:` item cursors for resume compatibility. Use the optional
+comma-separated `include` query parameter, for example
+`include=events,records,skills`, to filter object types:
 
 ```json
 {
