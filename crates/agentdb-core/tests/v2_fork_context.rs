@@ -1,8 +1,8 @@
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{
     AckExportConsumerRequest, AppendRequest, ClaimExportConsumerRequest, ContextInclude,
-    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, ForkSessionRequest, Runtime,
-    RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
+    ContextRequest, CreateExportConsumerRequest, ExportWatchRequest, FetchRequest,
+    ForkSessionRequest, Runtime, RuntimeRouteContext, SearchRequest, WatchRequest, WatchScope,
 };
 use agentdb_core::{NewAgent, NewSession, NewTenant, RUNTIME_PRIMARY_TABLET_ID};
 use agentdb_storage::{
@@ -83,6 +83,7 @@ async fn forked_session_replay_merges_parent_cutoff_then_child_events() {
         payload: serde_json::json!({"n": 10}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     })
     .await
@@ -98,6 +99,156 @@ async fn forked_session_replay_merges_parent_cutoff_then_child_events() {
         .map(|event| (event.kind.as_str(), event.seq))
         .collect();
     assert_eq!(seqs, vec![("parent", 0), ("parent", 1), ("child", 0)]);
+    assert_eq!(replay.fork_depth, 1);
+    assert_eq!(replay.segments_scanned, 2);
+    assert_eq!(replay.events_scanned, 3);
+}
+
+#[tokio::test]
+async fn fork_replay_bounds_ancestor_reads_to_fork_point() {
+    let (rt, tenant, agent, parent) = seed().await;
+    for n in 0..8 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &parent,
+            "parent",
+            serde_json::json!({"n": n}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let child = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: parent.session_id.clone(),
+            at_seq: 1,
+            alias: Some("bounded-child".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &child,
+        "child",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+
+    let replay = rt
+        .replay_session(&tenant.tenant_id, &child.session_id)
+        .await
+        .unwrap();
+    assert_eq!(replay.events.len(), 3);
+    assert_eq!(
+        replay.events_scanned, 3,
+        "replay scans parent[0..=fork_point] plus child, not the full parent tail"
+    );
+}
+
+#[tokio::test]
+async fn materialized_replay_prefix_collapses_deep_fork_chain_reads() {
+    let (rt, tenant, agent, root) = seed().await;
+    for n in 0..6 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &root,
+            "root",
+            serde_json::json!({"n": n}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let child = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: root.session_id.clone(),
+            at_seq: 2,
+            alias: Some("prefix-child".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &child,
+        "child",
+        serde_json::json!({"n": 10}),
+    ))
+    .await
+    .unwrap();
+
+    let grandchild = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: child.session_id.clone(),
+            at_seq: 0,
+            alias: Some("prefix-grandchild".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &grandchild,
+        "grandchild",
+        serde_json::json!({"n": 20}),
+    ))
+    .await
+    .unwrap();
+
+    let stitched = rt
+        .replay_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert_eq!(stitched.fork_depth, 2);
+    assert_eq!(stitched.segments_scanned, 3);
+    assert!(!stitched.materialized_prefix);
+
+    let materialized = rt
+        .materialize_replay_prefix(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert!(materialized.materialized_prefix);
+    assert_eq!(materialized.fork_depth, 2);
+    assert_eq!(materialized.segments_scanned, 2);
+
+    let replay = rt
+        .replay_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert!(replay.materialized_prefix);
+    assert_eq!(replay.segments_scanned, 2);
+    let kinds: Vec<_> = replay
+        .events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect();
+    assert_eq!(kinds, vec!["root", "root", "root", "child", "grandchild"]);
+    let replay_ids: Vec<_> = replay
+        .events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect();
+    let stitched_ids: Vec<_> = stitched
+        .events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect();
+    assert_eq!(replay_ids, stitched_ids);
+
+    let stored = rt
+        .get_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    let prefix = stored.replay_prefix.expect("prefix manifest persisted");
+    assert_eq!(prefix.event_count, 4);
+    assert_eq!(prefix.fork_depth, 2);
 }
 
 #[tokio::test]
@@ -229,7 +380,70 @@ async fn tenant_and_agent_watch_return_ordered_cursors_without_duplicates() {
         .await
         .unwrap();
     assert_eq!(after_first.len(), 1);
-    assert_eq!(after_first[0].event.kind, "second");
+    assert_eq!(
+        after_first[0]
+            .event
+            .as_ref()
+            .expect("watch item carries event")
+            .kind,
+        "second"
+    );
+}
+
+#[tokio::test]
+async fn watch_accepts_legacy_v2_item_cursor_after_frontier_upgrade() {
+    let (rt, tenant, agent, session) = seed().await;
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "first",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "second",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let legacy_cursor = format!(
+        "v2:{:020}:{}:{:020}:cell=none:scope=none:tablet=none:epoch=none:applied=none",
+        events[0].created_at_ms, events[0].session_id, events[0].seq
+    );
+
+    let resumed = rt
+        .watch(WatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Session,
+            session_id: Some(session.session_id.clone()),
+            agent_id: Some(agent.agent_id.clone()),
+            from_cursor: Some(legacy_cursor),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].event.as_ref().unwrap().kind, "second");
+    assert!(resumed[0].cursor.starts_with("frontier:v1:"));
+    assert!(resumed[0]
+        .cursor
+        .contains(&format!("{}@2", session.session_id)));
 }
 
 #[tokio::test]
@@ -313,7 +527,10 @@ async fn watch_cursor_includes_tablet_context_and_applied_index() {
     assert_eq!(items[0].tablet_id, Some(RUNTIME_PRIMARY_TABLET_ID));
     assert_eq!(items[0].tablet_epoch, Some(9));
     assert!(items[0].applied_index.unwrap_or_default() > 0);
-    assert!(items[0].cursor.starts_with("v2:"));
+    assert!(items[0].cursor.starts_with("frontier:v1:"));
+    assert!(items[0]
+        .cursor
+        .contains(&format!("{}@1", session.session_id)));
     assert!(items[0].cursor.contains("cell=cell-a"));
     assert!(items[0].cursor.contains("scope=tenant/tablet-watch"));
     assert!(items[0].cursor.contains("tablet=1"));

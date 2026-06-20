@@ -134,6 +134,40 @@ async fn fork_replay_and_subscribe_snapshot_work_over_http() {
         .map(|event| event["kind"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, vec!["parent", "parent", "child"]);
+    assert_eq!(replay["materialized_prefix"], false);
+
+    let materialized: serde_json::Value = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/sessions/{child_sid}/replay-prefix",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(materialized["materialized_prefix"], true);
+    assert_eq!(materialized["fork_depth"], 1);
+
+    let replay_after_prefix: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/sessions/{child_sid}/replay",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replay_after_prefix["materialized_prefix"], true);
 
     let sse = app
         .client

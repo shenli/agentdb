@@ -278,6 +278,7 @@ GET  /api/tenants/{tenant_id}/sessions/{session_id}/events
 POST /api/tenants/{tenant_id}/sessions/{session_id}/append-and-fetch
 POST /api/tenants/{tenant_id}/sessions/{session_id}/fork
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/replay
+POST /api/tenants/{tenant_id}/sessions/{session_id}/replay-prefix
 GET  /api/tenants/{tenant_id}/sessions/{session_id}/subscribe
 POST /api/tenants/{tenant_id}/sessions/{session_id}/context
 GET  /api/tenants/{tenant_id}/watch
@@ -292,11 +293,26 @@ POST /api/tenants/{tenant_id}/exports/consumers/{name}/rewind
 GET  /api/admin/exports
 ```
 
+`replay` returns the stitched logical session history plus scan stats:
+`fork_depth`, `segments_scanned`, `events_scanned`, and
+`materialized_prefix`. Fork ancestor reads are bounded to the fork point
+(`at_seq + 1`) instead of scanning the full ancestor tail. The core runtime can
+also materialize a forked session's non-leaf replay prefix via
+`POST /replay-prefix`, so later replay reads a compact prefix object plus the
+leaf session tail.
+
+Sandbox filesystem snapshots are coordinated through AgentDB snapshot refs and
+an external sandbox service. See
+`docs/reference/sandbox-snapshot-contract.md` for trigger ownership, restore,
+fork, retention, and dangling-ref behavior.
+
 `exports/watch` returns stable export envelopes for observability sinks.
 Persistent runtimes return durable ledger cursors (`ledger:...`) for events and
 metadata object mutations; in-memory/dev runtimes fall back to current event
-watch cursors (`v2:...`). Use the optional comma-separated `include` query
-parameter, for example `include=events,records,skills`, to filter object types:
+watch cursors (`frontier:v1:...`). Runtime `watch` accepts both frontier cursors
+and older `v2:` item cursors for resume compatibility. Use the optional
+comma-separated `include` query parameter, for example
+`include=events,records,skills`, to filter object types:
 
 ```json
 {
@@ -490,6 +506,13 @@ POST   /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST   /api/tenants/{tenant_id}/policy/gc-sweep
 ```
 
+Tenant and agent policy may include `secret_handling`. Setting
+`secret_handling.deny_raw_secret_fields` to `true` makes event append reject JSON
+payload keys shaped like raw credential fields, including `api_key`, `password`,
+`token`, `access_token`, `authorization`, `client_secret`, `refresh_token`,
+`secret_access_key`, and `private_key`. Use `credential_refs` for opaque vault /
+broker references instead of putting credential values in `payload`.
+
 Common headers:
 
 ```text
@@ -560,10 +583,18 @@ SessionHandle / Session
   fetch(from_seq=0, limit=100)
   fetch_recent(last_n=10)
   replay(from_seq=None, limit=100)
+  materialize_replay_prefix(from_seq=None, limit=100)
   fork(child_session_id=None, at_seq=0, alias=None)
   subscribe(from_seq=0, limit=100)
   context(max_events=None, max_bytes=None, include=None, record_query=None)
 ```
+
+`append` and `append_and_fetch` accept `artifact_refs`, `source_refs`, and
+`credential_refs`. Credential refs carry opaque `cred_ref` values resolved by a
+vault or broker outside AgentDB; do not put credential values in `payload`. The
+Python SDK rejects append payload keys shaped like raw credentials, such as
+`api_key`, `access_token`, `password`, and `private_key`, before sending the
+request.
 
 Lower-level sync `Client` methods:
 
@@ -660,10 +691,17 @@ SessionHandle / Session
   fetch(opts?)
   fetchRecent(n)
   replay(opts?)
+  materializeReplayPrefix(opts?)
   fork(opts)
   subscribe(opts?)
   context(opts?)
 ```
+
+`AppendOptions` supports `artifactRefs`, `sourceRefs`, and `credentialRefs`.
+`credentialRefs` are refs only; real secrets stay in the control plane / vault.
+The TypeScript SDK rejects append payload keys shaped like raw credentials, such
+as `api_key`, `access_token`, `password`, and `private_key`, before sending the
+request.
 
 Lower-level `Client` methods:
 

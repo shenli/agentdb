@@ -267,6 +267,10 @@ pub fn routes() -> Router<AppState> {
             get(replay_session),
         )
         .route(
+            "/api/tenants/:tenant_id/sessions/:session_id/replay-prefix",
+            post(materialize_replay_prefix),
+        )
+        .route(
             "/api/tenants/:tenant_id/sessions/:session_id/subscribe",
             get(subscribe_session),
         )
@@ -5788,6 +5792,7 @@ async fn append_event(
                 payload: body.payload,
                 artifact_refs: body.artifact_refs,
                 source_refs: body.source_refs,
+                credential_refs: body.credential_refs,
                 idempotency_key: idem_key,
             })
             .await
@@ -5862,6 +5867,7 @@ async fn append_and_fetch(
                     payload: body.payload,
                     artifact_refs: body.artifact_refs,
                     source_refs: body.source_refs,
+                    credential_refs: body.credential_refs,
                     idempotency_key: idem_key,
                 },
                 body.last,
@@ -5995,6 +6001,44 @@ async fn replay_session(
     let replay_sid = sid.clone();
     let mut replay = with_route_tablet_context(runtime.clone(), &route_headers, async move {
         runtime.replay_session(&replay_tid, &replay_sid).await
+    })
+    .await?;
+    if let Some(from_seq) = q.from_seq {
+        replay
+            .events
+            .retain(|event| event.session_id.as_str() != sid.as_str() || event.seq >= from_seq);
+    }
+    replay.events.truncate(q.limit.clamp(1, 1000));
+    Ok(with_headers(Json(replay).into_response(), route_headers))
+}
+
+async fn materialize_replay_prefix(
+    State(s): State<AppState>,
+    Path((tenant_id, session_id)): Path<(String, String)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    Query(q): Query<ReplayQuery>,
+) -> Result<Response, ApiError> {
+    reject_if_draining(&s)?;
+    let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
+    let sid = parse_id_or(&session_id, IdKind::Session, ErrorCode::SessionNotFound)?;
+    let route_headers =
+        match guard_session_request(&s, &tid, &sid, &original_uri, &headers, Method::POST, None)
+            .await
+        {
+            Ok(headers) => headers,
+            Err(response) => return Ok(response),
+        };
+    if let Err(response) = validate_forwarded_mutation(&s, &headers) {
+        return Ok(response);
+    }
+    let runtime = s.runtime.clone();
+    let replay_tid = tid.clone();
+    let replay_sid = sid.clone();
+    let mut replay = with_route_tablet_context(runtime.clone(), &route_headers, async move {
+        runtime
+            .materialize_replay_prefix(&replay_tid, &replay_sid)
+            .await
     })
     .await?;
     if let Some(from_seq) = q.from_seq {

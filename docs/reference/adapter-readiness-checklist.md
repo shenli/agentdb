@@ -21,6 +21,8 @@ Vercel AI SDK, MCP, or custom platform harnesses.
 | AgentDB ordering | Adapter uses AgentDB `seq`/`event_id` for replay ordering instead of inventing a separate durable sequence. |
 | Tool pairing | Every `tool_call` has a later `tool_result` or `tool_error` with the same `tool_call_id`. |
 | Large output artifacts | Large stdout/stderr/files/logs/screenshots are stored as artifacts and referenced from events. |
+| Credential boundary | Adapter records opaque `credential_refs` / `cred_ref` values, never raw credential values, and keeps credential injection in the control plane / egress broker. |
+| Tool output sanitization | Adapter relies on native SDK/runtime `tool_result` sanitization or applies equivalent redaction before non-native writes. |
 | Resume cursor | Adapter persists tenant, agent, session, and last handled `seq`/cursor so a fresh harness can recover. |
 | Context provenance | Adapter records `context_pack_built` when it builds model context and links model output back to that context event. |
 | Source refs | Derived summaries, records, artifacts, context packs, approvals, and model outputs preserve useful `source_refs`. |
@@ -66,16 +68,18 @@ Every adapter should include at least one smoke test with this shape:
 1. Create or resume an AgentDB session.
 2. Append a user/input event.
 3. Produce a tool call.
-4. Store a simulated large tool output as an artifact.
-5. Append a tool result referencing the call and artifact.
-6. Build context.
-7. Append `context_pack_built` with refs from the context response.
-8. Append a model output that references the context event.
-9. Simulate harness restart by rebuilding the session handle from IDs.
-10. Replay or fetch durable history.
-11. Append `agent_status: recovered` with `last_seen_seq`.
-12. Subscribe or watch from `last_seen_seq + 1`.
-13. Run `validate_adapter_events` / `validateAdapterEvents` on the recorded
+4. Produce a credentialed tool call using `credential_refs`, not raw secrets.
+5. Store a simulated large tool output as an artifact.
+6. Append a tool result referencing the call and artifact.
+7. Verify inline tool result text is sanitized or intentionally artifact-only.
+8. Build context.
+9. Append `context_pack_built` with refs from the context response.
+10. Append a model output that references the context event.
+11. Simulate harness restart by rebuilding the session handle from IDs.
+12. Replay or fetch durable history.
+13. Append `agent_status: recovered` with `last_seen_seq`.
+14. Subscribe or watch from `last_seen_seq + 1`.
+15. Run `validate_adapter_events` / `validateAdapterEvents` on the recorded
     sequence and require no warnings.
 
 ## 5. Framework Notes

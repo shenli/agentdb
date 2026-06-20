@@ -59,7 +59,7 @@ canonical session ID without exposing `tenantId` to normal app code.
 - `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
 - `AgentHandle.session`, `AgentHandle.sessionById`, `AgentHandle.bindSkill`
 - `SessionHandle.append`, `appendUser`, `modelMessage`, `toolCall`, `toolResult`, `contextPackBuilt`
-- `SessionHandle.fetch`, `fetchRecent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetchRecent`, `replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
 - `SessionHandle.artifacts`, `records`, `skills`
 - `eventRef`, `artifactRef`
 
@@ -67,7 +67,7 @@ The low-level tenant-scoped API remains available:
 
 - `Client.createTenant`, `createAgent`, `createSession`, `session`
 - `Session.append`, `appendAndFetch`, `fetch`, `fetchRecent`
-- `Session.replay`, `fork`, `subscribe`, `context`
+- `Session.replay`, `materializeReplayPrefix`, `fork`, `subscribe`, `context`
 - `Client.watch`
 - `Client.putArtifact`, `getArtifact`, `getArtifactBlob`
 - `Client.writeRecord`, `searchRecords`
@@ -148,6 +148,12 @@ await session.toolResult("call_1", "Generated report.", { sourceRefs: [eventRef(
 
 Helpers are intentionally client-side only. They do not prevent custom event
 kinds or adapter-specific payload fields.
+
+Append payloads reject raw credential-shaped field names such as `api_key`,
+`access_token`, `password`, and `private_key` before sending the request. Pass
+opaque vault or broker references through `credentialRefs` instead. The
+`toolResult` helper also redacts common credential tokens from inline summary,
+output, and metadata strings; put large raw stdout/stderr in artifacts.
 
 ## Context Provenance
 

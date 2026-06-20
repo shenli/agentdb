@@ -76,6 +76,7 @@ async fn append_rejects_cross_tenant_session() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     };
     let err = rt.append(req).await.unwrap_err();
@@ -102,6 +103,7 @@ async fn append_rejects_wrong_agent_for_session() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     };
     let err = rt.append(req).await.unwrap_err();

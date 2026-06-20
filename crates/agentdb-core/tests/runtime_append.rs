@@ -319,6 +319,198 @@ async fn idempotent_conflict_on_artifact_refs_change() {
 }
 
 #[tokio::test]
+async fn append_preserves_credential_refs_and_idempotency_hashes_them() {
+    use agentdb_core::event::CredentialRef;
+
+    let rt = Runtime::in_memory();
+    let (t, a, s) = rt.bootstrap_test_session().await;
+    let mut req = AppendRequest::simple(&t, &a, &s, "tool_call", serde_json::json!({}));
+    req.credential_refs = vec![CredentialRef {
+        cred_ref: "vault://agent/acme/github".into(),
+        provider: Some("github".into()),
+        scope: Some("repo:read".into()),
+        expires_at_ms: Some(1_000_000),
+    }];
+    req.idempotency_key = Some("cred-k1".into());
+    rt.append(req).await.unwrap();
+
+    let fetched = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: t.tenant_id.clone(),
+            session_id: s.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fetched[0].credential_refs.len(), 1);
+    assert_eq!(
+        fetched[0].credential_refs[0].cred_ref,
+        "vault://agent/acme/github"
+    );
+
+    let mut retry = AppendRequest::simple(&t, &a, &s, "tool_call", serde_json::json!({}));
+    retry.credential_refs = vec![CredentialRef {
+        cred_ref: "vault://agent/acme/slack".into(),
+        provider: Some("slack".into()),
+        scope: Some("chat:write".into()),
+        expires_at_ms: None,
+    }];
+    retry.idempotency_key = Some("cred-k1".into());
+    let err = rt.append(retry).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::IdempotencyConflict);
+}
+
+#[tokio::test]
+async fn append_secret_field_policy_rejects_raw_secret_payload_keys() {
+    let rt = Runtime::in_memory();
+    let tenant = rt
+        .create_tenant(NewTenant {
+            external_key: "secret-policy".into(),
+            policy: serde_json::json!({
+                "secret_handling": {
+                    "deny_raw_secret_fields": true
+                }
+            }),
+        })
+        .await
+        .unwrap();
+    let agent = rt
+        .create_agent(NewAgent {
+            tenant_id: tenant.tenant_id.clone(),
+            alias: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let session = rt
+        .create_session(NewSession {
+            tenant_id: tenant.tenant_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            alias: None,
+        })
+        .await
+        .unwrap();
+
+    let err = rt
+        .append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &session,
+            "tool_call",
+            serde_json::json!({
+                "input": {
+                    "api_key": "sk-raw-secret"
+                }
+            }),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert!(err.message.contains("input.api_key"));
+
+    let mut allowed = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_call",
+        serde_json::json!({
+            "input": {
+                "repo": "agentdb"
+            }
+        }),
+    );
+    allowed.credential_refs = vec![agentdb_core::CredentialRef {
+        cred_ref: "vault://agent/acme/github".into(),
+        provider: Some("github".into()),
+        scope: Some("repo:read".into()),
+        expires_at_ms: None,
+    }];
+    rt.append(allowed).await.unwrap();
+}
+
+#[tokio::test]
+async fn append_secret_field_policy_is_opt_in() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "legacy",
+        serde_json::json!({ "api_key": "legacy-test-value" }),
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn append_tool_result_sanitizes_inline_secret_output() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_result",
+        serde_json::json!({
+            "tool_call_id": "call_1",
+            "status": "ok",
+            "summary": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz12345",
+            "output": {
+                "stdout": "password=hunter2 sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz123456 AKIA1234567890ABCDEF"
+            },
+            "metadata": {
+                "trace": ["client_secret=raw"]
+            }
+        }),
+    ))
+    .await
+    .unwrap();
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let payload = &events[0].payload;
+    assert_eq!(payload["summary"], "Authorization: Bearer [REDACTED]");
+    assert_eq!(
+        payload["output"]["stdout"],
+        "password=[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    );
+    assert_eq!(payload["metadata"]["trace"][0], "client_secret=[REDACTED]");
+}
+
+#[tokio::test]
+async fn idempotent_tool_result_retry_hashes_sanitized_payload() {
+    let rt = Runtime::in_memory();
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+    let mut req = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_result",
+        serde_json::json!({
+            "tool_call_id": "call_1",
+            "status": "ok",
+            "summary": "sk-abcdefghijklmnopqrstuvwxyz",
+        }),
+    );
+    req.idempotency_key = Some("tool-result-secret".into());
+
+    let first = rt.append(req.clone()).await.unwrap();
+    let second = rt.append(req).await.unwrap();
+    assert_eq!(first.seq, second.seq);
+    assert_eq!(first.event_id, second.event_id);
+}
+
+#[tokio::test]
 async fn append_rejects_unknown_session() {
     use agentdb_core::id::{Id, IdKind};
     let rt = Runtime::in_memory();
@@ -332,6 +524,7 @@ async fn append_rejects_unknown_session() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
     };
     let err = rt.append(req).await.unwrap_err();

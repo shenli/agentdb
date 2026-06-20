@@ -66,7 +66,7 @@ asyncio.run(main())
 - `Workspace.artifacts`, `Workspace.records`, `Workspace.skills`
 - `AgentHandle.session`, `AgentHandle.session_by_id`, `AgentHandle.bind_skill`
 - `SessionHandle.append`, `append_user`, `model_message`, `tool_call`, `tool_result`, `context_pack_built`
-- `SessionHandle.fetch`, `fetch_recent`, `replay`, `fork`, `subscribe`, `context`
+- `SessionHandle.fetch`, `fetch_recent`, `replay`, `materialize_replay_prefix`, `fork`, `subscribe`, `context`
 - `SessionHandle.artifacts`, `records`, `skills`
 - `event_ref`, `artifact_ref`
 
@@ -139,6 +139,12 @@ session.tool_result("call_1", "Generated report.", source_refs=[event_ref(call)]
 
 Helpers are intentionally client-side only. They do not prevent custom event
 kinds or adapter-specific payload fields.
+
+Append payloads reject raw credential-shaped field names such as `api_key`,
+`access_token`, `password`, and `private_key` before sending the request. Pass
+opaque vault or broker references through `credential_refs` instead. The
+`tool_result` helper also redacts common credential tokens from inline summary,
+output, and metadata strings; put large raw stdout/stderr in artifacts.
 
 ## Context Provenance
 

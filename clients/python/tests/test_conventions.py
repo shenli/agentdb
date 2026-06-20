@@ -51,6 +51,21 @@ def test_tool_payload_builders_match_pairing_contract():
         "summary": "tests passed",
         "duration_ms": 12,
     }
+    sanitized = tool_result(
+        "call_1",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz12345",
+        output={
+            "stdout": (
+                "password=hunter2 sk-abcdefghijklmnopqrstuvwxyz "
+                "ghp_abcdefghijklmnopqrstuvwxyz123456 "
+                "AKIA1234567890ABCDEF"
+            )
+        },
+    )
+    assert sanitized["summary"] == "Authorization: Bearer [REDACTED]"
+    assert sanitized["output"]["stdout"] == (
+        "password=[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+    )
     assert tool_error(
         "call_1",
         "tests timed out",

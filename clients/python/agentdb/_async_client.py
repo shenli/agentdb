@@ -16,6 +16,7 @@ except ImportError as e:
     ) from e
 
 from ._sse import parse_lines_async
+from ._secrets import validate_no_raw_secret_fields
 from .client import (
     AgentId,
     AppendResult,
@@ -337,6 +338,7 @@ class AsyncSession:
         fetch_last_n: int = 0,
         artifact_refs: Optional[list] = None,
         source_refs: Optional[list] = None,
+        credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
         if fetch_last_n > 0:
@@ -347,12 +349,15 @@ class AsyncSession:
                 last=fetch_last_n,
                 artifact_refs=artifact_refs,
                 source_refs=source_refs,
+                credential_refs=credential_refs,
                 idempotency_key=idempotency_key,
             )
         data = await self._client._request(
             "POST",
             self._events_path(),
-            json=self._append_body(kind, payload, agent_id, artifact_refs, source_refs),
+            json=self._append_body(
+                kind, payload, agent_id, artifact_refs, source_refs, credential_refs
+            ),
             headers=_idem_header(idempotency_key),
         )
         return AppendResult(event_id=data["event_id"], seq=data["seq"], recent=[])
@@ -367,9 +372,12 @@ class AsyncSession:
         max_bytes: int = 1_000_000,
         artifact_refs: Optional[list] = None,
         source_refs: Optional[list] = None,
+        credential_refs: Optional[list] = None,
         idempotency_key: Optional[str] = None,
     ) -> AppendResult:
-        body = self._append_body(kind, payload, agent_id, artifact_refs, source_refs)
+        body = self._append_body(
+            kind, payload, agent_id, artifact_refs, source_refs, credential_refs
+        )
         body["last"] = last
         body["max_bytes"] = max_bytes
         data = await self._client._request(
@@ -393,6 +401,19 @@ class AsyncSession:
         data = await self._client._request(
             "GET",
             f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/replay",
+            params=params,
+        )
+        return [Event.from_dict(e) for e in data.get("events", [])]
+
+    async def materialize_replay_prefix(
+        self, *, from_seq: Optional[int] = None, limit: int = 100
+    ) -> List[Event]:
+        params = {"limit": str(limit)}
+        if from_seq is not None:
+            params["from_seq"] = str(from_seq)
+        data = await self._client._request(
+            "POST",
+            f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/replay-prefix",
             params=params,
         )
         return [Event.from_dict(e) for e in data.get("events", [])]
@@ -455,16 +476,19 @@ class AsyncSession:
         agent_id: Optional[AgentId],
         artifact_refs: Optional[list],
         source_refs: Optional[list],
+        credential_refs: Optional[list],
     ) -> dict:
         aid = agent_id or self.agent_id
         if aid is None:
             raise ValueError("agent_id is required for append")
+        validate_no_raw_secret_fields(payload)
         return {
             "agent_id": aid,
             "kind": kind,
             "payload": payload,
             "artifact_refs": artifact_refs or [],
             "source_refs": source_refs or [],
+            "credential_refs": credential_refs or [],
         }
 
     def _events_path(self) -> str:

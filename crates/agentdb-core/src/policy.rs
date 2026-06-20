@@ -106,6 +106,15 @@ pub struct LifecyclePolicy {
     pub derivative_only_after_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretHandlingPolicy {
+    /// Reject appends whose JSON payload includes raw-secret-shaped field names.
+    /// This is an opt-in server-side backstop; the primary contract remains
+    /// passing credential references through `credential_refs`.
+    #[serde(default)]
+    pub deny_raw_secret_fields: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimePolicy {
     #[serde(default)]
@@ -122,6 +131,8 @@ pub struct RuntimePolicy {
     pub retention: RetentionPolicy,
     #[serde(default)]
     pub lifecycle: LifecyclePolicy,
+    #[serde(default)]
+    pub secret_handling: SecretHandlingPolicy,
 }
 
 fn default_policy_version() -> u64 {
@@ -138,6 +149,7 @@ impl Default for RuntimePolicy {
             artifact_size: ArtifactSizePolicy::default(),
             retention: RetentionPolicy::default(),
             lifecycle: LifecyclePolicy::default(),
+            secret_handling: SecretHandlingPolicy::default(),
         }
     }
 }
@@ -174,7 +186,14 @@ fn has_policy_keys(v: &serde_json::Value) -> bool {
     obj.keys().any(|key| {
         matches!(
             key.as_str(),
-            "tier" | "version" | "priority" | "quota" | "artifact_size" | "retention" | "lifecycle"
+            "tier"
+                | "version"
+                | "priority"
+                | "quota"
+                | "artifact_size"
+                | "retention"
+                | "lifecycle"
+                | "secret_handling"
         )
     })
 }
@@ -219,6 +238,7 @@ fn tier_template(name: &str) -> RuntimePolicy {
                 archive_after_ms: Some(7 * 24 * 60 * 60 * 1000),
                 derivative_only_after_ms: Some(30 * 24 * 60 * 60 * 1000),
             },
+            secret_handling: SecretHandlingPolicy::default(),
         },
         "pro" => RuntimePolicy {
             tier: Some("pro".into()),
@@ -255,6 +275,7 @@ fn tier_template(name: &str) -> RuntimePolicy {
                 archive_after_ms: Some(30 * 24 * 60 * 60 * 1000),
                 derivative_only_after_ms: Some(90 * 24 * 60 * 60 * 1000),
             },
+            secret_handling: SecretHandlingPolicy::default(),
         },
         "enterprise" => RuntimePolicy {
             tier: Some("enterprise".into()),
@@ -290,6 +311,7 @@ fn tier_template(name: &str) -> RuntimePolicy {
             },
             retention: RetentionPolicy::default(),
             lifecycle: LifecyclePolicy::default(),
+            secret_handling: SecretHandlingPolicy::default(),
         },
         _ => RuntimePolicy::default(),
     }

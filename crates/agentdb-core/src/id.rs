@@ -13,6 +13,7 @@ pub enum IdKind {
     RecordEdge,
     Skill,
     Policy,
+    Snapshot,
 }
 
 impl IdKind {
@@ -28,6 +29,7 @@ impl IdKind {
             IdKind::RecordEdge => "edg",
             IdKind::Skill => "skl",
             IdKind::Policy => "pol",
+            IdKind::Snapshot => "snp",
         }
     }
 
@@ -43,6 +45,7 @@ impl IdKind {
             "edg" => IdKind::RecordEdge,
             "skl" => IdKind::Skill,
             "pol" => IdKind::Policy,
+            "snp" => IdKind::Snapshot,
             _ => return None,
         })
     }

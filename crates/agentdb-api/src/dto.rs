@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use agentdb_core::record::{IndexingPolicy, RecordStatus};
 use agentdb_core::runtime::{MetadataFilter, RecordSearchMatch};
-use agentdb_core::{AgentSkillBinding, ArtifactRef, RecordEdgeType, SourceRef};
+use agentdb_core::{AgentSkillBinding, ArtifactRef, CredentialRef, RecordEdgeType, SourceRef};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTenantBody {
@@ -78,6 +78,8 @@ pub struct AppendBody {
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub source_refs: Vec<SourceRef>,
+    #[serde(default)]
+    pub credential_refs: Vec<CredentialRef>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -90,6 +92,8 @@ pub struct AppendAndFetchBody {
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub source_refs: Vec<SourceRef>,
+    #[serde(default)]
+    pub credential_refs: Vec<CredentialRef>,
     #[serde(default = "default_last")]
     pub last: usize,
     #[serde(default = "default_max_bytes")]

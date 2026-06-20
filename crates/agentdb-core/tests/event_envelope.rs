@@ -1,4 +1,4 @@
-use agentdb_core::event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+use agentdb_core::event::{ArtifactRef, CredentialRef, EventEnvelope, NewEvent, SourceRef};
 use agentdb_core::id::{Id, IdKind};
 
 #[test]
@@ -15,6 +15,7 @@ fn envelope_carries_required_fields() {
         payload: serde_json::json!({"summary": "ok"}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: Some("client-1".into()),
         policy_version: 1,
         metadata_key_id: None,
@@ -33,6 +34,7 @@ fn envelope_carries_required_fields() {
     assert!(e.created_at_ms > 0);
     assert!(e.artifact_refs.is_empty());
     assert!(e.source_refs.is_empty());
+    assert!(e.credential_refs.is_empty());
     assert_eq!(e.payload, serde_json::json!({"summary": "ok"}));
 }
 
@@ -47,6 +49,7 @@ fn envelope_round_trips_through_json() {
         payload: serde_json::json!({}),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
         policy_version: 1,
         metadata_key_id: None,
@@ -62,7 +65,7 @@ fn envelope_round_trips_through_json() {
 }
 
 #[test]
-fn envelope_carries_artifact_and_source_refs() {
+fn envelope_carries_artifact_source_and_credential_refs() {
     let art = Id::new(IdKind::Artifact);
     let parent_session = Id::new(IdKind::Session);
     let e = EventEnvelope::create(NewEvent {
@@ -86,6 +89,12 @@ fn envelope_carries_artifact_and_source_refs() {
             record_id: None,
             skill_id: None,
         }],
+        credential_refs: vec![CredentialRef {
+            cred_ref: "vault://agent/acme/github".into(),
+            provider: Some("github".into()),
+            scope: Some("repo:read".into()),
+            expires_at_ms: Some(1_000_000),
+        }],
         idempotency_key: None,
         policy_version: 1,
         metadata_key_id: None,
@@ -96,6 +105,8 @@ fn envelope_carries_artifact_and_source_refs() {
     assert_eq!(e.source_refs.len(), 1);
     assert_eq!(e.source_refs[0].session_id, Some(parent_session));
     assert_eq!(e.source_refs[0].seq, Some(42));
+    assert_eq!(e.credential_refs.len(), 1);
+    assert_eq!(e.credential_refs[0].cred_ref, "vault://agent/acme/github");
 }
 
 #[test]
@@ -109,6 +120,7 @@ fn idempotency_key_is_omitted_from_json_when_none() {
         payload: serde_json::json!(null),
         artifact_refs: vec![],
         source_refs: vec![],
+        credential_refs: vec![],
         idempotency_key: None,
         policy_version: 1,
         metadata_key_id: None,
@@ -118,5 +130,9 @@ fn idempotency_key_is_omitted_from_json_when_none() {
     assert!(
         v.get("idempotency_key").is_none(),
         "idempotency_key should be omitted when None; got {v}"
+    );
+    assert!(
+        v.get("credential_refs").is_none(),
+        "credential_refs should be omitted when empty; got {v}"
     );
 }

@@ -36,6 +36,8 @@ def capture(client):
             return response(body={"event_id": "evt_2", "seq": 1, "recent": []})
         if url.endswith("/fork"):
             return response(body={"session_id": "ses_child", "agent_id": "agt_1"})
+        if url.endswith("/replay-prefix"):
+            return response(body={"events": []})
         if url.endswith("/replay"):
             return response(body={"events": []})
         if url.endswith("/context"):
@@ -68,6 +70,7 @@ def test_v2_urls_cover_core_flow():
         session.append_and_fetch({"hello": "again"})
         session.fork(at_seq=0, alias="branch")
         session.replay()
+        session.materialize_replay_prefix()
         session.context(include=["recent_events", "records"])
         c.watch(tenant["tenant_id"], scope="tenant")
         c.put_artifact(tenant["tenant_id"], b"blob")
@@ -83,6 +86,7 @@ def test_v2_urls_cover_core_flow():
     assert any("/append-and-fetch" in url for url in urls)
     assert any("/fork" in url for url in urls)
     assert any("/replay" in url for url in urls)
+    assert any("/replay-prefix" in url for url in urls)
     assert any("/context" in url for url in urls)
     assert any("/watch" in url for url in urls)
 
@@ -179,6 +183,25 @@ def test_session_append_requires_agent_id():
         Client("http://x").session("ten_1", "ses_1").append({"x": 1})
 
 
+def test_append_rejects_raw_secret_payload_fields_before_request():
+    c = Client("http://x")
+    calls, patched = capture(c)
+    session = c.session("ten_1", "ses_1", agent_id="agt_1")
+
+    with patched:
+        with pytest.raises(ValueError, match=r"input\[0\]\.access_token"):
+            session.append({"input": [{"access_token": "raw"}]})
+
+        session.append(
+            {"input": [{"repo": "agentdb"}]},
+            credential_refs=[{"cred_ref": "vault://agent/acme/github"}],
+        )
+
+    assert len(calls) == 1
+    body = calls[0][2]["json"]
+    assert body["credential_refs"] == [{"cred_ref": "vault://agent/acme/github"}]
+
+
 def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
     event = Event.from_dict(
         {
@@ -192,6 +215,7 @@ def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
             "runtime_version": "2026-04-28",
             "artifact_refs": [{"artifact_id": "art_1", "bytes": 4}],
             "source_refs": [{"event_id": "evt_call"}],
+            "credential_refs": [{"cred_ref": "vault://agent/acme/github"}],
             "metadata_key_id": "tenant:ten_1:default",
             "metadata_key_version": "v3",
             "created_at_ms": 123,
@@ -200,6 +224,7 @@ def test_event_from_dict_preserves_envelope_refs_and_key_metadata():
 
     assert event.artifact_refs == [{"artifact_id": "art_1", "bytes": 4}]
     assert event.source_refs == [{"event_id": "evt_call"}]
+    assert event.credential_refs == [{"cred_ref": "vault://agent/acme/github"}]
     assert event.runtime_version == "2026-04-28"
     assert event.metadata_key_id == "tenant:ten_1:default"
     assert event.metadata_key_version == "v3"

@@ -53,6 +53,17 @@ test("tool payload builders match pairing contract", () => {
     summary: "tests passed",
     duration_ms: 12,
   });
+  const sanitized = toolResult("call_1", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz12345", {
+    output: {
+      stdout:
+        "password=hunter2 sk-abcdefghijklmnopqrstuvwxyz ghp_abcdefghijklmnopqrstuvwxyz123456 AKIA1234567890ABCDEF",
+    },
+  });
+  assert.equal(sanitized.summary, "Authorization: Bearer [REDACTED]");
+  assert.equal(
+    (sanitized.output as Record<string, unknown>).stdout,
+    "password=[REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+  );
   assert.deepEqual(
     toolError("call_1", "tests timed out", {
       code: "TIMEOUT",

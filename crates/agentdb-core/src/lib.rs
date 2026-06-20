@@ -38,7 +38,7 @@ pub mod tenant;
 pub use agent::{Agent, NewAgent};
 pub use artifact::{Artifact, NewArtifact};
 pub use errors::{Error, ErrorCode};
-pub use event::{ArtifactRef, EventEnvelope, NewEvent, SourceRef};
+pub use event::{ArtifactRef, CredentialRef, EventEnvelope, NewEvent, SourceRef};
 pub use id::{Id, IdKind};
 pub use idempotency::{IdempotencyRecord, IdempotencyStore};
 pub use policy::{
@@ -47,15 +47,18 @@ pub use policy::{
 pub use record::{IndexingMode, IndexingPolicy, NewRecord, RecordStatus, SearchableRecord};
 pub use runtime::{
     BackpressureReport, BackpressureSignal, ChangefeedItem, ContextInclude, ContextRequest,
-    ContextResponse, FleetStorageSummary, ForkSessionRequest, GcSweepReport, LifecycleCounts,
-    LifecycleSweepReport, MetadataFilter, MetadataFilterCondition, MetadataFilterOp, NewRecordEdge,
-    PolicyWorkerReport, RecordEdge, RecordEdgeType, RecordIndexStats, RecordSearchMatch,
-    RecordSearchScoreComponents, RecordUpdate, ReplayResponse, Runtime, SessionStorageSummary,
-    TenantMetaEntry, TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope,
-    RUNTIME_PRIMARY_TABLET_ID,
+    ContextResponse, FleetStorageSummary, ForkEdge, ForkSessionRequest, GcSweepReport,
+    LifecycleCounts, LifecycleSweepReport, MetadataFilter, MetadataFilterCondition,
+    MetadataFilterOp, NewRecordEdge, NewSnapshotRef, PolicyWorkerReport, RecordEdge,
+    RecordEdgeType, RecordIndexStats, RecordSearchMatch, RecordSearchScoreComponents, RecordUpdate,
+    ReplayResponse, Runtime, SessionStorageSummary, SnapshotResolution, TenantMetaEntry,
+    TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
 };
-pub use segment::{SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile};
-pub use session::{Lifecycle, NewSession, Session};
+pub use segment::{
+    ReplayPrefixFile, ReplayPrefixManifest, SessionArchiveFile, SessionArchiveManifest,
+    SessionSegment, SessionSegmentFile,
+};
+pub use session::{Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tablet_state::{
     LoggedTabletStateMachine, TabletApplyResult, TabletCommand, TabletStateMachine, TabletWriteOp,

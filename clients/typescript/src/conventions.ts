@@ -109,12 +109,51 @@ export function toolResult(
   return compact({
     tool_call_id: toolCallId,
     status: opts.status ?? "ok",
-    summary,
-    output: opts.output,
+    summary: sanitizeToolOutput(summary),
+    output: opts.output === undefined ? undefined : sanitizeToolOutput(opts.output),
     duration_ms: opts.durationMs,
     exit_code: opts.exitCode,
-    metadata: opts.metadata,
+    metadata: opts.metadata === undefined ? undefined : sanitizeToolOutput(opts.metadata),
   });
+}
+
+const SECRET_ASSIGNMENT_RE = /\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|refresh[_-]?token|secret[_-]?access[_-]?key)\b(\s*[:=]\s*)([^\s,;]+)/gi;
+const AUTHORIZATION_RE = /\b(authorization\s*[:=]\s*(?:Bearer\s+)?)([^\s,;]+)/gi;
+const BEARER_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{20,}\b/gi;
+const OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{16,}\b/g;
+const GITHUB_TOKEN_RE = /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+const AWS_ACCESS_KEY_RE = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
+
+function sanitizeToolOutput(value: unknown): unknown {
+  return sanitizeToolOutputValue(value, new WeakSet<object>());
+}
+
+function sanitizeToolOutputValue(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === "string") return sanitizeSecretText(value);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return value;
+    seen.add(value);
+    return value.map((child) => sanitizeToolOutputValue(child, seen));
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, child]) => [
+      key,
+      sanitizeToolOutputValue(child, seen),
+    ])
+  );
+}
+
+function sanitizeSecretText(text: string): string {
+  return text
+    .replace(AUTHORIZATION_RE, "$1[REDACTED]")
+    .replace(BEARER_RE, "$1[REDACTED]")
+    .replace(SECRET_ASSIGNMENT_RE, "$1$2[REDACTED]")
+    .replace(OPENAI_KEY_RE, "[REDACTED]")
+    .replace(GITHUB_TOKEN_RE, "[REDACTED]")
+    .replace(AWS_ACCESS_KEY_RE, "[REDACTED]");
 }
 
 export function toolError(

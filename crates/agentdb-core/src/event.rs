@@ -29,6 +29,19 @@ pub struct SourceRef {
     pub skill_id: Option<Id>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialRef {
+    /// Opaque reference resolved by an agent-metadata DB / vault outside
+    /// AgentDB. This is a reference only; never store the secret value here.
+    pub cred_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub tenant_id: Id,
@@ -42,6 +55,8 @@ pub struct EventEnvelope {
     pub payload: serde_json::Value,
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_refs: Vec<SourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_refs: Vec<CredentialRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub policy_version: u64,
@@ -64,6 +79,7 @@ pub struct NewEvent {
     pub payload: serde_json::Value,
     pub artifact_refs: Vec<ArtifactRef>,
     pub source_refs: Vec<SourceRef>,
+    pub credential_refs: Vec<CredentialRef>,
     pub idempotency_key: Option<String>,
     pub policy_version: u64,
     pub metadata_key_id: Option<String>,
@@ -84,6 +100,7 @@ impl EventEnvelope {
             payload: req.payload,
             artifact_refs: req.artifact_refs,
             source_refs: req.source_refs,
+            credential_refs: req.credential_refs,
             idempotency_key: req.idempotency_key,
             policy_version: req.policy_version,
             metadata_key_id: req.metadata_key_id,

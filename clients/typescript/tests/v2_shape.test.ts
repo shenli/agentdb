@@ -21,6 +21,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
     if (raw.endsWith("/events")) return json({ event_id: "evt_1", seq: 0 });
     if (raw.endsWith("/append-and-fetch")) return json({ event_id: "evt_2", seq: 1, recent: [] });
     if (raw.endsWith("/fork")) return json({ session_id: "ses_child", agent_id: "agt_1" });
+    if (raw.includes("/replay-prefix")) return json({ events: [] });
     if (raw.includes("/replay")) return json({ events: [] });
     if (raw.endsWith("/context")) return json({ events: [], records: [], skills: [] });
     if (raw.includes("/watch")) return json([]);
@@ -40,6 +41,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   await session.appendAndFetch({ hello: "again" });
   await session.fork({ atSeq: 0, alias: "branch" });
   await session.replay();
+  await session.materializeReplayPrefix();
   await session.context({ include: ["recent_events", "records"] });
   await c.watch(String(tenant.tenant_id));
   await c.putArtifact(String(tenant.tenant_id), new Blob(["blob"]));
@@ -53,6 +55,7 @@ test("V2 SDK maps the core flow to tenant-scoped routes", async () => {
   assert.ok(calls.some((url) => url.includes("/append-and-fetch")));
   assert.ok(calls.some((url) => url.includes("/fork")));
   assert.ok(calls.some((url) => url.includes("/replay")));
+  assert.ok(calls.some((url) => url.includes("/replay-prefix")));
   assert.ok(calls.some((url) => url.includes("/context")));
   assert.ok(calls.some((url) => url.includes("/watch")));
 });
@@ -91,6 +94,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
             payload: { tool_call_id: "call_1" },
             artifact_refs: [{ artifact_id: "art_1" }],
             source_refs: [{ event_id: "evt_call" }],
+            credential_refs: [{ cred_ref: "vault://agent/acme/github" }],
             metadata_key_id: "tenant:ten_1:default",
             metadata_key_version: "v1",
           },
@@ -117,6 +121,7 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   const user = await session.appendUser("hello", { fetchLastN: 5 });
   const call = await session.toolCall("call_1", "sandbox.exec", { cmd: "python report.py" }, {
     sourceRefs: [eventRef(user)],
+    credentialRefs: [{ cred_ref: "vault://agent/acme/github", provider: "github" }],
   });
   const artifact = await session.artifacts.put(new Blob(["blob"]), { contentType: "text/plain" });
   await session.toolResult("call_1", "Generated report.", {
@@ -148,7 +153,16 @@ test("friendly SDK binds workspace agent session aliases and canonical ids", asy
   });
   assert.deepEqual(replayed[0]?.artifactRefs, [{ artifact_id: "art_1" }]);
   assert.deepEqual(replayed[0]?.sourceRefs, [{ event_id: "evt_call" }]);
+  assert.deepEqual(replayed[0]?.credentialRefs, [{ cred_ref: "vault://agent/acme/github" }]);
   assert.equal(replayed[0]?.metadataKeyId, "tenant:ten_1:default");
+  assert.ok(
+    calls.some((call) => {
+      const body = call.body as Record<string, unknown> | undefined;
+      return Array.isArray(body?.credential_refs)
+        && (body.credential_refs[0] as Record<string, unknown> | undefined)?.cred_ref
+          === "vault://agent/acme/github";
+    })
+  );
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/agents/agt_1/sessions")));
   assert.ok(calls.some((call) => call.url.includes("/api/tenants/ten_1/sessions/ses_1/events")));
 });
@@ -231,6 +245,31 @@ test("record search carries the last tenant commit sequence", async () => {
 test("append requires an agent id", async () => {
   const c = new Client({ baseUrl: "http://x", fetch: (async () => json({})) as typeof globalThis.fetch });
   await assert.rejects(() => c.session("ten_1", "ses_1").append({ x: 1 }), /agentId/);
+});
+
+test("append rejects raw secret payload fields before request", async () => {
+  const calls: unknown[] = [];
+  const mockFetch = async (_url: string | URL, init?: RequestInit) => {
+    calls.push(typeof init?.body === "string" ? JSON.parse(init.body) : undefined);
+    return json({ event_id: "evt_1", seq: 0 });
+  };
+
+  const c = new Client({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const session = c.session("ten_1", "ses_1", { agentId: "agt_1" });
+
+  await assert.rejects(
+    () => session.append({ input: [{ access_token: "raw" }] }),
+    /input\[0\]\.access_token/
+  );
+  await session.append(
+    { input: [{ repo: "agentdb" }] },
+    { credentialRefs: [{ cred_ref: "vault://agent/acme/github" }] }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual((calls[0] as Record<string, unknown>).credential_refs, [
+    { cred_ref: "vault://agent/acme/github" },
+  ]);
 });
 
 test("constructor rejects token + getToken combined", () => {

@@ -41,6 +41,7 @@ export interface Event {
   runtimeVersion?: string;
   artifactRefs: Record<string, unknown>[];
   sourceRefs: Record<string, unknown>[];
+  credentialRefs: Record<string, unknown>[];
   metadataKeyId?: string;
   metadataKeyVersion?: string;
   createdAtMs: number;
@@ -63,6 +64,7 @@ export interface AppendOptions {
   agentId?: AgentId;
   artifactRefs?: unknown[];
   sourceRefs?: unknown[];
+  credentialRefs?: unknown[];
   idempotencyKey?: string;
   fetchLastN?: number;
   actorId?: number;
@@ -96,6 +98,7 @@ export interface ModelMessageOptions {
 
 export interface ToolCallOptions {
   sourceRefs?: Record<string, unknown>[];
+  credentialRefs?: Record<string, unknown>[];
   idempotencyKey?: string;
   handId?: string;
   timeoutMs?: number;
@@ -413,6 +416,10 @@ export class SessionHandle {
 
   async replay(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
     return await this.session.replay(opts);
+  }
+
+  async materializeReplayPrefix(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    return await this.session.materializeReplayPrefix(opts);
   }
 
   async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<SessionHandle> {
@@ -806,6 +813,7 @@ export class Session {
       {
         kind: SessionEventKind.ToolCall,
         sourceRefs: opts.sourceRefs,
+        credentialRefs: opts.credentialRefs,
         idempotencyKey: opts.idempotencyKey,
       }
     );
@@ -884,6 +892,14 @@ export class Session {
     return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
   }
 
+  async materializeReplayPrefix(opts: { fromSeq?: number; limit?: number } = {}): Promise<Event[]> {
+    const url = new URL(`${this._client.baseUrl}/api/tenants/${enc(this.tenantId)}/sessions/${enc(this.sessionId)}/replay-prefix`);
+    if (opts.fromSeq !== undefined) url.searchParams.set("from_seq", String(opts.fromSeq));
+    url.searchParams.set("limit", String(opts.limit ?? 100));
+    const data = await (this._client as unknown as { _requestAbsolute(method: string, url: URL): Promise<Record<string, unknown>> })._requestAbsolute("POST", url);
+    return Array.isArray(data.events) ? data.events.map(eventFromDict) : [];
+  }
+
   async fork(opts: { atSeq: number; alias?: string | null } | string): Promise<Session> {
     const body = typeof opts === "string"
       ? { at_seq: 0, alias: opts }
@@ -928,14 +944,84 @@ export class Session {
   private appendBody(payload: unknown, opts: AppendOptions): Record<string, unknown> {
     const agentId = opts.agentId ?? this.agentId;
     if (!agentId) throw new Error("agentId is required for append");
+    validateNoRawSecretFields(payload);
     return {
       agent_id: agentId,
       kind: opts.kind ?? "message",
       payload,
       artifact_refs: opts.artifactRefs ?? [],
       source_refs: opts.sourceRefs ?? [],
+      credential_refs: opts.credentialRefs ?? [],
     };
   }
+}
+
+const RAW_SECRET_FIELD_NAMES = new Set([
+  "accesstoken",
+  "apikey",
+  "authtoken",
+  "authorization",
+  "bearertoken",
+  "clientsecret",
+  "openaiapikey",
+  "password",
+  "passwd",
+  "personalaccesstoken",
+  "privatekey",
+  "pwd",
+  "refreshtoken",
+  "secret",
+  "secretaccesskey",
+  "token",
+]);
+
+function validateNoRawSecretFields(payload: unknown): void {
+  const path = firstRawSecretFieldPath(payload, [], new WeakSet<object>());
+  if (path !== undefined) {
+    throw new Error(
+      `append payload field \`${path}\` looks like a raw secret; use credentialRefs for opaque vault / broker references`
+    );
+  }
+}
+
+function firstRawSecretFieldPath(value: unknown, path: string[], seen: WeakSet<object>): string | undefined {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+    for (let idx = 0; idx < value.length; idx += 1) {
+      path.push(`[${idx}]`);
+      const found = firstRawSecretFieldPath(value[idx], path, seen);
+      if (found !== undefined) return found;
+      path.pop();
+    }
+    return undefined;
+  }
+  if (value === null || typeof value !== "object") return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    path.push(key);
+    if (isRawSecretFieldName(key)) return formatSecretPath(path);
+    const found = firstRawSecretFieldPath(child, path, seen);
+    if (found !== undefined) return found;
+    path.pop();
+  }
+  return undefined;
+}
+
+function formatSecretPath(path: string[]): string {
+  let out = "";
+  for (const part of path) {
+    if (part.startsWith("[")) out += part;
+    else if (out) out += `.${part}`;
+    else out = part;
+  }
+  return out;
+}
+
+function isRawSecretFieldName(key: string): boolean {
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  return RAW_SECRET_FIELD_NAMES.has(normalized);
 }
 
 function eventFromDict(d: unknown): Event {
@@ -952,6 +1038,7 @@ function eventFromDict(d: unknown): Event {
     runtimeVersion: stringOrUndefined(rec.runtime_version),
     artifactRefs: arrayRecords(rec.artifact_refs),
     sourceRefs: arrayRecords(rec.source_refs),
+    credentialRefs: arrayRecords(rec.credential_refs),
     metadataKeyId: stringOrUndefined(rec.metadata_key_id),
     metadataKeyVersion: stringOrUndefined(rec.metadata_key_version),
     createdAtMs: Number(rec.created_at_ms ?? 0),

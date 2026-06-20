@@ -43,6 +43,7 @@ All conventions use the existing event envelope:
   "payload": {},
   "artifact_refs": [],
   "source_refs": [],
+  "credential_refs": [],
   "policy_version": 1
 }
 ```
@@ -56,6 +57,13 @@ Rules:
   `payload`.
 - `source_refs` points to the session events, artifacts, records, or skills that
   caused or informed this event.
+- `credential_refs` records opaque vault / broker references such as
+  `cred_ref`, never credential values. The harness or control plane resolves
+  these refs outside AgentDB and injects real auth at egress. Native SDKs reject
+  payload keys shaped like raw credentials before append; tenants or agents can
+  also opt into `secret_handling.deny_raw_secret_fields` for the same server-side
+  backstop. The runtime always sanitizes common credential tokens from inline
+  `tool_result` output string values before storing the event.
 - `runtime_version` is the release identifier of the runtime that wrote the
   event. Treat it as opaque provenance, not as a compatibility contract.
 - Payloads that need their own independent version should include
@@ -346,6 +354,11 @@ Optional payload fields:
 | `duration_ms` | number | Execution duration. |
 | `exit_code` | number | Process exit code when relevant. |
 | `metadata` | object | Adapter-specific details. |
+
+Native SDK `tool_result` helpers and the runtime append path sanitize obvious
+credential tokens in `summary`, `output`, and `metadata` string values before
+storage. Large raw stdout/stderr still belongs in artifacts, not inline
+payloads.
 
 Example:
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 
+from ._secrets import sanitize_tool_output
+
 
 class SessionEventKind(str, Enum):
     USER_MESSAGE = "user_message"
@@ -125,11 +127,11 @@ def tool_result(
         {
             "tool_call_id": tool_call_id,
             "status": status,
-            "summary": summary,
-            "output": dict(output) if output is not None else None,
+            "summary": sanitize_tool_output(summary),
+            "output": sanitize_tool_output(dict(output)) if output is not None else None,
             "duration_ms": duration_ms,
             "exit_code": exit_code,
-            "metadata": dict(metadata) if metadata is not None else None,
+            "metadata": sanitize_tool_output(dict(metadata)) if metadata is not None else None,
         }
     )
 

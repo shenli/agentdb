@@ -69,6 +69,31 @@ pub struct SessionArchiveFile {
     pub events: Vec<EventEnvelope>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayPrefixManifest {
+    pub prefix_id: Id,
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub event_count: u64,
+    pub bytes: u64,
+    pub sha256: String,
+    pub fork_depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key_version: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayPrefixFile {
+    pub runtime_version: String,
+    pub prefix_id: Id,
+    pub tenant_id: Id,
+    pub session_id: Id,
+    pub events: Vec<EventEnvelope>,
+}
+
 impl SessionSegment {
     pub fn new(req: NewSessionSegment) -> Self {
         Self {
@@ -83,6 +108,18 @@ impl SessionSegment {
             content_key_id: req.content_key_id,
             content_key_version: req.content_key_version,
             created_at_ms: crate::now_ms(),
+        }
+    }
+}
+
+impl ReplayPrefixFile {
+    pub fn from_events(manifest: &ReplayPrefixManifest, events: Vec<EventEnvelope>) -> Self {
+        Self {
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
+            prefix_id: manifest.prefix_id.clone(),
+            tenant_id: manifest.tenant_id.clone(),
+            session_id: manifest.session_id.clone(),
+            events,
         }
     }
 }
