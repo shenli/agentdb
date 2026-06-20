@@ -150,6 +150,108 @@ async fn fork_replay_bounds_ancestor_reads_to_fork_point() {
 }
 
 #[tokio::test]
+async fn materialized_replay_prefix_collapses_deep_fork_chain_reads() {
+    let (rt, tenant, agent, root) = seed().await;
+    for n in 0..6 {
+        rt.append(AppendRequest::simple(
+            &tenant,
+            &agent,
+            &root,
+            "root",
+            serde_json::json!({"n": n}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let child = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: root.session_id.clone(),
+            at_seq: 2,
+            alias: Some("prefix-child".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &child,
+        "child",
+        serde_json::json!({"n": 10}),
+    ))
+    .await
+    .unwrap();
+
+    let grandchild = rt
+        .fork_session(ForkSessionRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: child.session_id.clone(),
+            at_seq: 0,
+            alias: Some("prefix-grandchild".into()),
+        })
+        .await
+        .unwrap();
+    rt.append(AppendRequest::simple(
+        &tenant,
+        &agent,
+        &grandchild,
+        "grandchild",
+        serde_json::json!({"n": 20}),
+    ))
+    .await
+    .unwrap();
+
+    let stitched = rt
+        .replay_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert_eq!(stitched.fork_depth, 2);
+    assert_eq!(stitched.segments_scanned, 3);
+    assert!(!stitched.materialized_prefix);
+
+    let materialized = rt
+        .materialize_replay_prefix(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert!(materialized.materialized_prefix);
+    assert_eq!(materialized.fork_depth, 2);
+    assert_eq!(materialized.segments_scanned, 2);
+
+    let replay = rt
+        .replay_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    assert!(replay.materialized_prefix);
+    assert_eq!(replay.segments_scanned, 2);
+    let kinds: Vec<_> = replay
+        .events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect();
+    assert_eq!(kinds, vec!["root", "root", "root", "child", "grandchild"]);
+    let replay_ids: Vec<_> = replay
+        .events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect();
+    let stitched_ids: Vec<_> = stitched
+        .events
+        .iter()
+        .map(|event| event.event_id.as_str())
+        .collect();
+    assert_eq!(replay_ids, stitched_ids);
+
+    let stored = rt
+        .get_session(&tenant.tenant_id, &grandchild.session_id)
+        .await
+        .unwrap();
+    let prefix = stored.replay_prefix.expect("prefix manifest persisted");
+    assert_eq!(prefix.event_count, 4);
+    assert_eq!(prefix.fork_depth, 2);
+}
+
+#[tokio::test]
 async fn context_builder_respects_includes_and_byte_budget() {
     let (rt, tenant, agent, session) = seed().await;
     for n in 0..3 {

@@ -209,6 +209,11 @@ does what it is good at:
   refs; sandbox restore remains external by design)**.
 - **Resume.** Restore the sandbox filesystem from the ref'd snapshot, then replay
   the session tail from AgentDB. Two stores, stitched by the ref.
+- **Deep fork replay.** AgentDB can materialize a forked session's non-leaf
+  replay prefix into a durable content object and store a `ReplayPrefixManifest`
+  on the leaf session **(implemented)**. Future replay reads that compact prefix
+  plus the leaf tail, so a deep fork chain does not require rewalking every
+  ancestor on every read.
 
 Fork is lightweight precisely because the session log never tries to capture
 filesystem state, only point at it.
@@ -485,14 +490,16 @@ That is a real and sufficient market, but it means the positioning must target
 
 ## Open Questions
 
-- What durable replay-prefix materialization or segment compaction makes very
-  deep fork chains cheap enough to make fork a headline behavior?
+- What policy should automatically trigger replay-prefix materialization in
+  production: fork depth, replay scan count, byte threshold, explicit caller
+  request, or lifecycle sweep budget?
 
 High-priority runtime/security items from this architecture pass are now
 implemented: lifecycle policy enforcement, snapshot refs, fork-aware watch and
 export feeds, `watch` frontier cursors, event-level credential refs, SDK
 raw-secret validators, SDK/runtime `tool_result` output sanitization, and the
-opt-in server-side raw-secret field reject policy. Fork replay also now bounds
-ancestor reads to each fork point and reports replay scan stats. The sandbox
-snapshot ownership/restore/retention contract is defined, with implementation
-remaining in the external sandbox service by design.
+opt-in server-side raw-secret field reject policy. Fork replay now bounds
+ancestor reads to each fork point, reports replay scan stats, and supports
+durable materialized replay prefixes for deep chains. The sandbox snapshot
+ownership/restore/retention contract is defined, with implementation remaining
+in the external sandbox service by design.

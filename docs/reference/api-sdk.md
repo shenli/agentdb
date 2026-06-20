@@ -293,9 +293,11 @@ GET  /api/admin/exports
 ```
 
 `replay` returns the stitched logical session history plus scan stats:
-`fork_depth`, `segments_scanned`, and `events_scanned`. Fork ancestor reads are
-bounded to the fork point (`at_seq + 1`) instead of scanning the full ancestor
-tail.
+`fork_depth`, `segments_scanned`, `events_scanned`, and
+`materialized_prefix`. Fork ancestor reads are bounded to the fork point
+(`at_seq + 1`) instead of scanning the full ancestor tail. The core runtime can
+also materialize a forked session's non-leaf replay prefix so later replay reads
+a compact prefix object plus the leaf session tail.
 
 Sandbox filesystem snapshots are coordinated through AgentDB snapshot refs and
 an external sandbox service. See

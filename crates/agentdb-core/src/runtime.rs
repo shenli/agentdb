@@ -48,7 +48,8 @@ use crate::persist::{Persist, RecordIndexMutationOp};
 use crate::policy::{Priority, RuntimePolicy};
 use crate::record::{IndexingMode, NewRecord, RecordStatus, SearchableRecord};
 use crate::segment::{
-    SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile,
+    ReplayPrefixFile, ReplayPrefixManifest, SessionArchiveFile, SessionArchiveManifest,
+    SessionSegment, SessionSegmentFile,
 };
 use crate::session::{ForkRef, Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 use crate::skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
@@ -434,6 +435,8 @@ pub struct ReplayResponse {
     pub segments_scanned: usize,
     #[serde(default)]
     pub events_scanned: usize,
+    #[serde(default)]
+    pub materialized_prefix: bool,
 }
 
 /// Request to record a sandbox snapshot reference at a session `seq`. AgentDB
@@ -474,6 +477,8 @@ pub struct SessionStorageSummary {
     pub sealed_segment_count: usize,
     pub sealed_segments: Vec<SessionSegment>,
     pub archive_manifest: Option<SessionArchiveManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_prefix: Option<ReplayPrefixManifest>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2162,6 +2167,7 @@ impl Runtime {
             sealed_segment_count: session.sealed_segments.len(),
             sealed_segments: session.sealed_segments.clone(),
             archive_manifest: session.archive_manifest.clone(),
+            replay_prefix: session.replay_prefix.clone(),
         }
     }
 
@@ -2334,6 +2340,123 @@ impl Runtime {
             event_count: file.events.len() as u64,
             bytes: plaintext.len() as u64,
             sha256: plaintext_sha256,
+            content_key_id: Some(content_key.key_id.clone()),
+            content_key_version: content_key.key_version.clone(),
+            created_at_ms: crate::now_ms(),
+        })
+    }
+
+    async fn read_replay_prefix_events(
+        &self,
+        manifest: &ReplayPrefixManifest,
+    ) -> Result<Vec<EventEnvelope>> {
+        let current_key = self.resolve_key(&manifest.tenant_id, KeyOperation::ContentRead)?;
+        let stored_bytes = self
+            .content
+            .get(manifest.tenant_id.as_str(), manifest.prefix_id.as_str())
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("replay prefix get failed: {e}"),
+                )
+            })?;
+        let (content_key, ciphertext) = match decode_keyed_envelope(&stored_bytes).map_err(|e| {
+            Error::new(
+                ErrorCode::Internal,
+                format!("replay prefix envelope failed: {e}"),
+            )
+        })? {
+            Some((recorded_key, ciphertext)) => (recorded_key, ciphertext),
+            None => (
+                key_from_parts(&manifest.content_key_id, &manifest.content_key_version)
+                    .unwrap_or(current_key),
+                stored_bytes,
+            ),
+        };
+        let crypto_context = ContentCryptoContext {
+            tenant_id: manifest.tenant_id.as_str(),
+            artifact_id: manifest.prefix_id.as_str(),
+            key: &content_key,
+        };
+        let plaintext = self
+            .content_crypto
+            .decrypt(&crypto_context, &ciphertext)
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("replay prefix decrypt failed: {e}"),
+                )
+            })?;
+        let file: ReplayPrefixFile = serde_json::from_slice(&plaintext).map_err(|e| {
+            Error::new(
+                ErrorCode::Internal,
+                format!("replay prefix decode failed: {e}"),
+            )
+        })?;
+        if file.prefix_id.as_str() != manifest.prefix_id.as_str()
+            || file.tenant_id.as_str() != manifest.tenant_id.as_str()
+            || file.session_id.as_str() != manifest.session_id.as_str()
+        {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                "replay prefix content does not match manifest",
+            ));
+        }
+        Ok(file.events)
+    }
+
+    async fn write_replay_prefix(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+        events: Vec<EventEnvelope>,
+        fork_depth: usize,
+    ) -> Result<ReplayPrefixManifest> {
+        let prefix_id = Id::new(IdKind::Segment);
+        let content_key = self.resolve_key(tenant_id, KeyOperation::ContentWrite)?;
+        let file = ReplayPrefixFile {
+            runtime_version: crate::RUNTIME_VERSION.to_string(),
+            prefix_id: prefix_id.clone(),
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            events,
+        };
+        let plaintext = serde_json::to_vec(&file)
+            .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+        let plaintext_sha256 = sha256_hex(&plaintext);
+        let crypto_context = ContentCryptoContext {
+            tenant_id: tenant_id.as_str(),
+            artifact_id: prefix_id.as_str(),
+            key: &content_key,
+        };
+        let encrypted_bytes = self
+            .content_crypto
+            .encrypt(&crypto_context, &plaintext)
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("replay prefix encrypt failed: {e}"),
+                )
+            })?;
+        let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
+        self.content
+            .put(tenant_id.as_str(), prefix_id.as_str(), &stored_bytes)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("replay prefix put failed: {e}"),
+                )
+            })?;
+        Ok(ReplayPrefixManifest {
+            prefix_id,
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            event_count: file.events.len() as u64,
+            bytes: plaintext.len() as u64,
+            sha256: plaintext_sha256,
+            fork_depth,
             content_key_id: Some(content_key.key_id.clone()),
             content_key_version: content_key.key_version.clone(),
             created_at_ms: crate::now_ms(),
@@ -4100,11 +4223,39 @@ impl Runtime {
     }
 
     pub async fn replay_session(&self, tenant_id: &Id, session_id: &Id) -> Result<ReplayResponse> {
+        let leaf = self.get_session(tenant_id, session_id).await?;
+        if let Some(prefix) = leaf.replay_prefix.clone() {
+            let mut events = self.read_replay_prefix_events(&prefix).await?;
+            let mut leaf_events = self
+                .fetch_from_seq(FetchRequest {
+                    tenant_id: tenant_id.clone(),
+                    session_id: session_id.clone(),
+                    from_seq: 0,
+                    limit: usize::MAX,
+                })
+                .await?;
+            let events_scanned = events.len() + leaf_events.len();
+            events.append(&mut leaf_events);
+            return Ok(ReplayResponse {
+                session_id: session_id.clone(),
+                events,
+                fork_depth: prefix.fork_depth,
+                segments_scanned: 2,
+                events_scanned,
+                materialized_prefix: true,
+            });
+        }
+
         let mut segments: Vec<(Id, Option<u64>)> = Vec::new();
-        let mut current_id = session_id.clone();
+        let mut current_id = leaf.session_id.clone();
         let mut current_cutoff = None;
+        let mut next_session = Some(leaf);
         loop {
-            let session = self.get_session(tenant_id, &current_id).await?;
+            let session = if let Some(session) = next_session.take() {
+                session
+            } else {
+                self.get_session(tenant_id, &current_id).await?
+            };
             segments.push((session.session_id.clone(), current_cutoff));
             let Some(parent) = session.forked_from else {
                 break;
@@ -4142,7 +4293,73 @@ impl Runtime {
             fork_depth,
             segments_scanned,
             events_scanned,
+            materialized_prefix: false,
         })
+    }
+
+    /// Materialize the non-leaf replay prefix for a forked session. Future
+    /// `replay_session` calls read one compact prefix object plus the leaf tail
+    /// instead of rewalking every ancestor.
+    pub async fn materialize_replay_prefix(
+        &self,
+        tenant_id: &Id,
+        session_id: &Id,
+    ) -> Result<ReplayResponse> {
+        let session_commit_lock = self.session_commit_lock(session_id);
+        let _session_commit_guard = session_commit_lock.lock().await;
+        let leaf = self.get_session(tenant_id, session_id).await?;
+        if leaf.forked_from.is_none() {
+            return self.replay_session(tenant_id, session_id).await;
+        }
+        if leaf.replay_prefix.is_some() {
+            return self.replay_session(tenant_id, session_id).await;
+        }
+
+        let replay = self.replay_session(tenant_id, session_id).await?;
+        let prefix_events = replay
+            .events
+            .iter()
+            .filter(|event| event.session_id.as_str() != session_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        let manifest = self
+            .write_replay_prefix(tenant_id, session_id, prefix_events, replay.fork_depth)
+            .await?;
+        let updated = {
+            let mut s = self.state.lock().await;
+            let session = s
+                .sessions
+                .get_mut(session_id.as_str())
+                .filter(|sess| {
+                    sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
+                })
+                .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))?;
+            if session.forked_from != leaf.forked_from {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    "session fork lineage changed during replay prefix materialization",
+                ));
+            }
+            session.replay_prefix = Some(manifest.clone());
+            session.clone()
+        };
+        if let Some(p) = &self.persist {
+            if let Err(e) = p.put_session(&updated) {
+                {
+                    let mut s = self.state.lock().await;
+                    if let Some(session) = s.sessions.get_mut(session_id.as_str()) {
+                        session.replay_prefix = leaf.replay_prefix.clone();
+                    }
+                }
+                let _ = self
+                    .content
+                    .delete(tenant_id.as_str(), manifest.prefix_id.as_str())
+                    .await;
+                return Err(internal(e));
+            }
+        }
+
+        self.replay_session(tenant_id, session_id).await
     }
 
     /// Register a V2.3 skill. `(tenant_id, name, version)` is unique.

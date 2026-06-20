@@ -54,7 +54,10 @@ pub use runtime::{
     ReplayResponse, Runtime, SessionStorageSummary, SnapshotResolution, TenantMetaEntry,
     TenantStorageSummary, TenantWorkerReport, WatchRequest, WatchScope, RUNTIME_PRIMARY_TABLET_ID,
 };
-pub use segment::{SessionArchiveFile, SessionArchiveManifest, SessionSegment, SessionSegmentFile};
+pub use segment::{
+    ReplayPrefixFile, ReplayPrefixManifest, SessionArchiveFile, SessionArchiveManifest,
+    SessionSegment, SessionSegmentFile,
+};
 pub use session::{Lifecycle, NewSession, Session, SnapshotLayer, SnapshotRef};
 pub use skill::{AgentSkillBinding, BindSkillRequest, NewSkill, Skill};
 pub use tablet_state::{

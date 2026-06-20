@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::id::{Id, IdKind};
-use crate::segment::{SessionArchiveManifest, SessionSegment};
+use crate::segment::{ReplayPrefixManifest, SessionArchiveManifest, SessionSegment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +23,7 @@ pub enum Lifecycle {
     DerivativeOnly,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkRef {
     pub session_id: Id,
     pub at_seq: u64,
@@ -84,6 +84,11 @@ pub struct Session {
     pub sealed_segments: Vec<SessionSegment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_manifest: Option<SessionArchiveManifest>,
+    /// Durable materialized logical replay prefix for forked sessions. This
+    /// contains ancestor lineage events up to the leaf fork point; leaf-session
+    /// events remain in the normal hot/sealed/archive path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_prefix: Option<ReplayPrefixManifest>,
     /// Sandbox snapshot references recorded over the session's life, ordered by
     /// `at_seq`. AgentDB holds refs only; bytes live in the sandbox FS / object
     /// store. See `record_session_snapshot` / `resolve_resume_snapshot`.
@@ -123,6 +128,7 @@ impl Session {
             warm_head_from_seq: 0,
             sealed_segments: vec![],
             archive_manifest: None,
+            replay_prefix: None,
             snapshots: vec![],
             deleted_at_ms: None,
         }
