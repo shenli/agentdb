@@ -34,6 +34,40 @@ The native API is the canonical AgentDB runtime surface.
   do not reshape features into generic CRUD/database abstractions without a
   clear reason.
 
+## PR Documentation Sync
+
+This repo configures the general `shenli/dev-skills@pr-doc-sync` workflow.
+
+When finishing, pushing, or opening a pull request, check whether the change
+updates product behavior, runtime semantics, architecture, operations, API/SDK
+surface, deployment behavior, implementation status, support boundaries, or
+known limitations.
+
+If it does, update the relevant docs before calling the PR complete:
+
+- Design and implementation status:
+  `docs/architecture/current-design.md`
+- Product progress, remaining gaps, roadmap, and open product questions:
+  `docs/product-roadmap.md`
+- Product thesis, positioning, workload fit, and non-goals:
+  `docs/architecture/agentdb-product-thesis.md`
+- Implementation map and crate/runtime boundaries:
+  `docs/architecture/ARCHITECTURE.md`
+- API and SDK behavior:
+  `docs/reference/api-sdk.md`
+- MongoDB adapter behavior:
+  `docs/reference/mongodb-compatibility.md`
+- Sandbox snapshot behavior:
+  `docs/reference/sandbox-snapshot-contract.md`
+- Operations, deployment, performance, cluster, and local validation behavior:
+  `docs/operations/`
+- Error handling and operator remediation:
+  `docs/runbooks/`
+- Release readiness or public packaging changes:
+  `docs/release-checklist.md`
+
+If docs are not needed, state why in the PR summary or final response.
+
 ## MongoDB Client Compatibility
 
 AgentDB has a limited MongoDB wire adapter for clients and tools. It is not a

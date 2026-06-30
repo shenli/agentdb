@@ -1,8 +1,8 @@
 # AgentDB Architecture
 
 This document describes the current implementation shape. The product thesis is
-in [`agent-db.md`](agent-db.md), and the design commitments are in
-[`DESIGN.md`](DESIGN.md).
+in [`agentdb-product-thesis.md`](agentdb-product-thesis.md), and the design commitments are in
+[`current-design.md`](current-design.md).
 
 ## Layers
 

@@ -3,9 +3,9 @@
 This document covers day-2 operation of the **supported** AgentDB deployment
 shape: one server node.
 
-For deployment choices, see [DEPLOYMENT.md](DEPLOYMENT.md). For multi-node
-status, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md). For human and AI-agent
-operations, use [agentdbctl](AGENTDBCTL.md) by default.
+For deployment choices, see [deployment.md](deployment.md). For multi-node
+status, see [cluster-status.md](cluster-status.md). For human and AI-agent
+operations, use [agentdbctl](agentdbctl.md) by default.
 
 ## Scope
 
@@ -224,4 +224,4 @@ This document does not describe:
 - shard or placement rebalancing
 
 Those are not yet supported operator workflows in the current repository. See
-[CLUSTER_STATUS.md](CLUSTER_STATUS.md).
+[cluster-status.md](cluster-status.md).

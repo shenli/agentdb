@@ -207,7 +207,7 @@ round-trip to the SlateDB column as a rough production estimate.
 Interpretation: SlateDB on LocalFileSystem is about 2.7× slower than
 RocksDB — expected overhead for async-over-sync bridging plus the
 LSM layering. Both remain well within the agent-workload tail-latency
-budget from `docs/architecture/agent-db.md` §1.1. The throughput cost is mostly
+budget from `docs/architecture/agentdb-product-thesis.md` §1.1. The throughput cost is mostly
 in the fixed per-call overhead of the sync→async bridge, not the
 scan itself, so larger scans close the gap.
 

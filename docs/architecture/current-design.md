@@ -1,4 +1,4 @@
-# AgentDB Design
+# AgentDB Current Design
 
 AgentDB is a runtime database for AI agent platforms. It is designed around
 agent-native runtime objects rather than a compatibility facade for an existing
@@ -57,6 +57,31 @@ The current product shape is intentionally narrow:
 - object-store-backed runtime metadata is an optional evaluation path; the
   production write architecture should not depend on synchronous object-store
   writes for every append
+
+## Implementation Status
+
+This document is the current-state design contract. It intentionally separates
+runtime features that are implemented from integration work that belongs outside
+AgentDB or still needs product hardening.
+
+| Area | Status | Notes |
+|---|---|---|
+| Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, skill, policy, and tenant metadata exist in the Rust runtime and native API. |
+| Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. |
+| Append loop | Implemented | Per-session serialized append, contiguous `seq`, append-and-fetch, idempotency, backpressure signals, and raw-secret write-path guards. |
+| Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, replay scan stats, and explicit replay-prefix materialization over core/HTTP/SDK surfaces. |
+| Changefeeds | Implemented | Session subscribe, cursor-based `watch`, fork-edge control items, durable `export_watch`, and managed export consumers with claim/ack/rewind. |
+| Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths. |
+| Records and retrieval | Implemented for scoped runtime retrieval | Durable base records, local/global indexes, commit-sequence visibility repair, record edges, and source refs exist. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
+| Skills | Implemented | Versioned skill manifests and agent bindings are runtime objects; exact-version replay is supported through event refs and bindings. |
+| Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
+| Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
+| Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
+| MongoDB compatibility | Implemented narrow adapter | Optional MongoDB wire listener maps a fixed command/collection subset onto native runtime methods. It is not full MongoDB compatibility. |
+| Dashboard | Implemented baseline | Session-first dashboard exists; richer replay/fork/context/artifact inspection remains product work. |
+| Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, Docker/Compose/Helm examples, backup manifest/checkpoint endpoint, and runbooks exist. Restore apply, upgrade, and routine maintenance still need a boring operator story. |
+| Distributed/tablet operation | Evaluation/hardening | Metadata-backed routing, tablets, shard ranges, forwarding, tablet movement, snapshots, and Raft-backed write paths exist. This is not yet the default production deployment shape. |
+| Observability exporters | Partially implemented | Durable export primitives and managed consumers exist. First-party ClickHouse/ClickStack/JSONL/Parquet tooling is still maturing around those primitives. |
 
 ## Active Interfaces
 
@@ -138,11 +163,13 @@ retrying clients do not duplicate events or registrations.
 
 Fork creates a child session with fresh child-local sequence numbers and replay
 visibility over parent events through the fork point. Replay is explicit and
-fork-aware.
+fork-aware. Deep fork chains can be collapsed by materializing the non-leaf
+replay prefix into durable content and replaying that prefix plus the leaf tail.
 
 Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant, session, and agent watch returns changefeed items with cursors for
-higher-level consumers.
+higher-level consumers. Fork creation is emitted as a first-class fork-edge
+control item rather than by re-emitting ancestor events.
 
 Observability export is the durable sink boundary. Export endpoints serve
 tenant-scoped envelopes for events and runtime metadata, support backfill plus
@@ -186,6 +213,19 @@ execute requested tools or sandboxes as external hands
 append tool calls, tool results, model outputs, approvals, and artifacts
 repeat or sleep
 ```
+
+Sandbox resume uses a related two-store flow:
+
+```text
+resolve newest non-expired SnapshotRef for the session/fork point
+sandbox service restores the referenced filesystem layers
+AgentDB replays the session tail after the snapshot point
+append recovered agent status and continue
+```
+
+AgentDB stores the snapshot reference and replay truth. The sandbox service owns
+filesystem bytes, copy-on-write fork, mount, restore, and snapshot garbage
+collection.
 
 The canonical observability flow is:
 

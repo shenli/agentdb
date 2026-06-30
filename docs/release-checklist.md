@@ -102,5 +102,5 @@ ops/local-ci/scripts/local-ci.sh
   durability profile, working-set shape, workload mix, concurrency, warmup,
   measured duration, repeats, and caveats.
 - Do not publish benchmark ratios without the detailed methodology in
-  [operations/AGENTDB_BENCH.md](operations/AGENTDB_BENCH.md) and
+  [operations/agentdb-bench.md](operations/agentdb-bench.md) and
   [../tools/agentdb-bench/README.md](../tools/agentdb-bench/README.md).

@@ -313,9 +313,9 @@ exceptions. The ones an agent should know:
   [`examples/mongodb/node/quickstart.js`](examples/mongodb/node/quickstart.js)
   shows safe MongoDB client compatibility usage.
 - **Why this database exists** (motivation, requirements,
-  principles): [`docs/architecture/agent-db.md`](docs/architecture/agent-db.md).
+  principles): [`docs/architecture/agentdb-product-thesis.md`](docs/architecture/agentdb-product-thesis.md).
 - **What the architecture commits to** (identity, layering,
-  real-time, deployment): [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md).
+  real-time, deployment): [`docs/architecture/current-design.md`](docs/architecture/current-design.md).
 - **What the code does today**:
   [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
 - **OpenAPI spec**: `GET /openapi.json` on a running server.

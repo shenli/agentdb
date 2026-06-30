@@ -1,12 +1,14 @@
-# AgentDB: Agent Runtime Database
+# AgentDB Product Thesis
 
 AgentDB is a runtime database for AI agent platforms. It stores the durable
 execution state that lets agent systems recover, inspect, resume, replay, fork,
 and audit work.
 
 This document is the **why**: motivation, workload requirements, design
-principles, positioning, and open questions. For the current design
-commitments, see [`DESIGN.md`](DESIGN.md). For the implementation shape, see
+principles, positioning, and product-shaping questions. It avoids tracking
+feature-by-feature implementation status; for the current design contract and
+status table, see [`current-design.md`](current-design.md). For the live gap tracker, see
+[`../product-roadmap.md`](../product-roadmap.md). For the implementation shape, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## What AgentDB Is, By Elimination
@@ -245,11 +247,11 @@ AgentDB therefore needs:
 - observability for runaway sessions and noisy neighbors
 - operational paths that do not require per-tenant manual work
 
-The current implementation is single-node first, but the tenant model is
-deliberate. Tenant boundaries are part of the architecture: routes, policies,
-quotas, lifecycle work, watch scopes, storage accounting, and future placement
-decisions all preserve tenant scope. A future distributed implementation should
-extend those concepts instead of inventing a second product surface.
+The product is single-node first, but the tenant model is deliberate. Tenant
+boundaries are part of the architecture: routes, policies, quotas, lifecycle
+work, watch scopes, storage accounting, and placement decisions all preserve
+tenant scope. Distributed and managed deployments should extend those concepts
+instead of inventing a second product surface.
 
 Tenant identity is infrastructure state. Authentication and user-info metadata
 should establish the tenant/workspace boundary, while normal application code
@@ -508,6 +510,73 @@ AgentDB is not:
 
 Those systems can integrate with AgentDB. They should not be hidden inside it.
 
+## Workload Fit And Tradeoffs
+
+AgentDB should earn its place by being meaningfully better than general-purpose
+databases on one narrow workload: durable runtime state for AI agents.
+
+The target hot path is:
+
+```text
+append event -> assign session seq -> persist -> fetch recent/context state
+```
+
+Generic databases can implement this with multiple calls and application-side
+coordination. AgentDB makes it one runtime operation with built-in ordering,
+idempotency, policy, and visibility. The advantage should come from removing
+round trips and generic database machinery from the agent turn loop, not from
+trying to be a faster general-purpose database.
+
+Target direction:
+
+- **10x lower latency** on the agent-loop hot path where one AgentDB operation
+  replaces multiple generic database calls.
+- **10% retained-history cost** for long-lived session/event history by moving
+  inactive data out of hot database storage and into cheaper content/object
+  storage.
+
+These are product targets, not claims about the current implementation.
+
+AgentDB is intended to be a strong fit for:
+
+| Workload | Why AgentDB Should Fit |
+|---|---|
+| Agent turn loops | One append-and-fetch operation instead of several database calls |
+| Long-running sessions | Ordered durable history with replay and lifecycle |
+| Agent debugging | Session replay, fork, watch, and event envelopes are first-class |
+| Retry-heavy execution | Idempotency keys and ordered append are runtime semantics |
+| Large retained traces | Cold/archive storage can reduce hot database footprint |
+| Framework adapters | Adapters map to primitives instead of rebuilding them |
+| Tenant-scoped agent platforms | Runtime identity, policy, quota, and lifecycle are tenant-aware |
+
+AgentDB is probably not the right primary database for:
+
+| Workload | Better Fit |
+|---|---|
+| Product OLTP data | Postgres, MySQL, MongoDB, DynamoDB |
+| Arbitrary document apps | MongoDB |
+| Key-value/table apps with fixed access patterns | DynamoDB |
+| Complex relational transactions | Postgres or another relational database |
+| Analytical workloads | Warehouses, lakehouses, OLAP engines |
+| Standalone vector search | Vector/search databases |
+| General log analytics | Log/search platforms |
+| Full MongoDB/DynamoDB compatibility | MongoDB or DynamoDB |
+
+The benchmark scope should stay explicit:
+
+```text
+append event + fetch last N events
+append event + build context under budget
+replay 1k / 10k / 100k event sessions
+fork + continue
+watch active sessions
+retain 1M / 100M / 1B events for 90 or 365 days
+restore or replay archived history
+```
+
+If AgentDB cannot produce order-of-magnitude wins on these paths, the product
+needs to be rethought.
+
 ## Recommended Pattern: Config As Events
 
 AgentDB does not need a separate configuration store for many agent-platform
@@ -578,7 +647,9 @@ Why event-sourced plans fit AgentDB:
 
 ## Open Questions
 
-These questions remain product-shaping rather than fully settled:
+These are product-shaping questions, not the implementation gap tracker. See
+[`../product-roadmap.md`](../product-roadmap.md) for current feature progress and remaining
+engineering work.
 
 ### How Load-Bearing Is Fork?
 
@@ -605,8 +676,10 @@ pays for derivative generation.
 
 Some users will need raw traces for auditability. Others may prefer a cheaper
 mode that preserves summaries, records, and artifacts while deleting raw event
-payloads after a retention window. This choice affects product positioning,
-compliance, and storage architecture.
+or artifact payloads after a retention window. AgentDB already supports
+lifecycle and derivative-only artifact purge semantics; the open product
+question is how opinionated the default retention modes should be for different
+markets and compliance profiles.
 
 ### How Much Search Belongs In The Runtime Database?
 
@@ -623,9 +696,11 @@ search systems when the search workload becomes a product in its own right.
 
 ### What Is The Right Distributed Shape?
 
-The current priority is excellent single-node operation. Future distributed
-work should preserve the same native objects and runtime semantics. The open
-question is where to draw boundaries between control plane, data plane, indexing,
+The product priority remains excellent single-node operation, while the codebase
+also contains evaluation machinery for tablets, routing, movement, snapshots,
+and Raft-backed write paths. Future distributed work should preserve the same
+native objects and runtime semantics. The open question is where to draw
+boundaries between open-source server behavior, managed control plane, indexing,
 and artifact storage without making self-hosting too complex.
 
 ## References
