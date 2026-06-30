@@ -14,9 +14,6 @@ public docs path.
   implementation status, constraints, and non-goals
 - [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
   deliberately out-of-scope work, and open questions
-- [architecture/agent-runtime-architecture.md](architecture/agent-runtime-architecture.md)
-  - the emerging brains/hands/sessions stack, the three storage tiers and trust
-  boundary, and why AgentDB is a runtime store (not observability)
 - [architecture/architecture.md](architecture/architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
 - [architecture/storage-engine.md](architecture/storage-engine.md) - current

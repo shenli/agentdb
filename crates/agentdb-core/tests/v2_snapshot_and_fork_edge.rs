@@ -1,5 +1,6 @@
 //! Tests for the sandbox snapshot-ref protocol (#2) and the fork-aware
-//! changefeed (#4). See `docs/architecture/agent-runtime-architecture.md`.
+//! changefeed (#4). See `docs/architecture/design.md` and
+//! `docs/reference/sandbox-snapshot-contract.md`.
 
 use agentdb_core::runtime::{
     AppendRequest, ExportWatchRequest, ForkSessionRequest, NewSnapshotRef, Runtime, WatchRequest,

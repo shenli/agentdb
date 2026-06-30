@@ -43,6 +43,42 @@ framework adapters choose which slices, summaries, records, artifacts, and
 skills to pass to a model, while AgentDB preserves the underlying execution
 truth.
 
+## Runtime Boundaries
+
+AgentDB fits into a three-part agent platform stack:
+
+- **Brains**: models, harnesses, planners, context builders, and agent loops.
+- **Hands**: sandboxes, tools, MCP servers, browsers, filesystems, and external
+  systems.
+- **Sessions**: durable execution state that lets brains recover, inspect,
+  resume, replay, fork, and audit work.
+
+The matching storage boundaries are intentionally separate:
+
+| Storage tier | Holds | Workload shape |
+|---|---|---|
+| Agent metadata / vault | agent definitions, identity, config, credentials | low-volume, read-mostly, trusted |
+| AgentDB session store | ordered execution log, fork graph, artifact refs, records, lifecycle | append-heavy, per-session tail reads, replay/fork |
+| Sandbox filesystem | working files, scratch state, tool output bytes | POSIX read/write, large blobs, snapshot-on-demand |
+
+AgentDB is always below the credential trust line. Credentials live in the
+control plane / vault and are injected at egress by a broker. AgentDB stores
+opaque `credential_refs`, event history, artifacts refs, and runtime metadata;
+it must not store secret values, mounted filesystem paths, host credentials, or
+bearer-token object-store URLs.
+
+Sandbox state follows the same separation. AgentDB stores layered
+`SnapshotRef` metadata at committed session sequence numbers, while an external
+sandbox service owns byte capture, copy-on-write fork, restore, mount, and byte
+retention. Resume restores the referenced filesystem layers, then replays the
+AgentDB session tail from the snapshot point. Fork is a pointer in AgentDB and a
+copy-on-write relationship in the sandbox store.
+
+Memory, observability, analytics, and lakehouse data are derived tiers. They
+consume the durable session log through `watch` / `export_watch`; they do not
+own runtime truth. If a derived projection is lost or built incorrectly, it
+should be rebuildable from AgentDB history.
+
 ## Current Commitments
 
 The current product shape is intentionally narrow:
@@ -170,6 +206,12 @@ Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant, session, and agent watch returns changefeed items with cursors for
 higher-level consumers. Fork creation is emitted as a first-class fork-edge
 control item rather than by re-emitting ancestor events.
+
+Fork-aware feeds are feeds over a DAG of per-session sub-streams. Each physical
+event is emitted once on the session where it was written. A fork emits a
+`fork_edge` control item carrying `(parent_id, fork_point_seq, child_id)` so
+consumers can discover and follow child streams without duplicating parent
+history. Opaque frontier cursors track per-session next-sequence positions.
 
 Observability export is the durable sink boundary. Export endpoints serve
 tenant-scoped envelopes for events and runtime metadata, support backfill plus
