@@ -576,7 +576,7 @@ pub struct ExportWatchRequest {
 /// was forked from `parent_session_id` at `fork_point_seq`, so a consumer
 /// following the parent can discover the child sub-stream. It carries no events:
 /// fork is a pointer, not a re-emission of ancestor history. See
-/// `docs/architecture/design.md` (fork-aware feeds).
+/// `docs/design/design.md` (fork-aware feeds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkEdge {
     pub parent_session_id: Id,

@@ -12,7 +12,7 @@
 -- absent. `client_ip` is pulled from X-Forwarded-For when a
 -- reverse proxy fronts the node; NULL otherwise (our axum
 -- server doesn't expose the socket peer in the middleware path
--- today — see docs/architecture/architecture.md § admin audit).
+-- today — see docs/design/architecture.md § admin audit).
 --
 -- Retention: unmanaged — operators prune by vacuuming the
 -- meta store. At ~100B/row, 10M rows ≈ 1 GiB. Future work:

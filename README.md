@@ -31,7 +31,7 @@ runtime surface.
 - **Stream live state** to dashboards, supervisors, evaluators, and tools.
 
 General databases can store agent data. AgentDB focuses on the workload shape
-described in [docs/architecture/agentdb-product-thesis.md](docs/architecture/agentdb-product-thesis.md):
+described in [docs/design/product-thesis.md](docs/design/product-thesis.md):
 large semi-structured events, sharp hot-to-cold lifecycle changes, large total
 history, recent session-tail reads, and agent-native primitives.
 
@@ -133,7 +133,7 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 | First local run | [docs/quickstart.md](docs/quickstart.md) |
 | API and SDK surface | [docs/reference/api-sdk.md](docs/reference/api-sdk.md) |
 | MongoDB adapter rules | [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md) |
-| Architecture | [docs/architecture/architecture.md](docs/architecture/architecture.md) |
+| Architecture | [docs/design/architecture.md](docs/design/architecture.md) |
 | Deployment | [docs/operations/deployment.md](docs/operations/deployment.md) |
 | Operations | [docs/operations/operations.md](docs/operations/operations.md) |
 | Benchmarks | [tools/agentdb-bench](tools/agentdb-bench/README.md) |

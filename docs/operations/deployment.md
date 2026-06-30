@@ -198,6 +198,6 @@ Before exposing a maintained node:
   procedures
 - [cluster-alerts.md](cluster-alerts.md) - evaluation cluster alert triage
 - [performance.md](performance.md) - benchmark notes and current caveats
-- [../architecture/architecture.md](../architecture/architecture.md) - current
+- [../design/architecture.md](../design/architecture.md) - current
   process, storage, routing, and lifecycle implementation
 - [../runbooks/README.md](../runbooks/README.md) - API-error runbooks

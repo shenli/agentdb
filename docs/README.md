@@ -8,17 +8,17 @@ public docs path.
 
 - [quickstart.md](quickstart.md) - shortest path from checkout to a stored and
   replayable agent session
-- [architecture/agentdb-product-thesis.md](architecture/agentdb-product-thesis.md) - product thesis,
+- [design/product-thesis.md](design/product-thesis.md) - product thesis,
   workload requirements, positioning, and systems rationale
-- [architecture/design.md](architecture/design.md) - durable design commitments,
+- [design/design.md](design/design.md) - durable design commitments,
   implementation status, constraints, and non-goals
 - [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
   deliberately out-of-scope work, and open questions
-- [architecture/architecture.md](architecture/architecture.md) - current crate
+- [design/architecture.md](design/architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
-- [architecture/storage-engine.md](architecture/storage-engine.md) - current
+- [design/storage-engine.md](design/storage-engine.md) - current
   storage engine and replicated tablet/split-LSM improvement plan
-- [architecture/distributed-storage-cluster.md](architecture/distributed-storage-cluster.md)
+- [design/distributed-storage-cluster.md](design/distributed-storage-cluster.md)
   - next-step design for cells, AZ-aware placement, tenant blast radius, and
   distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
@@ -87,10 +87,10 @@ small repo-wide entrypoints.
 
 ## Forward-Looking Designs
 
-- [architecture/observability-export.md](architecture/observability-export.md)
+- [design/observability-export.md](design/observability-export.md)
   - design for exporting AgentDB runtime truth into observability and analytics
   sinks
-- [architecture/tiered-storage-redesign.md](architecture/tiered-storage-redesign.md)
+- [design/tiered-storage-redesign.md](design/tiered-storage-redesign.md)
   - redesign for real hot/cold/archive session storage and large artifact
   content handling
 - [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license

@@ -4,7 +4,7 @@ This document describes the intended redesign of AgentDB's hot/cold/archive
 storage model. It is a forward-looking design document. For the current
 implementation shape, see [`architecture.md`](architecture.md). For the product
 motivation behind lifecycle-aware runtime storage, see
-[`agentdb-product-thesis.md`](agentdb-product-thesis.md).
+[`product-thesis.md`](product-thesis.md).
 
 ## Problem
 

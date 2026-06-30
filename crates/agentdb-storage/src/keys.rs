@@ -1,6 +1,6 @@
 //! Tenant-first logical key encoders for runtime objects.
 //!
-//! See `docs/architecture/architecture.md` for the runtime/storage layout this module
+//! See `docs/design/architecture.md` for the runtime/storage layout this module
 //! supports. Every key starts with the namespace, then the tenant_id, then the
 //! object identity. This guarantees that a tenant-scoped prefix scan returns
 //! only that tenant's data and that range delete is a single prefix operation.

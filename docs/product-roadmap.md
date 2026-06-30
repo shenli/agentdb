@@ -2,9 +2,9 @@
 
 AgentDB is still pre-release. This roadmap tracks product progress and gaps in
 plain product terms rather than internal milestone names. For the current design
-contract, see [`architecture/design.md`](architecture/design.md).
+contract, see [`design/design.md`](design/design.md).
 For the conceptual motivation and positioning, see
-[`architecture/agentdb-product-thesis.md`](architecture/agentdb-product-thesis.md).
+[`design/product-thesis.md`](design/product-thesis.md).
 
 ## Implemented
 
