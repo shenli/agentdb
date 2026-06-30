@@ -119,6 +119,20 @@ AgentDB or still needs product hardening.
 | Distributed/tablet operation | Evaluation/hardening | Metadata-backed routing, tablets, shard ranges, forwarding, tablet movement, snapshots, and Raft-backed write paths exist. This is not yet the default production deployment shape. |
 | Observability exporters | Partially implemented | Durable export primitives and managed consumers exist. First-party ClickHouse/ClickStack/JSONL/Parquet tooling is still maturing around those primitives. |
 
+## Component Design Map
+
+Use this map to avoid overloading one design doc with every subsystem detail.
+
+| Question | Read |
+|---|---|
+| Why AgentDB exists, what it is not, and which workload it targets | [`product-thesis.md`](product-thesis.md) |
+| Current design contract and implementation status | this document |
+| Crate boundaries, request flow, API routes, and runtime implementation map | [`architecture.md`](architecture.md) |
+| Hot storage engine, tablet-local LSM state, Raft commit-before-apply, split/merge, placement classes, and index placement | [`tablet-storage-engine.md`](tablet-storage-engine.md) |
+| Cluster storage topology, cells, AZ placement, tenant blast radius, failover, scheduler behavior, and cluster validation | [`cluster-storage-topology.md`](cluster-storage-topology.md) |
+| Warm/cold/archive/derivative-only lifecycle, sealed segments, archive manifests, artifact byte lifecycle, and restore semantics | [`lifecycle-storage.md`](lifecycle-storage.md) |
+| Observability export ledger, managed consumers, ClickHouse/ClickStack path, sink contracts, and backfill | [`observability-export.md`](observability-export.md) |
+
 ## Active Interfaces
 
 The primary developer interface is the SDK surface. The supported public

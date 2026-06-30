@@ -1,8 +1,10 @@
-# AgentDB Tiered Storage Redesign
+# AgentDB Lifecycle Storage
 
-This document describes the intended redesign of AgentDB's hot/cold/archive
-storage model. It is a forward-looking design document. For the current
-implementation shape, see [`architecture.md`](architecture.md). For the product
+This document describes AgentDB's warm/cold/archive/derivative-only storage
+model for session history and artifact bytes. It is a forward-looking design
+document. For the current implementation shape, see [`architecture.md`](architecture.md).
+For the tablet-local hot storage engine, see
+[`tablet-storage-engine.md`](tablet-storage-engine.md). For the product
 motivation behind lifecycle-aware runtime storage, see
 [`product-thesis.md`](product-thesis.md).
 

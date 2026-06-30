@@ -1,9 +1,15 @@
-# AgentDB Storage Engine Architecture
+# AgentDB Tablet Storage Engine
 
 Status: design note
 
-This document describes the current AgentDB storage engine and the target
-direction for improving durability, scalability, and LSM-tree behavior.
+This document describes AgentDB's hot storage engine: current `KvStore`
+backends, the target replicated tablet write path, tablet-local LSM state,
+split/merge, placement classes, encryption metadata, and index placement.
+
+For cluster topology, cells, AZ placement, and operational hardening, see
+[`cluster-storage-topology.md`](cluster-storage-topology.md). For warm/cold/archive
+session lifecycle and artifact byte tiering, see
+[`lifecycle-storage.md`](lifecycle-storage.md).
 
 ## Summary
 

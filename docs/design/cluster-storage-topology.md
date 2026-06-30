@@ -1,4 +1,4 @@
-# Distributed Storage Cluster Next Step
+# Cluster Storage Topology
 
 Status: Track A and bounded Track B implemented; two-cell failover smoke
 passes; online split/merge cutover hardening continues
@@ -8,6 +8,10 @@ distributed storage cluster. It combines the existing replicated tablet design
 with multi-tenant blast-radius control, cell boundaries, availability-zone
 placement, and the validation plan needed before cluster mode should be treated
 as a supported production surface.
+
+For the tablet-local hot storage engine, see
+[`tablet-storage-engine.md`](tablet-storage-engine.md). For warm/cold/archive
+lifecycle semantics, see [`lifecycle-storage.md`](lifecycle-storage.md).
 
 ## Summary
 

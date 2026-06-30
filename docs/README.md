@@ -16,9 +16,9 @@ public docs path.
   deliberately out-of-scope work, and open questions
 - [design/architecture.md](design/architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
-- [design/storage-engine.md](design/storage-engine.md) - current
-  storage engine and replicated tablet/split-LSM improvement plan
-- [design/distributed-storage-cluster.md](design/distributed-storage-cluster.md)
+- [design/tablet-storage-engine.md](design/tablet-storage-engine.md) - hot
+  tablet storage engine, Raft commit path, and split-LSM improvement plan
+- [design/cluster-storage-topology.md](design/cluster-storage-topology.md)
   - next-step design for cells, AZ-aware placement, tenant blast radius, and
   distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
@@ -90,8 +90,8 @@ small repo-wide entrypoints.
 - [design/observability-export.md](design/observability-export.md)
   - design for exporting AgentDB runtime truth into observability and analytics
   sinks
-- [design/tiered-storage-redesign.md](design/tiered-storage-redesign.md)
-  - redesign for real hot/cold/archive session storage and large artifact
+- [design/lifecycle-storage.md](design/lifecycle-storage.md)
+  - warm/cold/archive session storage semantics and large artifact
   content handling
 - [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license
   and release notice guidance
