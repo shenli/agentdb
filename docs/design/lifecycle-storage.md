@@ -1,10 +1,12 @@
-# AgentDB Tiered Storage Redesign
+# AgentDB Lifecycle Storage
 
-This document describes the intended redesign of AgentDB's hot/cold/archive
-storage model. It is a forward-looking design document. For the current
-implementation shape, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the product
+This document describes AgentDB's warm/cold/archive/derivative-only storage
+model for session history and artifact bytes. It is a forward-looking design
+document. For the current implementation shape, see [`architecture.md`](architecture.md).
+For the tablet-local hot storage engine, see
+[`tablet-storage-engine.md`](tablet-storage-engine.md). For the product
 motivation behind lifecycle-aware runtime storage, see
-[`agent-db.md`](agent-db.md).
+[`product-thesis.md`](product-thesis.md).
 
 ## Problem
 
@@ -422,6 +424,72 @@ documentation.
   index, or summary-only representation.
 
 This keeps lifecycle movement independent from the search contract.
+
+## Artifact Content Optimization
+
+Artifacts are not normal session events. They are typically larger, more
+expensive to transfer, more likely to be binary, and more likely to benefit from
+range reads or streaming. AgentDB should keep the existing separation:
+
+- artifact metadata stays in the runtime store
+- raw artifact bytes live in `ContentBackend`
+- session events carry `artifact_refs`, not raw blob payloads
+
+That split lets append, replay, fork, and context paths stay small while raw
+bytes are fetched only by explicit blob reads.
+
+### Artifact Goals
+
+- Keep session append, replay, and fetch paths small and fast.
+- Make artifact bytes cheap to reference and expensive only when actually read.
+- Support object-store-backed large blobs without full in-memory buffering.
+- Keep artifact lifecycle independent from session metadata lifecycle.
+- Preserve metadata even when raw bytes move storage class or are purged.
+
+### Large Blob API Direction
+
+The current `ContentBackend` shape is memory-oriented: upload takes a complete
+byte slice and download returns the whole blob. That is acceptable for small
+artifacts, but large artifacts need explicit streaming and partial-read paths:
+
+```rust
+trait ContentBackend {
+    async fn put(&self, ...) -> Result<PutResult>;
+    async fn get(&self, ...) -> Result<Vec<u8>>;
+
+    // Future additions:
+    async fn put_stream(&self, ...);
+    async fn get_stream(&self, ...);
+    async fn get_range(&self, ...);
+}
+```
+
+The existing simple APIs can remain for small payloads. Streaming upload,
+streaming download, object-store multipart upload, and range reads should be the
+preferred path for large blobs.
+
+### Artifact Lifecycle
+
+Artifact bytes may need a different lifecycle from session metadata:
+
+- metadata stays hot and queryable
+- raw bytes move to cheaper object-store classes
+- raw bytes may be deleted while metadata and derived state remain
+- integrity verification can confirm object existence and `sha256`
+
+This matches the `DerivativeOnly` direction: users should still be able to see
+what artifact existed, which event referenced it, and which derived records came
+from it, even if the original bytes are gone by policy.
+
+### Artifact Priorities
+
+If artifact work is split into phases, prioritize:
+
+1. streaming upload and download
+2. object-store multipart upload
+3. range reads and partial preview APIs
+4. storage-class transitions and artifact metrics
+5. deduplication and integrity-verification workers
 
 ## Policy Model
 

@@ -31,7 +31,7 @@ runtime surface.
 - **Stream live state** to dashboards, supervisors, evaluators, and tools.
 
 General databases can store agent data. AgentDB focuses on the workload shape
-described in [docs/architecture/agent-db.md](docs/architecture/agent-db.md):
+described in [docs/design/product-thesis.md](docs/design/product-thesis.md):
 large semi-structured events, sharp hot-to-cold lifecycle changes, large total
 history, recent session-tail reads, and agent-native primitives.
 
@@ -121,7 +121,7 @@ or the copyable examples in [examples/mongodb](examples/mongodb/README.md).
 AgentDB's benchmark target is the common agent loop: append the next event and
 fetch the recent session tail needed for the next model or tool step. Current
 single-node benchmark notes and reproduction commands live in
-[docs/operations/PERFORMANCE.md](docs/operations/PERFORMANCE.md) and
+[docs/operations/performance.md](docs/operations/performance.md) and
 [tools/agentdb-bench](tools/agentdb-bench/README.md).
 
 ## Documentation
@@ -133,11 +133,11 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 | First local run | [docs/quickstart.md](docs/quickstart.md) |
 | API and SDK surface | [docs/reference/api-sdk.md](docs/reference/api-sdk.md) |
 | MongoDB adapter rules | [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md) |
-| Architecture | [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) |
-| Deployment | [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) |
-| Operations | [docs/operations/OPERATIONS.md](docs/operations/OPERATIONS.md) |
+| Architecture | [docs/design/architecture.md](docs/design/architecture.md) |
+| Deployment | [docs/operations/deployment.md](docs/operations/deployment.md) |
+| Operations | [docs/operations/operations.md](docs/operations/operations.md) |
 | Benchmarks | [tools/agentdb-bench](tools/agentdb-bench/README.md) |
-| Roadmap | [docs/roadmap.md](docs/roadmap.md) |
+| Roadmap | [docs/product-roadmap.md](docs/product-roadmap.md) |
 
 ## Repository Layout
 

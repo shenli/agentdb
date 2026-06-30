@@ -9,12 +9,12 @@ It covers:
 - what is and is not true cluster deployment today
 
 For start/stop, backup, restore, upgrade, and troubleshooting, see
-[OPERATIONS.md](OPERATIONS.md). For the current distributed-story status, see
-[CLUSTER_STATUS.md](CLUSTER_STATUS.md). For the intended future cluster model,
-see [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) and
-[CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md).
+[operations.md](operations.md). For the current distributed-story status, see
+[cluster-status.md](cluster-status.md). For the intended future cluster model,
+see [cluster-deployment.md](cluster-deployment.md) and
+[cluster-operations.md](cluster-operations.md).
 
-For human operations, prefer [agentdbctl](AGENTDBCTL.md). Raw HTTP endpoints
+For human operations, prefer [agentdbctl](agentdbctl.md). Raw HTTP endpoints
 are the backend contract and are still useful for load balancers, integrations,
 and emergency debugging, but normal operator docs should use the CLI.
 
@@ -159,7 +159,7 @@ If you are looking for those workflows, the right current answer is:
 - they are **not yet a supported deployment mode**
 - there is **no canonical runbook** in this repo for those actions today
 
-See [CLUSTER_STATUS.md](CLUSTER_STATUS.md) for details.
+See [cluster-status.md](cluster-status.md) for details.
 
 ## Recommended Deployment Choice
 
@@ -186,18 +186,18 @@ Before exposing a maintained node:
 
 ## Related Docs
 
-- [OPERATIONS.md](OPERATIONS.md) - start, stop, backup, restore, upgrade, and
+- [operations.md](operations.md) - start, stop, backup, restore, upgrade, and
   troubleshooting
-- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+- [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
-- [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current multi-node status and
+- [cluster-status.md](cluster-status.md) - current multi-node status and
   missing operator workflows
-- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
+- [cluster-deployment.md](cluster-deployment.md) - target cluster topology and
   bootstrap model
-- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
+- [cluster-operations.md](cluster-operations.md) - target day-2 cluster
   procedures
-- [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md) - evaluation cluster alert triage
-- [PERFORMANCE.md](PERFORMANCE.md) - benchmark notes and current caveats
-- [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
+- [cluster-alerts.md](cluster-alerts.md) - evaluation cluster alert triage
+- [performance.md](performance.md) - benchmark notes and current caveats
+- [../design/architecture.md](../design/architecture.md) - current
   process, storage, routing, and lifecycle implementation
 - [../runbooks/README.md](../runbooks/README.md) - API-error runbooks

@@ -32,7 +32,7 @@ pub struct ForkRef {
 /// One layer of a sandbox snapshot. A snapshot is layered, not monolithic
 /// (base image / deps / repo / artifacts), so AgentDB stores a *set* of layer
 /// references rather than a single opaque image. See
-/// `docs/architecture/AGENT_RUNTIME_ARCHITECTURE.md` (snapshot-ref protocol).
+/// `docs/reference/sandbox-snapshot-contract.md`.
 ///
 /// AgentDB holds only the *reference*, never the bytes; `ref_key` resolves in an
 /// external content/object store or the sandbox filesystem layer.

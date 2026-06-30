@@ -4,7 +4,7 @@ description: |
   AgentDB — an agent-native runtime database. Native HTTP API,
   event log, artifacts, records, and context packs. This chart is
   a skeleton for evaluation, not a production-hardened
-  deployment. See docs/ARCHITECTURE.md for the full design.
+  deployment. See docs/design/architecture.md for the full design.
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

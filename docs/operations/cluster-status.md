@@ -121,7 +121,7 @@ If you are looking for those workflows, the answer today is:
 
 ## What Is Implemented Now
 
-For human and AI-agent operations, use [agentdbctl](AGENTDBCTL.md). The
+For human and AI-agent operations, use [agentdbctl](agentdbctl.md). The
 endpoint names below document the backend API surface for precision; normal
 operator workflows should use the CLI equivalents first:
 
@@ -133,11 +133,11 @@ agentdbctl drain status
 ```
 
 For local real-process validation of the current Raft path, use
-[REAL_CLUSTER_SMOKE.md](REAL_CLUSTER_SMOKE.md). That smoke harness is a
+[real-cluster-smoke.md](real-cluster-smoke.md). That smoke harness is a
 development validation tool; it is not a supported production bootstrap
 procedure.
 
-For evaluation alert triage, use [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md). It
+For evaluation alert triage, use [cluster-alerts.md](cluster-alerts.md). It
 documents the first page-level signals for leaderless tablets, lagging
 replicas, stale routing, tablet-store pressure, and checkpoint/snapshot
 failures.
@@ -349,21 +349,21 @@ The honest operational message today is:
 
 Forward-looking target-state docs exist for that future work:
 
-- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md)
-- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md)
+- [cluster-deployment.md](cluster-deployment.md)
+- [cluster-operations.md](cluster-operations.md)
 
 Those documents describe the intended operator model, not a current support
 claim.
 
 ## Related Docs
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) - deployment choices and current support
-- [OPERATIONS.md](OPERATIONS.md) - day-2 single-node operations
-- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+- [deployment.md](deployment.md) - deployment choices and current support
+- [operations.md](operations.md) - day-2 single-node operations
+- [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
-- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
+- [cluster-deployment.md](cluster-deployment.md) - target cluster topology and
   bootstrap model
-- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
+- [cluster-operations.md](cluster-operations.md) - target day-2 cluster
   procedures
-- [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
+- [../design/architecture.md](../design/architecture.md) - current
   implementation shape

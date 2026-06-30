@@ -43,6 +43,42 @@ framework adapters choose which slices, summaries, records, artifacts, and
 skills to pass to a model, while AgentDB preserves the underlying execution
 truth.
 
+## Runtime Boundaries
+
+AgentDB fits into a three-part agent platform stack:
+
+- **Brains**: models, harnesses, planners, context builders, and agent loops.
+- **Hands**: sandboxes, tools, MCP servers, browsers, filesystems, and external
+  systems.
+- **Sessions**: durable execution state that lets brains recover, inspect,
+  resume, replay, fork, and audit work.
+
+The matching storage boundaries are intentionally separate:
+
+| Storage tier | Holds | Workload shape |
+|---|---|---|
+| Agent metadata / vault | agent definitions, identity, config, credentials | low-volume, read-mostly, trusted |
+| AgentDB session store | ordered execution log, fork graph, artifact refs, records, lifecycle | append-heavy, per-session tail reads, replay/fork |
+| Sandbox filesystem | working files, scratch state, tool output bytes | POSIX read/write, large blobs, snapshot-on-demand |
+
+AgentDB is always below the credential trust line. Credentials live in the
+control plane / vault and are injected at egress by a broker. AgentDB stores
+opaque `credential_refs`, event history, artifacts refs, and runtime metadata;
+it must not store secret values, mounted filesystem paths, host credentials, or
+bearer-token object-store URLs.
+
+Sandbox state follows the same separation. AgentDB stores layered
+`SnapshotRef` metadata at committed session sequence numbers, while an external
+sandbox service owns byte capture, copy-on-write fork, restore, mount, and byte
+retention. Resume restores the referenced filesystem layers, then replays the
+AgentDB session tail from the snapshot point. Fork is a pointer in AgentDB and a
+copy-on-write relationship in the sandbox store.
+
+Memory, observability, analytics, and lakehouse data are derived tiers. They
+consume the durable session log through `watch` / `export_watch`; they do not
+own runtime truth. If a derived projection is lost or built incorrectly, it
+should be rebuildable from AgentDB history.
+
 ## Current Commitments
 
 The current product shape is intentionally narrow:
@@ -57,6 +93,45 @@ The current product shape is intentionally narrow:
 - object-store-backed runtime metadata is an optional evaluation path; the
   production write architecture should not depend on synchronous object-store
   writes for every append
+
+## Implementation Status
+
+This document is the current-state design contract. It intentionally separates
+runtime features that are implemented from integration work that belongs outside
+AgentDB or still needs product hardening.
+
+| Area | Status | Notes |
+|---|---|---|
+| Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, skill, policy, and tenant metadata exist in the Rust runtime and native API. |
+| Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. |
+| Append loop | Implemented | Per-session serialized append, contiguous `seq`, append-and-fetch, idempotency, backpressure signals, and raw-secret write-path guards. |
+| Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, replay scan stats, and explicit replay-prefix materialization over core/HTTP/SDK surfaces. |
+| Changefeeds | Implemented | Session subscribe, cursor-based `watch`, fork-edge control items, durable `export_watch`, and managed export consumers with claim/ack/rewind. |
+| Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths. |
+| Records and retrieval | Implemented for scoped runtime retrieval | Durable base records, local/global indexes, commit-sequence visibility repair, record edges, and source refs exist. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
+| Skills | Implemented | Versioned skill manifests and agent bindings are runtime objects; exact-version replay is supported through event refs and bindings. |
+| Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
+| Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
+| Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
+| MongoDB compatibility | Implemented narrow adapter | Optional MongoDB wire listener maps a fixed command/collection subset onto native runtime methods. It is not full MongoDB compatibility. |
+| Dashboard | Implemented baseline | Session-first dashboard exists; richer replay/fork/context/artifact inspection remains product work. |
+| Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, Docker/Compose/Helm examples, backup manifest/checkpoint endpoint, and runbooks exist. Restore apply, upgrade, and routine maintenance still need a boring operator story. |
+| Distributed/tablet operation | Evaluation/hardening | Metadata-backed routing, tablets, shard ranges, forwarding, tablet movement, snapshots, and Raft-backed write paths exist. This is not yet the default production deployment shape. |
+| Observability exporters | Partially implemented | Durable export primitives and managed consumers exist. First-party ClickHouse/ClickStack/JSONL/Parquet tooling is still maturing around those primitives. |
+
+## Component Design Map
+
+Use this map to avoid overloading one design doc with every subsystem detail.
+
+| Question | Read |
+|---|---|
+| Why AgentDB exists, what it is not, and which workload it targets | [`product-thesis.md`](product-thesis.md) |
+| Current design contract and implementation status | this document |
+| Crate boundaries, request flow, API routes, and runtime implementation map | [`architecture.md`](architecture.md) |
+| Hot storage engine, tablet-local LSM state, Raft commit-before-apply, split/merge, placement classes, and index placement | [`tablet-storage-engine.md`](tablet-storage-engine.md) |
+| Cluster storage topology, cells, AZ placement, tenant blast radius, failover, scheduler behavior, and cluster validation | [`cluster-storage-topology.md`](cluster-storage-topology.md) |
+| Warm/cold/archive/derivative-only lifecycle, sealed segments, archive manifests, artifact byte lifecycle, and restore semantics | [`lifecycle-storage.md`](lifecycle-storage.md) |
+| Observability export ledger, managed consumers, ClickHouse/ClickStack path, sink contracts, and backfill | [`observability-export.md`](observability-export.md) |
 
 ## Active Interfaces
 
@@ -138,11 +213,19 @@ retrying clients do not duplicate events or registrations.
 
 Fork creates a child session with fresh child-local sequence numbers and replay
 visibility over parent events through the fork point. Replay is explicit and
-fork-aware.
+fork-aware. Deep fork chains can be collapsed by materializing the non-leaf
+replay prefix into durable content and replaying that prefix plus the leaf tail.
 
 Subscribe currently emits replay-style SSE frames from a requested sequence.
 Tenant, session, and agent watch returns changefeed items with cursors for
-higher-level consumers.
+higher-level consumers. Fork creation is emitted as a first-class fork-edge
+control item rather than by re-emitting ancestor events.
+
+Fork-aware feeds are feeds over a DAG of per-session sub-streams. Each physical
+event is emitted once on the session where it was written. A fork emits a
+`fork_edge` control item carrying `(parent_id, fork_point_seq, child_id)` so
+consumers can discover and follow child streams without duplicating parent
+history. Opaque frontier cursors track per-session next-sequence positions.
 
 Observability export is the durable sink boundary. Export endpoints serve
 tenant-scoped envelopes for events and runtime metadata, support backfill plus
@@ -186,6 +269,19 @@ execute requested tools or sandboxes as external hands
 append tool calls, tool results, model outputs, approvals, and artifacts
 repeat or sleep
 ```
+
+Sandbox resume uses a related two-store flow:
+
+```text
+resolve newest non-expired SnapshotRef for the session/fork point
+sandbox service restores the referenced filesystem layers
+AgentDB replays the session tail after the snapshot point
+append recovered agent status and continue
+```
+
+AgentDB stores the snapshot reference and replay truth. The sandbox service owns
+filesystem bytes, copy-on-write fork, mount, restore, and snapshot garbage
+collection.
 
 The canonical observability flow is:
 

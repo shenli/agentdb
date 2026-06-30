@@ -8,22 +8,17 @@ public docs path.
 
 - [quickstart.md](quickstart.md) - shortest path from checkout to a stored and
   replayable agent session
-- [release-checklist.md](release-checklist.md) - public-release and tag
-  readiness checklist
-- [architecture/agent-db.md](architecture/agent-db.md) - product thesis,
+- [design/product-thesis.md](design/product-thesis.md) - product thesis,
   workload requirements, positioning, and systems rationale
-- [architecture/AGENT_RUNTIME_ARCHITECTURE.md](architecture/AGENT_RUNTIME_ARCHITECTURE.md)
-  - the emerging brains/hands/sessions stack, the three storage tiers and trust
-  boundary, and why AgentDB is a runtime store (not observability)
-- [architecture/DESIGN.md](architecture/DESIGN.md) - durable design commitments,
-  constraints, and non-goals
-- [architecture/TRADEOFFS.md](architecture/TRADEOFFS.md) - what AgentDB is
-  optimized for, where it should win, and where it should not compete
-- [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - current crate
+- [design/design.md](design/design.md) - durable design commitments,
+  implementation status, constraints, and non-goals
+- [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
+  deliberately out-of-scope work, and open questions
+- [design/architecture.md](design/architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
-- [architecture/STORAGE_ENGINE.md](architecture/STORAGE_ENGINE.md) - current
-  storage engine and replicated tablet/split-LSM improvement plan
-- [architecture/DISTRIBUTED_STORAGE_CLUSTER.md](architecture/DISTRIBUTED_STORAGE_CLUSTER.md)
+- [design/tablet-storage-engine.md](design/tablet-storage-engine.md) - hot
+  tablet storage engine, Raft commit path, and split-LSM improvement plan
+- [design/cluster-storage-topology.md](design/cluster-storage-topology.md)
   - next-step design for cells, AZ-aware placement, tenant blast radius, and
   distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
@@ -31,17 +26,19 @@ public docs path.
 
 ## Run And Operate
 
-- [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) - supported deployment
+- [operations/deployment.md](operations/deployment.md) - supported deployment
   paths, packaging modes, and current cluster status
-- [operations/OPERATIONS.md](operations/OPERATIONS.md) - start/stop, backup,
+- [operations/operations.md](operations/operations.md) - start/stop, backup,
   restore, upgrade, and troubleshooting for the supported single-node shape
-- [operations/AGENTDBCTL.md](operations/AGENTDBCTL.md) - human and AI-agent
+- [operations/agentdbctl.md](operations/agentdbctl.md) - human and AI-agent
   friendly admin workflows
-- [operations/PERFORMANCE.md](operations/PERFORMANCE.md) - benchmark commands
+- [operations/performance.md](operations/performance.md) - benchmark commands
   and current performance notes
-- [operations/AGENTDB_BENCH.md](operations/AGENTDB_BENCH.md) - design and
+- [operations/agentdb-bench.md](operations/agentdb-bench.md) - design and
   testing plan for comparing AgentDB with MongoDB and Postgres on agent-runtime
   workloads
+- [operations/local-ci.md](operations/local-ci.md) - local validation profiles
+  used instead of always-on hosted CI
 - [runbooks/README.md](runbooks/README.md) - operator runbooks for API error
   codes and `doc_url` links
 
@@ -52,12 +49,16 @@ small repo-wide entrypoints.
 
 ## Cluster Work
 
-- [operations/CLUSTER_STATUS.md](operations/CLUSTER_STATUS.md) - honest status
+- [operations/cluster-status.md](operations/cluster-status.md) - honest status
   of multi-node support and missing operator workflows today
-- [operations/CLUSTER_DEPLOYMENT.md](operations/CLUSTER_DEPLOYMENT.md) -
+- [operations/cluster-deployment.md](operations/cluster-deployment.md) -
   forward-looking target deployment model for a real AgentDB cluster
-- [operations/CLUSTER_OPERATIONS.md](operations/CLUSTER_OPERATIONS.md) -
+- [operations/cluster-operations.md](operations/cluster-operations.md) -
   forward-looking day-2 workflows for add/remove/replace/drain/upgrade
+- [operations/cluster-alerts.md](operations/cluster-alerts.md) - evaluation
+  cluster alert triage
+- [operations/real-cluster-smoke.md](operations/real-cluster-smoke.md) -
+  local multi-process Raft smoke harness
 
 ## Reference
 
@@ -70,18 +71,27 @@ small repo-wide entrypoints.
   MongoDB client examples for Node and Python
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
   - canonical event payload conventions
+- [reference/sandbox-snapshot-contract.md](reference/sandbox-snapshot-contract.md)
+  - contract between AgentDB snapshot refs and an external sandbox service
 - [reference/adapter-readiness-checklist.md](reference/adapter-readiness-checklist.md)
   - adapter behavior and validation expectations
 
+## Validation And Release
+
+- [stability-test-plan.md](stability-test-plan.md) - deterministic, hardening,
+  and seeded-chaos validation plan
+- [stability-findings-2026-05.md](stability-findings-2026-05.md) - May 2026
+  stability findings and mitigation status
+- [release-checklist.md](release-checklist.md) - public-release and tag
+  readiness checklist
+
 ## Forward-Looking Designs
 
-- [architecture/OBSERVABILITY_EXPORT.md](architecture/OBSERVABILITY_EXPORT.md)
+- [design/observability-export.md](design/observability-export.md)
   - design for exporting AgentDB runtime truth into observability and analytics
   sinks
-- [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
-  - redesign for real hot/cold/archive session storage
-- [architecture/ARTIFACT_STORAGE_OPTIMIZATION.md](architecture/ARTIFACT_STORAGE_OPTIMIZATION.md)
-  - optimization plan for large artifact blobs and content backends
+- [design/lifecycle-storage.md](design/lifecycle-storage.md)
+  - warm/cold/archive session storage semantics and large artifact
+  content handling
 - [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license
   and release notice guidance
-- [roadmap.md](roadmap.md) - milestone direction and open work

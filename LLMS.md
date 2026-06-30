@@ -4,7 +4,7 @@ This file is written for an LLM agent that's learning AgentDB
 in one ingest. Sections are short, copy-pasteable, and ordered
 by how often a working agent needs them. Human devs may prefer
 [`README.md`](README.md) and
-[`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
+[`docs/design/architecture.md`](docs/design/architecture.md).
 
 If you (the agent) only read one section: go to **§3 The five
 operations**.
@@ -313,9 +313,9 @@ exceptions. The ones an agent should know:
   [`examples/mongodb/node/quickstart.js`](examples/mongodb/node/quickstart.js)
   shows safe MongoDB client compatibility usage.
 - **Why this database exists** (motivation, requirements,
-  principles): [`docs/architecture/agent-db.md`](docs/architecture/agent-db.md).
+  principles): [`docs/design/product-thesis.md`](docs/design/product-thesis.md).
 - **What the architecture commits to** (identity, layering,
-  real-time, deployment): [`docs/architecture/DESIGN.md`](docs/architecture/DESIGN.md).
+  real-time, deployment): [`docs/design/design.md`](docs/design/design.md).
 - **What the code does today**:
-  [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
+  [`docs/design/architecture.md`](docs/design/architecture.md).
 - **OpenAPI spec**: `GET /openapi.json` on a running server.

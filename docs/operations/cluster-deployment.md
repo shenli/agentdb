@@ -7,8 +7,8 @@ It is intentionally forward-looking. It explains how AgentDB **should** be
 deployed once clustered operation becomes a supported product surface. It is
 not a claim that the repository already ships a production-ready cluster mode.
 
-For the current support boundary, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
-For human and AI-agent operations, use [agentdbctl](AGENTDBCTL.md) by default.
+For the current support boundary, see [cluster-status.md](cluster-status.md).
+For human and AI-agent operations, use [agentdbctl](agentdbctl.md) by default.
 Raw admin endpoints remain the backend contract and an escape hatch.
 
 ## Purpose
@@ -432,11 +432,11 @@ It is the target operator model, not the current product claim.
 
 ## Related Docs
 
-- [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current support boundary
-- [CLUSTER_OPERATIONS.md](CLUSTER_OPERATIONS.md) - target day-2 cluster
+- [cluster-status.md](cluster-status.md) - current support boundary
+- [cluster-operations.md](cluster-operations.md) - target day-2 cluster
   procedures
-- [AGENTDBCTL.md](AGENTDBCTL.md) - recommended CLI for human and AI-agent
+- [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
-- [DEPLOYMENT.md](DEPLOYMENT.md) - supported deployment choices today
-- [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
+- [deployment.md](deployment.md) - supported deployment choices today
+- [../design/architecture.md](../design/architecture.md) - current
   implementation shape

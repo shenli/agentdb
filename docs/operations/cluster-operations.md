@@ -6,8 +6,8 @@ AgentDB cluster.
 It is forward-looking. Use it as the intended operator contract for cluster
 mode, not as a claim that all workflows already exist in the current server.
 
-For the current support boundary, see [CLUSTER_STATUS.md](CLUSTER_STATUS.md).
-For the recommended human CLI, see [AGENTDBCTL.md](AGENTDBCTL.md).
+For the current support boundary, see [cluster-status.md](cluster-status.md).
+For the recommended human CLI, see [agentdbctl.md](agentdbctl.md).
 
 Operator examples in this document use `agentdbctl` by default. Raw HTTP
 endpoints are still the backend contract and can be reached with
@@ -398,15 +398,15 @@ This is the target operating contract.
 The current repository is not yet at the point where operators should expect
 all of these workflows to be stable, documented, and supported end to end.
 
-Use [CLUSTER_STATUS.md](CLUSTER_STATUS.md) as the source of truth for what is
+Use [cluster-status.md](cluster-status.md) as the source of truth for what is
 actually supported today.
 
 ## Related Docs
 
-- [CLUSTER_DEPLOYMENT.md](CLUSTER_DEPLOYMENT.md) - target cluster topology and
+- [cluster-deployment.md](cluster-deployment.md) - target cluster topology and
   bootstrap model
-- [CLUSTER_STATUS.md](CLUSTER_STATUS.md) - current support boundary
-- [CLUSTER_ALERTS.md](CLUSTER_ALERTS.md) - evaluation alert and triage
+- [cluster-status.md](cluster-status.md) - current support boundary
+- [cluster-alerts.md](cluster-alerts.md) - evaluation alert and triage
   runbook
 - [../runbooks/node_draining.md](../runbooks/node_draining.md) - current drain
   error/runbook shape

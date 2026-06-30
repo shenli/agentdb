@@ -93,7 +93,7 @@ Why the split matters:
 
 All rows below use the mixed agent loop with Zipf-1.2 session selection, seed
 43, 1000 sessions, and a 60s measured window unless noted. Results were captured
-on a dedicated benchmark host; see `docs/operations/AGENTDB_BENCH.md` for
+on a dedicated benchmark host; see `docs/operations/agentdb-bench.md` for
 historical tuning details and reproduction guidance.
 
 The workload is intentionally agent-runtime shaped:
@@ -528,5 +528,5 @@ Before quoting numbers outside the repo:
 - Say when AgentDB's fused `append-and-fetch` API is part of the advantage.
 - Add working-set-exceeds-cache and tenant-aware noisy-neighbor cells for
   broader claims.
-- Keep historical tuning data in `docs/operations/AGENTDB_BENCH.md`, not in
+- Keep historical tuning data in `docs/operations/agentdb-bench.md`, not in
   this README.
