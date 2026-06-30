@@ -1,4 +1,4 @@
-# AgentDB Current Design
+# AgentDB Design
 
 AgentDB is a runtime database for AI agent platforms. It is designed around
 agent-native runtime objects rather than a compatibility facade for an existing

@@ -46,13 +46,13 @@ known limitations.
 If it does, update the relevant docs before calling the PR complete:
 
 - Design and implementation status:
-  `docs/architecture/current-design.md`
+  `docs/architecture/design.md`
 - Product progress, remaining gaps, roadmap, and open product questions:
   `docs/product-roadmap.md`
 - Product thesis, positioning, workload fit, and non-goals:
   `docs/architecture/agentdb-product-thesis.md`
 - Implementation map and crate/runtime boundaries:
-  `docs/architecture/ARCHITECTURE.md`
+  `docs/architecture/implementation-architecture.md`
 - API and SDK behavior:
   `docs/reference/api-sdk.md`
 - MongoDB adapter behavior:

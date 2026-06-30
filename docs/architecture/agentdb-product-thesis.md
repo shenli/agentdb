@@ -7,9 +7,9 @@ and audit work.
 This document is the **why**: motivation, workload requirements, design
 principles, positioning, and product-shaping questions. It avoids tracking
 feature-by-feature implementation status; for the current design contract and
-status table, see [`current-design.md`](current-design.md). For the live gap tracker, see
+status table, see [`design.md`](design.md). For the live gap tracker, see
 [`../product-roadmap.md`](../product-roadmap.md). For the implementation shape, see
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+[`implementation-architecture.md`](implementation-architecture.md).
 
 ## What AgentDB Is, By Elimination
 

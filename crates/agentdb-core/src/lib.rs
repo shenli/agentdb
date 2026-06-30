@@ -1,7 +1,7 @@
 //! AgentDB runtime database.
 //!
-//! See `docs/architecture/current-design.md` for the design and
-//! `docs/architecture/ARCHITECTURE.md` for the implementation map.
+//! See `docs/architecture/design.md` for the design and
+//! `docs/architecture/implementation-architecture.md` for the implementation map.
 //!
 //! Top-level types:
 //! - [`Tenant`], [`Agent`], [`Session`], [`EventEnvelope`] — runtime

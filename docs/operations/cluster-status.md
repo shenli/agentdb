@@ -365,5 +365,5 @@ claim.
   bootstrap model
 - [cluster-operations.md](cluster-operations.md) - target day-2 cluster
   procedures
-- [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - current
+- [../architecture/implementation-architecture.md](../architecture/implementation-architecture.md) - current
   implementation shape

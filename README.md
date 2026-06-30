@@ -133,7 +133,7 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 | First local run | [docs/quickstart.md](docs/quickstart.md) |
 | API and SDK surface | [docs/reference/api-sdk.md](docs/reference/api-sdk.md) |
 | MongoDB adapter rules | [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md) |
-| Architecture | [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) |
+| Architecture | [docs/architecture/implementation-architecture.md](docs/architecture/implementation-architecture.md) |
 | Deployment | [docs/operations/deployment.md](docs/operations/deployment.md) |
 | Operations | [docs/operations/operations.md](docs/operations/operations.md) |
 | Benchmarks | [tools/agentdb-bench](tools/agentdb-bench/README.md) |

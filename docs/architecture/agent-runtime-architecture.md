@@ -8,7 +8,7 @@ articulation of the storage tiers a production agent platform needs.
 It is positioning and rationale, not an implementation spec. Where a claim
 reflects current code it is marked **(implemented)**; where it reflects design
 direction it is marked **(designed)**. See
-[ARCHITECTURE.md](ARCHITECTURE.md) and [current-design.md](current-design.md) for the durable
+[implementation-architecture.md](implementation-architecture.md) and [design.md](design.md) for the durable
 commitments, and [agentdb-product-thesis.md](agentdb-product-thesis.md) for the product boundary.
 
 ## Context: The Stack Is Converging On Three Tiers
@@ -363,7 +363,7 @@ Observability attaches through the same changefeed family as memory: the durable
 `export_watch` ledger is exactly an export feed for sinks. The unifying picture is
 that the changefeed/CDC is how every derived tier reads the source of truth:
 **source-of-truth log -> changefeed/CDC -> {memory, observability, external
-sinks}.** See [OBSERVABILITY_EXPORT.md](OBSERVABILITY_EXPORT.md) for the export
+sinks}.** See [observability-export.md](observability-export.md) for the export
 design.
 
 ### Can You Use ClickHouse As The Session Store?

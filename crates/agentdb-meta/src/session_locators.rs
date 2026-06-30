@@ -15,7 +15,7 @@
 //! a follow-up PR is reverted, the locator rows are harmless
 //! historical metadata.
 //!
-//! See `docs/architecture/ARCHITECTURE.md`.
+//! See `docs/architecture/implementation-architecture.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

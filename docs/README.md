@@ -10,18 +10,18 @@ public docs path.
   replayable agent session
 - [architecture/agentdb-product-thesis.md](architecture/agentdb-product-thesis.md) - product thesis,
   workload requirements, positioning, and systems rationale
-- [architecture/current-design.md](architecture/current-design.md) - durable design commitments,
+- [architecture/design.md](architecture/design.md) - durable design commitments,
   implementation status, constraints, and non-goals
 - [product-roadmap.md](product-roadmap.md) - product progress, remaining gaps,
   deliberately out-of-scope work, and open questions
-- [architecture/AGENT_RUNTIME_ARCHITECTURE.md](architecture/AGENT_RUNTIME_ARCHITECTURE.md)
+- [architecture/agent-runtime-architecture.md](architecture/agent-runtime-architecture.md)
   - the emerging brains/hands/sessions stack, the three storage tiers and trust
   boundary, and why AgentDB is a runtime store (not observability)
-- [architecture/ARCHITECTURE.md](architecture/ARCHITECTURE.md) - current crate
+- [architecture/implementation-architecture.md](architecture/implementation-architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
-- [architecture/STORAGE_ENGINE.md](architecture/STORAGE_ENGINE.md) - current
+- [architecture/storage-engine.md](architecture/storage-engine.md) - current
   storage engine and replicated tablet/split-LSM improvement plan
-- [architecture/DISTRIBUTED_STORAGE_CLUSTER.md](architecture/DISTRIBUTED_STORAGE_CLUSTER.md)
+- [architecture/distributed-storage-cluster.md](architecture/distributed-storage-cluster.md)
   - next-step design for cells, AZ-aware placement, tenant blast radius, and
   distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
@@ -90,10 +90,10 @@ small repo-wide entrypoints.
 
 ## Forward-Looking Designs
 
-- [architecture/OBSERVABILITY_EXPORT.md](architecture/OBSERVABILITY_EXPORT.md)
+- [architecture/observability-export.md](architecture/observability-export.md)
   - design for exporting AgentDB runtime truth into observability and analytics
   sinks
-- [architecture/TIERED_STORAGE_REDESIGN.md](architecture/TIERED_STORAGE_REDESIGN.md)
+- [architecture/tiered-storage-redesign.md](architecture/tiered-storage-redesign.md)
   - redesign for real hot/cold/archive session storage and large artifact
   content handling
 - [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) - dependency license

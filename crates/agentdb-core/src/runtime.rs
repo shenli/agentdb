@@ -441,7 +441,7 @@ pub struct ReplayResponse {
 
 /// Request to record a sandbox snapshot reference at a session `seq`. AgentDB
 /// stores the reference only; the bytes live in the sandbox filesystem / object
-/// store. See `docs/architecture/AGENT_RUNTIME_ARCHITECTURE.md`.
+/// store. See `docs/architecture/agent-runtime-architecture.md`.
 #[derive(Debug, Clone)]
 pub struct NewSnapshotRef {
     pub tenant_id: Id,
@@ -576,7 +576,7 @@ pub struct ExportWatchRequest {
 /// was forked from `parent_session_id` at `fork_point_seq`, so a consumer
 /// following the parent can discover the child sub-stream. It carries no events:
 /// fork is a pointer, not a re-emission of ancestor history. See
-/// `docs/architecture/AGENT_RUNTIME_ARCHITECTURE.md` (changefeed over a forked log).
+/// `docs/architecture/agent-runtime-architecture.md` (changefeed over a forked log).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkEdge {
     pub parent_session_id: Id,
