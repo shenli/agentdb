@@ -8,7 +8,7 @@ articulation of the storage tiers a production agent platform needs.
 It is positioning and rationale, not an implementation spec. Where a claim
 reflects current code it is marked **(implemented)**; where it reflects design
 direction it is marked **(designed)**. See
-[implementation-architecture.md](implementation-architecture.md) and [design.md](design.md) for the durable
+[architecture.md](architecture.md) and [design.md](design.md) for the durable
 commitments, and [agentdb-product-thesis.md](agentdb-product-thesis.md) for the product boundary.
 
 ## Context: The Stack Is Converging On Three Tiers

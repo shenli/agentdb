@@ -4,7 +4,7 @@ This file is written for an LLM agent that's learning AgentDB
 in one ingest. Sections are short, copy-pasteable, and ordered
 by how often a working agent needs them. Human devs may prefer
 [`README.md`](README.md) and
-[`docs/architecture/implementation-architecture.md`](docs/architecture/implementation-architecture.md).
+[`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 
 If you (the agent) only read one section: go to **§3 The five
 operations**.
@@ -317,5 +317,5 @@ exceptions. The ones an agent should know:
 - **What the architecture commits to** (identity, layering,
   real-time, deployment): [`docs/architecture/design.md`](docs/architecture/design.md).
 - **What the code does today**:
-  [`docs/architecture/implementation-architecture.md`](docs/architecture/implementation-architecture.md).
+  [`docs/architecture/architecture.md`](docs/architecture/architecture.md).
 - **OpenAPI spec**: `GET /openapi.json` on a running server.

@@ -17,7 +17,7 @@ public docs path.
 - [architecture/agent-runtime-architecture.md](architecture/agent-runtime-architecture.md)
   - the emerging brains/hands/sessions stack, the three storage tiers and trust
   boundary, and why AgentDB is a runtime store (not observability)
-- [architecture/implementation-architecture.md](architecture/implementation-architecture.md) - current crate
+- [architecture/architecture.md](architecture/architecture.md) - current crate
   boundaries, request flow, storage, routing, and operational model
 - [architecture/storage-engine.md](architecture/storage-engine.md) - current
   storage engine and replicated tablet/split-LSM improvement plan

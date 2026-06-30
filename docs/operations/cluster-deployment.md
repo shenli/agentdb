@@ -438,5 +438,5 @@ It is the target operator model, not the current product claim.
 - [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
 - [deployment.md](deployment.md) - supported deployment choices today
-- [../architecture/implementation-architecture.md](../architecture/implementation-architecture.md) - current
+- [../architecture/architecture.md](../architecture/architecture.md) - current
   implementation shape

@@ -52,7 +52,7 @@ If it does, update the relevant docs before calling the PR complete:
 - Product thesis, positioning, workload fit, and non-goals:
   `docs/architecture/agentdb-product-thesis.md`
 - Implementation map and crate/runtime boundaries:
-  `docs/architecture/implementation-architecture.md`
+  `docs/architecture/architecture.md`
 - API and SDK behavior:
   `docs/reference/api-sdk.md`
 - MongoDB adapter behavior:

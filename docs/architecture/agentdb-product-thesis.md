@@ -9,7 +9,7 @@ principles, positioning, and product-shaping questions. It avoids tracking
 feature-by-feature implementation status; for the current design contract and
 status table, see [`design.md`](design.md). For the live gap tracker, see
 [`../product-roadmap.md`](../product-roadmap.md). For the implementation shape, see
-[`implementation-architecture.md`](implementation-architecture.md).
+[`architecture.md`](architecture.md).
 
 ## What AgentDB Is, By Elimination
 

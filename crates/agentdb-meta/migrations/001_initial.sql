@@ -2,7 +2,7 @@
 --
 -- Cross-dialect SQL targeting both SQLite and Postgres. Kept
 -- intentionally narrow — just what M19+ need to consume. See
--- docs/architecture/implementation-architecture.md for the design rationale.
+-- docs/architecture/architecture.md for the design rationale.
 
 CREATE TABLE IF NOT EXISTS tenants (
     internal_id     INTEGER PRIMARY KEY AUTOINCREMENT,
