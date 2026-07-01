@@ -18,7 +18,20 @@ python3 examples/agents/python/quickstart.py
 ```
 
 You should see three turns of output, each showing the rolling working memory
-grow by one event, then a fork that inherits the parent's events at fork time.
+grow by one event, then a fork that appends a child event on an alternate
+timeline.
+
+## Single-node feature demo
+
+```bash
+cargo run -p agentdb-server -- serve --config config/agentdb.toml
+AGENTDB_URL=http://127.0.0.1:7878 \
+  python3 examples/agents/python/single_node_feature_demo.py
+```
+
+This demo covers the local manual feature test path: create tenant, create
+agent, create session, append one event, upload/fetch one artifact, and run
+artifact lifecycle verification.
 
 ## OpenAI Agents SDK session adapter
 

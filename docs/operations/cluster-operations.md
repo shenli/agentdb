@@ -232,7 +232,8 @@ Current backup controls:
 Restore apply remains an offline operator procedure. The HTTP restore endpoint
 intentionally rejects destructive apply because live restore semantics require a
 cluster-wide stop/drain contract and runtime data copy/verification that are not
-safe to fake in an online handler.
+safe to fake in an online handler. For the supported single-node verification
+workflow, see [backup-verification.md](backup-verification.md).
 
 ### Restart Node
 

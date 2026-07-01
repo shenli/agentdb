@@ -13,6 +13,8 @@ For start/stop, backup, restore, upgrade, and troubleshooting, see
 [cluster-status.md](cluster-status.md). For the intended future cluster model,
 see [cluster-deployment.md](cluster-deployment.md) and
 [cluster-operations.md](cluster-operations.md).
+Before exposing a persistent node, use
+[single-node-production-checklist.md](single-node-production-checklist.md).
 
 For human operations, prefer [agentdbctl](agentdbctl.md). Raw HTTP endpoints
 are the backend contract and are still useful for load balancers, integrations,
@@ -182,12 +184,16 @@ Before exposing a maintained node:
 - place runtime metadata and content on durable storage
 - decide whether content should stay local or move to object storage
 - define backup/restore procedure before production traffic
+- complete the
+  [single-node production checklist](single-node-production-checklist.md)
 - understand that Helm today is single-replica evaluation, not clustered HA
 
 ## Related Docs
 
 - [operations.md](operations.md) - start, stop, backup, restore, upgrade, and
   troubleshooting
+- [single-node-production-checklist.md](single-node-production-checklist.md) -
+  preflight gate before exposing a persistent node
 - [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
 - [cluster-status.md](cluster-status.md) - current multi-node status and

@@ -414,9 +414,17 @@ Artifacts:
 
 ```text
 POST /api/tenants/{tenant_id}/artifacts
+GET  /api/tenants/{tenant_id}/artifacts/verify-lifecycle
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
 ```
+
+`artifacts/verify-lifecycle` is a non-destructive consistency check for
+single-node lifecycle operations. It verifies that live artifacts with raw bytes
+still read and hash correctly, and that derivative-only artifacts no longer
+have raw content in the content backend. The response includes counts plus
+per-artifact issues such as `missing_raw`, `hash_mismatch`, and
+`unexpected_raw_after_purge`.
 
 Records:
 

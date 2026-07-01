@@ -74,6 +74,7 @@ def test_v2_urls_cover_core_flow():
         session.context(include=["recent_events", "records"])
         c.watch(tenant["tenant_id"], scope="tenant")
         c.put_artifact(tenant["tenant_id"], b"blob")
+        c.verify_artifact_lifecycle(tenant["tenant_id"])
         c.write_record(tenant["tenant_id"], namespace=["mem"], text="x")
         c.search_records(tenant["tenant_id"], namespace=["mem"], text="x")
         skill = c.register_skill(tenant["tenant_id"], name="tool", version="1")
@@ -102,6 +103,7 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
 
         result = session.append_user("hello", fetch_last_n=5)
         artifact = session.artifacts.put(b"blob", content_type="text/plain")
+        workspace.artifacts.verify_lifecycle()
         session.tool_result(
             "call_1",
             "Generated report.",
@@ -123,6 +125,7 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any("/api/tenants/ten_1/agents/agt_1/sessions" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/append-and-fetch" in url for url in urls)
     assert any("/api/tenants/ten_1/artifacts" in url for url in urls)
+    assert any("/api/tenants/ten_1/artifacts/verify-lifecycle" in url for url in urls)
     assert any("/api/tenants/ten_1/records" in url for url in urls)
     assert any("/api/tenants/ten_1/skills" in url for url in urls)
     assert any("/api/tenants/ten_1/watch" in url for url in urls)

@@ -7,6 +7,18 @@ For deployment choices, see [deployment.md](deployment.md). For multi-node
 status, see [cluster-status.md](cluster-status.md). For human and AI-agent
 operations, use [agentdbctl](agentdbctl.md) by default.
 
+Detailed single-node runbooks:
+
+- [single-node-production-checklist.md](single-node-production-checklist.md)
+- [backup-verification.md](backup-verification.md)
+- [restore-recovery.md](restore-recovery.md)
+- [single-node-upgrade.md](single-node-upgrade.md)
+- [storage-maintenance.md](storage-maintenance.md)
+- [disk-full-recovery.md](disk-full-recovery.md)
+- [routine-maintenance.md](routine-maintenance.md)
+- [cdc-export.md](cdc-export.md)
+- [tiered-storage.md](tiered-storage.md)
+
 ## Scope
 
 This document is intentionally about one maintained shape:
@@ -108,6 +120,10 @@ agentdbctl restore validate /var/backups/agentdb/nightly-2026-05-05/manifest.jso
 
 The online backup command writes a manifest and optional metadata snapshot. It
 does not replace a full runtime data backup for local RocksDB deployments.
+Use [backup-verification.md](backup-verification.md) for the supported
+verification flow, tablet checkpoint checks, scratch install drills, and failure
+handling. Use [restore-recovery.md](restore-recovery.md) for offline recovery
+procedures.
 
 ### Local Storage
 
@@ -139,6 +155,9 @@ The durable truth may now span:
 - object-store content blobs
 
 ## Upgrade
+
+For the full preflight, upgrade, verification, and rollback procedure, see
+[single-node-upgrade.md](single-node-upgrade.md).
 
 ### Local Binary Upgrade
 
@@ -187,6 +206,10 @@ Treat it as a single-node restart in Kubernetes, not a rolling multi-node
 cluster upgrade.
 
 ## Troubleshooting
+
+For disk-full incidents, see [disk-full-recovery.md](disk-full-recovery.md).
+For storage inspection and compaction, see
+[storage-maintenance.md](storage-maintenance.md).
 
 Port already in use:
 

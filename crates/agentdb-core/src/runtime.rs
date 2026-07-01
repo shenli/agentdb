@@ -752,6 +752,32 @@ pub struct GcSweepReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactLifecycleIssue {
+    pub artifact_id: Id,
+    pub issue: String,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactLifecycleVerificationReport {
+    pub tenant_id: Option<Id>,
+    pub artifacts_checked: usize,
+    pub raw_present: usize,
+    pub raw_purged: usize,
+    pub missing_raw: usize,
+    pub hash_mismatch: usize,
+    pub unexpected_raw_after_purge: usize,
+    pub read_errors: usize,
+    pub issues: Vec<ArtifactLifecycleIssue>,
+}
+
+impl ArtifactLifecycleVerificationReport {
+    pub fn ok(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BackpressureSignal {
     pub bucket: String,
     pub percent: u64,
@@ -5226,6 +5252,83 @@ impl Runtime {
             ));
         }
         Ok(plaintext)
+    }
+
+    pub async fn verify_artifact_lifecycle_for_tenant(
+        &self,
+        tenant_id: &Id,
+    ) -> Result<ArtifactLifecycleVerificationReport> {
+        let artifacts = self.list_artifacts(tenant_id).await?;
+        let mut report = ArtifactLifecycleVerificationReport {
+            tenant_id: Some(tenant_id.clone()),
+            ..Default::default()
+        };
+
+        for artifact in artifacts {
+            report.artifacts_checked += 1;
+            if artifact.raw_purged_at_ms.is_some() {
+                match self
+                    .content
+                    .head(tenant_id.as_str(), artifact.artifact_id.as_str())
+                    .await
+                {
+                    Ok(false) => report.raw_purged += 1,
+                    Ok(true) => {
+                        report.unexpected_raw_after_purge += 1;
+                        report.issues.push(ArtifactLifecycleIssue {
+                            artifact_id: artifact.artifact_id.clone(),
+                            issue: "unexpected_raw_after_purge".into(),
+                            message:
+                                "artifact metadata is derivative-only but raw content still exists"
+                                    .into(),
+                        });
+                    }
+                    Err(error) => {
+                        report.read_errors += 1;
+                        report.issues.push(ArtifactLifecycleIssue {
+                            artifact_id: artifact.artifact_id.clone(),
+                            issue: "content_head_error".into(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            match self
+                .get_artifact_blob(tenant_id, &artifact.artifact_id)
+                .await
+            {
+                Ok(_) => report.raw_present += 1,
+                Err(error) if error.code == ErrorCode::ArtifactNotFound => {
+                    report.missing_raw += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "missing_raw".into(),
+                        message: "artifact metadata expects raw content but content is missing"
+                            .into(),
+                    });
+                }
+                Err(error) if error.code == ErrorCode::HashMismatch => {
+                    report.hash_mismatch += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "hash_mismatch".into(),
+                        message: error.message,
+                    });
+                }
+                Err(error) => {
+                    report.read_errors += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "content_read_error".into(),
+                        message: error.message,
+                    });
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     pub async fn delete_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<()> {

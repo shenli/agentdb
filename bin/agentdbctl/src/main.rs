@@ -6,9 +6,9 @@
 
 use std::{
     fmt::Write as _,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Write as IoWrite},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command as ProcessCommand,
 };
 
@@ -375,6 +375,11 @@ enum Command {
         #[command(subcommand)]
         command: TabletStoreCommand,
     },
+    /// Artifact inspection and lifecycle verification operations.
+    Artifacts {
+        #[command(subcommand)]
+        command: ArtifactsCommand,
+    },
     /// Observability export operations.
     Export {
         #[command(subcommand)]
@@ -683,6 +688,21 @@ enum BackupCommand {
 enum RestoreCommand {
     /// Validate a backup manifest. Destructive restore apply is not exposed.
     Validate { manifest_path: String },
+    /// Offline: copy a verified data snapshot and optional config into target paths.
+    ApplyLocal {
+        #[arg(long)]
+        manifest_path: PathBuf,
+        #[arg(long)]
+        data_backup_dir: PathBuf,
+        #[arg(long)]
+        target_data_dir: PathBuf,
+        #[arg(long)]
+        config_backup: Option<PathBuf>,
+        #[arg(long)]
+        target_config: Option<PathBuf>,
+        #[arg(long)]
+        allow_overwrite: bool,
+    },
     /// Offline: install one tablet checkpoint into a local single-tablet store root.
     InstallTabletCheckpoint {
         #[arg(long)]
@@ -706,6 +726,15 @@ enum TabletStoreCommand {
         tablet_id: i64,
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactsCommand {
+    /// Verify artifact metadata/raw-byte lifecycle consistency for one tenant.
+    VerifyLifecycle {
+        #[arg(long)]
+        tenant_id: String,
     },
 }
 
@@ -736,6 +765,8 @@ enum ClickHouseCommand {
     Init(ClickHouseInitArgs),
     /// Apply versioned first-party ClickHouse schema migrations.
     Migrate(ClickHouseMigrateArgs),
+    /// Roll back the first-party ClickHouse schema.
+    Rollback(ClickHouseRollbackArgs),
     /// Show AgentDB export status for one tenant.
     Status(ClickHouseStatusArgs),
     /// Print first-party dashboard and ClickStack smoke queries.
@@ -770,6 +801,16 @@ struct ClickHouseMigrateArgs {
     clickhouse_url: Option<String>,
     #[arg(long, default_value = "latest")]
     to: String,
+    #[arg(long)]
+    apply: bool,
+    #[arg(long)]
+    allow_destructive: bool,
+}
+
+#[derive(Args, Debug)]
+struct ClickHouseRollbackArgs {
+    #[arg(long, env = "CLICKHOUSE_URL")]
+    clickhouse_url: Option<String>,
     #[arg(long)]
     apply: bool,
     #[arg(long)]
@@ -1080,6 +1121,21 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 )
                 .await
             }
+            RestoreCommand::ApplyLocal {
+                manifest_path,
+                data_backup_dir,
+                target_data_dir,
+                config_backup,
+                target_config,
+                allow_overwrite,
+            } => apply_local_restore(
+                manifest_path,
+                data_backup_dir,
+                target_data_dir,
+                config_backup,
+                target_config,
+                allow_overwrite,
+            ),
             RestoreCommand::InstallTabletCheckpoint {
                 tablet_id,
                 checkpoint_dir,
@@ -1106,6 +1162,15 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
                 .await
             }
         },
+        Command::Artifacts { command } => match command {
+            ArtifactsCommand::VerifyLifecycle { tenant_id } => {
+                let tenant_id = require_non_empty_cli_arg("--tenant-id", tenant_id)?;
+                api.get(&format!(
+                    "/api/tenants/{tenant_id}/artifacts/verify-lifecycle"
+                ))
+                .await
+            }
+        },
         Command::Export { command } => export(api, command).await,
         Command::Raw { command } => match command {
             RawCommand::Get { path } => api.get(&path).await,
@@ -1119,6 +1184,124 @@ async fn run(api: &Api, command: Command) -> Result<Value> {
             }
         },
     }
+}
+
+fn require_non_empty_cli_arg(name: &str, value: String) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(anyhow!(
+            "{name} cannot be empty; set shell variables before invoking agentdbctl, for example: TENANT_ID=ten_...; agentdbctl artifacts verify-lifecycle --tenant-id \"$TENANT_ID\""
+        ));
+    }
+    Ok(value)
+}
+
+fn apply_local_restore(
+    manifest_path: PathBuf,
+    data_backup_dir: PathBuf,
+    target_data_dir: PathBuf,
+    config_backup: Option<PathBuf>,
+    target_config: Option<PathBuf>,
+    allow_overwrite: bool,
+) -> Result<Value> {
+    let manifest_raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(&manifest_raw)
+        .with_context(|| format!("parse manifest {}", manifest_path.display()))?;
+    if manifest["schema_version"].as_i64() != Some(1) {
+        return Err(anyhow!(
+            "unsupported backup manifest schema_version; expected 1"
+        ));
+    }
+    if !data_backup_dir.is_dir() {
+        return Err(anyhow!(
+            "data backup directory is missing or not a directory: {}",
+            data_backup_dir.display()
+        ));
+    }
+    if target_data_dir.exists() {
+        if !allow_overwrite {
+            return Err(anyhow!(
+                "target data dir exists: {}; rerun with --allow-overwrite after stopping AgentDB and preserving failed state",
+                target_data_dir.display()
+            ));
+        }
+    }
+
+    let config_pair = match (config_backup, target_config) {
+        (Some(src), Some(dst)) => {
+            if !src.is_file() {
+                return Err(anyhow!("config backup is missing: {}", src.display()));
+            }
+            if dst.exists() && !allow_overwrite {
+                return Err(anyhow!(
+                    "target config exists: {}; rerun with --allow-overwrite after preserving it",
+                    dst.display()
+                ));
+            }
+            Some((src, dst))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "--config-backup and --target-config must be provided together"
+            ));
+        }
+    };
+
+    if target_data_dir.exists() {
+        fs::remove_dir_all(&target_data_dir)
+            .with_context(|| format!("remove target data dir {}", target_data_dir.display()))?;
+    }
+    copy_dir_recursive(&data_backup_dir, &target_data_dir)?;
+
+    let mut copied_config = None;
+    if let Some((src, dst)) = config_pair {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create config parent {}", parent.display()))?;
+        }
+        fs::copy(&src, &dst)
+            .with_context(|| format!("copy config {} -> {}", src.display(), dst.display()))?;
+        copied_config = Some(dst.display().to_string());
+    }
+
+    Ok(json!({
+        "status": "applied_local_restore",
+        "destructive": allow_overwrite,
+        "manifest_path": manifest_path.display().to_string(),
+        "backup_id": manifest["backup_id"].as_str(),
+        "data_backup_dir": data_backup_dir.display().to_string(),
+        "target_data_dir": target_data_dir.display().to_string(),
+        "target_config": copied_config,
+        "next_steps": [
+            "run agentdb doctor --config <target-config>",
+            "start AgentDB with the restored config",
+            "run agentdbctl status"
+        ]
+    }))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!("copy {} -> {}", src_path.display(), dst_path.display())
+            })?;
+        } else if file_type.is_symlink() {
+            return Err(anyhow!(
+                "refusing to copy symlink in restore source: {}",
+                src_path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn raft(api: &Api, command: RaftCommand) -> Result<Value> {
@@ -1186,6 +1369,7 @@ async fn clickhouse(api: &Api, command: ClickHouseCommand) -> Result<Value> {
         ClickHouseCommand::Doctor(args) => clickhouse_doctor(api, args).await,
         ClickHouseCommand::Init(args) => clickhouse_init(args).await,
         ClickHouseCommand::Migrate(args) => clickhouse_migrate(args).await,
+        ClickHouseCommand::Rollback(args) => clickhouse_rollback(args).await,
         ClickHouseCommand::Status(args) => clickhouse_status(api, args).await,
         ClickHouseCommand::Queries => Ok(clickhouse_sample_queries()),
         ClickHouseCommand::ClickstackConfig(args) => Ok(clickstack_config(args)),
@@ -1544,6 +1728,72 @@ async fn clickhouse_migrate(args: ClickHouseMigrateArgs) -> Result<Value> {
         .clickhouse_url
         .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
     apply_clickhouse_schema(&url).await
+}
+
+async fn clickhouse_rollback(args: ClickHouseRollbackArgs) -> Result<Value> {
+    let statements = clickhouse_rollback_statements();
+    if !args.apply {
+        return Ok(json!({
+            "status": "dry_run",
+            "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+            "destructive": true,
+            "allow_destructive": args.allow_destructive,
+            "statements": statements
+        }));
+    }
+    if !args.allow_destructive {
+        return Err(anyhow!(
+            "ClickHouse rollback drops first-party AgentDB export tables/views; rerun with --allow-destructive to apply"
+        ));
+    }
+    let url = args
+        .clickhouse_url
+        .ok_or_else(|| anyhow!("--clickhouse-url or CLICKHOUSE_URL is required with --apply"))?;
+    let mut applied = Vec::new();
+    for statement in &statements {
+        clickhouse_query(&url, statement).await?;
+        applied.push(json!({
+            "statement": statement,
+            "status": "ok"
+        }));
+    }
+    let schema = clickhouse_schema_status(&url)
+        .await
+        .unwrap_or_else(|_| ClickHouseSchemaStatus {
+            current: false,
+            latest_version: CLICKHOUSE_SCHEMA_VERSION,
+            latest_applied: false,
+            existing_objects: Vec::new(),
+            missing_objects: CLICKHOUSE_REQUIRED_OBJECTS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        });
+    Ok(json!({
+        "status": "rolled_back",
+        "latest_version": CLICKHOUSE_SCHEMA_VERSION,
+        "destructive": true,
+        "applied": applied,
+        "schema": schema.to_json()
+    }))
+}
+
+fn clickhouse_rollback_statements() -> Vec<String> {
+    CLICKHOUSE_REQUIRED_OBJECTS
+        .iter()
+        .rev()
+        .map(|object| clickhouse_drop_statement(object))
+        .collect()
+}
+
+fn clickhouse_drop_statement(object: &str) -> String {
+    let kind = match object {
+        "agentdb_clickstack_logs" | "agentdb_clickstack_traces" | "otel_logs" | "otel_traces" => {
+            "VIEW"
+        }
+        _ => "TABLE",
+    };
+    format!("DROP {kind} IF EXISTS {object}")
 }
 
 async fn apply_clickhouse_schema(url: &str) -> Result<Value> {
@@ -3726,6 +3976,105 @@ mod tests {
     }
 
     #[test]
+    fn require_non_empty_cli_arg_rejects_empty_shell_expansion() {
+        let err = require_non_empty_cli_arg("--tenant-id", "".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--tenant-id cannot be empty"));
+        assert_eq!(
+            require_non_empty_cli_arg("--tenant-id", "ten_1".to_string()).unwrap(),
+            "ten_1"
+        );
+    }
+
+    #[test]
+    fn apply_local_restore_copies_data_and_requires_overwrite_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = temp.path().join("manifest.json");
+        let data_backup_dir = temp.path().join("data-backup");
+        let nested = data_backup_dir.join("runtime");
+        let target_data_dir = temp.path().join("target-data");
+        let config_backup = temp.path().join("agentdb.toml.bak");
+        let target_config = temp.path().join("agentdb.toml");
+
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            &manifest_path,
+            r#"{"schema_version":1,"backup_id":"nightly-1"}"#,
+        )
+        .unwrap();
+        std::fs::write(nested.join("state.json"), "{}").unwrap();
+        std::fs::write(&config_backup, "bind = '127.0.0.1:7878'\n").unwrap();
+
+        let result = apply_local_restore(
+            manifest_path.clone(),
+            data_backup_dir.clone(),
+            target_data_dir.clone(),
+            Some(config_backup.clone()),
+            Some(target_config.clone()),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "applied_local_restore");
+        assert_eq!(result["backup_id"], "nightly-1");
+        assert_eq!(
+            std::fs::read_to_string(target_data_dir.join("runtime/state.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_config).unwrap(),
+            "bind = '127.0.0.1:7878'\n"
+        );
+
+        let err = apply_local_restore(
+            manifest_path,
+            data_backup_dir,
+            target_data_dir,
+            Some(config_backup),
+            Some(target_config),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("target data dir exists"));
+    }
+
+    #[test]
+    fn apply_local_restore_validates_config_before_copying_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = temp.path().join("manifest.json");
+        let data_backup_dir = temp.path().join("data-backup");
+        let target_data_dir = temp.path().join("target-data");
+        let config_backup = temp.path().join("agentdb.toml.bak");
+        let target_config = temp.path().join("agentdb.toml");
+
+        std::fs::create_dir_all(&data_backup_dir).unwrap();
+        std::fs::write(
+            &manifest_path,
+            r#"{"schema_version":1,"backup_id":"nightly-1"}"#,
+        )
+        .unwrap();
+        std::fs::write(data_backup_dir.join("state.json"), "{}").unwrap();
+        std::fs::write(&config_backup, "new\n").unwrap();
+        std::fs::write(&target_config, "existing\n").unwrap();
+
+        let err = apply_local_restore(
+            manifest_path,
+            data_backup_dir,
+            target_data_dir.clone(),
+            Some(config_backup),
+            Some(target_config),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("target config exists"));
+        assert!(!target_data_dir.exists());
+    }
+
+    #[test]
     fn renders_table_for_node_rows() {
         let value = json!([
             {
@@ -3898,6 +4247,14 @@ mod tests {
         ] {
             assert!(CLICKHOUSE_REQUIRED_OBJECTS.contains(&required));
         }
+    }
+
+    #[test]
+    fn clickhouse_rollback_statements_drop_views_as_views() {
+        let statements = clickhouse_rollback_statements();
+        assert!(statements.contains(&"DROP VIEW IF EXISTS otel_logs".to_string()));
+        assert!(statements.contains(&"DROP VIEW IF EXISTS agentdb_clickstack_logs".to_string()));
+        assert!(statements.contains(&"DROP TABLE IF EXISTS agentdb_events".to_string()));
     }
 
     #[test]

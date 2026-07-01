@@ -170,6 +170,56 @@ async fn create_tenant_agent_session_append_fetch_round_trip() {
 }
 
 #[tokio::test]
+async fn artifact_lifecycle_verification_reports_healthy_artifact() {
+    let app = spawn_app().await;
+
+    let t: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({"external_key": "artifact-lifecycle", "policy": {}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = t["tenant_id"].as_str().unwrap();
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/artifacts", app.base))
+        .header("content-type", "text/plain")
+        .body("hello artifact")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let report: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/artifacts/verify-lifecycle",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(report["tenant_id"], tid);
+    assert_eq!(report["artifacts_checked"], 1);
+    assert_eq!(report["raw_present"], 1);
+    assert_eq!(report["raw_purged"], 0);
+    assert_eq!(report["issues"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn list_tenants_and_sessions_returns_counts_and_rows() {
     let app = spawn_app().await;
     let (tid, aid, sid) = bootstrap_session(&app).await;

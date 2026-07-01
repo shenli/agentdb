@@ -60,6 +60,63 @@ async fn create_artifact_round_trip() {
         .await
         .unwrap();
     assert_eq!(blob, bytes);
+
+    let report = rt
+        .verify_artifact_lifecycle_for_tenant(&t.tenant_id)
+        .await
+        .unwrap();
+    assert!(report.ok());
+    assert_eq!(report.artifacts_checked, 1);
+    assert_eq!(report.raw_present, 1);
+    assert_eq!(report.raw_purged, 0);
+    assert_eq!(report.issues.len(), 0);
+}
+
+#[tokio::test]
+async fn artifact_lifecycle_verification_reports_derivative_only_purge() {
+    let rt = Runtime::in_memory();
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "purge".into(),
+            policy: serde_json::json!({
+                "lifecycle": {"derivative_only_after_ms": 0}
+            }),
+        })
+        .await
+        .unwrap();
+    let art = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: t.tenant_id.clone(),
+                content_type: Some("text/plain".into()),
+                expected_sha256: None,
+            },
+            b"raw bytes".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let sweep = rt
+        .sweep_lifecycle_for_tenant_at(&t.tenant_id, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(sweep.artifacts_raw_purged, 1);
+
+    let blob_err = rt
+        .get_artifact_blob(&t.tenant_id, &art.artifact_id)
+        .await
+        .unwrap_err();
+    assert_eq!(blob_err.code, ErrorCode::ArtifactNotFound);
+
+    let report = rt
+        .verify_artifact_lifecycle_for_tenant(&t.tenant_id)
+        .await
+        .unwrap();
+    assert!(report.ok());
+    assert_eq!(report.artifacts_checked, 1);
+    assert_eq!(report.raw_present, 0);
+    assert_eq!(report.raw_purged, 1);
+    assert_eq!(report.issues.len(), 0);
 }
 
 #[tokio::test]

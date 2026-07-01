@@ -498,6 +498,9 @@ class ArtifactCollection:
     def blob(self, artifact_id: ArtifactId) -> bytes:
         return self._workspace._client.get_artifact_blob(self._workspace.tenant_id, artifact_id)
 
+    def verify_lifecycle(self) -> dict:
+        return self._workspace._client.verify_artifact_lifecycle(self._workspace.tenant_id)
+
 
 class RecordCollection:
     def __init__(self, workspace: Workspace) -> None:
@@ -673,6 +676,11 @@ class Client:
         if 200 <= resp.status_code < 300:
             return resp.content
         raise from_response(resp.status_code, _response_body(resp))
+
+    def verify_artifact_lifecycle(self, tenant_id: TenantId) -> dict:
+        return self._request(
+            "GET", f"/api/tenants/{_quote(tenant_id)}/artifacts/verify-lifecycle"
+        )
 
     def write_record(self, tenant_id: TenantId, **body: Any) -> dict:
         resp = self._raw_request("POST", f"/api/tenants/{_quote(tenant_id)}/records", json=body)

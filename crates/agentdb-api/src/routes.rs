@@ -315,6 +315,10 @@ pub fn routes() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/api/tenants/:tenant_id/artifacts/verify-lifecycle",
+            get(verify_artifact_lifecycle),
+        )
+        .route(
             "/api/tenants/:tenant_id/artifacts/:artifact_id",
             get(get_artifact),
         )
@@ -6897,6 +6901,25 @@ async fn get_artifact_blob(
         h.insert(header::CONTENT_LENGTH, v);
     }
     Ok(resp)
+}
+
+/// `GET /api/tenants/:tenant_id/artifacts/verify-lifecycle`
+///
+/// Non-destructive artifact lifecycle consistency check. Verifies that live
+/// artifacts with raw bytes still read and hash correctly, and that
+/// derivative-only artifacts no longer have raw content in the content backend.
+async fn verify_artifact_lifecycle(
+    State(s): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<agentdb_core::runtime::ArtifactLifecycleVerificationReport>, ApiError> {
+    let tid = parse_id_or(
+        &tenant_id,
+        IdKind::Tenant,
+        agentdb_core::ErrorCode::TenantNotFound,
+    )?;
+    Ok(Json(
+        s.runtime.verify_artifact_lifecycle_for_tenant(&tid).await?,
+    ))
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Option<String> {

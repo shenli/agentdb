@@ -187,6 +187,13 @@ agentdbctl backup create --backup-id nightly-2026-05-05 --directory ./backups
 agentdbctl backup create --backup-id tablet-copy --directory ./backups --include-tablet-checkpoints
 agentdbctl backup create --backup-id metadata-only --skip-runtime-summary
 agentdbctl restore validate ./backups/nightly-2026-05-05/manifest.json
+agentdbctl restore apply-local \
+  --manifest-path ./backups/nightly-2026-05-05/manifest.json \
+  --data-backup-dir ./backups/data-nightly-2026-05-05 \
+  --target-data-dir /var/lib/agentdb \
+  --config-backup ./backups/nightly-2026-05-05/agentdb.toml \
+  --target-config /etc/agentdb/agentdb.toml \
+  --allow-overwrite
 agentdbctl restore install-tablet-checkpoint \
   --tablet-id 7 \
   --checkpoint-dir ./backups/tablet-copy/tablet-stores/tablet-00000000000000000007 \
@@ -200,10 +207,34 @@ intentionally rejected because a checkpoint would include unrelated tablet
 state. Restore validation recomputes checkpoint size and checksum from disk and
 rejects mismatches.
 
+`restore apply-local` is an offline local filesystem restore helper. Stop the
+target node first. It validates the manifest schema, copies the data snapshot
+into the target data directory, optionally restores the matching config, refuses
+symlink entries, and requires `--allow-overwrite` before replacing an existing
+target data directory.
+
 `restore install-tablet-checkpoint` is an offline local filesystem operation,
 not an online cluster cutover. Stop the target node first. It restores only
 `grouped_rocksdb` with `--tablets-per-domain 1` and refuses non-empty target
 domains.
+
+For the end-to-end operator workflow, including validation cadence, scratch
+install drills, and failure handling, see
+[backup-verification.md](backup-verification.md).
+For offline restore procedures, see [restore-recovery.md](restore-recovery.md).
+For compaction guidance, see [storage-maintenance.md](storage-maintenance.md).
+
+Verify artifact lifecycle consistency for one tenant:
+
+```bash
+TENANT_ID=ten_...
+agentdbctl artifacts verify-lifecycle --tenant-id "$TENANT_ID"
+agentdbctl -o json artifacts verify-lifecycle --tenant-id "$TENANT_ID"
+```
+
+The command is read-only. It reports live artifacts whose raw bytes are missing
+or hash incorrectly, and derivative-only artifacts whose raw bytes still exist
+after purge.
 
 Register or remove nodes:
 
@@ -252,6 +283,20 @@ CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
 `init --apply` is an alias for applying the current schema. Prefer
 `migrate --apply` in deployment scripts because it records the current schema
 stamp in `agentdb_schema_migrations`.
+
+Inspect or apply a destructive rollback of the first-party ClickHouse export
+schema:
+
+```bash
+agentdbctl export clickhouse rollback
+agentdbctl -o json export clickhouse rollback | jq
+
+CLICKHOUSE_URL=http://agentdb:agentdb@127.0.0.1:8123/?database=agentdb \
+  agentdbctl export clickhouse rollback --apply --allow-destructive
+```
+
+Rollback drops only the AgentDB-managed ClickHouse export tables/views. It does
+not mutate AgentDB runtime state.
 
 Check AgentDB and ClickHouse reachability:
 
@@ -426,6 +471,10 @@ For systemd deployments, use
 `ops/observability/agentdb-export-clickhouse.service` with
 `ops/observability/agentdb-export-clickhouse.env.example` as the starting env
 file. The unit runs `migrate --apply` before starting the tailing exporter.
+
+For the end-to-end CDC/export operator workflow, including cursor recovery,
+managed consumer failover, privacy controls, and routine checks, see
+[cdc-export.md](cdc-export.md).
 
 ## Raw Escape Hatch
 

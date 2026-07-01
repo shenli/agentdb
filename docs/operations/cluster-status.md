@@ -220,6 +220,8 @@ And a very small amount of direct metadata admin:
   metadata snapshot
 - `agentdbctl restore validate <manifest-path>` for backup manifest validation;
   online destructive restore apply is intentionally not supported
+- [backup-verification.md](backup-verification.md) for the supported
+  single-node verification runbook and failure handling
 
 These help operators and developers inspect control-plane state and clean up
 obviously-bad metadata rows. They also provide the first useful node
