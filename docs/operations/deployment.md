@@ -93,8 +93,16 @@ Containerized single-node deployment:
 
 ```bash
 docker build -t agentdb:local .
-docker run --rm -p 7878:7878 -v agentdb-data:/data agentdb:local
+docker run --rm \
+  -p 127.0.0.1:7878:7878 \
+  -e AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters' \
+  -v agentdb-data:/data \
+  agentdb:local
 ```
+
+The bearer token must contain at least 16 visible ASCII characters with no
+whitespace; generate it outside the repository and terminate TLS before remote
+traffic reaches the HTTP listener.
 
 Use this when you want:
 
@@ -109,8 +117,11 @@ cluster topology.
 
 ```bash
 cd examples/compose
+export AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters'
 docker compose up --build
 ```
+
+The Compose token follows the same 16-character visible-ASCII rule.
 
 Use it when you want to check:
 
@@ -180,7 +191,9 @@ Before exposing a maintained node:
 - use a config file instead of long CLI flag lists
 - run `agentdb doctor --config <path>`
 - verify operator readiness with `agentdbctl status`
-- keep `/health/ready` available for load balancers and uptime probes
+- configure an installation bearer token before any non-loopback bind and
+  terminate TLS at the network edge
+- use `/health/live` for process liveness and `/health/ready` for traffic gates
 - place runtime metadata and content on durable storage
 - decide whether content should stay local or move to object storage
 - define backup/restore procedure before production traffic

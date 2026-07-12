@@ -191,6 +191,15 @@ struct ServeOpts {
     #[arg(long, env = "AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN")]
     internal_auth_previous_token: Option<String>,
 
+    /// Installation-level bearer token for every external HTTP API route.
+    /// Required when binding the HTTP listener to a non-loopback address.
+    #[arg(long, env = "AGENTDB_API_AUTH_TOKEN")]
+    api_auth_token: Option<String>,
+
+    /// Previous external API bearer token accepted during rotation.
+    #[arg(long, env = "AGENTDB_API_AUTH_PREVIOUS_TOKEN")]
+    api_auth_previous_token: Option<String>,
+
     /// Optional workspace bootstrap used by the `agentdb dev` wrapper.
     #[arg(skip)]
     dev_bootstrap: Option<DevBootstrap>,
@@ -308,6 +317,15 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .map(|_| agentdb_api::raft_ingress::RaftRsGroupRegistry::shared());
     let route_startup =
         prepare_route_startup(&config, route_location.clone(), raft_registry.clone()).await?;
+    let auth_meta = if let Some(startup) = route_startup.as_ref() {
+        startup.meta.clone()
+    } else if config.in_memory {
+        agentdb_meta::MetaStore::open_sqlite(":memory:").await?
+    } else {
+        std::fs::create_dir_all(&config.data_dir)?;
+        let path = config.data_dir.join("auth-meta.sqlite");
+        agentdb_meta::MetaStore::open_sqlite(&path.to_string_lossy()).await?
+    };
     let runtime_raft_logs: Option<
         BTreeMap<i64, Arc<dyn agentdb_storage::ReplicatedLog + Send + Sync>>,
     > = route_startup.as_ref().and_then(|startup| {
@@ -427,6 +445,22 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         }
     };
 
+    if !config.in_memory && config.route_node_id.is_none() {
+        let report = runtime
+            .reconcile_orphan_artifact_content()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        tracing::info!(
+            listing_supported = report.listing_supported,
+            objects_scanned = report.objects_scanned,
+            referenced_objects = report.referenced_objects,
+            orphan_objects_deleted = report.orphan_objects_deleted,
+            temporary_objects_deleted = report.temporary_objects_deleted,
+            delete_errors = report.delete_errors,
+            "completed startup artifact-content reconciliation"
+        );
+    }
+
     let record_index_worker_interval_ms = env_u64(
         "AGENTDB_RECORD_INDEX_WORKER_INTERVAL_MS",
         DEFAULT_RECORD_INDEX_WORKER_INTERVAL_MS,
@@ -464,11 +498,18 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
 
     let mut state = agentdb_api::AppState::new(runtime.clone())
+        .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
             timeout_ms: config.route_proxy_timeout_ms,
             max_response_bytes: config.route_proxy_max_response_bytes,
         })
         .with_tablet_store_status(tablet_store_status(&config));
+    if let Some(token) = config.api_auth_token.clone() {
+        state = state.with_api_auth_token(token);
+    }
+    if let Some(token) = config.api_auth_previous_token.clone() {
+        state = state.with_api_auth_previous_token(token);
+    }
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror);
     }
@@ -720,6 +761,8 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         mongo_password: None,
         internal_auth_token: None,
         internal_auth_previous_token: None,
+        api_auth_token: None,
+        api_auth_previous_token: None,
         dev_bootstrap: Some(DevBootstrap {
             workspace: opts.workspace,
             agent: opts.agent,
@@ -763,6 +806,8 @@ struct ResolvedServeConfig {
     mongo_password: Option<String>,
     internal_auth_token: Option<String>,
     internal_auth_previous_token: Option<String>,
+    api_auth_token: Option<String>,
+    api_auth_previous_token: Option<String>,
 }
 
 struct RouteStartup {
@@ -1048,6 +1093,15 @@ impl ResolvedServeConfig {
             .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN").ok());
         validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
         validate_previous_internal_auth_token(&internal_auth_token, &internal_auth_previous_token)?;
+        let api_auth_token = opts
+            .api_auth_token
+            .or(file.server.api_auth_token)
+            .or_else(|| std::env::var("AGENTDB_API_AUTH_TOKEN").ok());
+        let api_auth_previous_token = opts
+            .api_auth_previous_token
+            .or(file.server.api_auth_previous_token)
+            .or_else(|| std::env::var("AGENTDB_API_AUTH_PREVIOUS_TOKEN").ok());
+        validate_api_auth_tokens(bind, &api_auth_token, &api_auth_previous_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -1106,6 +1160,8 @@ impl ResolvedServeConfig {
             mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
+            api_auth_token,
+            api_auth_previous_token,
         })
     }
 
@@ -1192,6 +1248,15 @@ impl ResolvedServeConfig {
             .or_else(|| std::env::var("AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN").ok());
         validate_internal_auth_token(deployment_mode, &internal_auth_token)?;
         validate_previous_internal_auth_token(&internal_auth_token, &internal_auth_previous_token)?;
+        let api_auth_token = file
+            .server
+            .api_auth_token
+            .or_else(|| std::env::var("AGENTDB_API_AUTH_TOKEN").ok());
+        let api_auth_previous_token = file
+            .server
+            .api_auth_previous_token
+            .or_else(|| std::env::var("AGENTDB_API_AUTH_PREVIOUS_TOKEN").ok());
+        validate_api_auth_tokens(bind, &api_auth_token, &api_auth_previous_token)?;
 
         Ok(Self {
             deployment_mode,
@@ -1242,11 +1307,14 @@ impl ResolvedServeConfig {
             mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
+            api_auth_token,
+            api_auth_previous_token,
         })
     }
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     deployment: DeploymentFileConfig,
@@ -1261,19 +1329,24 @@ struct FileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeploymentFileConfig {
     mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServerFileConfig {
     bind: Option<SocketAddr>,
     dev: Option<bool>,
     internal_auth_token: Option<String>,
     internal_auth_previous_token: Option<String>,
+    api_auth_token: Option<String>,
+    api_auth_previous_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StorageFileConfig {
     data_dir: Option<PathBuf>,
     content_dir: Option<PathBuf>,
@@ -1287,11 +1360,13 @@ struct StorageFileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KvFileConfig {
     backend: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TabletStoreFileConfig {
     layout: Option<String>,
     root_dir: Option<PathBuf>,
@@ -1305,11 +1380,13 @@ struct TabletStoreFileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContentFileConfig {
     backend: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObjectStoreFileConfig {
     backend: Option<String>,
     local_root: Option<PathBuf>,
@@ -1320,6 +1397,7 @@ struct ObjectStoreFileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoutingFileConfig {
     node_id: Option<String>,
     shard_count: Option<i64>,
@@ -1335,6 +1413,7 @@ struct RoutingFileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MongoDbFileConfig {
     bind: Option<SocketAddr>,
     username: Option<String>,
@@ -1364,6 +1443,9 @@ fn validate_internal_auth_token(
         (_, Some(token)) if token.len() < 16 => {
             anyhow::bail!("server.internal_auth_token must be at least 16 characters")
         }
+        (_, Some(token)) if !token.bytes().all(|byte| byte.is_ascii_graphic()) => anyhow::bail!(
+            "server.internal_auth_token must contain only visible ASCII characters without whitespace"
+        ),
         (DeploymentMode::Cluster, None) => anyhow::bail!(
             "deployment.mode=cluster requires server.internal_auth_token or AGENTDB_INTERNAL_AUTH_TOKEN"
         ),
@@ -1381,8 +1463,56 @@ fn validate_previous_internal_auth_token(
     if previous.len() < 16 {
         anyhow::bail!("server.internal_auth_previous_token must be at least 16 characters");
     }
+    if !previous.bytes().all(|byte| byte.is_ascii_graphic()) {
+        anyhow::bail!(
+            "server.internal_auth_previous_token must contain only visible ASCII characters without whitespace"
+        );
+    }
+    if current.is_none() {
+        anyhow::bail!("server.internal_auth_previous_token requires server.internal_auth_token");
+    }
     if current.as_deref() == Some(previous) {
         anyhow::bail!("server.internal_auth_previous_token must differ from current token");
+    }
+    Ok(())
+}
+
+fn validate_api_auth_tokens(
+    bind: SocketAddr,
+    current: &Option<String>,
+    previous: &Option<String>,
+) -> anyhow::Result<()> {
+    if current.as_ref().is_some_and(|token| token.len() < 16) {
+        anyhow::bail!("server.api_auth_token must be at least 16 characters");
+    }
+    if current
+        .as_ref()
+        .is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        anyhow::bail!(
+            "server.api_auth_token must contain only visible ASCII characters without whitespace"
+        );
+    }
+    if let Some(previous) = previous.as_deref() {
+        if previous.len() < 16 {
+            anyhow::bail!("server.api_auth_previous_token must be at least 16 characters");
+        }
+        if !previous.bytes().all(|byte| byte.is_ascii_graphic()) {
+            anyhow::bail!(
+                "server.api_auth_previous_token must contain only visible ASCII characters without whitespace"
+            );
+        }
+        if current.is_none() {
+            anyhow::bail!("server.api_auth_previous_token requires server.api_auth_token");
+        }
+        if current.as_deref() == Some(previous) {
+            anyhow::bail!("server.api_auth_previous_token must differ from current token");
+        }
+    }
+    if !bind.ip().is_loopback() && current.is_none() {
+        anyhow::bail!(
+            "a non-loopback HTTP bind requires server.api_auth_token or AGENTDB_API_AUTH_TOKEN"
+        );
     }
     Ok(())
 }
@@ -1755,6 +1885,18 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
     }
     println!("  health:    http://{}/health/ready", config.bind);
     println!("  dashboard: http://{}/dashboard/", config.bind);
+    println!(
+        "  external api auth: {}",
+        if config.api_auth_token.is_some() {
+            if config.api_auth_previous_token.is_some() {
+                "static bearer enabled (previous token accepted during rotation)"
+            } else {
+                "static bearer enabled"
+            }
+        } else {
+            "loopback bootstrap (data API has no static bearer token)"
+        }
+    );
     if let Some(mongo_bind) = config.mongo_bind {
         println!("  mongodb:   mongodb://{mongo_bind}/");
         println!(
@@ -1898,6 +2040,18 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
     println!("AgentDB doctor");
     println!("  bind: {}", config.bind);
     println!("  deployment: {}", describe_deployment_mode(&config));
+    println!(
+        "  external api auth: {}",
+        if config.api_auth_token.is_some() {
+            if config.api_auth_previous_token.is_some() {
+                "static bearer enabled (rotation grace enabled)"
+            } else {
+                "static bearer enabled"
+            }
+        } else {
+            "loopback bootstrap; configure a bearer token before remote exposure"
+        }
+    );
     if config.in_memory {
         println!("  mode: dev in-memory");
         println!("  storage: skipped");
@@ -2322,7 +2476,7 @@ async fn sync_raft_rs_registry(
         .filter(|replica| {
             tablet_states
                 .get(&replica.tablet_id)
-                .map_or(true, |state| state != "tombstoned")
+                .is_none_or(|state| state != "tombstoned")
         })
         .map(|replica| replica.tablet_id)
         .collect();
@@ -2559,7 +2713,7 @@ fn spawn_raft_rs_tick_worker(
                     .get(&tablet_id)
                     .and_then(|tablet| tablet.owner_node_id.as_deref());
                 let local_is_owner = owner_node_id == Some(local_node_id.as_str());
-                let owner_unavailable = owner_node_id.map_or(true, |owner| {
+                let owner_unavailable = owner_node_id.is_none_or(|owner| {
                     cluster_node_unavailable(
                         nodes_by_id.get(owner),
                         now_ms,
@@ -2587,60 +2741,61 @@ fn spawn_raft_rs_tick_worker(
                         )
                     });
                 let raft_leader_missing = local_raft_leader_missing(local_status);
-                if !local_is_owner && !local_is_leader {
-                    if should_attempt_raft_failover_tick(
+                if !local_is_owner
+                    && !local_is_leader
+                    && should_attempt_raft_failover_tick(
                         owner_unavailable,
                         raft_leader_unavailable,
                         raft_leader_available,
                         raft_leader_missing,
-                    ) {
-                        if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+                    )
+                {
+                    if let Err(error) = group.expire_leader_lease(local_raft_node_id) {
+                        tracing::warn!(
+                            tablet_id,
+                            local_node_id,
+                            local_raft_node_id,
+                            ?error,
+                            "failed to expire local raft-rs leader lease"
+                        );
+                    }
+                    let failover_candidate = raft_replicas_by_id
+                        .iter()
+                        .filter_map(
+                            |((replica_tablet_id, raft_node_id), (node_id, applied_index))| {
+                                (*replica_tablet_id == tablet_id
+                                    && cluster_node_available(
+                                        nodes_by_id.get(node_id),
+                                        now_ms,
+                                        stale_node_threshold_ms,
+                                    ))
+                                .then_some((*raft_node_id, *applied_index))
+                            },
+                        )
+                        .max_by_key(|(raft_node_id, applied_index)| {
+                            (*applied_index, Reverse(*raft_node_id))
+                        })
+                        .map(|(raft_node_id, _)| raft_node_id);
+                    if failover_candidate == Some(local_raft_node_id) {
+                        let result = if should_campaign_for_raft_failover(
+                            raft_leader_unavailable,
+                            raft_leader_available,
+                            raft_leader_missing,
+                        ) {
+                            group
+                                .campaign(local_raft_node_id)
+                                .and_then(|()| group.tick(local_raft_node_id))
+                        } else {
+                            group.tick(local_raft_node_id)
+                        };
+                        if let Err(error) = result {
                             tracing::warn!(
-                                tablet_id,
-                                local_node_id,
-                                local_raft_node_id,
-                                ?error,
-                                "failed to expire local raft-rs leader lease"
-                            );
-                        }
-                        let failover_candidate = raft_replicas_by_id
-                            .iter()
-                            .filter_map(
-                                |((replica_tablet_id, raft_node_id), (node_id, applied_index))| {
-                                    (*replica_tablet_id == tablet_id
-                                        && cluster_node_available(
-                                            nodes_by_id.get(node_id),
-                                            now_ms,
-                                            stale_node_threshold_ms,
-                                        ))
-                                    .then_some((*raft_node_id, *applied_index))
-                                },
-                            )
-                            .max_by_key(|(raft_node_id, applied_index)| {
-                                (*applied_index, Reverse(*raft_node_id))
-                            })
-                            .map(|(raft_node_id, _)| raft_node_id);
-                        if failover_candidate == Some(local_raft_node_id) {
-                            let result = if should_campaign_for_raft_failover(
-                                raft_leader_unavailable,
-                                raft_leader_available,
-                                raft_leader_missing,
-                            ) {
-                                group
-                                    .campaign(local_raft_node_id)
-                                    .and_then(|()| group.tick(local_raft_node_id))
-                            } else {
-                                group.tick(local_raft_node_id)
-                            };
-                            if let Err(error) = result {
-                                tracing::warn!(
                                     tablet_id,
                                     local_node_id,
                                     local_raft_node_id,
                                     ?error,
                                     "failed to recover local raft-rs group after owner or leader became unavailable"
                                 );
-                            }
                         }
                     }
                 }
@@ -2694,7 +2849,7 @@ fn cluster_node_unavailable(
     stale_node_threshold_ms: i64,
 ) -> bool {
     let stale_deadline_ms = now_ms.saturating_sub(stale_node_threshold_ms);
-    node.map_or(true, |node| {
+    node.is_none_or(|node| {
         node.state.as_str() != "alive"
             || (node.last_heartbeat_ms <= stale_deadline_ms
                 && node.joined_at_ms <= stale_deadline_ms)
@@ -3644,6 +3799,7 @@ fn spawn_cluster_workers(deps: ClusterWorkerDeps, config: ClusterWorkerConfig) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_node_once(
     meta: &agentdb_meta::MetaStore,
     node_id: &str,
@@ -3786,7 +3942,7 @@ async fn run_cluster_scheduler_tick(
             "renewed locally owned tablet leases"
         );
     }
-    if let Some(registry) = raft_registry {
+    let pre_leader_aligned = if let Some(registry) = raft_registry {
         let renewed = reconcile_raft_leader_tablet_ownership(
             meta,
             registry,
@@ -3802,7 +3958,10 @@ async fn run_cluster_scheduler_tick(
                 "renewed local tablet ownership with matching raft leaders"
             );
         }
-    }
+        renewed
+    } else {
+        0
+    };
     let leader_row = match agentdb_meta::scheduler::get(pool).await? {
         Some(current) if current.node_id == node_id && current.is_live(now_ms) => {
             agentdb_meta::scheduler::renew(
@@ -3847,6 +4006,9 @@ async fn run_cluster_scheduler_tick(
     );
     if !is_leader {
         return Ok(());
+    }
+    if pre_leader_aligned > 0 {
+        status.add_tablet_reassignments(pre_leader_aligned as u64);
     }
 
     if let Some(registry) = raft_registry {
@@ -4631,13 +4793,13 @@ fn tablet_within_merge_limits(
         return false;
     }
     if config.tablet_lifecycle_merge_max_keys > 0
-        && !stats.is_some_and(|stats| stats.key_count <= config.tablet_lifecycle_merge_max_keys)
+        && stats.is_none_or(|stats| stats.key_count > config.tablet_lifecycle_merge_max_keys)
     {
         return false;
     }
     if config.tablet_lifecycle_merge_max_storage_bytes > 0
-        && !stats.is_some_and(|stats| {
-            stats.storage_bytes <= config.tablet_lifecycle_merge_max_storage_bytes
+        && stats.is_none_or(|stats| {
+            stats.storage_bytes > config.tablet_lifecycle_merge_max_storage_bytes
         })
     {
         return false;
@@ -5516,6 +5678,8 @@ mod tests {
             mongo_password: None,
             internal_auth_token: None,
             internal_auth_previous_token: None,
+            api_auth_token: None,
+            api_auth_previous_token: None,
             dev_bootstrap: None,
         }
     }
@@ -5714,6 +5878,49 @@ data_dir = "/tmp/agentdb-test"
             config.tablet_store_root_dir,
             PathBuf::from("/tmp/agentdb-test/tablet-stores")
         );
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_external_api_token() {
+        let bind: SocketAddr = "0.0.0.0:7878".parse().unwrap();
+        let error = validate_api_auth_tokens(bind, &None, &None).unwrap_err();
+        assert!(error.to_string().contains("non-loopback HTTP bind"));
+        validate_api_auth_tokens(bind, &Some("external-token-123".into()), &None).unwrap();
+    }
+
+    #[test]
+    fn external_api_tokens_must_be_header_safe() {
+        let bind: SocketAddr = "0.0.0.0:7878".parse().unwrap();
+        for token in ["external token 123", "éééééééé"] {
+            let error = validate_api_auth_tokens(bind, &Some(token.into()), &None).unwrap_err();
+            assert!(error.to_string().contains("visible ASCII"));
+        }
+
+        let current = Some("current-token-123".into());
+        let error = validate_api_auth_tokens(bind, &current, &Some("previous token 123".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("visible ASCII"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields_instead_of_silently_ignoring_typos() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[server]
+bind = "127.0.0.1:8787"
+api_auth_tokne = "misspelled"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+
+        let error = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("api_auth_tokne"));
     }
 
     #[test]
@@ -6004,6 +6211,38 @@ node_id = "node-a"
         assert!(err
             .to_string()
             .contains("server.internal_auth_previous_token must differ"));
+    }
+
+    #[test]
+    fn internal_auth_tokens_must_be_header_safe() {
+        for token in ["internal token 123", "éééééééé"] {
+            let mut opts = base_opts();
+            opts.internal_auth_token = Some(token.into());
+
+            let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+            assert!(err.to_string().contains("visible ASCII"));
+        }
+
+        let mut opts = base_opts();
+        opts.internal_auth_token = Some("current-token-123".into());
+        opts.internal_auth_previous_token = Some("previous token 123".into());
+
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+        assert!(err.to_string().contains("visible ASCII"));
+    }
+
+    #[test]
+    fn previous_internal_auth_token_requires_a_current_token() {
+        let mut opts = base_opts();
+        opts.internal_auth_previous_token = Some("previous-token-123".into());
+
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("server.internal_auth_previous_token requires server.internal_auth_token"));
     }
 
     #[test]

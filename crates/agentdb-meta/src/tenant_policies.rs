@@ -106,7 +106,7 @@ pub async fn upsert_with_cell(
     priority: i64,
     now_ms: i64,
 ) -> MetaResult<()> {
-    validate_policy(
+    validate_policy(PolicyValidation {
         placement_class,
         placement_scope_id,
         encryption_class,
@@ -115,7 +115,7 @@ pub async fn upsert_with_cell(
         cell_id,
         tier,
         priority,
-    )?;
+    })?;
     sqlx::query(
         "INSERT INTO tenant_policies
             (tenant_id, placement_class, placement_scope_id, encryption_class, key_policy_id,
@@ -206,19 +206,21 @@ pub async fn delete(pool: &AnyPool, tenant_id: &str) -> MetaResult<bool> {
     Ok(rows > 0)
 }
 
-fn validate_policy(
-    placement_class: &str,
-    placement_scope_id: &str,
-    encryption_class: &str,
+struct PolicyValidation<'a> {
+    placement_class: &'a str,
+    placement_scope_id: &'a str,
+    encryption_class: &'a str,
     encryption_policy_version: i64,
     policy_version: i64,
-    cell_id: &str,
-    tier: &str,
+    cell_id: &'a str,
+    tier: &'a str,
     priority: i64,
-) -> MetaResult<()> {
-    cells::validate_cell_id(cell_id)?;
-    validate_tier(tier)?;
-    match placement_class {
+}
+
+fn validate_policy(policy: PolicyValidation<'_>) -> MetaResult<()> {
+    cells::validate_cell_id(policy.cell_id)?;
+    validate_tier(policy.tier)?;
+    match policy.placement_class {
         "shared" | "dedicated" => {}
         other => {
             return Err(MetaError::InvalidInput(format!(
@@ -226,12 +228,12 @@ fn validate_policy(
             )))
         }
     }
-    if placement_scope_id.is_empty() {
+    if policy.placement_scope_id.is_empty() {
         return Err(MetaError::InvalidInput(
             "placement_scope_id must not be empty".into(),
         ));
     }
-    match encryption_class {
+    match policy.encryption_class {
         "pool" | "tenant" => {}
         other => {
             return Err(MetaError::InvalidInput(format!(
@@ -239,22 +241,22 @@ fn validate_policy(
             )))
         }
     }
-    if placement_class == "dedicated" && encryption_class != "tenant" {
+    if policy.placement_class == "dedicated" && policy.encryption_class != "tenant" {
         return Err(MetaError::InvalidInput(
             "dedicated placement requires tenant encryption class".into(),
         ));
     }
-    if encryption_policy_version < 0 {
+    if policy.encryption_policy_version < 0 {
         return Err(MetaError::InvalidInput(
             "encryption_policy_version must be non-negative".into(),
         ));
     }
-    if policy_version < 0 {
+    if policy.policy_version < 0 {
         return Err(MetaError::InvalidInput(
             "policy_version must be non-negative".into(),
         ));
     }
-    if priority < 0 {
+    if policy.priority < 0 {
         return Err(MetaError::InvalidInput(
             "priority must be non-negative".into(),
         ));

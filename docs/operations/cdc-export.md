@@ -21,6 +21,41 @@ Use `exports/watch` and managed consumers for CDC-style replication. It has
 durable cursors on persistent runtimes, backfill support, tombstone envelopes,
 and consumer checkpoint APIs.
 
+## Cursor Contract
+
+Persistent cursors are opaque. New rows use
+`ledger:<tenant>/v2/<20-digit-sequence>/<kind>/...`; the durable sequence is
+allocated per tenant at the serialized KV commit boundary. It therefore orders
+that tenant's committed mutations without relying on wall-clock timestamps.
+Legacy retained timestamp-based cursors remain resumable and order before v2
+cursors.
+
+For watch and backfill responses:
+
+- `next_cursor` is the last item returned in the current page, or null for an
+  empty page. Resume from it.
+- `high_watermark` is the ledger head captured before that request and can be
+  ahead of `next_cursor` when `limit` truncates the page.
+- `snapshot_high_watermark` is the durable ledger boundary paired with a
+  metadata backfill. Capture it from the first page and send the same value on
+  every continued page before switching to tail.
+
+Do not invent a cursor or treat the high watermark as though every preceding
+row was already delivered. An ordinary managed-consumer ack or rewind accepts
+only a real retained ledger item emitted for its tenant, scope, and include
+filter. On persistent runtimes, wait for `complete=true` before acknowledging a
+metadata snapshot, then send the last delivered `snapshot:...` cursor together
+with the complete response's `snapshot_high_watermark`. For an empty completed
+snapshot, send a null `cursor` with the non-null snapshot high watermark.
+AgentDB validates the snapshot tenant when present and the retained ledger
+boundary, and records the high watermark—not the page-local snapshot cursor—as
+the durable ack.
+
+These durable export endpoints currently require a single-tablet runtime.
+Metadata-backed cluster routing fails them closed with HTTP 422 because a
+cross-tablet merge frontier is not implemented; do not run a sink against one
+tablet owner and treat it as a tenant-wide feed.
+
 ## Inspect Export Capability
 
 Check one tenant:
@@ -120,6 +155,13 @@ Official connectors should use a named managed consumer:
 - resume from the last acked cursor after restart
 - use rewind only for intentional replay
 
+Managed-consumer status streams retained ledger rows while calculating pending
+count and oldest age. For one consumer, its additional scan memory use is O(1)
+and response time is O(N), where N is the number of retained ledger candidates
+visited after the checkpoint. Rows excluded by the include filter can still
+contribute to N. Alerting systems should poll at a bounded interval rather than
+fan out concurrent status requests for a severely lagged consumer.
+
 Run two or more tailing processes with the same `--consumer` and distinct
 `--lease-owner` values for standby failover. The active lease holder writes and
 acks; a standby can claim after `--lease-ms` expires.
@@ -168,6 +210,8 @@ If the exporter falls behind:
 If a cursor is invalid:
 
 - read the `oldest_available_cursor` from status or the error response
+- verify that the cursor came from this tenant and this consumer's scope and
+  include filter; fabricated or cross-consumer cursors are rejected
 - rewind the managed consumer to a valid cursor only when duplicate sink writes
   are acceptable or deduplicated
 - run a fresh backfill when the required cursor is no longer retained

@@ -153,6 +153,11 @@ pub struct ExportBackfillBody {
     pub include: Vec<String>,
     #[serde(default)]
     pub from_cursor: Option<String>,
+    /// Stable ledger boundary returned by the first metadata-snapshot page.
+    /// Required on subsequent metadata pages so backfill-to-tail handoff
+    /// cannot skip concurrent mutations.
+    #[serde(default)]
+    pub snapshot_high_watermark: Option<String>,
     #[serde(default = "default_fetch_limit")]
     pub limit: usize,
 }
@@ -179,7 +184,8 @@ pub struct ClaimExportConsumerBody {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AckExportConsumerBody {
-    pub cursor: String,
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub snapshot_high_watermark: Option<String>,
     #[serde(default)]

@@ -40,9 +40,9 @@ use agentdb_core::{
     NewAgent, NewArtifact, NewSession, NewSkill, NewTenant, Skill, SourceRef, Tenant,
 };
 use agentdb_meta::{
-    cells, nodes, placement_scopes, session_locators, tablet_movements, tablet_ranges,
-    tablet_rebalance, tablet_replicas, tablet_snapshots, tablet_stats, tablets, tenant_policies,
-    tenants,
+    admin_tokens, cells, nodes, placement_scopes, session_locators, tablet_movements,
+    tablet_ranges, tablet_rebalance, tablet_replicas, tablet_snapshots, tablet_stats, tablets,
+    tenant_policies, tenants,
 };
 
 use crate::dto::{
@@ -75,15 +75,15 @@ const DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS: i64 = 180_000;
 const DEFAULT_RAFT_SNAPSHOT_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_ADMIN_TABLET_LEASE_MS: i64 = 30_000;
 
-/// Per-request body cap for the artifact POST route. The runtime enforces a
-/// 16 MB ceiling on the bytes; we allow a single MB of slack at the HTTP
-/// layer so a borderline-oversized body still reaches the handler and
-/// surfaces a structured `ARTIFACT_TOO_LARGE` 422 instead of axum's default
-/// "payload too large" / connection reset.
-const ARTIFACT_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
+/// Per-request body cap for the artifact POST route. Runtime policy can allow
+/// up to 128 MiB; one MiB of transport slack lets an oversized request reach
+/// the structured `ARTIFACT_TOO_LARGE` check rather than Axum's generic 413.
+const ARTIFACT_BODY_LIMIT_BYTES: usize =
+    agentdb_core::policy::ABSOLUTE_MAX_ARTIFACT_BYTES as usize + 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route(
             "/api/internal/raft/messages",
@@ -98,6 +98,11 @@ pub fn routes() -> Router<AppState> {
             post(post_internal_tablet_movement_snapshot_export),
         )
         .route("/api/admin/cluster/health", get(get_cluster_health))
+        .route(
+            "/api/admin/tokens",
+            get(list_admin_tokens).post(mint_admin_token),
+        )
+        .route("/api/admin/tokens/:token_id", delete(revoke_admin_token))
         .route("/api/admin/cluster/readiness", get(get_cluster_readiness))
         .route("/api/admin/scheduler", get(get_admin_scheduler))
         .route("/api/admin/exports", get(get_admin_exports))
@@ -308,10 +313,9 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/tenants/:tenant_id/artifacts",
             post(create_artifact)
-                // Raise the per-route body limit so the runtime's 16 MB
-                // ARTIFACT_TOO_LARGE check actually fires; axum's default
-                // (2 MB) would reject these as PAYLOAD_TOO_LARGE before
-                // the handler ever runs.
+                // Raise the per-route body limit so tenant policy (up to the
+                // 128 MiB absolute ceiling) returns ARTIFACT_TOO_LARGE;
+                // axum's 2 MiB default would reject valid artifact policies.
                 .layer(DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT_BYTES)),
         )
         .route(
@@ -381,11 +385,97 @@ pub fn routes() -> Router<AppState> {
         .route("/api/policy/worker/run", post(run_policy_worker))
 }
 
-async fn health_ready() -> StatusCode {
+async fn health_live() -> StatusCode {
     StatusCode::OK
 }
 
+async fn health_ready(State(s): State<AppState>) -> StatusCode {
+    let readiness = build_cluster_readiness(
+        &s.routing.describe(),
+        s.drain.is_draining(),
+        DEFAULT_CLUSTER_STALE_NODE_THRESHOLD_MS,
+    );
+    if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MintAdminTokenBody {
+    description: String,
+    #[serde(default)]
+    scope: admin_tokens::AdminScope,
+}
+
+#[derive(Debug, Serialize)]
+struct MintAdminTokenResponse {
+    token_id: String,
+    token: String,
+    description: String,
+    created_at_ms: i64,
+    scope: admin_tokens::AdminScope,
+}
+
+async fn mint_admin_token(
+    State(s): State<AppState>,
+    Json(body): Json<MintAdminTokenBody>,
+) -> Result<(StatusCode, Json<MintAdminTokenResponse>), ApiError> {
+    let description = body.description.trim();
+    if description.is_empty() || description.len() > 256 {
+        return Err(invalid_admin_request(
+            "admin token description must contain 1 to 256 characters",
+        ));
+    }
+    let meta = auth_meta_required(&s)?;
+    let now_ms = i64::try_from(current_ms()).unwrap_or(i64::MAX);
+    let minted = admin_tokens::mint(meta.pool(), description, body.scope, now_ms)
+        .await
+        .map_err(internal_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(MintAdminTokenResponse {
+            token_id: minted.token_id,
+            token: minted.plaintext,
+            description: minted.summary.description,
+            created_at_ms: minted.summary.created_at_ms,
+            scope: minted.summary.scope,
+        }),
+    ))
+}
+
+async fn list_admin_tokens(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<admin_tokens::TokenSummary>>, ApiError> {
+    let meta = auth_meta_required(&s)?;
+    Ok(Json(
+        admin_tokens::list_active(meta.pool())
+            .await
+            .map_err(internal_error)?,
+    ))
+}
+
+async fn revoke_admin_token(
+    State(s): State<AppState>,
+    Path(token_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if token_id.trim().is_empty() || token_id.len() > 64 {
+        return Err(invalid_admin_request("admin token_id is malformed"));
+    }
+    let meta = auth_meta_required(&s)?;
+    let now_ms = i64::try_from(current_ms()).unwrap_or(i64::MAX);
+    let revoked = admin_tokens::revoke(meta.pool(), &token_id, now_ms)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::json!({
+        "token_id": token_id,
+        "revoked": revoked
+    })))
+}
+
 async fn get_admin_exports(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    require_single_tablet_export(&s)?;
     let consumers = s.runtime.list_export_consumer_statuses().await?;
     let pending_items_total: usize = consumers
         .iter()
@@ -2082,6 +2172,15 @@ fn meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
     })
 }
 
+fn auth_meta_required(s: &AppState) -> Result<&agentdb_meta::MetaStore, ApiError> {
+    s.auth_meta.as_ref().ok_or_else(|| {
+        ApiError(agentdb_core::Error::new(
+            ErrorCode::KeyUnavailable,
+            "admin token metadata is not configured on this node",
+        ))
+    })
+}
+
 fn internal_error(err: impl ToString) -> ApiError {
     ApiError(agentdb_core::Error::new(
         ErrorCode::Internal,
@@ -2558,7 +2657,7 @@ async fn get_admin_tablet_stats(
         .filter(|aggregate| {
             query
                 .tablet_id
-                .map_or(true, |tablet_id| aggregate.tablet_id == tablet_id)
+                .is_none_or(|tablet_id| aggregate.tablet_id == tablet_id)
         })
         .collect();
     Ok(Json(AdminTabletStatsResponse { stats, aggregates }))
@@ -5175,9 +5274,12 @@ fn build_cluster_readiness(
         return ClusterReadinessResponse {
             mode: health.mode,
             local_node_id: health.local_node_id,
-            ready: true,
+            ready: !local_is_draining,
             stale_threshold_ms,
-            reasons: Vec::new(),
+            reasons: local_is_draining
+                .then(|| "local node is draining".to_string())
+                .into_iter()
+                .collect(),
         };
     }
 
@@ -6152,11 +6254,21 @@ async fn export_watch(
     Path(tenant_id): Path<String>,
     Query(q): Query<WatchQuery>,
 ) -> Result<Json<ExportWatchResponse>, ApiError> {
+    require_single_tablet_export(&s)?;
     let req = export_watch_request_from_query(&tenant_id, q)?;
     let req_tenant_id = req.tenant_id.clone();
     let runtime = s.runtime.clone();
+    let high_watermark = runtime.export_high_watermark(&req_tenant_id).await?;
+    let through_cursor = high_watermark.clone();
     let items = with_route_tablet_context(runtime.clone(), &headers, async move {
-        runtime.export_watch(req).await
+        match through_cursor.as_deref() {
+            Some(through_cursor) => {
+                runtime
+                    .export_watch_through(req, Some(through_cursor))
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
     })
     .await?;
     let observed_at_ms = current_ms();
@@ -6170,7 +6282,7 @@ async fn export_watch(
         .export_oldest_available_cursor(&req_tenant_id)
         .await?;
     Ok(Json(ExportWatchResponse {
-        high_watermark: next_cursor.clone(),
+        high_watermark,
         next_cursor,
         oldest_available_cursor,
         items: envelopes,
@@ -6183,6 +6295,7 @@ async fn export_backfill(
     Path(tenant_id): Path<String>,
     Json(body): Json<ExportBackfillBody>,
 ) -> Result<Json<ExportBackfillResponse>, ApiError> {
+    require_single_tablet_export(&s)?;
     let include = if body.include.is_empty() {
         vec!["events".to_string()]
     } else {
@@ -6208,6 +6321,13 @@ async fn export_backfill(
             )));
         }
         let observed_at_ms = current_ms();
+        let snapshot_high_watermark = resolve_metadata_snapshot_high_watermark(
+            &s.runtime,
+            &tid,
+            body.from_cursor.as_deref(),
+            body.snapshot_high_watermark.as_deref(),
+        )
+        .await?;
         let (items, complete, oldest_available_cursor) = export_snapshot_backfill(
             &s.runtime,
             &tid,
@@ -6219,7 +6339,7 @@ async fn export_backfill(
         .await?;
         let next_cursor = items.last().map(|item| item.cursor.clone());
         return Ok(Json(ExportBackfillResponse {
-            snapshot_high_watermark: next_cursor.clone(),
+            snapshot_high_watermark,
             next_cursor,
             oldest_available_cursor,
             complete,
@@ -6240,8 +6360,23 @@ async fn export_backfill(
     let requested_limit = req.limit;
     let req_tenant_id = req.tenant_id.clone();
     let runtime = s.runtime.clone();
+    let snapshot_high_watermark = match body.snapshot_high_watermark {
+        Some(high_watermark) => {
+            validate_tenant_export_cursor(&runtime, &req_tenant_id, &high_watermark).await?;
+            Some(high_watermark)
+        }
+        None => runtime.export_high_watermark(&req_tenant_id).await?,
+    };
+    let through_cursor = snapshot_high_watermark.clone();
     let items = with_route_tablet_context(runtime.clone(), &headers, async move {
-        runtime.export_watch(req).await
+        match through_cursor.as_deref() {
+            Some(through_cursor) => {
+                runtime
+                    .export_watch_through(req, Some(through_cursor))
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
     })
     .await?;
     let observed_at_ms = current_ms();
@@ -6256,12 +6391,53 @@ async fn export_backfill(
         .export_oldest_available_cursor(&req_tenant_id)
         .await?;
     Ok(Json(ExportBackfillResponse {
-        snapshot_high_watermark: next_cursor.clone(),
+        snapshot_high_watermark,
         next_cursor,
         oldest_available_cursor,
         complete,
         items: envelopes,
     }))
+}
+
+async fn resolve_metadata_snapshot_high_watermark(
+    runtime: &Arc<agentdb_core::runtime::Runtime>,
+    tenant_id: &Id,
+    from_cursor: Option<&str>,
+    supplied_high_watermark: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    if from_cursor.is_some() && supplied_high_watermark.is_none() {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::InvalidCursor,
+            "continued metadata snapshot backfill requires snapshot_high_watermark from the first page",
+        )));
+    }
+    if let Some(high_watermark) = supplied_high_watermark {
+        validate_tenant_export_cursor(runtime, tenant_id, high_watermark).await?;
+        return Ok(Some(high_watermark.to_string()));
+    }
+    runtime
+        .export_high_watermark(tenant_id)
+        .await
+        .map_err(ApiError)
+}
+
+async fn validate_tenant_export_cursor(
+    runtime: &Arc<agentdb_core::runtime::Runtime>,
+    tenant_id: &Id,
+    cursor: &str,
+) -> Result<(), ApiError> {
+    runtime
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: Vec::new(),
+            from_cursor: Some(cursor.to_string()),
+            limit: 1,
+        })
+        .await?;
+    Ok(())
 }
 
 fn validate_export_snapshot_include(include: &str) -> Result<(), ApiError> {
@@ -6283,11 +6459,8 @@ async fn export_snapshot_backfill(
     limit: usize,
     observed_at_ms: u64,
 ) -> Result<(Vec<ExportEnvelope>, bool, Option<String>), ApiError> {
-    if from_cursor.is_some_and(|cursor| !cursor.starts_with("snapshot:")) {
-        return Err(ApiError(agentdb_core::Error::new(
-            ErrorCode::InvalidCursor,
-            "metadata snapshot backfill cursor must use the snapshot: format",
-        )));
+    if let Some(cursor) = from_cursor {
+        validate_metadata_snapshot_cursor(tenant_id, cursor)?;
     }
 
     let mut items = Vec::new();
@@ -6406,6 +6579,31 @@ async fn export_snapshot_backfill(
     Ok((items, complete, oldest_available_cursor))
 }
 
+fn validate_metadata_snapshot_cursor(tenant_id: &Id, cursor: &str) -> Result<(), ApiError> {
+    let parts = cursor
+        .strip_prefix("snapshot:")
+        .map(|raw| raw.split('/').collect::<Vec<_>>());
+    let valid = parts.as_ref().is_some_and(|parts| {
+        parts.len() == 4
+            && parts[0] == tenant_id.as_str()
+            && parts[1].len() == 20
+            && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+            && matches!(
+                parts[2],
+                "tenant" | "agent" | "session" | "artifact" | "record" | "skill" | "skill_binding"
+            )
+            && !parts[3].is_empty()
+    });
+    if !valid {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::InvalidCursor,
+            "metadata snapshot cursor is malformed or belongs to a different tenant",
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_snapshot_envelope(
     items: &mut Vec<ExportEnvelope>,
     object_type: &'static str,
@@ -6445,6 +6643,7 @@ async fn export_status(
     headers: HeaderMap,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<ExportStatusResponse>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let runtime = s.runtime.clone();
     let high_watermark = with_route_tablet_context(runtime.clone(), &headers, async move {
@@ -6479,6 +6678,7 @@ async fn create_export_consumer(
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateExportConsumerBody>,
 ) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let session_id = body
         .session_id
@@ -6508,6 +6708,7 @@ async fn get_export_consumer(
     State(s): State<AppState>,
     Path((tenant_id, name)): Path<(String, String)>,
 ) -> Result<Json<agentdb_core::runtime::ExportConsumerStatus>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     Ok(Json(
         s.runtime.get_export_consumer_status(&tid, &name).await?,
@@ -6519,6 +6720,7 @@ async fn claim_export_consumer(
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<ClaimExportConsumerBody>,
 ) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let consumer = s
         .runtime
@@ -6537,6 +6739,7 @@ async fn ack_export_consumer(
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<AckExportConsumerBody>,
 ) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let consumer = s
         .runtime
@@ -6556,6 +6759,7 @@ async fn rewind_export_consumer(
     Path((tenant_id, name)): Path<(String, String)>,
     Json(body): Json<RewindExportConsumerBody>,
 ) -> Result<Json<agentdb_core::runtime::ExportConsumer>, ApiError> {
+    require_single_tablet_export(&s)?;
     let tid = parse_id_or(&tenant_id, IdKind::Tenant, ErrorCode::TenantNotFound)?;
     let consumer = s
         .runtime
@@ -6567,6 +6771,16 @@ async fn rewind_export_consumer(
         })
         .await?;
     Ok(Json(consumer))
+}
+
+fn require_single_tablet_export(s: &AppState) -> Result<(), ApiError> {
+    if s.routing.describe().mode == "snapshot" {
+        return Err(ApiError(agentdb_core::Error::new(
+            ErrorCode::PolicyDenied,
+            "cross-tablet export frontiers are not implemented; durable export endpoints require a single-tablet runtime",
+        )));
+    }
+    Ok(())
 }
 
 fn watch_request_from_query(tenant_id: &str, q: WatchQuery) -> Result<WatchRequest, ApiError> {

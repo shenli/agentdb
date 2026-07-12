@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import json as jsonlib
 import os
-import uuid
 from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import requests
@@ -156,7 +155,45 @@ class AgentDB:
         if tenant_id is not None:
             return Workspace(self.client, tenant_id, name=name)
         external_key = name or os.environ.get("AGENTDB_WORKSPACE") or "default"
-        tenant = self.client.create_tenant(external_key, policy=policy)
+        user_info = getattr(self.client, "user_info", None)
+        if callable(user_info):
+            try:
+                info = user_info()
+            except AgentDBError as error:
+                if error.status_code != 404:
+                    raise
+            else:
+                resolved = _workspace_from_user_info(info, name)
+                if resolved is None:
+                    raise ValueError(
+                        "authenticated user-info did not include an allowed workspace"
+                    )
+                resolved_id, resolved_name, data = resolved
+                return Workspace(self.client, resolved_id, name=resolved_name or name, data=data)
+
+        for tenant in _optional_list(self.client, "list_tenants"):
+            if tenant.get("external_key") == external_key:
+                return Workspace(
+                    self.client,
+                    tenant["tenant_id"],
+                    name=external_key,
+                    data=tenant,
+                )
+        try:
+            tenant = self.client.create_tenant(external_key, policy=policy)
+        except AgentDBError as error:
+            if error.status_code != 409:
+                raise
+            tenant = next(
+                (
+                    candidate
+                    for candidate in _optional_list(self.client, "list_tenants")
+                    if candidate.get("external_key") == external_key
+                ),
+                None,
+            )
+            if tenant is None:
+                raise
         return Workspace(
             self.client,
             tenant["tenant_id"],
@@ -215,7 +252,23 @@ class Workspace:
 
         if agent_id is not None:
             return AgentHandle(self, agent_id, alias=alias)
-        data = self._client.create_agent(self.tenant_id, alias=alias, config=config)
+        if alias is not None:
+            existing = _find_by_alias(
+                _optional_list(self._client, "list_agents", self.tenant_id), alias
+            )
+            if existing is not None:
+                return AgentHandle(self, existing["agent_id"], alias=alias, data=existing)
+        try:
+            data = self._client.create_agent(self.tenant_id, alias=alias, config=config)
+        except AgentDBError as error:
+            if alias is None or error.status_code != 409:
+                raise
+            existing = _find_by_alias(
+                _optional_list(self._client, "list_agents", self.tenant_id), alias
+            )
+            if existing is None:
+                raise
+            data = existing
         return AgentHandle(self, data["agent_id"], alias=alias, data=data)
 
     def agent_by_id(self, agent_id: AgentId, *, alias: Optional[str] = None) -> "AgentHandle":
@@ -292,11 +345,46 @@ class AgentHandle:
                 agent_id=self.agent_id,
             )
             return SessionHandle(self.workspace, session, agent=self)
-        session = self.workspace._client.create_session(
-            self.workspace.tenant_id,
-            self.agent_id,
-            alias=alias,
-        )
+        if alias is not None:
+            existing = _find_by_alias(
+                _optional_list(
+                    self.workspace._client,
+                    "list_sessions",
+                    self.workspace.tenant_id,
+                ),
+                alias,
+            )
+            if existing is not None and existing.get("agent_id") == self.agent_id:
+                session = self.workspace._client.session(
+                    self.workspace.tenant_id,
+                    existing["session_id"],
+                    agent_id=self.agent_id,
+                )
+                return SessionHandle(self.workspace, session, agent=self)
+        try:
+            session = self.workspace._client.create_session(
+                self.workspace.tenant_id,
+                self.agent_id,
+                alias=alias,
+            )
+        except AgentDBError as error:
+            if alias is None or error.status_code != 409:
+                raise
+            existing = _find_by_alias(
+                _optional_list(
+                    self.workspace._client,
+                    "list_sessions",
+                    self.workspace.tenant_id,
+                ),
+                alias,
+            )
+            if existing is None or existing.get("agent_id") != self.agent_id:
+                raise
+            session = self.workspace._client.session(
+                self.workspace.tenant_id,
+                existing["session_id"],
+                agent_id=self.agent_id,
+            )
         return SessionHandle(self.workspace, session, agent=self)
 
     def session_by_id(self, session_id: SessionId) -> "SessionHandle":
@@ -575,7 +663,7 @@ class Client:
 
     @property
     def authenticated(self) -> bool:
-        return self._auth is not None
+        return self._auth is not None or self._token is not None or self._get_token is not None
 
     def health_ready(self) -> bool:
         try:
@@ -1039,6 +1127,75 @@ class Session:
         return f"/api/tenants/{_quote(self.tenant_id)}/sessions/{_quote(self.session_id)}/events"
 
 
+def _workspace_from_user_info(
+    info: dict, requested_name: Optional[str]
+) -> Optional[tuple[str, Optional[str], dict]]:
+    if requested_name is None and isinstance(info.get("tenant_id"), str):
+        return info["tenant_id"], None, info
+
+    workspaces = [item for item in info.get("workspaces", []) if isinstance(item, dict)]
+    target = requested_name or (
+        info.get("default_workspace")
+        if isinstance(info.get("default_workspace"), str)
+        else None
+    )
+    if target is None and len(workspaces) == 1:
+        workspace = workspaces[0]
+        tenant_id = _workspace_tenant_id(workspace)
+        if tenant_id is not None:
+            return tenant_id, _workspace_name(workspace), workspace
+    if target is not None:
+        for workspace in workspaces:
+            if target in _workspace_names(workspace):
+                tenant_id = _workspace_tenant_id(workspace)
+                if tenant_id is not None:
+                    return tenant_id, _workspace_name(workspace), workspace
+
+    current = info.get("workspace")
+    if isinstance(current, dict) and (
+        requested_name is None or requested_name in _workspace_names(current)
+    ):
+        tenant_id = _workspace_tenant_id(current)
+        if tenant_id is not None:
+            return tenant_id, _workspace_name(current), current
+    return None
+
+
+def _workspace_tenant_id(workspace: dict) -> Optional[str]:
+    value = workspace.get("tenant_id", workspace.get("id"))
+    return value if isinstance(value, str) else None
+
+
+def _workspace_name(workspace: dict) -> Optional[str]:
+    for key in ("name", "workspace", "external_key"):
+        value = workspace.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _workspace_names(workspace: dict) -> set[str]:
+    return {
+        value
+        for key in ("name", "workspace", "external_key")
+        if isinstance((value := workspace.get(key)), str)
+    }
+
+
+def _find_by_alias(items: list, alias: str) -> Optional[dict]:
+    return next(
+        (item for item in items if isinstance(item, dict) and item.get("alias") == alias),
+        None,
+    )
+
+
+def _optional_list(target: Any, method_name: str, *args: Any) -> list:
+    """Call a discovery method when a compatible client/test double has it."""
+
+    method = getattr(target, method_name, None)
+    return method(*args) if callable(method) else []
+
+
 def _decode(resp: requests.Response) -> Any:
     body = _response_body(resp)
     if 200 <= resp.status_code < 300:
@@ -1060,7 +1217,7 @@ def _quote(s: str) -> str:
 
 
 def _idem_header(key: Optional[str]) -> dict:
-    return {"Idempotency-Key": key or str(uuid.uuid4())}
+    return {"Idempotency-Key": key} if key else {}
 
 
 def append_one(

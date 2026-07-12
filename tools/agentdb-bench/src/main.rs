@@ -1509,7 +1509,7 @@ fn summarize_repeats(args: SummarizeRepeatsArgs) -> Result<()> {
                 session_selection.as_deref().unwrap_or(""),
                 zipf_exponent
                     .map(|value| value.to_string())
-                    .unwrap_or_else(String::new)
+                    .unwrap_or_default()
             );
             let group = groups.entry(key).or_insert_with(|| RepeatGroupAccumulator {
                 backend: report.backend.clone(),
@@ -1556,6 +1556,7 @@ fn summarize_repeats(args: SummarizeRepeatsArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_cell_warmup(
     client: &Client,
     args: &RunArgs,
@@ -1587,6 +1588,7 @@ async fn run_cell_warmup(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_cell(
     client: &Client,
     args: &RunArgs,
@@ -1710,6 +1712,7 @@ struct OperationOutcome {
     tenant_id: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_operation(
     client: &Client,
     pg_pool: Option<&PgPool>,
@@ -2149,6 +2152,7 @@ async fn create_content_backend_artifact(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_event(
     client: &Client,
     base_url: &str,
@@ -4102,7 +4106,7 @@ fn event_payload(
     seq: usize,
 ) -> Value {
     json!({
-        "role": if seq % 3 == 0 { "user" } else { "assistant" },
+        "role": if seq.is_multiple_of(3) { "user" } else { "assistant" },
         "content": deterministic_string(config.payload_bytes, rng),
         "bench": {
             "tenant_index": tenant_idx,

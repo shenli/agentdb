@@ -28,11 +28,19 @@ deployment choices, see [deployment.md](deployment.md).
 
 ## Health And Access
 
-- [ ] `/health/ready` is wired to load balancer or uptime checks.
+- [ ] `/health/live` is used only for process liveness and `/health/ready` is
+  wired to load balancers/traffic gates.
 - [ ] `agentdbctl status` returns healthy output.
+- [ ] A random static API bearer token of at least 16 visible ASCII characters
+  with no whitespace is injected outside the repository for every non-loopback
+  bind.
+- [ ] TLS terminates before bearer-authenticated network traffic.
+- [ ] Token rotation has a bounded previous-token removal procedure.
 - [ ] The dashboard is reachable only from an approved operator network or
-  protected by deployment-level access controls.
-- [ ] Admin tokens or auth configuration are stored outside the repository.
+  protected by deployment-level access controls; operators know dashboard
+  tokens are page-memory-only and disappear on reload.
+- [ ] Admin tokens and `<data_dir>/auth-meta.sqlite` have an ownership,
+  revocation, and backup procedure.
 - [ ] The MongoDB compatibility listener, if enabled, is bound to localhost or
   protected by separate access control and TLS.
 
@@ -45,6 +53,14 @@ deployment choices, see [deployment.md](deployment.md).
   domains, memtable budget, pending compaction bytes, and background errors.
 - [ ] `tablets_per_domain = 1` is used only when physical tablet checkpoints or
   high-isolation restore tests are required.
+- [ ] Restored production metadata fits under the 512 MiB aggregate startup
+  hydration default and the documented `AGENTDB_STARTUP_MAX_*` row caps, or
+  higher values have been RSS/startup-time tested on a copy.
+- [ ] Local-filesystem startup reconciliation logs zero unexpected orphan
+  delete errors and reports any crash-left temporary files it removed. The
+  content inventory fits under `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` (500,000
+  by default). Object-store deployments have a separate inventory/lifecycle
+  check because object listing reconciliation is not implemented there.
 - [ ] Manual compaction procedures are understood:
   [storage-maintenance.md](storage-maintenance.md).
 

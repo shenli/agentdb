@@ -31,8 +31,7 @@ from agentdb import AgentDB, Client
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-USER = os.environ.get("AGENTDB_USER", "demo")
-PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
+TOKEN = os.environ.get("AGENTDB_TOKEN")
 TENANT_KEY = os.environ.get("AGENTDB_TENANT", "single-node-demo")
 AGENT_ALIAS = os.environ.get("AGENTDB_AGENT", "single-node-demo-agent")
 SESSION_ALIAS = os.environ.get("AGENTDB_SESSION", "single-node-demo-session")
@@ -44,14 +43,14 @@ def dump(label: str, value: Any) -> None:
 
 
 def main() -> None:
-    health = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    health = Client(base_url=SERVER_URL, token=TOKEN)
     if not health.health_ready():
         raise SystemExit(
             f"AgentDB not ready at {SERVER_URL}. Start it with:\n"
             f"    cargo run -p agentdb-server -- serve --config config/agentdb.toml"
         )
 
-    db = AgentDB(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    db = AgentDB(base_url=SERVER_URL, token=TOKEN)
     workspace = db.workspace(f"{TENANT_KEY}-{int(time.time() * 1000)}")
     agent = workspace.agent(AGENT_ALIAS, config={"demo": "single-node-feature"})
     session = agent.session(SESSION_ALIAS)

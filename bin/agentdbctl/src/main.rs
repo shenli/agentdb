@@ -323,6 +323,7 @@ enum Output {
     Json,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Show cluster health, readiness, scheduler, and drain state.
@@ -411,6 +412,7 @@ enum NodesCommand {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum CellsCommand {
     /// List cells.
@@ -757,6 +759,7 @@ enum ExportCommand {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum ClickHouseCommand {
     /// Check AgentDB export and optional ClickHouse reachability.
@@ -857,6 +860,9 @@ struct ClickHouseRunArgs {
     lease_ms: u64,
     #[arg(long)]
     from_cursor: Option<String>,
+    /// First-page snapshot boundary required when resuming a metadata backfill.
+    #[arg(long, requires = "backfill")]
+    snapshot_high_watermark: Option<String>,
     #[arg(long, default_value_t = 1000)]
     limit: usize,
     #[arg(long = "include", value_delimiter = ',')]
@@ -941,6 +947,9 @@ struct JsonlRunArgs {
     lease_ms: u64,
     #[arg(long)]
     from_cursor: Option<String>,
+    /// First-page snapshot boundary required when resuming a metadata backfill.
+    #[arg(long, requires = "backfill")]
+    snapshot_high_watermark: Option<String>,
     #[arg(long, default_value_t = 1000)]
     limit: usize,
     #[arg(long = "include", value_delimiter = ',')]
@@ -1218,13 +1227,11 @@ fn apply_local_restore(
             data_backup_dir.display()
         ));
     }
-    if target_data_dir.exists() {
-        if !allow_overwrite {
-            return Err(anyhow!(
-                "target data dir exists: {}; rerun with --allow-overwrite after stopping AgentDB and preserving failed state",
-                target_data_dir.display()
-            ));
-        }
+    if target_data_dir.exists() && !allow_overwrite {
+        return Err(anyhow!(
+            "target data dir exists: {}; rerun with --allow-overwrite after stopping AgentDB and preserving failed state",
+            target_data_dir.display()
+        ));
     }
 
     let config_pair = match (config_backup, target_config) {
@@ -1915,6 +1922,7 @@ async fn ensure_claimed_export_consumer(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_claimed_export_consumer_for(
     api: &Api,
     tenant_id: &str,
@@ -1959,16 +1967,51 @@ async fn ensure_claimed_export_consumer_for(
     .await
 }
 
+async fn ack_empty_metadata_snapshot(
+    api: &Api,
+    tenant_id: &str,
+    consumer: Option<&str>,
+    lease_owner: &str,
+    snapshot_high_watermark: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let (Some(consumer), Some(snapshot_high_watermark)) = (consumer, snapshot_high_watermark)
+    else {
+        return Ok(());
+    };
+    if dry_run {
+        return Ok(());
+    }
+    api.post(
+        &format!(
+            "/api/tenants/{}/exports/consumers/{}/ack",
+            query_component(tenant_id),
+            query_component(consumer)
+        ),
+        json!({
+            "cursor": Value::Null,
+            "snapshot_high_watermark": snapshot_high_watermark,
+            "lease_owner": lease_owner
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     let modes = export_modes(&args.mode)?;
+    let metadata_backfill = args.backfill
+        && !args.include.is_empty()
+        && !args.include.iter().any(|item| item == "events");
     let mut cursor = args.from_cursor.clone();
+    let mut backfill_high_watermark = args.snapshot_high_watermark.clone();
     let started_at_ms = now_ms();
     let mut retry_attempts = 0_u64;
     let mut filtered_items = 0_u64;
     let mut inserted_rows = 0_u64;
     if let Some(consumer) = &args.consumer {
         let claimed = ensure_claimed_export_consumer(api, &args, consumer).await?;
-        if cursor.is_none() {
+        if cursor.is_none() && !metadata_backfill {
             cursor = claimed
                 .get("last_acked_cursor")
                 .and_then(Value::as_str)
@@ -2009,6 +2052,7 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                         "session_id": args.session_id.clone(),
                         "include": include.clone(),
                         "from_cursor": cursor.clone(),
+                        "snapshot_high_watermark": backfill_high_watermark.clone(),
                         "limit": args.limit
                     }),
                 )
@@ -2019,6 +2063,27 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                     .await?
             }
         };
+        if phase == ExportRunPhase::Backfill {
+            let response_high_watermark = response
+                .get("snapshot_high_watermark")
+                .and_then(Value::as_str);
+            match (backfill_high_watermark.as_deref(), response_high_watermark) {
+                (None, Some(high_watermark)) => {
+                    backfill_high_watermark = Some(high_watermark.to_string());
+                }
+                (Some(expected), Some(actual)) if expected != actual => {
+                    return Err(anyhow!(
+                        "export backfill changed snapshot_high_watermark between pages"
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(anyhow!(
+                        "export backfill omitted snapshot_high_watermark on a continued page"
+                    ));
+                }
+                _ => {}
+            }
+        }
         let raw_items = response
             .get("items")
             .and_then(Value::as_array)
@@ -2030,6 +2095,19 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
         if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
+                if metadata_backfill {
+                    let snapshot_high_watermark = backfill_high_watermark.as_deref();
+                    ack_empty_metadata_snapshot(
+                        api,
+                        &args.tenant_id,
+                        args.consumer.as_deref(),
+                        &args.lease_owner,
+                        snapshot_high_watermark,
+                        args.dry_run,
+                    )
+                    .await?;
+                }
+                cursor = backfill_high_watermark.clone();
                 if args.tail {
                     phase = ExportRunPhase::Watch;
                     continue;
@@ -2106,14 +2184,17 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             .get("next_cursor")
             .and_then(Value::as_str)
             .map(str::to_string);
-        if phase == ExportRunPhase::Backfill
-            && args.tail
-            && !args.include.is_empty()
-            && !args.include.iter().any(|item| item == "events")
-        {
-            cursor = None;
-        }
-        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+        let backfill_complete = phase == ExportRunPhase::Backfill
+            && response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+        let ack_cursor = if metadata_backfill && !backfill_complete {
+            None
+        } else {
+            cursor.as_deref()
+        };
+        if let (Some(consumer), Some(ack_cursor)) = (&args.consumer, ack_cursor) {
             if !args.dry_run {
                 api.post(
                     &format!(
@@ -2122,7 +2203,7 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
                         query_component(consumer)
                     ),
                     json!({
-                        "cursor": cursor,
+                        "cursor": ack_cursor,
                         "snapshot_high_watermark": response
                             .get("snapshot_high_watermark")
                             .and_then(Value::as_str),
@@ -2146,12 +2227,11 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
             ),
         )?;
         if phase == ExportRunPhase::Backfill {
-            let complete = response
-                .get("complete")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if complete {
+            if backfill_complete {
                 if args.tail {
+                    if metadata_backfill {
+                        cursor = backfill_high_watermark.clone();
+                    }
                     phase = ExportRunPhase::Watch;
                     continue;
                 }
@@ -2177,6 +2257,7 @@ async fn clickhouse_run(api: &Api, args: ClickHouseRunArgs) -> Result<Value> {
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clickhouse_run_result(
     args: &ClickHouseRunArgs,
     started_at_ms: u64,
@@ -2230,7 +2311,10 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
     } else {
         args.include.clone()
     };
+    let metadata_backfill =
+        args.backfill && !include.is_empty() && !include.iter().any(|item| item == "events");
     let mut cursor = args.from_cursor.clone();
+    let mut backfill_high_watermark = args.snapshot_high_watermark.clone();
     if let Some(consumer) = &args.consumer {
         let claimed = ensure_claimed_export_consumer_for(
             api,
@@ -2244,7 +2328,7 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
             args.lease_ms,
         )
         .await?;
-        if cursor.is_none() {
+        if cursor.is_none() && !metadata_backfill {
             cursor = claimed
                 .get("last_acked_cursor")
                 .and_then(Value::as_str)
@@ -2280,6 +2364,7 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                         "session_id": args.session_id.clone(),
                         "include": include.clone(),
                         "from_cursor": cursor.clone(),
+                        "snapshot_high_watermark": backfill_high_watermark.clone(),
                         "limit": args.limit
                     }),
                 )
@@ -2290,6 +2375,27 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                     .await?
             }
         };
+        if phase == ExportRunPhase::Backfill {
+            let response_high_watermark = response
+                .get("snapshot_high_watermark")
+                .and_then(Value::as_str);
+            match (backfill_high_watermark.as_deref(), response_high_watermark) {
+                (None, Some(high_watermark)) => {
+                    backfill_high_watermark = Some(high_watermark.to_string());
+                }
+                (Some(expected), Some(actual)) if expected != actual => {
+                    return Err(anyhow!(
+                        "export backfill changed snapshot_high_watermark between pages"
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(anyhow!(
+                        "export backfill omitted snapshot_high_watermark on a continued page"
+                    ));
+                }
+                _ => {}
+            }
+        }
         let raw_items = response
             .get("items")
             .and_then(Value::as_array)
@@ -2301,6 +2407,19 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
             filtered_items.saturating_add(raw_item_count.saturating_sub(items.len()) as u64);
         if raw_item_count == 0 {
             if phase == ExportRunPhase::Backfill {
+                if metadata_backfill {
+                    let snapshot_high_watermark = backfill_high_watermark.as_deref();
+                    ack_empty_metadata_snapshot(
+                        api,
+                        &args.tenant_id,
+                        args.consumer.as_deref(),
+                        &args.lease_owner,
+                        snapshot_high_watermark,
+                        args.dry_run,
+                    )
+                    .await?;
+                }
+                cursor = backfill_high_watermark.clone();
                 if args.tail {
                     phase = ExportRunPhase::Watch;
                     continue;
@@ -2322,7 +2441,17 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
             .get("next_cursor")
             .and_then(Value::as_str)
             .map(str::to_string);
-        if let (Some(consumer), Some(cursor)) = (&args.consumer, cursor.as_deref()) {
+        let backfill_complete = phase == ExportRunPhase::Backfill
+            && response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+        let ack_cursor = if metadata_backfill && !backfill_complete {
+            None
+        } else {
+            cursor.as_deref()
+        };
+        if let (Some(consumer), Some(ack_cursor)) = (&args.consumer, ack_cursor) {
             if !args.dry_run {
                 api.post(
                     &format!(
@@ -2331,7 +2460,7 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
                         query_component(consumer)
                     ),
                     json!({
-                        "cursor": cursor,
+                        "cursor": ack_cursor,
                         "snapshot_high_watermark": response
                             .get("snapshot_high_watermark")
                             .and_then(Value::as_str),
@@ -2354,12 +2483,11 @@ async fn jsonl_run(api: &Api, args: JsonlRunArgs) -> Result<Value> {
             ),
         )?;
         if phase == ExportRunPhase::Backfill {
-            let complete = response
-                .get("complete")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if complete {
+            if backfill_complete {
                 if args.tail {
+                    if metadata_backfill {
+                        cursor = backfill_high_watermark.clone();
+                    }
                     phase = ExportRunPhase::Watch;
                     continue;
                 }
@@ -4173,6 +4301,7 @@ mod tests {
             lease_owner: "agentdbctl".into(),
             lease_ms: 30_000,
             from_cursor: Some("v2:0001:ses_1:0002:cell=cell-a".into()),
+            snapshot_high_watermark: None,
             limit: 500,
             include: vec![],
             mode: vec!["native".into()],
@@ -4204,6 +4333,7 @@ mod tests {
             lease_owner: "agentdbctl-jsonl".into(),
             lease_ms: 30_000,
             from_cursor: Some("ledger:ten_1/0001/event/evt_1".into()),
+            snapshot_high_watermark: None,
             limit: 250,
             include: vec!["events".into(), "sessions".into()],
             backfill: false,

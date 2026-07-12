@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json as jsonlib
-import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Union
 
 try:
@@ -58,7 +57,7 @@ class AsyncClient:
 
     @property
     def authenticated(self) -> bool:
-        return self._auth is not None
+        return self._auth is not None or self._token is not None or self._get_token is not None
 
     async def __aenter__(self) -> "AsyncClient":
         return self
@@ -516,7 +515,7 @@ def _quote(s: str) -> str:
 
 
 def _idem_header(key: Optional[str]) -> dict:
-    return {"Idempotency-Key": key or str(uuid.uuid4())}
+    return {"Idempotency-Key": key} if key else {}
 
 
 __all__ = [

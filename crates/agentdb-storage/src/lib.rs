@@ -18,8 +18,9 @@ pub mod slate;
 pub mod tablet_store;
 
 pub use content::{
-    sha256_hex, AsyncMirrorContentBackend, AsyncMirrorStats, ContentBackend,
-    InMemoryContentBackend, LocalFsContentBackend, ObjectStoreContentBackend, PutResult,
+    sha256_hex, AsyncMirrorContentBackend, AsyncMirrorStats, ContentBackend, ContentListing,
+    ContentObject, InMemoryContentBackend, LocalFsContentBackend, ObjectStoreContentBackend,
+    PutResult,
 };
 pub use content_crypto::{
     ContentCryptoAdapter, ContentCryptoContext, IdentityContentCryptoAdapter,

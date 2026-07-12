@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+siphasher = { workspace = true }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]

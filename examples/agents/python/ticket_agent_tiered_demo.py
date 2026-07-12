@@ -31,8 +31,7 @@ from agentdb import AgentDB, context_source_refs, event_ref
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-USER = os.environ.get("AGENTDB_USER", "demo")
-PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
+TOKEN = os.environ.get("AGENTDB_TOKEN")
 TENANT_KEY = os.environ.get("AGENTDB_TENANT", "ticket-tiered-demo")
 
 
@@ -131,7 +130,7 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
 
 
 def main() -> None:
-    db = AgentDB(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    db = AgentDB(base_url=SERVER_URL, token=TOKEN)
     if not db.health_ready():
         raise SystemExit(
             f"AgentDB not ready at {SERVER_URL}. Start it with:\n"

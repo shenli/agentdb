@@ -68,6 +68,10 @@ The current best summary is:
 - On the core bounded matrix, AgentDB leads throughput on `mixed-agent-loop`,
   `append-only`, and `append-fetch-hot`. Simple append-only now uses the
   same-session append coalescer, which removed the previous Zipfian p99 tail.
+  This is an accessible application path: the maintained Python and TypeScript
+  SDKs omit `Idempotency-Key` unless the caller explicitly requests retry
+  identity, matching the benchmark's ordinary append requests. Explicit stable
+  keys still test/rely on idempotent replay and are not coalesced.
 - For matched single-node media-sync durability, AgentDB has improved a lot and
   beats MongoDB at c=32, but Postgres remains a strong baseline.
 - For the larger working-set profile, AgentDB now beats both MongoDB and

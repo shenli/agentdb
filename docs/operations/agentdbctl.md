@@ -28,6 +28,12 @@ export AGENTDB_URL=http://127.0.0.1:7878
 export AGENTDB_TOKEN=...
 ```
 
+`AGENTDB_TOKEN` may be the installation-wide static bearer token, an `admin`
+metadata token, or a `readonly` metadata token for GET-only admin commands.
+Metadata admin tokens do not authorize tenant data/export routes. The server
+returns a minted token plaintext once from `POST /api/admin/tokens`; list and
+revoke it with `agentdbctl raw` until dedicated token subcommands are added.
+
 Use JSON output for scripts and AI agents:
 
 ```bash
@@ -265,7 +271,9 @@ implementation exports event and runtime metadata envelopes, supports event
 backfill, supports tenant-scope metadata snapshot backfill, and provides
 managed consumer checkpoints. Persistent AgentDB runtimes use durable ledger
 cursors for export; in-memory/dev runtimes fall back to current event watch
-cursors. Runtime soft deletes are exported as tombstone envelopes.
+cursors. Runtime soft deletes are exported as tombstone envelopes. Export is
+currently supported only on single-tablet runtimes; metadata-backed clustered
+routing returns HTTP 422 rather than exposing an incomplete tablet-local feed.
 
 Start a local ClickHouse with the helper compose file:
 
@@ -456,6 +464,12 @@ durable checkpoints, include filters, lease ownership, and rewind state for
 official connectors. Use `agentdbctl raw get /api/admin/exports` to inspect all
 export consumers on a node, including pending item count, high watermark, lag,
 and lease-active state.
+
+The exporter keeps the first page's snapshot boundary fixed across a backfill.
+When manually resuming an interrupted metadata snapshot, provide both
+`--from-cursor snapshot:...` and the matching
+`--snapshot-high-watermark ledger:...`; a snapshot cursor alone is rejected so
+concurrent metadata mutations cannot be skipped during the tail handoff.
 
 For HA connector deployment, run two or more `run --tail` processes with the
 same `--consumer` and distinct `--lease-owner` values. The process holding the

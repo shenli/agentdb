@@ -1,8 +1,13 @@
 mod common;
 
-use agentdb_api::routing_http::{
-    HDR_CELL_ID, HDR_PLACEMENT_SCOPE_ID, HDR_TABLET_EPOCH, HDR_TABLET_ID,
+use std::sync::Arc;
+
+use agentdb_api::{
+    routing_http::{HDR_CELL_ID, HDR_PLACEMENT_SCOPE_ID, HDR_TABLET_EPOCH, HDR_TABLET_ID},
+    AppState,
 };
+use agentdb_core::Runtime;
+use agentdb_storage::{InMemoryContentBackend, InMemoryKvStore};
 use common::spawn_app;
 use serde_json::json;
 
@@ -348,7 +353,7 @@ async fn export_watch_returns_event_envelopes_and_resume_cursor() {
     let first_items = first["items"].as_array().unwrap();
     assert_eq!(first_items.len(), 1);
     assert_eq!(first["next_cursor"], first_items[0]["cursor"]);
-    assert_eq!(first["high_watermark"], first_items[0]["cursor"]);
+    assert_ne!(first["high_watermark"], first_items[0]["cursor"]);
     assert_eq!(first_items[0]["export_version"], "2026-05-14");
     assert_eq!(first_items[0]["op"], "insert");
     assert_eq!(first_items[0]["object_type"], "event");
@@ -392,6 +397,7 @@ async fn export_watch_returns_event_envelopes_and_resume_cursor() {
         .unwrap();
     let after_items = after["items"].as_array().unwrap();
     assert_eq!(after_items.len(), 1);
+    assert_eq!(first["high_watermark"], after_items[0]["cursor"]);
     assert_eq!(after_items[0]["kind"], "tool_result");
     assert_eq!(after_items[0]["tool_name"], "shell");
     assert_eq!(after_items[0]["tool_call_id"], "call-1");
@@ -502,7 +508,14 @@ async fn export_watch_scope_never_leaks_other_tenants_or_agents() {
 
 #[tokio::test]
 async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
-    let app = spawn_app().await;
+    // Use the durable-ledger path even though the backing store itself is
+    // in-memory. Runtime::in_memory intentionally exports only event frontiers,
+    // so it cannot prove metadata snapshot-to-tail handoff for record writes.
+    let runtime = Runtime::with_kv(
+        Arc::new(InMemoryKvStore::new()),
+        Arc::new(InMemoryContentBackend::default()),
+    );
+    let app = common::spawn_app_with_state(AppState::new(runtime)).await;
     let (tid, aid, sid) = seed(&app).await;
     append(&app, &tid, &aid, &sid, "first", 1).await;
     append(&app, &tid, &aid, &sid, "second", 2).await;
@@ -529,7 +542,7 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
     assert_eq!(items[0]["op"], "snapshot");
     assert_eq!(items[0]["kind"], "first");
     assert_eq!(first_page["complete"], false);
-    assert_eq!(first_page["snapshot_high_watermark"], items[0]["cursor"]);
+    assert_ne!(first_page["snapshot_high_watermark"], items[0]["cursor"]);
 
     let cursor = first_page["next_cursor"].as_str().unwrap();
     let second_page: serde_json::Value = app
@@ -553,6 +566,10 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
     let second_items = second_page["items"].as_array().unwrap();
     assert_eq!(second_items.len(), 1);
     assert_eq!(second_items[0]["kind"], "second");
+    assert_eq!(
+        first_page["snapshot_high_watermark"],
+        second_items[0]["cursor"]
+    );
     assert_eq!(second_page["complete"], true);
 
     app.client
@@ -573,6 +590,76 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
         .json(&json!({
             "scope": "tenant",
             "include": ["tenants", "agents", "sessions", "records"],
+            "limit": 2
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata_page["complete"], false);
+    let metadata_cursor = metadata_page["next_cursor"].as_str().unwrap();
+    let metadata_high_watermark = metadata_page["snapshot_high_watermark"].as_str().unwrap();
+
+    let missing_boundary = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "tenant",
+            "include": ["tenants", "agents", "sessions", "records"],
+            "from_cursor": metadata_cursor,
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_boundary.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let foreign_cursor = metadata_cursor.replacen(&tid, "ten_foreign", 1);
+    let foreign_snapshot_cursor = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "tenant",
+            "include": ["tenants", "agents", "sessions", "records"],
+            "from_cursor": foreign_cursor,
+            "snapshot_high_watermark": metadata_high_watermark,
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign_snapshot_cursor.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/records", app.base))
+        .json(&json!({
+            "namespace": ["mem"],
+            "text": "after snapshot boundary",
+            "policy": {"mode": "summary_only", "fields": [], "vector_allowed": false}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let metadata_second_page: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/exports/backfill", app.base))
+        .json(&json!({
+            "scope": "tenant",
+            "include": ["tenants", "agents", "sessions", "records"],
+            "from_cursor": metadata_cursor,
+            "snapshot_high_watermark": metadata_high_watermark,
             "limit": 10
         }))
         .send()
@@ -583,10 +670,38 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        metadata_second_page["snapshot_high_watermark"],
+        metadata_page["snapshot_high_watermark"]
+    );
+    assert_eq!(metadata_second_page["complete"], true);
+    let tail_after_boundary: serde_json::Value = app
+        .client
+        .get(format!("{}/api/tenants/{tid}/exports/watch", app.base))
+        .query(&[
+            ("scope", "tenant"),
+            ("include", "records"),
+            ("from_cursor", metadata_high_watermark),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tail_after_boundary["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["data"]["text"] == "after snapshot boundary"));
+
     let object_types = metadata_page["items"]
         .as_array()
         .unwrap()
         .iter()
+        .chain(metadata_second_page["items"].as_array().unwrap())
         .map(|item| item["object_type"].as_str().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -599,7 +714,6 @@ async fn export_backfill_pages_event_snapshots_and_rejects_unknown_includes() {
         .as_str()
         .unwrap()
         .starts_with("snapshot:"));
-    assert_eq!(metadata_page["complete"], true);
 
     let rejected = app
         .client
@@ -685,6 +799,38 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
         reqwest::StatusCode::UNPROCESSABLE_ENTITY
     );
 
+    let feed: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/exports/watch?scope=tenant",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stale_cursor = feed["next_cursor"].as_str().unwrap().to_string();
+    append(&app, &tid, &aid, &sid, "before-ack", 2).await;
+    let feed: serde_json::Value = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/exports/watch?scope=tenant",
+            app.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ack_cursor = feed["next_cursor"].as_str().unwrap().to_string();
+
     let rejected_ack = app
         .client
         .post(format!(
@@ -692,7 +838,7 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
             app.base
         ))
         .json(&json!({
-            "cursor": "v2:0001",
+            "cursor": ack_cursor,
             "lease_owner": "worker-b"
         }))
         .send()
@@ -703,6 +849,25 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
         reqwest::StatusCode::UNPROCESSABLE_ENTITY
     );
 
+    let rejected_snapshot_ack = app
+        .client
+        .post(format!(
+            "{}/api/tenants/{tid}/exports/consumers/clickhouse/ack",
+            app.base
+        ))
+        .json(&json!({
+            "cursor": null,
+            "snapshot_high_watermark": ack_cursor,
+            "lease_owner": "worker-a"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected_snapshot_ack.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+
     let acked: serde_json::Value = app
         .client
         .post(format!(
@@ -710,8 +875,8 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
             app.base
         ))
         .json(&json!({
-            "cursor": "v2:0001",
-            "snapshot_high_watermark": "v2:0001",
+            "cursor": ack_cursor,
+            "snapshot_high_watermark": ack_cursor,
             "lease_owner": "worker-a"
         }))
         .send()
@@ -722,9 +887,9 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
         .json()
         .await
         .unwrap();
-    assert_eq!(acked["last_acked_cursor"], "v2:0001");
-    assert_eq!(acked["snapshot_high_watermark"], "v2:0001");
-    append(&app, &tid, &aid, &sid, "after-ack", 2).await;
+    assert_eq!(acked["last_acked_cursor"], ack_cursor);
+    assert_eq!(acked["snapshot_high_watermark"], ack_cursor);
+    append(&app, &tid, &aid, &sid, "after-ack", 3).await;
 
     let stale_ack = app
         .client
@@ -733,7 +898,7 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
             app.base
         ))
         .json(&json!({
-            "cursor": "v2:0000",
+            "cursor": stale_cursor,
             "lease_owner": "worker-a"
         }))
         .send()
@@ -780,11 +945,8 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
         .unwrap();
     assert_eq!(fetched["consumer_name"], "clickhouse");
     assert!(fetched["last_acked_cursor"].is_null());
-    assert_eq!(fetched["pending_items"], 2);
-    assert!(fetched["high_watermark"]
-        .as_str()
-        .unwrap()
-        .starts_with("v2:"));
+    assert_eq!(fetched["pending_items"], 3);
+    assert!(fetched["high_watermark"].is_string());
     assert!(fetched["pending_oldest_created_at_ms"].is_u64());
     assert!(fetched["lag_ms"].is_u64());
     assert_eq!(fetched["lease_active"], true);
@@ -803,10 +965,10 @@ async fn export_consumers_claim_ack_and_rewind_cursors() {
     assert_eq!(admin["managed_consumers"], true);
     assert_eq!(admin["consumer_count"], 1);
     assert_eq!(admin["consumers"][0]["consumer_name"], "clickhouse");
-    assert_eq!(admin["consumers"][0]["pending_items"], 2);
+    assert_eq!(admin["consumers"][0]["pending_items"], 3);
     assert_eq!(admin["metrics"]["consumer_count"], 1);
     assert_eq!(admin["metrics"]["leased_consumer_count"], 1);
-    assert_eq!(admin["metrics"]["pending_items_total"], 2);
+    assert_eq!(admin["metrics"]["pending_items_total"], 3);
     assert!(admin["metrics"]["max_lag_ms"].is_u64());
     assert!(admin["metrics"]["oldest_pending_created_at_ms"].is_u64());
     assert_eq!(

@@ -28,8 +28,7 @@
 import { Client } from "../../../clients/typescript/dist/src/index.js";
 
 const SERVER_URL = process.env.AGENTDB_URL ?? "http://127.0.0.1:7878";
-const USER = process.env.AGENTDB_USER ?? "demo";
-const PASSWORD = process.env.AGENTDB_PASSWORD ?? "demo-secret";
+const TOKEN = process.env.AGENTDB_TOKEN;
 const SESSION = "agent-coord-ts";
 
 interface TaskPayload {
@@ -38,7 +37,7 @@ interface TaskPayload {
 }
 
 async function producer(): Promise<void> {
-  const client = new Client({ baseUrl: SERVER_URL, auth: { user: USER, password: PASSWORD } });
+  const client = new Client({ baseUrl: SERVER_URL, token: TOKEN });
   const sess = client.session(SESSION);
   // Tiny delay so the reactor's subscribe handshake lands first.
   // For a production-grade gap-free join, use `fromSeq` on the
@@ -52,7 +51,7 @@ async function producer(): Promise<void> {
 }
 
 async function reactor(): Promise<void> {
-  const client = new Client({ baseUrl: SERVER_URL, auth: { user: USER, password: PASSWORD } });
+  const client = new Client({ baseUrl: SERVER_URL, token: TOKEN });
   const sess = client.session(SESSION);
   console.log("reactor: waiting for task_done events…");
   let seen = 0;

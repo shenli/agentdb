@@ -75,7 +75,9 @@ The low-level tenant-scoped API remains available:
 
 IDs are opaque typed strings such as `ten_*`, `agt_*`, `ses_*`, `evt_*`,
 `art_*`, `rec_*`, and `skl_*`. Mutating SDK calls generate an
-`Idempotency-Key` automatically unless one is supplied.
+`Idempotency-Key` only when `idempotencyKey` is supplied. This keeps the
+default append path eligible for server-side same-session batching; reuse an
+explicit key when the caller may retry a mutation.
 
 For records, `writeRecord` captures the server's
 `X-AgentDB-Record-Commit-Seq` header per tenant. Later `searchRecords` calls

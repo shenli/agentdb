@@ -10,6 +10,8 @@ use agentdb_core::errors::ErrorCode;
 use agentdb_core::id::{Id, IdKind};
 use agentdb_core::runtime::Runtime;
 use agentdb_core::tenant::NewTenant;
+use agentdb_storage::{ContentBackend, InMemoryContentBackend, InMemoryKvStore};
+use std::sync::Arc;
 
 async fn fresh_tenant(rt: &Runtime, key: &str) -> agentdb_core::tenant::Tenant {
     rt.create_tenant(NewTenant {
@@ -249,4 +251,41 @@ async fn get_artifact_blob_returns_not_found_for_missing() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ArtifactNotFound);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_deletes_orphans_and_preserves_referenced_blobs() {
+    let content = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(Arc::new(InMemoryKvStore::new()), content.clone());
+    let tenant = fresh_tenant(&rt, "reconcile").await;
+    let artifact = rt
+        .create_artifact(
+            NewArtifact {
+                tenant_id: tenant.tenant_id.clone(),
+                content_type: None,
+                expected_sha256: None,
+            },
+            b"referenced".to_vec(),
+        )
+        .await
+        .unwrap();
+    content
+        .put(tenant.tenant_id.as_str(), "art_orphan", b"orphan")
+        .await
+        .unwrap();
+
+    let report = rt.reconcile_orphan_artifact_content().await.unwrap();
+    assert!(report.listing_supported);
+    assert_eq!(report.objects_scanned, 2);
+    assert_eq!(report.referenced_objects, 1);
+    assert_eq!(report.orphan_objects_deleted, 1);
+    assert_eq!(report.delete_errors, 0);
+    assert!(content
+        .head(tenant.tenant_id.as_str(), artifact.artifact_id.as_str())
+        .await
+        .unwrap());
+    assert!(!content
+        .head(tenant.tenant_id.as_str(), "art_orphan")
+        .await
+        .unwrap());
 }

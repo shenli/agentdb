@@ -10,6 +10,29 @@ use tokio::runtime::Runtime;
 
 use crate::error::{Error, Result};
 
+type SlateScanItem = Result<(Vec<u8>, Vec<u8>)>;
+
+struct SlateScanIter {
+    receiver: std::sync::mpsc::Receiver<SlateScanItem>,
+    runtime: Option<Arc<Runtime>>,
+}
+
+impl Iterator for SlateScanIter {
+    type Item = SlateScanItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.receiver.recv().ok()
+    }
+}
+
+impl Drop for SlateScanIter {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            std::thread::spawn(move || drop(runtime));
+        }
+    }
+}
+
 /// A `KvStore` backed by SlateDB on object storage.
 ///
 /// Owns a dedicated tokio `Runtime` to bridge the sync `KvStore` trait
@@ -107,6 +130,45 @@ impl SlateKvStore {
         rx.recv()
             .expect("slatedb bridge task dropped before sending")
     }
+
+    fn scan_prefix_stream(&self, prefix: &[u8]) -> Result<KvIter> {
+        let db = self.inner.clone();
+        let prefix = prefix.to_vec();
+        let runtime = self.runtime_arc();
+        let handle = runtime.handle().clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<SlateScanItem>(32);
+        handle.spawn(async move {
+            let mut iterator = match db.scan_prefix(&prefix[..]).await {
+                Ok(iterator) => iterator,
+                Err(error) => {
+                    let _ = sender.send(Err(Error::Other(format!("slatedb scan_prefix: {error}"))));
+                    return;
+                }
+            };
+            loop {
+                match iterator.next().await {
+                    Ok(Some(item)) => {
+                        if sender
+                            .send(Ok((item.key.to_vec(), item.value.to_vec())))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ =
+                            sender.send(Err(Error::Other(format!("slatedb scan_prefix: {error}"))));
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Box::new(SlateScanIter {
+            receiver,
+            runtime: Some(runtime),
+        }))
+    }
 }
 
 impl Drop for SlateKvStore {
@@ -166,21 +228,7 @@ impl KvStore for SlateKvStore {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
-        let db = self.inner.clone();
-        let prefix = prefix.to_vec();
-        // Eagerly collect into an owned Vec so the returned KvIter is 'static
-        // and doesn't borrow from self or the runtime.
-        let collected = self
-            .bridge(async move {
-                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut it = db.scan_prefix(&prefix[..]).await?;
-                while let Some(kv) = it.next().await? {
-                    out.push((kv.key.to_vec(), kv.value.to_vec()));
-                }
-                Ok::<_, slatedb::Error>(out)
-            })
-            .map_err(|e| Error::Other(format!("slatedb scan_prefix: {e}")))?;
-        Ok(Box::new(collected.into_iter().map(Ok)))
+        self.scan_prefix_stream(prefix)
     }
 
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
@@ -270,6 +318,52 @@ impl SlateSnapshot {
         rx.recv()
             .expect("slatedb snapshot bridge task dropped before sending")
     }
+
+    fn scan_prefix_stream(&self, prefix: &[u8]) -> Result<KvIter> {
+        let snapshot = self.snap.clone();
+        let prefix = prefix.to_vec();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("slate snapshot runtime accessed after Drop took it")
+            .clone();
+        let handle = runtime.handle().clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<SlateScanItem>(32);
+        handle.spawn(async move {
+            let mut iterator = match snapshot.scan_prefix(&prefix[..]).await {
+                Ok(iterator) => iterator,
+                Err(error) => {
+                    let _ = sender.send(Err(Error::Other(format!(
+                        "slatedb snapshot scan_prefix: {error}"
+                    ))));
+                    return;
+                }
+            };
+            loop {
+                match iterator.next().await {
+                    Ok(Some(item)) => {
+                        if sender
+                            .send(Ok((item.key.to_vec(), item.value.to_vec())))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = sender.send(Err(Error::Other(format!(
+                            "slatedb snapshot scan_prefix: {error}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Box::new(SlateScanIter {
+            receiver,
+            runtime: Some(runtime),
+        }))
+    }
 }
 
 impl KvSnapshot for SlateSnapshot {
@@ -282,19 +376,7 @@ impl KvSnapshot for SlateSnapshot {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
-        let snap = self.snap.clone();
-        let prefix = prefix.to_vec();
-        let collected = self
-            .bridge(async move {
-                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut it = snap.scan_prefix(&prefix[..]).await?;
-                while let Some(kv) = it.next().await? {
-                    out.push((kv.key.to_vec(), kv.value.to_vec()));
-                }
-                Ok::<_, slatedb::Error>(out)
-            })
-            .map_err(|e| Error::Other(format!("slatedb snapshot scan_prefix: {e}")))?;
-        Ok(Box::new(collected.into_iter().map(Ok)))
+        self.scan_prefix_stream(prefix)
     }
 }
 

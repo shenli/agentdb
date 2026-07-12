@@ -563,6 +563,20 @@ async fn export_consumers_survive_kv_rehydrate() {
         })
         .await
         .unwrap();
+    let feed = rt
+        .export_watch(ExportWatchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            scope: WatchScope::Tenant,
+            session_id: None,
+            agent_id: None,
+            include: vec!["tenants".into()],
+            from_cursor: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(feed.len(), 1);
+    let cursor = feed[0].cursor.clone();
     let consumer = rt
         .create_export_consumer(CreateExportConsumerRequest {
             tenant_id: tenant.tenant_id.clone(),
@@ -570,7 +584,7 @@ async fn export_consumers_survive_kv_rehydrate() {
             scope: WatchScope::Tenant,
             agent_id: None,
             session_id: None,
-            include: vec!["events".into()],
+            include: vec!["tenants".into()],
         })
         .await
         .unwrap();
@@ -584,11 +598,22 @@ async fn export_consumers_survive_kv_rehydrate() {
     })
     .await
     .unwrap();
+    let fabricated = rt
+        .ack_export_consumer(AckExportConsumerRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            consumer_name: "clickhouse".into(),
+            cursor: Some("v2:0001".into()),
+            snapshot_high_watermark: None,
+            lease_owner: Some("worker-a".into()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(fabricated.code, agentdb_core::ErrorCode::InvalidCursor);
     rt.ack_export_consumer(AckExportConsumerRequest {
         tenant_id: tenant.tenant_id.clone(),
         consumer_name: "clickhouse".into(),
-        cursor: "v2:0001".into(),
-        snapshot_high_watermark: Some("v2:0001".into()),
+        cursor: None,
+        snapshot_high_watermark: Some(cursor.clone()),
         lease_owner: Some("worker-a".into()),
     })
     .await
@@ -600,8 +625,11 @@ async fn export_consumers_survive_kv_rehydrate() {
         .await
         .unwrap();
     assert_eq!(loaded.scope, WatchScope::Tenant);
-    assert_eq!(loaded.last_acked_cursor.as_deref(), Some("v2:0001"));
-    assert_eq!(loaded.snapshot_high_watermark.as_deref(), Some("v2:0001"));
+    assert_eq!(loaded.last_acked_cursor.as_deref(), Some(cursor.as_str()));
+    assert_eq!(
+        loaded.snapshot_high_watermark.as_deref(),
+        Some(cursor.as_str())
+    );
     assert_eq!(loaded.lease_owner.as_deref(), Some("worker-a"));
 }
 
@@ -695,6 +723,24 @@ async fn export_watch_uses_durable_ledger_cursors_with_persistent_kv() {
     assert_eq!(first_page.len(), 1);
     assert_eq!(first_page[0].item.data["kind"], "first");
     assert!(first_page[0].cursor.starts_with("ledger:"));
+
+    let bounded_page = rt
+        .export_watch_through(
+            ExportWatchRequest {
+                tenant_id: tenant.tenant_id.clone(),
+                scope: WatchScope::Tenant,
+                session_id: None,
+                agent_id: None,
+                include: vec!["events".into()],
+                from_cursor: None,
+                limit: 10,
+            },
+            Some(&first_page[0].cursor),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bounded_page.len(), 1);
+    assert_eq!(bounded_page[0].item.data["kind"], "first");
 
     let hydrated = Runtime::with_kv(kv.clone(), content);
     let second_page = hydrated
@@ -882,7 +928,7 @@ async fn export_watch_paged_resume_survives_rehydrate_without_gaps_or_duplicates
             values.push(item.item.data["payload"]["n"].as_u64().unwrap());
         }
         cursor = page.last().map(|item| item.cursor.clone());
-        if pages % 3 == 0 {
+        if pages.is_multiple_of(3) {
             active = Runtime::with_kv(kv.clone(), content.clone());
         }
     }

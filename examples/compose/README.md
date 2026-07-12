@@ -12,30 +12,42 @@ containerized single-node path with persisted local state.
 
 ```bash
 cd examples/compose
+export AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters'
 docker compose up --build
 ```
 
-First run takes a few minutes (Rust release build). Subsequent
-`up` cycles are cached — code changes under `bin/` and `crates/`
-re-link in ~30s thanks to the layered Cargo cache in the
-Dockerfile.
+Compose requires the token because the server listens on `0.0.0.0` inside the
+container. It must contain at least 16 visible ASCII characters with no
+whitespace. The published host port is restricted to `127.0.0.1`.
+
+A clean ARM64 Docker Desktop validation build took 5 minutes 2 seconds; host
+CPU, architecture, and registry cache will change that number. The manifest
+layer caches crate downloads, and an unchanged rebuild reuses the final image;
+source changes still recompile the affected Rust/native dependency graph.
 
 ## Probe it
 
 ```bash
-# Readiness — should return 200 with status:"ok"
-curl -s http://localhost:7878/health/ready | jq
+# Readiness — should return HTTP 200
+curl -i http://localhost:7878/health/ready
+
+# Liveness — process restart signal, not a traffic gate
+curl -i http://localhost:7878/health/live
 
 # Dashboard
 open http://localhost:7878/dashboard
 ```
+
+Enter `AGENTDB_API_AUTH_TOKEN` in the dashboard for API views. It stays in page
+memory only and must be entered again after reload.
 
 ## Drive some traffic
 
 ```bash
 # Python SDK — recommended for application code
 pip install -e clients/python
-python3 examples/agents/python/quickstart.py
+AGENTDB_TOKEN="$AGENTDB_API_AUTH_TOKEN" \
+  python3 examples/agents/python/quickstart.py
 ```
 
 ## Tear down

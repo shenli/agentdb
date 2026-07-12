@@ -22,11 +22,19 @@ def capture(client):
 
     def fake(method, url, **kwargs):
         calls.append((method, url, kwargs))
+        if url.endswith("/api/me"):
+            return response(status=404, body={"error": {"message": "not found"}})
         if url.endswith("/api/tenants"):
+            if method == "GET":
+                return response(body={"tenants": []})
             return response(body={"tenant_id": "ten_1"})
         if url.endswith("/agents"):
+            if method == "GET":
+                return response(body={"agents": []})
             return response(body={"agent_id": "agt_1"})
         if url.endswith("/sessions"):
+            if method == "GET":
+                return response(body={"sessions": []})
             return response(body={"session_id": "ses_1", "agent_id": "agt_1"})
         if method == "GET" and url.endswith("/events"):
             return response(body=[])
@@ -120,7 +128,8 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
         db.session_by_id(session.id, tenant_id=workspace.id, agent_id=agent.id).fetch()
 
     urls = [url for _, url, _ in calls]
-    assert urls[0].endswith("/api/tenants")
+    assert urls[0].endswith("/api/me")
+    assert any(url.endswith("/api/tenants") for url in urls)
     assert any("/api/tenants/ten_1/agents" in url for url in urls)
     assert any("/api/tenants/ten_1/agents/agt_1/sessions" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/append-and-fetch" in url for url in urls)
@@ -130,6 +139,89 @@ def test_friendly_api_binds_workspace_agent_and_session_context():
     assert any("/api/tenants/ten_1/skills" in url for url in urls)
     assert any("/api/tenants/ten_1/watch" in url for url in urls)
     assert any("/api/tenants/ten_1/sessions/ses_1/replay" in url for url in urls)
+
+
+def test_friendly_api_resolves_authenticated_workspace_without_creating_tenant():
+    c = Client("http://x", token="secret")
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if url.endswith("/api/me"):
+            return response(
+                body={
+                    "default_workspace": "acme",
+                    "workspaces": [{"name": "acme", "tenant_id": "ten_auth"}],
+                }
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    with patch.object(c._http, "request", side_effect=fake):
+        workspace = AgentDB(_client=c).workspace("acme")
+
+    assert workspace.id == "ten_auth"
+    assert len(calls) == 1
+
+
+def test_friendly_alias_handles_reuse_existing_agent_and_session_after_restart():
+    c = Client("http://x")
+    calls = []
+
+    def fake(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if url.endswith("/api/me"):
+            return response(status=404, body={"error": {"message": "not found"}})
+        if url.endswith("/api/tenants"):
+            return response(body={"tenants": [{"tenant_id": "ten_1", "external_key": "acme"}]})
+        if url.endswith("/agents"):
+            return response(body={"agents": [{"agent_id": "agt_1", "alias": "sales"}]})
+        if url.endswith("/sessions"):
+            return response(
+                body={
+                    "sessions": [
+                        {"session_id": "ses_1", "agent_id": "agt_1", "alias": "ticket"}
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    with patch.object(c._http, "request", side_effect=fake):
+        workspace = AgentDB(_client=c).workspace("acme")
+        agent = workspace.agent("sales")
+        session = agent.session("ticket")
+
+    assert workspace.id == "ten_1"
+    assert agent.id == "agt_1"
+    assert session.id == "ses_1"
+    assert all(method == "GET" for method, _, _ in calls)
+
+
+def test_workspace_create_race_reuses_the_winning_tenant():
+    c = Client("http://x")
+    tenant_gets = 0
+
+    def fake(method, url, **kwargs):
+        nonlocal tenant_gets
+        if url.endswith("/api/me"):
+            return response(status=404, body={"error": {"message": "not found"}})
+        if url.endswith("/api/tenants") and method == "GET":
+            tenant_gets += 1
+            tenants = [] if tenant_gets == 1 else [
+                {"tenant_id": "ten_winner", "external_key": "acme"}
+            ]
+            return response(body={"tenants": tenants})
+        if url.endswith("/api/tenants") and method == "POST":
+            return response(
+                status=409,
+                body={"error": {"code": "alias_conflict", "message": "already exists"}},
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    with patch.object(c._http, "request", side_effect=fake):
+        workspace = AgentDB(_client=c).workspace("acme")
+
+    assert workspace.id == "ten_winner"
+    assert tenant_gets == 2
 
 
 def test_record_search_carries_last_tenant_commit_sequence():
@@ -162,21 +254,22 @@ def test_record_search_carries_last_tenant_commit_sequence():
     assert calls[2][2]["json"]["min_visible_record_commit_seq"] == 99
 
 
-def test_idempotency_key_is_generated_for_mutations():
+def test_idempotency_key_is_opt_in_for_mutations():
     c = Client("http://x")
     calls, patched = capture(c)
     with patched:
         c.session("ten_1", "ses_1", agent_id="agt_1").append({"x": 1})
-        c.register_skill("ten_1", name="tool", version="1")
+        c.register_skill("ten_1", name="tool", version="1", idempotency_key="skill-1")
     headers = [kwargs.get("headers", {}) for _, _, kwargs in calls]
-    assert any("Idempotency-Key" in h for h in headers)
+    assert "Idempotency-Key" not in headers[0]
+    assert any(h.get("Idempotency-Key") == "skill-1" for h in headers)
 
 
 def test_bearer_token_is_sent_when_configured():
     c = Client("http://x", token="tok_1")
     calls, patched = capture(c)
     with patched:
-        c.user_info()
+        c.list_tenants()
 
     assert calls[0][2]["headers"]["Authorization"] == "Bearer tok_1"
 

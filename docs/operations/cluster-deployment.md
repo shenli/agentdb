@@ -92,7 +92,8 @@ Each node should have:
 
 - a stable `node_id`
 - a routable internal address
-- a shared internal auth token for node-to-node Raft RPCs
+- a shared internal auth token for node-to-node Raft RPCs, containing at least
+  16 visible ASCII characters and no whitespace
 - region / availability-zone metadata
 - local fast storage for hot working set
 
@@ -396,7 +397,9 @@ Each node should have:
   compaction by debt)
 - routing refresh intervals
 - internal Raft RPC token (`server.internal_auth_token` or
-  `AGENTDB_INTERNAL_AUTH_TOKEN`)
+  `AGENTDB_INTERNAL_AUTH_TOKEN`); current and rotation-previous values require
+  at least 16 visible ASCII characters with no whitespace, and a previous token
+  cannot be configured without a current token
 
 ### Node-local settings
 

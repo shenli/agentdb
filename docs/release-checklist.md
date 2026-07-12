@@ -83,10 +83,30 @@ ops/local-ci/scripts/local-ci.sh
 - Verify Docker build inputs after docs/scripts moves:
 
   ```bash
+  docker build --target deps -t agentdb:deps-check .
   docker build -t agentdb:local .
+  docker run --rm agentdb:local --version
+  docker run --rm --entrypoint /usr/local/bin/agentdbctl agentdb:local --version
   ```
 
+  The manifest-only dependency stage must include every workspace member so a
+  clean cache build succeeds. The final image must contain both `agentdb` and
+  `agentdbctl`; non-loopback startup also requires
+  `AGENTDB_API_AUTH_TOKEN` at runtime.
+
 - Verify release workflows and tag naming in `.github/workflows/release.yml`.
+  For an archive matching the validation host, verify its separate checksum,
+  extract it, confirm both files are executable, and run both version commands:
+
+  ```bash
+  shasum -a 256 -c agentdb-vX.Y.Z-PLATFORM.tar.gz.sha256
+  tar -xzf agentdb-vX.Y.Z-PLATFORM.tar.gz
+  test -x agentdb-vX.Y.Z-PLATFORM/agentdb
+  test -x agentdb-vX.Y.Z-PLATFORM/agentdbctl
+  agentdb-vX.Y.Z-PLATFORM/agentdb --version
+  agentdb-vX.Y.Z-PLATFORM/agentdbctl --version
+  ```
+
 - Confirm generated artifacts are ignored and not staged:
 
   ```bash

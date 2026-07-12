@@ -2,23 +2,23 @@
 #
 # Multi-stage build for the `agentdb` binary.
 #
-# Stage 1 (`builder`): full Rust toolchain. Builds the release
-# binary and strips it. A chiseled dep-compile pass happens first
-# so code-only changes re-link in ~30s rather than refetching
-# every crate.
+# Stage 1 (`deps`): resolves the complete workspace from manifests only.
+# Stage 2 (`builder`): builds the release binaries and strips them. The
+# manifest-only dependency pass happens first so code-only changes reuse the
+# downloaded crate cache rather than refetching every crate.
 #
-# Stage 2 (`runtime`): distroless-slim base (Debian 12 slim —
+# Stage 3 (`runtime`): distroless-slim base (Debian 12 slim —
 # stays stable across Rust releases and ships ca-certificates + a
 # glibc that rustls happens to depend on transitively). Only the
-# binary lands in the final image; the source tree and the
+# two operator binaries land in the final image; the source tree and the
 # ~3GB target/ directory stay in the builder.
 
-# -------- builder --------
-FROM rust:1.95-bookworm AS builder
+# -------- dependency cache --------
+FROM rust:1.95-bookworm AS deps
 WORKDIR /src
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends clang libclang-dev \
+    && apt-get install -y --no-install-recommends clang libclang-dev protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Prime the dep cache. We copy just the manifests first so
@@ -27,33 +27,45 @@ RUN apt-get update \
 # `COPY . .` layer, not the downloaded crates.
 COPY Cargo.toml Cargo.lock ./
 COPY bin/agentdb-server/Cargo.toml bin/agentdb-server/
+COPY bin/agentdbctl/Cargo.toml bin/agentdbctl/
 COPY crates/agentdb-api/Cargo.toml crates/agentdb-api/
 COPY crates/agentdb-core/Cargo.toml crates/agentdb-core/
 COPY crates/agentdb-dashboard/Cargo.toml crates/agentdb-dashboard/
 COPY crates/agentdb-index/Cargo.toml crates/agentdb-index/
 COPY crates/agentdb-meta/Cargo.toml crates/agentdb-meta/
 COPY crates/agentdb-storage/Cargo.toml crates/agentdb-storage/
+COPY crates/agentdb-wire/Cargo.toml crates/agentdb-wire/
+COPY tools/agentdb-bench/Cargo.toml tools/agentdb-bench/
+COPY tools/agentdb-cluster-smoke/Cargo.toml tools/agentdb-cluster-smoke/
 
 # Dummy source files are needed because cargo can't resolve the
 # workspace without them. `cargo fetch --locked` materializes the
 # registry tree into $CARGO_HOME without touching the source, which
 # is the layer cache we want.
-RUN mkdir -p bin/agentdb-server/src crates/agentdb-api/src \
+RUN mkdir -p bin/agentdb-server/src bin/agentdbctl/src crates/agentdb-api/src \
         crates/agentdb-core/src crates/agentdb-dashboard/src \
         crates/agentdb-index/src crates/agentdb-meta/src \
-        crates/agentdb-storage/src crates/agentdb-index/benches \
+        crates/agentdb-storage/src crates/agentdb-wire/src \
+        crates/agentdb-index/benches tools/agentdb-bench/src \
+        tools/agentdb-cluster-smoke/src \
     && echo "fn main(){}" > bin/agentdb-server/src/main.rs \
-    && for c in api core dashboard index meta storage; do \
+    && echo "fn main(){}" > bin/agentdbctl/src/main.rs \
+    && echo "fn main(){}" > tools/agentdb-bench/src/main.rs \
+    && echo "fn main(){}" > tools/agentdb-cluster-smoke/src/main.rs \
+    && for c in api core dashboard index meta storage wire; do \
            echo "" > crates/agentdb-$c/src/lib.rs; \
        done \
     && echo "fn main(){}" > crates/agentdb-index/benches/vector_bench.rs \
     && cargo fetch --locked
 
+# -------- builder --------
+FROM deps AS builder
+
 # Now the real build. Source copy invalidates the compile-cache
 # layer but not the fetched-crates layer above.
 COPY . .
-RUN cargo build --release --locked -p agentdb-server \
-    && strip target/release/agentdb
+RUN cargo build --release --locked -p agentdb-server -p agentdbctl \
+    && strip target/release/agentdb target/release/agentdbctl
 
 # -------- runtime --------
 FROM debian:bookworm-slim AS runtime
@@ -71,6 +83,7 @@ USER agentdb
 WORKDIR /data
 
 COPY --from=builder --chown=agentdb:agentdb /src/target/release/agentdb /usr/local/bin/agentdb
+COPY --from=builder --chown=agentdb:agentdb /src/target/release/agentdbctl /usr/local/bin/agentdbctl
 
 # REST API. Dashboard shares the REST port.
 EXPOSE 7878

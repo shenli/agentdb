@@ -139,6 +139,15 @@ After purge:
 - `agentdbctl artifacts verify-lifecycle --tenant-id <tenant>` should report
   purged raw bytes without issues
 
+Artifact creation writes content before metadata. On a metadata persistence
+error the runtime attempts immediate blob deletion. Local filesystem content
+also fsyncs the file and containing directories around rename. On persistent
+standalone startup, before accepting traffic, AgentDB lists local content and
+deletes objects with no metadata that still retains raw content; inspect the
+`completed startup artifact-content reconciliation` log fields for scanned,
+deleted, and error counts. Do not run an equivalent sweep concurrently with
+writes because content legitimately exists briefly before metadata commits.
+
 ## Object-Store Dependencies
 
 For object-store-backed content, segments, archives, or artifacts, AgentDB does
@@ -150,6 +159,11 @@ not recreate external storage policy. Operators must preserve:
 - credentials or IAM role
 - encryption/key availability
 - object-store audit logs, if required
+
+The current object-store content backend does not expose listing to AgentDB, so
+the standalone startup orphan reconciliation reports `listing_supported=false`
+and does not delete remote objects. Use bucket inventory and lifecycle tooling
+to detect orphans until listing/reconciliation is implemented.
 
 If cold/archive reads fail after an object-store change, restore those external
 dependencies before changing AgentDB state.

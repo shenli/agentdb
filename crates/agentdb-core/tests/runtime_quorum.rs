@@ -936,7 +936,7 @@ async fn runtime_tablet_snapshot_preserves_export_ledger_high_watermark_and_cons
                 .ack_export_consumer(AckExportConsumerRequest {
                     tenant_id: tenant.tenant_id.clone(),
                     consumer_name: "clickhouse".into(),
-                    cursor: feed[0].cursor.clone(),
+                    cursor: Some(feed[0].cursor.clone()),
                     snapshot_high_watermark: Some(feed[0].cursor.clone()),
                     lease_owner: None,
                 })

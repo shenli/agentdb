@@ -280,7 +280,7 @@ async fn legacy_op_query_hello_gets_op_reply() -> anyhow::Result<()> {
     let mut doc_cursor = Cursor::new(&payload[20..]);
     let response = Document::from_reader(&mut doc_cursor)?;
     assert_eq!(response.get_f64("ok")?, 1.0);
-    assert_eq!(response.get_bool("isWritablePrimary")?, true);
+    assert!(response.get_bool("isWritablePrimary")?);
     assert!(response.get_i32("maxWireVersion")? >= 17);
 
     Ok(())

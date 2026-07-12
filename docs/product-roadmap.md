@@ -12,8 +12,12 @@ For the conceptual motivation and positioning, see
   skills, policies, tenant metadata, and record graph edges.
 - Per-session append semantics: serialized append, contiguous session-local
   sequence numbers, append-and-fetch, idempotency, and backpressure reporting.
-- Native tenant-scoped HTTP API plus maintained Python and TypeScript SDKs.
-- Session-first dashboard mounted at `/dashboard`.
+- Native tenant-scoped HTTP API plus maintained Python and TypeScript SDKs;
+  mandatory rotating installation bearer authentication on non-loopback binds,
+  metadata-backed admin/read-only tokens, and separate internal Raft
+  authentication.
+- Session-first dashboard mounted at `/dashboard`, with assets embedded in the
+  binary and bearer credentials kept only in page memory.
 - Local single-node runtime modes: in-memory development and RocksDB-backed
   metadata with separate content backends for artifacts, segments, archives, and
   replay prefixes.
@@ -24,8 +28,9 @@ For the conceptual motivation and positioning, see
   sessions, resume resolution across fork chains, dangling/expired ref fallback
   semantics, and the external sandbox-service contract.
 - Watch and export feeds: session subscribe, tenant/agent/session `watch`,
-  frontier cursors, fork-edge control items, durable `export_watch`, export
-  backfill, and managed export consumers with claim/ack/rewind.
+  frontier cursors, fork-edge control items, commit-ordered durable
+  `export_watch`, export backfill, and managed export consumers with validated
+  retained cursors plus claim/ack/rewind.
 - Record retrieval substrate: durable base records, source refs, local/global
   indexes, commit-sequence visibility repair, metadata filters, record edges,
   and SDK commit-sequence propagation.
@@ -37,7 +42,12 @@ For the conceptual motivation and positioning, see
   upgrade, storage maintenance, disk-full recovery, routine maintenance,
   CDC/export, tiered-storage lifecycle runbooks, read-only artifact lifecycle
   verification, offline local restore apply, ClickHouse export schema rollback,
-  and production preflight checklist.
+  production preflight checklist, distinct live/ready probes, local artifact
+  failure cleanup/startup orphan reconciliation, and explicit startup hydration
+  row/byte limits.
+- Release packaging: Docker images and tagged binary archives include both
+  `agentdb` and `agentdbctl`, so diagnostic, backup/restore, and export commands
+  do not require a source checkout.
 - Credential boundary hardening: opaque event-level `credential_refs`, SDK raw
   secret payload validators, optional server-side raw-secret field rejection,
   and runtime tool-result sanitization.
@@ -53,13 +63,26 @@ For the conceptual motivation and positioning, see
 
 ## Partial / Needs Hardening
 
+- **Authentication and authorization.** Static bearer auth and scoped admin
+  tokens protect non-loopback deployments, but loopback development can remain
+  open and the static token remains installation-wide. Per-principal tenant
+  authorization, identity-provider integration, and audit attribution belong
+  to future hosted or control-plane work.
+- **Startup and content scale.** Single-node startup hydration is now bounded at
+  512 MiB of serialized keys/values and explicit per-prefix row defaults, but
+  decoded state can consume more memory and startup still scans each prefix
+  before scanning it again to hydrate metadata/in-memory record indexes. Local
+  orphan reconciliation performs a full listing bounded to 500,000 entries by
+  default and removes crash-left temporary files; object-store content lacks
+  that listing primitive entirely.
 - **Dashboard.** A baseline dashboard exists. It still needs richer replay
   visualization, fork lineage, context provenance, artifact previews, policy
   state, export lag, and adapter convention warnings.
-- **Observability exporters.** Durable export primitives are implemented.
-  First-party ClickHouse/ClickStack/JSONL/Parquet operator guidance exists, but
-  sink-specific diagnostics, examples, and production packaging still need more
-  polish.
+- **Observability exporters.** Durable export primitives are implemented for
+  single-tablet runtimes. Snapshot-routed clusters fail export closed until a
+  cross-tablet merge frontier and cursor version exist. First-party
+  ClickHouse/ClickStack/JSONL/Parquet operator guidance exists, but
+  sink-specific diagnostics and examples still need more polish.
 - **Framework adapters.** Proofs exist. More adapters should show real recovery:
   crash/restart, idempotent retry, artifact recovery, fork, and watch/export
   consumption in one documented flow.

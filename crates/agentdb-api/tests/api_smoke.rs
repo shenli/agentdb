@@ -1791,6 +1791,39 @@ async fn admin_cluster_health_reports_degraded_unowned_tablet() {
 }
 
 #[tokio::test]
+async fn clustered_routing_rejects_export_until_cross_tablet_frontiers_exist() {
+    let runtime = Runtime::in_memory();
+    let tenant = runtime
+        .create_tenant(agentdb_core::NewTenant {
+            external_key: "cluster-export-gate".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let snapshot = RouteSnapshot::new(1)
+        .with_tablets(vec![tablet(0, Some("node-a"))])
+        .with_nodes(vec![node("node-a", "http://127.0.0.1:18080")]);
+    let state = AppState::new(runtime).with_routing(RouteRuntime::snapshot("node-a", snapshot));
+    let app = spawn_app_with_state(state).await;
+
+    let response = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{}/exports/status",
+            app.base, tenant.tenant_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("cross-tablet export frontiers"));
+}
+
+#[tokio::test]
 async fn admin_cluster_readiness_rejects_stale_local_node() {
     let runtime = Runtime::in_memory();
     let snapshot = RouteSnapshot::new(1)

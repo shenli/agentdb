@@ -7,6 +7,9 @@ __pycache__/
 target/
 crates/agentdb-wire/fuzz/Cargo.lock
 data/
+agentdb-data/
+local-backups/
+restore-scratch/
 .worktrees/
 tools/workload/agentdb-workload
 tools/workload/perf-probe

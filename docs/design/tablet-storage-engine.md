@@ -996,7 +996,9 @@ single-session appends or record writes.
    `server.internal_auth_token` or `AGENTDB_INTERNAL_AUTH_TOKEN`. During token
    rotation, ingress can also accept `server.internal_auth_previous_token` or
    `AGENTDB_INTERNAL_AUTH_PREVIOUS_TOKEN`; outbound RPCs always use the current
-   token. Inbound message/snapshot handlers validate that the `from` and `to`
+   token. Both tokens require at least 16 visible ASCII characters without
+   whitespace, and startup rejects a previous token without a current token.
+   Inbound message/snapshot handlers validate that the `from` and `to`
    Raft node IDs map to configured `tablet_replicas` rows when metadata is
    enabled, preventing authenticated but misrouted peer traffic from entering a
    local group.

@@ -70,6 +70,16 @@ jobs:
           rustup show active-toolchain || rustup show
           rustup target add ${{ matrix.target }}
 
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
       - name: Install cross-compile linker (Linux aarch64 only)
         if: matrix.apt-packages
         run: |
@@ -87,11 +97,11 @@ jobs:
           restore-keys: |
             cargo-release-${{ matrix.target }}-
 
-      - name: Build release binary
+      - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --locked -p agentdb-server --target ${{ matrix.target }}
+          cargo build --release --locked -p agentdb-server -p agentdbctl --target ${{ matrix.target }}
 
       - name: Strip + package
         id: pack
@@ -106,10 +116,12 @@ jobs:
           stage="agentdb-${tag}-${{ matrix.platform }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/agentdb" "$stage/agentdb"
+          cp "target/${{ matrix.target }}/release/agentdbctl" "$stage/agentdbctl"
           # `strip` is best-effort. Linux uses GNU strip; macOS
           # uses the system `strip`. Don't fail the build if it
           # doesn't shrink the binary.
           strip "$stage/agentdb" || true
+          strip "$stage/agentdbctl" || true
           cp README.md LICENSE "$stage/" 2>/dev/null || true
           tar -C "$(dirname "$stage")" -czf "${stage}.tar.gz" "$(basename "$stage")"
           shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"

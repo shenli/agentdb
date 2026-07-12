@@ -20,9 +20,8 @@
 //! partial write. The tmp file is fsynced before the rename so a crash
 //! between rename and the next write doesn't leave an unflushed blob.
 //!
-//! Parent-directory fsync (which would survive a crash that destroys the
-//! directory entry) is intentionally deferred to V2.4+; it costs an extra
-//! syscall per put and the V2.1 prototype doesn't need it.
+//! The parent directory is fsynced after rename so a successful `put` also
+//! makes the new directory entry durable across power loss.
 
 use std::collections::HashMap;
 use std::io;
@@ -47,6 +46,18 @@ use tokio::sync::mpsc;
 pub struct PutResult {
     pub bytes: u64,
     pub sha256_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentObject {
+    pub tenant_id: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentListing {
+    pub objects: Vec<ContentObject>,
+    pub temporary_objects_deleted: usize,
 }
 
 /// Abstraction over where artifact bytes live.
@@ -74,6 +85,15 @@ pub trait ContentBackend: Send + Sync {
     /// Best-effort delete. Removing a missing blob is NOT an error — the
     /// V2.4 GC reaper relies on idempotent delete to clean up orphans.
     async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()>;
+
+    /// Enumerate stored blobs for startup orphan reconciliation. Backends that
+    /// cannot provide a bounded namespace listing return `Unsupported`.
+    async fn list_objects(&self, _limit: usize) -> io::Result<ContentListing> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "content backend does not support object listing",
+        ))
+    }
 }
 
 // ----- AsyncMirrorContentBackend ---------------------------------------------
@@ -277,6 +297,10 @@ impl ContentBackend for AsyncMirrorContentBackend {
         })
         .await
     }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        self.primary.list_objects(limit).await
+    }
 }
 
 // ----- LocalFsContentBackend --------------------------------------------------
@@ -286,6 +310,8 @@ impl ContentBackend for AsyncMirrorContentBackend {
 pub struct LocalFsContentBackend {
     root: PathBuf,
 }
+
+static LOCAL_FS_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl LocalFsContentBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -307,15 +333,15 @@ impl LocalFsContentBackend {
         // Random suffix so concurrent puts of the same artifact_id (which
         // shouldn't normally happen — artifact_ids are UUIDv7 and unique
         // per call — but defensive) don't collide on the tmp path. We use a
-        // monotonic-ish nanosecond timestamp combined with a counter
-        // synthesized from the timestamp's low bits; that's good enough to
-        // avoid same-process collisions.
+        // monotonic-ish nanosecond timestamp combined with a process-local
+        // counter; that's enough to avoid same-process collisions.
         use std::time::{SystemTime, UNIX_EPOCH};
         let ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let suffix = format!(".tmp.{ns}");
+        let sequence = LOCAL_FS_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!(".tmp.{ns}.{sequence}");
         self.dir_for(tenant_id, artifact_id)
             .join(format!("blob{suffix}"))
     }
@@ -333,14 +359,25 @@ impl ContentBackend for LocalFsContentBackend {
         let sha256_hex = sha256_hex(bytes);
 
         // Write tmp + fsync + rename. tokio::fs::rename is atomic on POSIX.
-        // TODO(V2.4): fsync the parent directory to make the rename durable
-        // across power loss; not needed for the V2.1 prototype.
-        {
-            let mut f = tokio::fs::File::create(&tmp_path).await?;
-            f.write_all(bytes).await?;
-            f.sync_data().await?;
+        let write_result = async {
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            file.write_all(bytes).await?;
+            file.sync_data().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, &final_path).await
         }
-        tokio::fs::rename(&tmp_path, &final_path).await?;
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
+        if let Err(error) = sync_directory_chain(dir.clone(), self.root.clone()).await {
+            // A failed durability barrier is a failed put. Remove the visible
+            // object so callers never mistake an error return for a committed
+            // blob; the runtime also performs a best-effort cleanup.
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(error);
+        }
 
         Ok(PutResult {
             bytes: bytes.len() as u64,
@@ -364,16 +401,119 @@ impl ContentBackend for LocalFsContentBackend {
 
     async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
         let p = self.path_for(tenant_id, artifact_id);
-        match tokio::fs::remove_file(&p).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        let removed = match tokio::fs::remove_file(&p).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e),
+        };
+        if !removed {
+            return Ok(());
         }
-        // Best-effort cleanup of the empty parent dir. Ignore errors —
-        // a non-empty dir (e.g. concurrent put left a tmp behind) just
-        // means future GC will collect it.
-        let _ = tokio::fs::remove_dir(self.dir_for(tenant_id, artifact_id)).await;
+        let dir = self.dir_for(tenant_id, artifact_id);
+        sync_directory_chain(dir.clone(), self.root.clone()).await?;
+        // Best-effort cleanup of the empty artifact directory. A non-empty
+        // directory can contain an in-flight temporary write.
+        if tokio::fs::remove_dir(&dir).await.is_ok() {
+            if let Some(parent) = dir.parent() {
+                sync_directory_chain(parent.to_path_buf(), self.root.clone()).await?;
+            }
+        }
         Ok(())
+    }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        let root = self.root.join("artifact_content");
+        let mut tenants = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ContentListing {
+                    objects: Vec::new(),
+                    temporary_objects_deleted: 0,
+                })
+            }
+            Err(error) => return Err(error),
+        };
+        let mut objects = Vec::new();
+        let mut temporary_objects_deleted = 0_usize;
+        while let Some(tenant) = tenants.next_entry().await? {
+            if !tenant.file_type().await?.is_dir() {
+                continue;
+            }
+            let tenant_id = tenant.file_name().to_string_lossy().to_string();
+            let mut artifacts = tokio::fs::read_dir(tenant.path()).await?;
+            while let Some(artifact) = artifacts.next_entry().await? {
+                if !artifact.file_type().await?.is_dir() {
+                    continue;
+                }
+                let artifact_path = artifact.path();
+                let mut entries = tokio::fs::read_dir(&artifact_path).await?;
+                let mut has_blob = false;
+                let mut removed_temporary_file = false;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "blob" && entry.file_type().await?.is_file() {
+                        has_blob = true;
+                    } else if name.starts_with("blob.tmp.") && entry.file_type().await?.is_file() {
+                        tokio::fs::remove_file(entry.path()).await?;
+                        temporary_objects_deleted = temporary_objects_deleted.saturating_add(1);
+                        removed_temporary_file = true;
+                    }
+                }
+                if removed_temporary_file {
+                    sync_directory_chain(artifact_path.clone(), self.root.clone()).await?;
+                }
+                if has_blob {
+                    if objects.len() >= limit {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "content object listing exceeds configured limit of {limit} objects"
+                            ),
+                        ));
+                    }
+                    objects.push(ContentObject {
+                        tenant_id: tenant_id.clone(),
+                        artifact_id: artifact.file_name().to_string_lossy().to_string(),
+                    });
+                } else if tokio::fs::remove_dir(&artifact_path).await.is_ok() {
+                    sync_directory_chain(tenant.path(), self.root.clone()).await?;
+                }
+            }
+        }
+        Ok(ContentListing {
+            objects,
+            temporary_objects_deleted,
+        })
+    }
+}
+
+#[cfg(unix)]
+async fn sync_directory(path: PathBuf) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(|error| io::Error::other(format!("directory fsync task failed: {error}")))?
+}
+
+#[cfg(not(unix))]
+async fn sync_directory(_path: PathBuf) -> io::Result<()> {
+    Ok(())
+}
+
+async fn sync_directory_chain(mut path: PathBuf, stop_at: PathBuf) -> io::Result<()> {
+    loop {
+        sync_directory(path.clone()).await?;
+        if path == stop_at {
+            return Ok(());
+        }
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let parent = parent.to_path_buf();
+        if !parent.starts_with(&stop_at) {
+            return Ok(());
+        }
+        path = parent;
     }
 }
 
@@ -420,6 +560,26 @@ impl ContentBackend for InMemoryContentBackend {
         let mut g = self.blobs.lock().expect("blobs mutex poisoned");
         g.remove(&(tenant_id.to_string(), artifact_id.to_string()));
         Ok(())
+    }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        let blobs = self.blobs.lock().expect("blobs mutex poisoned");
+        if blobs.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("content object listing exceeds configured limit of {limit} objects"),
+            ));
+        }
+        Ok(ContentListing {
+            objects: blobs
+                .keys()
+                .map(|(tenant_id, artifact_id)| ContentObject {
+                    tenant_id: tenant_id.clone(),
+                    artifact_id: artifact_id.clone(),
+                })
+                .collect(),
+            temporary_objects_deleted: 0,
+        })
     }
 }
 

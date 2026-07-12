@@ -54,14 +54,18 @@ agentdb serve --config /etc/agentdb/agentdb.toml
 Useful checks:
 
 ```bash
+curl -fsS http://127.0.0.1:7878/health/live
+curl -fsS http://127.0.0.1:7878/health/ready
 agentdbctl status
 agentdbctl -o json status
 open http://127.0.0.1:7878/dashboard/
 ```
 
-Load balancers and uptime probes should still use `/health/ready`. Operators
-should usually use `agentdbctl status` because it aggregates health, readiness,
-scheduler, and drain state in one command.
+Use `/health/live` only for process-restart decisions. Load balancers and
+traffic gates must use `/health/ready`, which returns 503 while a node is
+draining or cluster routing state is unsafe. Operators should usually use
+`agentdbctl status` because it aggregates health, readiness, scheduler, and
+drain state in one command. Health routes do not require authentication.
 
 ## Configuration
 
@@ -78,8 +82,77 @@ data_dir = "/var/lib/agentdb"
 content_dir = "/var/lib/agentdb/content"
 ```
 
+A non-loopback bind is rejected unless `server.api_auth_token` or
+`AGENTDB_API_AUTH_TOKEN` contains at least 16 visible ASCII characters with no
+whitespace. Keep secrets outside the config repository and pass the same value
+to clients as `AGENTDB_TOKEN` or `agentdbctl --token`:
+
+```bash
+export AGENTDB_API_AUTH_TOKEN='replace-with-a-random-secret'
+export AGENTDB_TOKEN="$AGENTDB_API_AUTH_TOKEN"
+agentdb doctor --config /etc/agentdb/agentdb.toml
+agentdb serve --config /etc/agentdb/agentdb.toml
+```
+
+On a loopback bind, omitting the static token leaves the data API
+unauthenticated. The local admin API is also open for bootstrap until the first
+metadata-backed token is ever created; revoking all tokens does not reopen the
+bootstrap path. After that, its scope rules apply. Configure
+the static token even on loopback when other local users or workloads are not
+trusted.
+
+Static API tokens are installation-wide, not tenant-scoped authorization.
+Terminate TLS before sending them over a network. Rotation accepts a current
+and a distinct previous token through `AGENTDB_API_AUTH_PREVIOUS_TOKEN`; the
+previous token follows the same visible-ASCII rule, is valid only while a
+current token is configured, and should be removed after every client has
+moved. Metadata-backed `admin` and `readonly`
+tokens can be minted at `/api/admin/tokens`; their hashes live in
+`<data_dir>/auth-meta.sqlite` on a persistent standalone node, which must be
+included in volume-level backups. Cluster nodes reuse the shared metadata
+store.
+
+The dashboard keeps a bearer token in page memory only. It deletes legacy
+stored tokens, never accepts a token from URL parameters, and strips `token`
+and `access_token` parameters from the address bar. Reloading the page requires
+entering the token again. Dashboard assets are embedded in the server binary,
+so no source-tree `static/` directory is required at runtime.
+
 The repository also includes a template at
 [config/agentdb.toml](../../config/agentdb.toml).
+Configuration sections reject unknown fields. A misspelled or obsolete key
+therefore makes `doctor`/startup fail instead of silently running with a
+default; validate the file before every rollout.
+
+### Startup Hydration Limits
+
+The current single-node runtime hydrates metadata and record indexes into
+memory at startup. A preflight scans those persistent namespaces before
+hydration and fails startup instead of allowing unbounded memory growth. The
+default total scanned key/value budget is 512 MiB. Row defaults are:
+
+| Environment variable | Default rows | Applies to |
+|---|---:|---|
+| `AGENTDB_STARTUP_MAX_TENANTS` | 10,000 | tenants and tenant aliases |
+| `AGENTDB_STARTUP_MAX_AGENTS` | 100,000 | agents and agent aliases |
+| `AGENTDB_STARTUP_MAX_SESSIONS` | 250,000 | sessions and session aliases |
+| `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | artifact metadata |
+| `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | records, index outbox, and index commits |
+| `AGENTDB_STARTUP_MAX_RECORD_EDGES` | 500,000 | record graph edges |
+| `AGENTDB_STARTUP_MAX_SKILLS` | 100,000 | skills and unique skill keys |
+| `AGENTDB_STARTUP_MAX_SKILL_BINDINGS` | 500,000 | agent-skill bindings |
+| `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | managed export consumers |
+| `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | tenant metadata rows |
+| `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | retained idempotency results |
+| `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` | 500,000 | local content entries listed for orphan reconciliation; separate from the hydrated-byte total |
+
+`AGENTDB_STARTUP_MAX_HYDRATED_BYTES` changes the aggregate byte limit. Only a
+positive integer overrides a default; an unset, zero, or invalid value retains
+the corresponding default. Raising a cap does not make hydration streaming;
+size RSS and startup time on a restored copy first. Startup performs one O(N)
+preflight scan and then hydration, and the server log reports the scanned row
+and byte totals. Long-term removal of whole-state hydration remains an
+architecture scaling item.
 
 ## Stop
 
@@ -153,6 +226,19 @@ The durable truth may now span:
 - local node config
 - object-store runtime metadata
 - object-store content blobs
+
+For persistent standalone local-filesystem content, startup lists content
+objects before opening the listener and removes blobs not referenced by
+metadata that still retains raw content. It logs objects scanned, referenced,
+deleted, crash-left temporary files deleted, and delete errors. The listing is
+bounded by `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS`; exceeding the bound fails
+startup rather than allocating an unbounded inventory.
+
+Artifact writes also clean up content immediately when metadata persistence
+fails, and local content renames fsync the containing directory. Object-store
+content currently has no listing implementation, so startup reconciliation is
+reported as unsupported there; bucket inventory/lifecycle checks remain an
+operator responsibility.
 
 ## Upgrade
 
