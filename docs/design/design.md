@@ -103,19 +103,20 @@ AgentDB or still needs product hardening.
 | Area | Status | Notes |
 |---|---|---|
 | Runtime objects | Implemented | Tenant, agent, session, event, artifact, record, skill, policy, and tenant metadata exist in the Rust runtime and native API. |
-| Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. |
+| Native API and SDKs | Implemented | Tenant-scoped HTTP API plus maintained Python and TypeScript SDKs. Non-loopback binds require rotating installation bearer auth; scoped admin tokens protect admin routes. Loopback development may remain open, and tenant-scoped end-user authorization remains a hosted/control-plane concern. |
 | Append loop | Implemented | Per-session serialized append, contiguous `seq`, append-and-fetch, idempotency, backpressure signals, and raw-secret write-path guards. |
 | Fork and replay | Implemented | Pointer forks, fork-aware replay, bounded ancestor reads, replay scan stats, and explicit replay-prefix materialization over core/HTTP/SDK surfaces. |
-| Changefeeds | Implemented | Session subscribe, cursor-based `watch`, fork-edge control items, durable `export_watch`, and managed export consumers with claim/ack/rewind. |
-| Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths. |
+| Changefeeds | Implemented | Session subscribe, cursor-based `watch`, fork-edge control items, commit-ordered durable `export_watch`, and managed export consumers with retained-cursor validation and claim/ack/rewind. |
+| Artifacts | Implemented | Metadata and content bytes are stored separately with lifecycle-aware purge paths, a 128 MiB absolute object limit, local-filesystem fsync, failure cleanup, and standalone startup orphan reconciliation. The local sweep fully scans and materializes the blob listing; object-store listing/reconciliation is not yet implemented. |
 | Records and retrieval | Implemented for scoped runtime retrieval | Durable base records, local/global indexes, commit-sequence visibility repair, record edges, and source refs exist. Memory extraction, ranking, summarization, and embedding spend are application/platform responsibilities. |
 | Skills | Implemented | Versioned skill manifests and agent bindings are runtime objects; exact-version replay is supported through event refs and bindings. |
 | Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
 | Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
 | Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
 | MongoDB compatibility | Implemented narrow adapter | Optional MongoDB wire listener maps a fixed command/collection subset onto native runtime methods. It is not full MongoDB compatibility. |
-| Dashboard | Implemented baseline | Session-first dashboard exists; richer replay/fork/context/artifact inspection remains product work. |
-| Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, Docker/Compose/Helm examples, backup manifest/checkpoint endpoint, and runbooks exist. Restore apply, upgrade, and routine maintenance still need a boring operator story. |
+| Dashboard | Implemented baseline | Session-first dashboard assets are embedded in the binary; bearer input is page-memory-only and URL token parameters are scrubbed. Richer replay/fork/context/artifact inspection remains product work. |
+| Packaging | Implemented baseline | Docker images and tagged release archives contain both `agentdb` and `agentdbctl`; Compose/Helm provide the required API bearer secret for their non-loopback listener. |
+| Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, authenticated Docker/Compose/Helm examples, meaningful live/ready probes, startup hydration guarded by a 512 MiB serialized-KV budget plus per-prefix row caps, backup manifest/checkpoint endpoint, and runbooks exist. Whole-state hydration, decoded-memory overhead, and some restore/upgrade automation remain limits. |
 | Distributed/tablet operation | Evaluation/hardening | Metadata-backed routing, tablets, shard ranges, forwarding, tablet movement, snapshots, and Raft-backed write paths exist. This is not yet the default production deployment shape. |
 | Observability exporters | Partially implemented | Durable export primitives and managed consumers exist. First-party ClickHouse/ClickStack/JSONL/Parquet tooling is still maturing around those primitives. |
 
@@ -233,7 +234,9 @@ tail, and let named managed consumers claim leases and ack only after an
 external sink accepts a batch. The first supported sink is ClickHouse over HTTP,
 with native AgentDB tables and optional OTel-shaped ClickStack views. JSONL and
 Parquet paths provide archive/lakehouse handoff without adding sink-specific
-semantics to the runtime.
+semantics to the runtime. This boundary currently requires a single-tablet
+runtime; snapshot-routed clusters reject export until a cross-tablet merge
+frontier exists.
 
 Record indexes follow local/global semantics. A search with `sharding_key` uses
 the owner-local index and is the strong read-after-write boundary. A search

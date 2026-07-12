@@ -362,6 +362,48 @@ async fn append_preserves_credential_refs_and_idempotency_hashes_them() {
 }
 
 #[tokio::test]
+async fn persistent_append_without_idempotency_preserves_credential_refs() {
+    use agentdb_core::event::CredentialRef;
+    use agentdb_storage::{InMemoryContentBackend, InMemoryKvStore};
+    use std::sync::Arc;
+
+    let rt = Runtime::with_kv(
+        Arc::new(InMemoryKvStore::new()),
+        Arc::new(InMemoryContentBackend::default()),
+    );
+    let (tenant, agent, session) = rt.bootstrap_test_session().await;
+    let mut req = AppendRequest::simple(
+        &tenant,
+        &agent,
+        &session,
+        "tool_call",
+        serde_json::json!({}),
+    );
+    req.credential_refs = vec![CredentialRef {
+        cred_ref: "vault://agent/acme/github".into(),
+        provider: Some("github".into()),
+        scope: Some("repo:read".into()),
+        expires_at_ms: None,
+    }];
+    rt.append(req).await.unwrap();
+
+    let fetched = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id,
+            session_id: session.session_id,
+            from_seq: 0,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fetched[0].credential_refs.len(), 1);
+    assert_eq!(
+        fetched[0].credential_refs[0].cred_ref,
+        "vault://agent/acme/github"
+    );
+}
+
+#[tokio::test]
 async fn append_secret_field_policy_rejects_raw_secret_payload_keys() {
     let rt = Runtime::in_memory();
     let tenant = rt

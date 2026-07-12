@@ -23,25 +23,26 @@ Run me:
 
 Expected output: three turns printed, each showing the working
 memory growing by one event. Then a fork that branches off the
-session and shows the child sees the parent's history at fork
-time.
+session and appends a child event on the alternate timeline.
 """
 
 from __future__ import annotations
 
 import os
+import time
 
 from _bootstrap import ensure_repo_python_client_on_path
 
 ensure_repo_python_client_on_path()
 
-from agentdb import Client
+from agentdb import AgentDB, Client
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-USER = os.environ.get("AGENTDB_USER", "demo")
-PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
+TOKEN = os.environ.get("AGENTDB_TOKEN")
 SESSION_ID = "quickstart-agent"
+TENANT_KEY = os.environ.get("AGENTDB_TENANT", "quickstart")
+AGENT_ALIAS = os.environ.get("AGENTDB_AGENT", "quickstart-agent")
 
 
 def thought_for_turn(turn: int, recent_text: list[str]) -> dict:
@@ -64,16 +65,22 @@ def thought_for_turn(turn: int, recent_text: list[str]) -> dict:
 
 
 def main() -> None:
-    client = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
-    if not client.health_ready():
+    health = Client(base_url=SERVER_URL, token=TOKEN)
+    if not health.health_ready():
         raise SystemExit(
             f"AgentDB not ready at {SERVER_URL}. Start it with:\n"
             f"    cargo run -p agentdb-server -- serve --dev"
         )
 
-    sess = client.session(SESSION_ID)
-    print(f"# Session: {sess}\n")
+    db = AgentDB(base_url=SERVER_URL, token=TOKEN)
+    workspace = db.workspace(f"{TENANT_KEY}-{int(time.time() * 1000)}")
+    agent = workspace.agent(AGENT_ALIAS)
+    sess = agent.session(SESSION_ID)
+    print(f"# Workspace: {workspace.id}")
+    print(f"# Agent: {agent.id}")
+    print(f"# Session: {sess.id}\n")
 
+    last_parent_seq = 0
     for turn in range(3):
         # Pull the recent five events as context. Even though we
         # call this on the same line as the append, the server
@@ -83,6 +90,7 @@ def main() -> None:
         # Build the new event off whatever happened before.
         new_event = thought_for_turn(turn, recent_payloads)
         result = sess.append(new_event, fetch_last_n=5)
+        last_parent_seq = result.seq
         print(f"--- turn {turn} (seq={result.seq}) ---")
         for ev in result.recent:
             actor = ev.payload.get("role", "?")
@@ -91,9 +99,8 @@ def main() -> None:
         print()
 
     # Fork: branch the agent off into an alternate timeline.
-    # The child sees the parent's events at fork time, MVCC-backed.
     print("# Forking into an alternate timeline...")
-    branch = sess.fork(f"{SESSION_ID}-branch-a")
+    branch = sess.fork(f"{SESSION_ID}-branch-a", at_seq=last_parent_seq)
     branch_result = branch.append(
         {"role": "user", "text": "What if it were 3 + 3 instead?"},
         fetch_last_n=10,

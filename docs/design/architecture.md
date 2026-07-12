@@ -13,9 +13,10 @@ agentdb.toml / CLI overrides
 bin/agentdb-server
         |
         v
-crates/agentdb-api        native tenant-scoped /api/... HTTP routes
+crates/agentdb-api        bearer-protected tenant-scoped /api/... HTTP routes
         |                 optional MongoDB wire listener maps to runtime calls
         |                 export/watch/backfill/consumer admin routes
+        |                 public liveness/readiness and embedded dashboard
         |
         v
 crates/agentdb-core       multi-tenant runtime semantics
@@ -75,7 +76,12 @@ local runs and tests.
 
 Normal single-node runtime settings are not configured through environment
 variables. Docker, Compose, and Helm should mount a config file and start the
-server with `--config`.
+server with `--config`. Secrets are deliberate exceptions:
+`AGENTDB_API_AUTH_TOKEN` / `AGENTDB_API_AUTH_PREVIOUS_TOKEN` keep external API
+credentials out of the file, and the internal Raft and Mongo credentials have
+their own environment overrides. Startup hydration safety caps are also
+environment overrides because they are operational guardrails rather than
+durable data semantics.
 
 ## Runtime Model
 
@@ -130,8 +136,30 @@ POST /api/tenants/{tenant_id}/policy/lifecycle-sweep
 POST /api/tenants/{tenant_id}/policy/gc-sweep
 POST /api/policy/worker/run
 GET  /api/admin/exports
+GET  /api/admin/tokens
+POST /api/admin/tokens
+DELETE /api/admin/tokens/{token_id}
+GET  /health/live
 GET  /health/ready
 ```
+
+The native API has two bearer-token mechanisms. A rotating static installation
+token protects every external `/api/*` route and is mandatory for a
+non-loopback bind; either its current or previous value is accepted during
+rotation. On `/api/admin/*`, metadata-backed tokens are an alternate credential
+with `admin` or read-only scope. When no static token is configured, loopback
+data routes remain open for local development and local admin bootstrap remains
+open only until the first metadata-backed admin token is ever minted; revoking
+all tokens does not reopen bootstrap. These controls
+are coarse installation/admin authentication, not tenant-scoped end-user
+authorization. Internal Raft routes keep a separate rotating token, while
+health and dashboard assets remain public. Network deployments must terminate
+TLS before the HTTP listener.
+
+Dashboard HTML, JavaScript, and CSS are compiled into `agentdb`, so a release
+binary does not depend on a source-tree asset directory. The page keeps a
+manually entered bearer token in JavaScript memory only, removes legacy stored
+tokens, and scrubs `token` / `access_token` query parameters from the URL.
 
 Hosted/authenticated deployments should provide user-info metadata so SDKs can
 bind the authenticated principal to a tenant/workspace. The server-side runtime
@@ -246,6 +274,17 @@ last acked cursors, include filters, and lag status. Connectors must write the
 sink batch before acking AgentDB, so a crashed worker can replay the last
 unacked cursor range.
 
+Persistent v2 export cursors carry a per-tenant sequence assigned at the
+serialized KV commit boundary in a single-tablet runtime. This orders cursor
+delivery by commit rather than by wall-clock time. Page `next_cursor`
+identifies the last delivered row; request results stop at the captured
+`high_watermark`, while metadata pagination retains one first-page
+`snapshot_high_watermark`. Managed ack/rewind verifies that a cursor is an
+actual retained row for the same tenant, scope, and include filter; metadata
+snapshot acks normalize to the captured ledger high watermark. Retained legacy
+timestamp-based cursors remain readable during migration. Snapshot-routed
+clusters reject export endpoints until a cross-tablet frontier is implemented.
+
 ```text
 runtime mutation commits
         |
@@ -338,12 +377,52 @@ the content backend. Large artifact bytes are already out-of-line through
 synchronous object PUT for artifact uploads, which should remain separate from
 ordinary event append.
 
+Local filesystem writes fsync the content file before rename and then fsync the
+directory chain. If metadata persistence fails after a content write, the
+runtime deletes the blob. Persistent standalone startup also lists local
+content before opening the listener and deletes blobs not referenced by
+metadata that still retains raw content. The object-store backend does not
+currently implement object listing, so the startup orphan sweep is unsupported
+there and remains an explicit operational boundary. The local sweep is a full
+O(number of content objects) namespace scan, removes crash-left `blob.tmp.*`
+files, and materializes at most 500,000 entries by default before failing
+closed. `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` changes that explicit bound.
+Artifact policies default to 16 MiB per object and clamp at the 128 MiB
+absolute request/runtime limit.
+
 The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
 contract tests because the runtime reuses those foundations.
 
 The runtime code itself is `KvStore`-agnostic, so tiered session metadata works
 with either `RocksKvStore` or `SlateKvStore`. The `agentdb-server` binary now
 selects the KV backend and content backend from `agentdb.toml`.
+
+The current runtime still hydrates persisted metadata and in-memory record
+indexes during startup. A preflight applies these defaults before hydration:
+
+| Environment variable | Default | Prefixes limited by that value |
+|---|---:|---|
+| `AGENTDB_STARTUP_MAX_HYDRATED_BYTES` | 512 MiB (536,870,912 bytes) | Total serialized keys and values across all prefixes below |
+| `AGENTDB_STARTUP_MAX_TENANTS` | 10,000 | Tenants; tenant aliases |
+| `AGENTDB_STARTUP_MAX_AGENTS` | 100,000 | Agents; agent aliases |
+| `AGENTDB_STARTUP_MAX_SESSIONS` | 250,000 | Sessions; session aliases |
+| `AGENTDB_STARTUP_MAX_ARTIFACTS` | 250,000 | Artifact metadata |
+| `AGENTDB_STARTUP_MAX_RECORDS` | 100,000 | Records; record-index outbox rows; record commit rows |
+| `AGENTDB_STARTUP_MAX_RECORD_EDGES` | 500,000 | Record edges |
+| `AGENTDB_STARTUP_MAX_SKILLS` | 100,000 | Skills; unique skill keys |
+| `AGENTDB_STARTUP_MAX_SKILL_BINDINGS` | 500,000 | Agent/skill bindings |
+| `AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS` | 10,000 | Managed export consumers |
+| `AGENTDB_STARTUP_MAX_TENANT_META` | 500,000 | Tenant metadata rows |
+| `AGENTDB_STARTUP_MAX_IDEMPOTENCY` | 1,000,000 | Idempotency rows |
+| `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` | 500,000 | Local content entries listed for orphan reconciliation; separate from the serialized hydration-byte total |
+
+Where a setting covers multiple prefixes, the row cap is applied separately to
+each named prefix. Exceeding a row or aggregate-byte bound fails startup with
+an actionable `AGENTDB_STARTUP_MAX_*` message rather than proceeding to
+unbounded hydration. The 512 MiB limit is serialized KV size, not a process-RSS
+ceiling: decoded objects, maps, and record indexes require additional memory.
+The preflight is O(N), then normal hydration scans the same bounded state again.
+Removing whole-state hydration remains future scale work.
 
 ## Session Tiered Storage
 
@@ -392,13 +471,17 @@ session lifecycle, storage, and restore endpoints.
 - **Persistent single-node**: RocksDB metadata plus local filesystem artifact
   content, configured by `agentdb.toml`.
 - **Docker and Compose**: containerized single-node server with a mounted config
-  file and data volume.
+  file and data volume. The image contains both `agentdb` and `agentdbctl`.
 - **Observability export workers**: `agentdbctl` processes that tail managed
   export consumers into ClickHouse/ClickStack or JSONL/Parquet archives. They
   can run as systemd services or AWS deployment helpers and fail over through
   consumer lease expiry.
 - **Helm**: evaluation-oriented Kubernetes deployment that mounts config through
   a ConfigMap and uses the same health endpoints as the binary.
+
+Tagged release archives likewise contain both operator binaries; `agentdbctl`
+is therefore available for backup, restore, export, and diagnostic workflows
+without a source checkout.
 
 Distributed control-plane behavior is not the current user-facing deployment
 target. The priority is making one node easy to start, inspect, back up, upgrade,
@@ -413,15 +496,19 @@ purge metadata, index entries, and artifact content when policy allows.
 
 ## SDKs And Adapters
 
-The Python and TypeScript SDKs map directly to the native API. They generate
-idempotency keys for mutating calls and expose typed ID aliases as opaque
+The Python and TypeScript SDKs map directly to the native API. They send an
+idempotency key only when the caller supplies one, keeping default same-session
+appends eligible for server-side coalescing; applications that retry ambiguous
+mutations should provide a stable key. SDKs expose typed ID aliases as opaque
 strings.
 
 Their friendly surfaces keep tenant IDs out of normal application flows. In
 authenticated deployments, SDKs bind the workspace/tenant from `/api/me`-style
-user-info metadata; local development can use explicit workspace aliases. After
-that binding, SDKs reuse or create agent/session aliases under the resolved
-tenant.
+user-info metadata; local development can use explicit workspace aliases. The
+Python client falls back by listing an existing external key before creation,
+and both friendly surfaces reuse agent/session aliases after restart rather
+than treating a create conflict as a new identity. After binding, SDKs reuse or
+create aliases under the resolved tenant.
 
 Framework adapters should be thin. Their job is to map framework concepts onto
 AgentDB tenants, agents, sessions, events, records, artifacts, and skills while

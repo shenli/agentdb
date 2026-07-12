@@ -5,9 +5,14 @@ target/
 
 # Local dev state.
 data/
+agentdb-data/
+local-backups/
+restore-scratch/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+**/.venv/
+**/__pycache__/
 
 # IDE + git clutter.
 .idea/
@@ -19,6 +24,7 @@ docs/
 scripts/
 benchmarks/
 workload/target/
+tools/agentdb-bench/baselines/fixtures/corpus.jsonl
 
 # Test fixtures that bloat the context but aren't compile inputs.
 **/*.png

@@ -287,6 +287,7 @@ impl CommandContext {
                     payload,
                     artifact_refs: vec![],
                     source_refs: vec![],
+                    credential_refs: vec![],
                     idempotency_key,
                 },
                 fetch_last_n,
@@ -578,6 +579,7 @@ impl CommandContext {
                 payload,
                 artifact_refs: vec![],
                 source_refs: vec![],
+                credential_refs: vec![],
                 idempotency_key,
             })
             .await?;
@@ -597,6 +599,7 @@ impl CommandContext {
         self.runtime
             .write_record(NewRecord {
                 tenant_id: tenant_id.clone(),
+                external_id: None,
                 namespace,
                 scope: Value::Null,
                 text,
@@ -713,6 +716,11 @@ impl CommandContext {
                 tags: get_string_array(filter, "tags").unwrap_or_default(),
                 source_filter: None,
                 metadata_filter: None,
+                include_superseded: false,
+                min_score: None,
+                created_after_ms: None,
+                created_before_ms: None,
+                touch: false,
                 limit,
                 min_visible_record_commit_seq: None,
             })

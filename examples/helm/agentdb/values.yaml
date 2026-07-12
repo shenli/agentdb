@@ -25,6 +25,14 @@ service:
   # REST (+ dashboard).
   restPort: 7878
 
+# The chart never places bearer credentials in a ConfigMap or generated
+# manifest. Create a Secret and name it here; the value must contain at least
+# 16 visible ASCII characters with no whitespace because the pod listens on a
+# non-loopback address.
+auth:
+  existingSecret: ""
+  tokenKey: api-token
+
 # Persistent storage: 10Gi for RocksDB runtime metadata and local artifact
 # content.
 persistence:

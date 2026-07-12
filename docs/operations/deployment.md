@@ -13,6 +13,8 @@ For start/stop, backup, restore, upgrade, and troubleshooting, see
 [cluster-status.md](cluster-status.md). For the intended future cluster model,
 see [cluster-deployment.md](cluster-deployment.md) and
 [cluster-operations.md](cluster-operations.md).
+Before exposing a persistent node, use
+[single-node-production-checklist.md](single-node-production-checklist.md).
 
 For human operations, prefer [agentdbctl](agentdbctl.md). Raw HTTP endpoints
 are the backend contract and are still useful for load balancers, integrations,
@@ -91,8 +93,16 @@ Containerized single-node deployment:
 
 ```bash
 docker build -t agentdb:local .
-docker run --rm -p 7878:7878 -v agentdb-data:/data agentdb:local
+docker run --rm \
+  -p 127.0.0.1:7878:7878 \
+  -e AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters' \
+  -v agentdb-data:/data \
+  agentdb:local
 ```
+
+The bearer token must contain at least 16 visible ASCII characters with no
+whitespace; generate it outside the repository and terminate TLS before remote
+traffic reaches the HTTP listener.
 
 Use this when you want:
 
@@ -107,8 +117,11 @@ cluster topology.
 
 ```bash
 cd examples/compose
+export AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters'
 docker compose up --build
 ```
+
+The Compose token follows the same 16-character visible-ASCII rule.
 
 Use it when you want to check:
 
@@ -178,16 +191,22 @@ Before exposing a maintained node:
 - use a config file instead of long CLI flag lists
 - run `agentdb doctor --config <path>`
 - verify operator readiness with `agentdbctl status`
-- keep `/health/ready` available for load balancers and uptime probes
+- configure an installation bearer token before any non-loopback bind and
+  terminate TLS at the network edge
+- use `/health/live` for process liveness and `/health/ready` for traffic gates
 - place runtime metadata and content on durable storage
 - decide whether content should stay local or move to object storage
 - define backup/restore procedure before production traffic
+- complete the
+  [single-node production checklist](single-node-production-checklist.md)
 - understand that Helm today is single-replica evaluation, not clustered HA
 
 ## Related Docs
 
 - [operations.md](operations.md) - start, stop, backup, restore, upgrade, and
   troubleshooting
+- [single-node-production-checklist.md](single-node-production-checklist.md) -
+  preflight gate before exposing a persistent node
 - [agentdbctl.md](agentdbctl.md) - recommended CLI for human and AI-agent
   operations
 - [cluster-status.md](cluster-status.md) - current multi-node status and

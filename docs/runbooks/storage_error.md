@@ -56,9 +56,11 @@ different root causes. Check the server log for the full backtrace.
 
 ## Remediate
 
-1. **Disk full.** Delete old local backups, grow the volume, or
-   move the data/content directories to a larger disk. The server resumes
-   accepting writes once disk space comes back.
+1. **Disk full.** Follow
+   [../operations/disk-full-recovery.md](../operations/disk-full-recovery.md):
+   delete or move only safe artifacts, grow the volume, or move the
+   data/content directories to a larger disk. The server resumes accepting
+   writes once disk space comes back.
 2. **Permission mismatch.** Stop the server, fix ownership/permissions on
    `storage.data_dir` and `storage.content_dir`, then restart.
 3. **Corruption.** Stop the server and snapshot the data/content directories

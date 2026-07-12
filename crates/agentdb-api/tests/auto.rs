@@ -1,4 +1,4 @@
-#![allow(dead_code, non_snake_case)]
+#![allow(clippy::duplicate_mod, dead_code, non_snake_case)]
 
 #[path = "auto/S10_routing_epoch_residency_and_readiness_reject_unsafe_cluster_states.rs"]
 mod s10_routing_epoch_residency_and_readiness_reject_unsafe_cluster_states;

@@ -1884,11 +1884,13 @@ mod tests {
         let mut guard = group.inner.lock().expect("raft-rs group lock poisoned");
         let node = guard.node_mut(1).unwrap();
         node.last_applied_index = 10;
-        let mut stale = Entry::default();
-        stale.index = 9;
-        stale.term = 1;
-        stale.entry_type = EntryType::EntryNormal as i32;
-        stale.data = b"stale-entry".to_vec().into();
+        let stale = Entry {
+            index: 9,
+            term: 1,
+            entry_type: EntryType::EntryNormal as i32,
+            data: b"stale-entry".to_vec(),
+            ..Entry::default()
+        };
 
         node.apply_committed(vec![stale], 7).unwrap();
 

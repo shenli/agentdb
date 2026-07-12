@@ -1,6 +1,6 @@
 use agentdb_core::artifact::NewArtifact;
 use agentdb_core::errors::ErrorCode;
-use agentdb_core::policy::{Priority, RuntimePolicy};
+use agentdb_core::policy::{Priority, RuntimePolicy, ABSOLUTE_MAX_ARTIFACT_BYTES};
 use agentdb_core::record::{IndexingPolicy, NewRecord};
 use agentdb_core::runtime::{AppendRequest, Runtime};
 use agentdb_core::{BindSkillRequest, NewAgent, NewSession, NewSkill, NewTenant};
@@ -595,4 +595,18 @@ async fn append_and_fetch_enforces_and_applies_context_byte_budget() {
         .await
         .unwrap();
     assert!(response.recent.is_empty());
+}
+
+#[test]
+fn artifact_policy_cannot_exceed_the_http_runtime_ceiling() {
+    let policy = RuntimePolicy::from_json(&serde_json::json!({
+        "artifact_size": {
+            "max_inline_event_bytes": 65_536,
+            "max_artifact_bytes": ABSOLUTE_MAX_ARTIFACT_BYTES + 1
+        }
+    }));
+    assert_eq!(
+        policy.artifact_size.max_artifact_bytes,
+        ABSOLUTE_MAX_ARTIFACT_BYTES
+    );
 }

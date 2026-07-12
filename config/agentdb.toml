@@ -11,9 +11,21 @@ mode = "single_node" # or "cluster"
 bind = "127.0.0.1:7878"
 # dev = true uses ephemeral in-memory state.
 dev = false
+# A non-loopback HTTP bind requires a bearer token. Prefer setting
+# AGENTDB_API_AUTH_TOKEN instead of committing the current token. During a
+# rotation, set AGENTDB_API_AUTH_PREVIOUS_TOKEN temporarily; remove it after
+# every client has switched. Both values must be at least 16 visible ASCII
+# characters with no whitespace; the previous token requires a current token
+# and must differ from it.
+# api_auth_token = "change-me-min-16-chars"
+# api_auth_previous_token = "old-token-min-16-chars"
 # Required for cluster mode internal Raft RPCs. Prefer setting
 # AGENTDB_INTERNAL_AUTH_TOKEN in production instead of committing a secret.
+# Current and previous internal tokens follow the same 16-character, visible
+# ASCII, no-whitespace rule; a previous token is ignored only after it is
+# removed, never when the current token is absent.
 # internal_auth_token = "change-me-min-16-chars"
+# internal_auth_previous_token = "old-token-min-16-chars"
 
 [mongodb]
 # Optional MongoDB wire-protocol compatibility listener.

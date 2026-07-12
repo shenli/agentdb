@@ -78,6 +78,7 @@ impl IdempotencyStore {
 /// The implementation builds a canonical JSON object and hashes its string
 /// form. JSON object key order is fixed by the literal here, so identical
 /// inputs produce identical hashes.
+#[allow(clippy::too_many_arguments)]
 pub fn hash_request(
     tenant_id: &Id,
     agent_id: &Id,
@@ -99,7 +100,7 @@ pub fn hash_request(
         "source_refs": source_refs,
         "credential_refs": credential_refs,
     });
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = siphasher::sip::SipHasher13::new();
     serde_json::to_string(&canon).unwrap().hash(&mut h);
     h.finish()
 }
@@ -109,7 +110,26 @@ pub fn hash_request(
 /// the mutation result.
 pub fn hash_json(value: &serde_json::Value) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = siphasher::sip::SipHasher13::new();
     serde_json::to_string(value).unwrap().hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_hash_algorithm_is_pinned_to_legacy_default_hasher_values() {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = siphasher::sip::SipHasher13::new();
+        "hello".hash(&mut hasher);
+        assert_eq!(hasher.finish(), 16_156_531_084_128_653_017);
+
+        assert_eq!(
+            hash_json(&serde_json::json!({"a": 1})),
+            14_886_008_067_637_593_304
+        );
+    }
 }

@@ -151,34 +151,11 @@ impl KvStore for RocksKvStore {
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<KvIter> {
-        // Eagerly collect so the returned iterator is 'static w.r.t. lifetimes:
-        // RocksDB's DBIterator borrows from &DB and cannot be returned as a
-        // Box<dyn Iterator + 'static>. Stop on the first error (do not continue
-        // past it) so callers don't silently skip a corrupt read.
-        let prefix_vec = prefix.to_vec();
-        let iter = self
-            .db
-            .iterator(IteratorMode::From(&prefix_vec, Direction::Forward));
-        let mut results: Vec<Result<(Vec<u8>, Vec<u8>)>> = Vec::new();
-        for res in iter {
-            match res {
-                Ok((k, v)) => {
-                    if !k.starts_with(&prefix_vec) {
-                        break;
-                    }
-                    results.push(Ok((k.to_vec(), v.to_vec())));
-                }
-                Err(e) => {
-                    results.push(Err(Error::from(e)));
-                    break;
-                }
-            }
-        }
-        Ok(Box::new(results.into_iter()))
+        stream_prefix_from(self.db.clone(), prefix, prefix)
     }
 
     fn scan_prefix_from(&self, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
-        collect_prefix_from(&self.db, prefix, start)
+        stream_prefix_from(self.db.clone(), prefix, start)
     }
 
     fn write_batch(&self, ops: Vec<WriteOp>) -> Result<()> {
@@ -370,26 +347,32 @@ impl KvSnapshot for OwnedRocksSnapshotHandle {
     }
 }
 
-fn collect_prefix_from(db: &DB, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
+fn stream_prefix_from(db: Arc<DB>, prefix: &[u8], start: &[u8]) -> Result<KvIter> {
     let prefix_vec = prefix.to_vec();
     let start_vec = start.to_vec();
-    let iter = db.iterator(IteratorMode::From(&start_vec, Direction::Forward));
-    let mut out: Vec<KvResult> = Vec::new();
-    for res in iter {
-        match res {
-            Ok((k, v)) => {
-                if !k.starts_with(&prefix_vec) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<KvResult>(32);
+    std::thread::Builder::new()
+        .name("agentdb-rocks-scan".into())
+        .spawn(move || {
+            let iter = db.iterator(IteratorMode::From(&start_vec, Direction::Forward));
+            for result in iter {
+                let item = match result {
+                    Ok((key, value)) => {
+                        if !key.starts_with(&prefix_vec) {
+                            break;
+                        }
+                        Ok((key.to_vec(), value.to_vec()))
+                    }
+                    Err(error) => Err(Error::from(error)),
+                };
+                let failed = item.is_err();
+                if sender.send(item).is_err() || failed {
                     break;
                 }
-                out.push(Ok((k.to_vec(), v.to_vec())));
             }
-            Err(e) => {
-                out.push(Err(Error::from(e)));
-                break;
-            }
-        }
-    }
-    Ok(Box::new(out.into_iter()))
+        })
+        .map_err(|error| Error::Other(format!("spawn RocksDB prefix scan: {error}")))?;
+    Ok(Box::new(receiver.into_iter()))
 }
 
 fn collect_snapshot_prefix_from(

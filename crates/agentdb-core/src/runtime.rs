@@ -342,15 +342,6 @@ fn env_flag_disabled_runtime(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_flag_enabled_runtime(name: &str) -> bool {
-    std::env::var(name)
-        .map(|raw| {
-            let raw = raw.trim().to_ascii_lowercase();
-            matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
-        })
-        .unwrap_or(false)
-}
-
 #[derive(Debug, Clone)]
 pub struct AppendRequest {
     pub tenant_id: Id,
@@ -698,7 +689,7 @@ pub struct ClaimExportConsumerRequest {
 pub struct AckExportConsumerRequest {
     pub tenant_id: Id,
     pub consumer_name: String,
-    pub cursor: String,
+    pub cursor: Option<String>,
     pub snapshot_high_watermark: Option<String>,
     pub lease_owner: Option<String>,
 }
@@ -749,6 +740,42 @@ pub struct GcSweepReport {
     pub work_units: usize,
     pub soft_work_limit_exceeded: bool,
     pub hard_work_limit_hit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactLifecycleIssue {
+    pub artifact_id: Id,
+    pub issue: String,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactLifecycleVerificationReport {
+    pub tenant_id: Option<Id>,
+    pub artifacts_checked: usize,
+    pub raw_present: usize,
+    pub raw_purged: usize,
+    pub missing_raw: usize,
+    pub hash_mismatch: usize,
+    pub unexpected_raw_after_purge: usize,
+    pub read_errors: usize,
+    pub issues: Vec<ArtifactLifecycleIssue>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactContentReconciliationReport {
+    pub listing_supported: bool,
+    pub objects_scanned: usize,
+    pub referenced_objects: usize,
+    pub orphan_objects_deleted: usize,
+    pub temporary_objects_deleted: usize,
+    pub delete_errors: usize,
+}
+
+impl ArtifactLifecycleVerificationReport {
+    pub fn ok(&self) -> bool {
+        self.issues.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1192,7 +1219,6 @@ fn sanitize_secret_token(token: &str) -> String {
     if let Some((idx, sep)) = token
         .char_indices()
         .find(|(_, ch)| *ch == '=' || *ch == ':')
-        .map(|(idx, ch)| (idx, ch))
     {
         let key = &token[..idx];
         let value_start = idx + sep.len_utf8();
@@ -1877,6 +1903,136 @@ struct RuntimeHydration {
     text_index: InMemoryInverted,
     vector_index: HnswVectorIndex,
     global_record_index: Arc<dyn GlobalRecordIndex>,
+}
+
+fn startup_hydration_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn startup_hydration_max_bytes() -> u64 {
+    std::env::var("AGENTDB_STARTUP_MAX_HYDRATED_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(512 * 1024 * 1024)
+}
+
+fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 17] {
+    [
+        (
+            "tenants",
+            b"record/tenant/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_TENANTS", 10_000),
+        ),
+        (
+            "tenant aliases",
+            b"record/tenant_alias/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_TENANTS", 10_000),
+        ),
+        (
+            "agents",
+            b"record/agent/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_AGENTS", 100_000),
+        ),
+        (
+            "agent aliases",
+            b"record/agent_alias/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_AGENTS", 100_000),
+        ),
+        (
+            "sessions",
+            b"record/session/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_SESSIONS", 250_000),
+        ),
+        (
+            "session aliases",
+            b"record/session_alias/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_SESSIONS", 250_000),
+        ),
+        (
+            "artifacts",
+            b"record/artifact/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_ARTIFACTS", 250_000),
+        ),
+        (
+            "records",
+            b"record/searchable/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORDS", 100_000),
+        ),
+        (
+            "record index outbox",
+            b"record/searchable_index_outbox/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORDS", 100_000),
+        ),
+        (
+            "record index commits",
+            b"record/searchable_commit/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORDS", 100_000),
+        ),
+        (
+            "record edges",
+            b"record/searchable_edge/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_RECORD_EDGES", 500_000),
+        ),
+        (
+            "skills",
+            b"record/skill/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILLS", 100_000),
+        ),
+        (
+            "unique skill keys",
+            b"record/skill_unique/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILLS", 100_000),
+        ),
+        (
+            "skill bindings",
+            b"record/agent_skill/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_SKILL_BINDINGS", 500_000),
+        ),
+        (
+            "managed export consumers",
+            b"record/export_consumer/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_EXPORT_CONSUMERS", 10_000),
+        ),
+        (
+            "tenant metadata",
+            b"record/tenant_meta/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_TENANT_META", 500_000),
+        ),
+        (
+            "idempotency records",
+            b"record/idempotency/".as_slice(),
+            startup_hydration_limit("AGENTDB_STARTUP_MAX_IDEMPOTENCY", 1_000_000),
+        ),
+    ]
+}
+
+fn enforce_startup_hydration_limits(persist: &Persist) -> agentdb_storage::Result<()> {
+    let max_bytes = startup_hydration_max_bytes();
+    let mut total_rows = 0_usize;
+    let mut total_bytes = 0_u64;
+    for (label, prefix, max_rows) in startup_hydration_categories() {
+        let remaining_bytes = max_bytes.saturating_sub(total_bytes);
+        let (rows, bytes) = persist.ensure_hydration_prefix_within_limits(
+            label,
+            prefix,
+            max_rows,
+            remaining_bytes,
+        )?;
+        total_rows = total_rows.saturating_add(rows);
+        total_bytes = total_bytes.saturating_add(bytes);
+    }
+    tracing::info!(
+        total_rows,
+        total_bytes,
+        max_bytes,
+        "startup hydration preflight passed"
+    );
+    Ok(())
 }
 
 fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
@@ -2805,6 +2961,7 @@ impl Runtime {
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
     ) -> Arc<Self> {
+        enforce_startup_hydration_limits(&persist).expect("startup hydration limits");
         let hydration = hydrate_runtime_from_persist(&persist);
         let idem = IdempotencyStore::default();
         idem.extend(hydration.idempotency_records);
@@ -2949,15 +3106,96 @@ impl Runtime {
         Ok(true)
     }
 
+    fn validate_tablet_snapshot_hydration_limits(
+        &self,
+        tablet_id: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        let snapshot: TabletStateSnapshot = serde_json::from_slice(payload).map_err(|error| {
+            Error::new(
+                ErrorCode::Internal,
+                format!("decode tablet {tablet_id} runtime snapshot: {error}"),
+            )
+        })?;
+        if snapshot.tablet_id != tablet_id {
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!(
+                    "snapshot tablet_id {} does not match target tablet_id {tablet_id}",
+                    snapshot.tablet_id
+                ),
+            ));
+        }
+
+        let max_bytes = startup_hydration_max_bytes();
+        let mut prospective_total_bytes = 0_u64;
+        for (label, prefix, max_rows) in startup_hydration_categories() {
+            let (current_rows, current_bytes) = persist
+                .ensure_hydration_prefix_within_limits(label, prefix, usize::MAX, u64::MAX)
+                .map_err(internal)?;
+            let mut added_rows = 0_usize;
+            let mut added_bytes = 0_u64;
+            for entry in snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.key.starts_with(prefix))
+            {
+                let new_bytes = u64::try_from(entry.key.len().saturating_add(entry.value.len()))
+                    .unwrap_or(u64::MAX);
+                match persist.kv.get(&entry.key).map_err(internal)? {
+                    Some(current_value) => {
+                        let current_entry_bytes =
+                            u64::try_from(entry.key.len().saturating_add(current_value.len()))
+                                .unwrap_or(u64::MAX);
+                        added_bytes = added_bytes
+                            .saturating_add(new_bytes.saturating_sub(current_entry_bytes));
+                    }
+                    None => {
+                        added_rows = added_rows.saturating_add(1);
+                        added_bytes = added_bytes.saturating_add(new_bytes);
+                    }
+                }
+            }
+            let prospective_rows = current_rows.saturating_add(added_rows);
+            if prospective_rows > max_rows {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "tablet snapshot would exceed startup hydration limit for {label}: {prospective_rows} rows > {max_rows}; raise the matching AGENTDB_STARTUP_MAX_* setting only after sizing memory"
+                    ),
+                ));
+            }
+            prospective_total_bytes = prospective_total_bytes
+                .saturating_add(current_bytes)
+                .saturating_add(added_bytes);
+            if prospective_total_bytes > max_bytes {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "tablet snapshot would exceed AGENTDB_STARTUP_MAX_HYDRATED_BYTES: {prospective_total_bytes} key/value bytes > {max_bytes}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn install_tablet_snapshot_payload_and_rehydrate(
         &self,
         tablet_id: i64,
         payload: &[u8],
     ) -> Result<bool> {
+        if self.tablet_router.is_none() {
+            return Ok(false);
+        }
+        self.validate_tablet_snapshot_hydration_limits(tablet_id, payload)?;
         if !self.install_tablet_snapshot_payload(tablet_id, payload)? {
             return Ok(false);
         }
-        self.rehydrate_from_persist().await?;
+        self.rehydrate_from_persist(false).await?;
         Ok(true)
     }
 
@@ -2966,10 +3204,14 @@ impl Runtime {
         tablet_id: i64,
         payload: &[u8],
     ) -> Result<bool> {
+        if self.tablet_router.is_none() {
+            return Ok(false);
+        }
+        self.validate_tablet_snapshot_hydration_limits(tablet_id, payload)?;
         if !self.install_tablet_snapshot_payload_merge(tablet_id, payload)? {
             return Ok(false);
         }
-        self.rehydrate_from_persist().await?;
+        self.rehydrate_from_persist(false).await?;
         Ok(true)
     }
 
@@ -3077,10 +3319,13 @@ impl Runtime {
             .map_err(internal)
     }
 
-    async fn rehydrate_from_persist(&self) -> Result<()> {
+    async fn rehydrate_from_persist(&self, enforce_startup_limits: bool) -> Result<()> {
         let Some(persist) = self.persist.as_ref() else {
             return Ok(());
         };
+        if enforce_startup_limits {
+            enforce_startup_hydration_limits(persist).map_err(internal)?;
+        }
         let hydration = hydrate_runtime_from_persist(persist);
         self.idem.replace(hydration.idempotency_records);
         {
@@ -3120,7 +3365,11 @@ impl Runtime {
             .unwrap_or(0)
             > 0
         {
-            self.rehydrate_from_persist().await?;
+            // Replicated refresh already performs a full rehydrate. Running a
+            // second full-prefix startup preflight after every committed apply
+            // would double that O(N) cost; startup/snapshot paths enforce the
+            // explicit caps, while normal applies propagate rehydrate errors.
+            self.rehydrate_from_persist(false).await?;
         }
         Ok(())
     }
@@ -3902,10 +4151,9 @@ impl Runtime {
                     ));
                 }
             }
-            if !s
-                .tenants
+            if s.tenants
                 .get(req.tenant_id.as_str())
-                .is_some_and(|t| t.deleted_at_ms.is_none())
+                .is_none_or(|tenant| tenant.deleted_at_ms.is_some())
             {
                 return Err(Error::new(
                     ErrorCode::TenantNotFound,
@@ -4986,11 +5234,9 @@ impl Runtime {
     /// On success the bytes are durable (or in-memory equivalent) and the
     /// metadata is committed atomically with the secondary `by_sha256` index.
     ///
-    /// Atomicity caveat: the content write and the metadata write are
-    /// **separate** persistence steps. If the metadata write fails after the
-    /// content write succeeds we have an orphan blob; V2.4 GC will reap it
-    /// (TODO: link the reaper plan once it lands). This task accepts the
-    /// orphan window in exchange for a simpler V2.1 surface.
+    /// The content write and metadata write are separate persistence steps.
+    /// A metadata error triggers immediate content cleanup; a process crash in
+    /// the narrow interval is repaired by startup orphan reconciliation.
     pub async fn create_artifact(&self, req: NewArtifact, bytes: Vec<u8>) -> Result<Artifact> {
         let policy = self.resolve_policy_for_tenant(&req.tenant_id).await?;
         // Reject oversized blobs before touching the content backend so a
@@ -5010,10 +5256,9 @@ impl Runtime {
         // up the tenant; the content I/O happens after we drop it.
         {
             let s = self.state.lock().await;
-            if !s
-                .tenants
+            if s.tenants
                 .get(req.tenant_id.as_str())
-                .is_some_and(|t| t.deleted_at_ms.is_none())
+                .is_none_or(|tenant| tenant.deleted_at_ms.is_some())
             {
                 return Err(Error::new(
                     ErrorCode::TenantNotFound,
@@ -5092,11 +5337,28 @@ impl Runtime {
             .encrypt(&crypto_context, &bytes)
             .map_err(|e| Error::new(ErrorCode::Internal, format!("content encrypt failed: {e}")))?;
         let stored_bytes = encode_keyed_envelope(&content_key, &encrypted_bytes);
-        let _put = self
+        if let Err(error) = self
             .content
             .put(req.tenant_id.as_str(), artifact_id.as_str(), &stored_bytes)
             .await
-            .map_err(|e| Error::new(ErrorCode::Internal, format!("content put failed: {e}")))?;
+        {
+            if let Err(cleanup_error) = self
+                .content
+                .delete(req.tenant_id.as_str(), artifact_id.as_str())
+                .await
+            {
+                tracing::error!(
+                    ?cleanup_error,
+                    tenant_id = %req.tenant_id,
+                    artifact_id = %artifact_id,
+                    "failed to clean up partial artifact content write"
+                );
+            }
+            return Err(Error::new(
+                ErrorCode::Internal,
+                format!("content put failed: {error}"),
+            ));
+        }
 
         // Build the record with the freshly-minted id rather than relying on
         // Artifact::from_put to mint one (it would mint a different id from
@@ -5116,15 +5378,101 @@ impl Runtime {
             raw_purged_at_ms: None,
         };
 
-        // Persist metadata, then update the in-memory cache. If persist
-        // fails the bytes are an orphan (see atomicity caveat above).
+        // Serialize the metadata commit and cache publication under the state
+        // lock. Export snapshots capture their durable high-watermark before
+        // reading this cache; without this lock boundary they could observe
+        // the new ledger cursor but miss the corresponding artifact snapshot.
+        let mut state = self.state.lock().await;
         if let Some(p) = &self.persist {
-            p.put_artifact_async(&artifact).await.map_err(internal)?;
+            if let Err(error) = p.put_artifact_async(&artifact).await {
+                drop(state);
+                if let Err(cleanup_error) = self
+                    .content
+                    .delete(artifact.tenant_id.as_str(), artifact.artifact_id.as_str())
+                    .await
+                {
+                    tracing::error!(
+                        ?cleanup_error,
+                        tenant_id = %artifact.tenant_id,
+                        artifact_id = %artifact.artifact_id,
+                        "failed to clean up artifact content after metadata write error"
+                    );
+                }
+                return Err(internal(error));
+            }
         }
-        let mut s = self.state.lock().await;
-        s.artifacts
+        state
+            .artifacts
             .insert(artifact.artifact_id.as_str().to_string(), artifact.clone());
         Ok(artifact)
+    }
+
+    /// Remove content blobs that have no metadata record still retaining raw
+    /// content (soft-deleted artifacts remain referenced until GC/purge).
+    /// Call this during single-node startup before accepting writes; running it
+    /// concurrently with artifact creation can observe the intentional
+    /// content-before-metadata commit interval.
+    pub async fn reconcile_orphan_artifact_content(
+        &self,
+    ) -> Result<ArtifactContentReconciliationReport> {
+        let max_objects = startup_hydration_limit("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000);
+        let listing = match self.content.list_objects(max_objects).await {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                return Ok(ArtifactContentReconciliationReport::default())
+            }
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!("content object listing failed: {error}"),
+                ))
+            }
+        };
+        let referenced = {
+            let state = self.state.lock().await;
+            state
+                .artifacts
+                .values()
+                .filter(|artifact| artifact.raw_purged_at_ms.is_none())
+                .map(|artifact| {
+                    (
+                        artifact.tenant_id.as_str().to_string(),
+                        artifact.artifact_id.as_str().to_string(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let mut report = ArtifactContentReconciliationReport {
+            listing_supported: true,
+            temporary_objects_deleted: listing.temporary_objects_deleted,
+            ..Default::default()
+        };
+        for object in listing.objects {
+            report.objects_scanned = report.objects_scanned.saturating_add(1);
+            if referenced.contains(&(object.tenant_id.clone(), object.artifact_id.clone())) {
+                report.referenced_objects = report.referenced_objects.saturating_add(1);
+                continue;
+            }
+            match self
+                .content
+                .delete(&object.tenant_id, &object.artifact_id)
+                .await
+            {
+                Ok(()) => {
+                    report.orphan_objects_deleted = report.orphan_objects_deleted.saturating_add(1);
+                }
+                Err(error) => {
+                    report.delete_errors = report.delete_errors.saturating_add(1);
+                    tracing::error!(
+                        ?error,
+                        tenant_id = %object.tenant_id,
+                        artifact_id = %object.artifact_id,
+                        "failed to delete orphan artifact content"
+                    );
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Look up artifact metadata, scoped to `tenant_id`. Returns
@@ -5226,6 +5574,83 @@ impl Runtime {
             ));
         }
         Ok(plaintext)
+    }
+
+    pub async fn verify_artifact_lifecycle_for_tenant(
+        &self,
+        tenant_id: &Id,
+    ) -> Result<ArtifactLifecycleVerificationReport> {
+        let artifacts = self.list_artifacts(tenant_id).await?;
+        let mut report = ArtifactLifecycleVerificationReport {
+            tenant_id: Some(tenant_id.clone()),
+            ..Default::default()
+        };
+
+        for artifact in artifacts {
+            report.artifacts_checked += 1;
+            if artifact.raw_purged_at_ms.is_some() {
+                match self
+                    .content
+                    .head(tenant_id.as_str(), artifact.artifact_id.as_str())
+                    .await
+                {
+                    Ok(false) => report.raw_purged += 1,
+                    Ok(true) => {
+                        report.unexpected_raw_after_purge += 1;
+                        report.issues.push(ArtifactLifecycleIssue {
+                            artifact_id: artifact.artifact_id.clone(),
+                            issue: "unexpected_raw_after_purge".into(),
+                            message:
+                                "artifact metadata is derivative-only but raw content still exists"
+                                    .into(),
+                        });
+                    }
+                    Err(error) => {
+                        report.read_errors += 1;
+                        report.issues.push(ArtifactLifecycleIssue {
+                            artifact_id: artifact.artifact_id.clone(),
+                            issue: "content_head_error".into(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            match self
+                .get_artifact_blob(tenant_id, &artifact.artifact_id)
+                .await
+            {
+                Ok(_) => report.raw_present += 1,
+                Err(error) if error.code == ErrorCode::ArtifactNotFound => {
+                    report.missing_raw += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "missing_raw".into(),
+                        message: "artifact metadata expects raw content but content is missing"
+                            .into(),
+                    });
+                }
+                Err(error) if error.code == ErrorCode::HashMismatch => {
+                    report.hash_mismatch += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "hash_mismatch".into(),
+                        message: error.message,
+                    });
+                }
+                Err(error) => {
+                    report.read_errors += 1;
+                    report.issues.push(ArtifactLifecycleIssue {
+                        artifact_id: artifact.artifact_id.clone(),
+                        issue: "content_read_error".into(),
+                        message: error.message,
+                    });
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     pub async fn delete_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<()> {
@@ -6144,6 +6569,7 @@ impl Runtime {
             && req.idempotency_key.is_none()
             && req.artifact_refs.is_empty()
             && req.source_refs.is_empty()
+            && req.credential_refs.is_empty()
             && req.kind != "skill_used"
             && !env_flag_disabled_runtime("AGENTDB_SESSION_APPEND_COALESCE")
     }
@@ -6192,13 +6618,7 @@ impl Runtime {
         let wait_us = std::env::var("AGENTDB_SESSION_APPEND_BATCH_WAIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or_else(|| {
-                if env_flag_enabled_runtime("AGENTDB_ROCKSDB_SYNC_WRITES") {
-                    0
-                } else {
-                    0
-                }
-            });
+            .unwrap_or(0);
         loop {
             let mut jobs = Vec::new();
             {
@@ -6342,7 +6762,7 @@ impl Runtime {
             .collect::<Vec<_>>();
         coalesce_sample.events = event_refs.len();
         let session_checkpoint = persist_session_checkpoint
-            .then(|| final_session_snapshot.as_ref())
+            .then_some(final_session_snapshot.as_ref())
             .flatten();
         if let Some(p) = &self.persist {
             let durable_write_started = coalesce_profile.map(|_| Instant::now());
@@ -6432,6 +6852,7 @@ impl Runtime {
         }
     }
 
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn prepare_simple_append_under_state(
         &self,
         s: &State,
@@ -6544,7 +6965,7 @@ impl Runtime {
                 key
             }
         };
-        let prior_lifecycle = snapshot.lifecycle.clone();
+        let prior_lifecycle = snapshot.lifecycle;
         let prior_policy_version = snapshot.policy_version;
         if snapshot.lifecycle != Lifecycle::Warm {
             snapshot.lifecycle = Lifecycle::Warm;
@@ -6864,7 +7285,7 @@ impl Runtime {
                 .sessions
                 .get(req.session_id.as_str())
                 .expect("session presence checked above");
-            let prior_lifecycle = session.lifecycle.clone();
+            let prior_lifecycle = session.lifecycle;
             let prior_policy_version = session.policy_version;
             let mut snapshot = session.clone();
             if snapshot.lifecycle != Lifecycle::Warm {
@@ -7364,6 +7785,17 @@ impl Runtime {
     }
 
     pub async fn export_watch(&self, req: ExportWatchRequest) -> Result<Vec<ExportFeedItem>> {
+        self.export_watch_through(req, None).await
+    }
+
+    /// Read an export page no later than a captured tenant high-watermark.
+    /// The optional boundary is distinct from `from_cursor`: callers resume
+    /// after `from_cursor` but must not observe commits after `through_cursor`.
+    pub async fn export_watch_through(
+        &self,
+        req: ExportWatchRequest,
+        through_cursor: Option<&str>,
+    ) -> Result<Vec<ExportFeedItem>> {
         validate_export_include(&req.include)?;
         if req.limit == 0 {
             return Ok(Vec::new());
@@ -7389,60 +7821,78 @@ impl Runtime {
                 }
             }
             self.validate_persistent_export_cursor(&req).await?;
+            if let Some(through_cursor) = through_cursor {
+                let boundary_request = ExportWatchRequest {
+                    tenant_id: req.tenant_id.clone(),
+                    scope: WatchScope::Tenant,
+                    session_id: None,
+                    agent_id: None,
+                    include: Vec::new(),
+                    from_cursor: Some(through_cursor.to_string()),
+                    limit: 1,
+                };
+                self.validate_persistent_export_cursor(&boundary_request)
+                    .await?;
+            }
             let mut out = Vec::new();
             let cursor_context = self.changefeed_cursor_context()?;
-            let ledger_items = match req.scope {
-                WatchScope::Tenant => persist.scan_export_ledger_items(
+            let agent_id = (req.scope == WatchScope::Agent).then(|| {
+                req.agent_id
+                    .as_ref()
+                    .expect("validated export agent scope has agent_id")
+                    .as_str()
+            });
+            let session_id = (req.scope == WatchScope::Session).then(|| {
+                req.session_id
+                    .as_ref()
+                    .expect("validated export session scope has session_id")
+                    .as_str()
+            });
+            persist
+                .visit_export_ledger_items(
                     req.tenant_id.as_str(),
+                    agent_id,
+                    session_id,
                     req.from_cursor.as_deref(),
-                    usize::MAX,
-                ),
-                WatchScope::Agent => persist.scan_export_ledger_agent_items(
-                    req.tenant_id.as_str(),
-                    req.agent_id
-                        .as_ref()
-                        .expect("validated export agent scope has agent_id")
-                        .as_str(),
-                    req.from_cursor.as_deref(),
-                    usize::MAX,
-                ),
-                WatchScope::Session => persist.scan_export_ledger_session_items(
-                    req.tenant_id.as_str(),
-                    req.session_id
-                        .as_ref()
-                        .expect("validated export session scope has session_id")
-                        .as_str(),
-                    req.from_cursor.as_deref(),
-                    usize::MAX,
-                ),
-            }
-            .map_err(internal)?;
-            for (cursor, item) in ledger_items {
-                if !export_item_matches_scope(
-                    &item,
-                    req.scope,
-                    req.agent_id.as_ref(),
-                    req.session_id.as_ref(),
-                ) || !export_item_matches_include(&item, &req.include)
-                {
-                    continue;
-                }
-                out.push(ExportFeedItem {
-                    cursor,
-                    cell_id: cursor_context.cell_id.clone(),
-                    placement_scope_id: cursor_context.placement_scope_id.clone(),
-                    tablet_id: cursor_context.tablet_id,
-                    tablet_epoch: cursor_context.tablet_epoch,
-                    applied_index: cursor_context.applied_index,
-                    item,
-                });
-                if out.len() >= req.limit {
-                    break;
-                }
-            }
+                    |cursor, item| {
+                        if through_cursor.is_some_and(|boundary| cursor.as_str() > boundary) {
+                            return true;
+                        }
+                        if !export_item_matches_scope(
+                            &item,
+                            req.scope,
+                            req.agent_id.as_ref(),
+                            req.session_id.as_ref(),
+                        ) || !export_item_matches_include(&item, &req.include)
+                        {
+                            return false;
+                        }
+                        out.push(ExportFeedItem {
+                            cursor,
+                            cell_id: cursor_context.cell_id.clone(),
+                            placement_scope_id: cursor_context.placement_scope_id.clone(),
+                            tablet_id: cursor_context.tablet_id,
+                            tablet_epoch: cursor_context.tablet_epoch,
+                            applied_index: cursor_context.applied_index,
+                            item,
+                        });
+                        out.len() >= req.limit
+                    },
+                )
+                .map_err(internal)?;
             return Ok(out);
         }
 
+        let through_frontier = through_cursor
+            .map(|cursor| {
+                parse_watch_frontier_cursor(cursor).ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::InvalidCursor,
+                        "in-memory export high watermark must use the frontier:v1 format",
+                    )
+                })
+            })
+            .transpose()?;
         {
             let s = self.state.lock().await;
             validate_export_consumer_scope_in_state(
@@ -7472,6 +7922,12 @@ impl Runtime {
                 break;
             }
             for item in items {
+                if through_frontier
+                    .as_ref()
+                    .is_some_and(|frontier| !watch_item_delivered_by_frontier(&item, frontier))
+                {
+                    return Ok(out);
+                }
                 from_cursor = Some(item.cursor.clone());
                 let ledger_item = if let Some(event) = item.event {
                     export_ledger_item_from_event(event)
@@ -7540,6 +7996,19 @@ impl Runtime {
                     ),
                 ));
             }
+        }
+        let exists = self
+            .persist
+            .as_ref()
+            .expect("persistent cursor validation requires persistence")
+            .get_export_ledger_item(req.tenant_id.as_str(), cursor)
+            .map_err(internal)?
+            .is_some();
+        if !exists {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export cursor does not identify a retained ledger item",
+            ));
         }
         Ok(())
     }
@@ -7648,24 +8117,73 @@ impl Runtime {
         consumer: ExportConsumer,
     ) -> Result<ExportConsumerStatus> {
         let now_ms = crate::now_ms();
-        let items = self
-            .export_watch(ExportWatchRequest {
-                tenant_id: consumer.tenant_id.clone(),
-                scope: consumer.scope,
-                session_id: consumer.session_id.clone(),
-                agent_id: consumer.agent_id.clone(),
-                include: consumer.include.clone(),
-                from_cursor: consumer.last_acked_cursor.clone(),
-                limit: usize::MAX,
-            })
-            .await?;
-        let high_watermark = items.last().map(|item| item.cursor.clone()).or_else(|| {
+        let request = ExportWatchRequest {
+            tenant_id: consumer.tenant_id.clone(),
+            scope: consumer.scope,
+            session_id: consumer.session_id.clone(),
+            agent_id: consumer.agent_id.clone(),
+            include: consumer.include.clone(),
+            from_cursor: consumer.last_acked_cursor.clone(),
+            limit: usize::MAX,
+        };
+        let (high_watermark, pending_items, pending_oldest_created_at_ms) =
+            if let Some(persist) = &self.persist {
+                self.validate_persistent_export_cursor(&request).await?;
+                let mut high_watermark = None;
+                let mut pending_items = 0_usize;
+                let mut pending_oldest_created_at_ms = None;
+                let agent_id = (consumer.scope == WatchScope::Agent).then(|| {
+                    consumer
+                        .agent_id
+                        .as_ref()
+                        .expect("validated agent scope")
+                        .as_str()
+                });
+                let session_id = (consumer.scope == WatchScope::Session).then(|| {
+                    consumer
+                        .session_id
+                        .as_ref()
+                        .expect("validated session scope")
+                        .as_str()
+                });
+                persist
+                    .visit_export_ledger_items(
+                        consumer.tenant_id.as_str(),
+                        agent_id,
+                        session_id,
+                        consumer.last_acked_cursor.as_deref(),
+                        |cursor, item| {
+                            if !export_item_matches_scope(
+                                &item,
+                                consumer.scope,
+                                consumer.agent_id.as_ref(),
+                                consumer.session_id.as_ref(),
+                            ) || !export_item_matches_include(&item, &consumer.include)
+                            {
+                                return false;
+                            }
+                            pending_items = pending_items.saturating_add(1);
+                            pending_oldest_created_at_ms.get_or_insert(item.created_at_ms);
+                            high_watermark = Some(cursor);
+                            false
+                        },
+                    )
+                    .map_err(internal)?;
+                (high_watermark, pending_items, pending_oldest_created_at_ms)
+            } else {
+                let items = self.export_watch(request).await?;
+                (
+                    items.last().map(|item| item.cursor.clone()),
+                    items.len(),
+                    items.first().map(|item| item.item.created_at_ms),
+                )
+            };
+        let high_watermark = high_watermark.or_else(|| {
             consumer
                 .last_acked_cursor
                 .clone()
                 .or_else(|| consumer.snapshot_high_watermark.clone())
         });
-        let pending_oldest_created_at_ms = items.first().map(|item| item.item.created_at_ms);
         let lag_ms = pending_oldest_created_at_ms.map(|created| now_ms.saturating_sub(created));
         let lease_active = consumer
             .lease_expires_at_ms
@@ -7673,7 +8191,7 @@ impl Runtime {
         Ok(ExportConsumerStatus {
             consumer,
             high_watermark,
-            pending_items: items.len(),
+            pending_items,
             pending_oldest_created_at_ms,
             lag_ms,
             lease_active,
@@ -7743,10 +8261,14 @@ impl Runtime {
         req: AckExportConsumerRequest,
     ) -> Result<ExportConsumer> {
         validate_consumer_name(&req.consumer_name)?;
-        if req.cursor.trim().is_empty() {
+        if req
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.trim().is_empty())
+        {
             return Err(Error::new(
                 ErrorCode::InvalidCursor,
-                "export consumer ack cursor is required",
+                "export consumer ack cursor must not be empty",
             ));
         }
         let mut consumer = self
@@ -7756,15 +8278,74 @@ impl Runtime {
                 req.lease_owner.as_deref(),
             )
             .await?;
+        let snapshot_ack = req
+            .cursor
+            .as_deref()
+            .is_none_or(|cursor| cursor.starts_with("snapshot:"));
+        if snapshot_ack
+            && (consumer.scope != WatchScope::Tenant
+                || consumer.include.is_empty()
+                || !consumer.include.iter().all(|include| {
+                    matches!(
+                        include.as_str(),
+                        "tenants"
+                            | "agents"
+                            | "sessions"
+                            | "artifacts"
+                            | "records"
+                            | "skills"
+                            | "skill_bindings"
+                    )
+                }))
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "snapshot acknowledgements require a tenant-scope metadata-only consumer",
+            ));
+        }
+        let cursor = match req.cursor.as_deref() {
+            Some(snapshot_cursor) if snapshot_cursor.starts_with("snapshot:") => {
+                self.validate_snapshot_cursor_tenant(&consumer.tenant_id, snapshot_cursor)?;
+                if self.persist.is_some() && req.snapshot_high_watermark.is_none() {
+                    return Err(Error::new(
+                        ErrorCode::InvalidCursor,
+                        "persistent snapshot acknowledgements require snapshot_high_watermark",
+                    ));
+                }
+                req.snapshot_high_watermark.clone()
+            }
+            Some(cursor) => {
+                self.validate_export_consumer_cursor(&consumer, cursor, true)
+                    .await?;
+                Some(cursor.to_string())
+            }
+            None => {
+                if req.snapshot_high_watermark.is_none() {
+                    return Err(Error::new(
+                        ErrorCode::InvalidCursor,
+                        "export consumer acknowledgement requires cursor or snapshot_high_watermark",
+                    ));
+                }
+                req.snapshot_high_watermark.clone()
+            }
+        };
+        if let Some(high_watermark) = req.snapshot_high_watermark.as_deref() {
+            self.validate_export_consumer_cursor(&consumer, high_watermark, false)
+                .await?;
+        }
         if let Some(previous) = &consumer.last_acked_cursor {
-            if event_cursor_order_key(&req.cursor) < event_cursor_order_key(previous) {
+            if cursor.as_ref().is_some_and(|cursor| {
+                event_cursor_order_key(cursor) < event_cursor_order_key(previous)
+            }) {
                 return Err(Error::new(
                     ErrorCode::InvalidCursor,
                     "export consumer ack cursor is behind the last acked cursor; use rewind to move backward",
                 ));
             }
         }
-        consumer.last_acked_cursor = Some(req.cursor);
+        if let Some(cursor) = cursor {
+            consumer.last_acked_cursor = Some(cursor);
+        }
         if let Some(high_watermark) = req.snapshot_high_watermark {
             consumer.snapshot_high_watermark = Some(high_watermark);
         }
@@ -7785,10 +8366,103 @@ impl Runtime {
                 req.lease_owner.as_deref(),
             )
             .await?;
+        if let Some(cursor) = req.cursor.as_deref() {
+            self.validate_export_consumer_cursor(&consumer, cursor, true)
+                .await?;
+        }
         consumer.last_acked_cursor = req.cursor;
         consumer.updated_at_ms = crate::now_ms();
         self.persist_export_consumer_and_update_state(consumer)
             .await
+    }
+
+    fn validate_snapshot_cursor_tenant(&self, tenant_id: &Id, cursor: &str) -> Result<()> {
+        let parts = cursor
+            .strip_prefix("snapshot:")
+            .map(|raw| raw.split('/').collect::<Vec<_>>());
+        let valid = parts.as_ref().is_some_and(|parts| {
+            parts.len() == 4
+                && parts[0] == tenant_id.as_str()
+                && parts[1].len() == 20
+                && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+                && matches!(
+                    parts[2],
+                    "tenant"
+                        | "agent"
+                        | "session"
+                        | "artifact"
+                        | "record"
+                        | "skill"
+                        | "skill_binding"
+                )
+                && !parts[3].is_empty()
+        });
+        if !valid {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "snapshot cursor belongs to a different tenant or is malformed",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_export_consumer_cursor(
+        &self,
+        consumer: &ExportConsumer,
+        cursor: &str,
+        require_consumer_match: bool,
+    ) -> Result<()> {
+        let Some(persist) = &self.persist else {
+            return Ok(());
+        };
+        let Some(parts) = parse_export_ledger_cursor_for_runtime(cursor) else {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "persistent export consumer cursors must use the ledger: format",
+            ));
+        };
+        if parts.tenant_id != consumer.tenant_id.as_str() {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export consumer cursor belongs to a different tenant",
+            ));
+        }
+        if let Some(oldest) = self
+            .export_oldest_available_cursor(&consumer.tenant_id)
+            .await?
+        {
+            if cursor < oldest.as_str() {
+                return Err(Error::new(
+                    ErrorCode::InvalidCursor,
+                    format!(
+                        "export consumer cursor is older than the retained export ledger; oldest_available_cursor={oldest}"
+                    ),
+                ));
+            }
+        }
+        let Some(item) = persist
+            .get_export_ledger_item(consumer.tenant_id.as_str(), cursor)
+            .map_err(internal)?
+        else {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export consumer cursor does not identify a retained ledger item",
+            ));
+        };
+        if require_consumer_match
+            && (!export_item_matches_scope(
+                &item,
+                consumer.scope,
+                consumer.agent_id.as_ref(),
+                consumer.session_id.as_ref(),
+            ) || !export_item_matches_include(&item, &consumer.include))
+        {
+            return Err(Error::new(
+                ErrorCode::InvalidCursor,
+                "export consumer cursor was not emitted for this consumer scope and include filter",
+            ));
+        }
+        Ok(())
     }
 
     async fn load_export_consumer_for_update(
@@ -8402,19 +9076,17 @@ impl Runtime {
             index_record_into(&mut text, &mut vec, &record, doc_id);
         }
 
-        // Reserve the commit sequence under the state lock, but do not keep
-        // that lock while RocksDB does the durable write. The postings insert
-        // above is intentionally allowed to race ahead of persistence; searches
-        // only resolve records through `state.records`, which is populated
-        // after the durable write succeeds.
+        // Reserve the commit sequence and keep the state lock through durable
+        // persistence and cache publication. Metadata snapshot backfill reads
+        // its ledger high-watermark before taking this same lock; releasing it
+        // between commit and publication could let a snapshot skip the record
+        // and then tail from a cursor that already includes its create row.
         let commit_seq = next_record_commit_seq(&mut s);
-        drop(s);
         if let Some(p) = &self.persist {
             p.put_record_with_commit_seq_async(&record, Some(commit_seq))
                 .await
                 .map_err(internal)?;
         }
-        let mut s = self.state.lock().await;
         s.records
             .insert(record.record_id.as_str().to_string(), record.clone());
         s.doc_to_record
@@ -9351,9 +10023,13 @@ impl Runtime {
                     r.tenant_id.as_str() == req.tenant_id.as_str() && r.namespace == req.namespace
                 })
                 .map(|r| {
-                    let mut score = CandidateScore::default();
-                    score.score = 1.0;
-                    (r.clone(), score)
+                    (
+                        r.clone(),
+                        CandidateScore {
+                            score: 1.0,
+                            ..CandidateScore::default()
+                        },
+                    )
                 })
                 .collect()
         };
@@ -10215,6 +10891,26 @@ fn parse_export_ledger_cursor_for_runtime(
 ) -> Option<RuntimeExportLedgerCursorParts<'_>> {
     let raw = cursor.strip_prefix("ledger:")?;
     let parts = raw.split('/').collect::<Vec<_>>();
+    if parts.len() == 6
+        && parts[1] == "v2"
+        && parts[2].parse::<u64>().is_ok()
+        && parts[3] == "event"
+    {
+        return Some(RuntimeExportLedgerCursorParts {
+            tenant_id: parts[0],
+            session_id: Some(parts[4]),
+        });
+    }
+    if parts.len() == 6
+        && parts[1] == "v2"
+        && parts[2].parse::<u64>().is_ok()
+        && parts[3] == "object"
+    {
+        return Some(RuntimeExportLedgerCursorParts {
+            tenant_id: parts[0],
+            session_id: None,
+        });
+    }
     if parts.len() == 6 && parts[4] == "event" && parts[3].parse::<u64>().is_ok() {
         return Some(RuntimeExportLedgerCursorParts {
             tenant_id: parts[0],
@@ -10701,6 +11397,7 @@ fn extract_selected_fields(
     out
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

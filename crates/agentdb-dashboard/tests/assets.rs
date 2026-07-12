@@ -38,3 +38,14 @@ fn dashboard_does_not_call_legacy_admin_surface() {
         assert!(!app.contains(legacy), "{legacy} remains in app.js");
     }
 }
+
+#[test]
+fn dashboard_never_persists_or_links_bearer_tokens() {
+    let app = include_str!("../static/app.js");
+
+    assert!(app.contains("delete persisted.token"));
+    assert!(app.contains("delete stored.token"));
+    assert!(app.contains("url.searchParams.delete(\"token\")"));
+    assert!(!app.contains("mapQueryParam(params, cfg, \"token\""));
+    assert!(!app.contains("setQueryValue(url.searchParams, \"token\""));
+}

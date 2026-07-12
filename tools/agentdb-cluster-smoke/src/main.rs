@@ -1273,7 +1273,7 @@ async fn run_changefeed_probe(
     session_id: &str,
     next_seq: &mut u64,
 ) -> Result<()> {
-    eprintln!("changefeed: verifying watch and export cursor replay");
+    eprintln!("changefeed: verifying watch replay and cluster export fail-closed behavior");
     let owner = wait_tablet_owner(client, nodes, tablet_id, None, Duration::from_secs(90)).await?;
     let before_watch = watch_session(client, &owner.url, tenant_id, session_id).await?;
     let watch_cursor = before_watch
@@ -1291,13 +1291,7 @@ async fn run_changefeed_probe(
         .ok_or_else(|| {
             anyhow!("changefeed setup tenant watch response missing cursor: {before_tenant_watch}")
         })?;
-    let before_export =
-        export_watch_session(client, &owner.url, tenant_id, session_id, None, 100).await?;
-    let export_cursor = before_export["items"]
-        .as_array()
-        .and_then(|items| items.last())
-        .and_then(|item| item["cursor"].as_str())
-        .map(ToString::to_string);
+    assert_cluster_export_is_unsupported(client, &owner.url, tenant_id, session_id).await?;
 
     let first_seq = *next_seq;
     append_and_verify(
@@ -1378,38 +1372,10 @@ async fn run_changefeed_probe(
         }
     }
 
-    let export_page = export_watch_session(
-        client,
-        &owner.url,
-        tenant_id,
-        session_id,
-        export_cursor.as_deref(),
-        10,
-    )
-    .await?;
-    let export_items = export_page["items"]
-        .as_array()
-        .ok_or_else(|| anyhow!("export watch response missing items: {export_page}"))?;
-    for expected in [first_seq, second_seq] {
-        let Some(item) = export_items
-            .iter()
-            .find(|item| item["seq"].as_u64() == Some(expected))
-        else {
-            bail!("export watch did not include seq {expected}: {export_page}");
-        };
-        if item["object_type"] != "event" || item["op"] != "insert" {
-            bail!("export watch item for seq {expected} had unexpected shape: {item}");
-        }
-        let cursor = item["cursor"]
-            .as_str()
-            .ok_or_else(|| anyhow!("export watch item missing cursor: {item}"))?;
-        if !cursor.starts_with("ledger:") {
-            bail!("export watch cursor should use durable ledger format: {cursor}");
-        }
-    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_restart_persistence(
     args: &Args,
     client: &Client,
@@ -1521,6 +1487,7 @@ async fn run_checkpoint_install(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_explicit_replacement(
     _args: &Args,
     client: &Client,
@@ -1649,6 +1616,7 @@ async fn run_explicit_replacement(
     Ok(survivors)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_az_failure(
     args: &Args,
     client: &Client,
@@ -1768,6 +1736,7 @@ async fn run_az_failure(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_rolling_restart(
     args: &Args,
     client: &Client,
@@ -2870,21 +2839,26 @@ fn watch_item_session_id(item: &Value) -> Option<&str> {
         .or_else(|| item.get("event")?.get("session_id")?.as_str())
 }
 
-async fn export_watch_session(
+async fn assert_cluster_export_is_unsupported(
     client: &Client,
     base: &str,
     tenant_id: &str,
     session_id: &str,
-    from_cursor: Option<&str>,
-    limit: usize,
-) -> Result<Value> {
-    let mut path =
-        format!("/api/tenants/{tenant_id}/exports/watch?scope=session&session_id={session_id}&include=events&limit={limit}");
-    if let Some(cursor) = from_cursor {
-        path.push_str("&from_cursor=");
-        path.push_str(&query_encode(cursor));
+) -> Result<()> {
+    let response = client
+        .get(format!(
+            "{base}/api/tenants/{tenant_id}/exports/watch?scope=session&session_id={session_id}&include=events&limit=1"
+        ))
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "cluster export must fail closed until a cross-tablet frontier exists; status={status} body={body}"
+        );
     }
-    get_json(client, base, &path).await
+    Ok(())
 }
 
 fn query_encode(value: &str) -> String {

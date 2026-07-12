@@ -18,6 +18,7 @@ pub struct TestApp {
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
+#[allow(dead_code)]
 pub async fn spawn_app() -> TestApp {
     let runtime = Runtime::in_memory();
     let state = AppState::new(runtime);

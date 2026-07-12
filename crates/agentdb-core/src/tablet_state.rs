@@ -651,6 +651,9 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
     }
     if let Some(rest) = key.strip_prefix("export_ledger/") {
         let parts = rest.split('/').collect::<Vec<_>>();
+        if parts.len() == 6 && parts[1] == "v2" && parts[3] == "event" {
+            return placement(parts[0], Some(parts[4]));
+        }
         if parts.len() == 6 && parts[4] == "event" {
             return placement(parts[0], Some(parts[2]));
         }
@@ -667,6 +670,9 @@ fn classify_snapshot_entry(key: &[u8], value: &[u8]) -> StorageResult<SnapshotEn
         return placement(first_segment(rest)?, None);
     }
     if let Some(rest) = key.strip_prefix("export_ledger_high_watermark/") {
+        return placement(first_segment(rest)?, None);
+    }
+    if let Some(rest) = key.strip_prefix("export_ledger_sequence/") {
         return placement(first_segment(rest)?, None);
     }
     if let Some(rest) = key.strip_prefix("record/idempotency/") {

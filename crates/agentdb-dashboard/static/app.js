@@ -18,6 +18,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 document.addEventListener("DOMContentLoaded", () => {
+  scrubSensitiveQueryParams();
   restoreInputs();
   hydrateRouteState();
   document.querySelectorAll("[data-action]").forEach((button) => {
@@ -122,7 +123,9 @@ function readConfig(requireIds = true) {
     limit: Number($("limit").value || 100),
     token: $("token").value.trim(),
   };
-  localStorage.setItem(storeKey, JSON.stringify(cfg));
+  const persisted = { ...cfg };
+  delete persisted.token;
+  localStorage.setItem(storeKey, JSON.stringify(persisted));
   syncUrl(cfg);
   if (requireIds) {
     if (!cfg.tenantId) throw new Error("tenant_id is required");
@@ -133,8 +136,11 @@ function readConfig(requireIds = true) {
 
 function restoreInputs() {
   try {
+    const stored = JSON.parse(localStorage.getItem(storeKey) || "{}");
+    delete stored.token;
+    localStorage.setItem(storeKey, JSON.stringify(stored));
     const cfg = {
-      ...JSON.parse(localStorage.getItem(storeKey) || "{}"),
+      ...stored,
       ...configFromQuery(),
     };
     for (const [key, value] of Object.entries(cfg)) {
@@ -151,8 +157,15 @@ function configFromQuery() {
   mapQueryParam(params, cfg, "agentId", ["agentId", "agent_id"]);
   mapQueryParam(params, cfg, "fromSeq", ["fromSeq", "from_seq"]);
   mapQueryParam(params, cfg, "limit", ["limit"]);
-  mapQueryParam(params, cfg, "token", ["token"]);
   return cfg;
+}
+
+function scrubSensitiveQueryParams() {
+  const url = new URL(window.location.href);
+  const changed = url.searchParams.has("token") || url.searchParams.has("access_token");
+  url.searchParams.delete("token");
+  url.searchParams.delete("access_token");
+  if (changed) window.history.replaceState({}, "", url);
 }
 
 function mapQueryParam(params, cfg, key, names) {
@@ -172,11 +185,8 @@ function syncUrl(cfg) {
   setQueryValue(url.searchParams, "agent_id", cfg.agentId);
   setQueryValue(url.searchParams, "from_seq", String(cfg.fromSeq || 0));
   setQueryValue(url.searchParams, "limit", String(cfg.limit || 100));
-  if (cfg.token) {
-    setQueryValue(url.searchParams, "token", cfg.token);
-  } else {
-    url.searchParams.delete("token");
-  }
+  url.searchParams.delete("token");
+  url.searchParams.delete("access_token");
   window.history.replaceState({}, "", url);
 }
 

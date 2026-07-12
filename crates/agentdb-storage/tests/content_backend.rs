@@ -198,6 +198,33 @@ async fn local_persists_across_backend_instances() {
 }
 
 #[tokio::test]
+async fn local_listing_is_bounded_and_reaps_crash_left_temporary_files() {
+    let dir = TempDir::new().unwrap();
+    let backend = LocalFsContentBackend::new(dir.path());
+    backend
+        .put("ten_a", "art_live", b"persisted")
+        .await
+        .unwrap();
+    let crashed_dir = dir
+        .path()
+        .join("artifact_content")
+        .join("ten_a")
+        .join("art_partial");
+    std::fs::create_dir_all(&crashed_dir).unwrap();
+    let temporary = crashed_dir.join("blob.tmp.123.1");
+    std::fs::write(&temporary, b"partial").unwrap();
+
+    let listing = backend.list_objects(1).await.unwrap();
+    assert_eq!(listing.objects.len(), 1);
+    assert_eq!(listing.objects[0].artifact_id, "art_live");
+    assert_eq!(listing.temporary_objects_deleted, 1);
+    assert!(!temporary.exists());
+
+    let error = backend.list_objects(0).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
 async fn object_store_uses_artifact_content_layout() {
     let dir = TempDir::new().unwrap();
     let store: Arc<dyn ObjectStore> =

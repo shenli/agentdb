@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,27 +82,31 @@ fn export_consumer_key(tenant_id: &str, consumer_name: &str) -> String {
     format!("record/export_consumer/{tenant_id}/{consumer_name}")
 }
 
-fn export_ledger_event_key(event: &EventEnvelope) -> String {
+static EXPORT_LEDGER_PENDING_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_export_ledger_pending_token(object_id: &str) -> String {
     format!(
-        "export_ledger/{}/{:020}/{}/{:020}/event/{}",
-        event.tenant_id, event.created_at_ms, event.session_id, event.seq, event.event_id
+        "{:020}-{object_id}",
+        EXPORT_LEDGER_PENDING_SEQ.fetch_add(1, Ordering::Relaxed)
     )
 }
 
-static EXPORT_LEDGER_OBJECT_SEQ: AtomicU64 = AtomicU64::new(1);
-
-fn next_export_ledger_object_seq() -> u64 {
-    EXPORT_LEDGER_OBJECT_SEQ.fetch_add(1, Ordering::Relaxed)
+/// Export rows are built before they reach the serialized KV writer, but their
+/// public cursor must reflect durable write order rather than wall-clock time.
+/// `~pending` keys are therefore private write templates. The writer replaces
+/// the token with `v2/<tenant-local durable sequence>` immediately before the
+/// atomic batch is committed.
+fn export_ledger_event_key(event: &EventEnvelope, token: &str) -> String {
+    format!(
+        "export_ledger/{}/~pending/{token}/event/{}/{}",
+        event.tenant_id, event.session_id, event.event_id
+    )
 }
 
-fn export_ledger_object_key(item: &ExportLedgerItem) -> String {
+fn export_ledger_object_key(item: &ExportLedgerItem, token: &str) -> String {
     format!(
-        "export_ledger/{}/{:020}/{:020}/{}/{}",
-        item.tenant_id,
-        item.created_at_ms,
-        next_export_ledger_object_seq(),
-        item.object_type,
-        item.object_id
+        "export_ledger/{}/~pending/{token}/object/{}/{}",
+        item.tenant_id, item.object_type, item.object_id
     )
 }
 
@@ -119,22 +123,17 @@ fn export_ledger_key_from_item_cursor(tenant_id: &str, cursor: &str) -> Option<S
     Some(format!("export_ledger/{raw}"))
 }
 
-fn export_ledger_session_index_key(event: &EventEnvelope) -> String {
+fn export_ledger_session_index_key(event: &EventEnvelope, token: &str) -> String {
     format!(
-        "export_ledger_by_session/{}/{}/{:020}/{:020}/event/{}",
-        event.tenant_id, event.session_id, event.created_at_ms, event.seq, event.event_id
+        "export_ledger_by_session/{}/{}/~pending/{token}",
+        event.tenant_id, event.session_id
     )
 }
 
-fn export_ledger_agent_index_key(event: &EventEnvelope) -> String {
+fn export_ledger_agent_index_key(event: &EventEnvelope, token: &str) -> String {
     format!(
-        "export_ledger_by_agent/{}/{}/{:020}/{}/{:020}/event/{}",
-        event.tenant_id,
-        event.agent_id,
-        event.created_at_ms,
-        event.session_id,
-        event.seq,
-        event.event_id
+        "export_ledger_by_agent/{}/{}/~pending/{token}",
+        event.tenant_id, event.agent_id
     )
 }
 
@@ -154,6 +153,10 @@ fn export_ledger_high_watermark_key(tenant_id: &str) -> String {
     format!("export_ledger_high_watermark/{tenant_id}")
 }
 
+fn export_ledger_sequence_key(tenant_id: &str) -> String {
+    format!("export_ledger_sequence/{tenant_id}")
+}
+
 fn record_edge_key(tenant_id: &str, edge_id: &str) -> String {
     format!("record/searchable_edge/{tenant_id}/{edge_id}")
 }
@@ -169,6 +172,9 @@ fn export_ledger_cursor_at_or_before(cursor: &str, from_cursor: Option<&str>) ->
 fn export_ledger_object_id_from_key(key: &[u8]) -> Option<&str> {
     let raw = std::str::from_utf8(key).ok()?;
     let parts = raw.split('/').collect::<Vec<_>>();
+    if parts.len() == 7 && parts[2] == "v2" && matches!(parts[4], "event" | "object") {
+        return Some(parts[6]);
+    }
     if parts.len() == 7 && parts[5] == "event" {
         return Some(parts[6]);
     }
@@ -183,6 +189,162 @@ fn export_ledger_tenant_from_key(key: &[u8]) -> Option<&str> {
     let mut parts = raw.split('/');
     let _namespace = parts.next()?;
     parts.next()
+}
+
+#[derive(Default)]
+struct ExportLedgerSequencer {
+    last_by_tenant: Mutex<BTreeMap<String, u64>>,
+}
+
+impl ExportLedgerSequencer {
+    fn write(&self, kv: &dyn KvStore, ops: Vec<WriteOp>) -> KvResult<()> {
+        let mut last_by_tenant = self
+            .last_by_tenant
+            .lock()
+            .expect("export ledger sequencer lock poisoned");
+        let (ops, committed_sequences) = finalize_export_ledger_ops(kv, &last_by_tenant, ops)?;
+        kv.write_batch(ops)?;
+        for (tenant_id, sequence) in committed_sequences {
+            let cached = last_by_tenant.entry(tenant_id).or_default();
+            *cached = (*cached).max(sequence);
+        }
+        Ok(())
+    }
+}
+
+fn finalize_export_ledger_ops(
+    kv: &dyn KvStore,
+    last_by_tenant: &BTreeMap<String, u64>,
+    mut ops: Vec<WriteOp>,
+) -> KvResult<(Vec<WriteOp>, BTreeMap<String, u64>)> {
+    let mut assignments = BTreeMap::<String, u64>::new();
+    let mut highest_by_tenant = BTreeMap::<String, u64>::new();
+    let mut current_by_tenant = BTreeMap::<String, u64>::new();
+
+    for op in &ops {
+        let WriteOp::Put { key, .. } = op else {
+            continue;
+        };
+        let Some((tenant_id, token)) = pending_export_primary_identity(key) else {
+            continue;
+        };
+        if assignments.contains_key(token) {
+            continue;
+        }
+        let current = match current_by_tenant.get(tenant_id).copied() {
+            Some(current) => current,
+            None => {
+                let stored = kv
+                    .get(export_ledger_sequence_key(tenant_id).as_bytes())?
+                    .map(|raw| {
+                        raw.as_slice()
+                            .try_into()
+                            .map(u64::from_be_bytes)
+                            .map_err(|_| {
+                                StorageError::Other(format!(
+                                    "export ledger sequence for tenant {tenant_id} is invalid"
+                                ))
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                // A tablet snapshot, replicated write, or former leader can
+                // advance the durable sequence without touching this local
+                // process cache. Reconcile on every pending batch so a node
+                // that becomes leader again never reuses an old sequence.
+                stored.max(last_by_tenant.get(tenant_id).copied().unwrap_or(0))
+            }
+        };
+        let next = current.checked_add(1).ok_or_else(|| {
+            StorageError::Other(format!(
+                "export ledger sequence exhausted for tenant {tenant_id}"
+            ))
+        })?;
+        current_by_tenant.insert(tenant_id.to_string(), next);
+        assignments.insert(token.to_string(), next);
+        highest_by_tenant.insert(tenant_id.to_string(), next);
+    }
+
+    if assignments.is_empty() {
+        let committed_sequences = export_ledger_sequence_puts(&ops)?;
+        return Ok((ops, committed_sequences));
+    }
+
+    for op in &mut ops {
+        match op {
+            WriteOp::Put { key, value } => {
+                *key = rewrite_pending_export_bytes(key, &assignments);
+                if value.starts_with(b"export_ledger/") || value.starts_with(b"ledger:") {
+                    *value = rewrite_pending_export_bytes(value, &assignments);
+                }
+            }
+            WriteOp::Delete { key } => {
+                *key = rewrite_pending_export_bytes(key, &assignments);
+            }
+        }
+    }
+    for (tenant_id, sequence) in highest_by_tenant {
+        ops.push(WriteOp::Put {
+            key: export_ledger_sequence_key(&tenant_id).into_bytes(),
+            value: sequence.to_be_bytes().to_vec(),
+        });
+    }
+    let committed_sequences = export_ledger_sequence_puts(&ops)?;
+    Ok((ops, committed_sequences))
+}
+
+fn export_ledger_sequence_puts(ops: &[WriteOp]) -> KvResult<BTreeMap<String, u64>> {
+    let mut sequences = BTreeMap::<String, u64>::new();
+    for op in ops {
+        let WriteOp::Put { key, value } = op else {
+            continue;
+        };
+        let Some(tenant_id) = key.strip_prefix(b"export_ledger_sequence/") else {
+            continue;
+        };
+        let tenant_id = std::str::from_utf8(tenant_id)
+            .map_err(|_| StorageError::Other("export ledger sequence tenant is not utf8".into()))?;
+        let sequence = value
+            .as_slice()
+            .try_into()
+            .map(u64::from_be_bytes)
+            .map_err(|_| {
+                StorageError::Other(format!(
+                    "export ledger sequence for tenant {tenant_id} is invalid"
+                ))
+            })?;
+        sequences
+            .entry(tenant_id.to_string())
+            .and_modify(|current| *current = (*current).max(sequence))
+            .or_insert(sequence);
+    }
+    Ok(sequences)
+}
+
+fn pending_export_primary_identity(key: &[u8]) -> Option<(&str, &str)> {
+    let raw = std::str::from_utf8(key).ok()?;
+    let mut parts = raw.split('/');
+    if parts.next()? != "export_ledger" {
+        return None;
+    }
+    let tenant_id = parts.next()?;
+    if parts.next()? != "~pending" {
+        return None;
+    }
+    Some((tenant_id, parts.next()?))
+}
+
+fn rewrite_pending_export_bytes(bytes: &[u8], assignments: &BTreeMap<String, u64>) -> Vec<u8> {
+    let Ok(mut text) = std::str::from_utf8(bytes).map(str::to_string) else {
+        return bytes.to_vec();
+    };
+    for (token, sequence) in assignments {
+        text = text.replace(
+            &format!("/~pending/{token}"),
+            &format!("/v2/{sequence:020}"),
+        );
+    }
+    text.into_bytes()
 }
 
 fn export_item_from_event(event: &EventEnvelope) -> ExportLedgerItem {
@@ -200,6 +362,7 @@ fn export_item_from_event(event: &EventEnvelope) -> ExportLedgerItem {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_item_from_value(
     object_type: &str,
     tenant_id: crate::Id,
@@ -260,6 +423,7 @@ fn export_fork_edge_item(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_tombstone_item(
     object_type: &str,
     tenant_id: crate::Id,
@@ -410,6 +574,7 @@ fn write_ops_size(ops: &[WriteOp]) -> usize {
 
 struct AdaptiveWriteBatcher {
     kv: Arc<dyn KvStore + Send + Sync>,
+    export_ledger_sequencer: Arc<ExportLedgerSequencer>,
     tx: mpsc::Sender<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
@@ -550,7 +715,10 @@ fn adaptive_write_profile() -> Option<&'static AdaptiveWriteProfile> {
 }
 
 impl AdaptiveWriteBatcher {
-    fn from_env(kv: Arc<dyn KvStore + Send + Sync>) -> Option<Arc<Self>> {
+    fn from_env(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        export_ledger_sequencer: Arc<ExportLedgerSequencer>,
+    ) -> Option<Arc<Self>> {
         if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT") {
             return None;
         }
@@ -565,15 +733,16 @@ impl AdaptiveWriteBatcher {
             .and_then(|raw| raw.parse::<u64>().ok())
             // In single-node fsync mode, a short wait window materially
             // improves safe batching without the p99 hit of larger windows.
-            .unwrap_or_else(|| if sync_writes { 2_000 } else { 0 });
+            .unwrap_or(if sync_writes { 2_000 } else { 0 });
         let backlog_wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             // Preserve the direct fast path for isolated writes, but let the
             // writer coalesce briefly once a backlog already exists.
-            .unwrap_or_else(|| if sync_writes { 0 } else { 5 });
+            .unwrap_or(if sync_writes { 0 } else { 5 });
         Some(Arc::new(Self::new(
             kv,
+            export_ledger_sequencer,
             max_ops,
             wait_us,
             backlog_wait_us,
@@ -583,6 +752,7 @@ impl AdaptiveWriteBatcher {
 
     fn new(
         kv: Arc<dyn KvStore + Send + Sync>,
+        export_ledger_sequencer: Arc<ExportLedgerSequencer>,
         max_ops: usize,
         wait_us: u64,
         backlog_wait_us: u64,
@@ -595,11 +765,13 @@ impl AdaptiveWriteBatcher {
             .name("agentdb-adaptive-write".into())
             .spawn({
                 let kv = kv.clone();
+                let export_ledger_sequencer = export_ledger_sequencer.clone();
                 let queued = queued.clone();
                 let writer_busy = writer_busy.clone();
                 move || {
                     adaptive_write_loop(
                         kv,
+                        export_ledger_sequencer,
                         rx,
                         queued,
                         writer_busy,
@@ -611,6 +783,7 @@ impl AdaptiveWriteBatcher {
             });
         Self {
             kv,
+            export_ledger_sequencer,
             tx,
             queued,
             writer_busy,
@@ -628,7 +801,7 @@ impl AdaptiveWriteBatcher {
         {
             let op_count = ops.len();
             let write_started = Instant::now();
-            let result = self.kv.write_batch(ops);
+            let result = self.export_ledger_sequencer.write(self.kv.as_ref(), ops);
             let write_nanos = write_started.elapsed().as_nanos();
             self.writer_busy.store(0, Ordering::Release);
             if let Some(profile) = adaptive_write_profile() {
@@ -664,7 +837,7 @@ impl AdaptiveWriteBatcher {
         {
             let op_count = ops.len();
             let write_started = Instant::now();
-            let result = self.kv.write_batch(ops);
+            let result = self.export_ledger_sequencer.write(self.kv.as_ref(), ops);
             let write_nanos = write_started.elapsed().as_nanos();
             self.writer_busy.store(0, Ordering::Release);
             if let Some(profile) = adaptive_write_profile() {
@@ -709,8 +882,10 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn adaptive_write_loop(
     kv: Arc<dyn KvStore + Send + Sync>,
+    export_ledger_sequencer: Arc<ExportLedgerSequencer>,
     rx: mpsc::Receiver<AdaptiveWriteRequest>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
@@ -760,7 +935,7 @@ fn adaptive_write_loop(
         }
 
         let write_started = Instant::now();
-        let result = kv.write_batch(ops);
+        let result = export_ledger_sequencer.write(kv.as_ref(), ops);
         let write_nanos = write_started.elapsed().as_nanos();
         writer_busy.store(0, Ordering::Release);
         if let Some(profile) = adaptive_write_profile() {
@@ -797,18 +972,51 @@ fn key_from_parts(key_id: &Option<String>, key_version: &Option<String>) -> Opti
 pub(crate) struct Persist {
     pub kv: Arc<dyn KvStore + Send + Sync>,
     metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
+    export_ledger_sequencer: Arc<ExportLedgerSequencer>,
     adaptive_write_batcher: Option<Arc<AdaptiveWriteBatcher>>,
 }
 
 impl Persist {
+    pub(crate) fn ensure_hydration_prefix_within_limits(
+        &self,
+        label: &str,
+        prefix: &[u8],
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> KvResult<(usize, u64)> {
+        let mut rows = 0_usize;
+        let mut bytes = 0_u64;
+        for result in self.kv.scan_prefix(prefix)? {
+            let (key, value) = result?;
+            rows = rows.saturating_add(1);
+            bytes = bytes.saturating_add(
+                u64::try_from(key.len().saturating_add(value.len())).unwrap_or(u64::MAX),
+            );
+            if rows > max_rows {
+                return Err(StorageError::Other(format!(
+                    "startup hydration limit exceeded for {label}: more than {max_rows} rows; raise the matching AGENTDB_STARTUP_MAX_* setting only after sizing memory"
+                )));
+            }
+            if bytes > max_bytes {
+                return Err(StorageError::Other(format!(
+                    "startup hydration byte limit exceeded while scanning {label}: more than {max_bytes} key/value bytes; raise AGENTDB_STARTUP_MAX_HYDRATED_BYTES only after sizing memory"
+                )));
+            }
+        }
+        Ok((rows, bytes))
+    }
+
     pub fn with_metadata_crypto(
         kv: Arc<dyn KvStore + Send + Sync>,
         metadata_crypto: Arc<dyn MetadataCryptoAdapter>,
     ) -> Self {
-        let adaptive_write_batcher = AdaptiveWriteBatcher::from_env(kv.clone());
+        let export_ledger_sequencer = Arc::new(ExportLedgerSequencer::default());
+        let adaptive_write_batcher =
+            AdaptiveWriteBatcher::from_env(kv.clone(), export_ledger_sequencer.clone());
         Self {
             kv,
             metadata_crypto,
+            export_ledger_sequencer,
             adaptive_write_batcher,
         }
     }
@@ -1434,9 +1642,7 @@ impl Persist {
             )?,
         });
         for event in events {
-            ops.push(self.export_ledger_event_put_op(event)?);
-            ops.extend(self.export_ledger_index_put_ops(event));
-            ops.push(self.export_ledger_high_watermark_put_op(event));
+            ops.extend(self.export_ledger_event_ops(event)?);
         }
         Ok(ops)
     }
@@ -1462,9 +1668,7 @@ impl Persist {
             key: ek.into_bytes(),
             value: event_value,
         });
-        ops.push(self.export_ledger_event_put_op(event)?);
-        ops.extend(self.export_ledger_index_put_ops(event));
-        ops.push(self.export_ledger_high_watermark_put_op(event));
+        ops.extend(self.export_ledger_event_ops(event)?);
         if let Some(session) = session {
             let sk = session_record_key(session.tenant_id.as_str(), session.session_id.as_str());
             ops.push(WriteOp::Put {
@@ -1497,7 +1701,17 @@ impl Persist {
         Ok(ops)
     }
 
-    fn export_ledger_event_put_op(&self, event: &EventEnvelope) -> KvResult<WriteOp> {
+    fn export_ledger_event_ops(&self, event: &EventEnvelope) -> KvResult<Vec<WriteOp>> {
+        let token = next_export_ledger_pending_token(event.event_id.as_str());
+        Ok(vec![
+            self.export_ledger_event_put_op(event, &token)?,
+            self.export_ledger_session_index_put_op(event, &token),
+            self.export_ledger_agent_index_put_op(event, &token),
+            self.export_ledger_high_watermark_put_op(event, &token),
+        ])
+    }
+
+    fn export_ledger_event_put_op(&self, event: &EventEnvelope, token: &str) -> KvResult<WriteOp> {
         let item = export_item_from_event(event);
         let event_context =
             self.export_ledger_context(event.tenant_id.as_str(), event.event_id.as_str());
@@ -1506,13 +1720,13 @@ impl Persist {
             &serde_json::to_vec(&item).expect("export ledger item serializes"),
         )?;
         Ok(WriteOp::Put {
-            key: export_ledger_event_key(event).into_bytes(),
+            key: export_ledger_event_key(event, token).into_bytes(),
             value,
         })
     }
 
-    fn export_ledger_high_watermark_put_op(&self, event: &EventEnvelope) -> WriteOp {
-        let key = export_ledger_event_key(event);
+    fn export_ledger_high_watermark_put_op(&self, event: &EventEnvelope, token: &str) -> WriteOp {
+        let key = export_ledger_event_key(event, token);
         let cursor = format!("ledger:{}", key.trim_start_matches("export_ledger/"));
         WriteOp::Put {
             key: export_ledger_high_watermark_key(event.tenant_id.as_str()).into_bytes(),
@@ -1520,22 +1734,23 @@ impl Persist {
         }
     }
 
-    fn export_ledger_index_put_ops(&self, event: &EventEnvelope) -> Vec<WriteOp> {
-        let ledger_key = export_ledger_event_key(event).into_bytes();
-        vec![
-            WriteOp::Put {
-                key: export_ledger_session_index_key(event).into_bytes(),
-                value: ledger_key.clone(),
-            },
-            WriteOp::Put {
-                key: export_ledger_agent_index_key(event).into_bytes(),
-                value: ledger_key,
-            },
-        ]
+    fn export_ledger_session_index_put_op(&self, event: &EventEnvelope, token: &str) -> WriteOp {
+        WriteOp::Put {
+            key: export_ledger_session_index_key(event, token).into_bytes(),
+            value: export_ledger_event_key(event, token).into_bytes(),
+        }
+    }
+
+    fn export_ledger_agent_index_put_op(&self, event: &EventEnvelope, token: &str) -> WriteOp {
+        WriteOp::Put {
+            key: export_ledger_agent_index_key(event, token).into_bytes(),
+            value: export_ledger_event_key(event, token).into_bytes(),
+        }
     }
 
     fn export_ledger_item_put_ops(&self, item: ExportLedgerItem) -> KvResult<Vec<WriteOp>> {
-        let key = export_ledger_object_key(&item);
+        let token = next_export_ledger_pending_token(&item.object_id);
+        let key = export_ledger_object_key(&item, &token);
         let cursor = format!("ledger:{}", key.trim_start_matches("export_ledger/"));
         let context = self.export_ledger_context(item.tenant_id.as_str(), &item.object_id);
         let value = self.encrypt_metadata(
@@ -1555,11 +1770,8 @@ impl Persist {
         if let Some(session_id) = item.session_id.as_ref() {
             ops.push(WriteOp::Put {
                 key: format!(
-                    "export_ledger_by_session/{}/{}/{:020}/{}",
-                    item.tenant_id,
-                    session_id,
-                    item.created_at_ms,
-                    key.trim_start_matches("export_ledger/")
+                    "export_ledger_by_session/{}/{}/~pending/{token}",
+                    item.tenant_id, session_id
                 )
                 .into_bytes(),
                 value: key.as_bytes().to_vec(),
@@ -1568,11 +1780,8 @@ impl Persist {
         if let Some(agent_id) = item.agent_id.as_ref() {
             ops.push(WriteOp::Put {
                 key: format!(
-                    "export_ledger_by_agent/{}/{}/{:020}/{}",
-                    item.tenant_id,
-                    agent_id,
-                    item.created_at_ms,
-                    key.trim_start_matches("export_ledger/")
+                    "export_ledger_by_agent/{}/{}/~pending/{token}",
+                    item.tenant_id, agent_id
                 )
                 .into_bytes(),
                 value: key.into_bytes(),
@@ -1682,7 +1891,7 @@ impl Persist {
                 continue;
             };
             let last_seq = batch.events.last().map(|event| event.seq).unwrap_or(0);
-            if latest.as_ref().map_or(true, |(seq, _)| last_seq >= *seq) {
+            if latest.as_ref().is_none_or(|(seq, _)| last_seq >= *seq) {
                 latest = Some((last_seq, session));
             }
         }
@@ -1753,14 +1962,29 @@ impl Persist {
         Ok(Some(event))
     }
 
-    pub fn scan_export_ledger_items(
+    /// Visit durable export rows without materializing the whole matching
+    /// backlog. Returning `true` from `visitor` stops the scan.
+    pub(crate) fn visit_export_ledger_items<F>(
         &self,
         tenant_id: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
         from_cursor: Option<&str>,
-        limit: usize,
-    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
+        mut visitor: F,
+    ) -> KvResult<()>
+    where
+        F: FnMut(String, ExportLedgerItem) -> bool,
+    {
+        if let Some(session_id) = session_id {
+            let prefix = export_ledger_session_index_prefix(tenant_id, session_id);
+            return self.visit_export_ledger_index(tenant_id, &prefix, from_cursor, visitor);
+        }
+        if let Some(agent_id) = agent_id {
+            let prefix = export_ledger_agent_index_prefix(tenant_id, agent_id);
+            return self.visit_export_ledger_index(tenant_id, &prefix, from_cursor, visitor);
+        }
+
         let prefix = export_ledger_tenant_prefix(tenant_id);
-        let mut out = Vec::new();
         let start_key =
             from_cursor.and_then(|cursor| export_ledger_key_from_item_cursor(tenant_id, cursor));
         let iter = match start_key.as_deref() {
@@ -1782,44 +2006,23 @@ impl Persist {
             let plaintext = self.decrypt_metadata(&context, &value)?;
             let item: ExportLedgerItem =
                 serde_json::from_slice(&plaintext).expect("export ledger item decodes");
-            out.push((cursor, item));
-            if out.len() >= limit {
+            if visitor(cursor, item) {
                 break;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
-    pub fn scan_export_ledger_session_items(
+    fn visit_export_ledger_index<F>(
         &self,
         tenant_id: &str,
-        session_id: &str,
+        prefix: &str,
         from_cursor: Option<&str>,
-        limit: usize,
-    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
-        let prefix = export_ledger_session_index_prefix(tenant_id, session_id);
-        self.scan_export_ledger_index(tenant_id, prefix, from_cursor, limit)
-    }
-
-    pub fn scan_export_ledger_agent_items(
-        &self,
-        tenant_id: &str,
-        agent_id: &str,
-        from_cursor: Option<&str>,
-        limit: usize,
-    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
-        let prefix = export_ledger_agent_index_prefix(tenant_id, agent_id);
-        self.scan_export_ledger_index(tenant_id, prefix, from_cursor, limit)
-    }
-
-    fn scan_export_ledger_index(
-        &self,
-        tenant_id: &str,
-        prefix: String,
-        from_cursor: Option<&str>,
-        limit: usize,
-    ) -> KvResult<Vec<(String, ExportLedgerItem)>> {
-        let mut out = Vec::new();
+        mut visitor: F,
+    ) -> KvResult<()>
+    where
+        F: FnMut(String, ExportLedgerItem) -> bool,
+    {
         let iter = self.kv.scan_prefix(prefix.as_bytes())?;
         for res in iter {
             let (_index_key, ledger_key) = res?;
@@ -1843,12 +2046,31 @@ impl Persist {
             let plaintext = self.decrypt_metadata(&context, &value)?;
             let item: ExportLedgerItem =
                 serde_json::from_slice(&plaintext).expect("export ledger item decodes");
-            out.push((cursor, item));
-            if out.len() >= limit {
+            if visitor(cursor, item) {
                 break;
             }
         }
-        Ok(out)
+        Ok(())
+    }
+
+    pub fn get_export_ledger_item(
+        &self,
+        tenant_id: &str,
+        cursor: &str,
+    ) -> KvResult<Option<ExportLedgerItem>> {
+        let Some(key) = export_ledger_key_from_item_cursor(tenant_id, cursor) else {
+            return Ok(None);
+        };
+        let Some(value) = self.kv.get(key.as_bytes())? else {
+            return Ok(None);
+        };
+        let Some(object_id) = export_ledger_object_id_from_key(key.as_bytes()) else {
+            return Ok(None);
+        };
+        let context = self.export_ledger_context(tenant_id, object_id);
+        let plaintext = self.decrypt_metadata(&context, &value)?;
+        let item = serde_json::from_slice(&plaintext).expect("export ledger item decodes");
+        Ok(Some(item))
     }
 
     pub fn export_ledger_high_watermark(&self, tenant_id: &str) -> KvResult<Option<String>> {
@@ -2166,7 +2388,7 @@ impl Persist {
         if let Some(batcher) = &self.adaptive_write_batcher {
             batcher.submit_blocking(ops)
         } else {
-            self.kv.write_batch(ops)
+            self.export_ledger_sequencer.write(self.kv.as_ref(), ops)
         }
     }
 
@@ -2472,5 +2694,56 @@ impl Persist {
             out.push(binding);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod export_ledger_sequence_tests {
+    use super::*;
+    use agentdb_storage::InMemoryKvStore;
+
+    #[test]
+    fn sequencer_reconciles_a_durable_advance_that_bypassed_its_cache() {
+        let kv = InMemoryKvStore::new();
+        let sequencer = ExportLedgerSequencer::default();
+        sequencer
+            .write(
+                &kv,
+                vec![WriteOp::Put {
+                    key: b"export_ledger/ten_test/~pending/a/object/record/rec_a".to_vec(),
+                    value: b"first".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(kv
+            .get(b"export_ledger/ten_test/v2/00000000000000000001/object/record/rec_a")
+            .unwrap()
+            .is_some());
+
+        // Model a replicated apply or snapshot install that advances the
+        // durable counter while this process retains its old cached value.
+        kv.write_batch(vec![WriteOp::Put {
+            key: b"export_ledger_sequence/ten_test".to_vec(),
+            value: 9_u64.to_be_bytes().to_vec(),
+        }])
+        .unwrap();
+
+        sequencer
+            .write(
+                &kv,
+                vec![WriteOp::Put {
+                    key: b"export_ledger/ten_test/~pending/b/object/record/rec_b".to_vec(),
+                    value: b"second".to_vec(),
+                }],
+            )
+            .unwrap();
+        assert!(kv
+            .get(b"export_ledger/ten_test/v2/00000000000000000010/object/record/rec_b")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            kv.get(b"export_ledger_sequence/ten_test").unwrap(),
+            Some(10_u64.to_be_bytes().to_vec())
+        );
     }
 }

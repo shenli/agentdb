@@ -39,8 +39,7 @@
 import { AgentDB } from "../../../clients/typescript/dist/index.js";
 
 const SERVER_URL = process.env.AGENTDB_URL ?? "http://127.0.0.1:7878";
-const USER = process.env.AGENTDB_USER ?? "demo";
-const PASSWORD = process.env.AGENTDB_PASSWORD ?? "demo-secret";
+const TOKEN = process.env.AGENTDB_TOKEN;
 const WORKSPACE = process.env.AGENTDB_WORKSPACE ?? process.env.AGENTDB_TENANT ?? "quickstart-ts";
 const SESSION_ID = "quickstart-agent-ts";
 
@@ -73,7 +72,7 @@ function thoughtForTurn(turn: number, recentTexts: string[]): ChatPayload {
 async function main(): Promise<void> {
   const db = new AgentDB({
     baseUrl: SERVER_URL,
-    auth: { user: USER, password: PASSWORD },
+    token: TOKEN,
   });
   if (!(await db.healthReady())) {
     console.error(

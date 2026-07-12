@@ -2,6 +2,7 @@
 #
 # Bring it up:
 #   cd examples/compose
+#   export AGENTDB_API_AUTH_TOKEN='replace-with-at-least-16-characters'
 #   docker compose up --build
 #
 # Then:
@@ -18,7 +19,9 @@ services:
       context: ../..
       dockerfile: Dockerfile
     ports:
-      - "7878:7878"
+      - "127.0.0.1:7878:7878"
+    environment:
+      AGENTDB_API_AUTH_TOKEN: ${AGENTDB_API_AUTH_TOKEN:?set AGENTDB_API_AUTH_TOKEN to at least 16 visible ASCII characters without whitespace}
     volumes:
       - agentdb-data:/data
 

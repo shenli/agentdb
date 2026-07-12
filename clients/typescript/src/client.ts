@@ -10,7 +10,6 @@ import {
   userMessage,
 } from "./conventions.js";
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
 
 export type TenantId = string;
 export type AgentId = string;
@@ -185,7 +184,17 @@ export class AgentDB {
         return new Workspace(this.client, String(tenant.tenant_id), { name: externalKey, data: tenant });
       }
     }
-    const tenant = await this.client.createTenant(externalKey, opts.policy ?? {});
+    let tenant: Record<string, unknown>;
+    try {
+      tenant = await this.client.createTenant(externalKey, opts.policy ?? {});
+    } catch (err) {
+      if (!(err instanceof AgentDBError) || err.statusCode !== 409) throw err;
+      const existing = (await this.client.listTenants()).find(
+        (candidate) => candidate.external_key === externalKey
+      );
+      if (existing === undefined) throw err;
+      tenant = existing;
+    }
     return new Workspace(this.client, String(tenant.tenant_id), { name: externalKey, data: tenant });
   }
 
@@ -1171,7 +1180,7 @@ function enc(s: string): string {
 }
 
 function idem(key?: string): Record<string, string> {
-  return { "Idempotency-Key": key ?? randomUUID() };
+  return key === undefined ? {} : { "Idempotency-Key": key };
 }
 
 async function errorFrom(resp: Response): Promise<AgentDBError> {

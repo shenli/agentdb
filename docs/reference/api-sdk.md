@@ -9,6 +9,61 @@ surfaces. The API is tenant-scoped and uses opaque typed IDs such as `ten_*`,
 Humans should usually use `agentdbctl` for operations. The HTTP API below is
 the stable backend contract for SDKs, automation, and the CLI.
 
+### Authentication
+
+Set `server.api_auth_token` or `AGENTDB_API_AUTH_TOKEN` to protect every
+external `/api/*` request with `Authorization: Bearer <token>`. The server
+refuses a non-loopback HTTP bind unless this static installation token contains
+at least 16 visible ASCII characters and no whitespace. This keeps the token
+safe to place in an HTTP `Authorization` header. For a zero-downtime rotation,
+configure the new value as the current token and temporarily set
+`server.api_auth_previous_token` or
+`AGENTDB_API_AUTH_PREVIOUS_TOKEN`; remove the previous value after all clients
+have switched. The previous token follows the same character rule, must differ
+from the current token, and cannot be configured by itself. With no static
+token, a loopback listener leaves non-admin `/api/*` routes
+unauthenticated. Health and dashboard asset routes remain public.
+
+The metadata-backed admin-token API provides narrower credentials for
+`/api/admin/*`: `admin` scope permits every method and `readonly` permits only
+`GET`/`HEAD`. On a loopback server with no static token, admin routes are open
+only while the metadata store has never minted an admin token. Minting the
+first token closes that bootstrap path permanently; revoking every token does
+not reopen it, so configure a static token before revoking the final admin
+credential. The
+plaintext is returned once and only its SHA-256 hash is stored. Persistent
+standalone nodes use
+`<data_dir>/auth-meta.sqlite`, dev mode uses memory, and routed cluster nodes
+reuse the shared metadata store:
+
+```text
+GET    /api/admin/tokens
+POST   /api/admin/tokens             {"description":"operator","scope":"admin"}
+DELETE /api/admin/tokens/{token_id}
+```
+
+The static installation token is coarse-grained and also authorizes admin
+routes; metadata admin tokens do not authorize tenant data routes. This is not
+tenant-scoped end-user authorization. Terminate TLS at the ingress, load
+balancer, or service mesh before sending bearer tokens over a network. Internal
+Raft RPCs continue to use their separate current/previous token pair, with the
+same length and visible-ASCII rules; an internal previous token cannot be
+configured without a current token.
+
+Both native SDKs accept either a fixed bearer token or a token callback:
+
+```python
+from agentdb import AgentDB
+
+db = AgentDB("http://127.0.0.1:7878", token="...")
+```
+
+```typescript
+import { AgentDB } from "agentdb";
+
+const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878", token: "..." });
+```
+
 AgentDB also has an opt-in MongoDB wire-protocol compatibility listener for a
 narrow driver/tool subset. Enable it with `agentdb serve --mongo-bind
 127.0.0.1:7879` or `[mongodb].bind` in config. Optional MongoDB `PLAIN`
@@ -128,7 +183,11 @@ native API first. They do not fit the request/response Mongo command shape well.
 Health and admin:
 
 ```text
+GET  /health/live
 GET  /health/ready
+GET  /api/admin/tokens
+POST /api/admin/tokens
+DELETE /api/admin/tokens/{token_id}
 GET  /api/admin/cluster/health[?stale_threshold_ms={ms}]
 GET  /api/admin/cluster/readiness[?stale_threshold_ms={ms}]
 GET  /api/admin/scheduler
@@ -156,6 +215,12 @@ POST /api/admin/backups
 POST /api/admin/restores
 POST /api/policy/worker/run
 ```
+
+`/health/live` reports whether the HTTP process is alive. `/health/ready`
+returns `503 Service Unavailable` while the local node is draining or cluster
+routing state is unsafe; use readiness to remove a node from traffic and
+liveness only to decide whether the process should be restarted. Neither
+endpoint requires API authentication.
 
 Node maintenance body:
 
@@ -314,6 +379,12 @@ and older `v2:` item cursors for resume compatibility. Use the optional
 comma-separated `include` query parameter, for example
 `include=events,records,skills`, to filter object types:
 
+Durable export is currently a single-tablet feature. When metadata-backed
+cluster routing is active (`routing.mode = snapshot`), export status, watch,
+backfill, admin export status, and managed-consumer endpoints fail closed with
+HTTP 422 until a cross-tablet merge frontier exists. Ordinary runtime watch is
+still available in that evaluation mode.
+
 ```json
 {
   "items": [
@@ -341,6 +412,23 @@ comma-separated `include` query parameter, for example
   "high_watermark": "ledger:ten_..."
 }
 ```
+
+New durable cursors have the opaque shape
+`ledger:<tenant>/v2/<20-digit-sequence>/<kind>/...`. In a supported
+single-tablet runtime, the monotonically increasing per-tenant sequence is
+assigned at the serialized persistent commit boundary, so cursor order within
+a tenant is commit order rather than wall-clock order. Legacy retained
+timestamp cursors remain readable and sort before v2 cursors. Clients must not
+construct or parse either form.
+
+`next_cursor` is the cursor of the last item returned on this page and is the
+resume point for the next request; it is null when the page is empty.
+`high_watermark` is the export head captured before the request; results are
+bounded by it, and it may be ahead of `next_cursor` when the page is limited.
+Metadata backfill captures `snapshot_high_watermark` on the first page. Send
+that same value on every continued page together with `from_cursor`; the
+server rejects a continued metadata page without it or with an expired or
+foreign ledger boundary.
 
 Delete envelopes use `op = "delete"` and include `tombstone.reason`.
 Current reasons are `soft_delete`, `retention_gc`, and `tenant_purge`.
@@ -381,7 +469,9 @@ snapshots:
 Metadata snapshot includes use `snapshot:...` cursors and currently support
 `["tenants", "agents", "sessions", "artifacts", "records", "skills",
 "skill_bindings"]`. Do not mix `events` with metadata includes in one backfill
-request; run metadata backfill first, then event backfill/tail.
+request; run metadata backfill first, then event backfill/tail. Omit
+`snapshot_high_watermark` on the first metadata request, then echo the returned
+value on every request that supplies the preceding `from_cursor`.
 
 Managed export consumers provide durable checkpoints and leases. Official
 ClickHouse event exporters usually use `include=["events"]`; generic consumers
@@ -404,6 +494,25 @@ cursor or from the beginning. `GET /exports/consumers/{name}` and
 with total pending export items, max consumer lag, oldest pending timestamp,
 lease counts, and per-tenant oldest retained cursor/high-watermark entries.
 
+On persistent runtimes, ordinary ledger ack and rewind operations reject
+fabricated, expired, cross-tenant, scope-incompatible, or filter-incompatible
+cursors; the cursor must identify a retained ledger item emitted for that
+consumer. For a metadata snapshot, continue paging until a response reports
+`complete=true`, then pass the last delivered `snapshot:...` cursor and that
+response's `snapshot_high_watermark`. If the completed snapshot is empty,
+`cursor` may be null as long as `snapshot_high_watermark` is present. AgentDB
+verifies the snapshot tenant when a snapshot cursor exists and always verifies
+that the high watermark identifies a retained tenant ledger item, then stores
+the high watermark as the durable ack. Tailing therefore resumes at the ledger
+boundary instead of at a page-local snapshot cursor. Snapshot-style ack is
+accepted only for a tenant-scope, metadata-only consumer; event, agent, and
+session consumers must acknowledge a cursor they actually received.
+
+Consumer status counts pending rows by streaming the ledger. For one consumer,
+additional scan memory is O(1) and request time is O(N), where N is the number
+of retained ledger candidates visited after its checkpoint; rows excluded by
+the consumer's include filter can still contribute to N.
+
 For high availability, run at least two connector processes with the same
 consumer name and different `lease_owner` values. Only the active lease holder
 can ack. If it dies, another process claims the lease after expiry and resumes
@@ -414,9 +523,22 @@ Artifacts:
 
 ```text
 POST /api/tenants/{tenant_id}/artifacts
+GET  /api/tenants/{tenant_id}/artifacts/verify-lifecycle
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}
 GET  /api/tenants/{tenant_id}/artifacts/{artifact_id}/blob
 ```
+
+`artifacts/verify-lifecycle` is a non-destructive consistency check for
+single-node lifecycle operations. It verifies that live artifacts with raw bytes
+still read and hash correctly, and that derivative-only artifacts no longer
+have raw content in the content backend. The response includes counts plus
+per-artifact issues such as `missing_raw`, `hash_mismatch`, and
+`unexpected_raw_after_purge`.
+
+Artifact policy defaults to 16 MiB per object and may be raised to an absolute
+128 MiB (134,217,728-byte) limit. The native HTTP route accepts enough transport
+headroom for the runtime to return the structured `ARTIFACT_TOO_LARGE` error at
+that boundary; policies above 128 MiB are clamped.
 
 Records:
 
@@ -519,7 +641,7 @@ Common headers:
 Idempotency-Key          Optional mutation idempotency key.
 X-Sha256                 Optional artifact content checksum.
 X-AgentDB-Backpressure   Response header for backpressure signals.
-Authorization            Bearer token or Basic auth, depending on server config.
+Authorization            Bearer token for the native HTTP API when configured.
 ```
 
 ## Python SDK
@@ -544,6 +666,11 @@ session = agent.session("support-ticket-42")
 session.append_user("hello")
 events = session.replay(limit=100)
 ```
+
+`workspace()` first uses `/api/me` when that hosted identity endpoint exists.
+Otherwise it lists by `external_key` before creating, and agent/session helpers
+likewise reuse existing aliases (including after a client or server restart)
+before attempting creation.
 
 Primary sync classes:
 
@@ -595,6 +722,11 @@ vault or broker outside AgentDB; do not put credential values in `payload`. The
 Python SDK rejects append payload keys shaped like raw credentials, such as
 `api_key`, `access_token`, `password`, and `private_key`, before sending the
 request.
+
+The Python SDK sends `Idempotency-Key` only when the caller supplies
+`idempotency_key`. This keeps ordinary same-session appends eligible for server
+coalescing. Supply a stable key when the application may retry an ambiguous
+mutation; requests with an explicit key retain retry-safe replay semantics.
 
 Lower-level sync `Client` methods:
 
@@ -702,6 +834,10 @@ SessionHandle / Session
 The TypeScript SDK rejects append payload keys shaped like raw credentials, such
 as `api_key`, `access_token`, `password`, and `private_key`, before sending the
 request.
+
+The TypeScript SDK sends `Idempotency-Key` only when `idempotencyKey` is
+supplied. Omit it for the ordinary coalescible append path; pass a stable key
+when the application needs retry-safe replay after an ambiguous result.
 
 Lower-level `Client` methods:
 

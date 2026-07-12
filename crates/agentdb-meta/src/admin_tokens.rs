@@ -16,7 +16,6 @@ use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::AnyPool;
-use subtle::ConstantTimeEq;
 
 use crate::error::{MetaError, MetaResult};
 
@@ -61,14 +60,14 @@ impl AdminScope {
         }
     }
 
-    /// Parse from the persisted string form. Unknown values map
-    /// to `Admin` so an operator rolling back the code with the
-    /// migrated schema still gets a functional token (the column
-    /// default is `admin`, but this is belt-and-braces).
+    /// Parse from the persisted string form. Unknown values fail closed to
+    /// read-only so corrupted or forward-version metadata never grants write
+    /// access accidentally.
     pub fn from_stored(s: &str) -> Self {
         match s {
+            "admin" => AdminScope::Admin,
             "readonly" => AdminScope::Readonly,
-            _ => AdminScope::Admin,
+            _ => AdminScope::Readonly,
         }
     }
 }
@@ -109,9 +108,9 @@ pub async fn mint(
     rand::thread_rng().fill_bytes(&mut raw);
     let plaintext = format!("{TOKEN_PREFIX}{}", B64URL.encode(raw));
     let hash_b64 = B64.encode(sha256(plaintext.as_bytes()));
-    // `token_id` is the first 8 hex chars of the hash — an
-    // opaque stable identifier operators can use to `revoke`
-    // without pasting the full plaintext into CLI history.
+    // `token_id` is a 12-character URL-safe prefix of the hash — an opaque
+    // stable identifier operators can use to revoke without putting the full
+    // plaintext into CLI history.
     let token_id = short_id(&hash_b64);
 
     sqlx::query(
@@ -139,36 +138,21 @@ pub async fn mint(
     })
 }
 
-/// Constant-time verify a presented plaintext against the
-/// stored hashes. Returns `Ok(Some(token_id))` when matched,
-/// `Ok(None)` when not. Rejects revoked tokens the same way
-/// as unknown — the caller can't distinguish the two.
-///
-/// Walks every active row and does a constant-time compare.
-/// At prototype scale (handful of tokens) this is fine; a
-/// real deployment would index on a prefix to cut the scan
-/// down, but per-request cost is already a single atomic
-/// per entry.
+/// Verify a presented plaintext against the indexed SHA-256 hash. Returns
+/// `Ok(Some(token_id))` when matched and `Ok(None)` when unknown or revoked.
+/// Tokens contain 256 random bits, so querying by their digest does not turn
+/// a low-entropy secret into an offline oracle and keeps request cost bounded.
 pub async fn verify(pool: &AnyPool, presented: &str) -> MetaResult<Option<(String, AdminScope)>> {
     let candidate = B64.encode(sha256(presented.as_bytes()));
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT token_id, token_hash_b64, scope FROM admin_tokens WHERE revoked_at_ms IS NULL",
+    let matched: Option<(String, String)> = sqlx::query_as(
+        "SELECT token_id, scope
+           FROM admin_tokens
+          WHERE token_hash_b64 = $1 AND revoked_at_ms IS NULL",
     )
-    .fetch_all(pool)
+    .bind(candidate)
+    .fetch_optional(pool)
     .await?;
-    // Walk all rows even after a match, to keep timing
-    // independent of token position.
-    let mut matched: Option<(String, AdminScope)> = None;
-    for (id, hash, scope) in rows {
-        if candidate.as_bytes().ct_eq(hash.as_bytes()).unwrap_u8() == 1 {
-            // First match wins — the hash index is UNIQUE, so
-            // there can't be two.
-            if matched.is_none() {
-                matched = Some((id, AdminScope::from_stored(&scope)));
-            }
-        }
-    }
-    Ok(matched)
+    Ok(matched.map(|(id, scope)| (id, AdminScope::from_stored(&scope))))
 }
 
 /// Every non-revoked token, ordered by `created_at_ms`.
@@ -219,6 +203,16 @@ pub async fn count_active(pool: &AnyPool) -> MetaResult<i64> {
     Ok(n)
 }
 
+/// Number of token rows ever minted, including revoked rows. Bootstrap uses
+/// this count so revoking the final active credential cannot silently reopen
+/// the unauthenticated first-run path.
+pub async fn count_all(pool: &AnyPool) -> MetaResult<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_tokens")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -229,10 +223,17 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 fn short_id(hash_b64: &str) -> String {
-    // Take the first 12 characters of the base64 hash. Long
+    // Re-encode the stored standard-base64 hash as URL-safe base64 before
+    // truncating. Standard base64 can place `/` in an ID, which makes the ID
+    // impossible to address as a single HTTP path segment.
+    let hash = B64
+        .decode(hash_b64)
+        .expect("admin token hash is valid standard base64");
+    let url_safe_hash = B64URL.encode(hash);
+    // Take the first 12 characters of the URL-safe hash. Long
     // enough to be unique across any plausible cluster; short
     // enough for a CLI `revoke` argument.
-    hash_b64.chars().take(12).collect()
+    url_safe_hash.chars().take(12).collect()
 }
 
 /// Expose `MetaError` path for callers that want to map "not
@@ -317,11 +318,14 @@ mod tests {
     async fn count_active_tracks_mints_and_revokes() {
         let p = pool().await;
         assert_eq!(count_active(&p).await.unwrap(), 0);
+        assert_eq!(count_all(&p).await.unwrap(), 0);
         let a = mint(&p, "a", AdminScope::Admin, 100).await.unwrap();
         let _b = mint(&p, "b", AdminScope::Admin, 200).await.unwrap();
         assert_eq!(count_active(&p).await.unwrap(), 2);
+        assert_eq!(count_all(&p).await.unwrap(), 2);
         revoke(&p, &a.token_id, 300).await.unwrap();
         assert_eq!(count_active(&p).await.unwrap(), 1);
+        assert_eq!(count_all(&p).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -349,5 +353,13 @@ mod tests {
         let v_a = verify(&p, &a.plaintext).await.unwrap().unwrap();
         assert_eq!(v_r.1, AdminScope::Readonly);
         assert_eq!(v_a.1, AdminScope::Admin);
+    }
+
+    #[test]
+    fn unknown_persisted_scope_fails_closed() {
+        assert_eq!(
+            AdminScope::from_stored("future-scope"),
+            AdminScope::Readonly
+        );
     }
 }

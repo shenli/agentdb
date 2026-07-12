@@ -509,6 +509,7 @@ impl RouteRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dry_run_from_decision(
     mode: &'static str,
     local_node_id: &str,
@@ -658,7 +659,7 @@ impl RouteSnapshot {
                 && locator
                     .tenant_external_id
                     .as_deref()
-                    .map_or(true, |locator_tenant| locator_tenant == tenant_id)
+                    .is_none_or(|locator_tenant| locator_tenant == tenant_id)
         })
     }
 

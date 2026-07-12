@@ -80,6 +80,11 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup show
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       - name: Cache cargo registry + build
         uses: actions/cache@v4
         with:
@@ -124,6 +129,11 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup show
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Cache cargo
         uses: actions/cache@v4

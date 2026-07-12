@@ -38,14 +38,13 @@ from agentdb import Client
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-USER = os.environ.get("AGENTDB_USER", "demo")
-PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
+TOKEN = os.environ.get("AGENTDB_TOKEN")
 SESSION = "agent-coord"
 
 
 def producer() -> None:
     """Emits 3 task_started / task_done pairs."""
-    client = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    client = Client(base_url=SERVER_URL, token=TOKEN)
     sess = client.session(SESSION)
     # Brief delay so the reactor is attached when the first event
     # lands. (For a real workload, use `from_seq` on the reactor
@@ -59,7 +58,7 @@ def producer() -> None:
 
 def reactor() -> None:
     """Subscribes to the shared session, reacts only to task_done."""
-    client = Client(base_url=SERVER_URL, auth=(USER, PASSWORD))
+    client = Client(base_url=SERVER_URL, token=TOKEN)
     sess = client.session(SESSION)
     print("reactor: waiting for task_done events…")
     seen = 0

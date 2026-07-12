@@ -64,7 +64,7 @@ contract below it.
 
 ## Current State
 
-AgentDB already has the beginning of this surface:
+AgentDB has both the runtime watch surface and the durable export surface:
 
 - `GET /api/tenants/{tenant_id}/watch` returns `ChangefeedItem` values.
 - Watch supports tenant, agent, and session scope.
@@ -73,19 +73,25 @@ AgentDB already has the beginning of this surface:
 - Records already have a durable outbox-like path for async global indexing.
 - Architecture docs already treat watch/changefeed cursors as a dashboard and
   supervisor primitive.
+- Persistent export mutations are written to a dedicated durable ledger with
+  tenant, agent, and session indexes, retained-cursor validation, and managed
+  consumer checkpoints.
 
-The current watch implementation is not yet enough as a general replication
-contract:
+The general watch implementation remains intentionally different from the
+replication contract:
 
 - It primarily emits session events, not every runtime mutation.
 - It reconstructs results from live session events instead of reading a
   dedicated durable changefeed ledger.
-- The cursor is derived from event timestamp, session id, and sequence. That is
-  useful but not a complete placement- and restore-safe export cursor.
-- It does not define retention, expired-cursor handling, sink checkpointing, or
-  backfill behavior as explicit product contracts.
-- It does not provide projection-friendly schemas for ClickHouse and other
-  analytical sinks.
+- Its frontier/item cursors are for runtime observation, not external sink
+  checkpoints.
+
+The durable export API closes those replication gaps for single-tablet
+runtimes. Its v2 cursor contains a monotonic sequence allocated at the
+serialized persistent commit boundary, not a wall-clock timestamp; it defines
+retention and expired-cursor errors, backfill, leases/checkpoints, tombstones,
+and projection-friendly envelopes. Metadata-backed cross-tablet routing fails
+the export surface closed until it has a distributed merge frontier.
 
 ## Goals
 
@@ -287,26 +293,51 @@ export lag.
 
 ### 3. Stable Export Cursor
 
-The current watch cursor should evolve into an opaque cursor with enough
-information to survive tablet movement, restore, split, and merge.
-
-The internal cursor can encode:
+Persistent export uses an opaque `ledger:` cursor distinct from the general
+runtime-watch cursor. Its current v2 form encodes:
 
 ```text
 version
-tenant_id or tenant shard
-placement scope / cell
-tablet_id
-tablet_epoch
-applied_index
-change_seq_within_applied_index
+tenant_id
+per-tenant durable sequence (single-tablet runtime)
+object kind and identity
 ```
 
-Clients must treat the cursor as opaque. AgentDB can expose decoded cursor
-diagnostics in admin endpoints, but SDKs and sinks should persist and replay the
-opaque string.
+The sequence is allocated when the serialized KV writer commits the mutation
+and export row, so ordering follows durable commit order rather than event or
+wall-clock time. The persisted tenant sequence survives restart. Retained
+legacy timestamp-based ledger cursors remain readable during migration, but new
+writes receive v2 cursors.
 
-Expired cursors should return a structured error with:
+Clients must still treat the whole cursor as opaque. SDKs and sinks should
+persist and replay it, not parse or synthesize one. Managed consumer ack and
+rewind reject a well-formed but fabricated cursor: the row must still exist and
+match the consumer tenant, scope, and include filter.
+
+Persistent page boundaries have separate meanings:
+
+- `next_cursor` is the last row returned in that page and is the cursor for the
+  next page request.
+- `high_watermark` is the ledger head captured when an export-watch request
+  starts.
+- `snapshot_high_watermark` is captured on the first backfill page and remains
+  fixed across continued pages. Clients must echo it with `from_cursor`. When
+  a metadata snapshot completes, its acknowledgement normalizes to that fixed
+  boundary before tailing begins.
+
+Metadata enumeration is not a transactionally frozen KV snapshot across
+multiple page requests, so concurrent metadata mutation can affect which
+version appears in a page and can produce a snapshot-plus-tail duplicate. The
+fixed first-page ledger boundary ensures committed mutations after that point
+remain visible in the tail instead of being skipped. A true multi-page
+point-in-time snapshot remains future
+hardening.
+
+A future tablet-local cursor format may add placement/epoch fields behind the
+same opaque contract. Tablet movement and restore currently preserve the
+tenant ledger, high-watermark, and managed-consumer rows.
+
+Expired cursors return a structured error with:
 
 - `oldest_available_cursor`
 - `requested_cursor`
@@ -808,8 +839,19 @@ Response:
   artifacts, records, skills, and skill bindings.
 - Implemented: explicit persisted cursor validation and
   `oldest_available_cursor` reporting for export watch, backfill, and status.
+- Implemented: commit-ordered v2 durable cursors backed by a persisted
+  per-tenant sequence in single-tablet runtimes. Late commits cannot sort
+  behind an already-issued high-watermark merely because their wall-clock
+  timestamp is older; retained legacy timestamp cursors remain readable during
+  migration. Routed cross-tablet export fails closed pending a merge frontier.
+- Implemented: page-local `next_cursor`, request-start bounded
+  `high_watermark`, and fixed first-page `snapshot_high_watermark` semantics,
+  with tests covering limited pages and changes committed between pages.
 - Implemented: managed export consumers with durable checkpoints, include
   filters, leases, ack, and rewind.
+- Implemented: managed ack/rewind validation against an actual retained ledger
+  item for the consumer tenant, scope, and include filter. Metadata snapshot
+  acknowledgements normalize to the captured ledger high watermark.
 - Implemented: per-tenant durable export high-watermark pointers for
   persistent runtimes, so `exports/status` does not scan the full ledger.
 - Implemented: durable session and agent export ledger indexes for scoped
@@ -834,6 +876,8 @@ Response:
 - Implemented: `GET /api/admin/exports` visibility for managed consumers and
   current export capability, including pending item count, high watermark,
   oldest pending item timestamp, lag, and lease-active state.
+- Implemented: streaming pending-status calculation with O(1) additional
+  memory and O(number of retained pending rows) scan time.
 - Implemented: aggregate admin export metrics for total pending items, max
   lag, oldest pending timestamp, lease counts, and oldest retained cursors.
 - Implemented: normalized event observability fields for common convention
@@ -873,7 +917,7 @@ exports use secondary index rows that point back to the canonical tenant ledger
 entry, avoiding full tenant scans while preserving one sink checkpoint cursor
 format.
 
-HA behavior: run multiple connector workers with the same consumer name and
+Single-tablet HA behavior: run multiple connector workers with the same consumer name and
 distinct lease owners. Only the active lease holder can ack. The connector
 writes a batch to ClickHouse before acking AgentDB, so failover can replay the
 last unacked batch without data loss. RPO is zero for committed AgentDB events
@@ -1003,7 +1047,9 @@ formalized.
 
 - Resume from every returned cursor without gaps or duplicates.
 - Retry connector batches and verify idempotent sink state.
-- Backfill then tail from `snapshot_high_watermark` without gaps.
+- Backfill then tail from the fixed first-page `snapshot_high_watermark`
+  without gaps; tolerate snapshot/tail duplicates during concurrent metadata
+  mutation.
 - Delete and retention GC produce tombstones.
 - Export lag metrics increase when a sink stops and recover when it resumes.
 - Cursor expiry returns a structured error.
@@ -1016,10 +1062,11 @@ formalized.
 
 ## Open Questions
 
-- Should the first durable export ledger be tenant-local or tablet-local?
+- Which cross-tablet frontier and opaque cursor version should merge tablet
+  applied indexes/epochs without relying on one process-local tenant sequence?
 - Which normalized fields should become mandatory in the event conventions?
-- Should the ClickHouse connector be built into `agentdbctl`, shipped as a
-  separate binary, or both?
+- At what deployment scale does the `agentdbctl` worker need a separate
+  always-on connector binary/package?
 - What is the minimum retained changefeed window for hosted deployments?
 - Should the OTel projection target ClickStack's exact default table names or
   AgentDB-prefixed tables with compatibility views?
@@ -1028,15 +1075,17 @@ formalized.
 
 ## Recommendation
 
-Build this in this order:
+The durable ledger, managed consumers, ClickHouse/ClickStack path, and
+JSONL/Parquet path have landed. Continue in this order:
 
-1. Ship the ClickHouse golden path on top of current watch.
-2. Add managed consumers, durable ledger, and backfill.
-3. Expand object coverage to artifacts, records, lifecycle, policy, and
-   tombstones.
-4. Add OTel/ClickStack projection after the native schema is stable.
-5. Add S3/Parquet once the envelope and cursor contract are stable.
-6. Add Kafka, OpenTelemetry Collector, and warehouse/lakehouse connectors based
+1. Make metadata backfill a transactionally stable multi-page snapshot.
+2. Promote tenant policy mutation/redaction into the server-side export path;
+   connector-side filtering remains defense in depth, not the policy source.
+3. Validate cursor continuity and throughput under sustained tablet movement,
+   restore, retention, and multi-worker failover.
+4. Add a separate always-on connector package only when deployment evidence
+   shows `agentdbctl` workers are insufficient.
+5. Add Kafka, OpenTelemetry Collector, and warehouse/lakehouse connectors based
    on customer demand, without changing runtime export semantics.
 
 This gives observability systems a clean path without making AgentDB's runtime

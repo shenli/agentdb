@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Hard transport/runtime ceiling for one artifact. Tenant and agent policy
+/// can lower this value but cannot raise it.
+pub const ABSOLUTE_MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
@@ -165,7 +169,7 @@ impl RuntimePolicy {
             .map(tier_template)
             .unwrap_or_default();
         base = base.merge_override(v);
-        base
+        base.clamp_absolute_limits()
     }
 
     pub fn merge_override(mut self, override_json: &serde_json::Value) -> Self {
@@ -175,6 +179,14 @@ impl RuntimePolicy {
         let mut base = serde_json::to_value(&self).expect("policy serializes");
         merge_json(&mut base, override_json);
         self = serde_json::from_value(base).unwrap_or(self);
+        self.clamp_absolute_limits()
+    }
+
+    fn clamp_absolute_limits(mut self) -> Self {
+        self.artifact_size.max_artifact_bytes = self
+            .artifact_size
+            .max_artifact_bytes
+            .min(ABSOLUTE_MAX_ARTIFACT_BYTES);
         self
     }
 }
@@ -307,7 +319,7 @@ fn tier_template(name: &str) -> RuntimePolicy {
             },
             artifact_size: ArtifactSizePolicy {
                 max_inline_event_bytes: 256 * 1024,
-                max_artifact_bytes: 128 * 1024 * 1024,
+                max_artifact_bytes: ABSOLUTE_MAX_ARTIFACT_BYTES,
             },
             retention: RetentionPolicy::default(),
             lifecycle: LifecyclePolicy::default(),

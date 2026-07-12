@@ -43,13 +43,17 @@ fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
 #[derive(Default)]
 struct PartialThenFailContentBackend {
     writes: Mutex<Vec<(String, String, Vec<u8>)>>,
+    last_attempted_artifact_id: Mutex<Option<String>>,
 }
 
 impl PartialThenFailContentBackend {
     fn last_artifact_id(&self) -> Id {
-        let writes = self.writes.lock().expect("content writes lock poisoned");
         Id::parse_kind(
-            &writes.last().expect("content put attempted").1,
+            self.last_attempted_artifact_id
+                .lock()
+                .expect("last attempted artifact lock poisoned")
+                .as_deref()
+                .expect("content put attempted"),
             IdKind::Artifact,
         )
         .expect("artifact id parses")
@@ -71,6 +75,10 @@ impl ContentBackend for PartialThenFailContentBackend {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            *self
+                .last_attempted_artifact_id
+                .lock()
+                .expect("last attempted artifact lock poisoned") = Some(artifact_id.to_string());
             let partial_len = bytes.len().min(4);
             self.writes
                 .lock()
@@ -336,6 +344,10 @@ async fn failed_partial_content_write_does_not_publish_artifact_metadata() {
     assert_eq!(err.code, agentdb_core::ErrorCode::Internal);
 
     let failed_artifact_id = failing_content.last_artifact_id();
+    assert!(!failing_content
+        .head(tenant.tenant_id.as_str(), failed_artifact_id.as_str())
+        .await
+        .unwrap());
     assert_eq!(
         rt.get_artifact(&tenant.tenant_id, &failed_artifact_id)
             .await

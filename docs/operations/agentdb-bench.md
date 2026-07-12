@@ -89,6 +89,13 @@ adaptive fast path: direct write when there is no queue/active writer, queued
 group write when contention exists. Adaptive grouping is enabled by default and
 can be disabled with `AGENTDB_APPEND_GROUP_COMMIT=0`.
 
+The maintained Python and TypeScript SDKs now match this measured default path:
+they send `Idempotency-Key` only when the caller supplies a stable key. Ordinary
+appends are therefore coalescing-eligible, while explicitly idempotent retries
+retain replay semantics and intentionally bypass same-session coalescing. The
+append-only coalescing result is therefore reachable through default SDK calls,
+not only through the Rust benchmark client.
+
 The final mixed-path run also avoids a second state-lock acquisition for policy
 resolution, returns append-and-fetch hot tails from the append commit path,
 reuses the committed state for route backpressure headers, and relies on the

@@ -290,11 +290,14 @@ pub struct TabletStoreStatus {
 pub struct AppState {
     pub runtime: Arc<Runtime>,
     pub meta: Option<MetaStore>,
+    pub auth_meta: Option<MetaStore>,
     pub routing: RouteRuntime,
     pub raft_ingress: Option<Arc<dyn RaftRsIngress>>,
     pub raft_registry: Option<Arc<RaftRsGroupRegistry>>,
     pub internal_auth_token: Option<Arc<str>>,
     pub internal_auth_previous_token: Option<Arc<str>>,
+    pub api_auth_token: Option<Arc<str>>,
+    pub api_auth_previous_token: Option<Arc<str>>,
     pub drain: DrainState,
     pub scheduler: Option<SchedulerStatus>,
     pub tablet_store: Option<TabletStoreStatus>,
@@ -309,11 +312,14 @@ impl AppState {
         Self {
             runtime,
             meta: None,
+            auth_meta: None,
             routing: RouteRuntime::disabled(),
             raft_ingress: None,
             raft_registry: None,
             internal_auth_token: None,
             internal_auth_previous_token: None,
+            api_auth_token: None,
+            api_auth_previous_token: None,
             drain: DrainState::new("single-node"),
             scheduler: None,
             tablet_store: None,
@@ -325,7 +331,13 @@ impl AppState {
     }
 
     pub fn with_meta(mut self, meta: MetaStore) -> Self {
+        self.auth_meta = Some(meta.clone());
         self.meta = Some(meta);
+        self
+    }
+
+    pub fn with_auth_meta(mut self, meta: MetaStore) -> Self {
+        self.auth_meta = Some(meta);
         self
     }
 
@@ -353,6 +365,16 @@ impl AppState {
 
     pub fn with_internal_auth_previous_token(mut self, token: impl Into<Arc<str>>) -> Self {
         self.internal_auth_previous_token = Some(token.into());
+        self
+    }
+
+    pub fn with_api_auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.api_auth_token = Some(token.into());
+        self
+    }
+
+    pub fn with_api_auth_previous_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.api_auth_previous_token = Some(token.into());
         self
     }
 

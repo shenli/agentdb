@@ -200,6 +200,32 @@ test("friendly SDK can resolve workspace from auth user-info", async () => {
   assert.ok(!calls.some((call) => call.url.endsWith("/api/tenants") && call.body !== undefined));
 });
 
+test("workspace create race reuses the winning tenant", async () => {
+  let tenantGets = 0;
+  const mockFetch = async (url: string | URL, init?: RequestInit) => {
+    const raw = String(url);
+    if (raw.endsWith("/api/me")) return json({ error: { message: "not found" } }, 404);
+    if (raw.endsWith("/api/tenants") && init?.method === "GET") {
+      tenantGets += 1;
+      return json({
+        tenants: tenantGets === 1
+          ? []
+          : [{ tenant_id: "ten_winner", external_key: "acme" }],
+      });
+    }
+    if (raw.endsWith("/api/tenants") && init?.method === "POST") {
+      return json({ error: { code: "alias_conflict", message: "already exists" } }, 409);
+    }
+    throw new Error(`unexpected request: ${init?.method} ${raw}`);
+  };
+
+  const db = new AgentDB({ baseUrl: "http://x", fetch: mockFetch as typeof globalThis.fetch });
+  const workspace = await db.workspace("acme");
+
+  assert.equal(workspace.id, "ten_winner");
+  assert.equal(tenantGets, 2);
+});
+
 test("bearer token is sent when configured", async () => {
   const authHeaders: string[] = [];
   const mockFetch = async (_url: string | URL, init?: RequestInit) => {

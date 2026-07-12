@@ -29,8 +29,7 @@ from agentdb import AsyncClient
 
 
 SERVER_URL = os.environ.get("AGENTDB_URL", "http://127.0.0.1:7878")
-USER = os.environ.get("AGENTDB_USER", "demo")
-PASSWORD = os.environ.get("AGENTDB_PASSWORD", "demo-secret")
+TOKEN = os.environ.get("AGENTDB_TOKEN")
 SESSION_ID = "async-quickstart-agent"
 
 
@@ -55,7 +54,7 @@ def render(label: str, recent) -> None:
 
 
 async def main() -> None:
-    async with AsyncClient(base_url=SERVER_URL, auth=(USER, PASSWORD)) as client:
+    async with AsyncClient(base_url=SERVER_URL, token=TOKEN) as client:
         if not await client.health_ready():
             raise SystemExit(
                 f"AgentDB not ready at {SERVER_URL}. Start it with:\n"

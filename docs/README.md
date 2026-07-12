@@ -23,6 +23,11 @@ public docs path.
   distributed storage validation
 - [agentdb-messaging-house.md](agentdb-messaging-house.md)
   - product positioning and value-prop messaging framework
+- [design/codemate-product-note.md](design/codemate-product-note.md)
+  - research findings and local-first demo plan for CodeMate, a developer app
+  that uses AgentDB to review agent sessions and distill best practices
+- [design/codemate-prd.md](design/codemate-prd.md)
+  - simple PRD for CodeMate as a third-party local web app
 
 ## Run And Operate
 
@@ -30,6 +35,25 @@ public docs path.
   paths, packaging modes, and current cluster status
 - [operations/operations.md](operations/operations.md) - start/stop, backup,
   restore, upgrade, and troubleshooting for the supported single-node shape
+- [operations/single-node-production-checklist.md](operations/single-node-production-checklist.md)
+  - preflight gate before exposing a persistent single node
+- [operations/backup-verification.md](operations/backup-verification.md) -
+  backup manifest validation, tablet checkpoint checks, scratch install drills,
+  and recovery boundaries
+- [operations/restore-recovery.md](operations/restore-recovery.md) - offline
+  single-node restore and recovery procedure
+- [operations/single-node-upgrade.md](operations/single-node-upgrade.md) -
+  single-node upgrade, verification, and rollback procedure
+- [operations/storage-maintenance.md](operations/storage-maintenance.md) -
+  storage inspection, compaction, and sizing checks
+- [operations/disk-full-recovery.md](operations/disk-full-recovery.md) -
+  response procedure for full runtime or backup volumes
+- [operations/routine-maintenance.md](operations/routine-maintenance.md) -
+  daily, weekly, and pre-maintenance checklist
+- [operations/cdc-export.md](operations/cdc-export.md) - CDC/export operation,
+  ClickHouse, JSONL/Parquet archives, cursors, and consumer recovery
+- [operations/tiered-storage.md](operations/tiered-storage.md) -
+  warm/cold/archive/derivative-only lifecycle operation and verification
 - [operations/agentdbctl.md](operations/agentdbctl.md) - human and AI-agent
   friendly admin workflows
 - [operations/performance.md](operations/performance.md) - benchmark commands
