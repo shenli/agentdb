@@ -501,7 +501,7 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
 - **Oracle:** each tenant's reads/search/watch/export/Mongo/adapters/blob results equal only that tenant's model; cross-tenant requests return not found/invalid cursor without existence leaks; adapters produce the same core event/record model as native HTTP.
 - **Observability required:** model state per tenant, operation history, adapter request logs, index stats, response status/error codes.
 - **Exit criteria:** PASS for 10k operations over 20 seeds with zero isolation violations; FAIL on any cross-tenant object, cursor item, index result, or successful wrong-tenant mutation.
-- **Target test file:** `adapters/tests/auto/test_S5_tenant_isolation_across_http_sdk_mongo_adapters_and_export.py`
+- **Target test file:** `adapters/tests/auto/test_S5_tenant_isolation_across_http_sdk_adapters_and_export.py`
 - **Skeleton language:** python
 - **Skeleton:**
 

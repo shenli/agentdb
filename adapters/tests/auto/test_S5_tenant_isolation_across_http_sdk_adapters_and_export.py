@@ -1,5 +1,5 @@
 # AUTO-GENERATED from test plan: testing-plans/agentdb-project-wide-distributed-tests.md
-# Scenario: S5 tenant_isolation_across_http_sdk_mongo_adapters_and_export
+# Scenario: S5 tenant_isolation_across_http_sdk_adapters_and_export
 # Falsifies: C7, C11, C14, C20, C21
 #
 # REVIEW BEFORE TREATING AS A PERMANENT REGRESSION.
@@ -32,7 +32,6 @@ from agentdb import AgentDB, AgentDBError, Client  # noqa: E402
 @dataclasses.dataclass(frozen=True)
 class LiveServer:
     base_url: str
-    mongo_uri: str
 
 
 def _free_port() -> int:
@@ -67,7 +66,6 @@ def live_server():
             f"server binary not found at {SERVER_BIN}; run cargo build -p agentdb-server"
         )
     port = _free_port()
-    mongo_port = _free_port()
     proc = subprocess.Popen(
         [
             str(SERVER_BIN),
@@ -75,8 +73,6 @@ def live_server():
             "--in-memory",
             "--bind",
             f"127.0.0.1:{port}",
-            "--mongo-bind",
-            f"127.0.0.1:{mongo_port}",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -99,7 +95,6 @@ def live_server():
     try:
         yield LiveServer(
             base_url=base_url,
-            mongo_uri=f"mongodb://127.0.0.1:{mongo_port}/?directConnection=true",
         )
     finally:
         proc.terminate()
@@ -306,75 +301,3 @@ def test_tenant_isolation_across_typescript_sdk_and_export_surfaces(
     assert result["watchedA"] >= 1
 
 
-def test_tenant_isolation_across_mongo_database_mapping(live_server: LiveServer):
-    pymongo = pytest.importorskip("pymongo")
-
-    key_a = "tenant-a-mongo-auto"
-    key_b = "tenant-b-mongo-auto"
-    marker_a = "mongo-a-only"
-    marker_b = "mongo-b-only"
-
-    mongo_client = pymongo.MongoClient(
-        live_server.mongo_uri, serverSelectionTimeoutMS=2000
-    )
-    try:
-        mongo_client[key_a].events.insert_one(
-            {
-                "session_alias": "tenant-a-mongo-session",
-                "kind": "message",
-                "payload": {"label": marker_a},
-            }
-        )
-        mongo_client[key_b].events.insert_one(
-            {
-                "session_alias": "tenant-b-mongo-session",
-                "kind": "message",
-                "payload": {"label": marker_b},
-            }
-        )
-
-        events_a = list(mongo_client[key_a].events.find({"kind": "message"}))
-        encoded_events_a = json.dumps(events_a, default=str)
-        assert marker_a in encoded_events_a
-        assert marker_b not in encoded_events_a
-
-        events_b = list(mongo_client[key_b].events.find({"kind": "message"}))
-        encoded_events_b = json.dumps(events_b, default=str)
-        assert marker_b in encoded_events_b
-        assert marker_a not in encoded_events_b
-    finally:
-        mongo_client.close()
-
-    status, tenants = _json("GET", f"{live_server.base_url}/api/tenants")
-    assert status == 200
-    tenants_by_key = {
-        tenant["external_key"]: tenant["tenant_id"] for tenant in tenants["tenants"]
-    }
-    tenant_a = tenants_by_key[key_a]
-    tenant_b = tenants_by_key[key_b]
-
-    status, watch_a = _json(
-        "GET", f"{live_server.base_url}/api/tenants/{tenant_a}/watch?scope=tenant"
-    )
-    assert status == 200
-    encoded_watch_a = json.dumps(watch_a)
-    assert marker_a in encoded_watch_a
-    assert marker_b not in encoded_watch_a
-
-    status, export_a = _json(
-        "GET",
-        f"{live_server.base_url}/api/tenants/{tenant_a}/exports/watch?include=events&limit=100",
-    )
-    assert status == 200
-    encoded_export_a = json.dumps(export_a)
-    assert marker_a in encoded_export_a
-    assert marker_b not in encoded_export_a
-
-    status, export_b = _json(
-        "GET",
-        f"{live_server.base_url}/api/tenants/{tenant_b}/exports/watch?include=events&limit=100",
-    )
-    assert status == 200
-    encoded_export_b = json.dumps(export_b)
-    assert marker_b in encoded_export_b
-    assert marker_a not in encoded_export_b

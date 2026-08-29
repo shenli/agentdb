@@ -14,9 +14,10 @@ session lifecycle and artifact byte tiering, see
 ## Summary
 
 The current storage engine is a single-node runtime store behind the `KvStore`
-trait. It supports local RocksDB and an optional SlateDB-backed object-store
-mode. This is enough for prototype and evaluation workloads, but it is not the
-right production hot-write architecture for a multi-node AgentDB cluster.
+trait, backed by local RocksDB. (A SlateDB-backed object-store mode was
+evaluated and retired.) This is enough for prototype and evaluation workloads,
+but it is not the right production hot-write architecture for a multi-node
+AgentDB cluster.
 
 The target architecture is a replicated tablet store:
 
@@ -49,8 +50,6 @@ records, idempotency keys, and index outbox rows as tenant-scoped logical keys.
 The current backends are:
 
 - `RocksKvStore`: local RocksDB runtime metadata and event storage.
-- `SlateKvStore`: optional SlateDB runtime metadata over an `object_store`
-  backend.
 - `LocalFsContentBackend`: local artifact/content bytes.
 - `ObjectStoreContentBackend`: S3-compatible artifact/content bytes.
 - `InMemoryContentBackend`: test and in-memory runtime support.
@@ -132,16 +131,15 @@ API request
   -> acknowledge after local visibility
 ```
 
-For RocksDB, durability comes from the local RocksDB write path. For SlateDB,
-runtime metadata is written through SlateDB to object storage. Artifact bytes
+Durability comes from the local RocksDB write path. Artifact bytes
 may be written to local filesystem or object storage through `ContentBackend`.
 
 The remaining storage-engine limitations are:
 
 - The current physical KV layout can still put too many tablets in one LSM
   instance.
-- SlateDB over object storage validates the KV abstraction, but it is not a
-  replacement for quorum replication.
+- The retired SlateDB evaluation validated the KV abstraction over object
+  storage, but object storage is not a replacement for quorum replication.
 - Synchronous object-store writes are too slow and variable for ordinary
   session append latency.
 - One large LSM tree eventually concentrates write amplification, compaction
@@ -149,18 +147,15 @@ The remaining storage-engine limitations are:
 
 ## Role Of SlateDB
 
-SlateDB is useful as an evaluation backend and as proof that AgentDB's storage
-abstraction can target object storage. It should not be treated as the final
-cluster commit mechanism.
+SlateDB was evaluated as an optional `KvStore` backend and has been retired
+from the workspace. The evaluation proved that AgentDB's storage abstraction
+can target object storage; it also confirmed that an object-store-backed LSM
+should not be treated as the final cluster commit mechanism.
 
-SlateDB is a candidate for:
+An object-store-backed LSM such as SlateDB remains a candidate for possible
+future use in cold, archive, snapshot, or read-mostly paths.
 
-- testing object-store-backed runtime metadata behavior
-- validating cold/archive object-store assumptions
-- hardening the `KvStore` abstraction against non-RocksDB backends
-- possible future use in cold, archive, snapshot, or read-mostly paths
-
-SlateDB is not currently responsible for:
+It is not a mechanism for:
 
 - quorum replication
 - leader election

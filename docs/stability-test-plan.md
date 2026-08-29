@@ -7,8 +7,7 @@ Status: draft for the `stability-test` branch.
 - Catch data loss, duplicate commit, stale read, index drift, and changefeed
   cursor regressions before release.
 - Exercise real multi-process AgentDB clusters with Postgres metadata, MinIO
-  object storage, SlateDB runtime storage, grouped RocksDB tablet storage, and
-  raft-rs replication.
+  object storage, grouped RocksDB tablet storage, and raft-rs replication.
 - Keep tests deterministic by default. Random chaos must use an explicit seed
   and report that seed.
 

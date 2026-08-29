@@ -64,122 +64,6 @@ import { AgentDB } from "agentdb";
 const db = new AgentDB({ baseUrl: "http://127.0.0.1:7878", token: "..." });
 ```
 
-AgentDB also has an opt-in MongoDB wire-protocol compatibility listener for a
-narrow driver/tool subset. Enable it with `agentdb serve --mongo-bind
-127.0.0.1:7879` or `[mongodb].bind` in config. Optional MongoDB `PLAIN`
-username/password auth is available with `--mongo-username` and
-`--mongo-password`. The native API remains canonical for agent runtime
-operations. See
-[mongodb-compatibility.md](mongodb-compatibility.md) for a tutorial, mapping
-rules, limitations, and AI coding-agent guidance.
-
-## MongoDB Compatibility Subset
-
-The MongoDB listener is for driver/tool access to AgentDB runtime collections.
-It is not full MongoDB compatibility.
-
-Supported initial commands:
-
-```text
-hello / isMaster
-saslStart / saslContinue   PLAIN auth only, when configured
-ping
-buildInfo
-endSessions
-listDatabases
-listCollections
-insert
-find
-count
-aggregate                 limited $match + $count support
-createIndexes             accepted as a no-op compatibility command
-agentdbAppendAndFetch     AgentDB extension command
-agentdbFork               AgentDB extension command
-agentdbReplay             AgentDB extension command
-agentdbContext            AgentDB extension command
-agentdbTransitionLifecycle AgentDB extension command
-agentdbRestoreSession     AgentDB extension command
-```
-
-Supported collections:
-
-```text
-sessions
-events
-records
-artifacts     metadata find only
-skills        insert and find
-```
-
-Current write mapping:
-
-```text
-db.events.insertOne(...)    -> Runtime::append(...)
-db.sessions.insertOne(...)  -> Runtime::create_session(...)
-db.records.insertOne(...)   -> Runtime::write_record(...)
-db.skills.insertOne(...)    -> Runtime::register_skill(...)
-db.artifacts.find(...)      -> Runtime::list_artifacts(...)
-```
-
-Unsupported MongoDB commands return a Mongo-shaped error document with `ok: 0`
-and `codeName: "CommandNotFound"` rather than falling through to a separate
-storage path.
-
-Example:
-
-```javascript
-db.events.insertOne({
-  session_alias: "support-ticket-42",
-  kind: "message",
-  payload: {
-    role: "user",
-    content: "hello"
-  }
-})
-
-db.events.find({ kind: "message" })
-db.sessions.find({ alias: "support-ticket-42" })
-
-db.runCommand({
-  agentdbAppendAndFetch: "events",
-  session_alias: "support-ticket-42",
-  kind: "message",
-  payload: {
-    role: "assistant",
-    content: "hi"
-  },
-  fetch_last_n: 20
-})
-
-db.runCommand({
-  agentdbFork: "sessions",
-  session_id: "ses_...",
-  at_seq: 42,
-  alias: "experiment-branch"
-})
-
-db.runCommand({
-  agentdbReplay: "sessions",
-  session_id: "ses_..."
-})
-
-db.runCommand({
-  agentdbContext: "sessions",
-  session_id: "ses_...",
-  include: ["events", "records", "skills", "policy"],
-  max_events: 20,
-  max_bytes: 262144
-})
-```
-
-If an event insert omits `session_id`, the compatibility layer creates or
-reuses a session under the provided `session_alias` or the default
-`mongo-session` alias. If `agent_id` is omitted, it creates or reuses the
-tenant-local `mongo-default` agent.
-
-Streaming watch/subscribe, artifact blob transfer, and admin operations remain
-native API first. They do not fit the request/response Mongo command shape well.
-
 Health and admin:
 
 ```text
@@ -584,11 +468,11 @@ small scalar predicate language for record metadata:
 ```json
 {
   "namespace": ["db0", "memory"],
-  "text": "mongo regression",
+  "text": "checkout regression",
   "metadata_filter": {
     "all": [
       { "path": "repo", "op": "eq", "value": "agentdb" },
-      { "path": "component", "op": "eq", "value": "wire" },
+      { "path": "component", "op": "eq", "value": "api" },
       { "path": "confidence", "op": "gte", "value": 0.8 }
     ],
     "none": [

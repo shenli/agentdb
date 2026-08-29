@@ -37,7 +37,7 @@ domain_max_background_jobs = ${tablet_store_domain_max_background_jobs}
 domain_max_open_files = ${tablet_store_domain_max_open_files}
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"

@@ -14,7 +14,6 @@ pub mod metadata_crypto;
 pub mod raft_rs_log;
 pub mod replicated_log;
 pub mod rocks;
-pub mod slate;
 pub mod tablet_store;
 
 pub use content::{
@@ -39,12 +38,8 @@ pub use raft_rs_log::{
     RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsTransport,
     RaftRsWireMessage,
 };
-pub use replicated_log::{
-    LogCommit, LogEntry, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftLogRecord,
-    RaftLogTransport, RaftQuorumReplicatedLog, ReplicatedLog, SingleNodeReplicatedLog,
-};
+pub use replicated_log::{LogCommit, LogEntry, ReplicatedLog, SingleNodeReplicatedLog};
 pub use rocks::{RocksKvStore, RocksKvStoreConfig};
-pub use slate::SlateKvStore;
 pub use tablet_store::{
     summarize_checkpoint_dir, GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore,
     TabletStoreCheckpointSummary, TabletStoreDomainMetrics, TabletStoreLifecycle,

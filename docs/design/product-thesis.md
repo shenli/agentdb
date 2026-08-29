@@ -163,11 +163,12 @@ For AgentDB, this suggests a split:
   namespace, source refs, policy, and lifecycle. Search alone is not enough.
 
 This split also means object storage should not be the synchronous hot-write
-contract. SlateDB-on-object-storage is useful as an evaluation backend and a way
-to harden the storage abstraction, but it does not provide multi-node commit
-consensus. Production hot writes should commit to local durable state replicated
-across nodes; object storage should receive sealed segments, archive bundles,
-and large artifacts asynchronously after the write is already safe.
+contract. AgentDB evaluated an object-store-backed metadata store (SlateDB) to
+harden the storage abstraction and retired it: object storage does not provide
+multi-node commit consensus. Production hot writes should commit to local
+durable state replicated across nodes; object storage should receive sealed
+segments, archive bundles, and large artifacts asynchronously after the write
+is already safe.
 
 ### Query Patterns Are Concentrated
 
@@ -397,11 +398,10 @@ MongoDB can back an implementation, especially early. But exposing a
 MongoDB-shaped product would optimize for document CRUD while the user is
 actually asking for session runtime semantics.
 
-AgentDB's MongoDB compatibility listener is intentionally narrower than that.
-It is useful as an adapter for existing MongoDB drivers, shell tooling, and AI
-coding agents that already know MongoDB collection helpers. The listener maps a
-small command subset onto AgentDB runtime methods; it does not make MongoDB CRUD
-the product model or create a second storage path.
+AgentDB once shipped a narrow MongoDB wire-compatibility listener as a driver
+adapter and has since removed it: maintaining even a small command subset pulled
+the product toward document CRUD. The native API and SDKs are the runtime
+surface.
 
 **Columnar analytics stores, such as ClickHouse.** ClickHouse is excellent for
 high-volume analytical ingestion, aggregation, dashboards, and log-style

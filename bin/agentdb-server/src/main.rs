@@ -26,7 +26,6 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
-const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
 const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
@@ -169,18 +168,6 @@ struct ServeOpts {
     #[arg(long)]
     route_proxy_max_response_bytes: Option<u64>,
 
-    /// Optional MongoDB wire-protocol compatibility listener, e.g. 127.0.0.1:7879.
-    #[arg(long)]
-    mongo_bind: Option<SocketAddr>,
-
-    /// Optional MongoDB PLAIN auth username. Requires `--mongo-password`.
-    #[arg(long)]
-    mongo_username: Option<String>,
-
-    /// Optional MongoDB PLAIN auth password. Requires `--mongo-username`.
-    #[arg(long)]
-    mongo_password: Option<String>,
-
     /// Shared secret for internal node-to-node APIs. Can also be set with
     /// AGENTDB_INTERNAL_AUTH_TOKEN.
     #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN")]
@@ -210,14 +197,6 @@ struct DevOpts {
     /// `host:port` to bind. Defaults to `127.0.0.1:7878`.
     #[arg(long)]
     bind: Option<SocketAddr>,
-
-    /// MongoDB wire-protocol compatibility listener. Defaults to `127.0.0.1:7879`.
-    #[arg(long)]
-    mongo_bind: Option<SocketAddr>,
-
-    /// Disable the MongoDB compatibility listener.
-    #[arg(long)]
-    no_mongo: bool,
 
     /// Use persistent local storage instead of the default in-memory runtime.
     #[arg(long)]
@@ -371,17 +350,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
                 Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
             }
-            KvBackendKind::SlateDb => {
-                let object_store = build_object_store(
-                    config
-                        .object_store
-                        .as_ref()
-                        .expect("slatedb requires object store config"),
-                )?;
-                let prefix = slate_runtime_prefix(&config);
-                tracing::info!(prefix = %prefix, "opened SlateDB runtime backend");
-                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &prefix).await?)
-            }
         };
 
         let (content, content_mirror) = build_content_backend(&config)?;
@@ -476,25 +444,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
 
     if let Some(bootstrap) = dev_bootstrap.as_ref() {
         print_dev_bootstrap(&runtime, &config, bootstrap).await?;
-    }
-
-    if let Some(mongo_bind) = config.mongo_bind {
-        let mongo_listener = tokio::net::TcpListener::bind(mongo_bind).await?;
-        let mongo_runtime = runtime.clone();
-        let mongo_auth = config.mongo_auth();
-        tokio::spawn(async move {
-            if let Err(error) =
-                agentdb_wire::server::serve_with_auth(mongo_listener, mongo_runtime, mongo_auth)
-                    .await
-            {
-                tracing::error!(?error, "MongoDB compatibility listener stopped");
-            }
-        });
-        tracing::info!(
-            addr = %mongo_bind,
-            auth_enabled = config.mongo_auth_enabled(),
-            "MongoDB compatibility listener enabled"
-        );
     }
 
     let mut state = agentdb_api::AppState::new(runtime.clone())
@@ -731,14 +680,6 @@ async fn dev(opts: DevOpts) -> anyhow::Result<()> {
 }
 
 fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
-    let mongo_bind = if opts.no_mongo {
-        None
-    } else {
-        Some(
-            opts.mongo_bind
-                .unwrap_or_else(|| "127.0.0.1:7879".parse().expect("default mongo bind parses")),
-        )
-    };
     ServeOpts {
         config: None,
         bind: opts.bind,
@@ -756,9 +697,6 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         route_refresh_interval_ms: None,
         route_proxy_timeout_ms: None,
         route_proxy_max_response_bytes: None,
-        mongo_bind,
-        mongo_username: None,
-        mongo_password: None,
         internal_auth_token: None,
         internal_auth_previous_token: None,
         api_auth_token: None,
@@ -801,9 +739,6 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
-    mongo_bind: Option<SocketAddr>,
-    mongo_username: Option<String>,
-    mongo_password: Option<String>,
     internal_auth_token: Option<String>,
     internal_auth_previous_token: Option<String>,
     api_auth_token: Option<String>,
@@ -822,19 +757,6 @@ struct RaftRsRegistryBootstrap {
     tablet_ids: Vec<i64>,
     bootstrapped_tablet_ids: Vec<i64>,
     local_logs: BTreeMap<i64, Arc<agentdb_storage::RaftRsReplicatedLog>>,
-}
-
-impl ResolvedServeConfig {
-    fn mongo_auth(&self) -> Option<agentdb_wire::server::AuthConfig> {
-        Some(agentdb_wire::server::AuthConfig {
-            username: self.mongo_username.clone()?,
-            password: self.mongo_password.clone()?,
-        })
-    }
-
-    fn mongo_auth_enabled(&self) -> bool {
-        self.mongo_username.is_some() && self.mongo_password.is_some()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,7 +891,6 @@ enum DeploymentMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KvBackendKind {
     RocksDb,
-    SlateDb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1074,15 +995,6 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
-        let mongo_username = opts
-            .mongo_username
-            .or(file.mongodb.username)
-            .or_else(|| std::env::var("AGENTDB_MONGODB_USERNAME").ok());
-        let mongo_password = opts
-            .mongo_password
-            .or(file.mongodb.password)
-            .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
-        validate_mongo_auth(&mongo_username, &mongo_password)?;
         let internal_auth_token = opts
             .internal_auth_token
             .or(file.server.internal_auth_token)
@@ -1155,9 +1067,6 @@ impl ResolvedServeConfig {
                 .route_proxy_max_response_bytes
                 .or(file.routing.proxy_max_response_bytes)
                 .unwrap_or(16 * 1024 * 1024),
-            mongo_bind: opts.mongo_bind.or(file.mongodb.bind),
-            mongo_username,
-            mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
             api_auth_token,
@@ -1229,15 +1138,6 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
-        let mongo_username = file
-            .mongodb
-            .username
-            .or_else(|| std::env::var("AGENTDB_MONGODB_USERNAME").ok());
-        let mongo_password = file
-            .mongodb
-            .password
-            .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
-        validate_mongo_auth(&mongo_username, &mongo_password)?;
         let internal_auth_token = file
             .server
             .internal_auth_token
@@ -1302,9 +1202,6 @@ impl ResolvedServeConfig {
                 .routing
                 .proxy_max_response_bytes
                 .unwrap_or(16 * 1024 * 1024),
-            mongo_bind: file.mongodb.bind,
-            mongo_username,
-            mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
             api_auth_token,
@@ -1324,8 +1221,6 @@ struct FileConfig {
     storage: StorageFileConfig,
     #[serde(default)]
     routing: RoutingFileConfig,
-    #[serde(default)]
-    mongodb: MongoDbFileConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1410,29 +1305,6 @@ struct RoutingFileConfig {
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
     proxy_max_response_bytes: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MongoDbFileConfig {
-    bind: Option<SocketAddr>,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-fn validate_mongo_auth(username: &Option<String>, password: &Option<String>) -> anyhow::Result<()> {
-    match (username, password) {
-        (Some(username), Some(password)) if username.is_empty() || password.is_empty() => {
-            anyhow::bail!("mongodb username/password must not be empty")
-        }
-        (Some(_), Some(_)) | (None, None) => Ok(()),
-        (Some(_), None) => anyhow::bail!(
-            "mongodb username requires a password; set --mongo-password or AGENTDB_MONGODB_PASSWORD"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "mongodb password requires a username; set --mongo-username or AGENTDB_MONGODB_USERNAME"
-        ),
-    }
 }
 
 fn validate_internal_auth_token(
@@ -1520,7 +1392,6 @@ fn validate_api_auth_tokens(
 fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
     match cfg.backend.as_deref().unwrap_or("rocksdb") {
         "rocksdb" => Ok(KvBackendKind::RocksDb),
-        "slatedb" => Ok(KvBackendKind::SlateDb),
         other => anyhow::bail!("unknown storage.kv.backend: {other}"),
     }
 }
@@ -1608,28 +1479,7 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
-fn slate_runtime_prefix(config: &ResolvedServeConfig) -> String {
-    if matches!(config.deployment_mode, DeploymentMode::Cluster) {
-        if let Some(node_id) = config.route_node_id.as_deref() {
-            return format!(
-                "{SLATEDB_RUNTIME_PREFIX}/nodes/{}",
-                object_path_component(node_id)
-            );
-        }
-    }
-    SLATEDB_RUNTIME_PREFIX.to_string()
-}
 
-fn object_path_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
 
 #[derive(Clone)]
 struct RaftSnapshotObjectStore {
@@ -1803,15 +1653,12 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
 
 fn validate_storage_backend_config(
     deployment_mode: DeploymentMode,
-    kv_backend: KvBackendKind,
+    _kv_backend: KvBackendKind,
     content_backend: ContentBackendKind,
     object_store: Option<&ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    if matches!(kv_backend, KvBackendKind::SlateDb) && object_store.is_none() {
-        anyhow::bail!("storage.kv.backend=slatedb requires storage.object_store");
-    }
     if matches!(content_backend, ContentBackendKind::ObjectStore) && object_store.is_none() {
         anyhow::bail!("storage.content.backend=object_store requires storage.object_store");
     }
@@ -1897,17 +1744,6 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
             "loopback bootstrap (data API has no static bearer token)"
         }
     );
-    if let Some(mongo_bind) = config.mongo_bind {
-        println!("  mongodb:   mongodb://{mongo_bind}/");
-        println!(
-            "  mongo auth: {}",
-            if config.mongo_auth_enabled() {
-                "PLAIN username/password"
-            } else {
-                "disabled"
-            }
-        );
-    }
     println!(
         "  internal raft rpc: {}",
         if config.internal_auth_token.is_some() {
@@ -1940,13 +1776,6 @@ async fn print_dev_bootstrap(
     println!(
         "  python:    AGENTDB_URL=http://{} AGENTDB_WORKSPACE={} python3 examples/agents/python/openai_agents_quickstart.py",
         config.bind, bootstrap.workspace
-    );
-    println!(
-        "  mongodb:   mongosh \"mongodb://{}/?directConnection=true\"",
-        config
-            .mongo_bind
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "<disabled>".into())
     );
     println!("  doctor:    agentdb doctor --dev --dev-tools");
     println!("  local CI:  ops/local-ci/scripts/local-ci-status.sh --logs");
@@ -2068,10 +1897,6 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
             KvBackendKind::RocksDb => {
                 failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
             }
-            KvBackendKind::SlateDb => {
-                failed |=
-                    !check_object_store_config("shared object store", config.object_store.as_ref());
-            }
         }
         match config.content_backend {
             ContentBackendKind::LocalFs => {
@@ -2092,19 +1917,6 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
         Err(error) => {
             failed = true;
             println!("  error: cannot bind {}: {error}", config.bind);
-        }
-    }
-
-    if let Some(mongo_bind) = config.mongo_bind {
-        match std::net::TcpListener::bind(mongo_bind) {
-            Ok(listener) => {
-                drop(listener);
-                println!("  ok: mongodb bind address is available ({mongo_bind})");
-            }
-            Err(error) => {
-                failed = true;
-                println!("  error: cannot bind mongodb listener {mongo_bind}: {error}");
-            }
         }
     }
 
@@ -2244,14 +2056,6 @@ fn deployment_support_note(config: &ResolvedServeConfig) -> Option<&'static str>
         config.content_backend,
         config.object_store.as_ref().map(|cfg| cfg.backend),
     ) {
-        (
-            DeploymentMode::SingleNode,
-            KvBackendKind::SlateDb,
-            ContentBackendKind::ObjectStore,
-            Some(ObjectStoreBackendKind::S3),
-        ) => Some(
-            "single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment",
-        ),
         (DeploymentMode::Cluster, ..) => Some(
             "cluster mode is forward-looking; operator APIs and automation are still incomplete",
         ),
@@ -2262,12 +2066,6 @@ fn deployment_support_note(config: &ResolvedServeConfig) -> Option<&'static str>
 fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
     match config.kv_backend {
         KvBackendKind::RocksDb => "rocksdb".into(),
-        KvBackendKind::SlateDb => {
-            format!(
-                "slatedb@{}",
-                describe_object_store(config.object_store.as_ref())
-            )
-        }
     }
 }
 
@@ -5673,9 +5471,6 @@ mod tests {
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
             route_proxy_max_response_bytes: None,
-            mongo_bind: None,
-            mongo_username: None,
-            mongo_password: None,
             internal_auth_token: None,
             internal_auth_previous_token: None,
             api_auth_token: None,
@@ -5795,11 +5590,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_command_defaults_enable_mongo_and_bootstrap_workspace() {
+    fn dev_command_defaults_bootstrap_workspace() {
         let opts = serve_opts_from_dev_opts(DevOpts {
             bind: None,
-            mongo_bind: None,
-            no_mongo: false,
             persistent: false,
             data_dir: None,
             workspace: "dev".into(),
@@ -5809,7 +5602,6 @@ mod tests {
 
         assert!(opts.dev);
         assert!(opts.in_memory);
-        assert_eq!(opts.mongo_bind, Some("127.0.0.1:7879".parse().unwrap()));
         let bootstrap = opts.dev_bootstrap.unwrap();
         assert_eq!(bootstrap.workspace, "dev");
         assert_eq!(bootstrap.agent, "demo-agent");
@@ -5817,11 +5609,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_command_persistent_mode_uses_data_dir_and_can_disable_mongo() {
+    fn dev_command_persistent_mode_uses_data_dir() {
         let opts = serve_opts_from_dev_opts(DevOpts {
             bind: Some("127.0.0.1:9000".parse().unwrap()),
-            mongo_bind: None,
-            no_mongo: true,
             persistent: true,
             data_dir: Some(PathBuf::from("/tmp/agentdb-dev")),
             workspace: "workspace".into(),
@@ -5833,7 +5623,6 @@ mod tests {
         assert!(!opts.dev);
         assert!(!opts.in_memory);
         assert_eq!(opts.data_dir, Some(PathBuf::from("/tmp/agentdb-dev")));
-        assert_eq!(opts.mongo_bind, None);
     }
 
     #[test]
@@ -6067,7 +5856,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "localfs"
@@ -6101,7 +5890,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6134,7 +5923,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6165,7 +5954,7 @@ region = "us-west-2"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6243,39 +6032,6 @@ node_id = "node-a"
         assert!(err
             .to_string()
             .contains("server.internal_auth_previous_token requires server.internal_auth_token"));
-    }
-
-    #[test]
-    fn single_node_slatedb_s3_remains_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("agentdb.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[deployment]
-mode = "single_node"
-
-[storage.kv]
-backend = "slatedb"
-
-[storage.content]
-backend = "object_store"
-
-[storage.object_store]
-backend = "s3"
-bucket = "agentdb-test"
-region = "us-west-2"
-"#,
-        )
-        .unwrap();
-        let mut opts = base_opts();
-        opts.config = Some(config_path);
-        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
-        assert_eq!(config.deployment_mode, DeploymentMode::SingleNode);
-        assert_eq!(
-            deployment_support_note(&config),
-            Some("single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment")
-        );
     }
 
     #[tokio::test]

@@ -215,7 +215,7 @@ Do not do an ad-hoc file copy of active RocksDB files and assume it is safe.
 
 ### Object-Store-Backed Deployments
 
-If you use SlateDB and/or object-store content:
+If you use object-store content:
 
 - back up the config file
 - preserve object-store bucket policy and lifecycle configuration

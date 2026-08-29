@@ -89,7 +89,8 @@ cargo run -p agentdb-server -- serve --config config/agentdb.toml
 python3 examples/agents/python/ticket_agent_tiered_demo.py
 ```
 
-This is the best end-to-end demo app for a SlateDB + object-store deployment:
+This is the best end-to-end demo app for an object-store-backed tiered
+deployment:
 
 - realistic support-ticket session flow
 - tool call and tool result persistence
@@ -102,7 +103,7 @@ This is the best end-to-end demo app for a SlateDB + object-store deployment:
 
 ## AWS automation
 
-The repo also includes AWS deployment scaffolding for a real SlateDB + S3 run:
+The repo also includes AWS deployment scaffolding for a real S3-backed run:
 
 ```bash
 terraform -chdir=infra/aws/terraform init

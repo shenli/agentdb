@@ -65,7 +65,7 @@ struct Args {
     )]
     s3_endpoint: String,
 
-    /// S3 bucket used by SlateDB/content/snapshot storage.
+    /// S3 bucket used by content/snapshot storage.
     #[arg(long, env = "AGENTDB_S3_BUCKET", default_value = "agentdb-smoke")]
     s3_bucket: String,
 
@@ -292,7 +292,7 @@ data_dir = "{data_dir}"
 content_dir = "{content_dir}"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.tablet]
 layout = "grouped_rocksdb"

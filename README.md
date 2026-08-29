@@ -107,15 +107,6 @@ More examples:
 - [OpenAI Agents SDK adapter](adapters/openai-agents-agentdb/README.md)
 - [LangGraph adapter](adapters/langgraph-checkpoint-agentdb/README.md)
 
-## MongoDB Client Compatibility
-
-AgentDB includes an optional MongoDB wire listener for existing drivers and
-inspection tools. It is intentionally narrow: use fixed AgentDB collections,
-`directConnection=true`, and AgentDB extension commands for runtime primitives.
-
-Start with [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md)
-or the copyable examples in [examples/mongodb](examples/mongodb/README.md).
-
 ## Performance
 
 AgentDB's benchmark target is the common agent loop: append the next event and
@@ -132,7 +123,6 @@ Start with [docs/README.md](docs/README.md) for the full documentation map.
 |---|---|
 | First local run | [docs/quickstart.md](docs/quickstart.md) |
 | API and SDK surface | [docs/reference/api-sdk.md](docs/reference/api-sdk.md) |
-| MongoDB adapter rules | [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md) |
 | Architecture | [docs/design/architecture.md](docs/design/architecture.md) |
 | Deployment | [docs/operations/deployment.md](docs/operations/deployment.md) |
 | Operations | [docs/operations/operations.md](docs/operations/operations.md) |
@@ -147,7 +137,7 @@ clients/python          Python SDK
 clients/typescript      TypeScript SDK
 adapters/               Framework and tool adapters
 docs/                   Architecture, reference, operations, and runbooks
-examples/               Agent, MongoDB, compose, and Helm examples
+examples/               Agent, compose, and Helm examples
 ops/                    Local CI, smoke tests, observability, and systemd units
 tools/                  Benchmarks and workload tooling
 ```

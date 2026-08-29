@@ -190,10 +190,11 @@ single-mutex tenant-map becomes a bottleneck, which is above this
 prototype's scale. A follow-up milestone could shard to `DashMap` or
 per-tenant atomics if that changes.
 
-## Storage backend comparison (M11)
+## Storage backend comparison (M11, historical)
 
-Measured on the criterion benches in
-`crates/agentdb-core/benches/mvcc_bench.rs` with a session containing
+The SlateDB `KvStore` backend has since been retired; these numbers are
+kept as the record of that evaluation. Measured on the criterion benches
+in `crates/agentdb-core/benches/mvcc_bench.rs` with a session containing
 1000 events, both backends pointed at local disk (RocksDB on SSD,
 SlateDB on `object_store::local::LocalFileSystem`):
 
@@ -239,8 +240,8 @@ response bodies without draining them, which prevented connection
 reuse. Under c=64 this exhausted the macOS ephemeral port range in
 seconds and surfaced as "can't assign requested address" transport
 errors. The fix is `io.Copy(io.Discard, resp.Body); resp.Body.Close()`
-before the next request. Real clients (the Mongo driver, browsers,
-the dashboard) have never tripped this because they all reuse
+before the next request. Real clients (browsers, the dashboard,
+SDK HTTP clients) have never tripped this because they all reuse
 connections.
 
 **LifecycleEngine wasn't recording metrics.** Until this perf run,

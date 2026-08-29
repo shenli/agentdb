@@ -24,14 +24,12 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # futures: used in the LISTEN loop + tests.
 futures = "0.3"
 thiserror = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 serde = { workspace = true }
 # M19 auth: SCRAM-SHA-256 credential derivation + verification.
-sha2 = { workspace = true }
-hmac = { workspace = true }
-pbkdf2 = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 subtle = { workspace = true }

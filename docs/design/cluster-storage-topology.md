@@ -29,10 +29,10 @@ client request
   -> seal snapshots / history / artifacts to object storage asynchronously
 ```
 
-SlateDB should not be the production hot-write answer. It remains useful as an
-optional `KvStore` backend for abstraction testing and object-store evaluation,
-but the production write path should commit through local replicated tablet
-state first.
+SlateDB should not be the production hot-write answer. It was evaluated as an
+optional `KvStore` backend for abstraction testing and object-store evaluation
+and has been retired; the production write path should commit through local
+replicated tablet state first.
 
 The next design addition is a **cell**, used here as a short name for an
 isolation domain. The exact product/schema name can change. The required
@@ -562,8 +562,6 @@ The storage direction remains:
 - RocksDB or another local LSM for hot applied state
 - object storage for artifacts, sealed history, snapshots, archive, and
   retained cold data
-- SlateDB as optional/evaluation storage, not the production hot-write commit
-  path
 
 ### Storage Architecture Diagram
 
@@ -1141,8 +1139,6 @@ Operators should be able to answer:
 - split/merge refuses cross-cell and cross-tenant dedicated combinations
 - tenant policy changes fence stale routing epochs
 - route decisions include cell and AZ information where useful
-- SlateDB remains covered by `KvStore` contract tests only, not production
-  cluster claims
 
 ### Real-Process Cluster Smoke
 
@@ -1419,8 +1415,6 @@ Cluster mode should not be called production-supported until:
 - operator runbooks exist for add, drain, replace, restart, and upgrade
 - alerts exist for leaderless tablets, lagging replicas, stale owners,
   movement backlog, snapshot failures, and metadata degradation
-- SlateDB is clearly documented as optional/evaluation for runtime metadata,
-  not the hot production commit path
 
 ## Remaining Hardening Cut
 

@@ -36,16 +36,6 @@ curl -fsS \
 
 Allowed targets are `warm`, `cold`, `archive`, and `derivative_only`.
 
-The MongoDB compatibility adapter exposes the same runtime primitive:
-
-```javascript
-db.runCommand({
-  agentdbTransitionLifecycle: "sessions",
-  session_id: "ses_...",
-  target: "cold"
-})
-```
-
 ## Restore Archived History
 
 Restore archive-backed history to `warm` or `cold`:
@@ -56,16 +46,6 @@ curl -fsS \
   -H 'content-type: application/json' \
   -d '{"target":"warm"}' \
   http://127.0.0.1:7878/api/tenants/ten_.../sessions/ses_.../restore
-```
-
-MongoDB compatibility command:
-
-```javascript
-db.runCommand({
-  agentdbRestoreSession: "sessions",
-  session_id: "ses_...",
-  target: "warm"
-})
 ```
 
 Restore targets are `warm` and `cold`. Restore from archive is a session

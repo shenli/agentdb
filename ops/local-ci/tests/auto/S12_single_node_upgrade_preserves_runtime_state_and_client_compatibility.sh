@@ -29,9 +29,6 @@ fi
 
 BIND="${AGENTDB_S12_BIND:-127.0.0.1:32120}"
 BASE_URL="http://${BIND}"
-MONGO_MODE="${AGENTDB_S12_MONGO:-auto}"
-MONGO_BIND="${AGENTDB_S12_MONGO_BIND:-127.0.0.1:32121}"
-MONGO_URI="mongodb://${MONGO_BIND}/?directConnection=true"
 WORK_DIR="${AGENTDB_S12_WORK_DIR:-${SESSION_DIR}/artifacts/S12-upgrade}"
 DATA_DIR="${WORK_DIR}/data"
 CONTENT_DIR="${WORK_DIR}/content"
@@ -87,7 +84,7 @@ PY
 
 run_client_phase() {
   local phase="$1"
-  python3 - "${BASE_URL}" "${STATE_FILE}" "${METRICS_FILE}" "${phase}" "${ROOT}" "${MONGO_URI}" "${MONGO_MODE}" <<'PY' 2>&1 | tee -a "${CLIENT_LOG}"
+  python3 - "${BASE_URL}" "${STATE_FILE}" "${METRICS_FILE}" "${phase}" "${ROOT}" <<'PY' 2>&1 | tee -a "${CLIENT_LOG}"
 import json
 import os
 import pathlib
@@ -97,7 +94,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-base, state_path, metrics_path, phase, root, mongo_uri, mongo_mode = sys.argv[1:8]
+base, state_path, metrics_path, phase, root = sys.argv[1:6]
 sys.path.insert(0, str(pathlib.Path(root) / "clients" / "python"))
 
 def request(method, path, body=None, headers=None):
@@ -226,57 +223,6 @@ def assert_python_sdk_compat(state, expected_before):
         raise AssertionError(f"Python SDK expected seqs [0,1,2,3], got {after_seqs}")
     return {"before": before_seqs, "after": after_seqs}
 
-def assert_mongo_compat(state, required):
-    if mongo_mode == "0":
-        return {"status": "skipped", "reason": "AGENTDB_S12_MONGO=0"}
-    try:
-        from pymongo import MongoClient
-    except ImportError as exc:
-        if mongo_mode == "1":
-            raise AssertionError("pymongo is required when AGENTDB_S12_MONGO=1") from exc
-        return {"status": "skipped", "reason": "pymongo not installed"}
-
-    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-    try:
-        db = client[state["tenant_external_key"]]
-        session = db.sessions.find_one({"session_id": state["session_id"]})
-        if not session:
-            raise AssertionError("Mongo compatibility could not find upgraded session")
-        existing = list(db.events.find({"kind": "message"}))
-        observed_seqs = set()
-        for event in existing:
-            if isinstance(event.get("seq"), int):
-                observed_seqs.add(event["seq"])
-            payload = event.get("payload")
-            if isinstance(payload, dict) and isinstance(payload.get("seq"), int):
-                observed_seqs.add(payload["seq"])
-        for seq in required:
-            if seq not in observed_seqs:
-                raise AssertionError(
-                    f"Mongo compatibility did not observe seq {seq}; "
-                    f"observed={sorted(observed_seqs)} events={existing}"
-                )
-        appended = db.command(
-            {
-                "agentdbAppendAndFetch": "events",
-                "agent_id": state["agent_id"],
-                "session_id": state["session_id"],
-                "kind": "message",
-                "payload": {"seq": 4, "marker": "new-mongo"},
-                "idempotency_key": f"s12-mongo-{state['session_id']}-4",
-                "fetch_last_n": 10,
-            }
-        )
-        if appended.get("seq") != 4:
-            raise AssertionError(f"Mongo append expected seq 4, got {appended}")
-        return {
-            "status": "verified",
-            "session_id": session.get("session_id"),
-            "observed_events": len(existing),
-            "appended_seq": appended.get("seq"),
-        }
-    finally:
-        client.close()
 
 if phase == "old-write":
     tenant_external_key = f"s12-upgrade-{int(time.time())}"
@@ -323,10 +269,7 @@ elif phase == "new-verify":
     assert_events(tenant_id, session_id, [0, 1, 2, 3])
     assert_watch_contains(tenant_id, session_id, [0, 1, 2, 3])
     assert_export_contains(tenant_id, session_id, [0, 1, 2, 3])
-    mongo_result = assert_mongo_compat(state, [0, 1, 2, 3])
     final_expected = [0, 1, 2, 3]
-    if mongo_result.get("status") == "verified":
-        final_expected.append(4)
     final_events = assert_events(tenant_id, session_id, final_expected)
     assert_watch_contains(tenant_id, session_id, final_expected)
     assert_export_contains(tenant_id, session_id, final_expected)
@@ -338,7 +281,6 @@ elif phase == "new-verify":
             "final": len(final_events),
             "verified_seqs": final_expected,
             "python_sdk": sdk_result,
-            "mongo": mongo_result,
         },
     )
     print(f"new-verify verified tenant={tenant_id} session={session_id} seqs={final_expected}")
@@ -365,13 +307,10 @@ new_server_args=(
   --data-dir "${DATA_DIR}" \
   --content-dir "${CONTENT_DIR}"
 )
-if [[ "${MONGO_MODE}" != "0" ]]; then
-  new_server_args+=(--mongo-bind "${MONGO_BIND}")
-fi
 "${NEW_SERVER_BIN}" "${new_server_args[@]}" >"${NEW_LOG}" 2>&1 &
 PID="$!"
 wait_ready "${BASE_URL}"
 run_client_phase new-verify
 stop_server
 
-echo "PASS: single-node upgrade preserved fetch/watch/export state and accepted post-upgrade Python SDK/Mongo-compatible appends" | tee -a "${CLIENT_LOG}"
+echo "PASS: single-node upgrade preserved fetch/watch/export state and accepted post-upgrade Python SDK appends" | tee -a "${CLIENT_LOG}"

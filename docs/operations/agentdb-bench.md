@@ -69,11 +69,9 @@ from roughly 7.8k ops/s to 16.8k ops/s. These are not product claims yet:
 MongoDB/Postgres comparison runs, longer durations, and durable quorum profiles
 must be reported separately.
 
-The `agentdb-mongodb-api` profile now uses a narrower `agentdbFetchRecent`
-command instead of the heavier context-building command for the benchmark's
-tail-read operation. That raises the mixed workload from roughly 1.3k ops/s to
-roughly 12.5k ops/s at c=32, proving the original bad MongoDB-API result was
-partly adapter overhead.
+The historical `agentdb-mongodb-api` profile (removed along with the MongoDB
+wire listener) measured adapter overhead through that listener; its recorded
+numbers below are kept as an evaluation record.
 
 The remaining gap is not only the MongoDB wire layer. Perf and app-level timing
 showed native HTTP's persistent append path was dominated by the synchronous
@@ -463,7 +461,7 @@ Non-goals:
 | Backend | Purpose |
 |---|---|
 | `agentdb-native-rocksdb` | First AgentDB target: native HTTP API with local RocksDB storage. |
-| `agentdb-mongodb-api` | Implemented AgentDB adapter-overhead run through the MongoDB-compatible wire listener. |
+| `agentdb-mongodb-api` | Historical adapter-overhead run through the removed MongoDB wire listener (numbers retained for the record). |
 | `mongodb-session-doc` | Naive MongoDB model: one document per session with an embedded event array. |
 | `mongodb-event-log` | Implemented MongoDB baseline: sessions, events, records, and artifacts collections. |
 | `postgres-jsonb-session` | Naive Postgres model: one session row with a JSONB event array. |
@@ -1025,11 +1023,12 @@ Scale profiles should vary one dimension at a time:
 
 ### PR 2: Backend Adapters And Correctness Tests
 
-- Implement `agentdb-native`, `agentdb-mongodb-api`, `mongodb-session-doc`,
-  `mongodb-event-log`, `postgres-jsonb-session`, and `postgres-event-log`.
-  Initial status: `agentdb-native-rocksdb`, `agentdb-mongodb-api`,
-  `mongodb-event-log`, and `postgres-event-log` are implemented. MongoDB
-  session-doc and Postgres JSONB-session remain follow-up work.
+- Implement `agentdb-native`, `mongodb-session-doc`, `mongodb-event-log`,
+  `postgres-jsonb-session`, and `postgres-event-log`.
+  Current status: `agentdb-native-rocksdb`, `mongodb-event-log`, and
+  `postgres-event-log` are implemented; the `agentdb-mongodb-api` profile was
+  removed with the wire listener. MongoDB session-doc and Postgres
+  JSONB-session remain follow-up work.
 - Start AgentDB with local RocksDB storage for the first AgentDB profile.
 - Add adapter conformance tests for dataset prepare, append, fetch, fork,
   records, search, artifact metadata, and artifact payload/reference behavior.

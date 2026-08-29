@@ -41,8 +41,6 @@ deployment choices, see [deployment.md](deployment.md).
   tokens are page-memory-only and disappear on reload.
 - [ ] Admin tokens and `<data_dir>/auth-meta.sqlite` have an ownership,
   revocation, and backup procedure.
-- [ ] The MongoDB compatibility listener, if enabled, is bound to localhost or
-  protected by separate access control and TLS.
 
 ## Storage And Capacity
 

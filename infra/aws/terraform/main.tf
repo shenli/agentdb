@@ -75,7 +75,7 @@ resource "aws_iam_instance_profile" "agentdb" {
 
 resource "aws_security_group" "agentdb" {
   name        = "${var.name}-sg"
-  description = "Security group for AgentDB SlateDB/S3 demo"
+  description = "Security group for AgentDB S3 demo"
   vpc_id      = var.vpc_id
 
   ingress {

@@ -82,8 +82,7 @@ Behavior depends on which `resource` is missing.
   customer's slug" — pick one and communicate it.
 - Consider mid-term adding a `401 tenant_not_authenticated` error
   code so clients that point at the wrong tenant get a more
-  actionable signal than a generic 404 (separate PR; depends on M19
-  SCRAM).
+  actionable signal than a generic 404 (separate PR).
 - Keep `agentdbctl raw get /api/admin/sessions/{id}` in your
   incident-response playbook so operators don't have to grep RocksDB dumps to
   answer "does this session still exist?"

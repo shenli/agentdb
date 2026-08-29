@@ -77,7 +77,6 @@ agentdb serve --config /etc/agentdb/agentdb.toml
 Typical storage layouts:
 
 - RocksDB + local filesystem
-- SlateDB + shared object store
 - local filesystem or object-store-backed content blobs
 
 This is the recommended shape for:

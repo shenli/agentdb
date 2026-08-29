@@ -5,7 +5,6 @@ workloads. It can prepare the same tenant/agent/session/event/record/artifact
 dataset and run it against:
 
 - `agentdb-native-rocksdb`: AgentDB native HTTP API with local RocksDB storage.
-- `agentdb-mongodb-api`: AgentDB through its MongoDB-compatible listener.
 - `mongodb-event-log`: MongoDB with normalized event-log collections.
 - `postgres-event-log`: Postgres with normalized event-log tables.
 
@@ -406,15 +405,6 @@ single-document designs:
 - Postgres uses normalized session/event/record/artifact tables.
 - Large artifact bytes are not stored inside MongoDB documents or Postgres JSONB
   session rows for the default comparison.
-
-AgentDB's MongoDB-compatible listener is measured separately:
-
-```bash
-PROFILE=smoke tools/agentdb-bench/scripts/agentdb-bench-agentdb-mongodb.sh
-```
-
-Treat `agentdb-mongodb-api` as adapter-overhead measurement for AgentDB, not as
-the same thing as real MongoDB.
 
 The MongoDB and Postgres baseline wrappers use per-run Docker Compose project
 names and tear containers down on exit. Baseline database files are
