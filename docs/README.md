@@ -37,6 +37,9 @@ public docs path.
   restore, upgrade, and troubleshooting for the supported single-node shape
 - [operations/single-node-production-checklist.md](operations/single-node-production-checklist.md)
   - preflight gate before exposing a persistent single node
+- [operations/recovery.md](operations/recovery.md) - object storage as the
+  recovery root: recovery manifests, `recovery_lag_ms`, and
+  `agentdb restore-from-bucket`.
 - [operations/backup-verification.md](operations/backup-verification.md) -
   backup manifest validation, tablet checkpoint checks, scratch install drills,
   and recovery boundaries

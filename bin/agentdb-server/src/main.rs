@@ -87,6 +87,10 @@ enum Cmd {
     Doctor(DoctorOpts),
     /// Write a starter single-node config file.
     InitConfig(InitConfigOpts),
+    /// Rebuild an empty runtime data directory from the newest recovery
+    /// manifest in the configured object store.
+    #[command(name = "restore-from-bucket")]
+    RestoreFromBucket(RestoreFromBucketOpts),
 }
 
 #[derive(Parser, Debug)]
@@ -268,6 +272,14 @@ struct InitConfigOpts {
     force: bool,
 }
 
+#[derive(Parser, Debug)]
+struct RestoreFromBucketOpts {
+    /// Path to the agentdb.toml describing the data directory and the
+    /// object store holding the recovery manifests.
+    #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -277,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
+        Cmd::RestoreFromBucket(opts) => restore_from_bucket(opts).await,
     }
 }
 
@@ -339,6 +352,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             config.route_default_tablet_id
         );
     }
+    let mut recovery_kv: Option<Arc<dyn agentdb_storage::KvStore + Send + Sync>> = None;
     let (runtime, content_mirror) = if config.in_memory {
         tracing::info!("using in-memory runtime (state lost on shutdown)");
         (agentdb_core::Runtime::in_memory(), None)
@@ -352,6 +366,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             }
         };
 
+        recovery_kv = Some(kv.clone());
         let (content, content_mirror) = build_content_backend(&config)?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
@@ -461,6 +476,70 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror);
+    }
+    if let (Some(recovery_cfg), Some(kv), Some(object_store_cfg)) = (
+        config.recovery_manifest_backup,
+        recovery_kv.clone(),
+        config.object_store.as_ref(),
+    ) {
+        let store = build_object_store(object_store_cfg)?;
+        let recovery_store =
+            agentdb_storage::RecoveryObjectStore::new(store, RECOVERY_OBJECT_PREFIX);
+        let status = Arc::new(agentdb_api::state::RecoveryBackupStatus::new(
+            recovery_store.latest_uri(),
+            recovery_cfg.interval_ms,
+        ));
+        state = state.with_recovery_backup(status.clone());
+        let node_id = config.route_node_id.clone();
+        let interval = Duration::from_millis(recovery_cfg.interval_ms);
+        let max_bytes = recovery_cfg.max_bytes;
+        tracing::info!(
+            interval_ms = recovery_cfg.interval_ms,
+            destination = %recovery_store.latest_uri(),
+            "started recovery manifest backup worker"
+        );
+        tokio::spawn(async move {
+            loop {
+                let now_ms = now_ms_i64();
+                let kv_for_export = kv.clone();
+                let node = node_id.clone();
+                let exported = tokio::task::spawn_blocking(move || {
+                    agentdb_storage::export_recovery_manifest(
+                        kv_for_export,
+                        node.as_deref(),
+                        now_ms,
+                        max_bytes,
+                    )
+                })
+                .await;
+                match exported {
+                    Ok(Ok(bytes)) => {
+                        let header = agentdb_storage::read_recovery_manifest_header(&bytes).ok();
+                        match recovery_store.put_latest(&bytes, now_ms).await {
+                            Ok(_) => {
+                                let (entries, payload) = header
+                                    .map(|h| (h.entry_count, h.payload_bytes))
+                                    .unwrap_or((0, 0));
+                                status.record_success(now_ms, entries, payload);
+                            }
+                            Err(error) => {
+                                tracing::warn!(?error, "recovery manifest upload failed");
+                                status.record_failure(now_ms, error.to_string());
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(?error, "recovery manifest export failed");
+                        status.record_failure(now_ms, error.to_string());
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "recovery manifest export task panicked");
+                        status.record_failure(now_ms, error.to_string());
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
     if let Some(token) = config.internal_auth_token.clone() {
         state = state.with_internal_auth_token(token);
@@ -743,6 +822,7 @@ struct ResolvedServeConfig {
     internal_auth_previous_token: Option<String>,
     api_auth_token: Option<String>,
     api_auth_previous_token: Option<String>,
+    recovery_manifest_backup: Option<ResolvedRecoveryConfig>,
 }
 
 struct RouteStartup {
@@ -995,6 +1075,8 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
+        let recovery_manifest_backup =
+            resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
         let internal_auth_token = opts
             .internal_auth_token
             .or(file.server.internal_auth_token)
@@ -1071,6 +1153,7 @@ impl ResolvedServeConfig {
             internal_auth_previous_token,
             api_auth_token,
             api_auth_previous_token,
+            recovery_manifest_backup,
         })
     }
 
@@ -1138,6 +1221,8 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
+        let recovery_manifest_backup =
+            resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
         let internal_auth_token = file
             .server
             .internal_auth_token
@@ -1206,6 +1291,7 @@ impl ResolvedServeConfig {
             internal_auth_previous_token,
             api_auth_token,
             api_auth_previous_token,
+            recovery_manifest_backup,
         })
     }
 }
@@ -1221,6 +1307,8 @@ struct FileConfig {
     storage: StorageFileConfig,
     #[serde(default)]
     routing: RoutingFileConfig,
+    #[serde(default)]
+    recovery: RecoveryFileConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1649,6 +1737,56 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
             ))
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryFileConfig {
+    /// Enable periodic recovery-manifest backups to the object store.
+    /// Defaults to on when an object store is configured and the server is
+    /// persistent; set `false` to opt out explicitly.
+    enabled: Option<bool>,
+    manifest_backup_interval_ms: Option<u64>,
+    manifest_max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRecoveryConfig {
+    interval_ms: u64,
+    max_bytes: u64,
+}
+
+const DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS: u64 = 300_000;
+const DEFAULT_RECOVERY_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const RECOVERY_OBJECT_PREFIX: &str = "agentdb";
+
+fn resolve_recovery_config(
+    file: &RecoveryFileConfig,
+    object_store_configured: bool,
+    in_memory: bool,
+) -> anyhow::Result<Option<ResolvedRecoveryConfig>> {
+    let enabled = file
+        .enabled
+        .unwrap_or(object_store_configured && !in_memory);
+    if !enabled {
+        return Ok(None);
+    }
+    if !object_store_configured {
+        anyhow::bail!("recovery.enabled=true requires storage.object_store");
+    }
+    if in_memory {
+        anyhow::bail!("recovery manifest backups require persistent storage, not in-memory/dev mode");
+    }
+    Ok(Some(ResolvedRecoveryConfig {
+        interval_ms: file
+            .manifest_backup_interval_ms
+            .unwrap_or(DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS)
+            .max(1_000),
+        max_bytes: file
+            .manifest_max_bytes
+            .unwrap_or(DEFAULT_RECOVERY_MANIFEST_MAX_BYTES)
+            .max(1024),
+    }))
 }
 
 fn validate_storage_backend_config(
@@ -2147,6 +2285,63 @@ fn check_writable_dir(label: &str, path: &PathBuf) -> bool {
             false
         }
     }
+}
+
+async fn restore_from_bucket(opts: RestoreFromBucketOpts) -> anyhow::Result<()> {
+    let file = load_config(Some(&opts.config))?;
+    let data_dir = file.storage.data_dir.clone().unwrap_or_else(default_data_dir);
+    let object_store_cfg = resolve_object_store_config(
+        file.storage.object_store.as_ref(),
+        data_dir.join("object-store"),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("restore-from-bucket requires storage.object_store in {}", opts.config.display())
+    })?;
+
+    let runtime_dir = data_dir.join("runtime");
+    if runtime_dir.exists()
+        && std::fs::read_dir(&runtime_dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true)
+    {
+        anyhow::bail!(
+            "refusing to restore into existing runtime directory {}; move it aside first",
+            runtime_dir.display()
+        );
+    }
+
+    let store = build_object_store(&object_store_cfg)?;
+    let recovery_store = agentdb_storage::RecoveryObjectStore::new(store, RECOVERY_OBJECT_PREFIX);
+    println!("fetching {}", recovery_store.latest_uri());
+    let bytes = recovery_store.get_latest().await?;
+    let header = agentdb_storage::read_recovery_manifest_header(&bytes)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let age_ms = (now_ms_i64() - header.created_at_ms).max(0);
+    println!(
+        "manifest: created_at_ms={} (age {:.1} min), node_id={}, entries={}, payload_bytes={}",
+        header.created_at_ms,
+        age_ms as f64 / 60_000.0,
+        header.node_id.as_deref().unwrap_or("<none>"),
+        header.entry_count,
+        header.payload_bytes,
+    );
+
+    std::fs::create_dir_all(&runtime_dir)?;
+    let kv = agentdb_storage::RocksKvStore::open(&runtime_dir)?;
+    let stats = tokio::task::spawn_blocking(move || {
+        agentdb_storage::import_recovery_manifest(&kv, &bytes)
+    })
+    .await?
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    println!(
+        "restored {} entries ({} payload bytes) into {}",
+        stats.entries,
+        stats.payload_bytes,
+        runtime_dir.display()
+    );
+    println!("next: start the server normally (`agentdb serve --config {}`);", opts.config.display());
+    println!("artifact content is fetched from the object-store mirror on first read.");
+    Ok(())
 }
 
 fn init_config(opts: InitConfigOpts) -> anyhow::Result<()> {
@@ -5843,6 +6038,58 @@ node_id = "node-a"
         let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
         assert!(matches!(config.deployment_mode, DeploymentMode::Cluster));
         assert!(matches!(config.kv_backend, KvBackendKind::RocksDb));
+    }
+
+    #[test]
+    fn recovery_backup_defaults_on_with_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage.object_store]
+backend = "localfs"
+local_root = "/tmp/agentdb-test-object-store"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        let recovery = config.recovery_manifest_backup.expect("recovery enabled");
+        assert_eq!(recovery.interval_ms, DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS);
+        assert_eq!(recovery.max_bytes, DEFAULT_RECOVERY_MANIFEST_MAX_BYTES);
+    }
+
+    #[test]
+    fn recovery_backup_defaults_off_without_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        assert!(config.recovery_manifest_backup.is_none());
+    }
+
+    #[test]
+    fn recovery_backup_enabled_requires_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[recovery]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("recovery.enabled=true requires storage.object_store"));
     }
 
     #[test]

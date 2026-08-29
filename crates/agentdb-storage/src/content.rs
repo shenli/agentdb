@@ -663,6 +663,53 @@ impl ContentBackend for ObjectStoreContentBackend {
             ))),
         }
     }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        use futures::StreamExt;
+
+        let mut list_prefix = String::new();
+        if !self.prefix.is_empty() {
+            list_prefix.push_str(&self.prefix);
+            list_prefix.push('/');
+        }
+        list_prefix.push_str("artifact_content");
+        let list_path = ObjectPath::from(list_prefix.clone());
+
+        let mut objects = Vec::new();
+        let mut stream = self.store.list(Some(&list_path));
+        while let Some(entry) = stream.next().await {
+            let meta = entry
+                .map_err(|err| io::Error::other(format!("object store list failed: {err}")))?;
+            let location = meta.location.as_ref();
+            let relative = location
+                .strip_prefix(&list_prefix)
+                .unwrap_or(location)
+                .trim_start_matches('/');
+            // Expected layout: {tenant_id}/{artifact_id}/blob. Anything else
+            // under the content prefix is not an artifact blob and is skipped
+            // rather than treated as corruption.
+            let mut parts = relative.split('/');
+            let (Some(tenant_id), Some(artifact_id), Some("blob"), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if objects.len() >= limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("content object listing exceeds configured limit of {limit} objects"),
+                ));
+            }
+            objects.push(ContentObject {
+                tenant_id: tenant_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        Ok(ContentListing {
+            objects,
+            temporary_objects_deleted: 0,
+        })
+    }
 }
 
 fn map_object_store_get_error(err: object_store::Error) -> io::Error {

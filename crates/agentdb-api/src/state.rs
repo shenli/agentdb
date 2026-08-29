@@ -302,6 +302,7 @@ pub struct AppState {
     pub scheduler: Option<SchedulerStatus>,
     pub tablet_store: Option<TabletStoreStatus>,
     pub content_mirror: Option<Arc<AsyncMirrorContentBackend>>,
+    pub recovery_backup: Option<Arc<RecoveryBackupStatus>>,
     pub proxy: reqwest::Client,
     pub proxy_policy: ProxyPolicy,
     pub api_json_response_profile: Option<Arc<ApiJsonResponseProfile>>,
@@ -324,6 +325,7 @@ impl AppState {
             scheduler: None,
             tablet_store: None,
             content_mirror: None,
+            recovery_backup: None,
             proxy: reqwest::Client::new(),
             proxy_policy: ProxyPolicy::default(),
             api_json_response_profile: ApiJsonResponseProfile::from_env().map(Arc::new),
@@ -388,6 +390,11 @@ impl AppState {
         self
     }
 
+    pub fn with_recovery_backup(mut self, status: Arc<RecoveryBackupStatus>) -> Self {
+        self.recovery_backup = Some(status);
+        self
+    }
+
     pub fn with_content_mirror(mut self, content_mirror: Arc<AsyncMirrorContentBackend>) -> Self {
         self.content_mirror = Some(content_mirror);
         self
@@ -396,5 +403,63 @@ impl AppState {
     pub fn with_proxy_policy(mut self, proxy_policy: ProxyPolicy) -> Self {
         self.proxy_policy = proxy_policy;
         self
+    }
+}
+
+/// Point-in-time view of the recovery-manifest backup worker, served by
+/// `GET /api/admin/recovery`. `recovery_lag` is derived from
+/// `last_success_ms` by the route handler.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct RecoveryBackupSnapshot {
+    pub destination: String,
+    pub interval_ms: u64,
+    pub last_attempt_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_entry_count: Option<u64>,
+    pub last_payload_bytes: Option<u64>,
+    pub consecutive_failures: u64,
+}
+
+/// Shared status handle: the server backup worker writes, the admin route
+/// reads. A plain std Mutex — both sides only take it for field copies.
+#[derive(Debug)]
+pub struct RecoveryBackupStatus {
+    inner: std::sync::Mutex<RecoveryBackupSnapshot>,
+}
+
+impl RecoveryBackupStatus {
+    pub fn new(destination: impl Into<String>, interval_ms: u64) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(RecoveryBackupSnapshot {
+                destination: destination.into(),
+                interval_ms,
+                ..RecoveryBackupSnapshot::default()
+            }),
+        }
+    }
+
+    pub fn record_success(&self, now_ms: i64, entry_count: u64, payload_bytes: u64) {
+        let mut g = self.inner.lock().expect("recovery status mutex poisoned");
+        g.last_attempt_ms = Some(now_ms);
+        g.last_success_ms = Some(now_ms);
+        g.last_error = None;
+        g.last_entry_count = Some(entry_count);
+        g.last_payload_bytes = Some(payload_bytes);
+        g.consecutive_failures = 0;
+    }
+
+    pub fn record_failure(&self, now_ms: i64, error: impl Into<String>) {
+        let mut g = self.inner.lock().expect("recovery status mutex poisoned");
+        g.last_attempt_ms = Some(now_ms);
+        g.last_error = Some(error.into());
+        g.consecutive_failures += 1;
+    }
+
+    pub fn snapshot(&self) -> RecoveryBackupSnapshot {
+        self.inner
+            .lock()
+            .expect("recovery status mutex poisoned")
+            .clone()
     }
 }

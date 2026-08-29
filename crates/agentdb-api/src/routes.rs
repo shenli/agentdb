@@ -206,6 +206,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/indexes/records", get(get_record_index_status))
         .route("/api/admin/content-mirror", get(get_content_mirror_status))
+        .route("/api/admin/recovery", get(get_recovery_status))
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
@@ -973,6 +974,14 @@ struct ContentMirrorStatusResponse {
     completed: u64,
     failed: u64,
     backlog: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryStatusResponse {
+    enabled: bool,
+    manifest_backup: Option<crate::state::RecoveryBackupSnapshot>,
+    content_mirror: Option<ContentMirrorStatusResponse>,
+    recovery_lag_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4380,6 +4389,36 @@ async fn get_fleet_storage_summary(
     State(s): State<AppState>,
 ) -> Json<agentdb_core::FleetStorageSummary> {
     Json(s.runtime.fleet_storage_summary().await)
+}
+
+/// `GET /api/admin/recovery` — the recovery-root health view: manifest-backup
+/// worker status, content-mirror upload backlog, and the headline
+/// `recovery_lag_ms` (age of the newest recovery manifest in the bucket).
+/// This is the cell-loss RPO: what would be lost if every local disk
+/// disappeared right now and the bucket were the only survivor.
+async fn get_recovery_status(State(s): State<AppState>) -> Json<RecoveryStatusResponse> {
+    let now_ms = now_ms_i64();
+    let manifest_backup = s.recovery_backup.as_ref().map(|status| status.snapshot());
+    let recovery_lag_ms = manifest_backup
+        .as_ref()
+        .and_then(|b| b.last_success_ms)
+        .map(|success| (now_ms - success).max(0));
+    let content_mirror = s.content_mirror.as_ref().map(|mirror| {
+        let stats = mirror.stats();
+        ContentMirrorStatusResponse {
+            enabled: true,
+            queued: stats.queued,
+            completed: stats.completed,
+            failed: stats.failed,
+            backlog: stats.backlog,
+        }
+    });
+    Json(RecoveryStatusResponse {
+        enabled: manifest_backup.is_some(),
+        manifest_backup,
+        content_mirror,
+        recovery_lag_ms,
+    })
 }
 
 async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMirrorStatusResponse> {

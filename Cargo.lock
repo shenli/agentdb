@@ -145,6 +145,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "futures",
  "object_store",
  "prost",
  "protobuf",
@@ -152,6 +154,7 @@ dependencies = [
  "raft-engine",
  "rocksdb",
  "serde",
+ "serde_json",
  "sha2",
  "slog",
  "tempfile",

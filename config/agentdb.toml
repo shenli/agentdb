@@ -105,3 +105,13 @@ cell_id = "default"
 # availability_zone = "us-west-2a"
 # stable, mixed, or preemptible.
 capacity_class = "stable"
+
+# Recovery-manifest backups make the object store a recovery root: a
+# periodic full dump of runtime metadata is uploaded so
+# `agentdb restore-from-bucket --config agentdb.toml` can rebuild an empty
+# data directory from the bucket alone. Enabled automatically when
+# [storage.object_store] is configured and the server is persistent.
+# [recovery]
+# enabled = true
+# manifest_backup_interval_ms = 300000
+# manifest_max_bytes = 1073741824

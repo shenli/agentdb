@@ -872,6 +872,59 @@ async fn admin_routing_status_reports_disabled_mode() {
 }
 
 #[tokio::test]
+async fn admin_recovery_reports_disabled_without_backup_worker() {
+    let app = spawn_app().await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/recovery", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], false);
+    assert!(body["manifest_backup"].is_null());
+    assert!(body["recovery_lag_ms"].is_null());
+}
+
+#[tokio::test]
+async fn admin_recovery_reports_backup_status_and_lag() {
+    let status = Arc::new(agentdb_api::state::RecoveryBackupStatus::new(
+        "agentdb/recovery/manifest-latest.jsonl",
+        60_000,
+    ));
+    status.record_success(0, 42, 4096);
+    let state = agentdb_api::AppState::new(agentdb_core::Runtime::in_memory())
+        .with_recovery_backup(status.clone());
+    let app = spawn_app_with_state(state).await;
+
+    let body: serde_json::Value = app
+        .client
+        .get(format!("{}/api/admin/recovery", app.base))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["manifest_backup"]["last_entry_count"], 42);
+    assert_eq!(
+        body["manifest_backup"]["destination"],
+        "agentdb/recovery/manifest-latest.jsonl"
+    );
+    assert!(body["recovery_lag_ms"].as_i64().unwrap() >= 0);
+}
+
+#[tokio::test]
 async fn admin_content_mirror_reports_disabled_mode() {
     let app = spawn_app().await;
 

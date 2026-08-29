@@ -12,6 +12,7 @@ pub mod kms;
 pub mod kv;
 pub mod metadata_crypto;
 pub mod raft_rs_log;
+pub mod recovery;
 pub mod replicated_log;
 pub mod rocks;
 pub mod tablet_store;
@@ -37,6 +38,11 @@ pub use raft_rs_log::{
     stable_raft_node_id, RaftRsNodeConfig, RaftRsNodeRole, RaftRsReplicaStatus,
     RaftRsReplicatedLog, RaftRsSharedGroup, RaftRsSnapshotTransfer, RaftRsTransport,
     RaftRsWireMessage,
+};
+pub use recovery::{
+    export_recovery_manifest, import_recovery_manifest, read_recovery_manifest_header,
+    RecoveryImportStats, RecoveryManifestHeader, RecoveryObjectStore,
+    RECOVERY_MANIFEST_FORMAT_VERSION,
 };
 pub use replicated_log::{LogCommit, LogEntry, ReplicatedLog, SingleNodeReplicatedLog};
 pub use rocks::{RocksKvStore, RocksKvStoreConfig};

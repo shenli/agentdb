@@ -383,3 +383,39 @@ impl ContentBackend for FlakyContentBackend {
         self.inner.delete(tenant_id, artifact_id).await
     }
 }
+
+#[tokio::test]
+async fn object_store_backend_lists_artifact_blobs() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let backend = ObjectStoreContentBackend::new(store.clone(), "agentdb/content");
+    backend.put("ten_a", "art_1", b"one").await.unwrap();
+    backend.put("ten_a", "art_2", b"two").await.unwrap();
+    backend.put("ten_b", "art_3", b"three").await.unwrap();
+    // A non-blob object under the prefix is skipped, not treated as corruption.
+    store
+        .put(
+            &object_store::path::Path::from("agentdb/content/artifact_content/ten_a/stray"),
+            b"x".to_vec().into(),
+        )
+        .await
+        .unwrap();
+
+    let listing = backend.list_objects(10).await.unwrap();
+    let mut pairs: Vec<(String, String)> = listing
+        .objects
+        .into_iter()
+        .map(|o| (o.tenant_id, o.artifact_id))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("ten_a".into(), "art_1".into()),
+            ("ten_a".into(), "art_2".into()),
+            ("ten_b".into(), "art_3".into()),
+        ]
+    );
+
+    let err = backend.list_objects(2).await.unwrap_err();
+    assert!(err.to_string().contains("exceeds configured limit"));
+}
