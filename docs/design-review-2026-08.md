@@ -374,6 +374,60 @@ Design rules to lock in:
    change outages, not to protect the data path, which rules 1-4 already
    decouple.
 
+### Object storage as the recovery root
+
+Decision: Raft replication owns the acknowledged write; object storage stays
+off the performance-critical path — but the bucket must be a full recovery
+root. "Given only the bucket (and KMS), rebuild the cell." Today that is
+half-true: raft snapshots upload with retention/prune and a restore worker
+can bootstrap a node, sealed segments and archives land in the content
+backend — but the object-store backend implements no listing, and the
+manifests that make objects interpretable live only in the KV/meta store.
+Lose the metadata and the bucket is an uninterpretable pile of blobs.
+
+The recovery ladder, with the RPO each rung provides:
+
+| Failure | Recovery source | RPO |
+|---|---|---|
+| One node | Raft catch-up / peer snapshot (exists) | zero while quorum survives |
+| Quorum / cell loss | object storage: snapshots + sealed segments + metadata backup | bounded by upload lag |
+| Metadata loss | scavenge: rebuild manifests from self-describing objects | same as above |
+
+What has to change to make the lower rungs real:
+
+1. **Self-describing object layout.** Every object carries its own identity —
+   tenant, session, seq range, tablet, epoch, format version, checksum — in
+   the object itself, not only in a manifest row, and the key layout is a
+   versioned durable format contract (treat it like a file format). Recovery
+   must never need the metadata store to interpret a bucket.
+2. **Listing plus a per-cell root inventory.** Implement listing in
+   `ObjectStoreContentBackend` (currently unsupported — the startup orphan
+   sweep is explicitly not available there), and periodically write a
+   per-cell root inventory object so scavenge is bounded instead of a full
+   bucket scan.
+3. **Continuous upload with a measured lag.** Raft-snapshot upload cadence,
+   seal frequency, and content-mirror backlog together define the cell-loss
+   RPO. Expose `recovery_lag_seconds` per tablet as a first-class metric and
+   alert on it; tier the cadence (enterprise gets tighter RPO) per the tier
+   matrix above. Control-plane metadata (tenant policies, tablet maps) gets
+   periodic backups into the same bucket — or is made fully scavengeable.
+4. **GC ordering invariant.** upload → verify checksum → commit manifest →
+   only then is local state eligible for GC. The recovery guarantee is a
+   corollary: anything deleted locally is provably in the bucket. Never GC
+   on upload-attempted; only on upload-verified.
+5. **Restore as a tested product workflow.** `agentdbctl restore
+   --from-bucket` covering node bootstrap (exists for raft snapshots),
+   whole-cell rebuild, and manifest scavenge — exercised by periodic
+   automated restore drills. An untested restore path is not a recovery
+   root; this belongs in the same harness as the kill-9 crash tests.
+6. **KMS is part of the root.** Recovery from the bucket requires the KEKs;
+   document that dependency per tier, and note the deliberate exception:
+   crypto-shredded tenants are unrecoverable by design.
+
+This also completes the single-node story: one node plus a bucket gives
+"cheap to run, durable to S3 with a bounded, measured lag" — the natural
+middle rung between laptop dev and a 3-node cell.
+
 ### Bounding single-node blast radius
 
 The second blast-radius lesson: with chunks and replicas spread randomly across a
@@ -627,3 +681,4 @@ partial compatibility is a prior trap.*
 | 9 | Tenant-at-rest = zero marginal runtime cost: parked tablets, hibernating Raft, exception-only stats, documented wake contract | M–L | Dedicated isolation without per-tenant compute or control-plane pressure |
 | 10 | Tier matrix as one contract (share-a-tablet / own-tablets / own-a-cell) with a machine-readable tier descriptor | M | Tiers become selectable and verifiable by agent platforms; enterprise gets per-tenant blast radius |
 | 11 | Subtraction pass: remove wire listener, SlateDB backend, legacy quorum log, dead auth code; externalize ClickStack/Parquet; freeze tablet automation | M | One protocol, one backend, one quorum path; closes the worst P7 hole; attention lands on findings 1-2 |
+| 12 | S3 as recovery root: self-describing objects, listing + cell inventory, measured recovery lag, GC-after-verify, tested restore-from-bucket | M–L | Cell loss and metadata loss become bounded-RPO recoveries instead of disasters |
