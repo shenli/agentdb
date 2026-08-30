@@ -4,11 +4,7 @@
 //! traffic through `Runtime::with_kv`, drops the runtime, reopens the same
 //! KV directory, and asserts the next runtime sees the prior state.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::sync::Arc;
 
 use agentdb_core::agent::NewAgent;
 use agentdb_core::artifact::NewArtifact;
@@ -23,17 +19,26 @@ use agentdb_storage::{
 use tempfile::TempDir;
 
 fn open_kv(path: &std::path::Path) -> Arc<dyn KvStore + Send + Sync> {
-    static STORES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<dyn KvStore + Send + Sync>>>> =
-        OnceLock::new();
-    let stores = STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut stores = stores.lock().expect("runtime restart kv registry poisoned");
-    if let Some(kv) = stores.get(path) {
-        return kv.clone();
+    // A real restart: close-and-reopen from disk, exercising WAL recovery.
+    // The previous runtime\'s adaptive-write thread releases its KV handle
+    // asynchronously after drop, so briefly retry while RocksDB\'s LOCK file
+    // is still held rather than caching a warm handle (a cached handle would
+    // turn every "restart" test into a re-hydration test).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match RocksKvStore::open(path) {
+            Ok(kv) => return Arc::new(kv),
+            Err(err) => {
+                let message = err.to_string();
+                if std::time::Instant::now() >= deadline
+                    || !(message.contains("lock") || message.contains("LOCK"))
+                {
+                    panic!("open rocks kv: {message}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
     }
-    let kv: Arc<dyn KvStore + Send + Sync> =
-        Arc::new(RocksKvStore::open(path).expect("open rocks kv"));
-    stores.insert(path.to_path_buf(), kv.clone());
-    kv
 }
 
 /// Convenience for restart tests that don't exercise artifacts: pair every

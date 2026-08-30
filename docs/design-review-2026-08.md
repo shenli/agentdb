@@ -81,6 +81,17 @@ loses acknowledged appends. Compounding it:
 and add a kill-9-and-reopen crash harness. Cheapest, highest-leverage
 credibility fix in the repo.
 
+> **Branch status**: implemented. Fsync is on by default with a
+> backlog-aware group-commit window (idle appends pay only their own sync;
+> under 32-way concurrency the durable path measured *faster* than the old
+> non-durable one — see `docs/operations/performance.md`). Restart tests now
+> close and reopen RocksDB for real (the warm-handle `OnceLock` is gone; the
+> batcher writer thread joins deterministically on drop), and
+> `ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh`
+> SIGKILLs the live server mid-append-stream and asserts every acknowledged
+> append survives. Remaining: power-loss falsification of fsync itself needs
+> a VM-kill/dm-flakey rig on Linux.
+
 ### 2. The global in-RAM `State` is the real scale wall — being built around, not through
 
 Everything serializes on one lock; node capacity is bound to process RSS; the
@@ -670,7 +681,7 @@ partial compatibility is a prior trap.*
 
 | # | Action | Size | Pays off |
 |---|---|---|---|
-| 1 | fsync-on default + group commit + kill-9 crash harness | S–M | Durability promise becomes true |
+| 1 | fsync-on default + group commit + kill-9 crash harness | S–M | Durability promise becomes true. **Implemented on this branch** (power-loss rig remains) |
 | 2 | KV-authoritative state, sharded in-memory cache, incremental apply | L | Removes the scale wall; unblocks tablet step 5 |
 | 3 | Watch backed by export-ledger cursors | S | Hot path no longer pays for observers |
 | 4 | Per-tenant token scoping; wire-listener hardening | M | Isolation claims become enforceable |

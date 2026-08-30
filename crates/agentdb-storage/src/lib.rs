@@ -45,7 +45,7 @@ pub use recovery::{
     RECOVERY_MANIFEST_FORMAT_VERSION,
 };
 pub use replicated_log::{LogCommit, LogEntry, ReplicatedLog, SingleNodeReplicatedLog};
-pub use rocks::{RocksKvStore, RocksKvStoreConfig};
+pub use rocks::{RocksKvStore, RocksKvStoreConfig, rocksdb_sync_writes_enabled};
 pub use tablet_store::{
     summarize_checkpoint_dir, GroupedRocksDbTabletStore, PrefixScopedTabletStore, TabletKvStore,
     TabletStoreCheckpointSummary, TabletStoreDomainMetrics, TabletStoreLifecycle,

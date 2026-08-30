@@ -13,8 +13,8 @@ Usage: ops/local-ci/scripts/distributed-test-runner.sh [OPTIONS]
 
 Runs the distributed test plan gates intended for li-dev:
   quick    - authored Rust auto suites
-  nightly  - quick + S8 + S9 + S13 smoke
-  release  - quick + S8 + S9 + S13 release gate
+  nightly  - quick + S14 + S8 + S9 + S13 smoke
+  release  - quick + S14 + S8 + S9 + S13 release gate
 
 Options:
   --profile NAME     quick, nightly, or release. Defaults to nightly.
@@ -235,9 +235,14 @@ run_s13() {
     bash tools/agentdb-bench/tests/auto/S13_benchmark_claims_remain_reproducible_under_skew_and_noisy_neighbors.sh
 }
 
+run_s14() {
+  run_stage s14-sigkill-durability bash ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh
+}
+
 run_quick
 
 if [[ "$PROFILE" == "nightly" || "$PROFILE" == "release" ]]; then
+  run_s14
   run_s8
   run_s9
   run_s13
