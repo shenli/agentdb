@@ -603,6 +603,9 @@ struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
     enqueued_at: Instant,
     done: AdaptiveWriteCompletion,
+    // Captured at submit time: the writer thread has no task-local tablet
+    // context, so the flush re-enters this scope per group.
+    tablet_id: Option<i64>,
 }
 
 enum AdaptiveWriteCompletion {
@@ -838,6 +841,7 @@ impl AdaptiveWriteBatcher {
                 ops,
                 enqueued_at: Instant::now(),
                 done: AdaptiveWriteCompletion::Async(done),
+                tablet_id: crate::runtime::current_runtime_tablet_id(),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -876,6 +880,7 @@ impl AdaptiveWriteBatcher {
                 ops,
                 enqueued_at: Instant::now(),
                 done: AdaptiveWriteCompletion::Blocking(done),
+                tablet_id: crate::runtime::current_runtime_tablet_id(),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -930,8 +935,6 @@ fn adaptive_write_loop(
             }
         }
 
-        let mut ops = Vec::with_capacity(op_count);
-        let mut completions = Vec::with_capacity(requests.len());
         let request_count = requests.len();
 
         while writer_busy
@@ -944,20 +947,35 @@ fn adaptive_write_loop(
             .iter()
             .map(|request| request.enqueued_at.elapsed().as_nanos())
             .sum::<u128>();
+
+        // One flush per tablet scope: the KV handle may be a tablet router
+        // that resolves the destination from the task-local tablet id, so
+        // ops from different tablets must never share a write_batch.
+        // BTreeMap keeps a deterministic flush order; arrival order is
+        // preserved within each tablet.
+        let mut groups: std::collections::BTreeMap<
+            Option<i64>,
+            (Vec<WriteOp>, Vec<AdaptiveWriteCompletion>),
+        > = std::collections::BTreeMap::new();
         for request in requests {
-            ops.extend(request.ops);
-            completions.push(request.done);
+            let group = groups.entry(request.tablet_id).or_default();
+            group.0.extend(request.ops);
+            group.1.push(request.done);
         }
 
         let write_started = Instant::now();
-        let result = export_ledger_sequencer.write(kv.as_ref(), ops);
+        for (tablet_id, (ops, completions)) in groups {
+            let result = crate::runtime::with_runtime_tablet_scope_sync(tablet_id, || {
+                export_ledger_sequencer.write(kv.as_ref(), ops)
+            });
+            for done in completions {
+                done.send(&result);
+            }
+        }
         let write_nanos = write_started.elapsed().as_nanos();
         writer_busy.store(0, Ordering::Release);
         if let Some(profile) = adaptive_write_profile() {
             profile.record_grouped(request_count, op_count, queue_nanos, write_nanos);
-        }
-        for done in completions {
-            done.send(&result);
         }
     }
 }

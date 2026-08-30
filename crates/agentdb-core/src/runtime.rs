@@ -72,6 +72,25 @@ tokio::task_local! {
     static CURRENT_RUNTIME_ROUTE_CONTEXT: RuntimeRouteContext;
 }
 
+/// Tablet routing rides a task-local, which does not follow work handed to
+/// other threads. Any component that moves a write off the submitting task
+/// (the adaptive write batcher) must capture the id at submit time with this
+/// helper and re-enter the scope at flush time with
+/// [`with_runtime_tablet_scope_sync`].
+pub(crate) fn current_runtime_tablet_id() -> Option<i64> {
+    CURRENT_RUNTIME_TABLET_ID.try_with(|tablet_id| *tablet_id).ok()
+}
+
+pub(crate) fn with_runtime_tablet_scope_sync<R>(
+    tablet_id: Option<i64>,
+    f: impl FnOnce() -> R,
+) -> R {
+    match tablet_id {
+        Some(tablet_id) => CURRENT_RUNTIME_TABLET_ID.sync_scope(tablet_id, f),
+        None => f(),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeRouteContext {
     pub tablet_id: Option<i64>,
