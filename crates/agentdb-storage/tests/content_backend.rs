@@ -419,3 +419,95 @@ async fn object_store_backend_lists_artifact_blobs() {
     let err = backend.list_objects(2).await.unwrap_err();
     assert!(err.to_string().contains("exceeds configured limit"));
 }
+
+fn now_wallclock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn managed_cache_evicts_cold_objects_and_recolds_after_readthrough() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    let mirror = in_memory();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8)
+        .with_local_cache_ttl_ms(500);
+
+    backend.put("ten_a", "seg_1", b"cold data").await.unwrap();
+    wait_for_mirror(&backend, 1).await;
+
+    // Still warm: age below TTL, nothing evicted.
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 0);
+    assert!(primary.head("ten_a", "seg_1").await.unwrap());
+
+    // Past TTL: local copy evicted, mirror copy retained.
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 1);
+    assert!(!primary.head("ten_a", "seg_1").await.unwrap());
+    assert!(mirror.head("ten_a", "seg_1").await.unwrap());
+
+    // Cold read pulls through the mirror and re-caches locally...
+    assert_eq!(backend.get("ten_a", "seg_1").await.unwrap(), b"cold data");
+    assert!(primary.head("ten_a", "seg_1").await.unwrap());
+
+    // ...and the re-cached copy goes cold again on a later sweep.
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 1);
+    assert!(!primary.head("ten_a", "seg_1").await.unwrap());
+    assert_eq!(backend.stats().evicted, 2);
+}
+
+#[tokio::test]
+async fn managed_cache_never_evicts_the_only_copy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    let mirror = in_memory();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8)
+        .with_local_cache_ttl_ms(0);
+
+    // Written to the primary directly: the mirror never saw it.
+    primary.put("ten_a", "seg_only", b"unmirrored").await.unwrap();
+
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 0);
+    assert_eq!(report.retained_unmirrored, 1);
+    assert!(primary.head("ten_a", "seg_only").await.unwrap());
+}
+
+#[tokio::test]
+async fn managed_cache_touch_on_read_keeps_object_warm() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    let mirror = in_memory();
+    let backend = AsyncMirrorContentBackend::new(primary.clone(), mirror.clone(), 8)
+        .with_local_cache_ttl_ms(5_000);
+
+    backend.put("ten_a", "seg_hot", b"hot data").await.unwrap();
+    wait_for_mirror(&backend, 1).await;
+
+    // A read refreshes the object's age; a sweep just inside the TTL after
+    // that read must retain it.
+    assert_eq!(backend.get("ten_a", "seg_hot").await.unwrap(), b"hot data");
+    let read_ms = now_wallclock_ms();
+    let report = backend
+        .run_cache_sweep_once(read_ms + 4_000, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(report.evicted, 0);
+    assert!(primary.head("ten_a", "seg_hot").await.unwrap());
+}

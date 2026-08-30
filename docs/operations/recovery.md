@@ -61,6 +61,14 @@ error, not a silent no-op.
 }
 ```
 
+In mirror mode the local content copy is a **managed cache**
+(`storage.content.local_cache_ttl_ms`, default 24h): local objects unread
+past the TTL whose object-store copy exists are evicted, so cold content —
+sealed segments, archives, idle artifacts — lives only in the object store.
+A cold read pulls through the mirror, re-caches locally, and the object goes
+cold again after another TTL. `evicted` and `local_cache_ttl_ms` appear in
+the `content_mirror` block above.
+
 `recovery_lag_ms` is the headline number: the age of the newest manifest in
 the bucket — what would be lost if every local disk disappeared right now
 and the bucket were the only survivor. Alert on it the way you would alert
@@ -88,7 +96,9 @@ session, and sequence-range identity inside the blob.
 
 - **Upload → verify → manifest → only then GC.** Local state may only be
   garbage-collected after its object-store copy is verified. Anything
-  deleted locally is therefore provably in the bucket.
+  deleted locally is therefore provably in the bucket. The content cache
+  sweep enforces this mechanically: it never evicts a local object whose
+  mirror copy is absent.
 - **Restore never merges.** Import into a non-empty runtime directory is
   refused; recovery is always into a fresh directory.
 - **The manifest format is a compatibility contract.** Version bumps require

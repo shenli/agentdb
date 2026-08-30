@@ -974,6 +974,8 @@ struct ContentMirrorStatusResponse {
     completed: u64,
     failed: u64,
     backlog: u64,
+    evicted: u64,
+    local_cache_ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4411,6 +4413,8 @@ async fn get_recovery_status(State(s): State<AppState>) -> Json<RecoveryStatusRe
             completed: stats.completed,
             failed: stats.failed,
             backlog: stats.backlog,
+            evicted: stats.evicted,
+            local_cache_ttl_ms: mirror.local_cache_ttl_ms(),
         }
     });
     Json(RecoveryStatusResponse {
@@ -4429,6 +4433,8 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
             completed: 0,
             failed: 0,
             backlog: 0,
+            evicted: 0,
+            local_cache_ttl_ms: None,
         });
     };
     let stats = mirror.stats();
@@ -4438,6 +4444,8 @@ async fn get_content_mirror_status(State(s): State<AppState>) -> Json<ContentMir
         completed: stats.completed,
         failed: stats.failed,
         backlog: stats.backlog,
+        evicted: stats.evicted,
+        local_cache_ttl_ms: mirror.local_cache_ttl_ms(),
     })
 }
 

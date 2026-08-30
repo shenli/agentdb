@@ -475,7 +475,40 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         state = state.with_api_auth_previous_token(token);
     }
     if let Some(content_mirror) = content_mirror {
-        state = state.with_content_mirror(content_mirror);
+        state = state.with_content_mirror(content_mirror.clone());
+        if content_mirror.local_cache_ttl_ms().is_some() {
+            let sweep_interval =
+                Duration::from_millis(config.content_cache_sweep_interval_ms);
+            let list_limit =
+                env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
+            tracing::info!(
+                interval_ms = config.content_cache_sweep_interval_ms,
+                ttl_ms = ?content_mirror.local_cache_ttl_ms(),
+                "started content cache sweeper (cold content lives only in the object store)"
+            );
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(sweep_interval).await;
+                    match content_mirror
+                        .run_cache_sweep_once(now_ms_i64(), list_limit)
+                        .await
+                    {
+                        Ok(report) if report.evicted > 0 => {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                evicted = report.evicted,
+                                retained_unmirrored = report.retained_unmirrored,
+                                "content cache sweep evicted cold local copies"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(?error, "content cache sweep failed");
+                        }
+                    }
+                }
+            });
+        }
     }
     if let (Some(recovery_cfg), Some(kv), Some(object_store_cfg)) = (
         config.recovery_manifest_backup,
@@ -823,6 +856,8 @@ struct ResolvedServeConfig {
     api_auth_token: Option<String>,
     api_auth_previous_token: Option<String>,
     recovery_manifest_backup: Option<ResolvedRecoveryConfig>,
+    content_local_cache_ttl_ms: Option<u64>,
+    content_cache_sweep_interval_ms: u64,
 }
 
 struct RouteStartup {
@@ -1077,6 +1112,14 @@ impl ResolvedServeConfig {
         )?;
         let recovery_manifest_backup =
             resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
+        let content_local_cache_ttl_ms =
+            resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+        let content_cache_sweep_interval_ms = file
+            .storage
+            .content
+            .cache_sweep_interval_ms
+            .unwrap_or(DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS)
+            .max(1_000);
         let internal_auth_token = opts
             .internal_auth_token
             .or(file.server.internal_auth_token)
@@ -1154,6 +1197,8 @@ impl ResolvedServeConfig {
             api_auth_token,
             api_auth_previous_token,
             recovery_manifest_backup,
+            content_local_cache_ttl_ms,
+            content_cache_sweep_interval_ms,
         })
     }
 
@@ -1223,6 +1268,14 @@ impl ResolvedServeConfig {
         )?;
         let recovery_manifest_backup =
             resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
+        let content_local_cache_ttl_ms =
+            resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+        let content_cache_sweep_interval_ms = file
+            .storage
+            .content
+            .cache_sweep_interval_ms
+            .unwrap_or(DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS)
+            .max(1_000);
         let internal_auth_token = file
             .server
             .internal_auth_token
@@ -1292,6 +1345,8 @@ impl ResolvedServeConfig {
             api_auth_token,
             api_auth_previous_token,
             recovery_manifest_backup,
+            content_local_cache_ttl_ms,
+            content_cache_sweep_interval_ms,
         })
     }
 }
@@ -1366,6 +1421,12 @@ struct TabletStoreFileConfig {
 #[serde(deny_unknown_fields)]
 struct ContentFileConfig {
     backend: Option<String>,
+    /// Managed-cache TTL for the local content copy in mirror mode. Local
+    /// objects unread for this long whose object-store copy exists are
+    /// evicted (cold data then lives only in the object store). Defaults to
+    /// 24h in mirror mode; 0 disables eviction.
+    local_cache_ttl_ms: Option<u64>,
+    cache_sweep_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1707,15 +1768,20 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                 DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
             )
             .max(1);
-            let backend = Arc::new(agentdb_storage::AsyncMirrorContentBackend::new(
+            let mut mirror_backend = agentdb_storage::AsyncMirrorContentBackend::new(
                 primary,
                 mirror,
                 queue_capacity,
-            ));
+            );
+            if let Some(ttl_ms) = config.content_local_cache_ttl_ms {
+                mirror_backend = mirror_backend.with_local_cache_ttl_ms(ttl_ms);
+            }
+            let backend = Arc::new(mirror_backend);
             tracing::info!(
                 primary_path = %content_dir.display(),
                 mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
                 queue_capacity,
+                local_cache_ttl_ms = ?config.content_local_cache_ttl_ms,
                 "opened async mirrored artifact content backend"
             );
             Ok((backend.clone(), Some(backend)))
@@ -1759,6 +1825,31 @@ struct ResolvedRecoveryConfig {
 const DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS: u64 = 300_000;
 const DEFAULT_RECOVERY_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const RECOVERY_OBJECT_PREFIX: &str = "agentdb";
+const DEFAULT_CONTENT_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS: u64 = 300_000;
+
+/// Mirror mode defaults to a managed local cache (cold content only in the
+/// object store); `local_cache_ttl_ms = 0` opts out. Non-mirror content
+/// backends have no cache to manage.
+fn resolve_content_cache_ttl(
+    file: &ContentFileConfig,
+    content_backend: ContentBackendKind,
+    deployment_mode: DeploymentMode,
+) -> Option<u64> {
+    // Mirror mode (LocalFs primary + async object-store mirror) exists only
+    // for cluster deployments with an object-store content backend; the
+    // other shapes have no local cache to manage.
+    let mirror_mode = matches!(content_backend, ContentBackendKind::ObjectStore)
+        && matches!(deployment_mode, DeploymentMode::Cluster);
+    if !mirror_mode {
+        return None;
+    }
+    match file.local_cache_ttl_ms {
+        Some(0) => None,
+        Some(ttl) => Some(ttl.max(1_000)),
+        None => Some(DEFAULT_CONTENT_CACHE_TTL_MS),
+    }
+}
 
 fn resolve_recovery_config(
     file: &RecoveryFileConfig,
@@ -6038,6 +6129,36 @@ node_id = "node-a"
         let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
         assert!(matches!(config.deployment_mode, DeploymentMode::Cluster));
         assert!(matches!(config.kv_backend, KvBackendKind::RocksDb));
+    }
+
+    #[test]
+    fn content_cache_ttl_defaults_on_in_mirror_mode_and_zero_disables() {
+        let file = ContentFileConfig {
+            backend: Some("object_store".into()),
+            local_cache_ttl_ms: None,
+            cache_sweep_interval_ms: None,
+        };
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            Some(DEFAULT_CONTENT_CACHE_TTL_MS)
+        );
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::SingleNode),
+            None
+        );
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::LocalFs, DeploymentMode::Cluster),
+            None
+        );
+        let disabled = ContentFileConfig {
+            backend: Some("object_store".into()),
+            local_cache_ttl_ms: Some(0),
+            cache_sweep_interval_ms: None,
+        };
+        assert_eq!(
+            resolve_content_cache_ttl(&disabled, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            None
+        );
     }
 
     #[test]
