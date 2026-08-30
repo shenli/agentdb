@@ -4240,12 +4240,19 @@ impl Runtime {
                     })
                     .count();
                 if active_sessions >= max {
+                    // Transient by design: lifecycle sweeps and session
+                    // closure drain this quota, so a retrying agent should
+                    // back off (429 + Retry-After), not treat it as a hard
+                    // policy denial.
                     return Err(Error::new(
-                        ErrorCode::PolicyDenied,
+                        ErrorCode::RateLimited,
                         format!(
-                            "policy_version {} denies session create: active session quota {max} exhausted",
+                            "policy_version {} defers session create: active session quota {max} exhausted",
                             policy.version
                         ),
+                    )
+                    .with_suggestion(
+                        "retry after backoff; close or archive idle sessions to free quota",
                     ));
                 }
             }
@@ -4358,8 +4365,10 @@ impl Runtime {
                 at_seq: req.at_seq,
             });
             child.policy_version = parent.policy_version;
-            s.sessions
-                .insert(child.session_id.as_str().to_string(), child.clone());
+            // Reserve the alias under the lock so a concurrent fork/create
+            // cannot claim it while we persist, but do NOT publish the
+            // session yet: memory follows durable commit (same rule as the
+            // append path), so a persist failure must leave no visible child.
             if let Some(alias) = child.alias.as_deref() {
                 if !alias.is_empty() {
                     s.session_aliases.insert(
@@ -4371,7 +4380,25 @@ impl Runtime {
             child
         };
         if let Some(p) = &self.persist {
-            p.put_forked_session(&child).map_err(internal)?;
+            if let Err(error) = p.put_forked_session(&child) {
+                let mut s = self.state.lock().await;
+                if let Some(alias) = child.alias.as_deref() {
+                    if !alias.is_empty() {
+                        let key = scoped_alias_key(child.tenant_id.as_str(), alias);
+                        if s.session_aliases.get(&key).map(String::as_str)
+                            == Some(child.session_id.as_str())
+                        {
+                            s.session_aliases.remove(&key);
+                        }
+                    }
+                }
+                return Err(internal(error));
+            }
+        }
+        {
+            let mut s = self.state.lock().await;
+            s.sessions
+                .insert(child.session_id.as_str().to_string(), child.clone());
         }
         Ok(child)
     }
@@ -5257,6 +5284,45 @@ impl Runtime {
     /// A metadata error triggers immediate content cleanup; a process crash in
     /// the narrow interval is repaired by startup orphan reconciliation.
     pub async fn create_artifact(&self, req: NewArtifact, bytes: Vec<u8>) -> Result<Artifact> {
+        self.create_artifact_with_idempotency(req, bytes, None).await
+    }
+
+    /// `create_artifact` with retry semantics: a repeated call with the same
+    /// `idempotency_key` and identical content returns the original artifact
+    /// instead of storing a second blob; the same key with different content
+    /// is an `IdempotencyConflict`.
+    pub async fn create_artifact_with_idempotency(
+        &self,
+        req: NewArtifact,
+        bytes: Vec<u8>,
+        idempotency_key: Option<String>,
+    ) -> Result<Artifact> {
+        let idem_entry = match idempotency_key.as_deref().filter(|key| !key.is_empty()) {
+            Some(key) => {
+                let full_key = format!("{}::artifact::{key}", req.tenant_id);
+                let payload_hash = hash_json(&serde_json::json!({
+                    "op": "create_artifact",
+                    "tenant_id": req.tenant_id.as_str(),
+                    "content_type": req.content_type,
+                    "sha256": sha256_hex(&bytes),
+                }));
+                if let Some(record) = self.idem.lookup(&full_key) {
+                    if record.payload_hash != payload_hash {
+                        return Err(Error::new(
+                            ErrorCode::IdempotencyConflict,
+                            format!(
+                                "idempotency key {key} was used with different artifact content"
+                            ),
+                        ));
+                    }
+                    let artifact: Artifact = serde_json::from_str(&record.result_json)
+                        .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
+                    return Ok(artifact);
+                }
+                Some((full_key, payload_hash))
+            }
+            None => None,
+        };
         let policy = self.resolve_policy_for_tenant(&req.tenant_id).await?;
         // Reject oversized blobs before touching the content backend so a
         // misbehaving caller can't fill disk by streaming a huge body.
@@ -5423,6 +5489,21 @@ impl Runtime {
         state
             .artifacts
             .insert(artifact.artifact_id.as_str().to_string(), artifact.clone());
+        if let Some((full_key, payload_hash)) = idem_entry {
+            let record = IdempotencyRecord {
+                payload_hash,
+                result_json: serde_json::to_string(&artifact)
+                    .map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?,
+                created_at_ms: crate::now_ms(),
+            };
+            if let Some(p) = &self.persist {
+                if let Err(error) = p.put_idempotency(&full_key, &record) {
+                    tracing::warn!(?error, "artifact idempotency record persist failed");
+                }
+            }
+            self.idem.put(full_key, record);
+        }
+        drop(state);
         Ok(artifact)
     }
 
@@ -5435,6 +5516,19 @@ impl Runtime {
         &self,
     ) -> Result<ArtifactContentReconciliationReport> {
         let max_objects = startup_hydration_limit("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000);
+        // Crash-left temporaries first (destructive, startup-only), then the
+        // read-only listing used for orphan reconciliation.
+        let temporary_objects_deleted = match self.content.sweep_temporary_objects(max_objects).await
+        {
+            Ok(removed) => removed,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => 0,
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    format!("temporary content sweep failed: {error}"),
+                ))
+            }
+        };
         let listing = match self.content.list_objects(max_objects).await {
             Ok(listing) => listing,
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
@@ -5449,7 +5543,7 @@ impl Runtime {
         };
         let referenced = {
             let state = self.state.lock().await;
-            state
+            let mut referenced: BTreeSet<(String, String)> = state
                 .artifacts
                 .values()
                 .filter(|artifact| artifact.raw_purged_at_ms.is_none())
@@ -5459,11 +5553,36 @@ impl Runtime {
                         artifact.artifact_id.as_str().to_string(),
                     )
                 })
-                .collect::<BTreeSet<_>>()
+                .collect();
+            // Tiered session history shares the content namespace with
+            // artifacts: sealed segments, archive bundles, and replay-prefix
+            // blobs are all referenced from session metadata, not from the
+            // artifacts map. Missing any of them here turns the orphan sweep
+            // into a data destroyer — a restart would delete every cold and
+            // archived session's history. Source segments of an archive are
+            // kept too: a crash between archive-manifest commit and source
+            // cleanup leaves them present, and retaining a stale blob until
+            // GC is always safer than deleting a referenced one.
+            for session in state.sessions.values() {
+                let tenant = session.tenant_id.as_str().to_string();
+                for segment in &session.sealed_segments {
+                    referenced.insert((tenant.clone(), segment.segment_id.as_str().to_string()));
+                }
+                if let Some(archive) = &session.archive_manifest {
+                    referenced.insert((tenant.clone(), archive.manifest_id.as_str().to_string()));
+                    for source in &archive.source_segment_ids {
+                        referenced.insert((tenant.clone(), source.as_str().to_string()));
+                    }
+                }
+                if let Some(prefix) = &session.replay_prefix {
+                    referenced.insert((tenant.clone(), prefix.prefix_id.as_str().to_string()));
+                }
+            }
+            referenced
         };
         let mut report = ArtifactContentReconciliationReport {
             listing_supported: true,
-            temporary_objects_deleted: listing.temporary_objects_deleted,
+            temporary_objects_deleted,
             ..Default::default()
         };
         for object in listing.objects {
@@ -7719,18 +7838,42 @@ impl Runtime {
 
         let cursor_context = self.changefeed_cursor_context()?;
 
+        // Frontier-first: the cursor already records each session's
+        // next-sequence position, so a poll fetches only events past it,
+        // bounded by the requested page size — O(new events + sessions in
+        // scope), not O(total retained history). Legacy (pre-frontier)
+        // cursors fall back to the full scan below for compatibility.
+        let frontier_positions = req
+            .from_cursor
+            .as_deref()
+            .and_then(parse_watch_frontier_cursor);
+        let legacy_cursor = req.from_cursor.is_some() && frontier_positions.is_none();
+        let per_session_limit = if legacy_cursor {
+            usize::MAX
+        } else {
+            req.limit.max(1)
+        };
+
         // Build a unified, totally-ordered feed of per-session event sub-streams
         // plus fork-edge control items. Each physical event is emitted exactly
         // once on the session where it was written (no re-emission of ancestor
         // history across a fork). Entry = (order_key-bearing cursor, item).
         let mut entries: Vec<(String, ChangefeedItem)> = Vec::new();
         for session_id in session_ids {
+            let from_seq = if legacy_cursor {
+                0
+            } else {
+                frontier_positions
+                    .as_ref()
+                    .and_then(|positions| positions.get(session_id.as_str()).copied())
+                    .unwrap_or(0)
+            };
             let events = self
                 .fetch_from_seq(FetchRequest {
                     tenant_id: req.tenant_id.clone(),
                     session_id,
-                    from_seq: 0,
-                    limit: usize::MAX,
+                    from_seq,
+                    limit: per_session_limit,
                 })
                 .await?;
             for event in events {
@@ -7774,16 +7917,12 @@ impl Runtime {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let mut frontier = req
-            .from_cursor
-            .as_deref()
-            .and_then(parse_watch_frontier_cursor)
-            .unwrap_or_default();
-        let legacy_from_cursor_key = req
-            .from_cursor
-            .as_deref()
-            .filter(|cursor| parse_watch_frontier_cursor(cursor).is_none())
-            .map(event_cursor_order_key);
+        let mut frontier = frontier_positions.unwrap_or_default();
+        let legacy_from_cursor_key = if legacy_cursor {
+            req.from_cursor.as_deref().map(event_cursor_order_key)
+        } else {
+            None
+        };
         for (cursor, mut item) in entries {
             if legacy_from_cursor_key.is_some_and(|from| event_cursor_order_key(&cursor) <= from) {
                 continue;
@@ -8648,6 +8787,14 @@ impl Runtime {
             }
         }
 
+        // Archive and sealed segments are NOT mutually exclusive: sealing a
+        // reopened warm head on top of an archived session keeps the archive
+        // manifest AND pushes new segments above it. The merged view must
+        // read archive, then segments, then the warm head — treating these
+        // as alternatives makes post-archive segments invisible, and the
+        // next archive compaction (which reads through this path) would
+        // write a bundle without them and delete their blobs: silent,
+        // permanent history loss. Caught by the S15 lifecycle-chaos harness.
         if let Some(manifest) = &session.archive_manifest {
             let mut archived = self.read_session_archive_events(manifest).await?;
             archived.retain(|event| event.seq >= req.from_seq);
@@ -8656,22 +8803,21 @@ impl Runtime {
                 out.truncate(req.limit);
                 return Ok(out);
             }
-        } else {
-            let mut segments = session.sealed_segments.clone();
-            segments.sort_by_key(|segment| segment.seq_start);
-            for segment in segments {
-                if segment.seq_end < req.from_seq {
-                    continue;
-                }
-                let mut events = self.read_session_segment_events(&segment).await?;
-                if req.from_seq > segment.seq_start {
-                    events.retain(|event| event.seq >= req.from_seq);
-                }
-                out.extend(events);
-                if out.len() >= req.limit {
-                    out.truncate(req.limit);
-                    return Ok(out);
-                }
+        }
+        let mut segments = session.sealed_segments.clone();
+        segments.sort_by_key(|segment| segment.seq_start);
+        for segment in segments {
+            if segment.seq_end < req.from_seq {
+                continue;
+            }
+            let mut events = self.read_session_segment_events(&segment).await?;
+            if req.from_seq > segment.seq_start {
+                events.retain(|event| event.seq >= req.from_seq);
+            }
+            out.extend(events);
+            if out.len() >= req.limit {
+                out.truncate(req.limit);
+                return Ok(out);
             }
         }
 
@@ -9861,7 +10007,14 @@ impl Runtime {
         self: Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        // Idempotency retention piggybacks on this worker: roughly every five
+        // minutes of ticks, expire old records from the in-memory table and
+        // delete their durable rows.
+        let sweep_every = (std::time::Duration::from_secs(300).as_millis()
+            / interval.as_millis().max(1))
+            .max(1) as u64;
         tokio::spawn(async move {
+            let mut ticks: u64 = 0;
             loop {
                 if let Err(error) = self.apply_record_index_outbox_once().await {
                     let mut s = self.state.lock().await;
@@ -9869,9 +10022,44 @@ impl Runtime {
                     drop(s);
                     tracing::warn!(?error, "record index outbox replay failed");
                 }
+                ticks += 1;
+                if ticks % sweep_every == 0 {
+                    self.sweep_idempotency_retention();
+                }
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+
+    /// Expire idempotency records past the retention TTL (and beyond the
+    /// entry cap) from the in-memory table, and delete the matching durable
+    /// rows so restarts do not resurrect them.
+    pub fn sweep_idempotency_retention(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let removed = self.idem.evict(
+            now_ms,
+            crate::idempotency::idempotency_ttl_ms(),
+            crate::idempotency::idempotency_max_entries(),
+        );
+        if removed.is_empty() {
+            return;
+        }
+        if let Some(p) = &self.persist {
+            let mut delete_errors = 0usize;
+            for key in &removed {
+                if p.delete_idempotency(key).is_err() {
+                    delete_errors += 1;
+                }
+            }
+            tracing::info!(
+                expired = removed.len(),
+                delete_errors,
+                "idempotency retention sweep removed expired records"
+            );
+        }
     }
 
     /// Search the (tenant, namespace) scope and return records only. Call

@@ -23,6 +23,29 @@ pub struct IdempotencyRecord {
 #[derive(Default, Debug)]
 pub struct IdempotencyStore {
     inner: Mutex<HashMap<String, IdempotencyRecord>>,
+    puts_since_eviction: std::sync::atomic::AtomicU64,
+}
+
+/// Retention knobs for the in-memory idempotency table. Every cross-component
+/// map is a quota site: without a TTL and cap this is an unbounded queue that
+/// grows with every keyed mutation for the life of the process.
+pub const DEFAULT_IDEMPOTENCY_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const DEFAULT_IDEMPOTENCY_MAX_ENTRIES: usize = 1_000_000;
+const EVICTION_EVERY_N_PUTS: u64 = 4_096;
+
+pub fn idempotency_ttl_ms() -> u64 {
+    std::env::var("AGENTDB_IDEMPOTENCY_TTL_MS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_IDEMPOTENCY_TTL_MS)
+}
+
+pub fn idempotency_max_entries() -> usize {
+    std::env::var("AGENTDB_IDEMPOTENCY_MAX_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IDEMPOTENCY_MAX_ENTRIES)
 }
 
 impl IdempotencyStore {
@@ -31,6 +54,51 @@ impl IdempotencyStore {
     }
     pub fn put(&self, key: String, record: IdempotencyRecord) {
         self.inner.lock().unwrap().insert(key, record);
+        let puts = self
+            .puts_since_eviction
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if puts != 0 && puts % EVICTION_EVERY_N_PUTS == 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.evict(now_ms, idempotency_ttl_ms(), idempotency_max_entries());
+        }
+    }
+
+    /// Drop expired records, then enforce the entry cap by evicting the
+    /// oldest survivors. Returns the keys removed so the caller can also
+    /// delete the corresponding durable rows.
+    pub fn evict(&self, now_ms: u64, ttl_ms: u64, max_entries: usize) -> Vec<String> {
+        let mut g = self.inner.lock().unwrap();
+        let mut removed = Vec::new();
+        g.retain(|key, record| {
+            let expired = now_ms.saturating_sub(record.created_at_ms) > ttl_ms;
+            if expired {
+                removed.push(key.clone());
+            }
+            !expired
+        });
+        if g.len() > max_entries {
+            let mut by_age: Vec<(u64, String)> = g
+                .iter()
+                .map(|(key, record)| (record.created_at_ms, key.clone()))
+                .collect();
+            by_age.sort_unstable();
+            for (_, key) in by_age.into_iter().take(g.len() - max_entries) {
+                g.remove(&key);
+                removed.push(key);
+            }
+        }
+        removed
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
     }
     pub fn remove(&self, key: &str) {
         self.inner.lock().unwrap().remove(key);
@@ -131,5 +199,33 @@ mod tests {
             hash_json(&serde_json::json!({"a": 1})),
             14_886_008_067_637_593_304
         );
+    }
+
+    #[test]
+    fn evict_removes_expired_and_enforces_cap() {
+        let store = IdempotencyStore::default();
+        for i in 0..10u64 {
+            store.put(
+                format!("key-{i}"),
+                IdempotencyRecord {
+                    payload_hash: i,
+                    result_json: "{}".into(),
+                    created_at_ms: i * 100,
+                },
+            );
+        }
+        // TTL pass: records older than 500ms at now=1000 (created <= 400).
+        let removed = store.evict(1_000, 500, 100);
+        assert_eq!(removed.len(), 5);
+        assert_eq!(store.len(), 5);
+        assert!(store.lookup("key-4").is_none());
+        assert!(store.lookup("key-5").is_some());
+
+        // Cap pass: shrink to the 2 newest survivors.
+        let removed = store.evict(1_000, u64::MAX, 2);
+        assert_eq!(removed.len(), 3);
+        assert_eq!(store.len(), 2);
+        assert!(store.lookup("key-8").is_some());
+        assert!(store.lookup("key-9").is_some());
     }
 }

@@ -25,7 +25,16 @@ cd "${ROOT}"
 ITERATIONS="${AGENTDB_S14_ITERATIONS:-3}"
 KILL_AFTER_MS="${AGENTDB_S14_KILL_AFTER_MS:-1500}"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agentdb-s14.XXXXXX")"
-trap 'kill "${SERVER_PID:-0}" 2>/dev/null || true; rm -rf "${WORK_DIR}"' EXIT
+cleanup() {
+  status=$?
+  kill "${SERVER_PID:-0}" 2>/dev/null || true
+  if [[ ${status} -ne 0 ]]; then
+    echo "FAILED: work dir preserved for inspection: ${WORK_DIR}" >&2
+  else
+    rm -rf "${WORK_DIR}"
+  fi
+}
+trap cleanup EXIT
 
 PORT="$(python3 - <<'PY'
 import socket

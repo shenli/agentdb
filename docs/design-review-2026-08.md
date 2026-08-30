@@ -677,16 +677,47 @@ Where the familiarity lesson does land for AgentDB:
 Principle to record: *familiarity over novelty, but only at full fidelity —
 partial compatibility is a prior trap.*
 
+## Chaos-testing findings (2026-08-30)
+
+The S14-S16 crash/chaos harnesses (`ops/local-ci/tests/auto/`, wired into
+the nightly/release runner; scenario records in
+`testing-plans/agentdb-project-wide-distributed-tests.md`) found two
+pre-existing silent data-loss bugs within their first runs — both on the
+tiered-storage path, both invisible to the prior test suite because restart
+tests paired each restart with a fresh in-memory content backend:
+
+1. **Startup orphan sweep destroyed tiered history.** Its referenced-set
+   held only artifact ids, so every persistent restart deleted all sealed
+   segments, archive bundles, and replay prefixes as "orphans". Fixed:
+   session-referenced content ids (including archive sources, kept
+   conservatively) are now part of the referenced set; pinned by a
+   restart regression test.
+2. **Merged read dropped post-archive segments.** Archive manifest and
+   sealed segments were treated as mutually exclusive in `fetch_from_seq`,
+   though the lifecycle seals reopened warm heads on top of an archive.
+   Post-archive segments were unreadable, and the next archive compaction
+   (which reads through the same path) wrote a bundle without them and
+   deleted their blobs — permanent loss on the healthy path, no crash
+   required. Fixed: archive, segments, and warm head merge; pinned by a
+   lifecycle regression test.
+
+The harnesses also caught a design error in this branch's own cache sweep
+(reusing the destructive `list_objects` tmp-cleanup as a periodic scan,
+which could destroy in-flight uploads) — now split into a read-only listing
+plus an explicit startup-only `sweep_temporary_objects`. Property tests
+(proptest) cover the recovery-manifest format; a concurrent flaky-mirror
+chaos test covers cache eviction invariants under fault.
+
 ## Prioritized actions
 
 | # | Action | Size | Pays off |
 |---|---|---|---|
 | 1 | fsync-on default + group commit + kill-9 crash harness | S–M | Durability promise becomes true. **Implemented on this branch** (power-loss rig remains) |
 | 2 | KV-authoritative state, sharded in-memory cache, incremental apply | L | Removes the scale wall; unblocks tablet step 5 |
-| 3 | Watch backed by export-ledger cursors | S | Hot path no longer pays for observers |
+| 3 | Watch backed by export-ledger cursors | S | Hot path no longer pays for observers. **Largely implemented on this branch**: watch is frontier-incremental — a poll fetches only events past each session's cursor position, bounded by the page size, instead of every event of every in-scope session; full ledger-backed live push remains the finding-4 end state |
 | 4 | Per-tenant token scoping; wire-listener hardening | M | Isolation claims become enforceable |
-| 5 | Idempotency retention, fork write-order, raft scan pagination | S | Closes known distributed-storage failure shapes |
-| 6 | 429 + Retry-After; wire artifact Idempotency-Key | S | Stock agent retry loops work unmodified |
+| 5 | Idempotency retention, fork write-order, raft scan pagination | S | Closes known distributed-storage failure shapes. **Implemented on this branch**: idempotency TTL+cap eviction with durable-row cleanup, fork is durable-first with alias reservation, raft replay has a fail-closed byte budget |
+| 6 | 429 + Retry-After; wire artifact Idempotency-Key | S | Stock agent retry loops work unmodified. **Implemented on this branch**: active-session quota exhaustion returns 429, all 429/503 responses carry Retry-After, artifact create is idempotent under Idempotency-Key |
 | 7 | Agent-experience eval suite (daily regression) | M | LLMS.md stops being an untested hypothesis |
 | 8 | Universe/Cell metadata split; locators as pinned exceptions; compressed ranges authoritative | M–L | Metadata cardinality bounded per cell; blast radius contained |
 | 9 | Tenant-at-rest = zero marginal runtime cost: parked tablets, hibernating Raft, exception-only stats, documented wake contract | M–L | Dedicated isolation without per-tenant compute or control-plane pressure |

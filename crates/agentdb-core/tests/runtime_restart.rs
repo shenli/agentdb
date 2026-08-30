@@ -1651,3 +1651,98 @@ async fn register_and_bind_skill_replay_via_persist_after_cache_drop() {
         "bind_skill different-skill_id retry must surface IdempotencyConflict; got {bind_diverged:?}"
     );
 }
+
+/// Regression (S15 chaos finding): the startup orphan sweep must treat sealed
+/// segments, archive bundles, and replay prefixes as referenced content. Before
+/// the fix its referenced-set held only artifact ids, so every persistent
+/// restart deleted all tiered session history as "orphans".
+#[tokio::test]
+async fn orphan_reconciliation_keeps_segment_and_archive_blobs_across_restart() {
+    let kv_dir = TempDir::new().unwrap();
+    let content_dir = TempDir::new().unwrap();
+
+    let (tenant_id, session_id, agent_id) = {
+        let kv = open_kv(kv_dir.path());
+        let content: Arc<dyn ContentBackend> =
+            Arc::new(LocalFsContentBackend::new(content_dir.path()));
+        let rt = Runtime::with_kv(kv, content);
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "orphan-sweep".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let a = rt
+            .create_agent(NewAgent {
+                tenant_id: t.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let s = rt
+            .create_session(NewSession {
+                tenant_id: t.tenant_id.clone(),
+                agent_id: a.agent_id.clone(),
+                alias: None,
+            })
+            .await
+            .unwrap();
+        for n in 0..3u64 {
+            rt.append(AppendRequest::simple(
+                &t,
+                &a,
+                &s,
+                "message",
+                serde_json::json!({ "n": n }),
+            ))
+            .await
+            .unwrap();
+        }
+        rt.transition_session_lifecycle(&t.tenant_id, &s.session_id, Lifecycle::Archive)
+            .await
+            .unwrap();
+        for n in 3..5u64 {
+            rt.append(AppendRequest::simple(
+                &t,
+                &a,
+                &s,
+                "message",
+                serde_json::json!({ "n": n }),
+            ))
+            .await
+            .unwrap();
+        }
+        rt.transition_session_lifecycle(&t.tenant_id, &s.session_id, Lifecycle::Cold)
+            .await
+            .unwrap();
+        (t.tenant_id, s.session_id, a.agent_id)
+    };
+    let _ = agent_id;
+
+    // Restart with the SAME content directory and run the startup sweep, the
+    // way `agentdb serve` does before accepting writes.
+    let kv = open_kv(kv_dir.path());
+    let content: Arc<dyn ContentBackend> =
+        Arc::new(LocalFsContentBackend::new(content_dir.path()));
+    let rt = Runtime::with_kv(kv, content);
+    let report = rt.reconcile_orphan_artifact_content().await.unwrap();
+    assert_eq!(
+        report.orphan_objects_deleted, 0,
+        "sweep must not delete referenced segment/archive blobs"
+    );
+    assert!(report.referenced_objects >= 2, "archive bundle + sealed segment");
+
+    let events = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id,
+            session_id,
+            from_seq: 0,
+            limit: usize::MAX,
+        })
+        .await
+        .unwrap();
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4], "tiered history intact after restart");
+}

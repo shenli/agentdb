@@ -28,7 +28,23 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = status_for(self.0.code);
-        (status, Json(self.0)).into_response()
+        // Machine-readable backoff: agents' stock retry loops key off
+        // Retry-After, so every shed/unavailable response carries one.
+        // 429 = quota pressure drains quickly; 503 = drain/election-scale
+        // conditions deserve a longer pause.
+        let retry_after_secs = match status {
+            StatusCode::TOO_MANY_REQUESTS => Some("1"),
+            StatusCode::SERVICE_UNAVAILABLE => Some("5"),
+            _ => None,
+        };
+        let mut response = (status, Json(self.0)).into_response();
+        if let Some(secs) = retry_after_secs {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(secs),
+            );
+        }
+        response
     }
 }
 

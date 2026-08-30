@@ -7073,21 +7073,16 @@ async fn create_artifact(
         .get(SHA256_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    // Idempotency-Key on artifact POST is intentionally a no-op for V2.1.
-    // Read it just to avoid surprising clients that send it; a future
-    // milestone will route it through an idempotency store like the
-    // append path does.
-    let _ = idempotency_key(&headers);
-
     let art = s
         .runtime
-        .create_artifact(
+        .create_artifact_with_idempotency(
             NewArtifact {
                 tenant_id: tid.clone(),
                 content_type,
                 expected_sha256,
             },
             body.to_vec(),
+            idempotency_key(&headers),
         )
         .await?;
     let backpressure = s.runtime.backpressure_for_tenant(&tid).await?;

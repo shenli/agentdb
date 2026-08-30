@@ -396,3 +396,80 @@ async fn bootstrap_session_with_key(app: &TestApp, external_key: &str) -> (Strin
     let sid = s["session_id"].as_str().unwrap().to_string();
     (tid, aid, sid)
 }
+
+#[tokio::test]
+async fn artifact_idempotency_key_replays_and_conflicts() {
+    let app = spawn_app().await;
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&serde_json::json!({"external_key": "art-idem"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = tenant["tenant_id"].as_str().unwrap();
+
+    let first: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/artifacts", app.base))
+        .header("Idempotency-Key", "upload-1")
+        .body("same bytes")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Retry with the same key and content replays the original artifact —
+    // no second blob is stored.
+    let replay: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/artifacts", app.base))
+        .header("Idempotency-Key", "upload-1")
+        .body("same bytes")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["artifact_id"], replay["artifact_id"]);
+    assert_eq!(first["sha256"], replay["sha256"]);
+
+    // Same key, different content: conflict, not silent replay.
+    let conflict = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/artifacts", app.base))
+        .header("Idempotency-Key", "upload-1")
+        .body("different bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), 409);
+
+    // The replayed artifact's blob is readable exactly once-stored.
+    let blob = app
+        .client
+        .get(format!(
+            "{}/api/tenants/{tid}/artifacts/{}/blob",
+            app.base,
+            first["artifact_id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&blob[..], b"same bytes");
+}

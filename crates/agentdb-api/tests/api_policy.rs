@@ -696,3 +696,62 @@ async fn delete_agent_and_tenant_gc_are_exposed_over_api() {
         .unwrap();
     assert_eq!(gc["gc"]["tenants_purged"].as_u64(), Some(1));
 }
+
+#[tokio::test]
+async fn exhausted_session_quota_returns_429_with_retry_after() {
+    let app = spawn_app().await;
+    let tenant: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants", app.base))
+        .json(&json!({
+            "external_key": "quota-429",
+            "policy": {"quota": {"max_active_sessions": 1}}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tid = tenant["tenant_id"].as_str().unwrap();
+    let agent: serde_json::Value = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let aid = agent["agent_id"].as_str().unwrap();
+
+    app.client
+        .post(format!("{}/api/tenants/{tid}/agents/{aid}/sessions", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    // Quota exhausted: a stock agent retry loop needs 429 + Retry-After,
+    // and the body must say the condition is retryable.
+    let shed = app
+        .client
+        .post(format!("{}/api/tenants/{tid}/agents/{aid}/sessions", app.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shed.status(), 429);
+    let retry_after = shed
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("429 must carry a numeric Retry-After");
+    assert!(retry_after >= 1);
+    let body: serde_json::Value = shed.json().await.unwrap();
+    assert_eq!(body["code"], "RATE_LIMITED");
+}

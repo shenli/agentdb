@@ -274,7 +274,7 @@ async fn active_session_quota_enforces_hard_limit_and_reports_soft_limit() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code, ErrorCode::PolicyDenied);
+    assert_eq!(err.code, ErrorCode::RateLimited);
 }
 
 #[tokio::test]

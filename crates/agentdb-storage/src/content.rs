@@ -96,7 +96,17 @@ pub trait ContentBackend: Send + Sync {
         Ok(())
     }
 
-    /// Enumerate stored blobs for startup orphan reconciliation. Backends that
+    /// Remove crash-left temporary files (and empty artifact directories)
+    /// from the store. DESTRUCTIVE toward in-flight writes: a live put's
+    /// tmp file is indistinguishable from a crash-left one, so call this
+    /// only before the backend accepts writes (startup reconciliation),
+    /// never from a periodic task. Returns the number of temporaries removed.
+    async fn sweep_temporary_objects(&self, _limit: usize) -> io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Enumerate stored blobs. Read-only — safe to run concurrently with
+    /// writes (the periodic cache sweep depends on this). Backends that
     /// cannot provide a bounded namespace listing return `Unsupported`.
     async fn list_objects(&self, _limit: usize) -> io::Result<ContentListing> {
         Err(io::Error::new(
@@ -400,6 +410,10 @@ impl ContentBackend for AsyncMirrorContentBackend {
         .await
     }
 
+    async fn sweep_temporary_objects(&self, limit: usize) -> io::Result<usize> {
+        self.primary.sweep_temporary_objects(limit).await
+    }
+
     async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
         self.primary.list_objects(limit).await
     }
@@ -533,6 +547,57 @@ impl ContentBackend for LocalFsContentBackend {
         Ok(())
     }
 
+    async fn sweep_temporary_objects(&self, limit: usize) -> io::Result<usize> {
+        let root = self.root.join("artifact_content");
+        let mut tenants = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut removed = 0_usize;
+        let mut scanned = 0_usize;
+        while let Some(tenant) = tenants.next_entry().await? {
+            if !tenant.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut artifacts = tokio::fs::read_dir(tenant.path()).await?;
+            while let Some(artifact) = artifacts.next_entry().await? {
+                if !artifact.file_type().await?.is_dir() {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("temporary sweep exceeds configured limit of {limit} objects"),
+                    ));
+                }
+                let artifact_path = artifact.path();
+                let mut entries = tokio::fs::read_dir(&artifact_path).await?;
+                let mut has_blob = false;
+                let mut removed_temporary_file = false;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "blob" && entry.file_type().await?.is_file() {
+                        has_blob = true;
+                    } else if name.starts_with("blob.tmp.") && entry.file_type().await?.is_file() {
+                        tokio::fs::remove_file(entry.path()).await?;
+                        removed = removed.saturating_add(1);
+                        removed_temporary_file = true;
+                    }
+                }
+                if removed_temporary_file {
+                    sync_directory_chain(artifact_path.clone(), self.root.clone()).await?;
+                }
+                if !has_blob && tokio::fs::remove_dir(&artifact_path).await.is_ok() {
+                    sync_directory_chain(tenant.path(), self.root.clone()).await?;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
         let root = self.root.join("artifact_content");
         let mut tenants = match tokio::fs::read_dir(&root).await {
@@ -546,7 +611,6 @@ impl ContentBackend for LocalFsContentBackend {
             Err(error) => return Err(error),
         };
         let mut objects = Vec::new();
-        let mut temporary_objects_deleted = 0_usize;
         while let Some(tenant) = tenants.next_entry().await? {
             if !tenant.file_type().await?.is_dir() {
                 continue;
@@ -558,51 +622,36 @@ impl ContentBackend for LocalFsContentBackend {
                     continue;
                 }
                 let artifact_path = artifact.path();
-                let mut entries = tokio::fs::read_dir(&artifact_path).await?;
-                let mut has_blob = false;
-                let mut removed_temporary_file = false;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name == "blob" && entry.file_type().await?.is_file() {
-                        has_blob = true;
-                    } else if name.starts_with("blob.tmp.") && entry.file_type().await?.is_file() {
-                        tokio::fs::remove_file(entry.path()).await?;
-                        temporary_objects_deleted = temporary_objects_deleted.saturating_add(1);
-                        removed_temporary_file = true;
-                    }
+                let blob_path = artifact_path.join("blob");
+                let Ok(metadata) = tokio::fs::metadata(&blob_path).await else {
+                    // No committed blob (in-flight put or crash leftover):
+                    // not listable, and cleanup belongs to
+                    // `sweep_temporary_objects`, never a read-only listing.
+                    continue;
+                };
+                if objects.len() >= limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "content object listing exceeds configured limit of {limit} objects"
+                        ),
+                    ));
                 }
-                if removed_temporary_file {
-                    sync_directory_chain(artifact_path.clone(), self.root.clone()).await?;
-                }
-                if has_blob {
-                    if objects.len() >= limit {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "content object listing exceeds configured limit of {limit} objects"
-                            ),
-                        ));
-                    }
-                    let last_modified_ms = tokio::fs::metadata(artifact_path.join("blob"))
-                        .await
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as i64);
-                    objects.push(ContentObject {
-                        tenant_id: tenant_id.clone(),
-                        artifact_id: artifact.file_name().to_string_lossy().to_string(),
-                        last_modified_ms,
-                    });
-                } else if tokio::fs::remove_dir(&artifact_path).await.is_ok() {
-                    sync_directory_chain(tenant.path(), self.root.clone()).await?;
-                }
+                let last_modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64);
+                objects.push(ContentObject {
+                    tenant_id: tenant_id.clone(),
+                    artifact_id: artifact.file_name().to_string_lossy().to_string(),
+                    last_modified_ms,
+                });
             }
         }
         Ok(ContentListing {
             objects,
-            temporary_objects_deleted,
+            temporary_objects_deleted: 0,
         })
     }
 }

@@ -214,10 +214,15 @@ async fn local_listing_is_bounded_and_reaps_crash_left_temporary_files() {
     let temporary = crashed_dir.join("blob.tmp.123.1");
     std::fs::write(&temporary, b"partial").unwrap();
 
+    // The read-only listing must NOT touch the temporary (it may belong to
+    // an in-flight put); the explicit startup sweep reaps it.
     let listing = backend.list_objects(1).await.unwrap();
     assert_eq!(listing.objects.len(), 1);
     assert_eq!(listing.objects[0].artifact_id, "art_live");
-    assert_eq!(listing.temporary_objects_deleted, 1);
+    assert!(temporary.exists(), "read-only listing must not delete temporaries");
+
+    let removed = backend.sweep_temporary_objects(10).await.unwrap();
+    assert_eq!(removed, 1);
     assert!(!temporary.exists());
 
     let error = backend.list_objects(0).await.unwrap_err();
@@ -510,4 +515,94 @@ async fn managed_cache_touch_on_read_keeps_object_warm() {
         .unwrap();
     assert_eq!(report.evicted, 0);
     assert!(primary.head("ten_a", "seg_hot").await.unwrap());
+}
+
+/// Chaos: concurrent writers, readers, and cache sweeps against a mirror that
+/// fails transiently. Invariants under fault: (1) a read never returns wrong
+/// bytes; (2) the sweep never evicts an object the mirror does not hold;
+/// (3) once the mirror heals, every object converges into it and eviction
+/// then leaves the mirror as the only copy, still serving correct reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_cache_chaos_flaky_mirror_never_loses_data() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let primary: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(dir.path()));
+    // 4 consecutive transient mirror-put failures: one credit short of the
+    // 5-attempt retry budget, so the first upload rides the whole retry
+    // ladder and still succeeds; nothing may end up in `failed`.
+    let mirror: Arc<dyn ContentBackend> = Arc::new(FlakyContentBackend::new(4, 0));
+    let backend = Arc::new(
+        AsyncMirrorContentBackend::new_with_retries(primary.clone(), mirror, 64, 5)
+            .with_local_cache_ttl_ms(0),
+    );
+
+    let objects: Vec<(String, String, Vec<u8>)> = (0..48)
+        .map(|i| {
+            (
+                format!("ten_{}", i % 3),
+                format!("obj_{i}"),
+                format!("payload-{i}").into_bytes(),
+            )
+        })
+        .collect();
+
+    // Concurrent writers and sweepers.
+    let mut tasks = Vec::new();
+    for chunk in objects.chunks(12) {
+        let backend = backend.clone();
+        let chunk = chunk.to_vec();
+        tasks.push(tokio::spawn(async move {
+            for (tenant, artifact, bytes) in chunk {
+                backend.put(&tenant, &artifact, &bytes).await.unwrap();
+            }
+        }));
+    }
+    for _ in 0..4 {
+        let backend = backend.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..10 {
+                let now = now_wallclock_ms() + 60_000;
+                let _ = backend.run_cache_sweep_once(now, 10_000).await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    // Reads are correct throughout and after the storm, wherever each object
+    // currently lives (local, mirror, or mid-eviction).
+    for (tenant, artifact, bytes) in &objects {
+        assert_eq!(&backend.get(tenant, artifact).await.unwrap(), bytes);
+    }
+
+    // Drain the mirror queue (retries included), then verify convergence:
+    // a final sweep must be able to evict EVERY object because the healed
+    // mirror holds them all.
+    for _ in 0..200 {
+        if backend.stats().backlog == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(backend.stats().backlog, 0, "mirror queue drained");
+    assert_eq!(backend.stats().failed, 0, "retries healed every flaky upload");
+
+    let report = backend
+        .run_cache_sweep_once(now_wallclock_ms() + 60_000, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(report.retained_unmirrored, 0, "nothing left unmirrored");
+
+    for (tenant, artifact, bytes) in &objects {
+        assert!(
+            !primary.head(tenant, artifact).await.unwrap(),
+            "cold object evicted locally"
+        );
+        assert_eq!(
+            &backend.get(tenant, artifact).await.unwrap(),
+            bytes,
+            "mirror-only object still serves correct bytes"
+        );
+    }
 }

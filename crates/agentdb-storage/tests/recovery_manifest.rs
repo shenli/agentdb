@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use agentdb_storage::{
     export_recovery_manifest, import_recovery_manifest, read_recovery_manifest_header,
-    KvStore, RecoveryObjectStore, RocksKvStore,
+    InMemoryKvStore, KvStore, RecoveryObjectStore, RocksKvStore,
 };
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -48,4 +48,71 @@ async fn rocksdb_roundtrip_through_object_store() {
     let dst_rows: Vec<_> = dst.scan_prefix(b"").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(src_rows.len(), 2_501);
     assert_eq!(src_rows, dst_rows);
+}
+
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Any set of binary KV pairs — arbitrary bytes in keys and values,
+        /// including empty values and non-UTF-8 keys — survives the
+        /// export → import roundtrip exactly.
+        #[test]
+        fn manifest_roundtrip_preserves_arbitrary_binary_pairs(
+            pairs in proptest::collection::btree_map(
+                proptest::collection::vec(any::<u8>(), 1..64),
+                proptest::collection::vec(any::<u8>(), 0..256),
+                0..40,
+            )
+        ) {
+            let src = InMemoryKvStore::default();
+            for (k, v) in &pairs {
+                src.put(k, v).unwrap();
+            }
+            let src: Arc<dyn KvStore + Send + Sync> = Arc::new(src);
+            let bytes = export_recovery_manifest(src, None, 7, u64::MAX).unwrap();
+            let header = read_recovery_manifest_header(&bytes).unwrap();
+            prop_assert_eq!(header.entry_count, pairs.len() as u64);
+
+            let dst = InMemoryKvStore::default();
+            import_recovery_manifest(&dst, &bytes).unwrap();
+            let restored: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = dst
+                .scan_prefix(b"")
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            prop_assert_eq!(restored, pairs);
+        }
+
+        /// Cutting the manifest at any byte offset must never import
+        /// successfully with fewer entries than the header declares —
+        /// truncation is an error, not silent partial recovery.
+        #[test]
+        fn truncated_manifest_never_imports_partially(
+            cut_fraction in 0.0f64..1.0f64,
+        ) {
+            let src = InMemoryKvStore::default();
+            for i in 0..20u32 {
+                src.put(format!("key-{i:04}").as_bytes(), &i.to_be_bytes()).unwrap();
+            }
+            let src: Arc<dyn KvStore + Send + Sync> = Arc::new(src);
+            let bytes = export_recovery_manifest(src, None, 7, u64::MAX).unwrap();
+            let cut = ((bytes.len() as f64) * cut_fraction) as usize;
+            let truncated = &bytes[..cut];
+
+            let dst = InMemoryKvStore::default();
+            match import_recovery_manifest(&dst, truncated) {
+                Ok(stats) => prop_assert_eq!(stats.entries, 20, "full import only"),
+                Err(_) => {
+                    // Refused: acceptable, and the target must not be left
+                    // half-imported *silently* — a partial import that
+                    // errored is visible to the caller, which is the
+                    // contract (restore into a fresh dir, retry on error).
+                }
+            }
+        }
+    }
 }
