@@ -1053,6 +1053,17 @@ impl Persist {
         }
     }
 
+    /// Drop the adaptive write batcher, reverting every write to a direct
+    /// per-caller KV write. Replicated runtimes call this at construction:
+    /// group commit exists to amortize the RocksDB WAL fsync, but replicated
+    /// tablets get their durability from the raft log, and funneling every
+    /// tablet's writes through the batcher's single writer thread lets one
+    /// stalled raft commit head-of-line-block the whole node (found by the
+    /// S8 real-cluster smoke).
+    pub(crate) fn disable_adaptive_write_batcher(&mut self) {
+        self.adaptive_write_batcher = None;
+    }
+
     fn encrypt_metadata(
         &self,
         context: &MetadataCryptoContext<'_>,
@@ -2817,6 +2828,23 @@ impl Persist {
                 Ok(None)
             }
         }
+    }
+
+    /// Delete drained outbox rows. Keys are regenerated from the mutations
+    /// (the key embeds tenant, commit_seq, record id).
+    pub fn delete_record_index_mutations(&self, mutations: &[RecordIndexMutation]) -> KvResult<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        self.write_ops(
+            mutations
+                .iter()
+                .map(|m| WriteOp::Delete {
+                    key: record_index_outbox_key(&m.tenant_id, m.commit_seq, &m.record_id)
+                        .into_bytes(),
+                })
+                .collect(),
+        )
     }
 
     pub fn scan_all_record_index_mutations(&self) -> KvResult<Vec<RecordIndexMutation>> {

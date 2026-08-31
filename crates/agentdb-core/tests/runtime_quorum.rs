@@ -1225,3 +1225,127 @@ async fn runtime_can_register_new_replicated_tablets_after_startup() {
     assert!(runtime.unregister_replicated_tablet(7).unwrap());
     assert!(!runtime.registered_tablet_ids().contains(&7));
 }
+
+/// Stage 3 regression: after a failover, the new leader's record commit-seq
+/// counter must be past every sequence the old leader replicated (learned via
+/// the incremental outbox drain, not a full rehydrate), and external-id
+/// dedupe must hold across the failover.
+#[tokio::test]
+async fn failover_leader_continues_commit_seqs_and_honors_replicated_external_ids() {
+    let dir = TempDir::new().unwrap();
+    let raft_configs: Vec<_> = (1..=3)
+        .map(|node_id| RaftRsNodeConfig {
+            node_id,
+            role: RaftRsNodeRole::Voter,
+            raft_engine_dir: dir.path().join(format!("raft-n{node_id}")),
+        })
+        .collect();
+    let (group, logs) = RaftRsSharedGroup::open(RUNTIME_PRIMARY_TABLET_ID, raft_configs).unwrap();
+    group.elect(1).unwrap();
+
+    let kv1: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n1")).unwrap());
+    let kv2: Arc<dyn KvStore + Send + Sync> =
+        Arc::new(RocksKvStore::open(dir.path().join("kv-n2")).unwrap());
+    let old_leader = Runtime::with_kv_and_replicated_log(kv1, content(), logs[0].clone());
+    let new_leader = Runtime::with_kv_and_replicated_log(kv2, content(), logs[1].clone());
+
+    let tenant = old_leader
+        .create_tenant(NewTenant {
+            external_key: "stage3-failover".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let policy = IndexingPolicy {
+        mode: IndexingMode::SummaryOnly,
+        fields: vec![],
+        vector_allowed: false,
+    };
+    let mut max_seq = 0;
+    for i in 0..5 {
+        let written = old_leader
+            .write_record_with_commit(NewRecord {
+                tenant_id: tenant.tenant_id.clone(),
+                external_id: Some(format!("stage3-{i}")),
+                namespace: vec!["stage3".into()],
+                scope: serde_json::json!({}),
+                text: Some(format!("payload before failover {i}")),
+                metadata: serde_json::json!({"i": i}),
+                tags: vec![],
+                source: None,
+                embedding: None,
+                policy: policy.clone(),
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        max_seq = max_seq.max(written.commit_token.seq);
+    }
+
+    group.mark_unavailable(1).unwrap();
+    for _ in 0..50 {
+        if group.elect(2).is_ok() {
+            break;
+        }
+        group.tick(2).unwrap();
+        group.tick(3).unwrap();
+    }
+
+    // New leader mints a commit seq strictly past everything replicated.
+    let written = new_leader
+        .write_record_with_commit(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            external_id: Some("stage3-after".into()),
+            namespace: vec!["stage3".into()],
+            scope: serde_json::json!({}),
+            text: Some("payload after failover".into()),
+            metadata: serde_json::json!({}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy: policy.clone(),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        written.commit_token.seq > max_seq,
+        "post-failover commit seq {} must exceed replicated max {}",
+        written.commit_token.seq,
+        max_seq
+    );
+
+    // External ids claimed before the failover dedupe on the new leader:
+    // upserting stage3-2 must update the replicated record, not duplicate it.
+    let upserted = new_leader
+        .upsert_record_with_commit(NewRecord {
+            tenant_id: tenant.tenant_id.clone(),
+            external_id: Some("stage3-2".into()),
+            namespace: vec!["stage3".into()],
+            scope: serde_json::json!({}),
+            text: Some("rewritten across failover".into()),
+            metadata: serde_json::json!({"rewritten": true}),
+            tags: vec![],
+            source: None,
+            embedding: None,
+            policy,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        upserted.record.version > 1,
+        "upsert must have updated the replicated record (version {}), not created a duplicate",
+        upserted.record.version
+    );
+    assert_eq!(
+        new_leader
+            .list_records(&tenant.tenant_id)
+            .await
+            .unwrap()
+            .len(),
+        6,
+        "5 pre-failover records + 1 post-failover, no external-id duplicates"
+    );
+}

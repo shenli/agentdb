@@ -631,6 +631,17 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   # 3. Oracle - run linearizability/contiguous-seq checker and readiness assertions.
   # TODO: analyze operation history and final replay dumps.
   ```
+- **2026-08-31 re-run finding:** first run since the durable-by-default
+  merge (#288) failed — every write stalled 60s ("raft-rs command did not
+  commit before timeout") and retries stalled behind them. Bisected on a
+  28-core box: pre-#288 passes, #288+ fails. Root cause: routing all writes
+  through the group-commit batcher's single writer thread let one slow raft
+  commit head-of-line-block every tablet. Fixed by disabling the batcher on
+  replicated runtimes (raft log provides durability there); S8 passes again.
+  Open follow-up: occasional >60s raft commits pre-date #288 (retries absorb
+  them) — the raft tick worker runs control-plane SQL before every tick, so
+  metadata-DB stalls can starve heartbeat-driven retransmission.
+
 
 ### Scenario S9: tablet_replacement_split_merge_preserves_state_idempotency_and_cursors
 

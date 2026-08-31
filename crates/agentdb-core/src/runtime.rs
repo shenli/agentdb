@@ -2301,6 +2301,15 @@ fn record_index_snapshots_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Incremental replicated apply (Stage 3) is the default;
+/// `AGENTDB_REPLICATED_APPLY=full` restores the legacy full rehydrate after
+/// every committed apply as a kill switch.
+fn replicated_incremental_apply_enabled() -> bool {
+    std::env::var("AGENTDB_REPLICATED_APPLY")
+        .map(|raw| raw.trim() != "full")
+        .unwrap_or(true)
+}
+
 /// Restore the record indexes from a persisted snapshot, then delta-replay
 /// every record whose commit sequence moved past the snapshot's watermarks.
 /// Replaces the full scan-and-retokenize rebuild; record ROWS are not made
@@ -3276,7 +3285,7 @@ impl Runtime {
     }
 
     fn from_persist_with_tablet_router_and_mode(
-        persist: Persist,
+        mut persist: Persist,
         content: Arc<dyn ContentBackend>,
         kms: Arc<dyn KmsKeyResolver>,
         content_crypto: Arc<dyn ContentCryptoAdapter>,
@@ -3291,6 +3300,12 @@ impl Runtime {
         } else {
             hydration_override.unwrap_or_else(startup_hydration_mode)
         };
+        if tablet_router.is_some() {
+            // Replicated tablets are durable through the raft log; the
+            // group-commit batcher's single writer thread would let one
+            // stalled raft commit head-of-line-block every tablet's writes.
+            persist.disable_adaptive_write_batcher();
+        }
         enforce_startup_hydration_limits(&persist, hydration_mode)
             .expect("startup hydration limits");
         let hydration =
@@ -3703,12 +3718,97 @@ impl Runtime {
             .unwrap_or(0)
             > 0
         {
-            // Replicated refresh already performs a full rehydrate. Running a
-            // second full-prefix startup preflight after every committed apply
-            // would double that O(N) cost; startup/snapshot paths enforce the
-            // explicit caps, while normal applies propagate rehydrate errors.
-            self.rehydrate_from_persist(false).await?;
+            if replicated_incremental_apply_enabled() {
+                self.invalidate_after_replicated_apply().await?;
+            } else {
+                // Legacy full rehydrate (AGENTDB_REPLICATED_APPLY=full).
+                // No second full-prefix startup preflight: startup/snapshot
+                // paths enforce the explicit caps.
+                self.rehydrate_from_persist(false).await?;
+            }
         }
+        Ok(())
+    }
+
+    /// Stage 3 of KV-authoritative state: after committed Raft entries are
+    /// applied to the tablet KV, invalidate instead of rebuilding. The large
+    /// cached sets (tenants/agents/sessions/artifacts/aliases/records/rows/
+    /// event hot tails) are evicted and reload on demand through the Stage 1
+    /// fallbacks; the small config sets with no per-row fallback (skills,
+    /// bindings, export consumers, record edges, tenant meta) are re-scanned;
+    /// the search indexes catch up incrementally from the replicated outbox
+    /// rows. Cost per apply: O(changed + small sets), not O(everything).
+    async fn invalidate_after_replicated_apply(&self) -> Result<()> {
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        let skills = persist.scan_all_skills().map_err(internal)?;
+        let skill_uniques = persist.scan_all_skill_uniques().map_err(internal)?;
+        let bindings = persist.scan_all_agent_skill_bindings().map_err(internal)?;
+        let consumers = persist.scan_all_export_consumers().map_err(internal)?;
+        let edges = persist.scan_all_record_edges().map_err(internal)?;
+        let meta = persist.scan_all_tenant_meta().map_err(internal)?;
+        {
+            let mut s = self.state.lock().await;
+            s.tenants.clear();
+            s.agents.clear();
+            s.sessions.clear();
+            s.artifacts.clear();
+            s.tenant_aliases.clear();
+            s.agent_aliases.clear();
+            s.session_aliases.clear();
+            s.records.clear();
+            s.events.clear();
+            s.tenant_aggregate_cache.clear();
+            s.skills.clear();
+            for skill in skills {
+                if skill.deleted_at_ms.is_none() {
+                    s.skills.insert(skill.skill_id.as_str().to_string(), skill);
+                }
+            }
+            s.skill_uniques.clear();
+            for ((tenant, name, version), skill_id) in skill_uniques {
+                s.skill_uniques
+                    .insert(skill_unique_state_key(&tenant, &name, &version), skill_id);
+            }
+            s.agent_skill_bindings.clear();
+            for binding in bindings {
+                if binding.deleted_at_ms.is_none() {
+                    s.agent_skill_bindings.insert(
+                        (
+                            binding.agent_id.as_str().to_string(),
+                            binding.skill_id.as_str().to_string(),
+                        ),
+                        binding,
+                    );
+                }
+            }
+            s.export_consumers.clear();
+            for consumer in consumers {
+                s.export_consumers.insert(
+                    (
+                        consumer.tenant_id.as_str().to_string(),
+                        consumer.consumer_name.clone(),
+                    ),
+                    consumer,
+                );
+            }
+            s.record_edges.clear();
+            for edge in edges {
+                if edge.deleted_at_ms.is_none() {
+                    s.record_edges
+                        .insert(edge.edge_id.as_str().to_string(), edge);
+                }
+            }
+            s.tenant_meta.clear();
+            for entry in meta {
+                s.tenant_meta
+                    .insert(tenant_meta_key(&entry.tenant_id, &entry.key), entry);
+            }
+        }
+        // Text/vector/global indexes, doc maps, commit seqs, and the
+        // external-id map converge through the replicated outbox rows.
+        self.apply_record_index_outbox_once().await?;
         Ok(())
     }
 
@@ -5095,6 +5195,7 @@ impl Runtime {
     }
 
     pub async fn create_tenant_with_id(&self, tenant_id: Id, req: NewTenant) -> Result<Tenant> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&tenant_id).await?;
         self.ensure_tenant_alias_cached(&req.external_key).await?;
         let t = {
@@ -5666,6 +5767,7 @@ impl Runtime {
         req: NewSkill,
         idempotency_key: Option<String>,
     ) -> Result<Skill> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
         let idem_full_key = idempotency_key.as_ref().map(|k| {
             format!(
@@ -5884,6 +5986,7 @@ impl Runtime {
     /// Bind an exact skill version to an agent. Rebinding the same skill id is
     /// idempotent even without an Idempotency-Key.
     pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
         self.ensure_agent_cached(&req.tenant_id, &req.agent_id)
             .await?;
@@ -10212,6 +10315,7 @@ impl Runtime {
     }
 
     pub async fn write_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
+        self.refresh_replicated_state().await?;
         let record = SearchableRecord::create(req);
         self.ensure_tenant_cached(&record.tenant_id).await?;
         let policy = self.resolve_policy_for_tenant(&record.tenant_id).await?;
@@ -10360,6 +10464,7 @@ impl Runtime {
         record_id: &Id,
         include_deleted: bool,
     ) -> Result<SearchableRecord> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(tenant_id).await?;
         self.ensure_record_cached(tenant_id, record_id).await?;
         let s = self.state.lock().await;
@@ -10380,6 +10485,7 @@ impl Runtime {
     }
 
     pub async fn list_records(&self, tenant_id: &Id) -> Result<Vec<SearchableRecord>> {
+        self.refresh_replicated_state().await?;
         self.get_tenant(tenant_id).await?;
         let mut records = self
             .authoritative_tenant_records(tenant_id)
@@ -10572,6 +10678,7 @@ impl Runtime {
     }
 
     pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
         // Resolve the external-id mapping first, then make sure the mapped
         // row is cached BEFORE applying the liveness filter — in lazy mode
@@ -10630,6 +10737,7 @@ impl Runtime {
         &self,
         update: RecordUpdate,
     ) -> Result<WriteRecordResult> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&update.tenant_id).await?;
         self.ensure_record_cached(&update.tenant_id, &update.record_id)
             .await?;
@@ -10759,6 +10867,7 @@ impl Runtime {
     }
 
     pub async fn touch_record(&self, tenant_id: &Id, record_id: &Id) -> Result<SearchableRecord> {
+        self.refresh_replicated_state().await?;
         let mut touched = self
             .touch_records_by_ids(tenant_id, &[record_id.as_str().to_string()])
             .await?;
@@ -10845,6 +10954,7 @@ impl Runtime {
     }
 
     pub async fn create_record_edge(&self, req: NewRecordEdge) -> Result<RecordEdge> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
         self.ensure_record_cached(&req.tenant_id, &req.source_record_id)
             .await?;
@@ -10896,6 +11006,7 @@ impl Runtime {
     }
 
     pub async fn record_edges(&self, tenant_id: &Id, record_id: &Id) -> Result<Vec<RecordEdge>> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(tenant_id).await?;
         self.ensure_record_cached(tenant_id, record_id).await?;
         let s = self.state.lock().await;
@@ -10940,6 +11051,8 @@ impl Runtime {
     }
 
     pub async fn delete_record_edge(&self, tenant_id: &Id, edge_id: &Id) -> Result<()> {
+        self.refresh_replicated_state().await?;
+        self.ensure_tenant_cached(tenant_id).await?;
         let mut s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10973,6 +11086,7 @@ impl Runtime {
         key: impl Into<String>,
         value: serde_json::Value,
     ) -> Result<TenantMetaEntry> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(tenant_id).await?;
         let key = key.into();
         let entry = {
@@ -11004,6 +11118,7 @@ impl Runtime {
     }
 
     pub async fn get_tenant_meta(&self, tenant_id: &Id, key: &str) -> Result<TenantMetaEntry> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
@@ -11029,15 +11144,32 @@ impl Runtime {
         let mut mutations = p.scan_all_record_index_mutations().map_err(internal)?;
         mutations.sort_by_key(|mutation| mutation.commit_seq);
 
+        // Mutations at or below BOTH watermarks are fully reflected in the
+        // local and global indexes — trim their outbox rows so the per-drain
+        // scan stays proportional to new mutations, not to history. (The
+        // outbox is a catch-up queue, not a rebuild source: full rebuilds
+        // scan the record rows.)
+        let floor = {
+            let s = self.state.lock().await;
+            s.local_record_index_watermark
+                .min(s.global_record_index_watermark)
+        };
+        let (drained, pending): (Vec<_>, Vec<_>) = mutations
+            .into_iter()
+            .partition(|mutation| mutation.commit_seq <= floor);
+        p.delete_record_index_mutations(&drained)
+            .map_err(internal)?;
+
         let mut applied = 0usize;
-        for mutation in mutations {
-            let persisted_record = if matches!(mutation.op, RecordIndexMutationOp::Upsert) {
-                p.get_record(&mutation.tenant_id, &mutation.record_id)
-                    .map_err(internal)?
-            } else {
-                None
-            };
+        for mutation in pending {
+            let persisted_record = p
+                .get_record(&mutation.tenant_id, &mutation.record_id)
+                .map_err(internal)?;
             let mut s = self.state.lock().await;
+            // Replicated applies land commit sequences this node never
+            // minted; keep the local counter monotone so a newly elected
+            // leader cannot reuse them.
+            s.next_record_commit_seq = s.next_record_commit_seq.max(mutation.commit_seq);
             if matches!(mutation.op, RecordIndexMutationOp::Upsert)
                 && !s.records.contains_key(&mutation.record_id)
             {
@@ -11144,10 +11276,41 @@ impl Runtime {
                         s.doc_to_record.insert(doc_id, mutation.record_id.clone());
                         s.record_to_doc.insert(mutation.record_id.clone(), doc_id);
                     }
+                    // Followers learn external-id claims only through this
+                    // queue; the current row is authoritative.
+                    if let Some(external_id) = record.external_id.as_deref() {
+                        s.record_external_ids.insert(
+                            record_external_key(&record.tenant_id, external_id),
+                            mutation.record_id.clone(),
+                        );
+                    }
                 }
                 RecordIndexMutationOp::Delete => {
                     if let Some(doc) = s.record_to_doc.remove(&mutation.record_id) {
                         s.doc_to_record.remove(&doc);
+                    }
+                    // Release the external id, but only if the mapping still
+                    // points at this record — a newer record may have
+                    // reclaimed it since.
+                    match persisted_record
+                        .as_ref()
+                        .and_then(|r| r.external_id.as_deref())
+                    {
+                        Some(external_id) => {
+                            let key = record_external_key(
+                                &persisted_record.as_ref().expect("checked above").tenant_id,
+                                external_id,
+                            );
+                            if s.record_external_ids.get(&key) == Some(&mutation.record_id) {
+                                s.record_external_ids.remove(&key);
+                            }
+                        }
+                        None => {
+                            // Row already purged: scrub any mapping still
+                            // pointing at it (rare — purge follows retention).
+                            s.record_external_ids
+                                .retain(|_, mapped| mapped != &mutation.record_id);
+                        }
                     }
                 }
             }
@@ -11258,6 +11421,7 @@ impl Runtime {
         &self,
         req: SearchRequest,
     ) -> Result<Vec<RecordSearchMatch>> {
+        self.refresh_replicated_state().await?;
         // Public funnel: the API calls this directly (not search_records),
         // so the tenant row must be pulled through the KV fallback here —
         // both branches below check the cached map. Found by the S18
@@ -11507,6 +11671,7 @@ impl Runtime {
     /// out at the resolve step. V2.4 will replace this with a proper
     /// tombstoning pass.
     pub async fn delete_record(&self, tenant_id: &Id, record_id: &Id) -> Result<()> {
+        self.refresh_replicated_state().await?;
         self.ensure_tenant_cached(tenant_id).await?;
         self.ensure_record_cached(tenant_id, record_id).await?;
         let mut s = self.state.lock().await;

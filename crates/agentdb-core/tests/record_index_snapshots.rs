@@ -372,3 +372,41 @@ async fn search_record_matches_works_on_a_cold_tenant_cache() {
         .unwrap();
     assert_eq!(matches.len(), 1);
 }
+
+/// The outbox is a catch-up queue, not a rebuild source: once a mutation is
+/// reflected in both the local and global indexes, its row is trimmed so the
+/// per-drain scan stays proportional to new mutations.
+#[tokio::test]
+async fn outbox_rows_are_trimmed_once_both_indexes_reflect_them() {
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+    let rt = Runtime::with_kv(kv, content);
+    let t = rt
+        .create_tenant(NewTenant {
+            external_key: "outbox-trim".into(),
+            policy: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    for i in 0..4 {
+        rt.upsert_record_with_commit(new_record(&t.tenant_id, i, &format!("trim me {i}")))
+            .await
+            .unwrap();
+    }
+    let (upserts, _) = rt.record_index_outbox_counts_for_test().unwrap();
+    assert_eq!(upserts, 4, "rows queued before any drain");
+
+    // First drain applies everything (advancing the global watermark);
+    // second drain finds all rows at or below both watermarks and trims.
+    rt.apply_record_index_outbox_once().await.unwrap();
+    rt.apply_record_index_outbox_once().await.unwrap();
+    let (upserts, deletes) = rt.record_index_outbox_counts_for_test().unwrap();
+    assert_eq!((upserts, deletes), (0, 0), "drained rows are deleted");
+
+    // And search still works, of course.
+    let matches = rt
+        .search_records(text_search(&t.tenant_id, "trim me"))
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 4);
+}
