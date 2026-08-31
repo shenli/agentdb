@@ -2160,6 +2160,126 @@ impl Persist {
         Ok(max_seq)
     }
 
+    fn get_json_row<T: serde::de::DeserializeOwned>(&self, key: String) -> KvResult<Option<T>> {
+        match self.kv.get(key.as_bytes())? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|err| {
+                agentdb_storage::Error::Other(format!("row at {key} does not decode: {err}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_string_row(&self, key: String) -> KvResult<Option<String>> {
+        Ok(self
+            .kv
+            .get(key.as_bytes())?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    // Point reads for the cache-miss fallback path: the in-memory maps are a
+    // cache over these rows, not the authority. Deleted rows are returned
+    // as-is (soft-delete tombstones) so callers' liveness filters apply.
+    pub fn get_tenant_row(&self, tenant_id: &str) -> KvResult<Option<Tenant>> {
+        self.get_json_row(tenant_record_key(tenant_id))
+    }
+
+    pub fn get_agent_row(&self, tenant_id: &str, agent_id: &str) -> KvResult<Option<Agent>> {
+        self.get_json_row(agent_record_key(tenant_id, agent_id))
+    }
+
+    pub fn get_session_row(&self, tenant_id: &str, session_id: &str) -> KvResult<Option<Session>> {
+        self.get_json_row(session_record_key(tenant_id, session_id))
+    }
+
+    pub fn get_artifact_row(
+        &self,
+        tenant_id: &str,
+        artifact_id: &str,
+    ) -> KvResult<Option<Artifact>> {
+        // Artifact metadata rows are envelope-encrypted; mirror the
+        // hydration decode rather than parsing the raw bytes as JSON.
+        let key = artifact_record_key(tenant_id, artifact_id);
+        let Some(bytes) = self.kv.get(key.as_bytes())? else {
+            return Ok(None);
+        };
+        let context = MetadataCryptoContext {
+            tenant_id,
+            object_kind: MetadataObjectKind::Artifact,
+            object_id: artifact_id,
+            key: None,
+        };
+        let plaintext = self.decrypt_metadata(&context, &bytes)?;
+        Ok(Some(serde_json::from_slice(&plaintext).map_err(|err| {
+            agentdb_storage::Error::Other(format!("artifact row at {key} does not decode: {err}"))
+        })?))
+    }
+
+    pub fn get_tenant_alias_row(&self, external_key: &str) -> KvResult<Option<String>> {
+        self.get_string_row(tenant_alias_key(external_key))
+    }
+
+    pub fn get_agent_alias_row(&self, tenant_id: &str, alias: &str) -> KvResult<Option<String>> {
+        self.get_string_row(agent_alias_key(tenant_id, alias))
+    }
+
+    pub fn get_session_alias_row(&self, tenant_id: &str, alias: &str) -> KvResult<Option<String>> {
+        self.get_string_row(session_alias_key(tenant_id, alias))
+    }
+
+    // Tenant-scoped enumeration for the KV-authoritative read path. The
+    // tenant-first key layout makes each of these a single bounded prefix
+    // scan; they are the enumeration counterpart of the point reads above.
+    pub fn scan_tenant_agents(&self, tenant_id: &str) -> KvResult<Vec<Agent>> {
+        let prefix = format!("record/agent/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("agent row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_tenant_sessions(&self, tenant_id: &str) -> KvResult<Vec<Session>> {
+        let prefix = format!("record/session/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("session row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_tenant_artifacts(&self, tenant_id: &str) -> KvResult<Vec<Artifact>> {
+        let prefix = format!("record/artifact/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix = std::str::from_utf8(&k[b"record/artifact/".len()..])
+                .map_err(|_| agentdb_storage::Error::Other("artifact key is not utf8".into()))?;
+            let mut split = suffix.splitn(2, '/');
+            let key_tenant = split.next().unwrap_or_default();
+            let artifact_id = split.next().unwrap_or_default();
+            let context = MetadataCryptoContext {
+                tenant_id: key_tenant,
+                object_kind: MetadataObjectKind::Artifact,
+                object_id: artifact_id,
+                key: None,
+            };
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            out.push(serde_json::from_slice(&plaintext).map_err(|err| {
+                agentdb_storage::Error::Other(format!("artifact row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
     pub fn scan_all_tenants(&self) -> KvResult<Vec<Tenant>> {
         // Note: the prefix ends in '/', so this does NOT pick up sibling
         // namespaces like `record/tenant_alias/...` because their bytes after
