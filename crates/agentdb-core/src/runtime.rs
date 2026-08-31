@@ -67,6 +67,17 @@ static APPEND_PATH_PROFILE: OnceLock<Option<AppendPathProfile>> = OnceLock::new(
 static SESSION_APPEND_COALESCE_PROFILE: OnceLock<Option<SessionAppendCoalesceProfile>> =
     OnceLock::new();
 
+/// Per-tenant metadata aggregates used by quota admission and backpressure.
+/// Computed from authoritative enumerations (drift-free) and cached briefly
+/// for the advisory hot path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TenantAggregates {
+    pub active_sessions: usize,
+    pub live_agents: usize,
+    pub live_artifacts: usize,
+    pub live_artifact_bytes: u64,
+}
+
 tokio::task_local! {
     static CURRENT_RUNTIME_TABLET_ID: i64;
     static CURRENT_RUNTIME_ROUTE_CONTEXT: RuntimeRouteContext;
@@ -917,6 +928,8 @@ pub struct TenantMetaEntry {
 
 #[derive(Default, Debug)]
 struct State {
+    /// Aggregate cache for backpressure/quota: value + computed-at instant.
+    tenant_aggregate_cache: BTreeMap<String, (TenantAggregates, std::time::Instant)>,
     tenants: BTreeMap<String, Tenant>,
     agents: BTreeMap<String, Agent>,
     sessions: BTreeMap<String, Session>,
@@ -2030,11 +2043,21 @@ fn startup_hydration_categories() -> [(&'static str, &'static [u8], usize); 17] 
     ]
 }
 
-fn enforce_startup_hydration_limits(persist: &Persist) -> agentdb_storage::Result<()> {
+fn enforce_startup_hydration_limits(
+    persist: &Persist,
+    mode: HydrationMode,
+) -> agentdb_storage::Result<()> {
     let max_bytes = startup_hydration_max_bytes();
     let mut total_rows = 0_usize;
     let mut total_bytes = 0_u64;
     for (label, prefix, max_rows) in startup_hydration_categories() {
+        if mode == HydrationMode::Lazy
+            && LAZY_HYDRATION_SKIPPED_PREFIXES
+                .iter()
+                .any(|skipped| *skipped == prefix)
+        {
+            continue;
+        }
         let remaining_bytes = max_bytes.saturating_sub(total_bytes);
         let (rows, bytes) = persist.ensure_hydration_prefix_within_limits(
             label,
@@ -2054,61 +2077,53 @@ fn enforce_startup_hydration_limits(persist: &Persist) -> agentdb_storage::Resul
     Ok(())
 }
 
-fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
+/// How much metadata the runtime loads into the cache at startup.
+///
+/// `Full` (default) hydrates everything, preserving historical behavior.
+/// `Lazy` skips the tenant/agent/session/artifact maps and the alias maps —
+/// they load on first touch through the KV fallback path — so startup cost
+/// and resident memory stop scaling with total retained metadata. Records,
+/// search indexes, skills, export consumers, tenant metadata, and
+/// idempotency rows still hydrate (their fallback lands in a later stage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrationMode {
+    Full,
+    Lazy,
+}
+
+fn startup_hydration_mode() -> HydrationMode {
+    match std::env::var("AGENTDB_STARTUP_HYDRATION")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "lazy" => HydrationMode::Lazy,
+        _ => HydrationMode::Full,
+    }
+}
+
+/// Prefixes that lazy hydration leaves to the on-demand fallback path; the
+/// startup preflight row caps do not apply to them in lazy mode (their whole
+/// point is supporting populations larger than the caps).
+const LAZY_HYDRATION_SKIPPED_PREFIXES: [&[u8]; 7] = [
+    b"record/tenant/",
+    b"record/tenant_alias/",
+    b"record/agent/",
+    b"record/agent_alias/",
+    b"record/session/",
+    b"record/session_alias/",
+    b"record/artifact/",
+];
+
+fn hydrate_runtime_from_persist(persist: &Persist, mode: HydrationMode) -> RuntimeHydration {
     let mut state = State::default();
-    for t in persist.scan_all_tenants().expect("hydrate tenants") {
-        state.tenants.insert(t.tenant_id.as_str().to_string(), t);
-    }
-    for a in persist.scan_all_agents().expect("hydrate agents") {
-        state.agents.insert(a.agent_id.as_str().to_string(), a);
-    }
-    for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
-        if let Some(log_session) = persist
-            .latest_append_log_session(s.tenant_id.as_str(), s.session_id.as_str())
-            .expect("hydrate append log session")
-        {
-            s = log_session;
-        }
-        // Reconcile next_seq against persisted events.
-        let max_seq = persist
-            .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
-            .expect("hydrate session events");
-        if let Some(m) = max_seq {
-            if s.next_seq <= m {
-                s.next_seq = m + 1;
-            }
-        }
-        state.sessions.insert(s.session_id.as_str().to_string(), s);
-    }
-    for art in persist.scan_all_artifacts().expect("hydrate artifacts") {
-        state
-            .artifacts
-            .insert(art.artifact_id.as_str().to_string(), art);
-    }
-    // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
-    // runtime keeps enforcing the same constraints. We scan the alias prefixes
-    // directly rather than walking records; alias rows are the source of truth.
-    for (external_key, tenant_id) in persist
-        .scan_all_tenant_aliases()
-        .expect("hydrate tenant aliases")
-    {
-        state.tenant_aliases.insert(external_key, tenant_id);
-    }
-    for ((tenant, alias), agent_id) in persist
-        .scan_all_agent_aliases()
-        .expect("hydrate agent aliases")
-    {
-        state
-            .agent_aliases
-            .insert(scoped_alias_key(&tenant, &alias), agent_id);
-    }
-    for ((tenant, alias), session_id) in persist
-        .scan_all_session_aliases()
-        .expect("hydrate session aliases")
-    {
-        state
-            .session_aliases
-            .insert(scoped_alias_key(&tenant, &alias), session_id);
+    // In lazy mode the tenant/agent/session/artifact maps and alias maps are
+    // left empty: the KV fallback path loads rows on first touch and the
+    // enumeration paths scan KV directly. Everything below the block still
+    // hydrates in both modes.
+    if mode == HydrationMode::Full {
+        hydrate_metadata_maps(persist, &mut state);
     }
     for skill in persist.scan_all_skills().expect("hydrate skills") {
         if skill.deleted_at_ms.is_none() {
@@ -2232,6 +2247,64 @@ fn hydrate_runtime_from_persist(persist: &Persist) -> RuntimeHydration {
         global_record_index,
     }
 }
+
+fn hydrate_metadata_maps(persist: &Persist, state: &mut State) {
+    for t in persist.scan_all_tenants().expect("hydrate tenants") {
+        state.tenants.insert(t.tenant_id.as_str().to_string(), t);
+    }
+    for a in persist.scan_all_agents().expect("hydrate agents") {
+        state.agents.insert(a.agent_id.as_str().to_string(), a);
+    }
+    for mut s in persist.scan_all_sessions().expect("hydrate sessions") {
+        if let Some(log_session) = persist
+            .latest_append_log_session(s.tenant_id.as_str(), s.session_id.as_str())
+            .expect("hydrate append log session")
+        {
+            s = log_session;
+        }
+        // Reconcile next_seq against persisted events.
+        let max_seq = persist
+            .max_event_seq(s.tenant_id.as_str(), s.session_id.as_str())
+            .expect("hydrate session events");
+        if let Some(m) = max_seq {
+            if s.next_seq <= m {
+                s.next_seq = m + 1;
+            }
+        }
+        state.sessions.insert(s.session_id.as_str().to_string(), s);
+    }
+    for art in persist.scan_all_artifacts().expect("hydrate artifacts") {
+        state
+            .artifacts
+            .insert(art.artifact_id.as_str().to_string(), art);
+    }
+    // Rebuild alias-uniqueness maps from on-disk alias rows so a restarted
+    // runtime keeps enforcing the same constraints. We scan the alias prefixes
+    // directly rather than walking records; alias rows are the source of truth.
+    for (external_key, tenant_id) in persist
+        .scan_all_tenant_aliases()
+        .expect("hydrate tenant aliases")
+    {
+        state.tenant_aliases.insert(external_key, tenant_id);
+    }
+    for ((tenant, alias), agent_id) in persist
+        .scan_all_agent_aliases()
+        .expect("hydrate agent aliases")
+    {
+        state
+            .agent_aliases
+            .insert(scoped_alias_key(&tenant, &alias), agent_id);
+    }
+    for ((tenant, alias), session_id) in persist
+        .scan_all_session_aliases()
+        .expect("hydrate session aliases")
+    {
+        state
+            .session_aliases
+            .insert(scoped_alias_key(&tenant, &alias), session_id);
+    }
+}
+
 
 fn reconcile_session_next_seq_from_persisted_events(
     state: &mut State,
@@ -2980,8 +3053,17 @@ impl Runtime {
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
     ) -> Arc<Self> {
-        enforce_startup_hydration_limits(&persist).expect("startup hydration limits");
-        let hydration = hydrate_runtime_from_persist(&persist);
+        // Replicated runtimes rebuild full state on Raft apply, so they
+        // always hydrate fully; lazy mode is a single-node startup
+        // optimization until Stage 3 makes apply incremental.
+        let hydration_mode = if tablet_router.is_some() {
+            HydrationMode::Full
+        } else {
+            startup_hydration_mode()
+        };
+        enforce_startup_hydration_limits(&persist, hydration_mode)
+            .expect("startup hydration limits");
+        let hydration = hydrate_runtime_from_persist(&persist, hydration_mode);
         let idem = IdempotencyStore::default();
         idem.extend(hydration.idempotency_records);
 
@@ -3343,9 +3425,12 @@ impl Runtime {
             return Ok(());
         };
         if enforce_startup_limits {
-            enforce_startup_hydration_limits(persist).map_err(internal)?;
+            enforce_startup_hydration_limits(persist, HydrationMode::Full).map_err(internal)?;
         }
-        let hydration = hydrate_runtime_from_persist(persist);
+        // The replicated-apply rehydrate replaces the whole state, so it
+        // always runs in full mode; lazy hydration is a single-node startup
+        // optimization until Stage 3 makes apply incremental.
+        let hydration = hydrate_runtime_from_persist(persist, HydrationMode::Full);
         self.idem.replace(hydration.idempotency_records);
         {
             let mut state = self.state.lock().await;
@@ -3550,10 +3635,19 @@ impl Runtime {
                 return Ok(());
             }
         }
-        if let Some(mut row) = p
+        let mut loaded = p
             .get_session_row(tenant_id.as_str(), session_id.as_str())
+            .map_err(internal)?;
+        // The append-log fast path persists newer session snapshots in the
+        // log instead of rewriting the row; mirror hydration and prefer the
+        // latest log snapshot when present.
+        if let Some(log_session) = p
+            .latest_append_log_session(tenant_id.as_str(), session_id.as_str())
             .map_err(internal)?
         {
+            loaded = Some(log_session);
+        }
+        if let Some(mut row) = loaded {
             // The durable session row's next_seq can lag the event rows (the
             // append batch includes the session row only periodically); the
             // events themselves are the sequence authority, so reconcile
@@ -3676,6 +3770,274 @@ impl Runtime {
         Ok(())
     }
 
+    // ----- Authoritative enumerations (Stage 2 of KV-authoritative state) --
+    //
+    // Enumerations must not depend on the cache being complete: in lazy
+    // hydration mode the maps hold only touched rows. The durable KV scan is
+    // the complete base set; cached rows overlay it because they are fresher
+    // (correct next_seq, uncheckpointed mutations). When persist is None the
+    // maps ARE the store and are returned directly.
+
+    async fn authoritative_all_tenants(&self) -> Result<Vec<Tenant>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_all_tenants().map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.tenants
+                            .get(row.tenant_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.tenants.values().cloned().collect())
+            }
+        }
+    }
+
+    async fn authoritative_tenant_agents(&self, tenant_id: &Id) -> Result<Vec<Agent>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_tenant_agents(tenant_id.as_str()).map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| s.agents.get(row.agent_id.as_str()).cloned().unwrap_or(row))
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.agents
+                    .values()
+                    .filter(|a| a.tenant_id.as_str() == tenant_id.as_str())
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
+    async fn authoritative_tenant_sessions(&self, tenant_id: &Id) -> Result<Vec<Session>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_tenant_sessions(tenant_id.as_str()).map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.sessions
+                            .get(row.session_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.sessions
+                    .values()
+                    .filter(|sess| sess.tenant_id.as_str() == tenant_id.as_str())
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
+    async fn authoritative_tenant_artifacts(&self, tenant_id: &Id) -> Result<Vec<Artifact>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p
+                    .scan_tenant_artifacts(tenant_id.as_str())
+                    .map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.artifacts
+                            .get(row.artifact_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.artifacts
+                    .values()
+                    .filter(|a| a.tenant_id.as_str() == tenant_id.as_str())
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
+    async fn authoritative_all_sessions(&self) -> Result<Vec<Session>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_all_sessions().map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.sessions
+                            .get(row.session_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.sessions.values().cloned().collect())
+            }
+        }
+    }
+
+    async fn authoritative_all_artifacts(&self) -> Result<Vec<Artifact>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_all_artifacts().map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.artifacts
+                            .get(row.artifact_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.artifacts.values().cloned().collect())
+            }
+        }
+    }
+
+    /// Drop a tenant's cached aggregates after any mutation that changes
+    /// them, so the next advisory read recomputes instead of serving a
+    /// pre-mutation snapshot for up to the cache TTL.
+    async fn invalidate_tenant_aggregates(&self, tenant_id: &Id) {
+        let mut s = self.state.lock().await;
+        s.tenant_aggregate_cache.remove(tenant_id.as_str());
+    }
+
+    /// Compute per-tenant aggregates from the authoritative enumerations and
+    /// refresh the cache entry. `max_age` permits serving the cached value
+    /// (advisory paths pass ~2s; quota-enforcing creates pass ZERO).
+    async fn tenant_aggregates_cached(
+        &self,
+        tenant_id: &Id,
+        max_age: std::time::Duration,
+    ) -> Result<TenantAggregates> {
+        if !max_age.is_zero() {
+            let s = self.state.lock().await;
+            if let Some((agg, at)) = s.tenant_aggregate_cache.get(tenant_id.as_str()) {
+                if at.elapsed() <= max_age {
+                    return Ok(*agg);
+                }
+            }
+        }
+        let sessions = self.authoritative_tenant_sessions(tenant_id).await?;
+        let agents = self.authoritative_tenant_agents(tenant_id).await?;
+        let artifacts = self.authoritative_tenant_artifacts(tenant_id).await?;
+        let agg = TenantAggregates {
+            active_sessions: sessions
+                .iter()
+                .filter(|sess| {
+                    sess.deleted_at_ms.is_none() && sess.status == crate::session::Status::Active
+                })
+                .count(),
+            live_agents: agents.iter().filter(|a| a.deleted_at_ms.is_none()).count(),
+            live_artifacts: artifacts
+                .iter()
+                .filter(|a| a.deleted_at_ms.is_none())
+                .count(),
+            live_artifact_bytes: artifacts
+                .iter()
+                .filter(|a| a.deleted_at_ms.is_none())
+                .map(|a| a.bytes)
+                .sum(),
+        };
+        let mut s = self.state.lock().await;
+        s.tenant_aggregate_cache
+            .insert(tenant_id.as_str().to_string(), (agg, std::time::Instant::now()));
+        Ok(agg)
+    }
+
+    /// Pull the authoritative metadata population for a scope into the
+    /// cache (entry-or-insert, so fresher cached rows win). Batch jobs whose
+    /// mutation logic walks the cached maps (GC purge, policy workers) call
+    /// this first so lazy hydration mode sees the full population; the
+    /// eviction policy trims the cache again afterwards.
+    async fn warm_metadata_caches_for_scope(&self, tenant_scope: Option<&Id>) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        let tenants = match tenant_scope {
+            Some(tenant_id) => p
+                .get_tenant_row(tenant_id.as_str())
+                .map_err(internal)?
+                .into_iter()
+                .collect(),
+            None => p.scan_all_tenants().map_err(internal)?,
+        };
+        let (agents, sessions, artifacts) = match tenant_scope {
+            Some(tenant_id) => (
+                p.scan_tenant_agents(tenant_id.as_str()).map_err(internal)?,
+                p.scan_tenant_sessions(tenant_id.as_str()).map_err(internal)?,
+                p.scan_tenant_artifacts(tenant_id.as_str())
+                    .map_err(internal)?,
+            ),
+            None => (
+                p.scan_all_agents().map_err(internal)?,
+                p.scan_all_sessions().map_err(internal)?,
+                p.scan_all_artifacts().map_err(internal)?,
+            ),
+        };
+        let mut s = self.state.lock().await;
+        for row in tenants {
+            s.tenants
+                .entry(row.tenant_id.as_str().to_string())
+                .or_insert(row);
+        }
+        for row in agents {
+            s.agents.entry(row.agent_id.as_str().to_string()).or_insert(row);
+        }
+        for row in sessions {
+            s.sessions
+                .entry(row.session_id.as_str().to_string())
+                .or_insert(row);
+        }
+        for row in artifacts {
+            s.artifacts
+                .entry(row.artifact_id.as_str().to_string())
+                .or_insert(row);
+        }
+        Ok(())
+    }
+
+    /// Warm the tenant cache for every id in the iterator. Batch jobs that
+    /// resolve policy through the cached tenant rows call this after an
+    /// authoritative enumeration so lazy hydration mode sees every tenant.
+    async fn ensure_tenants_cached<I>(&self, tenant_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Id>,
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for tenant_id in tenant_ids {
+            if seen.insert(tenant_id.as_str().to_string()) {
+                self.ensure_tenant_cached(&tenant_id).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Test-only: drop the metadata caches so the KV fallback path is
     /// exercised. Meaningful only for persistent runtimes — an in-memory
     /// runtime's maps ARE the store. Records, indexes, skills, and
@@ -3721,12 +4083,12 @@ impl Runtime {
     }
 
     pub async fn list_tenants(&self) -> Vec<Tenant> {
-        let s = self.state.lock().await;
-        s.tenants
-            .values()
-            .filter(|t| t.deleted_at_ms.is_none())
-            .cloned()
-            .collect()
+        let mut tenants = self
+            .authoritative_all_tenants()
+            .await
+            .unwrap_or_default();
+        tenants.retain(|t| t.deleted_at_ms.is_none());
+        tenants
     }
 
     /// Look up an agent by id, scoped to the given tenant. Returns
@@ -3760,24 +4122,14 @@ impl Runtime {
     }
 
     pub async fn list_agents(&self, tenant_id: &Id) -> Result<Vec<Agent>> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut agents: Vec<Agent> = s
-            .agents
-            .values()
+        self.get_tenant(tenant_id).await?;
+        let mut agents: Vec<Agent> = self
+            .authoritative_tenant_agents(tenant_id)
+            .await?
+            .into_iter()
             .filter(|agent| {
                 agent.deleted_at_ms.is_none() && agent.tenant_id.as_str() == tenant_id.as_str()
             })
-            .cloned()
             .collect();
         agents.sort_by(|a, b| {
             a.alias
@@ -3819,6 +4171,8 @@ impl Runtime {
                 return Err(internal(e));
             }
         }
+        drop(s);
+        self.invalidate_tenant_aggregates(tenant_id).await;
         Ok(())
     }
 
@@ -3852,6 +4206,8 @@ impl Runtime {
                 return Err(internal(e));
             }
         }
+        drop(s);
+        self.invalidate_tenant_aggregates(tenant_id).await;
         Ok(())
     }
 
@@ -3902,13 +4258,14 @@ impl Runtime {
     }
 
     pub async fn fleet_storage_summary(&self) -> FleetStorageSummary {
-        let s = self.state.lock().await;
-        let live_tenants: Vec<Tenant> = s
-            .tenants
-            .values()
+        let live_tenants: Vec<Tenant> = self
+            .authoritative_all_tenants()
+            .await
+            .unwrap_or_default()
+            .into_iter()
             .filter(|tenant| tenant.deleted_at_ms.is_none())
-            .cloned()
             .collect();
+        let all_sessions = self.authoritative_all_sessions().await.unwrap_or_default();
 
         let mut tenant_summaries = Vec::with_capacity(live_tenants.len());
         let mut lifecycle_counts = LifecycleCounts::default();
@@ -3920,9 +4277,8 @@ impl Runtime {
         let mut archived_bytes = 0u64;
 
         for tenant in &live_tenants {
-            let sessions: Vec<Session> = s
-                .sessions
-                .values()
+            let sessions: Vec<Session> = all_sessions
+                .iter()
                 .filter(|session| {
                     session.deleted_at_ms.is_none()
                         && session.tenant_id.as_str() == tenant.tenant_id.as_str()
@@ -4303,24 +4659,14 @@ impl Runtime {
     }
 
     pub async fn list_sessions(&self, tenant_id: &Id) -> Result<Vec<Session>> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut sessions: Vec<Session> = s
-            .sessions
-            .values()
+        self.get_tenant(tenant_id).await?;
+        let mut sessions: Vec<Session> = self
+            .authoritative_tenant_sessions(tenant_id)
+            .await?
+            .into_iter()
             .filter(|sess| {
                 sess.deleted_at_ms.is_none() && sess.tenant_id.as_str() == tenant_id.as_str()
             })
-            .cloned()
             .collect();
         sessions.sort_by(|a, b| {
             b.last_active_at_ms
@@ -4362,6 +4708,8 @@ impl Runtime {
                 return Err(internal(e));
             }
         }
+        drop(s);
+        self.invalidate_tenant_aggregates(tenant_id).await;
         Ok(())
     }
 
@@ -4410,6 +4758,11 @@ impl Runtime {
         if let Some(alias) = req.alias.as_deref() {
             self.ensure_agent_alias_cached(&req.tenant_id, alias).await?;
         }
+        // Quota admission uses the authoritative count (max_age ZERO), not
+        // the cache, so lazy hydration cannot under-count.
+        let agg = self
+            .tenant_aggregates_cached(&req.tenant_id, std::time::Duration::ZERO)
+            .await?;
         self.refresh_replicated_state().await?;
         let a = {
             let mut s = self.state.lock().await;
@@ -4417,13 +4770,7 @@ impl Runtime {
                 Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id))
             })?;
             if let Some(max) = policy.quota.max_agents {
-                let live_agents = s
-                    .agents
-                    .values()
-                    .filter(|a| {
-                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
-                    })
-                    .count();
+                let live_agents = agg.live_agents;
                 if live_agents >= max {
                     return Err(Error::new(
                         ErrorCode::PolicyDenied,
@@ -4471,6 +4818,7 @@ impl Runtime {
         if let Some(p) = &self.persist {
             p.put_agent(&a).map_err(internal)?;
         }
+        self.invalidate_tenant_aggregates(&a.tenant_id).await;
         Ok(a)
     }
 
@@ -4492,6 +4840,9 @@ impl Runtime {
         if let Some(alias) = req.alias.as_deref() {
             self.ensure_session_alias_cached(&req.tenant_id, alias).await?;
         }
+        let agg = self
+            .tenant_aggregates_cached(&req.tenant_id, std::time::Duration::ZERO)
+            .await?;
         self.refresh_replicated_state().await?;
         let sess = {
             let mut s = self.state.lock().await;
@@ -4499,15 +4850,7 @@ impl Runtime {
                 Error::new(ErrorCode::TenantNotFound, format!("{}", req.tenant_id))
             })?;
             if let Some(max) = policy.quota.max_active_sessions {
-                let active_sessions = s
-                    .sessions
-                    .values()
-                    .filter(|sess| {
-                        sess.tenant_id.as_str() == req.tenant_id.as_str()
-                            && sess.deleted_at_ms.is_none()
-                            && sess.status == crate::session::Status::Active
-                    })
-                    .count();
+                let active_sessions = agg.active_sessions;
                 if active_sessions >= max {
                     // Transient by design: lifecycle sweeps and session
                     // closure drain this quota, so a retrying agent should
@@ -4577,6 +4920,7 @@ impl Runtime {
         if let Some(p) = &self.persist {
             p.put_session(&sess).map_err(internal)?;
         }
+        self.invalidate_tenant_aggregates(&sess.tenant_id).await;
         Ok(sess)
     }
 
@@ -4674,6 +5018,7 @@ impl Runtime {
             s.sessions
                 .insert(child.session_id.as_str().to_string(), child.clone());
         }
+        self.invalidate_tenant_aggregates(&req.tenant_id).await;
         Ok(child)
     }
 
@@ -4939,6 +5284,7 @@ impl Runtime {
         req: NewSkill,
         idempotency_key: Option<String>,
     ) -> Result<Skill> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         let idem_full_key = idempotency_key.as_ref().map(|k| {
             format!(
                 "{}::{}::{}::{}",
@@ -5041,6 +5387,7 @@ impl Runtime {
     }
 
     pub async fn get_skill(&self, tenant_id: &Id, skill_id: &Id) -> Result<Skill> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5058,6 +5405,7 @@ impl Runtime {
     }
 
     pub async fn list_skills(&self, tenant_id: &Id) -> Result<Vec<Skill>> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5154,6 +5502,8 @@ impl Runtime {
     /// Bind an exact skill version to an agent. Rebinding the same skill id is
     /// idempotent even without an Idempotency-Key.
     pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
         let idem_full_key = req.idempotency_key.as_ref().map(|k| {
             format!(
                 "{}::{}::{}::{}",
@@ -5246,6 +5596,8 @@ impl Runtime {
         tenant_id: &Id,
         agent_id: &Id,
     ) -> Result<Vec<AgentSkillBinding>> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_agent_cached(tenant_id, agent_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5322,6 +5674,9 @@ impl Runtime {
 
     pub async fn backpressure_for_tenant(&self, tenant_id: &Id) -> Result<BackpressureReport> {
         self.ensure_tenant_cached(tenant_id).await?;
+        let agg = self
+            .tenant_aggregates_cached(tenant_id, std::time::Duration::from_secs(2))
+            .await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5337,25 +5692,11 @@ impl Runtime {
         let mut report = BackpressureReport::default();
 
         if let Some(soft) = policy.quota.soft_max_active_sessions {
-            let active_sessions = s
-                .sessions
-                .values()
-                .filter(|sess| {
-                    sess.tenant_id.as_str() == tenant_id.as_str()
-                        && sess.deleted_at_ms.is_none()
-                        && sess.status == crate::session::Status::Active
-                })
-                .count();
-            report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
+            report.push_if_over("active_sessions", agg.active_sessions as u64, soft as u64);
         }
 
         if let Some(soft) = policy.quota.soft_max_agents {
-            let live_agents = s
-                .agents
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .count();
-            report.push_if_over("agents", live_agents as u64, soft as u64);
+            report.push_if_over("agents", agg.live_agents as u64, soft as u64);
         }
 
         if let Some(soft) = policy.quota.soft_max_records {
@@ -5372,22 +5713,11 @@ impl Runtime {
         }
 
         if let Some(soft) = policy.quota.soft_max_artifacts {
-            let live_artifacts = s
-                .artifacts
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .count();
-            report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+            report.push_if_over("artifacts", agg.live_artifacts as u64, soft as u64);
         }
 
         if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
-            let live_bytes: u64 = s
-                .artifacts
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .map(|a| a.bytes)
-                .sum();
-            report.push_if_over("artifact_storage", live_bytes, soft);
+            report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
         }
 
         if let Some(soft) = policy.quota.soft_max_skills {
@@ -5452,6 +5782,11 @@ impl Runtime {
         tenant_id: &Id,
         session_id: &Id,
     ) -> Result<BackpressureReport> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_session_cached(tenant_id, session_id).await?;
+        let agg = self
+            .tenant_aggregates_cached(tenant_id, std::time::Duration::from_secs(2))
+            .await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5474,24 +5809,10 @@ impl Runtime {
         let mut report = BackpressureReport::default();
 
         if let Some(soft) = policy.quota.soft_max_active_sessions {
-            let active_sessions = s
-                .sessions
-                .values()
-                .filter(|sess| {
-                    sess.tenant_id.as_str() == tenant_id.as_str()
-                        && sess.deleted_at_ms.is_none()
-                        && sess.status == crate::session::Status::Active
-                })
-                .count();
-            report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
+            report.push_if_over("active_sessions", agg.active_sessions as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_agents {
-            let live_agents = s
-                .agents
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .count();
-            report.push_if_over("agents", live_agents as u64, soft as u64);
+            report.push_if_over("agents", agg.live_agents as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_records {
             let live_records = s
@@ -5506,21 +5827,10 @@ impl Runtime {
             report.push_if_over("records", live_records as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_artifacts {
-            let live_artifacts = s
-                .artifacts
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .count();
-            report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+            report.push_if_over("artifacts", agg.live_artifacts as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
-            let live_bytes: u64 = s
-                .artifacts
-                .values()
-                .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-                .map(|a| a.bytes)
-                .sum();
-            report.push_if_over("artifact_storage", live_bytes, soft);
+            report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
         }
         if let Some(soft) = policy.quota.soft_max_skills {
             let live_skills = s
@@ -5601,6 +5911,9 @@ impl Runtime {
             None => None,
         };
         self.ensure_tenant_cached(&req.tenant_id).await?;
+        let agg = self
+            .tenant_aggregates_cached(&req.tenant_id, std::time::Duration::ZERO)
+            .await?;
         let policy = self.resolve_policy_for_tenant(&req.tenant_id).await?;
         // Reject oversized blobs before touching the content backend so a
         // misbehaving caller can't fill disk by streaming a huge body.
@@ -5629,13 +5942,7 @@ impl Runtime {
                 ));
             }
             if let Some(max) = policy.quota.max_artifacts {
-                let live_artifacts = s
-                    .artifacts
-                    .values()
-                    .filter(|a| {
-                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
-                    })
-                    .count();
+                let live_artifacts = agg.live_artifacts;
                 if live_artifacts >= max {
                     return Err(Error::new(
                         ErrorCode::PolicyDenied,
@@ -5647,14 +5954,7 @@ impl Runtime {
                 }
             }
             if let Some(max) = policy.quota.max_artifact_storage_bytes {
-                let live_bytes: u64 = s
-                    .artifacts
-                    .values()
-                    .filter(|a| {
-                        a.tenant_id.as_str() == req.tenant_id.as_str() && a.deleted_at_ms.is_none()
-                    })
-                    .map(|a| a.bytes)
-                    .sum();
+                let live_bytes: u64 = agg.live_artifact_bytes;
                 if live_bytes.saturating_add(len) > max {
                     return Err(Error::new(
                         ErrorCode::PolicyDenied,
@@ -5782,6 +6082,7 @@ impl Runtime {
             self.idem.put(full_key, record);
         }
         drop(state);
+        self.invalidate_tenant_aggregates(&artifact.tenant_id).await;
         Ok(artifact)
     }
 
@@ -5820,10 +6121,10 @@ impl Runtime {
             }
         };
         let referenced = {
-            let state = self.state.lock().await;
-            let mut referenced: BTreeSet<(String, String)> = state
-                .artifacts
-                .values()
+            let all_artifacts = self.authoritative_all_artifacts().await?;
+            let all_sessions = self.authoritative_all_sessions().await?;
+            let mut referenced: BTreeSet<(String, String)> = all_artifacts
+                .iter()
                 .filter(|artifact| artifact.raw_purged_at_ms.is_none())
                 .map(|artifact| {
                     (
@@ -5841,7 +6142,7 @@ impl Runtime {
             // kept too: a crash between archive-manifest commit and source
             // cleanup leaves them present, and retaining a stale blob until
             // GC is always safer than deleting a referenced one.
-            for session in state.sessions.values() {
+            for session in &all_sessions {
                 let tenant = session.tenant_id.as_str().to_string();
                 for segment in &session.sealed_segments {
                     referenced.insert((tenant.clone(), segment.segment_id.as_str().to_string()));
@@ -5927,25 +6228,15 @@ impl Runtime {
     }
 
     pub async fn list_artifacts(&self, tenant_id: &Id) -> Result<Vec<Artifact>> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut artifacts = s
-            .artifacts
-            .values()
+        self.get_tenant(tenant_id).await?;
+        let mut artifacts = self
+            .authoritative_tenant_artifacts(tenant_id)
+            .await?
+            .into_iter()
             .filter(|artifact| {
                 artifact.deleted_at_ms.is_none()
                     && artifact.tenant_id.as_str() == tenant_id.as_str()
             })
-            .cloned()
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| {
             b.created_at_ms
@@ -6111,6 +6402,8 @@ impl Runtime {
                 return Err(internal(e));
             }
         }
+        drop(s);
+        self.invalidate_tenant_aggregates(tenant_id).await;
         Ok(())
     }
 
@@ -6145,11 +6438,25 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<LifecycleSweepReport> {
         let mut report = LifecycleSweepReport::default();
+        let scanned_sessions = match tenant_scope {
+            Some(tenant_id) => self.authoritative_tenant_sessions(tenant_id).await?,
+            None => self.authoritative_all_sessions().await?,
+        };
+        let scanned_artifacts = match tenant_scope {
+            Some(tenant_id) => self.authoritative_tenant_artifacts(tenant_id).await?,
+            None => self.authoritative_all_artifacts().await?,
+        };
+        let sweep_tenant_ids: Vec<Id> = scanned_sessions
+            .iter()
+            .map(|session| session.tenant_id.clone())
+            .chain(scanned_artifacts.iter().map(|a| a.tenant_id.clone()))
+            .collect();
+        self.ensure_tenants_cached(sweep_tenant_ids).await?;
         let (session_candidates, artifact_candidates) =
             {
                 let s = self.state.lock().await;
                 let mut candidates = Vec::new();
-                for session in s.sessions.values() {
+                for session in &scanned_sessions {
                     if session.deleted_at_ms.is_some() {
                         continue;
                     }
@@ -6166,24 +6473,23 @@ impl Runtime {
                     }
                 }
 
-                let artifacts =
-                    s.artifacts
-                        .values()
-                        .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
-                        .filter(|a| {
-                            tenant_scope
-                                .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
-                                .unwrap_or(true)
-                        })
-                        .filter(|a| {
-                            let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
-                            !policy.retention.legal_hold
-                                && policy.lifecycle.derivative_only_after_ms.is_some_and(
-                                    |threshold| now_ms.saturating_sub(a.created_at_ms) >= threshold,
-                                )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
+                let artifacts = scanned_artifacts
+                    .iter()
+                    .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
+                    .filter(|a| {
+                        tenant_scope
+                            .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                            .unwrap_or(true)
+                    })
+                    .filter(|a| {
+                        let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                        !policy.retention.legal_hold
+                            && policy.lifecycle.derivative_only_after_ms.is_some_and(|threshold| {
+                                now_ms.saturating_sub(a.created_at_ms) >= threshold
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 (candidates, artifacts)
             };
 
@@ -6275,10 +6581,9 @@ impl Runtime {
         max_tenants: usize,
     ) -> Result<PolicyWorkerReport> {
         let mut scheduled = {
-            let s = self.state.lock().await;
-            let mut tenants: Vec<(Id, Priority)> = s
-                .tenants
-                .values()
+            let all_tenants = self.authoritative_all_tenants().await?;
+            let mut tenants: Vec<(Id, Priority)> = all_tenants
+                .iter()
                 .map(|tenant| {
                     let policy = RuntimePolicy::from_json(&tenant.policy);
                     (tenant.tenant_id.clone(), policy.priority)
@@ -6355,6 +6660,8 @@ impl Runtime {
         now_ms: u64,
     ) -> Result<GcSweepReport> {
         let mut report = GcSweepReport::default();
+        // GC's purge logic walks the cached maps; make them complete first.
+        self.warm_metadata_caches_for_scope(tenant_scope).await?;
         let idempotency_candidates = {
             let s = self.state.lock().await;
             let mut out = Vec::new();
@@ -8070,27 +8377,29 @@ impl Runtime {
         if let Some(agent_id) = req.agent_id.as_ref() {
             self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
         }
+        self.get_tenant(&req.tenant_id).await?;
+        // Enumerate over the authoritative session set (KV base + cache
+        // overlay), not the cache alone: in lazy hydration mode the cache
+        // holds only touched rows, and a watch must not silently narrow to
+        // them.
+        let tenant_sessions: Vec<Session> = self
+            .authoritative_tenant_sessions(&req.tenant_id)
+            .await?
+            .into_iter()
+            .filter(|session| {
+                session.deleted_at_ms.is_none()
+                    && session.tenant_id.as_str() == req.tenant_id.as_str()
+            })
+            .collect();
         let (session_ids, fork_edges): (Vec<Id>, Vec<ForkEdge>) = {
-            let s = self.state.lock().await;
-            let tenant_live = s
-                .tenants
-                .get(req.tenant_id.as_str())
-                .is_some_and(|tenant| tenant.deleted_at_ms.is_none());
-            if !tenant_live {
-                return Err(Error::new(
-                    ErrorCode::TenantNotFound,
-                    format!("{}", req.tenant_id),
-                ));
-            }
             let session_ids: Vec<Id> = match req.scope {
                 WatchScope::Session => {
                     let session_id = req.session_id.clone().ok_or_else(|| {
                         Error::new(ErrorCode::SessionNotFound, "watch session_id is required")
                     })?;
-                    let live = s.sessions.get(session_id.as_str()).is_some_and(|session| {
-                        session.deleted_at_ms.is_none()
-                            && session.tenant_id.as_str() == req.tenant_id.as_str()
-                    });
+                    let live = tenant_sessions
+                        .iter()
+                        .any(|session| session.session_id.as_str() == session_id.as_str());
                     if !live {
                         return Err(Error::new(
                             ErrorCode::SessionNotFound,
@@ -8099,36 +8408,18 @@ impl Runtime {
                     }
                     vec![session_id]
                 }
-                WatchScope::Tenant => s
-                    .sessions
-                    .values()
-                    .filter(|session| {
-                        session.deleted_at_ms.is_none()
-                            && session.tenant_id.as_str() == req.tenant_id.as_str()
-                    })
+                WatchScope::Tenant => tenant_sessions
+                    .iter()
                     .map(|session| session.session_id.clone())
                     .collect(),
                 WatchScope::Agent => {
                     let agent_id = req.agent_id.clone().ok_or_else(|| {
                         Error::new(ErrorCode::AgentNotFound, "watch agent_id is required")
                     })?;
-                    let live = s.agents.get(agent_id.as_str()).is_some_and(|agent| {
-                        agent.deleted_at_ms.is_none()
-                            && agent.tenant_id.as_str() == req.tenant_id.as_str()
-                    });
-                    if !live {
-                        return Err(Error::new(
-                            ErrorCode::AgentNotFound,
-                            format!("{}", agent_id),
-                        ));
-                    }
-                    s.sessions
-                        .values()
-                        .filter(|session| {
-                            session.deleted_at_ms.is_none()
-                                && session.tenant_id.as_str() == req.tenant_id.as_str()
-                                && session.agent_id.as_str() == agent_id.as_str()
-                        })
+                    self.get_agent(&req.tenant_id, &agent_id).await?;
+                    tenant_sessions
+                        .iter()
+                        .filter(|session| session.agent_id.as_str() == agent_id.as_str())
                         .map(|session| session.session_id.clone())
                         .collect()
                 }
@@ -8139,13 +8430,8 @@ impl Runtime {
             // not announce when only the child (not the parent) is in scope.
             let scoped: std::collections::HashSet<&str> =
                 session_ids.iter().map(|id| id.as_str()).collect();
-            let fork_edges: Vec<ForkEdge> = s
-                .sessions
-                .values()
-                .filter(|session| {
-                    session.deleted_at_ms.is_none()
-                        && session.tenant_id.as_str() == req.tenant_id.as_str()
-                })
+            let fork_edges: Vec<ForkEdge> = tenant_sessions
+                .iter()
                 .filter_map(|session| {
                     let parent = session.forked_from.as_ref()?;
                     if !scoped.contains(parent.session_id.as_str()) {
@@ -8283,6 +8569,13 @@ impl Runtime {
         validate_export_include(&req.include)?;
         if req.limit == 0 {
             return Ok(Vec::new());
+        }
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        if let Some(session_id) = req.session_id.as_ref() {
+            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+        }
+        if let Some(agent_id) = req.agent_id.as_ref() {
+            self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
         }
         if let Some(persist) = &self.persist {
             let scope_validation = {
@@ -8503,6 +8796,13 @@ impl Runtime {
     ) -> Result<ExportConsumer> {
         validate_consumer_name(&req.consumer_name)?;
         validate_export_include(&req.include)?;
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        if let Some(session_id) = req.session_id.as_ref() {
+            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+        }
+        if let Some(agent_id) = req.agent_id.as_ref() {
+            self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
+        }
         let now_ms = crate::now_ms();
         let consumer = {
             let s = self.state.lock().await;
@@ -8559,6 +8859,7 @@ impl Runtime {
         tenant_id: &Id,
         consumer_name: &str,
     ) -> Result<ExportConsumer> {
+        self.ensure_tenant_cached(tenant_id).await?;
         validate_consumer_name(consumer_name)?;
         let s = self.state.lock().await;
         validate_tenant_live_in_state(&s, tenant_id)?;
@@ -8686,6 +8987,7 @@ impl Runtime {
         &self,
         req: ClaimExportConsumerRequest,
     ) -> Result<ExportConsumer> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         validate_consumer_name(&req.consumer_name)?;
         if req.lease_owner.trim().is_empty() {
             return Err(Error::new(
@@ -8744,6 +9046,7 @@ impl Runtime {
         &self,
         req: AckExportConsumerRequest,
     ) -> Result<ExportConsumer> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         validate_consumer_name(&req.consumer_name)?;
         if req
             .cursor
@@ -8842,6 +9145,7 @@ impl Runtime {
         &self,
         req: RewindExportConsumerRequest,
     ) -> Result<ExportConsumer> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         validate_consumer_name(&req.consumer_name)?;
         let mut consumer = self
             .load_export_consumer_for_update(
@@ -10058,6 +10362,7 @@ impl Runtime {
     }
 
     pub async fn create_record_edge(&self, req: NewRecordEdge) -> Result<RecordEdge> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         let edge = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -10104,6 +10409,7 @@ impl Runtime {
     }
 
     pub async fn record_edges(&self, tenant_id: &Id, record_id: &Id) -> Result<Vec<RecordEdge>> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10179,6 +10485,7 @@ impl Runtime {
         key: impl Into<String>,
         value: serde_json::Value,
     ) -> Result<TenantMetaEntry> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let key = key.into();
         let entry = {
             let s = self.state.lock().await;
@@ -10209,6 +10516,7 @@ impl Runtime {
     }
 
     pub async fn get_tenant_meta(&self, tenant_id: &Id, key: &str) -> Result<TenantMetaEntry> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10770,16 +11078,18 @@ fn resolve_policy_for_agent_in_state(
     Ok(base.merge_override(override_json))
 }
 
-fn backpressure_for_tenant_session_in_state(
-    s: &State,
-    policy: &RuntimePolicy,
-    tenant_id: &Id,
-    session: &Session,
-) -> BackpressureReport {
-    let mut report = BackpressureReport::default();
-
-    if let Some(soft) = policy.quota.soft_max_active_sessions {
-        let active_sessions = s
+/// Aggregates for the in-lock hot path: the fresh cache entry when present
+/// (kept warm by the async callers), else map-derived counts — exact in full
+/// hydration, a lower bound in lazy mode (advisory reporting only; quota
+/// enforcement always goes through `tenant_aggregates_cached` with ZERO age).
+fn tenant_aggregates_in_state(s: &State, tenant_id: &Id) -> TenantAggregates {
+    if let Some((agg, at)) = s.tenant_aggregate_cache.get(tenant_id.as_str()) {
+        if at.elapsed() <= std::time::Duration::from_secs(2) {
+            return *agg;
+        }
+    }
+    TenantAggregates {
+        active_sessions: s
             .sessions
             .values()
             .filter(|sess| {
@@ -10787,16 +11097,40 @@ fn backpressure_for_tenant_session_in_state(
                     && sess.deleted_at_ms.is_none()
                     && sess.status == crate::session::Status::Active
             })
-            .count();
-        report.push_if_over("active_sessions", active_sessions as u64, soft as u64);
-    }
-    if let Some(soft) = policy.quota.soft_max_agents {
-        let live_agents = s
+            .count(),
+        live_agents: s
             .agents
             .values()
             .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-            .count();
-        report.push_if_over("agents", live_agents as u64, soft as u64);
+            .count(),
+        live_artifacts: s
+            .artifacts
+            .values()
+            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+            .count(),
+        live_artifact_bytes: s
+            .artifacts
+            .values()
+            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
+            .map(|a| a.bytes)
+            .sum(),
+    }
+}
+
+fn backpressure_for_tenant_session_in_state(
+    s: &State,
+    policy: &RuntimePolicy,
+    tenant_id: &Id,
+    session: &Session,
+) -> BackpressureReport {
+    let agg = tenant_aggregates_in_state(s, tenant_id);
+    let mut report = BackpressureReport::default();
+
+    if let Some(soft) = policy.quota.soft_max_active_sessions {
+        report.push_if_over("active_sessions", agg.active_sessions as u64, soft as u64);
+    }
+    if let Some(soft) = policy.quota.soft_max_agents {
+        report.push_if_over("agents", agg.live_agents as u64, soft as u64);
     }
     if let Some(soft) = policy.quota.soft_max_records {
         let live_records = s
@@ -10811,21 +11145,10 @@ fn backpressure_for_tenant_session_in_state(
         report.push_if_over("records", live_records as u64, soft as u64);
     }
     if let Some(soft) = policy.quota.soft_max_artifacts {
-        let live_artifacts = s
-            .artifacts
-            .values()
-            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-            .count();
-        report.push_if_over("artifacts", live_artifacts as u64, soft as u64);
+        report.push_if_over("artifacts", agg.live_artifacts as u64, soft as u64);
     }
     if let Some(soft) = policy.quota.soft_max_artifact_storage_bytes {
-        let live_bytes: u64 = s
-            .artifacts
-            .values()
-            .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
-            .map(|a| a.bytes)
-            .sum();
-        report.push_if_over("artifact_storage", live_bytes, soft);
+        report.push_if_over("artifact_storage", agg.live_artifact_bytes, soft);
     }
     if let Some(soft) = policy.quota.soft_max_skills {
         let live_skills = s

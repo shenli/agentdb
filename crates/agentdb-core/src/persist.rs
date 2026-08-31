@@ -2226,6 +2226,60 @@ impl Persist {
         self.get_string_row(session_alias_key(tenant_id, alias))
     }
 
+    // Tenant-scoped enumeration for the KV-authoritative read path. The
+    // tenant-first key layout makes each of these a single bounded prefix
+    // scan; they are the enumeration counterpart of the point reads above.
+    pub fn scan_tenant_agents(&self, tenant_id: &str) -> KvResult<Vec<Agent>> {
+        let prefix = format!("record/agent/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("agent row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_tenant_sessions(&self, tenant_id: &str) -> KvResult<Vec<Session>> {
+        let prefix = format!("record/session/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("session row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
+    pub fn scan_tenant_artifacts(&self, tenant_id: &str) -> KvResult<Vec<Artifact>> {
+        let prefix = format!("record/artifact/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (k, v) = res?;
+            let suffix = std::str::from_utf8(&k[b"record/artifact/".len()..])
+                .map_err(|_| agentdb_storage::Error::Other("artifact key is not utf8".into()))?;
+            let mut split = suffix.splitn(2, '/');
+            let key_tenant = split.next().unwrap_or_default();
+            let artifact_id = split.next().unwrap_or_default();
+            let context = MetadataCryptoContext {
+                tenant_id: key_tenant,
+                object_kind: MetadataObjectKind::Artifact,
+                object_id: artifact_id,
+                key: None,
+            };
+            let plaintext = self.decrypt_metadata(&context, &v)?;
+            out.push(serde_json::from_slice(&plaintext).map_err(|err| {
+                agentdb_storage::Error::Other(format!("artifact row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
     pub fn scan_all_tenants(&self) -> KvResult<Vec<Tenant>> {
         // Note: the prefix ends in '/', so this does NOT pick up sibling
         // namespaces like `record/tenant_alias/...` because their bytes after

@@ -197,6 +197,9 @@ run_stage() {
 run_quick() {
   run_stage core-auto cargo test -q -p agentdb-core --test auto
   run_stage api-auto cargo test -q -p agentdb-api --test auto
+  # Lazy-hydration parity: the same scenario suites must pass with the
+  # metadata caches starting empty (KV-fallback reads carry everything).
+  run_stage core-auto-lazy env AGENTDB_STARTUP_HYDRATION=lazy cargo test -q -p agentdb-core --test auto --test kv_authoritative_reads
 }
 
 run_s8() {
