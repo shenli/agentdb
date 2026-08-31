@@ -685,3 +685,123 @@ async fn lazy_records_search_and_dedupe_work_with_no_resident_rows() {
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].metadata["updated"], true);
 }
+
+/// Skills, their uniqueness rows, and agent bindings are lazy too: nothing
+/// resident after a lazy restart, every funnel loads through the KV
+/// fallback, and full eviction never changes results.
+#[tokio::test]
+async fn lazy_skills_and_bindings_work_with_no_resident_rows() {
+    use agentdb_core::runtime::HydrationMode;
+    use agentdb_core::skill::{BindSkillRequest, NewSkill};
+
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+
+    let (tenant_id, agent_id, skill_id) = {
+        let rt = Runtime::with_kv(kv.clone(), content.clone());
+        let (t, a, _s) = bootstrap(&rt).await;
+        let skill = rt
+            .register_skill(
+                NewSkill {
+                    tenant_id: t.tenant_id.clone(),
+                    name: "summarize".into(),
+                    version: "1.0.0".into(),
+                    manifest: serde_json::json!({"entry": "main"}),
+                    artifact_refs: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        rt.bind_skill(BindSkillRequest {
+            tenant_id: t.tenant_id.clone(),
+            agent_id: a.agent_id.clone(),
+            skill_id: skill.skill_id.clone(),
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+        (t.tenant_id, a.agent_id, skill.skill_id)
+    };
+
+    let rt = Runtime::with_kv_and_hydration_mode(kv, content, HydrationMode::Lazy);
+
+    // Cold reads through the fallback.
+    assert_eq!(
+        rt.get_skill(&tenant_id, &skill_id).await.unwrap().name,
+        "summarize"
+    );
+    assert_eq!(rt.list_skills(&tenant_id).await.unwrap().len(), 1);
+    let bindings = rt.list_agent_skills(&tenant_id, &agent_id).await.unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].skill_id, skill_id);
+
+    // Cold uniqueness: re-registering the same name@version must conflict
+    // even though the uniqueness map started empty.
+    rt.debug_evict_metadata_caches().await;
+    let err = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: tenant_id.clone(),
+                name: "summarize".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, agentdb_core::errors::ErrorCode::AliasConflict);
+
+    // Cold rebind is idempotent (the existing binding loads via fallback).
+    rt.debug_evict_metadata_caches().await;
+    let rebound = rt
+        .bind_skill(BindSkillRequest {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            skill_id: skill_id.clone(),
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rebound.skill_id, skill_id);
+    assert_eq!(
+        rt.list_agent_skills(&tenant_id, &agent_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "rebind must not duplicate the binding"
+    );
+
+    // Cold delete cascades to bindings that were not resident.
+    rt.debug_evict_metadata_caches().await;
+    rt.delete_skill(&tenant_id, &skill_id).await.unwrap();
+    assert!(rt.get_skill(&tenant_id, &skill_id).await.is_err());
+    assert!(rt
+        .list_agent_skills(&tenant_id, &agent_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(rt.list_skills(&tenant_id).await.unwrap().is_empty());
+
+    // Tombstone semantics match full hydration: name@version stays reserved
+    // until GC purges the soft-deleted skill (the uniqueness row survives
+    // the delete), so a cold re-register still conflicts.
+    rt.debug_evict_metadata_caches().await;
+    let err = rt
+        .register_skill(
+            NewSkill {
+                tenant_id: tenant_id.clone(),
+                name: "summarize".into(),
+                version: "1.0.0".into(),
+                manifest: serde_json::json!({"entry": "v2"}),
+                artifact_refs: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, agentdb_core::errors::ErrorCode::AliasConflict);
+}

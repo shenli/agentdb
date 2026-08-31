@@ -97,13 +97,21 @@ need context).
 
 ### 3.2 Fork a session
 
-Branch into an alternate timeline. The child sees the parent's
-events at fork time; subsequent writes diverge.
+Branch into an alternate timeline. The child inherits the
+parent's history up to the fork point (MVCC-backed, no copy);
+subsequent writes diverge.
 
 ```python
 branch = session.fork("ticket-42-branch-a")
 branch.append({"role": "user", "text": "try the refund path"})
 ```
+
+Know where inherited history shows up: `append`/`fetch` on the
+child return only events written to the child itself (its working
+tail), while **replay** (`GET .../sessions/{id}/replay`) and
+**context packs** return the full merged history — inherited
+parent prefix plus child events. Use replay/context when the
+branch needs the pre-fork conversation.
 
 ### 3.3 Search records
 
@@ -123,6 +131,14 @@ matches = workspace.records.search(
     limit=5,
 )
 ```
+
+Search is eventually consistent by default (an async indexer
+feeds the global index). For read-your-writes — search right
+after a write — pass the write's commit token: the HTTP write
+response carries `X-AgentDB-Record-Commit-Seq`, and search
+accepts it back as `min_visible_record_commit_seq`, which
+forces a consistent view at least that fresh. SDK record
+handles carry this token for you.
 
 ### 3.4 Build context
 
@@ -198,19 +214,30 @@ const child = await session.fork("ticket-42-branch-a");
 
 ## 6. Errors you'll see
 
-Every error response carries `{"error": {"code", "kind",
-"message"}}` plus an HTTP status. SDKs map these to typed
-exceptions. The ones an agent should know:
+Every error response is a flat JSON object:
+
+```json
+{"code": "SESSION_NOT_FOUND", "message": "…", "retryable": false}
+```
+
+`code` is a stable SCREAMING_SNAKE identifier, `retryable` tells
+you whether the same request can simply be retried, and some
+errors add a `suggestion` string with the fix. 429 and 503
+responses also carry a `Retry-After` header (seconds) — honor it
+before retrying. SDKs map these to typed exceptions. The ones an
+agent should know:
 
 | HTTP | Meaning | What to do |
 |---|---|---|
 | 400 | bad request body | fix the body shape |
 | 401 | missing/invalid auth | add `Authorization` |
-| 403 | wrong tenant | re-check credentials match the session |
+| 403 | wrong tenant for this bearer token | re-check credentials match the session |
 | 404 | tenant or session unknown | check the names |
+| 409 | alias/version/idempotency conflict | read the existing resource instead |
 | 421 | routing drift on a forwarded request | retry once; if persistent, ask an operator |
-| 429 | quota exhausted | back off `retry_after_ms` and retry |
-| 503 | node draining or fault injected | retry on a different node |
+| 422 | request understood but denied (quota policy, size caps) | read `message`; don't blind-retry |
+| 429 | quota exhausted | back off `Retry-After` seconds and retry |
+| 503 | node draining or fault injected | honor `Retry-After`, then retry (another node if you have one) |
 
 ---
 
@@ -229,4 +256,6 @@ exceptions. The ones an agent should know:
   real-time, deployment): [`docs/design/design.md`](docs/design/design.md).
 - **What the code does today**:
   [`docs/design/architecture.md`](docs/design/architecture.md).
-- **OpenAPI spec**: `GET /openapi.json` on a running server.
+- **Full HTTP surface**: [`docs/reference/`](docs/reference/) and
+  the route list in
+  [`crates/agentdb-api/src/routes.rs`](crates/agentdb-api/src/routes.rs).

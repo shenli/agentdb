@@ -2897,6 +2897,54 @@ impl Persist {
         Ok(out)
     }
 
+    pub fn get_skill_row(&self, tenant_id: &str, skill_id: &str) -> KvResult<Option<Skill>> {
+        self.get_json_row(skill_record_key(tenant_id, skill_id))
+    }
+
+    /// Value of the `(tenant, name, version)` uniqueness row: the skill id.
+    pub fn get_skill_unique_row(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        version: &str,
+    ) -> KvResult<Option<String>> {
+        self.get_string_row(skill_unique_key(tenant_id, name, version))
+    }
+
+    pub fn get_agent_skill_binding_row(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        skill_id: &str,
+    ) -> KvResult<Option<AgentSkillBinding>> {
+        self.get_json_row(agent_skill_binding_key(tenant_id, agent_id, skill_id))
+    }
+
+    pub fn scan_tenant_skills(&self, tenant_id: &str) -> KvResult<Vec<Skill>> {
+        let prefix = format!("record/skill/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).expect("skill decodes"));
+        }
+        Ok(out)
+    }
+
+    pub fn scan_tenant_agent_skill_bindings(
+        &self,
+        tenant_id: &str,
+    ) -> KvResult<Vec<AgentSkillBinding>> {
+        let prefix = format!("record/agent_skill/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).expect("agent skill binding decodes"));
+        }
+        Ok(out)
+    }
+
     pub fn scan_all_skills(&self) -> KvResult<Vec<Skill>> {
         let iter = self.kv.scan_prefix(b"record/skill/")?;
         let mut out = Vec::new();

@@ -638,9 +638,11 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   through the group-commit batcher's single writer thread let one slow raft
   commit head-of-line-block every tablet. Fixed by disabling the batcher on
   replicated runtimes (raft log provides durability there); S8 passes again.
-  Open follow-up: occasional >60s raft commits pre-date #288 (retries absorb
-  them) — the raft tick worker runs control-plane SQL before every tick, so
-  metadata-DB stalls can starve heartbeat-driven retransmission.
+  Follow-up fixed same day: the raw raft tick now runs SQL-free in its own
+  task, the outbox no longer refreshes peer URLs via SQL per send tick, and
+  replica-health writes are deduped + time-boxed outside the send loop.
+  Retries halved; the residual (a few single-retry slow first commits per
+  smoke, absorbed as pre-#288) remains a small open item.
 
 
 ### Scenario S9: tablet_replacement_split_merge_preserves_state_idempotency_and_cursors
