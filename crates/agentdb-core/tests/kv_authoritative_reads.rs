@@ -515,3 +515,153 @@ async fn lazy_runtime_serves_cold_and_eviction_sweep_bounds_the_cache() {
         assert_eq!(events.len(), 27, "seed + post-evict + 25 chaos appends");
     }
 }
+
+/// Records are KV-authoritative too: in lazy mode the search indexes are
+/// built at startup but record ROWS are not resident; search materializes
+/// hits through the fallback, external-id dedupe works cold, and eviction
+/// of the records cache never changes results.
+#[tokio::test]
+async fn lazy_records_search_and_dedupe_work_with_no_resident_rows() {
+    use agentdb_core::runtime::{HydrationMode, SearchRequest};
+
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+
+    let tenant_id = {
+        let rt = Runtime::with_kv(kv.clone(), content.clone());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "lazy-records".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        for i in 0..5 {
+            rt.upsert_record_with_commit(NewRecord {
+                tenant_id: t.tenant_id.clone(),
+                external_id: Some(format!("ext-{i}")),
+                namespace: vec!["notes".into()],
+                scope: serde_json::json!({}),
+                text: Some(format!("searchable note number {i}")),
+                metadata: serde_json::json!({"i": i}),
+                tags: vec![],
+                source: None,
+                embedding: None,
+                policy: IndexingPolicy {
+                    mode: agentdb_core::record::IndexingMode::SummaryOnly,
+                    fields: vec![],
+                    vector_allowed: false,
+                },
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+        }
+        t.tenant_id
+    };
+
+    let rt = Runtime::with_kv_and_hydration_mode(kv, content, HydrationMode::Lazy);
+
+    // Text search materializes rows through the fallback (none resident).
+    let matches = rt
+        .search_records(SearchRequest {
+            tenant_id: tenant_id.clone(),
+            namespace: vec!["notes".into()],
+            sharding_key: None,
+            text: Some("searchable note".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
+            limit: 50,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 5, "index hits materialize via KV fallback");
+
+    // Enumeration and brute-force (no text) search read the authority.
+    assert_eq!(rt.list_records(&tenant_id).await.unwrap().len(), 5);
+    let brute = rt
+        .search_records(SearchRequest {
+            tenant_id: tenant_id.clone(),
+            namespace: vec!["notes".into()],
+            sharding_key: None,
+            text: None,
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
+            limit: 50,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(brute.len(), 5);
+
+    // External-id dedupe on a cold cache: upserting ext-2 must UPDATE the
+    // existing record, not create a duplicate.
+    rt.debug_evict_metadata_caches().await;
+    rt.upsert_record_with_commit(NewRecord {
+        tenant_id: tenant_id.clone(),
+        external_id: Some("ext-2".into()),
+        namespace: vec!["notes".into()],
+        scope: serde_json::json!({}),
+        text: Some("updated text for two".into()),
+        metadata: serde_json::json!({"updated": true}),
+        tags: vec![],
+        source: None,
+        embedding: None,
+        policy: IndexingPolicy {
+            mode: agentdb_core::record::IndexingMode::SummaryOnly,
+            fields: vec![],
+            vector_allowed: false,
+        },
+        expires_at_ms: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        rt.list_records(&tenant_id).await.unwrap().len(),
+        5,
+        "cold upsert deduped by external id"
+    );
+
+    // Evict the records cache and search again: identical results. The
+    // global index is eventually consistent (outbox-fed), so drain the
+    // outbox first — same as the background worker would.
+    rt.apply_record_index_outbox_once().await.unwrap();
+    rt.debug_evict_metadata_caches().await;
+    let matches = rt
+        .search_records(SearchRequest {
+            tenant_id: tenant_id.clone(),
+            namespace: vec!["notes".into()],
+            sharding_key: None,
+            text: Some("updated text".into()),
+            embedding: None,
+            tags: vec![],
+            source_filter: None,
+            metadata_filter: None,
+            include_superseded: false,
+            min_score: None,
+            created_after_ms: None,
+            created_before_ms: None,
+            touch: false,
+            limit: 50,
+            min_visible_record_commit_seq: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].metadata["updated"], true);
+}

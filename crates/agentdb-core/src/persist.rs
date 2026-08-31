@@ -2214,6 +2214,27 @@ impl Persist {
         })?))
     }
 
+    pub fn get_record_row(
+        &self,
+        tenant_id: &str,
+        record_id: &str,
+    ) -> KvResult<Option<SearchableRecord>> {
+        self.get_json_row(record_key(tenant_id, record_id))
+    }
+
+    pub fn scan_tenant_records(&self, tenant_id: &str) -> KvResult<Vec<SearchableRecord>> {
+        let prefix = format!("record/searchable/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("record row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
     pub fn get_tenant_alias_row(&self, external_key: &str) -> KvResult<Option<String>> {
         self.get_string_row(tenant_alias_key(external_key))
     }

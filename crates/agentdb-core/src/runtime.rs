@@ -76,6 +76,7 @@ pub struct TenantAggregates {
     pub live_agents: usize,
     pub live_artifacts: usize,
     pub live_artifact_bytes: u64,
+    pub live_records: usize,
 }
 
 tokio::task_local! {
@@ -2237,7 +2238,13 @@ fn hydrate_runtime_from_persist(persist: &Persist, mode: HydrationMode) -> Runti
             ))
             .expect("hydrate global record index");
         state.global_record_index_watermark = state.global_record_index_watermark.max(commit_seq);
-        state.records.insert(r.record_id.as_str().to_string(), r);
+        // In lazy mode the search indexes, doc-id maps, commit sequences,
+        // and external-id map are built here as usual, but the record ROWS
+        // (the large payloads) are not retained — they load on demand
+        // through the KV fallback like the other metadata maps.
+        if mode == HydrationMode::Full {
+            state.records.insert(r.record_id.as_str().to_string(), r);
+        }
     }
 
     RuntimeHydration {
@@ -3741,6 +3748,54 @@ impl Runtime {
         Ok(())
     }
 
+    async fn ensure_record_cached(&self, tenant_id: &Id, record_id: &Id) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if s.records.contains_key(record_id.as_str()) {
+                return Ok(());
+            }
+        }
+        if let Some(row) = p
+            .get_record_row(tenant_id.as_str(), record_id.as_str())
+            .map_err(internal)?
+        {
+            let mut s = self.state.lock().await;
+            s.records
+                .entry(record_id.as_str().to_string())
+                .or_insert(row);
+        }
+        Ok(())
+    }
+
+    async fn authoritative_tenant_records(&self, tenant_id: &Id) -> Result<Vec<SearchableRecord>> {
+        match &self.persist {
+            Some(p) => {
+                let scanned = p.scan_tenant_records(tenant_id.as_str()).map_err(internal)?;
+                let s = self.state.lock().await;
+                Ok(scanned
+                    .into_iter()
+                    .map(|row| {
+                        s.records
+                            .get(row.record_id.as_str())
+                            .cloned()
+                            .unwrap_or(row)
+                    })
+                    .collect())
+            }
+            None => {
+                let s = self.state.lock().await;
+                Ok(s.records
+                    .values()
+                    .filter(|r| r.tenant_id.as_str() == tenant_id.as_str())
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
     async fn ensure_tenant_alias_cached(&self, external_key: &str) -> Result<()> {
         let Some(p) = &self.persist else {
             return Ok(());
@@ -4013,6 +4068,12 @@ impl Runtime {
                 .filter(|a| a.deleted_at_ms.is_none())
                 .map(|a| a.bytes)
                 .sum(),
+            live_records: self
+                .authoritative_tenant_records(tenant_id)
+                .await?
+                .iter()
+                .filter(|r| r.deleted_at_ms.is_none() && !r.is_expired())
+                .count(),
         };
         let mut s = self.state.lock().await;
         s.tenant_aggregate_cache
@@ -4067,6 +4128,17 @@ impl Runtime {
         for row in artifacts {
             s.artifacts
                 .entry(row.artifact_id.as_str().to_string())
+                .or_insert(row);
+        }
+        drop(s);
+        let records = match tenant_scope {
+            Some(tenant_id) => p.scan_tenant_records(tenant_id.as_str()).map_err(internal)?,
+            None => p.scan_all_records().map_err(internal)?,
+        };
+        let mut s = self.state.lock().await;
+        for row in records {
+            s.records
+                .entry(row.record_id.as_str().to_string())
                 .or_insert(row);
         }
         Ok(())
@@ -4134,6 +4206,12 @@ impl Runtime {
         }
         let mut evicted = 0usize;
         let mut s = self.state.lock().await;
+        let max_records =
+            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_RECORDS", 100_000);
+        if s.records.len() > max_records {
+            evicted += s.records.len();
+            s.records.clear();
+        }
         if s.sessions.len() > max_sessions {
             evicted += s.sessions.len();
             s.sessions.clear();
@@ -5819,16 +5897,7 @@ impl Runtime {
         }
 
         if let Some(soft) = policy.quota.soft_max_records {
-            let live_records = s
-                .records
-                .values()
-                .filter(|r| {
-                    r.tenant_id.as_str() == tenant_id.as_str()
-                        && r.deleted_at_ms.is_none()
-                        && !r.is_expired()
-                })
-                .count();
-            report.push_if_over("records", live_records as u64, soft as u64);
+            report.push_if_over("records", agg.live_records as u64, soft as u64);
         }
 
         if let Some(soft) = policy.quota.soft_max_artifacts {
@@ -5934,16 +6003,7 @@ impl Runtime {
             report.push_if_over("agents", agg.live_agents as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_records {
-            let live_records = s
-                .records
-                .values()
-                .filter(|r| {
-                    r.tenant_id.as_str() == tenant_id.as_str()
-                        && r.deleted_at_ms.is_none()
-                        && !r.is_expired()
-                })
-                .count();
-            report.push_if_over("records", live_records as u64, soft as u64);
+            report.push_if_over("records", agg.live_records as u64, soft as u64);
         }
         if let Some(soft) = policy.quota.soft_max_artifacts {
             report.push_if_over("artifacts", agg.live_artifacts as u64, soft as u64);
@@ -7398,6 +7458,15 @@ impl Runtime {
             self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
             self.ensure_session_cached(&req.tenant_id, &req.session_id)
                 .await?;
+            // Source-ref validation reads record rows under the lock; make
+            // sure referenced records are resident first (lazy mode).
+            for source_ref in &req.source_refs {
+                if let Some(record_id) = &source_ref.record_id {
+                    if record_id.kind() == crate::id::IdKind::Record {
+                        self.ensure_record_cached(&req.tenant_id, record_id).await?;
+                    }
+                }
+            }
             let result = self
                 .append_with_policy_attempt(
                     req.clone(),
@@ -9946,6 +10015,7 @@ impl Runtime {
 
     pub async fn write_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
         let record = SearchableRecord::create(req);
+        self.ensure_tenant_cached(&record.tenant_id).await?;
         let policy = self.resolve_policy_for_tenant(&record.tenant_id).await?;
 
         // Validate tenant exists. We hold the state lock only for the
@@ -10092,6 +10162,8 @@ impl Runtime {
         record_id: &Id,
         include_deleted: bool,
     ) -> Result<SearchableRecord> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_record_cached(tenant_id, record_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10110,27 +10182,17 @@ impl Runtime {
     }
 
     pub async fn list_records(&self, tenant_id: &Id) -> Result<Vec<SearchableRecord>> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        if !tenant_live {
-            return Err(Error::new(
-                ErrorCode::TenantNotFound,
-                format!("{}", tenant_id),
-            ));
-        }
-        let mut records = s
-            .records
-            .values()
+        self.get_tenant(tenant_id).await?;
+        let mut records = self
+            .authoritative_tenant_records(tenant_id)
+            .await?
+            .into_iter()
             .filter(|record| {
                 record.tenant_id.as_str() == tenant_id.as_str()
                     && record.deleted_at_ms.is_none()
                     && !record.is_expired()
                     && record.status == RecordStatus::Active
             })
-            .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|a, b| {
             a.created_at_ms
@@ -10232,18 +10294,33 @@ impl Runtime {
 
     pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
-        let existing_id = if let Some(external_id) = req.external_id.as_deref() {
+        // Resolve the external-id mapping first, then make sure the mapped
+        // row is cached BEFORE applying the liveness filter — in lazy mode
+        // an unresident row must not look like "no existing record" (that
+        // would create a duplicate under the same external id).
+        let candidate_id = if let Some(external_id) = req.external_id.as_deref() {
             let s = self.state.lock().await;
             s.record_external_ids
                 .get(&record_external_key(&req.tenant_id, external_id))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate_id.as_deref() {
+            if let Ok(record_id) = Id::parse_kind(candidate, IdKind::Record) {
+                self.ensure_record_cached(&req.tenant_id, &record_id).await?;
+            }
+        }
+        let existing_id = if let Some(candidate) = candidate_id {
+            let s = self.state.lock().await;
+            Some(candidate)
                 .filter(|record_id| {
-                    s.records.get(*record_id).is_some_and(|record| {
+                    s.records.get(record_id).is_some_and(|record| {
                         record.tenant_id.as_str() == req.tenant_id.as_str()
                             && record.deleted_at_ms.is_none()
                             && !record.is_expired()
                     })
                 })
-                .cloned()
         } else {
             None
         };
@@ -10274,6 +10351,9 @@ impl Runtime {
         &self,
         update: RecordUpdate,
     ) -> Result<WriteRecordResult> {
+        self.ensure_tenant_cached(&update.tenant_id).await?;
+        self.ensure_record_cached(&update.tenant_id, &update.record_id)
+            .await?;
         let mut s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10413,6 +10493,11 @@ impl Runtime {
         tenant_id: &Id,
         record_ids: &[String],
     ) -> Result<Vec<SearchableRecord>> {
+        for record_id in record_ids {
+            if let Ok(record_id) = Id::parse_kind(record_id, crate::id::IdKind::Record) {
+                self.ensure_record_cached(tenant_id, &record_id).await?;
+            }
+        }
         let mut s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10482,6 +10567,10 @@ impl Runtime {
 
     pub async fn create_record_edge(&self, req: NewRecordEdge) -> Result<RecordEdge> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
+        self.ensure_record_cached(&req.tenant_id, &req.source_record_id)
+            .await?;
+        self.ensure_record_cached(&req.tenant_id, &req.target_record_id)
+            .await?;
         let edge = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -10529,6 +10618,7 @@ impl Runtime {
 
     pub async fn record_edges(&self, tenant_id: &Id, record_id: &Id) -> Result<Vec<RecordEdge>> {
         self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_record_cached(tenant_id, record_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -10921,6 +11011,19 @@ impl Runtime {
             return self.search_record_matches_local(req).await;
         }
 
+        // Resolve global-index hits whose rows are not cached (lazy mode).
+        let missing_hit_ids: Vec<Id> = {
+            let s = self.state.lock().await;
+            result
+                .hits
+                .iter()
+                .filter(|hit| !s.records.contains_key(hit.record_id.as_str()))
+                .filter_map(|hit| Id::parse_kind(&hit.record_id, crate::id::IdKind::Record).ok())
+                .collect()
+        };
+        for record_id in &missing_hit_ids {
+            self.ensure_record_cached(&req.tenant_id, record_id).await?;
+        }
         let s = self.state.lock().await;
         let mut candidates = Vec::with_capacity(result.hits.len());
         for hit in result.hits {
@@ -10992,6 +11095,36 @@ impl Runtime {
                     .and_modify(|s| s.merge_vector(score))
                     .or_insert_with(|| CandidateScore::with_vector(score));
             }
+        }
+
+        // Lazy-mode row resolution: the search indexes are complete, but the
+        // record rows may not be resident. Brute-force and repair paths walk
+        // rows by tenant, so pre-warm the tenant's rows for those; the
+        // index-driven path only needs the matched ids, resolved below.
+        if self.hydration_mode == HydrationMode::Lazy
+            && ((req.text.is_none() && req.embedding.is_none())
+                || req.min_visible_record_commit_seq.is_some())
+        {
+            let scanned = self.authoritative_tenant_records(&req.tenant_id).await?;
+            let mut s = self.state.lock().await;
+            for row in scanned {
+                s.records
+                    .entry(row.record_id.as_str().to_string())
+                    .or_insert(row);
+            }
+        }
+        // Resolve index hits whose rows are not cached (targeted point
+        // reads; a no-op when everything is resident).
+        let missing_hit_ids: Vec<Id> = {
+            let s = self.state.lock().await;
+            hits.keys()
+                .filter_map(|doc| s.doc_to_record.get(doc))
+                .filter(|rid| !s.records.contains_key(rid.as_str()))
+                .filter_map(|rid| Id::parse_kind(rid, crate::id::IdKind::Record).ok())
+                .collect()
+        };
+        for record_id in &missing_hit_ids {
+            self.ensure_record_cached(&req.tenant_id, record_id).await?;
         }
 
         let mut s = self.state.lock().await;
@@ -11085,6 +11218,8 @@ impl Runtime {
     /// out at the resolve step. V2.4 will replace this with a proper
     /// tombstoning pass.
     pub async fn delete_record(&self, tenant_id: &Id, record_id: &Id) -> Result<()> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_record_cached(tenant_id, record_id).await?;
         let mut s = self.state.lock().await;
         let live = s.records.get(record_id.as_str()).is_some_and(|r| {
             r.deleted_at_ms.is_none() && r.tenant_id.as_str() == tenant_id.as_str()
@@ -11242,6 +11377,15 @@ fn tenant_aggregates_in_state(s: &State, tenant_id: &Id) -> TenantAggregates {
             .filter(|a| a.tenant_id.as_str() == tenant_id.as_str() && a.deleted_at_ms.is_none())
             .map(|a| a.bytes)
             .sum(),
+        live_records: s
+            .records
+            .values()
+            .filter(|r| {
+                r.tenant_id.as_str() == tenant_id.as_str()
+                    && r.deleted_at_ms.is_none()
+                    && !r.is_expired()
+            })
+            .count(),
     }
 }
 
@@ -11261,16 +11405,7 @@ fn backpressure_for_tenant_session_in_state(
         report.push_if_over("agents", agg.live_agents as u64, soft as u64);
     }
     if let Some(soft) = policy.quota.soft_max_records {
-        let live_records = s
-            .records
-            .values()
-            .filter(|r| {
-                r.tenant_id.as_str() == tenant_id.as_str()
-                    && r.deleted_at_ms.is_none()
-                    && !r.is_expired()
-            })
-            .count();
-        report.push_if_over("records", live_records as u64, soft as u64);
+        report.push_if_over("records", agg.live_records as u64, soft as u64);
     }
     if let Some(soft) = policy.quota.soft_max_artifacts {
         report.push_if_over("artifacts", agg.live_artifacts as u64, soft as u64);
