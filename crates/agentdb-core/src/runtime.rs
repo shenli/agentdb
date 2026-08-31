@@ -1015,6 +1015,14 @@ struct State {
     /// state mutex serializes counter increments alongside record
     /// inserts.
     next_doc_seq: u64,
+    /// Watermark of the last record-index snapshot written (or restored)
+    /// by this runtime. The snapshot writer skips work until the live
+    /// watermark advances far enough past this.
+    last_record_index_snapshot_watermark: u64,
+    record_index_snapshot_writes_total: u64,
+    /// True when startup restored the indexes from a persisted snapshot
+    /// (plus delta replay) instead of the full record scan.
+    record_index_snapshot_loaded: bool,
 }
 
 fn insert_runtime_event_cache(
@@ -2120,7 +2128,11 @@ const LAZY_HYDRATION_SKIPPED_PREFIXES: [&[u8]; 7] = [
     b"record/artifact/",
 ];
 
-fn hydrate_runtime_from_persist(persist: &Persist, mode: HydrationMode) -> RuntimeHydration {
+fn hydrate_runtime_from_persist(
+    persist: &Persist,
+    mode: HydrationMode,
+    use_snapshot: bool,
+) -> RuntimeHydration {
     let mut state = State::default();
     // In lazy mode the tenant/agent/session/artifact maps and alias maps are
     // left empty: the KV fallback path loads rows on first touch and the
@@ -2189,14 +2201,36 @@ fn hydrate_runtime_from_persist(persist: &Persist, mode: HydrationMode) -> Runti
     let idempotency_records = persist
         .scan_all_idempotency()
         .expect("hydrate idempotency records");
-    let mut hydrated_record_commit_seq: BTreeMap<String, u64> = persist
+    let commit_seq_rows = persist
         .scan_all_record_commit_seqs()
-        .expect("hydrate record commit sequences")
-        .into_iter()
+        .expect("hydrate record commit sequences");
+    let mut hydrated_record_commit_seq: BTreeMap<String, u64> = commit_seq_rows
+        .iter()
+        .map(|(_, record_id, seq)| (record_id.clone(), *seq))
         .collect();
     if let Some(max_commit_seq) = hydrated_record_commit_seq.values().copied().max() {
         state.next_record_commit_seq = max_commit_seq;
         state.local_record_index_watermark = max_commit_seq;
+    }
+
+    let snapshot = if use_snapshot && record_index_snapshots_enabled() {
+        persist.get_record_index_snapshot().unwrap_or_else(|error| {
+            tracing::warn!(?error, "failed to read record index snapshot; rebuilding");
+            None
+        })
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot {
+        let (text_index, vector_index, global_record_index) =
+            hydrate_record_indexes_from_snapshot(persist, &mut state, snapshot, &commit_seq_rows);
+        return RuntimeHydration {
+            state,
+            idempotency_records,
+            text_index,
+            vector_index,
+            global_record_index,
+        };
     }
 
     // Build the V2.2 text + vector indexes from scratch and replay every live
@@ -2256,6 +2290,147 @@ fn hydrate_runtime_from_persist(persist: &Persist, mode: HydrationMode) -> Runti
         vector_index,
         global_record_index,
     }
+}
+
+/// `1`/unset enables persisted record-index snapshots (write and load);
+/// `AGENTDB_RECORD_INDEX_SNAPSHOT=0` is the kill switch — startup falls back
+/// to the full-scan rebuild and the worker stops writing snapshots.
+fn record_index_snapshots_enabled() -> bool {
+    std::env::var("AGENTDB_RECORD_INDEX_SNAPSHOT")
+        .map(|raw| raw.trim() != "0")
+        .unwrap_or(true)
+}
+
+/// Restore the record indexes from a persisted snapshot, then delta-replay
+/// every record whose commit sequence moved past the snapshot's watermarks.
+/// Replaces the full scan-and-retokenize rebuild; record ROWS are not made
+/// resident (they load on demand through the KV fallback, in every
+/// hydration mode — the same machinery lazy hydration and cache eviction
+/// already rely on).
+fn hydrate_record_indexes_from_snapshot(
+    persist: &Persist,
+    state: &mut State,
+    snapshot: crate::persist::RecordIndexSnapshot,
+    commit_seq_rows: &[(String, String, u64)],
+) -> (
+    InMemoryInverted,
+    HnswVectorIndex,
+    Arc<dyn GlobalRecordIndex>,
+) {
+    let mut text_index = InMemoryInverted::from_snapshot(&snapshot.text);
+    let mut vector_index =
+        HnswVectorIndex::from_snapshot(&snapshot.vector, HnswVectorIndex::default_ef());
+    let global_record_index: Arc<dyn GlobalRecordIndex> =
+        Arc::new(InMemoryGlobalRecordIndex::from_snapshot(&snapshot.global));
+
+    state.next_doc_seq = snapshot.next_doc_seq;
+    for (session_internal_id, doc_seq, record_id) in &snapshot.doc_to_record {
+        let doc_id = DocId::new(*session_internal_id, *doc_seq);
+        state.doc_to_record.insert(doc_id, record_id.clone());
+        state.record_to_doc.insert(record_id.clone(), doc_id);
+    }
+    for (key, record_id) in &snapshot.record_external_ids {
+        state
+            .record_external_ids
+            .insert(key.clone(), record_id.clone());
+    }
+    // Commit sequences for records live at capture come from the
+    // authoritative rows (which may already be newer; the delta pass below
+    // reconciles the index state to match).
+    let seq_by_record: BTreeMap<&str, u64> = commit_seq_rows
+        .iter()
+        .map(|(_, record_id, seq)| (record_id.as_str(), *seq))
+        .collect();
+    for (_, _, record_id) in &snapshot.doc_to_record {
+        if let Some(seq) = seq_by_record.get(record_id.as_str()) {
+            state.record_commit_seq.insert(record_id.clone(), *seq);
+        }
+    }
+    state.local_record_index_watermark = snapshot.watermark;
+    state.global_record_index_watermark = snapshot.global_watermark;
+    state.next_record_commit_seq = state
+        .next_record_commit_seq
+        .max(snapshot.next_record_commit_seq);
+    state.last_record_index_snapshot_watermark = snapshot.watermark;
+    state.record_index_snapshot_loaded = true;
+
+    let floor = snapshot.watermark.min(snapshot.global_watermark);
+    for (tenant_id, record_id, seq) in commit_seq_rows {
+        state.next_record_commit_seq = state.next_record_commit_seq.max(*seq);
+        if *seq <= floor {
+            continue;
+        }
+        let row = persist
+            .get_record(tenant_id, record_id)
+            .expect("hydrate delta record");
+        let live = row
+            .as_ref()
+            .is_some_and(|r| r.deleted_at_ms.is_none() && !r.is_expired());
+        if *seq > snapshot.watermark {
+            // Same steps as a live update: drop the old doc mapping, then
+            // re-index if the record is still live. Ghost postings for the
+            // old doc id stay in the text/vector structures, exactly as
+            // they would in a running process.
+            if let Some(doc_id) = state.record_to_doc.remove(record_id.as_str()) {
+                state.doc_to_record.remove(&doc_id);
+            }
+            if live {
+                let r = row.as_ref().expect("live implies present");
+                let doc_id = mint_doc_id(&mut state.next_doc_seq);
+                index_record_into(&mut text_index, &mut vector_index, r, doc_id);
+                state.doc_to_record.insert(doc_id, record_id.clone());
+                state.record_to_doc.insert(record_id.clone(), doc_id);
+                if let Some(external_id) = r.external_id.as_deref() {
+                    state.record_external_ids.insert(
+                        record_external_key(&r.tenant_id, external_id),
+                        record_id.clone(),
+                    );
+                }
+                state.record_commit_seq.insert(record_id.clone(), *seq);
+            } else {
+                match row.as_ref() {
+                    Some(r) => {
+                        // Soft-deleted or expired after capture.
+                        if let Some(external_id) = r.external_id.as_deref() {
+                            state
+                                .record_external_ids
+                                .remove(&record_external_key(&r.tenant_id, external_id));
+                        }
+                        state.record_commit_seq.insert(record_id.clone(), *seq);
+                    }
+                    None => {
+                        // Purged after a post-snapshot soft-delete; drop any
+                        // snapshot-era external-id entries pointing at it.
+                        state
+                            .record_external_ids
+                            .retain(|_, mapped| mapped != record_id);
+                        state.record_commit_seq.remove(record_id.as_str());
+                    }
+                }
+            }
+            state.local_record_index_watermark = state.local_record_index_watermark.max(*seq);
+        }
+        if *seq > snapshot.global_watermark {
+            let mutation = match row.as_ref().filter(|_| live) {
+                Some(r) => global_index_mutation_for_record(r, *seq, GlobalIndexMutationOp::Upsert),
+                None => GlobalIndexMutation {
+                    tenant_id: tenant_id.clone(),
+                    record_id: record_id.clone(),
+                    namespace: vec![],
+                    placement_id: 0,
+                    commit_seq: *seq,
+                    op: GlobalIndexMutationOp::Delete,
+                    terms: vec![],
+                },
+            };
+            global_record_index
+                .apply(mutation)
+                .expect("hydrate global record index delta");
+            state.global_record_index_watermark = state.global_record_index_watermark.max(*seq);
+        }
+    }
+
+    (text_index, vector_index, global_record_index)
 }
 
 fn hydrate_metadata_maps(persist: &Persist, state: &mut State) {
@@ -3118,7 +3293,8 @@ impl Runtime {
         };
         enforce_startup_hydration_limits(&persist, hydration_mode)
             .expect("startup hydration limits");
-        let hydration = hydrate_runtime_from_persist(&persist, hydration_mode);
+        let hydration =
+            hydrate_runtime_from_persist(&persist, hydration_mode, tablet_router.is_none());
         let idem = IdempotencyStore::default();
         idem.extend(hydration.idempotency_records);
 
@@ -3486,7 +3662,9 @@ impl Runtime {
         // The replicated-apply rehydrate replaces the whole state, so it
         // always runs in full mode; lazy hydration is a single-node startup
         // optimization until Stage 3 makes apply incremental.
-        let hydration = hydrate_runtime_from_persist(persist, HydrationMode::Full);
+        // Snapshots are skipped here: the replicated apply path must see the
+        // exact persisted rows, not an accelerator view.
+        let hydration = hydrate_runtime_from_persist(persist, HydrationMode::Full, false);
         self.idem.replace(hydration.idempotency_records);
         {
             let mut state = self.state.lock().await;
@@ -10014,6 +10192,12 @@ pub struct RecordIndexStats {
     pub record_index_worker_failures_total: u64,
     pub global_index_apply_failures_total: u64,
     pub record_index_outbox_skipped_total: u64,
+    #[serde(default)]
+    pub snapshot_loaded_at_startup: bool,
+    #[serde(default)]
+    pub snapshot_last_watermark: u64,
+    #[serde(default)]
+    pub snapshot_writes_total: u64,
 }
 
 impl Runtime {
@@ -10271,6 +10455,18 @@ impl Runtime {
         Ok(())
     }
 
+    /// Overwrite the persisted record-index snapshot with undecodable bytes,
+    /// for the corruption-fallback regression test.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn corrupt_record_index_snapshot_for_test(&self) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        p.put_raw_record_index_snapshot_bytes(b"{not json")
+            .map_err(internal)
+    }
+
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn record_index_outbox_counts_for_test(&self) -> Result<(usize, usize)> {
@@ -10303,7 +10499,76 @@ impl Runtime {
             record_index_worker_failures_total: s.record_index_worker_failures_total,
             global_index_apply_failures_total: s.global_record_index_apply_failures_total,
             record_index_outbox_skipped_total: s.record_index_outbox_skipped_total,
+            snapshot_loaded_at_startup: s.record_index_snapshot_loaded,
+            snapshot_last_watermark: s.last_record_index_snapshot_watermark,
+            snapshot_writes_total: s.record_index_snapshot_writes_total,
         }
+    }
+
+    /// Persist a record-index snapshot if the local watermark has advanced
+    /// at least `AGENTDB_RECORD_INDEX_SNAPSHOT_MIN_ADVANCE` (default 256)
+    /// commits past the last snapshot — or unconditionally with `force`.
+    /// Returns whether a snapshot was written. No-ops (Ok(false)) without a
+    /// persist layer, on replicated runtimes, when snapshots are disabled,
+    /// or when the global index backend cannot dump itself.
+    pub async fn write_record_index_snapshot(&self, force: bool) -> Result<bool> {
+        let Some(p) = &self.persist else {
+            return Ok(false);
+        };
+        if self.tablet_router.is_some() || !record_index_snapshots_enabled() {
+            return Ok(false);
+        }
+        let min_advance: u64 = std::env::var("AGENTDB_RECORD_INDEX_SNAPSHOT_MIN_ADVANCE")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(256);
+        let snapshot = {
+            let s = self.state.lock().await;
+            if !force
+                && s.local_record_index_watermark
+                    .saturating_sub(s.last_record_index_snapshot_watermark)
+                    < min_advance.max(1)
+            {
+                return Ok(false);
+            }
+            let Some(global) = self.global_record_index.snapshot() else {
+                return Ok(false);
+            };
+            // Lock order matches the write paths: state, then text, then
+            // vector — held only while cloning, so the capture is a
+            // consistent point-in-time view.
+            let text = self.text_index.lock().expect("text index lock");
+            let vector = self.vector_index.lock().expect("vector index lock");
+            crate::persist::RecordIndexSnapshot {
+                format_version: crate::persist::RECORD_INDEX_SNAPSHOT_FORMAT_VERSION,
+                watermark: s.local_record_index_watermark,
+                global_watermark: s.global_record_index_watermark,
+                next_doc_seq: s.next_doc_seq,
+                next_record_commit_seq: s.next_record_commit_seq,
+                text: text.to_snapshot(),
+                vector: vector.to_snapshot(),
+                global,
+                doc_to_record: s
+                    .doc_to_record
+                    .iter()
+                    .map(|(doc_id, record_id)| {
+                        (doc_id.session_internal_id, doc_id.seq, record_id.clone())
+                    })
+                    .collect(),
+                record_external_ids: s
+                    .record_external_ids
+                    .iter()
+                    .map(|(key, record_id)| (key.clone(), record_id.clone()))
+                    .collect(),
+            }
+        };
+        let watermark = snapshot.watermark;
+        p.put_record_index_snapshot(&snapshot).map_err(internal)?;
+        let mut s = self.state.lock().await;
+        s.last_record_index_snapshot_watermark =
+            s.last_record_index_snapshot_watermark.max(watermark);
+        s.record_index_snapshot_writes_total += 1;
+        Ok(true)
     }
 
     pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
@@ -10919,6 +11184,12 @@ impl Runtime {
                     drop(s);
                     tracing::warn!(?error, "record index outbox replay failed");
                 }
+                if let Err(error) = self.write_record_index_snapshot(false).await {
+                    let mut s = self.state.lock().await;
+                    s.record_index_worker_failures_total += 1;
+                    drop(s);
+                    tracing::warn!(?error, "record index snapshot write failed");
+                }
                 ticks += 1;
                 if ticks % sweep_every == 0 {
                     self.sweep_idempotency_retention();
@@ -10987,6 +11258,11 @@ impl Runtime {
         &self,
         req: SearchRequest,
     ) -> Result<Vec<RecordSearchMatch>> {
+        // Public funnel: the API calls this directly (not search_records),
+        // so the tenant row must be pulled through the KV fallback here —
+        // both branches below check the cached map. Found by the S18
+        // SIGKILL harness: a cold lazy restart 404'd the first search.
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         if req.sharding_key.is_none() {
             return self.search_record_matches_global(req).await;
         }

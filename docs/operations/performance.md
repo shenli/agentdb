@@ -183,6 +183,21 @@ Watch `GET /api/admin/indexes/records` for:
 - `local_index_repairs_total`
 - `record_index_worker_failures_total`
 - `global_index_apply_failures_total`
+- `snapshot_loaded_at_startup`, `snapshot_last_watermark`, `snapshot_writes_total`
+
+## Record Index Snapshots
+
+Startup does not re-scan and re-tokenize every record. The index worker
+persists a snapshot of the text/vector/global indexes, doc-id maps, and
+external-id map (keyed by the record-index watermark) whenever the watermark
+has advanced at least `AGENTDB_RECORD_INDEX_SNAPSHOT_MIN_ADVANCE` commits
+(default 256) since the last snapshot. On boot the runtime restores the
+snapshot and delta-replays only the records whose commit sequence moved past
+it — updates, deletes, and GC purges included. Any snapshot decode failure
+falls back to the full rebuild; `AGENTDB_RECORD_INDEX_SNAPSHOT=0` disables
+snapshots entirely (write and load). HNSW graphs are not stored — they
+rebuild lazily from the snapshotted vectors on the first query per path.
+Replicated runtimes skip snapshots until the incremental Raft apply lands.
 
 Sustained non-zero global lag means no-key searches can miss fresh records
 unless callers pass `min_visible_record_commit_seq`. The maintained SDKs pass

@@ -5040,7 +5040,7 @@
         <path data-edge-from="core" data-edge-to="content" data-edge-label="artifact blobs" data-edge-key="4" data-edge-id="core-to-content" data-composition-points="820,269;900,269;900,132;980,132" d="M 820 269 L 892 269 Q 900 269 900 261 L 900 140 Q 900 132 908 132 L 980 132" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="core" data-edge-to="raft" data-edge-label="cluster: TabletCommand" data-edge-key="5" data-edge-id="core-to-raft" data-composition-points="735,312;735,336;756,336;756,356;740,356;740,380" d="M 735 312 L 735 328 Q 735 336 743 336 L 748 336 Q 756 336 756 344 L 756 348 Q 756 356 748 356 L 748 356 Q 740 356 740 364 L 740 380" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="raft" data-edge-to="persist" data-edge-label="apply committed" data-edge-key="6" data-edge-id="raft-to-persist" data-composition-points="815,419;980,419" d="M 815 419 L 980 419" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="api" data-edge-to="meta" data-edge-label="routing, admin tokens" data-edge-key="7" data-edge-id="api-to-meta" data-composition-points="403,304;403,342;115,342;115,380" d="M 403 304 L 403 334 Q 403 342 395 342 L 123 342 Q 115 342 115 350 L 115 380" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="api" data-edge-to="meta" data-edge-label="routing, tokens (admin/tenant)" data-edge-key="7" data-edge-id="api-to-meta" data-composition-points="403,304;403,342;115,342;115,380" d="M 403 304 L 403 334 Q 403 342 395 342 L 123 342 Q 115 342 115 350 L 115 380" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="sinks" data-edge-to="api" data-edge-label="exports/watch + ack" data-edge-key="8" data-edge-id="sinks-to-api" data-composition-points="417,380;417,304" d="M 417 380 L 417 304" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="content" data-edge-to="objstore" data-edge-label="async mirror + evict" data-edge-key="9" data-edge-id="content-to-objstore" data-composition-points="1055,164;1055,240" d="M 1055 164 L 1055 240" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="persist" data-edge-to="objstore" data-edge-label="recovery manifests 5m" data-edge-key="10" data-edge-id="persist-to-objstore" data-composition-points="1055,380;1055,304" d="M 1055 380 L 1055 304" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
@@ -5058,8 +5058,8 @@
         <text data-detail="context" x="110" y="286" class="t-muted" font-size="9" text-anchor="middle">Python / TypeScript SDKs</text>
         </g>
 
-        <g id="node-api" data-node-id="api" data-node-label="agentdb-api" tabindex="0" role="button" aria-label="Focus agentdb-api, Axum HTTP :7878, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Axum HTTP :7878" data-node-tag="static bearer" data-node-context="agentdb-server process (single binary)">
-          <title>agentdb-api · Axum HTTP :7878 · agentdb-server process (single binary) · static bearer</title>
+        <g id="node-api" data-node-id="api" data-node-label="agentdb-api" tabindex="0" role="button" aria-label="Focus agentdb-api, Axum HTTP :7878, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Axum HTTP :7878" data-node-tag="scoped bearer tokens" data-node-context="agentdb-server process (single binary)">
+          <title>agentdb-api · Axum HTTP :7878 · agentdb-server process (single binary) · scoped bearer tokens</title>
           <rect x="340" y="240" width="140" height="64" rx="6" class="c-mask"/>
           <rect x="340" y="240" width="140" height="64" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(346 246) scale(0.6875)">
@@ -5067,11 +5067,11 @@
           </g>
           <text data-node-label="" data-detail-anchor="" x="410" y="270" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">agentdb-api</text>
         <text data-detail="context" x="410" y="286" class="t-muted" font-size="9" text-anchor="middle">Axum HTTP :7878</text>
-        <text data-detail="fine" x="410" y="296" class="t-backend" font-size="7" text-anchor="middle">static bearer</text>
+        <text data-detail="fine" x="410" y="296" class="t-backend" font-size="7" text-anchor="middle">scoped bearer tokens</text>
         </g>
 
-        <g id="node-core" data-node-id="core" data-node-label="agentdb-core Runtime" tabindex="0" role="button" aria-label="Focus agentdb-core Runtime, sessions, fork, policy, GC, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="sessions, fork, policy, GC" data-node-tag="global Mutex&lt;State&gt;" data-node-context="agentdb-server process (single binary)">
-          <title>agentdb-core Runtime · sessions, fork, policy, GC · agentdb-server process (single binary) · global Mutex&lt;State&gt;</title>
+        <g id="node-core" data-node-id="core" data-node-label="agentdb-core Runtime" tabindex="0" role="button" aria-label="Focus agentdb-core Runtime, sessions, fork, policy, GC, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="sessions, fork, policy, GC" data-node-tag="KV-authoritative cache" data-node-context="agentdb-server process (single binary)">
+          <title>agentdb-core Runtime · sessions, fork, policy, GC · agentdb-server process (single binary) · KV-authoritative cache</title>
           <rect x="650" y="240" width="170" height="72" rx="6" class="c-mask"/>
           <rect x="650" y="240" width="170" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(656 246) scale(0.6875)">
@@ -5079,11 +5079,11 @@
           </g>
           <text data-node-label="" data-detail-anchor="" x="735" y="274" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">agentdb-core Runtime</text>
         <text data-detail="context" x="735" y="290" class="t-muted" font-size="9" text-anchor="middle">sessions, fork, policy, GC</text>
-        <text data-detail="fine" x="735" y="304" class="t-backend" font-size="7" text-anchor="middle">global Mutex&lt;State&gt;</text>
+        <text data-detail="fine" x="735" y="304" class="t-backend" font-size="7" text-anchor="middle">KV-authoritative cache</text>
         </g>
 
-        <g id="node-index" data-node-id="index" data-node-label="agentdb-index" tabindex="0" role="button" aria-label="Focus agentdb-index, BM25 + HNSW, in-process, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="BM25 + HNSW, in-process" data-node-context="agentdb-server process (single binary)">
-          <title>agentdb-index · BM25 + HNSW, in-process · agentdb-server process (single binary)</title>
+        <g id="node-index" data-node-id="index" data-node-label="agentdb-index" tabindex="0" role="button" aria-label="Focus agentdb-index, BM25 + HNSW, in-process, agentdb-server process (single binary)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="BM25 + HNSW, in-process" data-node-tag="snapshot + delta replay" data-node-context="agentdb-server process (single binary)">
+          <title>agentdb-index · BM25 + HNSW, in-process · agentdb-server process (single binary) · snapshot + delta replay</title>
           <rect x="665" y="100" width="140" height="64" rx="6" class="c-mask"/>
           <rect x="665" y="100" width="140" height="64" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(671 106) scale(0.6875)">
@@ -5091,6 +5091,7 @@
           </g>
           <text data-node-label="" data-detail-anchor="" x="735" y="130" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">agentdb-index</text>
         <text data-detail="context" x="735" y="146" class="t-muted" font-size="9" text-anchor="middle">BM25 + HNSW, in-process</text>
+        <text data-detail="fine" x="735" y="156" class="t-backend" font-size="7" text-anchor="middle">snapshot + delta replay</text>
         </g>
 
         <g id="node-persist" data-node-id="persist" data-node-label="KvStore" tabindex="0" role="button" aria-label="Focus KvStore, RocksDB / mem, Architecture component" aria-pressed="false" data-node-kind="database" data-node-sublabel="RocksDB / mem" data-node-tag="fsync on, group commit" data-node-context="Architecture component">
@@ -5195,9 +5196,9 @@
           <rect x="856.5" y="413" width="82" height="14" rx="3" class="c-mask"/>
           <text x="897.5" y="423" class="t-messagebus" font-size="8" text-anchor="middle">apply committed</text>
         </g>
-        <g data-detail="context" data-edge-from="api" data-edge-to="meta" data-edge-label="routing, admin tokens" data-edge-key="7" data-edge-id="api-to-meta">
-          <rect x="203.6" y="322" width="110.8" height="14" rx="3" class="c-mask"/>
-          <text x="259" y="332" class="t-messagebus" font-size="8" text-anchor="middle">routing, admin tokens</text>
+        <g data-detail="context" data-edge-from="api" data-edge-to="meta" data-edge-label="routing, tokens (admin/tenant)" data-edge-key="7" data-edge-id="api-to-meta">
+          <rect x="182" y="322" width="154" height="14" rx="3" class="c-mask"/>
+          <text x="259" y="332" class="t-messagebus" font-size="8" text-anchor="middle">routing, tokens (admin/tenant)</text>
         </g>
         <g data-detail="context" data-edge-from="sinks" data-edge-to="api" data-edge-label="exports/watch + ack" data-edge-key="8" data-edge-id="sinks-to-api">
           <rect x="366.4" y="360" width="101.2" height="14" rx="3" class="c-mask"/>
@@ -5433,6 +5434,7 @@
           <li>&bull; append mints seq under the global state lock</li>
           <li>&bull; one RocksDB WriteBatch: event + export ledger + idempotency</li>
           <li>&bull; memory state updated only after the durable write</li>
+          <li>&bull; auth: static root token or scoped bearer (admin / readonly / per-tenant), verify memoized in-process</li>
         </ul>
       </div>
 
@@ -5442,9 +5444,9 @@
           <h3>State model</h3>
         </div>
         <ul>
-          <li>&bull; authoritative state lives in RAM (25 BTreeMaps, one tokio Mutex)</li>
-          <li>&bull; KV store is a mirror; startup fully rehydrates and rebuilds indexes</li>
-          <li>&bull; WAL fsync on by default; backlog-aware group commit; SIGKILL-tested</li>
+          <li>&bull; KV is authoritative; RAM maps are a bounded cache (point-read fallback, eviction caps, lazy startup)</li>
+          <li>&bull; search indexes restore from watermark-keyed snapshots + delta replay (no full re-scan)</li>
+          <li>&bull; WAL fsync on by default; backlog-aware group commit; SIGKILL-tested (S14-S18)</li>
         </ul>
       </div>
 
