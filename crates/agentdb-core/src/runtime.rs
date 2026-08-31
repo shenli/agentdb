@@ -3480,14 +3480,244 @@ impl Runtime {
 
     /// Look up a tenant by id. Returns `TenantNotFound` if the id doesn't
     /// match a live (non-soft-deleted) tenant.
+    // ----- Cache-miss fallback (Stage 1 of KV-authoritative state) --------
+    //
+    // The in-memory `State` maps are a cache over the durable KV rows, not
+    // the authority. Public funnels call these `ensure_*_cached` helpers
+    // before taking the state lock, so a row evicted from (or never loaded
+    // into) the cache is transparently re-read from KV. The insert uses
+    // entry-or-insert semantics: a concurrent writer's newer in-memory row
+    // is never clobbered by the older row we read before racing it.
+    // Soft-deleted rows are cached too (tombstones) so liveness filters in
+    // the lock-holding code behave identically on hit and miss.
+
+    fn metadata_cache_miss_retryable(code: ErrorCode) -> bool {
+        matches!(
+            code,
+            ErrorCode::TenantNotFound
+                | ErrorCode::AgentNotFound
+                | ErrorCode::SessionNotFound
+                | ErrorCode::ArtifactNotFound
+        )
+    }
+
+    async fn ensure_tenant_cached(&self, tenant_id: &Id) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if s.tenants.contains_key(tenant_id.as_str()) {
+                return Ok(());
+            }
+        }
+        if let Some(row) = p.get_tenant_row(tenant_id.as_str()).map_err(internal)? {
+            let mut s = self.state.lock().await;
+            s.tenants
+                .entry(tenant_id.as_str().to_string())
+                .or_insert(row);
+        }
+        Ok(())
+    }
+
+    async fn ensure_agent_cached(&self, tenant_id: &Id, agent_id: &Id) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if s.agents.contains_key(agent_id.as_str()) {
+                return Ok(());
+            }
+        }
+        if let Some(row) = p
+            .get_agent_row(tenant_id.as_str(), agent_id.as_str())
+            .map_err(internal)?
+        {
+            let mut s = self.state.lock().await;
+            s.agents.entry(agent_id.as_str().to_string()).or_insert(row);
+        }
+        Ok(())
+    }
+
+    async fn ensure_session_cached(&self, tenant_id: &Id, session_id: &Id) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if s.sessions.contains_key(session_id.as_str()) {
+                return Ok(());
+            }
+        }
+        if let Some(mut row) = p
+            .get_session_row(tenant_id.as_str(), session_id.as_str())
+            .map_err(internal)?
+        {
+            // The durable session row's next_seq can lag the event rows (the
+            // append batch includes the session row only periodically); the
+            // events themselves are the sequence authority, so reconcile
+            // before publishing the row into the cache.
+            if let Some(max_seq) = p
+                .max_event_seq(tenant_id.as_str(), session_id.as_str())
+                .map_err(internal)?
+            {
+                let next = max_seq.saturating_add(1);
+                if next > row.next_seq {
+                    row.next_seq = next;
+                }
+            }
+            let mut s = self.state.lock().await;
+            s.sessions
+                .entry(session_id.as_str().to_string())
+                .or_insert(row);
+        }
+        Ok(())
+    }
+
+    async fn ensure_artifact_cached(&self, tenant_id: &Id, artifact_id: &Id) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if s.artifacts.contains_key(artifact_id.as_str()) {
+                return Ok(());
+            }
+        }
+        if let Some(row) = p
+            .get_artifact_row(tenant_id.as_str(), artifact_id.as_str())
+            .map_err(internal)?
+        {
+            let mut s = self.state.lock().await;
+            s.artifacts
+                .entry(artifact_id.as_str().to_string())
+                .or_insert(row);
+        }
+        Ok(())
+    }
+
+    async fn ensure_tenant_alias_cached(&self, external_key: &str) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        if external_key.is_empty() {
+            return Ok(());
+        }
+        {
+            let s = self.state.lock().await;
+            if s.tenant_aliases.contains_key(external_key) {
+                return Ok(());
+            }
+        }
+        if let Some(tenant_id) = p.get_tenant_alias_row(external_key).map_err(internal)? {
+            if let Ok(tenant_id) = Id::parse_kind(&tenant_id, crate::id::IdKind::Tenant) {
+                self.ensure_tenant_cached(&tenant_id).await?;
+            }
+            let mut s = self.state.lock().await;
+            s.tenant_aliases
+                .entry(external_key.to_string())
+                .or_insert(tenant_id);
+        }
+        Ok(())
+    }
+
+    async fn ensure_agent_alias_cached(&self, tenant_id: &Id, alias: &str) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        if alias.is_empty() {
+            return Ok(());
+        }
+        let key = scoped_alias_key(tenant_id.as_str(), alias);
+        {
+            let s = self.state.lock().await;
+            if s.agent_aliases.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        if let Some(agent_id) = p
+            .get_agent_alias_row(tenant_id.as_str(), alias)
+            .map_err(internal)?
+        {
+            if let Ok(agent_id) = Id::parse_kind(&agent_id, crate::id::IdKind::Agent) {
+                self.ensure_agent_cached(tenant_id, &agent_id).await?;
+            }
+            let mut s = self.state.lock().await;
+            s.agent_aliases.entry(key).or_insert(agent_id);
+        }
+        Ok(())
+    }
+
+    async fn ensure_session_alias_cached(&self, tenant_id: &Id, alias: &str) -> Result<()> {
+        let Some(p) = &self.persist else {
+            return Ok(());
+        };
+        if alias.is_empty() {
+            return Ok(());
+        }
+        let key = scoped_alias_key(tenant_id.as_str(), alias);
+        {
+            let s = self.state.lock().await;
+            if s.session_aliases.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        if let Some(session_id) = p
+            .get_session_alias_row(tenant_id.as_str(), alias)
+            .map_err(internal)?
+        {
+            if let Ok(session_id) = Id::parse_kind(&session_id, crate::id::IdKind::Session) {
+                self.ensure_session_cached(tenant_id, &session_id).await?;
+            }
+            let mut s = self.state.lock().await;
+            s.session_aliases.entry(key).or_insert(session_id);
+        }
+        Ok(())
+    }
+
+    /// Test-only: drop the metadata caches so the KV fallback path is
+    /// exercised. Meaningful only for persistent runtimes — an in-memory
+    /// runtime's maps ARE the store. Records, indexes, skills, and
+    /// tenant-meta stay cached (their fallback lands in Stage 2).
+    #[doc(hidden)]
+    pub async fn debug_evict_metadata_caches(&self) {
+        if self.persist.is_none() {
+            return;
+        }
+        let mut s = self.state.lock().await;
+        s.tenants.clear();
+        s.agents.clear();
+        s.sessions.clear();
+        s.artifacts.clear();
+        s.tenant_aliases.clear();
+        s.agent_aliases.clear();
+        s.session_aliases.clear();
+    }
+
     pub async fn get_tenant(&self, tenant_id: &Id) -> Result<Tenant> {
         self.refresh_replicated_state().await?;
-        let s = self.state.lock().await;
-        s.tenants
-            .get(tenant_id.as_str())
-            .filter(|t| t.deleted_at_ms.is_none())
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
+        // Bounded retry: an eviction can race between the ensure step and the
+        // cache read; re-running the ensure re-loads the row from KV. A
+        // genuine not-found simply fails all attempts with cheap point gets.
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(tenant_id).await?;
+            let result = {
+                let s = self.state.lock().await;
+                s.tenants
+                    .get(tenant_id.as_str())
+                    .filter(|t| t.deleted_at_ms.is_none())
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id))
+                    })
+            };
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
     }
 
     pub async fn list_tenants(&self) -> Vec<Tenant> {
@@ -3502,20 +3732,31 @@ impl Runtime {
     /// Look up an agent by id, scoped to the given tenant. Returns
     /// `AgentNotFound` if the id is unknown or belongs to a different tenant.
     pub async fn get_agent(&self, tenant_id: &Id, agent_id: &Id) -> Result<Agent> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        s.agents
-            .get(agent_id.as_str())
-            .filter(|a| {
-                tenant_live
-                    && a.deleted_at_ms.is_none()
-                    && a.tenant_id.as_str() == tenant_id.as_str()
-            })
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(tenant_id).await?;
+            self.ensure_agent_cached(tenant_id, agent_id).await?;
+            let result = {
+                let s = self.state.lock().await;
+                let tenant_live = s
+                    .tenants
+                    .get(tenant_id.as_str())
+                    .is_some_and(|t| t.deleted_at_ms.is_none());
+                s.agents
+                    .get(agent_id.as_str())
+                    .filter(|a| {
+                        tenant_live
+                            && a.deleted_at_ms.is_none()
+                            && a.tenant_id.as_str() == tenant_id.as_str()
+                    })
+                    .cloned()
+                    .ok_or_else(|| Error::new(ErrorCode::AgentNotFound, format!("{}", agent_id)))
+            };
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
     }
 
     pub async fn list_agents(&self, tenant_id: &Id) -> Result<Vec<Agent>> {
@@ -3617,20 +3858,33 @@ impl Runtime {
     /// Look up a session by id, scoped to the given tenant. Returns
     /// `SessionNotFound` if the id is unknown or belongs to a different tenant.
     pub async fn get_session(&self, tenant_id: &Id, session_id: &Id) -> Result<Session> {
-        let s = self.state.lock().await;
-        let tenant_live = s
-            .tenants
-            .get(tenant_id.as_str())
-            .is_some_and(|t| t.deleted_at_ms.is_none());
-        s.sessions
-            .get(session_id.as_str())
-            .filter(|sess| {
-                tenant_live
-                    && sess.deleted_at_ms.is_none()
-                    && sess.tenant_id.as_str() == tenant_id.as_str()
-            })
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorCode::SessionNotFound, format!("{}", session_id)))
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(tenant_id).await?;
+            self.ensure_session_cached(tenant_id, session_id).await?;
+            let result = {
+                let s = self.state.lock().await;
+                let tenant_live = s
+                    .tenants
+                    .get(tenant_id.as_str())
+                    .is_some_and(|t| t.deleted_at_ms.is_none());
+                s.sessions
+                    .get(session_id.as_str())
+                    .filter(|sess| {
+                        tenant_live
+                            && sess.deleted_at_ms.is_none()
+                            && sess.tenant_id.as_str() == tenant_id.as_str()
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::new(ErrorCode::SessionNotFound, format!("{}", session_id))
+                    })
+            };
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
     }
 
     pub async fn get_session_storage(
@@ -3708,6 +3962,8 @@ impl Runtime {
         session_id: &Id,
         target: Lifecycle,
     ) -> Result<SessionStorageSummary> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_session_cached(tenant_id, session_id).await?;
         let session_commit_lock = self.session_commit_lock(session_id);
         let _session_commit_guard = session_commit_lock.lock().await;
         match target {
@@ -3752,6 +4008,8 @@ impl Runtime {
         session_id: &Id,
         target: Lifecycle,
     ) -> Result<SessionStorageSummary> {
+        self.ensure_tenant_cached(tenant_id).await?;
+        self.ensure_session_cached(tenant_id, session_id).await?;
         let session_commit_lock = self.session_commit_lock(session_id);
         let _session_commit_guard = session_commit_lock.lock().await;
         if !matches!(target, Lifecycle::Warm | Lifecycle::Cold) {
@@ -4113,6 +4371,8 @@ impl Runtime {
     }
 
     pub async fn create_tenant_with_id(&self, tenant_id: Id, req: NewTenant) -> Result<Tenant> {
+        self.ensure_tenant_cached(&tenant_id).await?;
+        self.ensure_tenant_alias_cached(&req.external_key).await?;
         let t = {
             let mut s = self.state.lock().await;
             if s.tenants.contains_key(tenant_id.as_str()) {
@@ -4146,6 +4406,10 @@ impl Runtime {
     }
 
     pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        if let Some(alias) = req.alias.as_deref() {
+            self.ensure_agent_alias_cached(&req.tenant_id, alias).await?;
+        }
         self.refresh_replicated_state().await?;
         let a = {
             let mut s = self.state.lock().await;
@@ -4223,6 +4487,11 @@ impl Runtime {
         req: NewSession,
         session_id: Option<Id>,
     ) -> Result<Session> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
+        if let Some(alias) = req.alias.as_deref() {
+            self.ensure_session_alias_cached(&req.tenant_id, alias).await?;
+        }
         self.refresh_replicated_state().await?;
         let sess = {
             let mut s = self.state.lock().await;
@@ -4312,6 +4581,11 @@ impl Runtime {
     }
 
     pub async fn fork_session(&self, req: ForkSessionRequest) -> Result<Session> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        self.ensure_session_cached(&req.tenant_id, &req.session_id).await?;
+        if let Some(alias) = req.alias.as_deref() {
+            self.ensure_session_alias_cached(&req.tenant_id, alias).await?;
+        }
         let child = {
             let mut s = self.state.lock().await;
             let parent = s
@@ -4407,6 +4681,8 @@ impl Runtime {
     /// stored on the session and travels with it; AgentDB never holds the bytes.
     /// `at_seq` must be within the session's committed range (`<= next_seq`).
     pub async fn record_session_snapshot(&self, req: NewSnapshotRef) -> Result<SnapshotRef> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        self.ensure_session_cached(&req.tenant_id, &req.session_id).await?;
         if req.layers.is_empty() {
             return Err(Error::new(
                 ErrorCode::PolicyDenied,
@@ -5045,6 +5321,7 @@ impl Runtime {
     }
 
     pub async fn backpressure_for_tenant(&self, tenant_id: &Id) -> Result<BackpressureReport> {
+        self.ensure_tenant_cached(tenant_id).await?;
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -5323,6 +5600,7 @@ impl Runtime {
             }
             None => None,
         };
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         let policy = self.resolve_policy_for_tenant(&req.tenant_id).await?;
         // Reject oversized blobs before touching the content backend so a
         // misbehaving caller can't fill disk by streaming a huge body.
@@ -5619,6 +5897,19 @@ impl Runtime {
     /// agent/session lookups) so the caller in tenant A cannot probe
     /// tenant B's artifact ids by error-code differential.
     pub async fn get_artifact(&self, tenant_id: &Id, artifact_id: &Id) -> Result<Artifact> {
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(tenant_id).await?;
+            self.ensure_artifact_cached(tenant_id, artifact_id).await?;
+            let result = self.get_artifact_from_cache(tenant_id, artifact_id).await;
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    async fn get_artifact_from_cache(&self, tenant_id: &Id, artifact_id: &Id) -> Result<Artifact> {
         let s = self.state.lock().await;
         let tenant_live = s
             .tenants
@@ -6670,6 +6961,34 @@ impl Runtime {
     }
 
     async fn append_with_policy(
+        &self,
+        req: AppendRequest,
+        resolved_policy: Option<RuntimePolicy>,
+        fetch_recent: Option<usize>,
+        context_max_bytes: Option<usize>,
+    ) -> Result<AppendCommitResponse> {
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(&req.tenant_id).await?;
+            self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
+            self.ensure_session_cached(&req.tenant_id, &req.session_id)
+                .await?;
+            let result = self
+                .append_with_policy_attempt(
+                    req.clone(),
+                    resolved_policy.clone(),
+                    fetch_recent,
+                    context_max_bytes,
+                )
+                .await;
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    async fn append_with_policy_attempt(
         &self,
         req: AppendRequest,
         resolved_policy: Option<RuntimePolicy>,
@@ -7744,6 +8063,13 @@ impl Runtime {
     }
 
     pub async fn watch(&self, req: WatchRequest) -> Result<Vec<ChangefeedItem>> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
+        if let Some(session_id) = req.session_id.as_ref() {
+            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+        }
+        if let Some(agent_id) = req.agent_id.as_ref() {
+            self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
+        }
         let (session_ids, fork_edges): (Vec<Id>, Vec<ForkEdge>) = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -8739,6 +9065,20 @@ impl Runtime {
     /// committed seq.
     pub async fn fetch_from_seq(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         self.refresh_replicated_state().await?;
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(&req.tenant_id).await?;
+            self.ensure_session_cached(&req.tenant_id, &req.session_id)
+                .await?;
+            let result = self.fetch_from_seq_attempt(req.clone()).await;
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    async fn fetch_from_seq_attempt(&self, req: FetchRequest) -> Result<Vec<EventEnvelope>> {
         let (session, hot_in_memory) = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -8881,6 +9221,26 @@ impl Runtime {
             return Ok(Vec::new());
         }
         self.refresh_replicated_state().await?;
+        for attempt in 0..16 {
+            self.ensure_tenant_cached(&tenant_id).await?;
+            self.ensure_session_cached(&tenant_id, &session_id).await?;
+            let result = self
+                .fetch_recent_attempt(tenant_id.clone(), session_id.clone(), limit)
+                .await;
+            match result {
+                Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
+                result => return result,
+            }
+        }
+        unreachable!("bounded retry loop returns")
+    }
+
+    async fn fetch_recent_attempt(
+        &self,
+        tenant_id: Id,
+        session_id: Id,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>> {
         let (session, from_seq, hot_in_memory) = {
             let s = self.state.lock().await;
             let tenant_live = s
@@ -9448,6 +9808,7 @@ impl Runtime {
     }
 
     pub async fn upsert_record_with_commit(&self, req: NewRecord) -> Result<WriteRecordResult> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         let existing_id = if let Some(external_id) = req.external_id.as_deref() {
             let s = self.state.lock().await;
             s.record_external_ids
@@ -10065,6 +10426,7 @@ impl Runtime {
     /// Search the (tenant, namespace) scope and return records only. Call
     /// [`Runtime::search_record_matches`] when ranking/debug metadata is needed.
     pub async fn search_records(&self, req: SearchRequest) -> Result<Vec<SearchableRecord>> {
+        self.ensure_tenant_cached(&req.tenant_id).await?;
         Ok(self
             .search_record_matches(req)
             .await?
