@@ -68,6 +68,12 @@ impl HnswVectorIndex {
         Self::with_ef(DEFAULT_EF)
     }
 
+    /// The `ef` used by [`HnswVectorIndex::new`]; snapshot restores pass
+    /// this to stay behaviorally identical to a fresh index.
+    pub const fn default_ef() -> usize {
+        DEFAULT_EF
+    }
+
     pub fn with_ef(ef: usize) -> Self {
         Self {
             per_path: Mutex::new(HashMap::new()),

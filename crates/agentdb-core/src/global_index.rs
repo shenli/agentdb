@@ -61,6 +61,12 @@ pub trait GlobalRecordIndex: Send + Sync {
     fn reset(&self) -> Result<()> {
         Ok(())
     }
+    /// Serializable dump of the index, if the implementation supports it.
+    /// `None` (the default) means the runtime skips writing record-index
+    /// snapshots for this backend.
+    fn snapshot(&self) -> Option<GlobalIndexSnapshot> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -109,7 +115,79 @@ struct GlobalIndexEntry {
     terms: BTreeSet<String>,
 }
 
+/// Serializable snapshot of the in-memory global record index, captured
+/// alongside the local text/vector snapshots so a restart can restore the
+/// global view without a full record scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIndexSnapshot {
+    pub entries: Vec<GlobalIndexSnapshotEntry>,
+    pub tenant_watermark: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIndexSnapshotEntry {
+    pub tenant_id: String,
+    pub record_id: String,
+    pub namespace: Vec<String>,
+    pub placement_id: i64,
+    pub commit_seq: u64,
+    pub terms: Vec<String>,
+}
+
+impl InMemoryGlobalRecordIndex {
+    pub fn to_snapshot(&self) -> GlobalIndexSnapshot {
+        let inner = self.inner.lock().expect("global record index lock");
+        GlobalIndexSnapshot {
+            entries: inner
+                .records
+                .values()
+                .map(|entry| GlobalIndexSnapshotEntry {
+                    tenant_id: entry.tenant_id.clone(),
+                    record_id: entry.record_id.clone(),
+                    namespace: entry.namespace.clone(),
+                    placement_id: entry.placement_id,
+                    commit_seq: entry.commit_seq,
+                    terms: entry.terms.iter().cloned().collect(),
+                })
+                .collect(),
+            tenant_watermark: inner
+                .tenant_watermark
+                .iter()
+                .map(|(tenant, seq)| (tenant.clone(), *seq))
+                .collect(),
+        }
+    }
+
+    pub fn from_snapshot(snap: &GlobalIndexSnapshot) -> Self {
+        let mut state = InMemoryGlobalRecordIndexState::default();
+        for entry in &snap.entries {
+            let entry = GlobalIndexEntry {
+                tenant_id: entry.tenant_id.clone(),
+                record_id: entry.record_id.clone(),
+                namespace: entry.namespace.clone(),
+                placement_id: entry.placement_id,
+                commit_seq: entry.commit_seq,
+                terms: entry.terms.iter().cloned().collect(),
+            };
+            state
+                .scope_records
+                .entry((entry.tenant_id.clone(), entry.namespace.clone()))
+                .or_default()
+                .insert(entry.record_id.clone());
+            state.records.insert(entry.record_id.clone(), entry);
+        }
+        state.tenant_watermark = snap.tenant_watermark.iter().cloned().collect();
+        Self {
+            inner: Mutex::new(state),
+        }
+    }
+}
+
 impl GlobalRecordIndex for InMemoryGlobalRecordIndex {
+    fn snapshot(&self) -> Option<GlobalIndexSnapshot> {
+        Some(self.to_snapshot())
+    }
+
     fn reset(&self) -> Result<()> {
         *self.inner.lock().expect("global record index lock") =
             InMemoryGlobalRecordIndexState::default();

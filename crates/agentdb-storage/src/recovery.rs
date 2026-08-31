@@ -89,8 +89,7 @@ pub fn export_recovery_manifest(
         entry_count,
         payload_bytes,
     };
-    let mut out =
-        serde_json::to_string(&header).map_err(|err| Error::Other(err.to_string()))?;
+    let mut out = serde_json::to_string(&header).map_err(|err| Error::Other(err.to_string()))?;
     for line in lines {
         out.push('\n');
         out.push_str(&line);
@@ -287,8 +286,8 @@ mod tests {
         let bytes = export_recovery_manifest(src, None, 1, u64::MAX).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         let bumped = text.replacen("\"format_version\":1", "\"format_version\":999", 1);
-        let err = import_recovery_manifest(&InMemoryKvStore::default(), bumped.as_bytes())
-            .unwrap_err();
+        let err =
+            import_recovery_manifest(&InMemoryKvStore::default(), bumped.as_bytes()).unwrap_err();
         assert!(err.to_string().contains("format_version 999"));
     }
 

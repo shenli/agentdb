@@ -219,7 +219,10 @@ async fn local_listing_is_bounded_and_reaps_crash_left_temporary_files() {
     let listing = backend.list_objects(1).await.unwrap();
     assert_eq!(listing.objects.len(), 1);
     assert_eq!(listing.objects[0].artifact_id, "art_live");
-    assert!(temporary.exists(), "read-only listing must not delete temporaries");
+    assert!(
+        temporary.exists(),
+        "read-only listing must not delete temporaries"
+    );
 
     let removed = backend.sweep_temporary_objects(10).await.unwrap();
     assert_eq!(removed, 1);
@@ -483,7 +486,10 @@ async fn managed_cache_never_evicts_the_only_copy() {
         .with_local_cache_ttl_ms(0);
 
     // Written to the primary directly: the mirror never saw it.
-    primary.put("ten_a", "seg_only", b"unmirrored").await.unwrap();
+    primary
+        .put("ten_a", "seg_only", b"unmirrored")
+        .await
+        .unwrap();
 
     let report = backend
         .run_cache_sweep_once(now_wallclock_ms() + 10_000, 1_000)
@@ -586,7 +592,11 @@ async fn managed_cache_chaos_flaky_mirror_never_loses_data() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(backend.stats().backlog, 0, "mirror queue drained");
-    assert_eq!(backend.stats().failed, 0, "retries healed every flaky upload");
+    assert_eq!(
+        backend.stats().failed,
+        0,
+        "retries healed every flaky upload"
+    );
 
     let report = backend
         .run_cache_sweep_once(now_wallclock_ms() + 60_000, 10_000)

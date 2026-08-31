@@ -209,6 +209,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/recovery", get(get_recovery_status))
         .route("/api/admin/backups", post(create_admin_backup))
         .route("/api/admin/restores", post(validate_admin_restore))
+        .route("/api/me", get(get_me))
         .route("/api/storage/summary", get(get_fleet_storage_summary))
         .route("/api/tenants", get(list_tenants).post(create_tenant))
         .route(
@@ -408,6 +409,8 @@ struct MintAdminTokenBody {
     description: String,
     #[serde(default)]
     scope: admin_tokens::AdminScope,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -417,6 +420,8 @@ struct MintAdminTokenResponse {
     description: String,
     created_at_ms: i64,
     scope: admin_tokens::AdminScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
 }
 
 async fn mint_admin_token(
@@ -430,10 +435,45 @@ async fn mint_admin_token(
         ));
     }
     let meta = auth_meta_required(&s)?;
+    let tenant_id = match (body.scope, body.tenant_id.as_deref()) {
+        (admin_tokens::AdminScope::Tenant, Some(tenant_id)) => {
+            let tenant_id = tenant_id.trim();
+            if tenant_id.is_empty() || tenant_id.len() > 128 {
+                return Err(invalid_admin_request("tenant_id is malformed"));
+            }
+            // Bind only to tenants that exist so a typo cannot mint a
+            // credential that starts working when the id is later created.
+            let tid = parse_id_or(
+                tenant_id,
+                IdKind::Tenant,
+                agentdb_core::ErrorCode::TenantNotFound,
+            )?;
+            s.runtime.get_tenant(&tid).await?;
+            Some(tenant_id.to_string())
+        }
+        (admin_tokens::AdminScope::Tenant, None) => {
+            return Err(invalid_admin_request(
+                "tenant-scoped tokens require a tenant_id",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(invalid_admin_request(
+                "tenant_id is only valid with scope \"tenant\"",
+            ));
+        }
+        (_, None) => None,
+    };
     let now_ms = i64::try_from(current_ms()).unwrap_or(i64::MAX);
-    let minted = admin_tokens::mint(meta.pool(), description, body.scope, now_ms)
-        .await
-        .map_err(internal_error)?;
+    let minted = admin_tokens::mint_scoped(
+        meta.pool(),
+        description,
+        body.scope,
+        tenant_id.as_deref(),
+        now_ms,
+    )
+    .await
+    .map_err(internal_error)?;
+    s.auth_cache.invalidate();
     Ok((
         StatusCode::CREATED,
         Json(MintAdminTokenResponse {
@@ -442,8 +482,15 @@ async fn mint_admin_token(
             description: minted.summary.description,
             created_at_ms: minted.summary.created_at_ms,
             scope: minted.summary.scope,
+            tenant_id: minted.summary.tenant_id,
         }),
     ))
+}
+
+async fn get_me(
+    axum::Extension(principal): axum::Extension<crate::auth::ApiPrincipal>,
+) -> Json<crate::auth::ApiPrincipal> {
+    Json(principal)
 }
 
 async fn list_admin_tokens(
@@ -469,6 +516,7 @@ async fn revoke_admin_token(
     let revoked = admin_tokens::revoke(meta.pool(), &token_id, now_ms)
         .await
         .map_err(internal_error)?;
+    s.auth_cache.invalidate();
     Ok(Json(serde_json::json!({
         "token_id": token_id,
         "revoked": revoked

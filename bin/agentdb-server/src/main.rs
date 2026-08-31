@@ -477,10 +477,8 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     if let Some(content_mirror) = content_mirror {
         state = state.with_content_mirror(content_mirror.clone());
         if content_mirror.local_cache_ttl_ms().is_some() {
-            let sweep_interval =
-                Duration::from_millis(config.content_cache_sweep_interval_ms);
-            let list_limit =
-                env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
+            let sweep_interval = Duration::from_millis(config.content_cache_sweep_interval_ms);
+            let list_limit = env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
             tracing::info!(
                 interval_ms = config.content_cache_sweep_interval_ms,
                 ttl_ms = ?content_mirror.local_cache_ttl_ms(),
@@ -1628,8 +1626,6 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
-
-
 #[derive(Clone)]
 struct RaftSnapshotObjectStore {
     store: Arc<dyn ObjectStore>,
@@ -1768,11 +1764,8 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                 DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
             )
             .max(1);
-            let mut mirror_backend = agentdb_storage::AsyncMirrorContentBackend::new(
-                primary,
-                mirror,
-                queue_capacity,
-            );
+            let mut mirror_backend =
+                agentdb_storage::AsyncMirrorContentBackend::new(primary, mirror, queue_capacity);
             if let Some(ttl_ms) = config.content_local_cache_ttl_ms {
                 mirror_backend = mirror_backend.with_local_cache_ttl_ms(ttl_ms);
             }
@@ -1866,7 +1859,9 @@ fn resolve_recovery_config(
         anyhow::bail!("recovery.enabled=true requires storage.object_store");
     }
     if in_memory {
-        anyhow::bail!("recovery manifest backups require persistent storage, not in-memory/dev mode");
+        anyhow::bail!(
+            "recovery manifest backups require persistent storage, not in-memory/dev mode"
+        );
     }
     Ok(Some(ResolvedRecoveryConfig {
         interval_ms: file
@@ -2380,13 +2375,20 @@ fn check_writable_dir(label: &str, path: &PathBuf) -> bool {
 
 async fn restore_from_bucket(opts: RestoreFromBucketOpts) -> anyhow::Result<()> {
     let file = load_config(Some(&opts.config))?;
-    let data_dir = file.storage.data_dir.clone().unwrap_or_else(default_data_dir);
+    let data_dir = file
+        .storage
+        .data_dir
+        .clone()
+        .unwrap_or_else(default_data_dir);
     let object_store_cfg = resolve_object_store_config(
         file.storage.object_store.as_ref(),
         data_dir.join("object-store"),
     )?
     .ok_or_else(|| {
-        anyhow::anyhow!("restore-from-bucket requires storage.object_store in {}", opts.config.display())
+        anyhow::anyhow!(
+            "restore-from-bucket requires storage.object_store in {}",
+            opts.config.display()
+        )
     })?;
 
     let runtime_dir = data_dir.join("runtime");
@@ -2419,18 +2421,20 @@ async fn restore_from_bucket(opts: RestoreFromBucketOpts) -> anyhow::Result<()> 
 
     std::fs::create_dir_all(&runtime_dir)?;
     let kv = agentdb_storage::RocksKvStore::open(&runtime_dir)?;
-    let stats = tokio::task::spawn_blocking(move || {
-        agentdb_storage::import_recovery_manifest(&kv, &bytes)
-    })
-    .await?
-    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let stats =
+        tokio::task::spawn_blocking(move || agentdb_storage::import_recovery_manifest(&kv, &bytes))
+            .await?
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     println!(
         "restored {} entries ({} payload bytes) into {}",
         stats.entries,
         stats.payload_bytes,
         runtime_dir.display()
     );
-    println!("next: start the server normally (`agentdb serve --config {}`);", opts.config.display());
+    println!(
+        "next: start the server normally (`agentdb serve --config {}`);",
+        opts.config.display()
+    );
     println!("artifact content is fetched from the object-store mirror on first read.");
     Ok(())
 }
@@ -6139,11 +6143,19 @@ node_id = "node-a"
             cache_sweep_interval_ms: None,
         };
         assert_eq!(
-            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            resolve_content_cache_ttl(
+                &file,
+                ContentBackendKind::ObjectStore,
+                DeploymentMode::Cluster
+            ),
             Some(DEFAULT_CONTENT_CACHE_TTL_MS)
         );
         assert_eq!(
-            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::SingleNode),
+            resolve_content_cache_ttl(
+                &file,
+                ContentBackendKind::ObjectStore,
+                DeploymentMode::SingleNode
+            ),
             None
         );
         assert_eq!(
@@ -6156,7 +6168,11 @@ node_id = "node-a"
             cache_sweep_interval_ms: None,
         };
         assert_eq!(
-            resolve_content_cache_ttl(&disabled, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            resolve_content_cache_ttl(
+                &disabled,
+                ContentBackendKind::ObjectStore,
+                DeploymentMode::Cluster
+            ),
             None
         );
     }

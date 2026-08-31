@@ -169,6 +169,12 @@ const MIGRATIONS: &[(i64, &str, &str, &str)] = &[
         include_str!("../migrations/025_manual_tablet_movements.sql"),
         include_str!("../migrations/025_manual_tablet_movements.pg.sql"),
     ),
+    (
+        26,
+        "tenant-scoped bearer tokens",
+        include_str!("../migrations/026_admin_token_tenant_scope.sql"),
+        include_str!("../migrations/026_admin_token_tenant_scope.pg.sql"),
+    ),
 ];
 
 /// Apply all pending migrations to `pool`. `dialect` tells the

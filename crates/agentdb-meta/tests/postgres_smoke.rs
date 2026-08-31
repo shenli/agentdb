@@ -139,8 +139,8 @@ async fn pg_admin_token_roundtrip() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(v.0, minted.token_id);
-    assert_eq!(v.1, admin_tokens::AdminScope::Admin);
+    assert_eq!(v.token_id, minted.token_id);
+    assert_eq!(v.scope, admin_tokens::AdminScope::Admin);
 
     let active = admin_tokens::list_active(store.pool()).await.unwrap();
     assert_eq!(active.len(), 1);

@@ -901,7 +901,6 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn adaptive_write_loop(
     kv: Arc<dyn KvStore + Send + Sync>,
@@ -1052,6 +1051,17 @@ impl Persist {
             export_ledger_sequencer,
             adaptive_write_batcher,
         }
+    }
+
+    /// Drop the adaptive write batcher, reverting every write to a direct
+    /// per-caller KV write. Replicated runtimes call this at construction:
+    /// group commit exists to amortize the RocksDB WAL fsync, but replicated
+    /// tablets get their durability from the raft log, and funneling every
+    /// tablet's writes through the batcher's single writer thread lets one
+    /// stalled raft commit head-of-line-block the whole node (found by the
+    /// S8 real-cluster smoke).
+    pub(crate) fn disable_adaptive_write_batcher(&mut self) {
+        self.adaptive_write_batcher = None;
     }
 
     fn encrypt_metadata(
@@ -2214,6 +2224,27 @@ impl Persist {
         })?))
     }
 
+    pub fn get_record_row(
+        &self,
+        tenant_id: &str,
+        record_id: &str,
+    ) -> KvResult<Option<SearchableRecord>> {
+        self.get_json_row(record_key(tenant_id, record_id))
+    }
+
+    pub fn scan_tenant_records(&self, tenant_id: &str) -> KvResult<Vec<SearchableRecord>> {
+        let prefix = format!("record/searchable/{tenant_id}/");
+        let iter = self.kv.scan_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for res in iter {
+            let (_k, v) = res?;
+            out.push(serde_json::from_slice(&v).map_err(|err| {
+                agentdb_storage::Error::Other(format!("record row does not decode: {err}"))
+            })?);
+        }
+        Ok(out)
+    }
+
     pub fn get_tenant_alias_row(&self, external_key: &str) -> KvResult<Option<String>> {
         self.get_string_row(tenant_alias_key(external_key))
     }
@@ -2736,7 +2767,8 @@ impl Persist {
         Ok(out)
     }
 
-    pub fn scan_all_record_commit_seqs(&self) -> KvResult<Vec<(String, u64)>> {
+    /// Every persisted `(tenant_id, record_id, commit_seq)` triple.
+    pub fn scan_all_record_commit_seqs(&self) -> KvResult<Vec<(String, String, u64)>> {
         let prefix = b"record/searchable_commit/";
         let iter = self.kv.scan_prefix(prefix)?;
         let mut out = Vec::new();
@@ -2745,15 +2777,74 @@ impl Persist {
             let suffix =
                 std::str::from_utf8(&k[prefix.len()..]).expect("record_commit key suffix is utf8");
             let mut split = suffix.splitn(2, '/');
-            let _tenant_id = split.next().expect("tenant_id segment");
+            let tenant_id = split.next().expect("tenant_id segment").to_string();
             let record_id = split.next().expect("record_id segment").to_string();
             if v.len() == 8 {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&v);
-                out.push((record_id, u64::from_be_bytes(bytes)));
+                out.push((tenant_id, record_id, u64::from_be_bytes(bytes)));
             }
         }
         Ok(out)
+    }
+
+    /// Atomically replace the persisted record-index snapshot blob.
+    pub fn put_record_index_snapshot(&self, snapshot: &RecordIndexSnapshot) -> KvResult<()> {
+        self.write_ops(vec![WriteOp::Put {
+            key: RECORD_INDEX_SNAPSHOT_KEY.to_vec(),
+            value: serde_json::to_vec(snapshot).expect("record index snapshot serializes"),
+        }])
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn put_raw_record_index_snapshot_bytes(&self, bytes: &[u8]) -> KvResult<()> {
+        self.write_ops(vec![WriteOp::Put {
+            key: RECORD_INDEX_SNAPSHOT_KEY.to_vec(),
+            value: bytes.to_vec(),
+        }])
+    }
+
+    /// Load the persisted record-index snapshot, if any. Decode failures
+    /// (unknown format version included) return `Ok(None)` — a snapshot is
+    /// an accelerator, and startup falls back to the full-scan rebuild.
+    pub fn get_record_index_snapshot(&self) -> KvResult<Option<RecordIndexSnapshot>> {
+        let Some(bytes) = self.kv.get(RECORD_INDEX_SNAPSHOT_KEY)? else {
+            return Ok(None);
+        };
+        match serde_json::from_slice::<RecordIndexSnapshot>(&bytes) {
+            Ok(snapshot) if snapshot.format_version == RECORD_INDEX_SNAPSHOT_FORMAT_VERSION => {
+                Ok(Some(snapshot))
+            }
+            Ok(snapshot) => {
+                tracing::warn!(
+                    format_version = snapshot.format_version,
+                    "ignoring record index snapshot with unsupported format version"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                tracing::warn!(?error, "ignoring undecodable record index snapshot");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Delete drained outbox rows. Keys are regenerated from the mutations
+    /// (the key embeds tenant, commit_seq, record id).
+    pub fn delete_record_index_mutations(&self, mutations: &[RecordIndexMutation]) -> KvResult<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        self.write_ops(
+            mutations
+                .iter()
+                .map(|m| WriteOp::Delete {
+                    key: record_index_outbox_key(&m.tenant_id, m.commit_seq, &m.record_id)
+                        .into_bytes(),
+                })
+                .collect(),
+        )
     }
 
     pub fn scan_all_record_index_mutations(&self) -> KvResult<Vec<RecordIndexMutation>> {
@@ -2899,4 +2990,35 @@ mod export_ledger_sequence_tests {
             Some(10_u64.to_be_bytes().to_vec())
         );
     }
+}
+
+pub const RECORD_INDEX_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Key for the singleton record-index snapshot blob. Shares the
+/// `record/searchable` stem but not the `record/searchable/` prefix, so the
+/// record row scan never picks it up (same trick as the commit/outbox keys).
+const RECORD_INDEX_SNAPSHOT_KEY: &[u8] = b"record/searchable_index_snapshot";
+
+/// Point-in-time dump of every derived record-index structure, keyed by the
+/// local record-index watermark. Startup restores it and then delta-replays
+/// only the records whose commit sequence moved past `watermark`, instead of
+/// scanning and re-tokenizing every record. The snapshot is strictly an
+/// accelerator: any load failure falls back to the full rebuild.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RecordIndexSnapshot {
+    pub format_version: u32,
+    /// `local_record_index_watermark` at capture: every record with
+    /// `commit_seq <= watermark` is reflected in the structures below.
+    pub watermark: u64,
+    /// `global_record_index_watermark` at capture.
+    pub global_watermark: u64,
+    pub next_doc_seq: u64,
+    pub next_record_commit_seq: u64,
+    pub text: agentdb_index::TextSnapshot,
+    pub vector: agentdb_index::VectorSnapshot,
+    pub global: crate::global_index::GlobalIndexSnapshot,
+    /// `(doc.session_internal_id, doc.seq, record_id)` — the doc-id maps.
+    pub doc_to_record: Vec<(u64, u64, String)>,
+    /// external-id map: `record_external_key -> record_id`.
+    pub record_external_ids: Vec<(String, String)>,
 }

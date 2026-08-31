@@ -50,6 +50,10 @@ pub enum AdminScope {
     /// Read-only: only `GET` against `/api/admin/*`. Mutations
     /// (POST/PUT/DELETE) return 403.
     Readonly,
+    /// Data-plane access to exactly one tenant. The bound tenant id is
+    /// stored alongside the token; the API middleware rejects any request
+    /// outside `/api/tenants/{that_tenant}/...`.
+    Tenant,
 }
 
 impl AdminScope {
@@ -57,6 +61,7 @@ impl AdminScope {
         match self {
             AdminScope::Admin => "admin",
             AdminScope::Readonly => "readonly",
+            AdminScope::Tenant => "tenant",
         }
     }
 
@@ -67,6 +72,7 @@ impl AdminScope {
         match s {
             "admin" => AdminScope::Admin,
             "readonly" => AdminScope::Readonly,
+            "tenant" => AdminScope::Tenant,
             _ => AdminScope::Readonly,
         }
     }
@@ -78,6 +84,8 @@ pub struct TokenSummary {
     pub token_id: String,
     pub description: String,
     pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     pub revoked_at_ms: Option<i64>,
     #[serde(default)]
     pub scope: AdminScope,
@@ -104,6 +112,31 @@ pub async fn mint(
     scope: AdminScope,
     now_ms: i64,
 ) -> MetaResult<MintedToken> {
+    mint_scoped(pool, description, scope, None, now_ms).await
+}
+
+/// `mint` with an optional tenant binding: required for `Tenant` scope,
+/// rejected for the others.
+pub async fn mint_scoped(
+    pool: &AnyPool,
+    description: &str,
+    scope: AdminScope,
+    tenant_id: Option<&str>,
+    now_ms: i64,
+) -> MetaResult<MintedToken> {
+    match (scope, tenant_id) {
+        (AdminScope::Tenant, None) => {
+            return Err(crate::error::MetaError::Conflict(
+                "tenant-scoped tokens require a tenant_id".into(),
+            ))
+        }
+        (AdminScope::Admin | AdminScope::Readonly, Some(_)) => {
+            return Err(crate::error::MetaError::Conflict(
+                "tenant_id is only valid for tenant-scoped tokens".into(),
+            ))
+        }
+        _ => {}
+    }
     let mut raw = [0u8; TOKEN_BYTES];
     rand::thread_rng().fill_bytes(&mut raw);
     let plaintext = format!("{TOKEN_PREFIX}{}", B64URL.encode(raw));
@@ -114,14 +147,15 @@ pub async fn mint(
     let token_id = short_id(&hash_b64);
 
     sqlx::query(
-        "INSERT INTO admin_tokens (token_id, token_hash_b64, description, created_at_ms, revoked_at_ms, scope)
-             VALUES ($1, $2, $3, $4, NULL, $5)",
+        "INSERT INTO admin_tokens (token_id, token_hash_b64, description, created_at_ms, revoked_at_ms, scope, tenant_id)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6)",
     )
     .bind(&token_id)
     .bind(&hash_b64)
     .bind(description)
     .bind(now_ms)
     .bind(scope.as_str())
+    .bind(tenant_id)
     .execute(pool)
     .await?;
 
@@ -130,6 +164,7 @@ pub async fn mint(
             token_id: token_id.clone(),
             description: description.to_string(),
             created_at_ms: now_ms,
+            tenant_id: tenant_id.map(str::to_string),
             revoked_at_ms: None,
             scope,
         },
@@ -142,23 +177,46 @@ pub async fn mint(
 /// `Ok(Some(token_id))` when matched and `Ok(None)` when unknown or revoked.
 /// Tokens contain 256 random bits, so querying by their digest does not turn
 /// a low-entropy secret into an offline oracle and keeps request cost bounded.
-pub async fn verify(pool: &AnyPool, presented: &str) -> MetaResult<Option<(String, AdminScope)>> {
+/// A live (non-revoked) token matched by [`verify`].
+#[derive(Debug, Clone)]
+pub struct VerifiedToken {
+    pub token_id: String,
+    pub scope: AdminScope,
+    /// Bound tenant; always `Some` when `scope` is [`AdminScope::Tenant`].
+    pub tenant_id: Option<String>,
+}
+
+pub async fn verify(pool: &AnyPool, presented: &str) -> MetaResult<Option<VerifiedToken>> {
     let candidate = B64.encode(sha256(presented.as_bytes()));
-    let matched: Option<(String, String)> = sqlx::query_as(
-        "SELECT token_id, scope
+    let matched: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT token_id, scope, tenant_id
            FROM admin_tokens
           WHERE token_hash_b64 = $1 AND revoked_at_ms IS NULL",
     )
     .bind(candidate)
     .fetch_optional(pool)
     .await?;
-    Ok(matched.map(|(id, scope)| (id, AdminScope::from_stored(&scope))))
+    Ok(matched.and_then(|(token_id, scope, tenant_id)| {
+        let scope = AdminScope::from_stored(&scope);
+        // Fail closed: a tenant-scoped row without its binding must never
+        // authenticate as anything.
+        if scope == AdminScope::Tenant && tenant_id.is_none() {
+            return None;
+        }
+        Some(VerifiedToken {
+            token_id,
+            scope,
+            tenant_id,
+        })
+    }))
 }
+
+type ActiveTokenRow = (String, String, i64, Option<i64>, String, Option<String>);
 
 /// Every non-revoked token, ordered by `created_at_ms`.
 pub async fn list_active(pool: &AnyPool) -> MetaResult<Vec<TokenSummary>> {
-    let rows: Vec<(String, String, i64, Option<i64>, String)> = sqlx::query_as(
-        "SELECT token_id, description, created_at_ms, revoked_at_ms, scope
+    let rows: Vec<ActiveTokenRow> = sqlx::query_as(
+        "SELECT token_id, description, created_at_ms, revoked_at_ms, scope, tenant_id
            FROM admin_tokens
           WHERE revoked_at_ms IS NULL
           ORDER BY created_at_ms ASC, token_id ASC",
@@ -167,13 +225,16 @@ pub async fn list_active(pool: &AnyPool) -> MetaResult<Vec<TokenSummary>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, desc, created, revoked, scope)| TokenSummary {
-            token_id: id,
-            description: desc,
-            created_at_ms: created,
-            revoked_at_ms: revoked,
-            scope: AdminScope::from_stored(&scope),
-        })
+        .map(
+            |(id, desc, created, revoked, scope, tenant_id)| TokenSummary {
+                token_id: id,
+                description: desc,
+                created_at_ms: created,
+                tenant_id,
+                revoked_at_ms: revoked,
+                scope: AdminScope::from_stored(&scope),
+            },
+        )
         .collect())
 }
 
@@ -211,6 +272,13 @@ pub async fn count_all(pool: &AnyPool) -> MetaResult<i64> {
         .fetch_one(pool)
         .await?;
     Ok(n)
+}
+
+/// Stable cache key for a presented token: the same SHA-256/base64 form the
+/// database stores, so callers can memoize verify() results without holding
+/// plaintext credentials in memory.
+pub fn fingerprint(presented: &str) -> String {
+    B64.encode(sha256(presented.as_bytes()))
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -271,8 +339,9 @@ mod tests {
         let p = pool().await;
         let minted = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
         let found = verify(&p, &minted.plaintext).await.unwrap().unwrap();
-        assert_eq!(found.0, minted.token_id);
-        assert_eq!(found.1, AdminScope::Admin);
+        assert_eq!(found.token_id, minted.token_id);
+        assert_eq!(found.scope, AdminScope::Admin);
+        assert_eq!(found.tenant_id, None);
     }
 
     #[tokio::test]
@@ -282,7 +351,7 @@ mod tests {
         let found = verify(&p, "agentdb_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
             .await
             .unwrap();
-        assert_eq!(found, None);
+        assert!(found.is_none());
     }
 
     #[tokio::test]
@@ -291,7 +360,7 @@ mod tests {
         let minted = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
         assert!(revoke(&p, &minted.token_id, 200).await.unwrap());
         let found = verify(&p, &minted.plaintext).await.unwrap();
-        assert_eq!(found, None, "revoked tokens must not verify");
+        assert!(found.is_none(), "revoked tokens must not verify");
     }
 
     #[tokio::test]
@@ -351,8 +420,43 @@ mod tests {
         let a = mint(&p, "a", AdminScope::Admin, 20).await.unwrap();
         let v_r = verify(&p, &r.plaintext).await.unwrap().unwrap();
         let v_a = verify(&p, &a.plaintext).await.unwrap().unwrap();
-        assert_eq!(v_r.1, AdminScope::Readonly);
-        assert_eq!(v_a.1, AdminScope::Admin);
+        assert_eq!(v_r.scope, AdminScope::Readonly);
+        assert_eq!(v_a.scope, AdminScope::Admin);
+    }
+
+    #[tokio::test]
+    async fn tenant_scope_roundtrips_binding_and_validates_mint() {
+        let p = pool().await;
+        let minted = mint_scoped(&p, "workspace", AdminScope::Tenant, Some("t_1"), 100)
+            .await
+            .unwrap();
+        assert_eq!(minted.summary.tenant_id.as_deref(), Some("t_1"));
+        let found = verify(&p, &minted.plaintext).await.unwrap().unwrap();
+        assert_eq!(found.scope, AdminScope::Tenant);
+        assert_eq!(found.tenant_id.as_deref(), Some("t_1"));
+        let listed = list_active(&p).await.unwrap();
+        assert_eq!(listed[0].tenant_id.as_deref(), Some("t_1"));
+
+        assert!(mint_scoped(&p, "no binding", AdminScope::Tenant, None, 200)
+            .await
+            .is_err());
+        assert!(
+            mint_scoped(&p, "admin bound", AdminScope::Admin, Some("t_1"), 300)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_row_without_binding_never_verifies() {
+        let p = pool().await;
+        let minted = mint(&p, "alice", AdminScope::Admin, 100).await.unwrap();
+        // Simulate a corrupted or hand-edited row: tenant scope, no binding.
+        sqlx::query("UPDATE admin_tokens SET scope = 'tenant', tenant_id = NULL")
+            .execute(&p)
+            .await
+            .unwrap();
+        assert!(verify(&p, &minted.plaintext).await.unwrap().is_none());
     }
 
     #[test]

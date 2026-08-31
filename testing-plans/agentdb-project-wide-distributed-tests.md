@@ -631,6 +631,17 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   # 3. Oracle - run linearizability/contiguous-seq checker and readiness assertions.
   # TODO: analyze operation history and final replay dumps.
   ```
+- **2026-08-31 re-run finding:** first run since the durable-by-default
+  merge (#288) failed — every write stalled 60s ("raft-rs command did not
+  commit before timeout") and retries stalled behind them. Bisected on a
+  28-core box: pre-#288 passes, #288+ fails. Root cause: routing all writes
+  through the group-commit batcher's single writer thread let one slow raft
+  commit head-of-line-block every tablet. Fixed by disabling the batcher on
+  replicated runtimes (raft log provides durability there); S8 passes again.
+  Open follow-up: occasional >60s raft commits pre-date #288 (retries absorb
+  them) — the raft tick worker runs control-plane SQL before every tick, so
+  metadata-DB stalls can starve heartbeat-driven retransmission.
+
 
 ### Scenario S9: tablet_replacement_split_merge_preserves_state_idempotency_and_cursors
 
@@ -916,6 +927,31 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
   The in-process counterpart is `kv_authoritative_reads.rs` (eviction-chaos
   and zero-cap sweeper tests), which runs in the quick profile in both
   hydration modes.
+
+### Scenario S18: record_index_snapshots_survive_sigkill (implemented 2026-08-31)
+
+- **Falsifies if it FAILs:** the snapshot-restore claim — with record-index
+  snapshots written on nearly every worker tick
+  (`AGENTDB_RECORD_INDEX_SNAPSHOT_MIN_ADVANCE=1`, 100ms interval) while
+  mixed record traffic (upserts, updates, deletes) churns, and SIGKILL
+  landing at arbitrary points including mid-snapshot-write, a lazy restart
+  must restore the indexes from whatever snapshot generation survived and
+  delta-replay the rest: every acked upsert is text-searchable with at
+  least its acked generation, every acked delete stays gone, and
+  external-id dedupe holds (exactly one live record per external id).
+- **Technique:** real-binary chaos: 24-key external-id round-robin with a
+  delete every 6th op, per-op fsynced ack journal, journal replay as the
+  oracle, single committed-but-unacked in-flight op tolerated by
+  construction (sequential traffic ⇒ at most one ambiguous op).
+- **Target test file:** `ops/local-ci/tests/auto/S18_record_index_snapshots_survive_sigkill.sh`
+- **Status:** implemented, wired into nightly/release runner; passing
+  (~2,200 acked record ops per cycle across ~20 snapshot generations).
+  Found one real bug on its first run: `search_record_matches` (the public
+  funnel the HTTP API calls) skipped the tenant KV fallback, so the first
+  search after a cold lazy restart returned TENANT_NOT_FOUND. The
+  in-process counterpart is `record_index_snapshots.rs` (restore parity,
+  delta replay incl. purge scrub, corruption fallback, min-advance gate),
+  which runs in the quick profile in both hydration modes.
 
 ## 7b. Coverage adequacy argument
 

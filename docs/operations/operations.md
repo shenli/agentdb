@@ -94,23 +94,33 @@ agentdb doctor --config /etc/agentdb/agentdb.toml
 agentdb serve --config /etc/agentdb/agentdb.toml
 ```
 
-On a loopback bind, omitting the static token leaves the data API
-unauthenticated. The local admin API is also open for bootstrap until the first
-metadata-backed token is ever created; revoking all tokens does not reopen the
-bootstrap path. After that, its scope rules apply. Configure
-the static token even on loopback when other local users or workloads are not
-trusted.
+On a loopback bind, omitting the static token leaves the whole API open only
+until the first metadata-backed token is ever created; after that, every
+`/api/*` request needs a credential, and revoking all tokens does not reopen
+the bootstrap path. Configure the static token even on loopback when other
+local users or workloads are not trusted.
 
-Static API tokens are installation-wide, not tenant-scoped authorization.
-Terminate TLS before sending them over a network. Rotation accepts a current
-and a distinct previous token through `AGENTDB_API_AUTH_PREVIOUS_TOKEN`; the
+The static API token is the installation-wide root credential. Terminate TLS
+before sending any token over a network. Rotation accepts a current and a
+distinct previous token through `AGENTDB_API_AUTH_PREVIOUS_TOKEN`; the
 previous token follows the same visible-ASCII rule, is valid only while a
 current token is configured, and should be removed after every client has
-moved. Metadata-backed `admin` and `readonly`
-tokens can be minted at `/api/admin/tokens`; their hashes live in
-`<data_dir>/auth-meta.sqlite` on a persistent standalone node, which must be
-included in volume-level backups. Cluster nodes reuse the shared metadata
-store.
+moved.
+
+Metadata-backed tokens minted at `/api/admin/tokens` carry one of three
+scopes: `admin` (full access to the admin and data planes), `readonly`
+(GET/HEAD anywhere), and `tenant` (data-plane access bound to exactly one
+tenant — mint with `{"scope": "tenant", "tenant_id": "t_..."}` against an
+existing tenant). A tenant-scoped bearer can only reach
+`/api/tenants/{its_tenant}/...` plus `GET /api/me`; everything else returns
+403. `GET /api/me` reports the caller's scope and bound tenant, so an SDK can
+discover its workspace from the credential alone. Verification results are
+memoized in memory for `AGENTDB_AUTH_CACHE_TTL_MS` (default 60000; 0 disables
+caching); mint and revoke invalidate the local node's cache immediately, so on
+a multi-node deployment a revoked token can remain valid on other nodes for up
+to the TTL. Token hashes live in `<data_dir>/auth-meta.sqlite` on a persistent
+standalone node, which must be included in volume-level backups. Cluster nodes
+reuse the shared metadata store.
 
 The dashboard keeps a bearer token in page memory only. It deletes legacy
 stored tokens, never accepts a token from URL parameters, and strips `token`
