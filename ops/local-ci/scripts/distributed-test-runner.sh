@@ -12,9 +12,9 @@ usage() {
 Usage: ops/local-ci/scripts/distributed-test-runner.sh [OPTIONS]
 
 Runs the distributed test plan gates intended for li-dev:
-  quick    - authored Rust auto suites and Mongo wire tests
-  nightly  - quick + S11 fuzz smoke + S8 + S9 + S13 smoke
-  release  - quick + larger S11 fuzz + S8 + S9 + S13 release gate
+  quick    - authored Rust auto suites
+  nightly  - quick + S14-S16 crash/chaos + S8 + S9 + S13 smoke
+  release  - quick + S14-S16 crash/chaos + S8 + S9 + S13 release gate
 
 Options:
   --profile NAME     quick, nightly, or release. Defaults to nightly.
@@ -26,7 +26,6 @@ Environment:
   AGENTDB_DISTRIBUTED_RUN_ROOT   Defaults to $HOME/agentdb-distributed-test-runs.
   AGENTDB_DISTRIBUTED_BRANCH     Defaults to main.
   AGENTDB_DISTRIBUTED_SKIP_PULL  Set to 1 to skip git synchronization.
-  S11_FUZZ_RUNS                  Override fuzz run count.
 EOF
 }
 
@@ -198,21 +197,6 @@ run_stage() {
 run_quick() {
   run_stage core-auto cargo test -q -p agentdb-core --test auto
   run_stage api-auto cargo test -q -p agentdb-api --test auto
-  run_stage wire cargo test -q -p agentdb-wire
-  run_stage wire-fuzz-check cargo check --manifest-path crates/agentdb-wire/fuzz/Cargo.toml
-}
-
-run_s11_fuzz() {
-  local runs="${S11_FUZZ_RUNS:-250000}"
-  if [[ "$PROFILE" == "release" ]]; then
-    runs="${S11_FUZZ_RUNS:-5000000}"
-  fi
-  if ! cargo fuzz --help >/dev/null 2>&1; then
-    echo "cargo-fuzz is required; install with: cargo install cargo-fuzz --locked" >&2
-    exit 2
-  fi
-  run_stage s11-fuzz bash -lc \
-    "cd crates/agentdb-wire && cargo +nightly fuzz run S11_wire_sdk_adapter_and_config_boundaries -- -runs=$runs"
 }
 
 run_s8() {
@@ -251,10 +235,24 @@ run_s13() {
     bash tools/agentdb-bench/tests/auto/S13_benchmark_claims_remain_reproducible_under_skew_and_noisy_neighbors.sh
 }
 
+run_s14() {
+  run_stage s14-sigkill-durability bash ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh
+}
+
+run_s15() {
+  run_stage s15-lifecycle-chaos bash ops/local-ci/tests/auto/S15_lifecycle_transitions_survive_sigkill_chaos.sh
+}
+
+run_s16() {
+  run_stage s16-restore-drill bash ops/local-ci/tests/auto/S16_restore_from_bucket_drill_bounds_rpo.sh
+}
+
 run_quick
 
 if [[ "$PROFILE" == "nightly" || "$PROFILE" == "release" ]]; then
-  run_s11_fuzz
+  run_s14
+  run_s15
+  run_s16
   run_s8
   run_s9
   run_s13

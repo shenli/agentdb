@@ -26,7 +26,6 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_CONFIG_PATH: &str = "agentdb.toml";
 const SAMPLE_CONFIG: &str = include_str!("../../../config/agentdb.toml");
-const SLATEDB_RUNTIME_PREFIX: &str = "agentdb/runtime";
 const OBJECT_STORE_CONTENT_PREFIX: &str = "agentdb/content";
 const RAFT_SNAPSHOT_OBJECT_PREFIX: &str = "agentdb/raft-snapshots";
 const DEFAULT_CLUSTER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
@@ -88,6 +87,10 @@ enum Cmd {
     Doctor(DoctorOpts),
     /// Write a starter single-node config file.
     InitConfig(InitConfigOpts),
+    /// Rebuild an empty runtime data directory from the newest recovery
+    /// manifest in the configured object store.
+    #[command(name = "restore-from-bucket")]
+    RestoreFromBucket(RestoreFromBucketOpts),
 }
 
 #[derive(Parser, Debug)]
@@ -169,18 +172,6 @@ struct ServeOpts {
     #[arg(long)]
     route_proxy_max_response_bytes: Option<u64>,
 
-    /// Optional MongoDB wire-protocol compatibility listener, e.g. 127.0.0.1:7879.
-    #[arg(long)]
-    mongo_bind: Option<SocketAddr>,
-
-    /// Optional MongoDB PLAIN auth username. Requires `--mongo-password`.
-    #[arg(long)]
-    mongo_username: Option<String>,
-
-    /// Optional MongoDB PLAIN auth password. Requires `--mongo-username`.
-    #[arg(long)]
-    mongo_password: Option<String>,
-
     /// Shared secret for internal node-to-node APIs. Can also be set with
     /// AGENTDB_INTERNAL_AUTH_TOKEN.
     #[arg(long, env = "AGENTDB_INTERNAL_AUTH_TOKEN")]
@@ -210,14 +201,6 @@ struct DevOpts {
     /// `host:port` to bind. Defaults to `127.0.0.1:7878`.
     #[arg(long)]
     bind: Option<SocketAddr>,
-
-    /// MongoDB wire-protocol compatibility listener. Defaults to `127.0.0.1:7879`.
-    #[arg(long)]
-    mongo_bind: Option<SocketAddr>,
-
-    /// Disable the MongoDB compatibility listener.
-    #[arg(long)]
-    no_mongo: bool,
 
     /// Use persistent local storage instead of the default in-memory runtime.
     #[arg(long)]
@@ -289,6 +272,14 @@ struct InitConfigOpts {
     force: bool,
 }
 
+#[derive(Parser, Debug)]
+struct RestoreFromBucketOpts {
+    /// Path to the agentdb.toml describing the data directory and the
+    /// object store holding the recovery manifests.
+    #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -298,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Dev(opts) => dev(opts).await,
         Cmd::Doctor(opts) => doctor(opts),
         Cmd::InitConfig(opts) => init_config(opts),
+        Cmd::RestoreFromBucket(opts) => restore_from_bucket(opts).await,
     }
 }
 
@@ -360,6 +352,7 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             config.route_default_tablet_id
         );
     }
+    let mut recovery_kv: Option<Arc<dyn agentdb_storage::KvStore + Send + Sync>> = None;
     let (runtime, content_mirror) = if config.in_memory {
         tracing::info!("using in-memory runtime (state lost on shutdown)");
         (agentdb_core::Runtime::in_memory(), None)
@@ -371,19 +364,9 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 tracing::info!(path = %kv_path.display(), "opened RocksDB runtime backend");
                 Arc::new(agentdb_storage::RocksKvStore::open(&kv_path)?)
             }
-            KvBackendKind::SlateDb => {
-                let object_store = build_object_store(
-                    config
-                        .object_store
-                        .as_ref()
-                        .expect("slatedb requires object store config"),
-                )?;
-                let prefix = slate_runtime_prefix(&config);
-                tracing::info!(prefix = %prefix, "opened SlateDB runtime backend");
-                Arc::new(agentdb_storage::SlateKvStore::open(object_store, &prefix).await?)
-            }
         };
 
+        recovery_kv = Some(kv.clone());
         let (content, content_mirror) = build_content_backend(&config)?;
         if let Some(logs) = runtime_raft_logs {
             tracing::info!(
@@ -478,25 +461,6 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         print_dev_bootstrap(&runtime, &config, bootstrap).await?;
     }
 
-    if let Some(mongo_bind) = config.mongo_bind {
-        let mongo_listener = tokio::net::TcpListener::bind(mongo_bind).await?;
-        let mongo_runtime = runtime.clone();
-        let mongo_auth = config.mongo_auth();
-        tokio::spawn(async move {
-            if let Err(error) =
-                agentdb_wire::server::serve_with_auth(mongo_listener, mongo_runtime, mongo_auth)
-                    .await
-            {
-                tracing::error!(?error, "MongoDB compatibility listener stopped");
-            }
-        });
-        tracing::info!(
-            addr = %mongo_bind,
-            auth_enabled = config.mongo_auth_enabled(),
-            "MongoDB compatibility listener enabled"
-        );
-    }
-
     let mut state = agentdb_api::AppState::new(runtime.clone())
         .with_auth_meta(auth_meta)
         .with_proxy_policy(agentdb_api::state::ProxyPolicy {
@@ -511,7 +475,104 @@ async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         state = state.with_api_auth_previous_token(token);
     }
     if let Some(content_mirror) = content_mirror {
-        state = state.with_content_mirror(content_mirror);
+        state = state.with_content_mirror(content_mirror.clone());
+        if content_mirror.local_cache_ttl_ms().is_some() {
+            let sweep_interval =
+                Duration::from_millis(config.content_cache_sweep_interval_ms);
+            let list_limit =
+                env_usize("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000).max(1);
+            tracing::info!(
+                interval_ms = config.content_cache_sweep_interval_ms,
+                ttl_ms = ?content_mirror.local_cache_ttl_ms(),
+                "started content cache sweeper (cold content lives only in the object store)"
+            );
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(sweep_interval).await;
+                    match content_mirror
+                        .run_cache_sweep_once(now_ms_i64(), list_limit)
+                        .await
+                    {
+                        Ok(report) if report.evicted > 0 => {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                evicted = report.evicted,
+                                retained_unmirrored = report.retained_unmirrored,
+                                "content cache sweep evicted cold local copies"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(?error, "content cache sweep failed");
+                        }
+                    }
+                }
+            });
+        }
+    }
+    if let (Some(recovery_cfg), Some(kv), Some(object_store_cfg)) = (
+        config.recovery_manifest_backup,
+        recovery_kv.clone(),
+        config.object_store.as_ref(),
+    ) {
+        let store = build_object_store(object_store_cfg)?;
+        let recovery_store =
+            agentdb_storage::RecoveryObjectStore::new(store, RECOVERY_OBJECT_PREFIX);
+        let status = Arc::new(agentdb_api::state::RecoveryBackupStatus::new(
+            recovery_store.latest_uri(),
+            recovery_cfg.interval_ms,
+        ));
+        state = state.with_recovery_backup(status.clone());
+        let node_id = config.route_node_id.clone();
+        let interval = Duration::from_millis(recovery_cfg.interval_ms);
+        let max_bytes = recovery_cfg.max_bytes;
+        tracing::info!(
+            interval_ms = recovery_cfg.interval_ms,
+            destination = %recovery_store.latest_uri(),
+            "started recovery manifest backup worker"
+        );
+        tokio::spawn(async move {
+            loop {
+                let now_ms = now_ms_i64();
+                let kv_for_export = kv.clone();
+                let node = node_id.clone();
+                let exported = tokio::task::spawn_blocking(move || {
+                    agentdb_storage::export_recovery_manifest(
+                        kv_for_export,
+                        node.as_deref(),
+                        now_ms,
+                        max_bytes,
+                    )
+                })
+                .await;
+                match exported {
+                    Ok(Ok(bytes)) => {
+                        let header = agentdb_storage::read_recovery_manifest_header(&bytes).ok();
+                        match recovery_store.put_latest(&bytes, now_ms).await {
+                            Ok(_) => {
+                                let (entries, payload) = header
+                                    .map(|h| (h.entry_count, h.payload_bytes))
+                                    .unwrap_or((0, 0));
+                                status.record_success(now_ms, entries, payload);
+                            }
+                            Err(error) => {
+                                tracing::warn!(?error, "recovery manifest upload failed");
+                                status.record_failure(now_ms, error.to_string());
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(?error, "recovery manifest export failed");
+                        status.record_failure(now_ms, error.to_string());
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "recovery manifest export task panicked");
+                        status.record_failure(now_ms, error.to_string());
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
     if let Some(token) = config.internal_auth_token.clone() {
         state = state.with_internal_auth_token(token);
@@ -731,14 +792,6 @@ async fn dev(opts: DevOpts) -> anyhow::Result<()> {
 }
 
 fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
-    let mongo_bind = if opts.no_mongo {
-        None
-    } else {
-        Some(
-            opts.mongo_bind
-                .unwrap_or_else(|| "127.0.0.1:7879".parse().expect("default mongo bind parses")),
-        )
-    };
     ServeOpts {
         config: None,
         bind: opts.bind,
@@ -756,9 +809,6 @@ fn serve_opts_from_dev_opts(opts: DevOpts) -> ServeOpts {
         route_refresh_interval_ms: None,
         route_proxy_timeout_ms: None,
         route_proxy_max_response_bytes: None,
-        mongo_bind,
-        mongo_username: None,
-        mongo_password: None,
         internal_auth_token: None,
         internal_auth_previous_token: None,
         api_auth_token: None,
@@ -801,13 +851,13 @@ struct ResolvedServeConfig {
     route_refresh_interval_ms: u64,
     route_proxy_timeout_ms: u64,
     route_proxy_max_response_bytes: u64,
-    mongo_bind: Option<SocketAddr>,
-    mongo_username: Option<String>,
-    mongo_password: Option<String>,
     internal_auth_token: Option<String>,
     internal_auth_previous_token: Option<String>,
     api_auth_token: Option<String>,
     api_auth_previous_token: Option<String>,
+    recovery_manifest_backup: Option<ResolvedRecoveryConfig>,
+    content_local_cache_ttl_ms: Option<u64>,
+    content_cache_sweep_interval_ms: u64,
 }
 
 struct RouteStartup {
@@ -822,19 +872,6 @@ struct RaftRsRegistryBootstrap {
     tablet_ids: Vec<i64>,
     bootstrapped_tablet_ids: Vec<i64>,
     local_logs: BTreeMap<i64, Arc<agentdb_storage::RaftRsReplicatedLog>>,
-}
-
-impl ResolvedServeConfig {
-    fn mongo_auth(&self) -> Option<agentdb_wire::server::AuthConfig> {
-        Some(agentdb_wire::server::AuthConfig {
-            username: self.mongo_username.clone()?,
-            password: self.mongo_password.clone()?,
-        })
-    }
-
-    fn mongo_auth_enabled(&self) -> bool {
-        self.mongo_username.is_some() && self.mongo_password.is_some()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,7 +1006,6 @@ enum DeploymentMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KvBackendKind {
     RocksDb,
-    SlateDb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1074,15 +1110,16 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
-        let mongo_username = opts
-            .mongo_username
-            .or(file.mongodb.username)
-            .or_else(|| std::env::var("AGENTDB_MONGODB_USERNAME").ok());
-        let mongo_password = opts
-            .mongo_password
-            .or(file.mongodb.password)
-            .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
-        validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let recovery_manifest_backup =
+            resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
+        let content_local_cache_ttl_ms =
+            resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+        let content_cache_sweep_interval_ms = file
+            .storage
+            .content
+            .cache_sweep_interval_ms
+            .unwrap_or(DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS)
+            .max(1_000);
         let internal_auth_token = opts
             .internal_auth_token
             .or(file.server.internal_auth_token)
@@ -1155,13 +1192,13 @@ impl ResolvedServeConfig {
                 .route_proxy_max_response_bytes
                 .or(file.routing.proxy_max_response_bytes)
                 .unwrap_or(16 * 1024 * 1024),
-            mongo_bind: opts.mongo_bind.or(file.mongodb.bind),
-            mongo_username,
-            mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
             api_auth_token,
             api_auth_previous_token,
+            recovery_manifest_backup,
+            content_local_cache_ttl_ms,
+            content_cache_sweep_interval_ms,
         })
     }
 
@@ -1229,15 +1266,16 @@ impl ResolvedServeConfig {
             in_memory,
             route_node_id.as_deref(),
         )?;
-        let mongo_username = file
-            .mongodb
-            .username
-            .or_else(|| std::env::var("AGENTDB_MONGODB_USERNAME").ok());
-        let mongo_password = file
-            .mongodb
-            .password
-            .or_else(|| std::env::var("AGENTDB_MONGODB_PASSWORD").ok());
-        validate_mongo_auth(&mongo_username, &mongo_password)?;
+        let recovery_manifest_backup =
+            resolve_recovery_config(&file.recovery, object_store.is_some(), in_memory)?;
+        let content_local_cache_ttl_ms =
+            resolve_content_cache_ttl(&file.storage.content, content_backend, deployment_mode);
+        let content_cache_sweep_interval_ms = file
+            .storage
+            .content
+            .cache_sweep_interval_ms
+            .unwrap_or(DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS)
+            .max(1_000);
         let internal_auth_token = file
             .server
             .internal_auth_token
@@ -1302,13 +1340,13 @@ impl ResolvedServeConfig {
                 .routing
                 .proxy_max_response_bytes
                 .unwrap_or(16 * 1024 * 1024),
-            mongo_bind: file.mongodb.bind,
-            mongo_username,
-            mongo_password,
             internal_auth_token,
             internal_auth_previous_token,
             api_auth_token,
             api_auth_previous_token,
+            recovery_manifest_backup,
+            content_local_cache_ttl_ms,
+            content_cache_sweep_interval_ms,
         })
     }
 }
@@ -1325,7 +1363,7 @@ struct FileConfig {
     #[serde(default)]
     routing: RoutingFileConfig,
     #[serde(default)]
-    mongodb: MongoDbFileConfig,
+    recovery: RecoveryFileConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1383,6 +1421,12 @@ struct TabletStoreFileConfig {
 #[serde(deny_unknown_fields)]
 struct ContentFileConfig {
     backend: Option<String>,
+    /// Managed-cache TTL for the local content copy in mirror mode. Local
+    /// objects unread for this long whose object-store copy exists are
+    /// evicted (cold data then lives only in the object store). Defaults to
+    /// 24h in mirror mode; 0 disables eviction.
+    local_cache_ttl_ms: Option<u64>,
+    cache_sweep_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1410,29 +1454,6 @@ struct RoutingFileConfig {
     refresh_interval_ms: Option<u64>,
     proxy_timeout_ms: Option<u64>,
     proxy_max_response_bytes: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MongoDbFileConfig {
-    bind: Option<SocketAddr>,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-fn validate_mongo_auth(username: &Option<String>, password: &Option<String>) -> anyhow::Result<()> {
-    match (username, password) {
-        (Some(username), Some(password)) if username.is_empty() || password.is_empty() => {
-            anyhow::bail!("mongodb username/password must not be empty")
-        }
-        (Some(_), Some(_)) | (None, None) => Ok(()),
-        (Some(_), None) => anyhow::bail!(
-            "mongodb username requires a password; set --mongo-password or AGENTDB_MONGODB_PASSWORD"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "mongodb password requires a username; set --mongo-username or AGENTDB_MONGODB_USERNAME"
-        ),
-    }
 }
 
 fn validate_internal_auth_token(
@@ -1520,7 +1541,6 @@ fn validate_api_auth_tokens(
 fn resolve_kv_backend(cfg: &KvFileConfig) -> anyhow::Result<KvBackendKind> {
     match cfg.backend.as_deref().unwrap_or("rocksdb") {
         "rocksdb" => Ok(KvBackendKind::RocksDb),
-        "slatedb" => Ok(KvBackendKind::SlateDb),
         other => anyhow::bail!("unknown storage.kv.backend: {other}"),
     }
 }
@@ -1608,28 +1628,7 @@ fn build_object_store(config: &ResolvedObjectStoreConfig) -> anyhow::Result<Arc<
     }
 }
 
-fn slate_runtime_prefix(config: &ResolvedServeConfig) -> String {
-    if matches!(config.deployment_mode, DeploymentMode::Cluster) {
-        if let Some(node_id) = config.route_node_id.as_deref() {
-            return format!(
-                "{SLATEDB_RUNTIME_PREFIX}/nodes/{}",
-                object_path_component(node_id)
-            );
-        }
-    }
-    SLATEDB_RUNTIME_PREFIX.to_string()
-}
 
-fn object_path_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
 
 #[derive(Clone)]
 struct RaftSnapshotObjectStore {
@@ -1769,15 +1768,20 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
                 DEFAULT_CONTENT_MIRROR_QUEUE_CAPACITY,
             )
             .max(1);
-            let backend = Arc::new(agentdb_storage::AsyncMirrorContentBackend::new(
+            let mut mirror_backend = agentdb_storage::AsyncMirrorContentBackend::new(
                 primary,
                 mirror,
                 queue_capacity,
-            ));
+            );
+            if let Some(ttl_ms) = config.content_local_cache_ttl_ms {
+                mirror_backend = mirror_backend.with_local_cache_ttl_ms(ttl_ms);
+            }
+            let backend = Arc::new(mirror_backend);
             tracing::info!(
                 primary_path = %content_dir.display(),
                 mirror_prefix = %OBJECT_STORE_CONTENT_PREFIX,
                 queue_capacity,
+                local_cache_ttl_ms = ?config.content_local_cache_ttl_ms,
                 "opened async mirrored artifact content backend"
             );
             Ok((backend.clone(), Some(backend)))
@@ -1801,17 +1805,89 @@ fn build_content_backend(config: &ResolvedServeConfig) -> anyhow::Result<Content
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryFileConfig {
+    /// Enable periodic recovery-manifest backups to the object store.
+    /// Defaults to on when an object store is configured and the server is
+    /// persistent; set `false` to opt out explicitly.
+    enabled: Option<bool>,
+    manifest_backup_interval_ms: Option<u64>,
+    manifest_max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRecoveryConfig {
+    interval_ms: u64,
+    max_bytes: u64,
+}
+
+const DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS: u64 = 300_000;
+const DEFAULT_RECOVERY_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const RECOVERY_OBJECT_PREFIX: &str = "agentdb";
+const DEFAULT_CONTENT_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_CONTENT_CACHE_SWEEP_INTERVAL_MS: u64 = 300_000;
+
+/// Mirror mode defaults to a managed local cache (cold content only in the
+/// object store); `local_cache_ttl_ms = 0` opts out. Non-mirror content
+/// backends have no cache to manage.
+fn resolve_content_cache_ttl(
+    file: &ContentFileConfig,
+    content_backend: ContentBackendKind,
+    deployment_mode: DeploymentMode,
+) -> Option<u64> {
+    // Mirror mode (LocalFs primary + async object-store mirror) exists only
+    // for cluster deployments with an object-store content backend; the
+    // other shapes have no local cache to manage.
+    let mirror_mode = matches!(content_backend, ContentBackendKind::ObjectStore)
+        && matches!(deployment_mode, DeploymentMode::Cluster);
+    if !mirror_mode {
+        return None;
+    }
+    match file.local_cache_ttl_ms {
+        Some(0) => None,
+        Some(ttl) => Some(ttl.max(1_000)),
+        None => Some(DEFAULT_CONTENT_CACHE_TTL_MS),
+    }
+}
+
+fn resolve_recovery_config(
+    file: &RecoveryFileConfig,
+    object_store_configured: bool,
+    in_memory: bool,
+) -> anyhow::Result<Option<ResolvedRecoveryConfig>> {
+    let enabled = file
+        .enabled
+        .unwrap_or(object_store_configured && !in_memory);
+    if !enabled {
+        return Ok(None);
+    }
+    if !object_store_configured {
+        anyhow::bail!("recovery.enabled=true requires storage.object_store");
+    }
+    if in_memory {
+        anyhow::bail!("recovery manifest backups require persistent storage, not in-memory/dev mode");
+    }
+    Ok(Some(ResolvedRecoveryConfig {
+        interval_ms: file
+            .manifest_backup_interval_ms
+            .unwrap_or(DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS)
+            .max(1_000),
+        max_bytes: file
+            .manifest_max_bytes
+            .unwrap_or(DEFAULT_RECOVERY_MANIFEST_MAX_BYTES)
+            .max(1024),
+    }))
+}
+
 fn validate_storage_backend_config(
     deployment_mode: DeploymentMode,
-    kv_backend: KvBackendKind,
+    _kv_backend: KvBackendKind,
     content_backend: ContentBackendKind,
     object_store: Option<&ResolvedObjectStoreConfig>,
     in_memory: bool,
     route_node_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    if matches!(kv_backend, KvBackendKind::SlateDb) && object_store.is_none() {
-        anyhow::bail!("storage.kv.backend=slatedb requires storage.object_store");
-    }
     if matches!(content_backend, ContentBackendKind::ObjectStore) && object_store.is_none() {
         anyhow::bail!("storage.content.backend=object_store requires storage.object_store");
     }
@@ -1897,17 +1973,6 @@ fn print_startup_banner(config: &ResolvedServeConfig) {
             "loopback bootstrap (data API has no static bearer token)"
         }
     );
-    if let Some(mongo_bind) = config.mongo_bind {
-        println!("  mongodb:   mongodb://{mongo_bind}/");
-        println!(
-            "  mongo auth: {}",
-            if config.mongo_auth_enabled() {
-                "PLAIN username/password"
-            } else {
-                "disabled"
-            }
-        );
-    }
     println!(
         "  internal raft rpc: {}",
         if config.internal_auth_token.is_some() {
@@ -1940,13 +2005,6 @@ async fn print_dev_bootstrap(
     println!(
         "  python:    AGENTDB_URL=http://{} AGENTDB_WORKSPACE={} python3 examples/agents/python/openai_agents_quickstart.py",
         config.bind, bootstrap.workspace
-    );
-    println!(
-        "  mongodb:   mongosh \"mongodb://{}/?directConnection=true\"",
-        config
-            .mongo_bind
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "<disabled>".into())
     );
     println!("  doctor:    agentdb doctor --dev --dev-tools");
     println!("  local CI:  ops/local-ci/scripts/local-ci-status.sh --logs");
@@ -2068,10 +2126,6 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
             KvBackendKind::RocksDb => {
                 failed |= !check_writable_dir("runtime dir", &config.data_dir.join("runtime"));
             }
-            KvBackendKind::SlateDb => {
-                failed |=
-                    !check_object_store_config("shared object store", config.object_store.as_ref());
-            }
         }
         match config.content_backend {
             ContentBackendKind::LocalFs => {
@@ -2092,19 +2146,6 @@ fn doctor(opts: DoctorOpts) -> anyhow::Result<()> {
         Err(error) => {
             failed = true;
             println!("  error: cannot bind {}: {error}", config.bind);
-        }
-    }
-
-    if let Some(mongo_bind) = config.mongo_bind {
-        match std::net::TcpListener::bind(mongo_bind) {
-            Ok(listener) => {
-                drop(listener);
-                println!("  ok: mongodb bind address is available ({mongo_bind})");
-            }
-            Err(error) => {
-                failed = true;
-                println!("  error: cannot bind mongodb listener {mongo_bind}: {error}");
-            }
         }
     }
 
@@ -2244,14 +2285,6 @@ fn deployment_support_note(config: &ResolvedServeConfig) -> Option<&'static str>
         config.content_backend,
         config.object_store.as_ref().map(|cfg| cfg.backend),
     ) {
-        (
-            DeploymentMode::SingleNode,
-            KvBackendKind::SlateDb,
-            ContentBackendKind::ObjectStore,
-            Some(ObjectStoreBackendKind::S3),
-        ) => Some(
-            "single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment",
-        ),
         (DeploymentMode::Cluster, ..) => Some(
             "cluster mode is forward-looking; operator APIs and automation are still incomplete",
         ),
@@ -2262,12 +2295,6 @@ fn deployment_support_note(config: &ResolvedServeConfig) -> Option<&'static str>
 fn describe_kv_backend(config: &ResolvedServeConfig) -> String {
     match config.kv_backend {
         KvBackendKind::RocksDb => "rocksdb".into(),
-        KvBackendKind::SlateDb => {
-            format!(
-                "slatedb@{}",
-                describe_object_store(config.object_store.as_ref())
-            )
-        }
     }
 }
 
@@ -2349,6 +2376,63 @@ fn check_writable_dir(label: &str, path: &PathBuf) -> bool {
             false
         }
     }
+}
+
+async fn restore_from_bucket(opts: RestoreFromBucketOpts) -> anyhow::Result<()> {
+    let file = load_config(Some(&opts.config))?;
+    let data_dir = file.storage.data_dir.clone().unwrap_or_else(default_data_dir);
+    let object_store_cfg = resolve_object_store_config(
+        file.storage.object_store.as_ref(),
+        data_dir.join("object-store"),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("restore-from-bucket requires storage.object_store in {}", opts.config.display())
+    })?;
+
+    let runtime_dir = data_dir.join("runtime");
+    if runtime_dir.exists()
+        && std::fs::read_dir(&runtime_dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true)
+    {
+        anyhow::bail!(
+            "refusing to restore into existing runtime directory {}; move it aside first",
+            runtime_dir.display()
+        );
+    }
+
+    let store = build_object_store(&object_store_cfg)?;
+    let recovery_store = agentdb_storage::RecoveryObjectStore::new(store, RECOVERY_OBJECT_PREFIX);
+    println!("fetching {}", recovery_store.latest_uri());
+    let bytes = recovery_store.get_latest().await?;
+    let header = agentdb_storage::read_recovery_manifest_header(&bytes)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let age_ms = (now_ms_i64() - header.created_at_ms).max(0);
+    println!(
+        "manifest: created_at_ms={} (age {:.1} min), node_id={}, entries={}, payload_bytes={}",
+        header.created_at_ms,
+        age_ms as f64 / 60_000.0,
+        header.node_id.as_deref().unwrap_or("<none>"),
+        header.entry_count,
+        header.payload_bytes,
+    );
+
+    std::fs::create_dir_all(&runtime_dir)?;
+    let kv = agentdb_storage::RocksKvStore::open(&runtime_dir)?;
+    let stats = tokio::task::spawn_blocking(move || {
+        agentdb_storage::import_recovery_manifest(&kv, &bytes)
+    })
+    .await?
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    println!(
+        "restored {} entries ({} payload bytes) into {}",
+        stats.entries,
+        stats.payload_bytes,
+        runtime_dir.display()
+    );
+    println!("next: start the server normally (`agentdb serve --config {}`);", opts.config.display());
+    println!("artifact content is fetched from the object-store mirror on first read.");
+    Ok(())
 }
 
 fn init_config(opts: InitConfigOpts) -> anyhow::Result<()> {
@@ -5673,9 +5757,6 @@ mod tests {
             route_refresh_interval_ms: None,
             route_proxy_timeout_ms: None,
             route_proxy_max_response_bytes: None,
-            mongo_bind: None,
-            mongo_username: None,
-            mongo_password: None,
             internal_auth_token: None,
             internal_auth_previous_token: None,
             api_auth_token: None,
@@ -5795,11 +5876,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_command_defaults_enable_mongo_and_bootstrap_workspace() {
+    fn dev_command_defaults_bootstrap_workspace() {
         let opts = serve_opts_from_dev_opts(DevOpts {
             bind: None,
-            mongo_bind: None,
-            no_mongo: false,
             persistent: false,
             data_dir: None,
             workspace: "dev".into(),
@@ -5809,7 +5888,6 @@ mod tests {
 
         assert!(opts.dev);
         assert!(opts.in_memory);
-        assert_eq!(opts.mongo_bind, Some("127.0.0.1:7879".parse().unwrap()));
         let bootstrap = opts.dev_bootstrap.unwrap();
         assert_eq!(bootstrap.workspace, "dev");
         assert_eq!(bootstrap.agent, "demo-agent");
@@ -5817,11 +5895,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_command_persistent_mode_uses_data_dir_and_can_disable_mongo() {
+    fn dev_command_persistent_mode_uses_data_dir() {
         let opts = serve_opts_from_dev_opts(DevOpts {
             bind: Some("127.0.0.1:9000".parse().unwrap()),
-            mongo_bind: None,
-            no_mongo: true,
             persistent: true,
             data_dir: Some(PathBuf::from("/tmp/agentdb-dev")),
             workspace: "workspace".into(),
@@ -5833,7 +5909,6 @@ mod tests {
         assert!(!opts.dev);
         assert!(!opts.in_memory);
         assert_eq!(opts.data_dir, Some(PathBuf::from("/tmp/agentdb-dev")));
-        assert_eq!(opts.mongo_bind, None);
     }
 
     #[test]
@@ -6057,6 +6132,88 @@ node_id = "node-a"
     }
 
     #[test]
+    fn content_cache_ttl_defaults_on_in_mirror_mode_and_zero_disables() {
+        let file = ContentFileConfig {
+            backend: Some("object_store".into()),
+            local_cache_ttl_ms: None,
+            cache_sweep_interval_ms: None,
+        };
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            Some(DEFAULT_CONTENT_CACHE_TTL_MS)
+        );
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::ObjectStore, DeploymentMode::SingleNode),
+            None
+        );
+        assert_eq!(
+            resolve_content_cache_ttl(&file, ContentBackendKind::LocalFs, DeploymentMode::Cluster),
+            None
+        );
+        let disabled = ContentFileConfig {
+            backend: Some("object_store".into()),
+            local_cache_ttl_ms: Some(0),
+            cache_sweep_interval_ms: None,
+        };
+        assert_eq!(
+            resolve_content_cache_ttl(&disabled, ContentBackendKind::ObjectStore, DeploymentMode::Cluster),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_backup_defaults_on_with_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[storage.object_store]
+backend = "localfs"
+local_root = "/tmp/agentdb-test-object-store"
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        let recovery = config.recovery_manifest_backup.expect("recovery enabled");
+        assert_eq!(recovery.interval_ms, DEFAULT_RECOVERY_MANIFEST_INTERVAL_MS);
+        assert_eq!(recovery.max_bytes, DEFAULT_RECOVERY_MANIFEST_MAX_BYTES);
+    }
+
+    #[test]
+    fn recovery_backup_defaults_off_without_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
+        assert!(config.recovery_manifest_backup.is_none());
+    }
+
+    #[test]
+    fn recovery_backup_enabled_requires_object_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agentdb.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[recovery]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut opts = base_opts();
+        opts.config = Some(config_path);
+        let err = ResolvedServeConfig::from_serve_opts(opts).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("recovery.enabled=true requires storage.object_store"));
+    }
+
+    #[test]
     fn cluster_mode_requires_object_store_content() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("agentdb.toml");
@@ -6067,7 +6224,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "localfs"
@@ -6101,7 +6258,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6134,7 +6291,7 @@ node_id = "node-a"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6165,7 +6322,7 @@ region = "us-west-2"
 mode = "cluster"
 
 [storage.kv]
-backend = "slatedb"
+backend = "rocksdb"
 
 [storage.content]
 backend = "object_store"
@@ -6243,39 +6400,6 @@ node_id = "node-a"
         assert!(err
             .to_string()
             .contains("server.internal_auth_previous_token requires server.internal_auth_token"));
-    }
-
-    #[test]
-    fn single_node_slatedb_s3_remains_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("agentdb.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[deployment]
-mode = "single_node"
-
-[storage.kv]
-backend = "slatedb"
-
-[storage.content]
-backend = "object_store"
-
-[storage.object_store]
-backend = "s3"
-bucket = "agentdb-test"
-region = "us-west-2"
-"#,
-        )
-        .unwrap();
-        let mut opts = base_opts();
-        opts.config = Some(config_path);
-        let config = ResolvedServeConfig::from_serve_opts(opts).unwrap();
-        assert_eq!(config.deployment_mode, DeploymentMode::SingleNode);
-        assert_eq!(
-            deployment_support_note(&config),
-            Some("single-node SlateDB + S3 is intended for testing/evaluation, not the primary production deployment")
-        );
     }
 
     #[tokio::test]

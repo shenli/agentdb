@@ -34,8 +34,8 @@ remaining sessions.
    error string from `agentdb_core::fetch_events_from_seq`. That
    string is the authoritative cause.
 3. Categorize the underlying error:
-   - **Storage transient.** S3 / SlateDB throttling, RocksDB
-     stall, network blip. The error string typically names
+   - **Storage transient.** S3 throttling, RocksDB stall,
+     network blip. The error string typically names
      the backend.
    - **Session deleted.** The session was removed between the
      subscribe call and the scan. The error refers to a
@@ -76,8 +76,7 @@ remaining sessions.
    - `agentdbctl raw get /api/admin/boxes` for `is_stale` / `lease_lost`
      conditions on the box that owns the session until box state has a modeled
      CLI command.
-   - The KV-backend metrics (RocksDB compaction, SlateDB
-     reads, S3 5xx rate).
+   - The KV-backend metrics (RocksDB compaction, S3 5xx rate).
    - The audit log for recent admin operations on the
      affected session id.
 

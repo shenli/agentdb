@@ -17,8 +17,8 @@ The API listens on `http://127.0.0.1:7878`. The dashboard is available at:
 http://127.0.0.1:7878/dashboard/
 ```
 
-`agentdb dev` stores state in memory, enables the local MongoDB compatibility
-listener, and creates a demo workspace/session for experimentation.
+`agentdb dev` stores state in memory and creates a demo workspace/session for
+experimentation.
 
 ## 2. Run The Python Agent Quickstart
 
@@ -73,4 +73,3 @@ RocksDB bindings locally.
 
 - Read the full [README](../README.md).
 - Review the native API and SDK reference in [reference/api-sdk.md](reference/api-sdk.md).
-- Try the MongoDB compatibility examples in [examples/mongodb](../examples/mongodb/README.md).

@@ -185,7 +185,6 @@ truth for:
 - cold session segments
 - archive bundles
 - artifact blobs
-- object-store-backed runtime metadata when using SlateDB-style storage
 
 This storage must outlive any one node.
 

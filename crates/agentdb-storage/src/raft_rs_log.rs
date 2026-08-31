@@ -1279,6 +1279,18 @@ fn replay_raft_engine_to_storage(
     } else {
         HardState::default()
     };
+    // The unapplied tail must be materialized for raft-rs MemStorage, so
+    // memory here is proportional to retained-log backlog. Healthy operation
+    // bounds that via snapshot/compaction; this budget turns the pathological
+    // case (compaction stalled for a long time) into an actionable startup
+    // error instead of an OOM. The backlog length is the blast radius.
+    let replay_max_bytes = std::env::var("AGENTDB_RAFT_REPLAY_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(512 * 1024 * 1024);
+    let mut replayed_bytes: u64 = 0;
+    let mut budget_exceeded = false;
     let mut entries_by_index = BTreeMap::new();
     engine
         .scan_raw_messages(
@@ -1287,6 +1299,11 @@ fn replay_raft_engine_to_storage(
             Some(b"entry0"),
             false,
             |_, raw| {
+                replayed_bytes = replayed_bytes.saturating_add(raw.len() as u64);
+                if replayed_bytes > replay_max_bytes {
+                    budget_exceeded = true;
+                    return false;
+                }
                 if let Ok(entry) = Entry::decode(raw) {
                     entries_by_index.insert(entry.index, entry);
                 }
@@ -1294,6 +1311,11 @@ fn replay_raft_engine_to_storage(
             },
         )
         .map_err(map_raft_engine_error)?;
+    if budget_exceeded {
+        return Err(Error::Other(format!(
+            "raft group {raft_group_id} retained log exceeds              AGENTDB_RAFT_REPLAY_MAX_BYTES={replay_max_bytes}; compact the log              (snapshot catch-up) or raise the budget before restarting"
+        )));
+    }
     let entries: Vec<_> = entries_by_index
         .into_values()
         .filter(|entry| entry.index > snapshot_index)

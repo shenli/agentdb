@@ -20,6 +20,39 @@ All runs use the same hardware and default server config unless noted.
 The server, probe, and shell are colocated on localhost, so latency
 numbers include loopback TCP round-trip (~50 µs on this box).
 
+## Durable by default (2026-08-30)
+
+Acknowledged appends now fsync the RocksDB WAL by default
+(`AGENTDB_ROCKSDB_SYNC_WRITES=0` opts out). Group commit is backlog-aware:
+an idle append pays only its own sync; under concurrency the writer
+coalesces the queue into one synced batch (2 ms window,
+`AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US`).
+
+Reference numbers, Apple M5 laptop, release build, 256-byte payloads,
+Python thread-pool client over loopback (client overhead included; macOS
+fsync does not force platter flush, so absolute sync cost is optimistic —
+Linux numbers will differ):
+
+| Mode | Workers | Throughput | p50 | p99 |
+|---|---:|---:|---:|---:|
+| fsync on (default) | 1 | 426/s | 2.40 ms | 4.18 ms |
+| fsync on (default) | 32 | 3,470/s | 8.87 ms | 17.19 ms |
+| fsync off (opt-out) | 1 | 423/s | 2.31 ms | 4.62 ms |
+| fsync off (opt-out) | 32 | 1,846/s | 13.67 ms | 59.69 ms |
+
+Two observations: single-writer latency is unchanged by the durable
+default (the backlog-aware window adds no idle wait), and under
+concurrency the durable path is *faster* — group commit turns 32
+contending writers into large synced batches, while the non-durable
+direct path degrades under CAS contention.
+
+Crash safety is regression-tested by
+`ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh`:
+every acknowledged append must survive SIGKILL mid-stream across repeated
+crash/restart cycles. (SIGKILL cannot falsify fsync itself — the page
+cache survives process death; power-loss protection needs a VM-kill or
+dm-flakey rig, tracked as follow-up.)
+
 ## Throughput scaling
 
 `tools/workload/cmd/perf-probe` spins N workers that each loop
@@ -190,10 +223,11 @@ single-mutex tenant-map becomes a bottleneck, which is above this
 prototype's scale. A follow-up milestone could shard to `DashMap` or
 per-tenant atomics if that changes.
 
-## Storage backend comparison (M11)
+## Storage backend comparison (M11, historical)
 
-Measured on the criterion benches in
-`crates/agentdb-core/benches/mvcc_bench.rs` with a session containing
+The SlateDB `KvStore` backend has since been retired; these numbers are
+kept as the record of that evaluation. Measured on the criterion benches
+in `crates/agentdb-core/benches/mvcc_bench.rs` with a session containing
 1000 events, both backends pointed at local disk (RocksDB on SSD,
 SlateDB on `object_store::local::LocalFileSystem`):
 
@@ -239,8 +273,8 @@ response bodies without draining them, which prevented connection
 reuse. Under c=64 this exhausted the macOS ephemeral port range in
 seconds and surfaced as "can't assign requested address" transport
 errors. The fix is `io.Copy(io.Discard, resp.Body); resp.Body.Close()`
-before the next request. Real clients (the Mongo driver, browsers,
-the dashboard) have never tripped this because they all reuse
+before the next request. Real clients (browsers, the dashboard,
+SDK HTTP clients) have never tripped this because they all reuse
 connections.
 
 **LifecycleEngine wasn't recording metrics.** Until this perf run,

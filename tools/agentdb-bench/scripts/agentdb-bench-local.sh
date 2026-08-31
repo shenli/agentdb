@@ -52,6 +52,9 @@ fi
 agentdb_server_env=()
 case "${DURABILITY_PROFILE}" in
   single-node-wal | dev-fast)
+    # Non-durable ceiling: opt out of the fsync-on default so these profiles
+    # keep measuring the unsynced write path.
+    agentdb_server_env+=(AGENTDB_ROCKSDB_SYNC_WRITES=0)
     ;;
   single-node-fsync | durable-single | durable-grouped)
     # Match a single-node durable commit: every returned append has reached a

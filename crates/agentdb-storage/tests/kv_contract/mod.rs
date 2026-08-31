@@ -1,5 +1,5 @@
 //! Backend-agnostic `KvStore` contract tests. Used by rocks_integration.rs
-//! and slate_integration.rs to exercise identical behavior. Tests that rely
+//! to exercise backend-independent behavior. Tests that rely
 //! on backend-specific semantics (e.g. RocksDB's reopen-and-read) stay in
 //! their dedicated integration file.
 //!

@@ -93,6 +93,12 @@ domain_max_open_files = 128
 
 [storage.content]
 backend = "localfs" # or "object_store"
+# In cluster mirror mode (object_store content + LocalFs staging), the local
+# copy is a managed cache: objects unread for this TTL whose object-store
+# copy exists are evicted, so cold content lives only in the object store.
+# 0 disables eviction. Default: 24h.
+# local_cache_ttl_ms = 86400000
+# cache_sweep_interval_ms = 300000
 
 [routing]
 # Required in cluster mode.
@@ -105,3 +111,13 @@ cell_id = "default"
 # availability_zone = "us-west-2a"
 # stable, mixed, or preemptible.
 capacity_class = "stable"
+
+# Recovery-manifest backups make the object store a recovery root: a
+# periodic full dump of runtime metadata is uploaded so
+# `agentdb restore-from-bucket --config agentdb.toml` can rebuild an empty
+# data directory from the bucket alone. Enabled automatically when
+# [storage.object_store] is configured and the server is persistent.
+# [recovery]
+# enabled = true
+# manifest_backup_interval_ms = 300000
+# manifest_max_bytes = 1073741824

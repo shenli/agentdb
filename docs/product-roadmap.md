@@ -51,8 +51,6 @@ For the conceptual motivation and positioning, see
 - Credential boundary hardening: opaque event-level `credential_refs`, SDK raw
   secret payload validators, optional server-side raw-secret field rejection,
   and runtime tool-result sanitization.
-- Optional MongoDB wire listener for a deliberately narrow driver/tool
-  compatibility subset.
 - Framework integration proofs for LangGraph, OpenAI Agents SDK, MCP, and
   Vercel AI SDK style persistence.
 - Evaluation cluster components: metadata-backed routing, session locators,

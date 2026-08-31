@@ -51,7 +51,7 @@ pub trait KvSnapshot: Send + Sync {
 
 /// Minimum surface the rest of AgentDB depends on.
 ///
-/// Additional backends (e.g. SlateDB) can implement this trait to be
+/// Additional backends can implement this trait to be
 /// drop-in swappable. The key-shape contract (see `key.rs`) is assumed.
 pub trait KvStore: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;

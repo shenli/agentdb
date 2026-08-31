@@ -575,16 +575,37 @@ fn write_ops_size(ops: &[WriteOp]) -> usize {
 struct AdaptiveWriteBatcher {
     kv: Arc<dyn KvStore + Send + Sync>,
     export_ledger_sequencer: Arc<ExportLedgerSequencer>,
-    tx: mpsc::Sender<AdaptiveWriteRequest>,
+    // Option so Drop can release the sender (ending the writer loop) before
+    // joining the writer thread; None only during teardown.
+    tx: Option<mpsc::Sender<AdaptiveWriteRequest>>,
     queued: Arc<AtomicU64>,
     writer_busy: Arc<AtomicU64>,
     direct_fast_path: bool,
+    writer: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for AdaptiveWriteBatcher {
+    fn drop(&mut self) {
+        // Deterministic shutdown: close the channel so the writer loop
+        // drains and exits, then join so the KV handle held by the thread
+        // is released before the batcher's owner (and, in tests, the
+        // backing temp directory) goes away.
+        self.tx = None;
+        if let Ok(mut writer) = self.writer.lock() {
+            if let Some(handle) = writer.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 struct AdaptiveWriteRequest {
     ops: Vec<WriteOp>,
     enqueued_at: Instant,
     done: AdaptiveWriteCompletion,
+    // Captured at submit time: the writer thread has no task-local tablet
+    // context, so the flush re-enters this scope per group.
+    tablet_id: Option<i64>,
 }
 
 enum AdaptiveWriteCompletion {
@@ -722,7 +743,7 @@ impl AdaptiveWriteBatcher {
         if env_flag_disabled("AGENTDB_APPEND_GROUP_COMMIT") {
             return None;
         }
-        let sync_writes = env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES");
+        let sync_writes = agentdb_storage::rocksdb_sync_writes_enabled();
         let max_ops = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_MAX_OPS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -731,15 +752,15 @@ impl AdaptiveWriteBatcher {
         let wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            // In single-node fsync mode, a short wait window materially
-            // improves safe batching without the p99 hit of larger windows.
-            .unwrap_or(if sync_writes { 2_000 } else { 0 });
+            // No unconditional wait: an idle append pays only its own fsync.
+            .unwrap_or(0);
         let backlog_wait_us = std::env::var("AGENTDB_APPEND_GROUP_COMMIT_BACKLOG_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            // Preserve the direct fast path for isolated writes, but let the
-            // writer coalesce briefly once a backlog already exists.
-            .unwrap_or(if sync_writes { 0 } else { 5 });
+            // Coalesce only when a backlog already exists. In fsync mode a
+            // 2ms window amortizes the WAL sync across every queued session;
+            // in non-durable mode a tiny pause is enough to batch bursts.
+            .unwrap_or(if sync_writes { 2_000 } else { 5 });
         Some(Arc::new(Self::new(
             kv,
             export_ledger_sequencer,
@@ -761,7 +782,7 @@ impl AdaptiveWriteBatcher {
         let (tx, rx) = mpsc::channel::<AdaptiveWriteRequest>();
         let queued = Arc::new(AtomicU64::new(0));
         let writer_busy = Arc::new(AtomicU64::new(0));
-        let _ = thread::Builder::new()
+        let writer = thread::Builder::new()
             .name("agentdb-adaptive-write".into())
             .spawn({
                 let kv = kv.clone();
@@ -784,10 +805,11 @@ impl AdaptiveWriteBatcher {
         Self {
             kv,
             export_ledger_sequencer,
-            tx,
+            tx: Some(tx),
             queued,
             writer_busy,
             direct_fast_path,
+            writer: std::sync::Mutex::new(writer.ok()),
         }
     }
 
@@ -813,10 +835,13 @@ impl AdaptiveWriteBatcher {
         let (done, rx) = tokio::sync::oneshot::channel();
         self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
+            .as_ref()
+            .expect("adaptive write batcher used after teardown")
             .send(AdaptiveWriteRequest {
                 ops,
                 enqueued_at: Instant::now(),
                 done: AdaptiveWriteCompletion::Async(done),
+                tablet_id: crate::runtime::current_runtime_tablet_id(),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -849,10 +874,13 @@ impl AdaptiveWriteBatcher {
         let (done, rx) = mpsc::channel();
         self.queued.fetch_add(1, Ordering::Relaxed);
         self.tx
+            .as_ref()
+            .expect("adaptive write batcher used after teardown")
             .send(AdaptiveWriteRequest {
                 ops,
                 enqueued_at: Instant::now(),
                 done: AdaptiveWriteCompletion::Blocking(done),
+                tablet_id: crate::runtime::current_runtime_tablet_id(),
             })
             .map_err(|request| {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -873,14 +901,6 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|raw| {
-            let raw = raw.trim().to_ascii_lowercase();
-            matches!(raw.as_str(), "1" | "true" | "on" | "enabled" | "yes")
-        })
-        .unwrap_or(false)
-}
 
 #[allow(clippy::too_many_arguments)]
 fn adaptive_write_loop(
@@ -915,8 +935,6 @@ fn adaptive_write_loop(
             }
         }
 
-        let mut ops = Vec::with_capacity(op_count);
-        let mut completions = Vec::with_capacity(requests.len());
         let request_count = requests.len();
 
         while writer_busy
@@ -929,20 +947,35 @@ fn adaptive_write_loop(
             .iter()
             .map(|request| request.enqueued_at.elapsed().as_nanos())
             .sum::<u128>();
+
+        // One flush per tablet scope: the KV handle may be a tablet router
+        // that resolves the destination from the task-local tablet id, so
+        // ops from different tablets must never share a write_batch.
+        // BTreeMap keeps a deterministic flush order; arrival order is
+        // preserved within each tablet.
+        let mut groups: std::collections::BTreeMap<
+            Option<i64>,
+            (Vec<WriteOp>, Vec<AdaptiveWriteCompletion>),
+        > = std::collections::BTreeMap::new();
         for request in requests {
-            ops.extend(request.ops);
-            completions.push(request.done);
+            let group = groups.entry(request.tablet_id).or_default();
+            group.0.extend(request.ops);
+            group.1.push(request.done);
         }
 
         let write_started = Instant::now();
-        let result = export_ledger_sequencer.write(kv.as_ref(), ops);
+        for (tablet_id, (ops, completions)) in groups {
+            let result = crate::runtime::with_runtime_tablet_scope_sync(tablet_id, || {
+                export_ledger_sequencer.write(kv.as_ref(), ops)
+            });
+            for done in completions {
+                done.send(&result);
+            }
+        }
         let write_nanos = write_started.elapsed().as_nanos();
         writer_busy.store(0, Ordering::Release);
         if let Some(profile) = adaptive_write_profile() {
             profile.record_grouped(request_count, op_count, queue_nanos, write_nanos);
-        }
-        for done in completions {
-            done.send(&result);
         }
     }
 }

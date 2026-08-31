@@ -52,6 +52,9 @@ pub struct PutResult {
 pub struct ContentObject {
     pub tenant_id: String,
     pub artifact_id: String,
+    /// Last-modified time of the stored object, when the backend can supply
+    /// it cheaply. Drives managed-cache eviction in the async mirror.
+    pub last_modified_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +89,24 @@ pub trait ContentBackend: Send + Sync {
     /// V2.4 GC reaper relies on idempotent delete to clean up orphans.
     async fn delete(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()>;
 
-    /// Enumerate stored blobs for startup orphan reconciliation. Backends that
+    /// Best-effort "this object was just used" hint so managed caches can
+    /// keep recently read objects local. Backends without a cheap way to
+    /// record it treat it as a no-op.
+    async fn touch(&self, _tenant_id: &str, _artifact_id: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Remove crash-left temporary files (and empty artifact directories)
+    /// from the store. DESTRUCTIVE toward in-flight writes: a live put's
+    /// tmp file is indistinguishable from a crash-left one, so call this
+    /// only before the backend accepts writes (startup reconciliation),
+    /// never from a periodic task. Returns the number of temporaries removed.
+    async fn sweep_temporary_objects(&self, _limit: usize) -> io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Enumerate stored blobs. Read-only — safe to run concurrently with
+    /// writes (the periodic cache sweep depends on this). Backends that
     /// cannot provide a bounded namespace listing return `Unsupported`.
     async fn list_objects(&self, _limit: usize) -> io::Result<ContentListing> {
         Err(io::Error::new(
@@ -104,6 +124,15 @@ pub struct AsyncMirrorStats {
     pub completed: u64,
     pub failed: u64,
     pub backlog: u64,
+    pub evicted: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorCacheSweepReport {
+    pub scanned: u64,
+    pub evicted: u64,
+    pub retained_unmirrored: u64,
+    pub skipped_no_mtime: u64,
 }
 
 #[derive(Default)]
@@ -112,6 +141,7 @@ struct AsyncMirrorCounters {
     completed: AtomicU64,
     failed: AtomicU64,
     backlog: AtomicU64,
+    evicted: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -139,6 +169,10 @@ pub struct AsyncMirrorContentBackend {
     mirror: Arc<dyn ContentBackend>,
     sender: mpsc::Sender<MirrorJob>,
     counters: Arc<AsyncMirrorCounters>,
+    /// When set, the primary is a managed cache over the mirror: local
+    /// copies older than this TTL whose mirror copy exists are evicted by
+    /// the cache sweep, and local read hits refresh the object's age.
+    local_cache_ttl_ms: Option<u64>,
 }
 
 impl AsyncMirrorContentBackend {
@@ -183,7 +217,77 @@ impl AsyncMirrorContentBackend {
             mirror,
             sender,
             counters,
+            local_cache_ttl_ms: None,
         }
+    }
+
+    /// Turn the primary into a managed cache: local objects unread for
+    /// `ttl_ms` are evicted once the mirror holds them. Cold data then lives
+    /// only in the mirror; a later read pulls it back through and the cycle
+    /// repeats.
+    pub fn with_local_cache_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.local_cache_ttl_ms = Some(ttl_ms);
+        self
+    }
+
+    pub fn local_cache_ttl_ms(&self) -> Option<u64> {
+        self.local_cache_ttl_ms
+    }
+
+    /// One managed-cache sweep pass. Evicts local objects whose age exceeds
+    /// the TTL **and** whose mirror copy exists — never the only copy. The
+    /// upload path already verified content (atomic put of the same bytes),
+    /// so mirror existence is the eviction precondition.
+    pub async fn run_cache_sweep_once(
+        &self,
+        now_ms: i64,
+        list_limit: usize,
+    ) -> io::Result<MirrorCacheSweepReport> {
+        let Some(ttl_ms) = self.local_cache_ttl_ms else {
+            return Ok(MirrorCacheSweepReport::default());
+        };
+        let listing = self.primary.list_objects(list_limit).await?;
+        let mut report = MirrorCacheSweepReport {
+            scanned: listing.objects.len() as u64,
+            ..MirrorCacheSweepReport::default()
+        };
+        for object in listing.objects {
+            let Some(modified_ms) = object.last_modified_ms else {
+                report.skipped_no_mtime += 1;
+                continue;
+            };
+            if now_ms.saturating_sub(modified_ms) < ttl_ms as i64 {
+                continue;
+            }
+            match self
+                .mirror
+                .head(&object.tenant_id, &object.artifact_id)
+                .await
+            {
+                Ok(true) => {
+                    self.primary
+                        .delete(&object.tenant_id, &object.artifact_id)
+                        .await?;
+                    self.counters.evicted.fetch_add(1, Ordering::Relaxed);
+                    report.evicted += 1;
+                }
+                Ok(false) => {
+                    // Mirror does not have it (upload pending or failed):
+                    // the local copy is the only copy. Never evict it.
+                    report.retained_unmirrored += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        tenant_id = %object.tenant_id,
+                        artifact_id = %object.artifact_id,
+                        "cache sweep mirror head failed; retaining local copy"
+                    );
+                    report.retained_unmirrored += 1;
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn stats(&self) -> AsyncMirrorStats {
@@ -192,6 +296,7 @@ impl AsyncMirrorContentBackend {
             completed: self.counters.completed.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
             backlog: self.counters.backlog.load(Ordering::Relaxed),
+            evicted: self.counters.evicted.load(Ordering::Relaxed),
         }
     }
 
@@ -265,7 +370,14 @@ impl ContentBackend for AsyncMirrorContentBackend {
 
     async fn get(&self, tenant_id: &str, artifact_id: &str) -> io::Result<Vec<u8>> {
         match self.primary.get(tenant_id, artifact_id).await {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => {
+                if self.local_cache_ttl_ms.is_some() {
+                    if let Err(error) = self.primary.touch(tenant_id, artifact_id).await {
+                        tracing::debug!(?error, "content cache touch failed");
+                    }
+                }
+                Ok(bytes)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let bytes = self.mirror.get(tenant_id, artifact_id).await?;
                 if let Err(backfill_err) = self.primary.put(tenant_id, artifact_id, &bytes).await {
@@ -296,6 +408,10 @@ impl ContentBackend for AsyncMirrorContentBackend {
             artifact_id: artifact_id.into(),
         })
         .await
+    }
+
+    async fn sweep_temporary_objects(&self, limit: usize) -> io::Result<usize> {
+        self.primary.sweep_temporary_objects(limit).await
     }
 
     async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
@@ -349,6 +465,16 @@ impl LocalFsContentBackend {
 
 #[async_trait]
 impl ContentBackend for LocalFsContentBackend {
+    async fn touch(&self, tenant_id: &str, artifact_id: &str) -> io::Result<()> {
+        let path = self.path_for(tenant_id, artifact_id);
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            file.set_modified(std::time::SystemTime::now())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("touch task failed: {error}")))?
+    }
+
     async fn put(&self, tenant_id: &str, artifact_id: &str, bytes: &[u8]) -> io::Result<PutResult> {
         let dir = self.dir_for(tenant_id, artifact_id);
         tokio::fs::create_dir_all(&dir).await?;
@@ -421,6 +547,57 @@ impl ContentBackend for LocalFsContentBackend {
         Ok(())
     }
 
+    async fn sweep_temporary_objects(&self, limit: usize) -> io::Result<usize> {
+        let root = self.root.join("artifact_content");
+        let mut tenants = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut removed = 0_usize;
+        let mut scanned = 0_usize;
+        while let Some(tenant) = tenants.next_entry().await? {
+            if !tenant.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut artifacts = tokio::fs::read_dir(tenant.path()).await?;
+            while let Some(artifact) = artifacts.next_entry().await? {
+                if !artifact.file_type().await?.is_dir() {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("temporary sweep exceeds configured limit of {limit} objects"),
+                    ));
+                }
+                let artifact_path = artifact.path();
+                let mut entries = tokio::fs::read_dir(&artifact_path).await?;
+                let mut has_blob = false;
+                let mut removed_temporary_file = false;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == "blob" && entry.file_type().await?.is_file() {
+                        has_blob = true;
+                    } else if name.starts_with("blob.tmp.") && entry.file_type().await?.is_file() {
+                        tokio::fs::remove_file(entry.path()).await?;
+                        removed = removed.saturating_add(1);
+                        removed_temporary_file = true;
+                    }
+                }
+                if removed_temporary_file {
+                    sync_directory_chain(artifact_path.clone(), self.root.clone()).await?;
+                }
+                if !has_blob && tokio::fs::remove_dir(&artifact_path).await.is_ok() {
+                    sync_directory_chain(tenant.path(), self.root.clone()).await?;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
         let root = self.root.join("artifact_content");
         let mut tenants = match tokio::fs::read_dir(&root).await {
@@ -434,7 +611,6 @@ impl ContentBackend for LocalFsContentBackend {
             Err(error) => return Err(error),
         };
         let mut objects = Vec::new();
-        let mut temporary_objects_deleted = 0_usize;
         while let Some(tenant) = tenants.next_entry().await? {
             if !tenant.file_type().await?.is_dir() {
                 continue;
@@ -446,44 +622,36 @@ impl ContentBackend for LocalFsContentBackend {
                     continue;
                 }
                 let artifact_path = artifact.path();
-                let mut entries = tokio::fs::read_dir(&artifact_path).await?;
-                let mut has_blob = false;
-                let mut removed_temporary_file = false;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name == "blob" && entry.file_type().await?.is_file() {
-                        has_blob = true;
-                    } else if name.starts_with("blob.tmp.") && entry.file_type().await?.is_file() {
-                        tokio::fs::remove_file(entry.path()).await?;
-                        temporary_objects_deleted = temporary_objects_deleted.saturating_add(1);
-                        removed_temporary_file = true;
-                    }
+                let blob_path = artifact_path.join("blob");
+                let Ok(metadata) = tokio::fs::metadata(&blob_path).await else {
+                    // No committed blob (in-flight put or crash leftover):
+                    // not listable, and cleanup belongs to
+                    // `sweep_temporary_objects`, never a read-only listing.
+                    continue;
+                };
+                if objects.len() >= limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "content object listing exceeds configured limit of {limit} objects"
+                        ),
+                    ));
                 }
-                if removed_temporary_file {
-                    sync_directory_chain(artifact_path.clone(), self.root.clone()).await?;
-                }
-                if has_blob {
-                    if objects.len() >= limit {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "content object listing exceeds configured limit of {limit} objects"
-                            ),
-                        ));
-                    }
-                    objects.push(ContentObject {
-                        tenant_id: tenant_id.clone(),
-                        artifact_id: artifact.file_name().to_string_lossy().to_string(),
-                    });
-                } else if tokio::fs::remove_dir(&artifact_path).await.is_ok() {
-                    sync_directory_chain(tenant.path(), self.root.clone()).await?;
-                }
+                let last_modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64);
+                objects.push(ContentObject {
+                    tenant_id: tenant_id.clone(),
+                    artifact_id: artifact.file_name().to_string_lossy().to_string(),
+                    last_modified_ms,
+                });
             }
         }
         Ok(ContentListing {
             objects,
-            temporary_objects_deleted,
+            temporary_objects_deleted: 0,
         })
     }
 }
@@ -576,6 +744,7 @@ impl ContentBackend for InMemoryContentBackend {
                 .map(|(tenant_id, artifact_id)| ContentObject {
                     tenant_id: tenant_id.clone(),
                     artifact_id: artifact_id.clone(),
+                    last_modified_ms: None,
                 })
                 .collect(),
             temporary_objects_deleted: 0,
@@ -662,6 +831,54 @@ impl ContentBackend for ObjectStoreContentBackend {
                 "object store delete failed: {err}"
             ))),
         }
+    }
+
+    async fn list_objects(&self, limit: usize) -> io::Result<ContentListing> {
+        use futures::StreamExt;
+
+        let mut list_prefix = String::new();
+        if !self.prefix.is_empty() {
+            list_prefix.push_str(&self.prefix);
+            list_prefix.push('/');
+        }
+        list_prefix.push_str("artifact_content");
+        let list_path = ObjectPath::from(list_prefix.clone());
+
+        let mut objects = Vec::new();
+        let mut stream = self.store.list(Some(&list_path));
+        while let Some(entry) = stream.next().await {
+            let meta = entry
+                .map_err(|err| io::Error::other(format!("object store list failed: {err}")))?;
+            let location = meta.location.as_ref();
+            let relative = location
+                .strip_prefix(&list_prefix)
+                .unwrap_or(location)
+                .trim_start_matches('/');
+            // Expected layout: {tenant_id}/{artifact_id}/blob. Anything else
+            // under the content prefix is not an artifact blob and is skipped
+            // rather than treated as corruption.
+            let mut parts = relative.split('/');
+            let (Some(tenant_id), Some(artifact_id), Some("blob"), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if objects.len() >= limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("content object listing exceeds configured limit of {limit} objects"),
+                ));
+            }
+            objects.push(ContentObject {
+                tenant_id: tenant_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                last_modified_ms: Some(meta.last_modified.timestamp_millis()),
+            });
+        }
+        Ok(ContentListing {
+            objects,
+            temporary_objects_deleted: 0,
+        })
     }
 }
 

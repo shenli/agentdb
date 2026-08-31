@@ -39,7 +39,7 @@ def run_demo(db: Any, *, tenant_key: str = TENANT_KEY) -> dict:
     workspace = db.workspace(f"{tenant_key}-{int(time.time() * 1000)}")
     agent = workspace.agent(
         "ticket-tiered-demo-agent",
-        config={"runtime": "ticket-demo", "tiering": "slatedb-s3"},
+        config={"runtime": "ticket-demo", "tiering": "object-store"},
     )
     session = agent.session("ticket-SUP-42")
 

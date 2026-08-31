@@ -39,9 +39,6 @@ script_for_backend() {
     postgres | postgres-event-log)
       printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-postgres.sh"
       ;;
-    agentdb-mongodb | agentdb-mongodb-api)
-      printf '%s\n' "${ROOT}/tools/agentdb-bench/scripts/agentdb-bench-agentdb-mongodb.sh"
-      ;;
     *)
       echo "unknown backend: $1" >&2
       exit 1

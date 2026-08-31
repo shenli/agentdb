@@ -794,3 +794,90 @@ async fn tenant_soft_delete_gc_expands_to_children_then_tenant() {
         ErrorCode::ArtifactNotFound
     );
 }
+
+/// Regression (S15 chaos finding): sealing a reopened warm head on top of an
+/// archived session must keep those events readable, and a second archive
+/// compaction must fold them into the new bundle instead of destroying them.
+#[tokio::test]
+async fn post_archive_segments_stay_readable_and_survive_recompaction() {
+    let rt = Runtime::in_memory();
+    let tenant = tenant_with_policy(&rt, "post-archive-segments", serde_json::json!({})).await;
+    let session = session_for(&rt, &tenant).await;
+    let agent_id = session.agent_id.clone();
+
+    let append = |n: u64| {
+        let rt = rt.clone();
+        let tenant_id = tenant.tenant_id.clone();
+        let agent_id = agent_id.clone();
+        let session_id = session.session_id.clone();
+        async move {
+            rt.append(AppendRequest {
+                tenant_id,
+                agent_id,
+                session_id,
+                kind: "message".into(),
+                payload: serde_json::json!({"n": n}),
+                artifact_refs: vec![],
+                source_refs: vec![],
+                credential_refs: vec![],
+                idempotency_key: None,
+            })
+            .await
+            .unwrap()
+        }
+    };
+
+    // History 0..2 archived, then 3..5 sealed ON TOP of the archive, then
+    // 6 in the reopened warm head: all three tiers live at once.
+    for n in 0..3 {
+        append(n).await;
+    }
+    rt.transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+        .await
+        .unwrap();
+    for n in 3..6 {
+        append(n).await;
+    }
+    let summary = rt
+        .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Cold)
+        .await
+        .unwrap();
+    assert!(summary.archive_manifest.is_some(), "archive kept under cold seal");
+    assert_eq!(summary.sealed_segment_count, 1, "post-archive segment sealed");
+    append(6).await;
+
+    let all_tiers = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: usize::MAX,
+        })
+        .await
+        .unwrap();
+    let seqs: Vec<u64> = all_tiers.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6], "archive + segment + warm merge");
+
+    // Re-archive: the new bundle must contain the full history, not just the
+    // old bundle's contents.
+    let summary = rt
+        .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Archive)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.archive_manifest.as_ref().map(|m| m.event_count),
+        Some(7),
+        "recompaction folds post-archive history into the new bundle"
+    );
+    let after = rt
+        .fetch_from_seq(FetchRequest {
+            tenant_id: tenant.tenant_id.clone(),
+            session_id: session.session_id.clone(),
+            from_seq: 0,
+            limit: usize::MAX,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 7);
+    assert!(after.iter().enumerate().all(|(i, e)| e.seq == i as u64));
+}

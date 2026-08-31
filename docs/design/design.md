@@ -113,7 +113,6 @@ AgentDB or still needs product hardening.
 | Policy, lifecycle, and GC | Implemented | Quota/backpressure, warm/cold/archive lifecycle, archive restore, retention, legal hold, derivative-only artifact purge, and policy workers exist. |
 | Credential boundary | Implemented defense in depth | Events carry opaque `credential_refs`; SDKs and runtime sanitize/reject common raw-secret payload shapes. Real secret resolution remains in the control plane/vault. |
 | Sandbox snapshots | AgentDB refs implemented; sandbox service external | AgentDB stores `SnapshotRef` / `SnapshotLayer` metadata and resolves resume refs across fork chains. Snapshot bytes, copy-on-write fork, restore, and byte retention belong to the sandbox service. |
-| MongoDB compatibility | Implemented narrow adapter | Optional MongoDB wire listener maps a fixed command/collection subset onto native runtime methods. It is not full MongoDB compatibility. |
 | Dashboard | Implemented baseline | Session-first dashboard assets are embedded in the binary; bearer input is page-memory-only and URL token parameters are scrubbed. Richer replay/fork/context/artifact inspection remains product work. |
 | Packaging | Implemented baseline | Docker images and tagged release archives contain both `agentdb` and `agentdbctl`; Compose/Helm provide the required API bearer secret for their non-loopback listener. |
 | Single-node operations | Partially implemented | In-memory and RocksDB modes, config-first server flow, authenticated Docker/Compose/Helm examples, meaningful live/ready probes, startup hydration guarded by a 512 MiB serialized-KV budget plus per-prefix row caps, backup manifest/checkpoint endpoint, and runbooks exist. Whole-state hydration, decoded-memory overhead, and some restore/upgrade automation remain limits. |
@@ -154,15 +153,13 @@ data plane later needs lower overhead, the expected evolution is to keep HTTP as
 the public and operational surface while adding a binary SDK transport or
 internal node protocol for hot paths.
 
-The server also has an opt-in MongoDB wire-protocol compatibility listener for a
-narrow subset of driver/tool workflows. This is an adapter onto the same runtime
-methods, not the canonical performance path and not a full MongoDB replacement.
-
 The current workspace intentionally does not maintain:
 
 - a Go SDK
 - tenantless routes from earlier prototypes
 - a version-gating server flag
+- a MongoDB wire-protocol compatibility listener
+- a SlateDB `KvStore` backend
 
 ## Identity
 
@@ -333,12 +330,12 @@ sink failure must not block ordinary appends. Connectors replay from durable
 export cursors and apply sink-specific schema, privacy, retry, and dashboard
 logic outside the hot runtime path.
 
-SlateDB is allowed as an optional `KvStore` backend to validate the abstraction
-and evaluate object-store-backed runtime metadata. It should not be treated as
-the production answer for hot write durability or multi-node safety. A clustered
-AgentDB needs a replicated local log/tablet commit path, such as Raft-style
-quorum replication, before acknowledging writes; object storage belongs behind
-asynchronous sealing, archival, and artifact flows.
+An object-store-backed `KvStore` (SlateDB) was evaluated to validate the
+abstraction and then retired. Object storage is not the answer for hot write
+durability or multi-node safety. A clustered AgentDB needs a replicated local
+log/tablet commit path, such as Raft-style quorum replication, before
+acknowledging writes; object storage belongs behind asynchronous sealing,
+archival, and artifact flows.
 
 ## SDKs And Adapters
 

@@ -15,7 +15,6 @@ agentdb-core = { path = "../../crates/agentdb-core" }
 agentdb-dashboard = { path = "../../crates/agentdb-dashboard" }
 agentdb-meta = { path = "../../crates/agentdb-meta" }
 agentdb-storage = { path = "../../crates/agentdb-storage" }
-agentdb-wire = { path = "../../crates/agentdb-wire" }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
@@ -29,4 +28,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

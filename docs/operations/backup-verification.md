@@ -16,8 +16,7 @@ This runbook applies to one AgentDB server node using:
 
 - a config file
 - local metadata or configured metadata storage
-- local RocksDB runtime storage, SlateDB/object-store runtime storage, or local
-  content/object-store content backends
+- local RocksDB runtime storage with local or object-store content backends
 - optional `grouped_rocksdb` tablet-store checkpoints when the layout is
   compatible
 

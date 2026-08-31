@@ -73,7 +73,7 @@ impl RocksKvStore {
         let db = DB::open(&opts, path)?;
         Ok(Self {
             db: Arc::new(db),
-            sync_writes: env_flag_enabled("AGENTDB_ROCKSDB_SYNC_WRITES"),
+            sync_writes: rocksdb_sync_writes_enabled(),
         })
     }
 
@@ -234,14 +234,23 @@ fn rocks_property_bool(db: &DB, name: &str) -> Result<Option<bool>> {
     Ok(rocks_property_u64(db, name)?.map(|value| value != 0))
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+/// Whether acknowledged RocksDB writes fsync the WAL before returning.
+///
+/// ON by default: AgentDB's core promise is that an acknowledged append
+/// survives a crash, so an ack must mean "WAL on disk", not "in the
+/// memtable". Set `AGENTDB_ROCKSDB_SYNC_WRITES=0` (or false/off/no/disabled)
+/// to opt out for throwaway environments and benchmarks that measure the
+/// non-durable ceiling.
+pub fn rocksdb_sync_writes_enabled() -> bool {
+    match std::env::var("AGENTDB_ROCKSDB_SYNC_WRITES") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        ),
+        Err(_) => true,
+    }
 }
+
 
 /// Borrows from a `RocksKvStore`; caller keeps the store alive via its own reference.
 struct RocksSnapshotHandle<'a> {

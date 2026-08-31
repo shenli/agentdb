@@ -501,7 +501,7 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
 - **Oracle:** each tenant's reads/search/watch/export/Mongo/adapters/blob results equal only that tenant's model; cross-tenant requests return not found/invalid cursor without existence leaks; adapters produce the same core event/record model as native HTTP.
 - **Observability required:** model state per tenant, operation history, adapter request logs, index stats, response status/error codes.
 - **Exit criteria:** PASS for 10k operations over 20 seeds with zero isolation violations; FAIL on any cross-tenant object, cursor item, index result, or successful wrong-tenant mutation.
-- **Target test file:** `adapters/tests/auto/test_S5_tenant_isolation_across_http_sdk_mongo_adapters_and_export.py`
+- **Target test file:** `adapters/tests/auto/test_S5_tenant_isolation_across_http_sdk_adapters_and_export.py`
 - **Skeleton language:** python
 - **Skeleton:**
 
@@ -847,6 +847,57 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
 
   ====
   ```
+
+### Scenario S14: acknowledged_appends_survive_sigkill (implemented 2026-08-30)
+
+- **Falsifies if it FAILs:** the ack-ordering claim (an ack is issued only
+  after the WAL write reached the kernel) and WAL recovery from torn
+  mid-stream crash state.
+- **Technique:** real-process crash injection (SIGKILL mid-append-stream)
+  against the release contract's default configuration (fsync on).
+- **Oracle:** every acknowledged seq present after cold restart; unacked
+  seqs may exist. Ground truth is the client's fsynced ack log.
+- **Known limitation:** SIGKILL preserves the OS page cache, so fsync
+  itself (power-loss protection) is not falsified; a VM-kill/dm-flakey rig
+  on Linux remains follow-up work.
+- **Target test file:** `ops/local-ci/tests/auto/S14_acknowledged_appends_survive_sigkill.sh`
+- **Status:** implemented, wired into nightly/release runner. Found nothing
+  on first landing (implemented together with the fsync-on default).
+
+### Scenario S15: lifecycle_transitions_survive_sigkill_chaos (implemented 2026-08-30)
+
+- **Falsifies if it FAILs:** seal-to-cold / compact-to-archive / restore
+  move history without losing acknowledged events; crashed transitions
+  leave the session readable and append-able; reopened warm heads keep
+  sequences contiguous.
+- **Technique:** randomized append/transition chaos driver with SIGKILL at
+  arbitrary points; per-op fsynced ack log including transition responses.
+- **Oracle:** every acked seq readable through the merged tier view with
+  the correct payload (green-but-broken audit), plus a post-recovery append
+  landing at the contiguous next seq.
+- **Target test file:** `ops/local-ci/tests/auto/S15_lifecycle_transitions_survive_sigkill_chaos.sh`
+- **Status:** implemented, wired into nightly/release runner. **Found two
+  pre-existing data-loss bugs on first run**: (1) the startup orphan sweep
+  deleted all sealed-segment/archive/replay-prefix blobs (its referenced
+  set held only artifact ids) — every persistent restart destroyed tiered
+  history; (2) the merged read treated archive and sealed segments as
+  mutually exclusive, so post-archive segments were invisible and the next
+  archive compaction permanently destroyed them. Both fixed with pinned
+  regression tests (`runtime_restart::orphan_reconciliation_keeps_segment_and_archive_blobs_across_restart`,
+  `lifecycle_gc::post_archive_segments_stay_readable_and_survive_recompaction`).
+
+### Scenario S16: restore_from_bucket_drill_bounds_rpo (implemented 2026-08-30)
+
+- **Falsifies if it FAILs:** the recovery-root claim — after total loss of
+  the data directory, `agentdb restore-from-bucket` rebuilds the node and
+  every event acknowledged before the newest recovery manifest survives.
+- **Technique:** seed acked events, confirm a manifest backup via
+  `GET /api/admin/recovery`, SIGKILL, `rm -rf` the data directory, restore
+  from the bucket, restart, verify.
+- **Oracle:** all manifest-covered events present; post-manifest events may
+  be lost (that gap is exactly what `recovery_lag_ms` reports).
+- **Target test file:** `ops/local-ci/tests/auto/S16_restore_from_bucket_drill_bounds_rpo.sh`
+- **Status:** implemented, wired into nightly/release runner; passing.
 
 ## 7b. Coverage adequacy argument
 

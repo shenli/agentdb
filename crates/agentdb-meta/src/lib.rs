@@ -27,7 +27,6 @@ pub mod nodes;
 pub mod placement_scopes;
 pub mod routing;
 pub mod scheduler;
-pub mod scram;
 pub mod session_locators;
 pub mod session_overrides;
 pub mod shards;
@@ -41,7 +40,6 @@ pub mod tablets;
 pub mod tenant_policies;
 pub mod tenant_quotas;
 pub mod tenants;
-pub mod users;
 
 pub use error::{MetaError, MetaResult};
 

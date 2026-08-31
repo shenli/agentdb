@@ -49,16 +49,3 @@ ops/local-ci/scripts/local-ci.sh
   database versions, and whether the result is single-node or replicated.
 - Keep AgentDB-owned package metadata MIT-only. Dependency licenses remain their
   own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## MongoDB Wire Adapter Changes
-
-AgentDB's MongoDB listener is a limited compatibility adapter, not a general
-MongoDB-compatible database. For changes in that area, run:
-
-```bash
-cargo check -q -p agentdb-server
-cargo test -q -p agentdb-wire
-```
-
-See [docs/reference/mongodb-compatibility.md](docs/reference/mongodb-compatibility.md)
-for the supported command subset.

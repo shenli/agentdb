@@ -37,6 +37,9 @@ public docs path.
   restore, upgrade, and troubleshooting for the supported single-node shape
 - [operations/single-node-production-checklist.md](operations/single-node-production-checklist.md)
   - preflight gate before exposing a persistent single node
+- [operations/recovery.md](operations/recovery.md) - object storage as the
+  recovery root: recovery manifests, `recovery_lag_ms`, and
+  `agentdb restore-from-bucket`.
 - [operations/backup-verification.md](operations/backup-verification.md) -
   backup manifest validation, tablet checkpoint checks, scratch install drills,
   and recovery boundaries
@@ -86,13 +89,7 @@ small repo-wide entrypoints.
 
 ## Reference
 
-- [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API, SDK surface,
-  and MongoDB compatibility subset
-- [reference/mongodb-compatibility.md](reference/mongodb-compatibility.md) -
-  MongoDB client tutorial, mapping rules, limitations, and AI coding-agent
-  guidance
-- [../examples/mongodb/README.md](../examples/mongodb/README.md) - copyable
-  MongoDB client examples for Node and Python
+- [reference/api-sdk.md](reference/api-sdk.md) - native HTTP API and SDK surface
 - [reference/session-event-conventions.md](reference/session-event-conventions.md)
   - canonical event payload conventions
 - [reference/sandbox-snapshot-contract.md](reference/sandbox-snapshot-contract.md)

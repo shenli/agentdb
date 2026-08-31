@@ -14,7 +14,6 @@ bin/agentdb-server
         |
         v
 crates/agentdb-api        bearer-protected tenant-scoped /api/... HTTP routes
-        |                 optional MongoDB wire listener maps to runtime calls
         |                 export/watch/backfill/consumer admin routes
         |                 public liveness/readiness and embedded dashboard
         |
@@ -78,8 +77,8 @@ Normal single-node runtime settings are not configured through environment
 variables. Docker, Compose, and Helm should mount a config file and start the
 server with `--config`. Secrets are deliberate exceptions:
 `AGENTDB_API_AUTH_TOKEN` / `AGENTDB_API_AUTH_PREVIOUS_TOKEN` keep external API
-credentials out of the file, and the internal Raft and Mongo credentials have
-their own environment overrides. Startup hydration safety caps are also
+credentials out of the file, and the internal Raft credentials have their own
+environment overrides. Startup hydration safety caps are also
 environment overrides because they are operational guardrails rather than
 durable data semantics.
 
@@ -167,22 +166,9 @@ still treats tenant IDs as the routing, policy, quota, lifecycle, watch,
 storage-accounting, and admin boundary; this is SDK/API ergonomics on top of a
 multi-tenant runtime, not a tenantless data model.
 
-There is no version-gating server flag or maintained Go SDK in the current
-workspace.
-
-An optional MongoDB compatibility listener can be enabled with `--mongo-bind` or
-`[mongodb].bind`. It is intentionally narrow: initial support covers basic
-handshake, collection discovery, `insert`, `find`, `count`, limited
-`aggregate`, no-op `createIndexes`, and request/response AgentDB extension
-commands such as `agentdbAppendAndFetch`, `agentdbFork`, `agentdbReplay`, and
-`agentdbContext`. It is an adapter onto `agentdb-core`, not a separate storage
-path or full MongoDB clone.
-
-The compatibility layer maps MongoDB database names to tenant external keys and
-fixed collection names such as `events`, `sessions`, `records`, `artifacts`,
-and `skills` to AgentDB runtime objects. It accepts MongoDB-style access for
-driver/tool convenience, while AgentDB extension commands expose runtime
-operations that do not fit normal CRUD.
+The workspace intentionally does not maintain a version-gating server flag, a
+Go SDK, a MongoDB wire-compatibility listener, or a SlateDB `KvStore` backend.
+The native HTTP API is the only client protocol.
 
 ## Record Index Consistency
 
@@ -323,19 +309,14 @@ after each processed batch.
 
 ## Storage
 
-The runtime persists metadata through `KvStore`. The server now supports:
+The runtime persists metadata through `KvStore`. The supported backend is
+`RocksKvStore` for local-disk runtime metadata. Persistent single-node RocksDB
+mode stores runtime metadata under `<data-dir>/runtime`.
 
-- `RocksKvStore` for local-disk runtime metadata
-- `SlateKvStore` for object-store-backed runtime metadata
-
-Persistent single-node RocksDB mode stores runtime metadata under
-`<data-dir>/runtime`. SlateDB mode stores runtime metadata under the fixed
-object-store prefix `agentdb/runtime`.
-
-SlateDB is currently an optional evaluation backend, not the target production
-commit path. It proves that the `KvStore` abstraction can run over object
-storage, but it is not a replication mechanism and does not replace a
-multi-node consensus protocol. The production direction for clustered hot
+An object-store-backed `KvStore` (SlateDB) was evaluated and retired. The
+evaluation confirmed that the `KvStore` abstraction can run over object
+storage, but object storage is not a replication mechanism and does not replace
+a multi-node consensus protocol. The production direction for clustered hot
 writes is a replicated local log/tablet path that commits after quorum, with
 object-store upload happening asynchronously for sealed history, artifacts, and
 archives.
@@ -390,12 +371,12 @@ closed. `AGENTDB_STARTUP_MAX_CONTENT_OBJECTS` changes that explicit bound.
 Artifact policies default to 16 MiB per object and clamp at the 128 MiB
 absolute request/runtime limit.
 
-The storage crate still contains lower-level RocksDB/SlateDB primitives and KV
+The storage crate still contains lower-level RocksDB primitives and KV
 contract tests because the runtime reuses those foundations.
 
-The runtime code itself is `KvStore`-agnostic, so tiered session metadata works
-with either `RocksKvStore` or `SlateKvStore`. The `agentdb-server` binary now
-selects the KV backend and content backend from `agentdb.toml`.
+The runtime code itself is `KvStore`-agnostic; tiered session metadata works
+with any conforming `KvStore` implementation. The `agentdb-server` binary
+selects the content backend from `agentdb.toml`.
 
 The current runtime still hydrates persisted metadata and in-memory record
 indexes during startup. A preflight applies these defaults before hydration:
