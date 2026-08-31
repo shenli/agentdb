@@ -2732,6 +2732,35 @@ fn spawn_raft_rs_tick_worker(
     stale_node_threshold_ms: i64,
 ) {
     let interval = interval.max(Duration::from_millis(50));
+    // Task A: the raw raft tick. Heartbeats, election timeouts, and
+    // retransmission all hang off this clock, so NOTHING here may touch the
+    // metadata database — a control-plane SQL stall used to gate the tick
+    // and freeze in-flight commits for the full append timeout (seen as
+    // 60s write stalls in the S8 real-cluster smoke).
+    {
+        let registry = registry.clone();
+        let local_node_id = local_node_id.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                for (tablet_id, group) in registry.groups_snapshot() {
+                    if let Err(error) = group.tick(local_raft_node_id) {
+                        tracing::warn!(
+                            tablet_id,
+                            local_node_id,
+                            local_raft_node_id,
+                            ?error,
+                            "failed to tick local raft-rs group"
+                        );
+                    }
+                }
+            }
+        });
+    }
+    // Task B: failover evaluation. This one is legitimately SQL-driven
+    // (owner/leader liveness comes from the control plane); a slow metadata
+    // database now only delays failover detection, never the raft clock.
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
@@ -2886,15 +2915,6 @@ fn spawn_raft_rs_tick_worker(
                                 );
                         }
                     }
-                }
-                if let Err(error) = group.tick(local_raft_node_id) {
-                    tracing::warn!(
-                        tablet_id,
-                        local_node_id,
-                        local_raft_node_id,
-                        ?error,
-                        "failed to tick local raft-rs group"
-                    );
                 }
             }
         }
@@ -3096,7 +3116,9 @@ async fn run_raft_rs_message_outbox_tick(
     outbox: &agentdb_api::internal_raft_http::RaftRsHttpOutbox,
     max_messages_per_tick: usize,
 ) -> anyhow::Result<usize> {
-    refresh_raft_rs_peer_urls(meta, registry, outbox).await?;
+    // Peer URLs are seeded at startup and kept fresh by the dedicated
+    // change-notified refresher; re-resolving them via SQL on every send
+    // tick let a metadata-database stall stop message pumping entirely.
     let mut sent = 0usize;
     for (tablet_id, group) in registry.groups_snapshot() {
         if sent >= max_messages_per_tick {
@@ -3135,16 +3157,19 @@ async fn flush_raft_rs_group_messages_with_health(
     }
     let mut sent = 0usize;
     let mut failed = Vec::new();
+    // Latest observed health per peer this tick. The send loop itself must
+    // stay free of SQL: two round trips per raft message turned retransmit
+    // bursts into a self-amplifying control-plane storm (slow DB -> stalled
+    // sends -> more retransmits -> more health updates).
+    let mut peer_health: BTreeMap<u64, &'static str> = BTreeMap::new();
     for (index, message) in messages.iter().take(send_limit).cloned().enumerate() {
         match outbox.send_message_to_peer(&message).await {
             Ok(()) => {
-                set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "healthy")
-                    .await?;
+                peer_health.insert(message.to, "healthy");
                 sent += 1;
             }
             Err(error) => {
-                set_raft_replica_health_by_raft_node_id(meta, tablet_id, message.to, "unreachable")
-                    .await?;
+                peer_health.insert(message.to, "unreachable");
                 tracing::debug!(
                     tablet_id,
                     from = message.from,
@@ -3158,6 +3183,33 @@ async fn flush_raft_rs_group_messages_with_health(
     }
     if !failed.is_empty() {
         group.restore_wire_messages(failed)?;
+    }
+    // Health reporting is advisory (it feeds failover candidate selection);
+    // write it deduped and time-boxed so a stalled metadata database costs
+    // this tick at most the budget, never the message pump.
+    let health_budget = Duration::from_millis(2_000);
+    let report = async {
+        for (raft_node_id, health) in &peer_health {
+            if let Err(error) =
+                set_raft_replica_health_by_raft_node_id(meta, tablet_id, *raft_node_id, health)
+                    .await
+            {
+                tracing::warn!(
+                    tablet_id,
+                    raft_node_id,
+                    health,
+                    ?error,
+                    "failed to report raft replica health"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(health_budget, report).await.is_err() {
+        tracing::warn!(
+            tablet_id,
+            budget_ms = health_budget.as_millis() as u64,
+            "raft replica health reporting exceeded its budget; dropped this tick"
+        );
     }
     Ok(sent)
 }
