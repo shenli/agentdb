@@ -371,3 +371,147 @@ async fn concurrent_traffic_survives_repeated_cache_eviction() {
         }
     }
 }
+
+/// Stage 2: a lazy runtime starts with empty metadata caches, serves
+/// everything through the KV fallback, and the eviction sweep keeps the
+/// cache bounded without breaking traffic.
+#[tokio::test]
+async fn lazy_runtime_serves_cold_and_eviction_sweep_bounds_the_cache() {
+    use agentdb_core::runtime::HydrationMode;
+
+    let kv: Arc<dyn KvStore + Send + Sync> = Arc::new(InMemoryKvStore::default());
+    let content: Arc<dyn ContentBackend> = Arc::new(InMemoryContentBackend::default());
+
+    // Seed through a full runtime, then reopen lazily over the same KV.
+    let (tenant_id, agent_id, session_ids) = {
+        let rt = Runtime::with_kv(kv.clone(), content.clone());
+        let t = rt
+            .create_tenant(NewTenant {
+                external_key: "lazy-mode".into(),
+                policy: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let a = rt
+            .create_agent(NewAgent {
+                tenant_id: t.tenant_id.clone(),
+                alias: None,
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let s = rt
+                .create_session(NewSession {
+                    tenant_id: t.tenant_id.clone(),
+                    agent_id: a.agent_id.clone(),
+                    alias: None,
+                })
+                .await
+                .unwrap();
+            rt.append(AppendRequest::simple(
+                &t,
+                &a,
+                &s,
+                "message",
+                serde_json::json!({"seed": true}),
+            ))
+            .await
+            .unwrap();
+            ids.push(s.session_id);
+        }
+        (t.tenant_id, a.agent_id, ids)
+    };
+
+    let rt = Runtime::with_kv_and_hydration_mode(kv, content, HydrationMode::Lazy);
+
+    // Cold start: enumeration sees the full population despite empty caches.
+    let listed = rt.list_sessions(&tenant_id).await.unwrap();
+    assert_eq!(listed.len(), 8, "lazy enumeration reads KV, not the cache");
+
+    // Traffic works cold, and appends stay contiguous.
+    for session_id in &session_ids {
+        let events = rt
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                from_seq: 0,
+                limit: usize::MAX,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    // The cache is now warm with 8 sessions; a sweep with a cap of 4 clears
+    // it, and traffic keeps flowing through the fallback afterwards.
+    let evicted = rt.sweep_metadata_cache_with_caps(10_000, 10_000, 4, 10_000).await;
+    assert!(evicted >= 8, "sweep cleared the oversized session cache: {evicted}");
+
+    let t = rt.get_tenant(&tenant_id).await.unwrap();
+    let a = rt.get_agent(&tenant_id, &agent_id).await.unwrap();
+    for (i, session_id) in session_ids.iter().enumerate() {
+        let s = rt.get_session(&tenant_id, session_id).await.unwrap();
+        let resp = rt
+            .append(AppendRequest::simple(
+                &t,
+                &a,
+                &s,
+                "message",
+                serde_json::json!({"post_evict": i}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.seq, 1, "contiguous after eviction");
+    }
+
+    // Chaos: concurrent traffic racing an aggressive sweeper.
+    let mut tasks = Vec::new();
+    for session_id in session_ids.iter().cloned() {
+        let rt = rt.clone();
+        let (t, a) = (t.clone(), a.clone());
+        let tid = tenant_id.clone();
+        tasks.push(tokio::spawn(async move {
+            let s = rt.get_session(&tid, &session_id).await.unwrap();
+            for n in 0..25u64 {
+                let resp = rt
+                    .append(AppendRequest::simple(
+                        &t,
+                        &a,
+                        &s,
+                        "message",
+                        serde_json::json!({"n": n}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.seq, 2 + n);
+            }
+        }));
+    }
+    {
+        let rt = rt.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..100 {
+                rt.sweep_metadata_cache_with_caps(0, 0, 0, 0).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    for session_id in &session_ids {
+        let events = rt
+            .fetch_from_seq(FetchRequest {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                from_seq: 0,
+                limit: usize::MAX,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 27, "seed + post-evict + 25 chaos appends");
+    }
+}

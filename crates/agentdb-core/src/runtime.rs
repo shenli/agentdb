@@ -1377,6 +1377,7 @@ fn priority_rank(p: Priority) -> u8 {
 
 pub struct Runtime {
     state: Mutex<State>,
+    hydration_mode: HydrationMode,
     session_commit_locks: StdMutex<BTreeMap<String, Weak<Mutex<()>>>>,
     session_append_queues: StdMutex<BTreeMap<String, Weak<SessionAppendQueue>>>,
     idem: IdempotencyStore,
@@ -2729,6 +2730,7 @@ impl Runtime {
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            hydration_mode: HydrationMode::Full,
             session_commit_locks: StdMutex::new(BTreeMap::new()),
             session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
@@ -2746,6 +2748,7 @@ impl Runtime {
     pub fn in_memory_with_kms(kms: Arc<dyn KmsKeyResolver>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            hydration_mode: HydrationMode::Full,
             session_commit_locks: StdMutex::new(BTreeMap::new()),
             session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
@@ -2766,6 +2769,7 @@ impl Runtime {
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            hydration_mode: HydrationMode::Full,
             session_commit_locks: StdMutex::new(BTreeMap::new()),
             session_append_queues: StdMutex::new(BTreeMap::new()),
             idem: IdempotencyStore::default(),
@@ -3053,13 +3057,58 @@ impl Runtime {
         content_crypto: Arc<dyn ContentCryptoAdapter>,
         tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
     ) -> Arc<Self> {
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            kms,
+            content_crypto,
+            tablet_router,
+            None,
+        )
+    }
+
+    /// Test-only constructor variant with an explicit hydration mode, so
+    /// tests can exercise lazy hydration without racing on process-global
+    /// environment variables.
+    #[doc(hidden)]
+    pub fn with_kv_and_hydration_mode(
+        kv: Arc<dyn KvStore + Send + Sync>,
+        content: Arc<dyn ContentBackend>,
+        mode: HydrationMode,
+    ) -> Arc<Self> {
+        let runtime_kv = Arc::new(
+            RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
+                .expect("open runtime tablet state"),
+        );
+        let persist = Persist::with_metadata_crypto(
+            runtime_kv,
+            Arc::new(IdentityMetadataCryptoAdapter),
+        );
+        Self::from_persist_with_tablet_router_and_mode(
+            persist,
+            content,
+            Arc::new(AllowAllKmsKeyResolver),
+            Arc::new(IdentityContentCryptoAdapter),
+            None,
+            Some(mode),
+        )
+    }
+
+    fn from_persist_with_tablet_router_and_mode(
+        persist: Persist,
+        content: Arc<dyn ContentBackend>,
+        kms: Arc<dyn KmsKeyResolver>,
+        content_crypto: Arc<dyn ContentCryptoAdapter>,
+        tablet_router: Option<Arc<RuntimeTabletRouterKvStore>>,
+        hydration_override: Option<HydrationMode>,
+    ) -> Arc<Self> {
         // Replicated runtimes rebuild full state on Raft apply, so they
         // always hydrate fully; lazy mode is a single-node startup
         // optimization until Stage 3 makes apply incremental.
         let hydration_mode = if tablet_router.is_some() {
             HydrationMode::Full
         } else {
-            startup_hydration_mode()
+            hydration_override.unwrap_or_else(startup_hydration_mode)
         };
         enforce_startup_hydration_limits(&persist, hydration_mode)
             .expect("startup hydration limits");
@@ -3069,6 +3118,7 @@ impl Runtime {
 
         Arc::new(Self {
             state: Mutex::new(hydration.state),
+            hydration_mode,
             session_commit_locks: StdMutex::new(BTreeMap::new()),
             session_append_queues: StdMutex::new(BTreeMap::new()),
             idem,
@@ -4036,6 +4086,75 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    /// Metadata-cache eviction caps: when a cached map grows past its cap,
+    /// the sweep clears it (rows reload on demand through the KV fallback).
+    /// Defaults match the historical hydration caps, so a lazy runtime's
+    /// resident metadata never exceeds what full hydration would have held.
+    fn metadata_cache_cap(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    }
+
+    /// Evict oversized metadata caches (lazy mode only — in full hydration
+    /// the maps ARE the hydrated working set and eviction would fight the
+    /// hydrator). Whole-map clear is deliberate: entries carry no recency
+    /// information, every read path tolerates a cold cache (Stage 1's
+    /// eviction-chaos test is the proof), and point reloads are cheap.
+    /// Alias maps are exempt — fork/create hold in-memory alias
+    /// *reservations* that are not yet durable, and they are small.
+    pub async fn sweep_metadata_cache(&self) -> usize {
+        let max_tenants =
+            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_TENANTS", 10_000);
+        let max_agents =
+            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_AGENTS", 100_000);
+        let max_sessions =
+            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_SESSIONS", 250_000);
+        let max_artifacts =
+            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_ARTIFACTS", 250_000);
+        self.sweep_metadata_cache_with_caps(max_tenants, max_agents, max_sessions, max_artifacts)
+            .await
+    }
+
+    /// Caps-explicit sweep core; public for deterministic tests.
+    #[doc(hidden)]
+    pub async fn sweep_metadata_cache_with_caps(
+        &self,
+        max_tenants: usize,
+        max_agents: usize,
+        max_sessions: usize,
+        max_artifacts: usize,
+    ) -> usize {
+        if self.hydration_mode != HydrationMode::Lazy {
+            return 0;
+        }
+        let mut evicted = 0usize;
+        let mut s = self.state.lock().await;
+        if s.sessions.len() > max_sessions {
+            evicted += s.sessions.len();
+            s.sessions.clear();
+        }
+        if s.artifacts.len() > max_artifacts {
+            evicted += s.artifacts.len();
+            s.artifacts.clear();
+        }
+        if s.agents.len() > max_agents {
+            evicted += s.agents.len();
+            s.agents.clear();
+        }
+        if s.tenants.len() > max_tenants {
+            evicted += s.tenants.len();
+            s.tenants.clear();
+            s.tenant_aggregate_cache.clear();
+        }
+        if evicted > 0 {
+            tracing::info!(evicted, "metadata cache sweep cleared oversized maps");
+        }
+        evicted
     }
 
     /// Test-only: drop the metadata caches so the KV fallback path is
@@ -10682,6 +10801,12 @@ impl Runtime {
         let sweep_every = (std::time::Duration::from_secs(300).as_millis()
             / interval.as_millis().max(1))
             .max(1) as u64;
+        let cache_sweep_ms: u128 = std::env::var("AGENTDB_METADATA_CACHE_SWEEP_MS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(60_000);
+        let cache_sweep_every =
+            (cache_sweep_ms / interval.as_millis().max(1)).max(1) as u64;
         tokio::spawn(async move {
             let mut ticks: u64 = 0;
             loop {
@@ -10694,6 +10819,9 @@ impl Runtime {
                 ticks += 1;
                 if ticks % sweep_every == 0 {
                     self.sweep_idempotency_retention();
+                }
+                if ticks % cache_sweep_every == 0 {
+                    self.sweep_metadata_cache().await;
                 }
                 tokio::time::sleep(interval).await;
             }

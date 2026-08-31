@@ -13,8 +13,8 @@ Usage: ops/local-ci/scripts/distributed-test-runner.sh [OPTIONS]
 
 Runs the distributed test plan gates intended for li-dev:
   quick    - authored Rust auto suites
-  nightly  - quick + S14-S16 crash/chaos + S8 + S9 + S13 smoke
-  release  - quick + S14-S16 crash/chaos + S8 + S9 + S13 release gate
+  nightly  - quick + S14-S17 crash/chaos + S8 + S9 + S13 smoke
+  release  - quick + S14-S17 crash/chaos + S8 + S9 + S13 release gate
 
 Options:
   --profile NAME     quick, nightly, or release. Defaults to nightly.
@@ -250,12 +250,17 @@ run_s16() {
   run_stage s16-restore-drill bash ops/local-ci/tests/auto/S16_restore_from_bucket_drill_bounds_rpo.sh
 }
 
+run_s17() {
+  run_stage s17-lazy-eviction-chaos bash ops/local-ci/tests/auto/S17_lazy_hydration_and_cache_eviction_survive_sigkill.sh
+}
+
 run_quick
 
 if [[ "$PROFILE" == "nightly" || "$PROFILE" == "release" ]]; then
   run_s14
   run_s15
   run_s16
+  run_s17
   run_s8
   run_s9
   run_s13

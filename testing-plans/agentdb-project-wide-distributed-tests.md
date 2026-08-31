@@ -899,6 +899,24 @@ Verdict legend: covered / partial / not covered. Gap-kind legend: no test / shal
 - **Target test file:** `ops/local-ci/tests/auto/S16_restore_from_bucket_drill_bounds_rpo.sh`
 - **Status:** implemented, wired into nightly/release runner; passing.
 
+### Scenario S17: lazy_hydration_and_cache_eviction_survive_sigkill (implemented 2026-08-31)
+
+- **Falsifies if it FAILs:** the KV-authoritative-state claim — with empty
+  metadata caches at startup (`AGENTDB_STARTUP_HYDRATION=lazy`), eviction
+  caps below the live session count, and sweeps every 200ms wiping warm
+  entries mid-traffic, every acknowledged append must survive SIGKILL and a
+  cold lazy restart with contiguous per-session sequences and correct
+  payloads.
+- **Technique:** real-binary chaos: round-robin appends across more
+  sessions than the cache cap holds, adversarial cache env, SIGKILL
+  mid-stream, per-op fsynced ack log, per-session payload audit.
+- **Target test file:** `ops/local-ci/tests/auto/S17_lazy_hydration_and_cache_eviction_survive_sigkill.sh`
+- **Status:** implemented, wired into nightly/release runner; passing
+  (~880 acked appends per cycle with the cache wiped ~7 times per cycle).
+  The in-process counterpart is `kv_authoritative_reads.rs` (eviction-chaos
+  and zero-cap sweeper tests), which runs in the quick profile in both
+  hydration modes.
+
 ## 7b. Coverage adequacy argument
 
 | Claim | Threat model (how it could fail) | Scenarios that exercise the threats | Why these are sufficient |
