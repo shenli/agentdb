@@ -75,3 +75,67 @@ pub fn parse_id_or(
     agentdb_core::Id::parse_kind(s, kind)
         .map_err(|e| ApiError(Error::new(not_found_code, e.to_string())))
 }
+
+/// Response-mapping middleware: any client-error response under `/api/` that
+/// is not already JSON (axum extractor rejections — malformed bodies, wrong
+/// content type, unknown routes, oversized payloads — are plain text) gets
+/// wrapped in the standard error envelope. Agents parse errors as JSON; a
+/// text/plain 4xx breaks every SDK error path. Pinned by the
+/// agent-experience eval suite against the LLMS.md contract.
+pub async fn envelope_plain_client_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let response = next.run(request).await;
+    if !is_api || !response.status().is_client_error() {
+        return response;
+    }
+    let already_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if already_json {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let mut message = String::from_utf8_lossy(&bytes).trim().to_string();
+    if message.is_empty() {
+        message = parts
+            .status
+            .canonical_reason()
+            .unwrap_or("bad request")
+            .to_string();
+    }
+    let code = match parts.status {
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::METHOD_NOT_ALLOWED => "METHOD_NOT_ALLOWED",
+        StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "UNSUPPORTED_MEDIA_TYPE",
+        StatusCode::UNPROCESSABLE_ENTITY => "UNPROCESSABLE_ENTITY",
+        _ => "BAD_REQUEST",
+    };
+    let mut wrapped = (
+        parts.status,
+        Json(serde_json::json!({
+            "code": code,
+            "message": message,
+            "retryable": false
+        })),
+    )
+        .into_response();
+    // Preserve auth challenges and similar contract headers if present.
+    for header in [
+        axum::http::header::WWW_AUTHENTICATE,
+        axum::http::header::RETRY_AFTER,
+    ] {
+        if let Some(value) = parts.headers.get(&header) {
+            wrapped.headers_mut().insert(header.clone(), value.clone());
+        }
+    }
+    wrapped
+}

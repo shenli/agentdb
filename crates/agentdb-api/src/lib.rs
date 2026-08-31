@@ -25,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             auth::authorize_external_api,
         ))
+        .layer(middleware::from_fn(errors::envelope_plain_client_errors))
         .with_state(state)
 }
 

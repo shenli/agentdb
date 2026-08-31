@@ -13,8 +13,8 @@ Usage: ops/local-ci/scripts/distributed-test-runner.sh [OPTIONS]
 
 Runs the distributed test plan gates intended for li-dev:
   quick    - authored Rust auto suites
-  nightly  - quick + S14-S18 crash/chaos + S8 + S9 + S13 smoke
-  release  - quick + S14-S18 crash/chaos + S8 + S9 + S13 release gate
+  nightly  - quick + S14-S18 crash/chaos + agent-experience evals + S8 + S9 + S13 smoke
+  release  - quick + S14-S18 crash/chaos + agent-experience evals + S8 + S9 + S13 release gate
 
 Options:
   --profile NAME     quick, nightly, or release. Defaults to nightly.
@@ -258,6 +258,10 @@ run_s18() {
   run_stage s18-index-snapshot-chaos bash ops/local-ci/tests/auto/S18_record_index_snapshots_survive_sigkill.sh
 }
 
+run_agent_evals() {
+  run_stage agent-experience-evals bash ops/evals/agent-experience-eval.sh
+}
+
 run_quick
 
 if [[ "$PROFILE" == "nightly" || "$PROFILE" == "release" ]]; then
@@ -266,6 +270,7 @@ if [[ "$PROFILE" == "nightly" || "$PROFILE" == "release" ]]; then
   run_s16
   run_s17
   run_s18
+  run_agent_evals
   run_s8
   run_s9
   run_s13

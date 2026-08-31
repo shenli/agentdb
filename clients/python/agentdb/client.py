@@ -164,12 +164,21 @@ class AgentDB:
                     raise
             else:
                 resolved = _workspace_from_user_info(info, name)
-                if resolved is None:
+                if resolved is not None:
+                    resolved_id, resolved_name, data = resolved
+                    return Workspace(
+                        self.client, resolved_id, name=resolved_name or name, data=data
+                    )
+                if _user_info_is_tenant_bound(info):
+                    # The credential IS bound to a workspace, just not the
+                    # requested one — surfacing that beats silently creating
+                    # a tenant the token cannot reach.
                     raise ValueError(
                         "authenticated user-info did not include an allowed workspace"
                     )
-                resolved_id, resolved_name, data = resolved
-                return Workspace(self.client, resolved_id, name=resolved_name or name, data=data)
+                # Unbound principals (root/admin/readonly, or a dev server
+                # with auth open) fall through to the list/create bootstrap
+                # flow below.
 
         for tenant in _optional_list(self.client, "list_tenants"):
             if tenant.get("external_key") == external_key:
@@ -1159,6 +1168,16 @@ def _workspace_from_user_info(
         if tenant_id is not None:
             return tenant_id, _workspace_name(current), current
     return None
+
+
+def _user_info_is_tenant_bound(info: dict) -> bool:
+    """True when the principal carries any workspace binding at all."""
+
+    return (
+        isinstance(info.get("tenant_id"), str)
+        or bool(info.get("workspaces"))
+        or isinstance(info.get("workspace"), dict)
+    )
 
 
 def _workspace_tenant_id(workspace: dict) -> Optional[str]:

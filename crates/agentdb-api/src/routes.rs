@@ -487,10 +487,28 @@ async fn mint_admin_token(
     ))
 }
 
+/// `GET /api/me`: the caller's principal. Tenant-scoped bearers also get
+/// their workspace spelled out (`tenant` + a one-entry `workspaces` list)
+/// so SDKs can bind a workspace handle from the credential alone.
 async fn get_me(
+    State(s): State<AppState>,
     axum::Extension(principal): axum::Extension<crate::auth::ApiPrincipal>,
-) -> Json<crate::auth::ApiPrincipal> {
-    Json(principal)
+) -> Json<serde_json::Value> {
+    let mut body = serde_json::to_value(&principal).expect("principal serializes");
+    if let crate::auth::ApiPrincipal::Tenant { tenant_id, .. } = &principal {
+        if let Ok(tid) = agentdb_core::Id::parse_kind(tenant_id, IdKind::Tenant) {
+            if let Ok(tenant) = s.runtime.get_tenant(&tid).await {
+                let workspace = serde_json::json!({
+                    "tenant_id": tenant.tenant_id,
+                    "name": tenant.external_key,
+                    "external_key": tenant.external_key,
+                });
+                body["tenant"] = serde_json::to_value(&tenant).expect("tenant serializes");
+                body["workspaces"] = serde_json::json!([workspace]);
+            }
+        }
+    }
+    Json(body)
 }
 
 async fn list_admin_tokens(
