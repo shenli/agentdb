@@ -842,8 +842,14 @@ async fn post_archive_segments_stay_readable_and_survive_recompaction() {
         .transition_session_lifecycle(&tenant.tenant_id, &session.session_id, Lifecycle::Cold)
         .await
         .unwrap();
-    assert!(summary.archive_manifest.is_some(), "archive kept under cold seal");
-    assert_eq!(summary.sealed_segment_count, 1, "post-archive segment sealed");
+    assert!(
+        summary.archive_manifest.is_some(),
+        "archive kept under cold seal"
+    );
+    assert_eq!(
+        summary.sealed_segment_count, 1,
+        "post-archive segment sealed"
+    );
     append(6).await;
 
     let all_tiers = rt
@@ -856,7 +862,11 @@ async fn post_archive_segments_stay_readable_and_survive_recompaction() {
         .await
         .unwrap();
     let seqs: Vec<u64> = all_tiers.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5, 6], "archive + segment + warm merge");
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 3, 4, 5, 6],
+        "archive + segment + warm merge"
+    );
 
     // Re-archive: the new bundle must contain the full history, not just the
     // old bundle's contents.

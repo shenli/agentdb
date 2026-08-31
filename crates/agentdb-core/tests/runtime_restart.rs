@@ -1724,15 +1724,17 @@ async fn orphan_reconciliation_keeps_segment_and_archive_blobs_across_restart() 
     // Restart with the SAME content directory and run the startup sweep, the
     // way `agentdb serve` does before accepting writes.
     let kv = open_kv(kv_dir.path());
-    let content: Arc<dyn ContentBackend> =
-        Arc::new(LocalFsContentBackend::new(content_dir.path()));
+    let content: Arc<dyn ContentBackend> = Arc::new(LocalFsContentBackend::new(content_dir.path()));
     let rt = Runtime::with_kv(kv, content);
     let report = rt.reconcile_orphan_artifact_content().await.unwrap();
     assert_eq!(
         report.orphan_objects_deleted, 0,
         "sweep must not delete referenced segment/archive blobs"
     );
-    assert!(report.referenced_objects >= 2, "archive bundle + sealed segment");
+    assert!(
+        report.referenced_objects >= 2,
+        "archive bundle + sealed segment"
+    );
 
     let events = rt
         .fetch_from_seq(FetchRequest {
@@ -1744,5 +1746,9 @@ async fn orphan_reconciliation_keeps_segment_and_archive_blobs_across_restart() 
         .await
         .unwrap();
     let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, vec![0, 1, 2, 3, 4], "tiered history intact after restart");
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 3, 4],
+        "tiered history intact after restart"
+    );
 }

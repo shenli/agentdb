@@ -901,7 +901,6 @@ fn env_flag_disabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn adaptive_write_loop(
     kv: Arc<dyn KvStore + Send + Sync>,

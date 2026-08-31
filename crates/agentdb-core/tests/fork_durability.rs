@@ -48,7 +48,9 @@ impl KvStore for FailingWritesKv {
         self.check()?;
         self.inner.write_batch(ops)
     }
-    fn snapshot<'a>(&'a self) -> agentdb_storage::Result<Box<dyn agentdb_storage::KvSnapshot + 'a>> {
+    fn snapshot<'a>(
+        &'a self,
+    ) -> agentdb_storage::Result<Box<dyn agentdb_storage::KvSnapshot + 'a>> {
         self.inner.snapshot()
     }
     fn snapshot_owned(
@@ -99,9 +101,15 @@ async fn failed_fork_persist_leaves_no_child_and_releases_alias() {
         })
         .await
         .unwrap();
-    rt.append(AppendRequest::simple(&t, &a, &s, "x", serde_json::json!({})))
-        .await
-        .unwrap();
+    rt.append(AppendRequest::simple(
+        &t,
+        &a,
+        &s,
+        "x",
+        serde_json::json!({}),
+    ))
+    .await
+    .unwrap();
 
     // Arm the fault: the fork's durable write fails, so no child may be
     // published and the alias must be reusable.

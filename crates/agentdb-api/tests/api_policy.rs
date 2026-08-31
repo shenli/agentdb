@@ -727,7 +727,10 @@ async fn exhausted_session_quota_returns_429_with_retry_after() {
     let aid = agent["agent_id"].as_str().unwrap();
 
     app.client
-        .post(format!("{}/api/tenants/{tid}/agents/{aid}/sessions", app.base))
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
         .json(&json!({}))
         .send()
         .await
@@ -739,7 +742,10 @@ async fn exhausted_session_quota_returns_429_with_retry_after() {
     // and the body must say the condition is retryable.
     let shed = app
         .client
-        .post(format!("{}/api/tenants/{tid}/agents/{aid}/sessions", app.base))
+        .post(format!(
+            "{}/api/tenants/{tid}/agents/{aid}/sessions",
+            app.base
+        ))
         .json(&json!({}))
         .send()
         .await

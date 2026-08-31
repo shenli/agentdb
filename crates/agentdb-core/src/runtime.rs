@@ -90,7 +90,9 @@ tokio::task_local! {
 /// helper and re-enter the scope at flush time with
 /// [`with_runtime_tablet_scope_sync`].
 pub(crate) fn current_runtime_tablet_id() -> Option<i64> {
-    CURRENT_RUNTIME_TABLET_ID.try_with(|tablet_id| *tablet_id).ok()
+    CURRENT_RUNTIME_TABLET_ID
+        .try_with(|tablet_id| *tablet_id)
+        .ok()
 }
 
 pub(crate) fn with_runtime_tablet_scope_sync<R>(
@@ -2313,7 +2315,6 @@ fn hydrate_metadata_maps(persist: &Persist, state: &mut State) {
     }
 }
 
-
 fn reconcile_session_next_seq_from_persisted_events(
     state: &mut State,
     tenant_id: &Id,
@@ -3087,10 +3088,8 @@ impl Runtime {
             RuntimeTabletKvStore::single_node(kv, RUNTIME_PRIMARY_TABLET_ID)
                 .expect("open runtime tablet state"),
         );
-        let persist = Persist::with_metadata_crypto(
-            runtime_kv,
-            Arc::new(IdentityMetadataCryptoAdapter),
-        );
+        let persist =
+            Persist::with_metadata_crypto(runtime_kv, Arc::new(IdentityMetadataCryptoAdapter));
         Self::from_persist_with_tablet_router_and_mode(
             persist,
             content,
@@ -3773,7 +3772,9 @@ impl Runtime {
     async fn authoritative_tenant_records(&self, tenant_id: &Id) -> Result<Vec<SearchableRecord>> {
         match &self.persist {
             Some(p) => {
-                let scanned = p.scan_tenant_records(tenant_id.as_str()).map_err(internal)?;
+                let scanned = p
+                    .scan_tenant_records(tenant_id.as_str())
+                    .map_err(internal)?;
                 let s = self.state.lock().await;
                 Ok(scanned
                     .into_iter()
@@ -3929,7 +3930,9 @@ impl Runtime {
     async fn authoritative_tenant_sessions(&self, tenant_id: &Id) -> Result<Vec<Session>> {
         match &self.persist {
             Some(p) => {
-                let scanned = p.scan_tenant_sessions(tenant_id.as_str()).map_err(internal)?;
+                let scanned = p
+                    .scan_tenant_sessions(tenant_id.as_str())
+                    .map_err(internal)?;
                 let s = self.state.lock().await;
                 Ok(scanned
                     .into_iter()
@@ -4076,8 +4079,10 @@ impl Runtime {
                 .count(),
         };
         let mut s = self.state.lock().await;
-        s.tenant_aggregate_cache
-            .insert(tenant_id.as_str().to_string(), (agg, std::time::Instant::now()));
+        s.tenant_aggregate_cache.insert(
+            tenant_id.as_str().to_string(),
+            (agg, std::time::Instant::now()),
+        );
         Ok(agg)
     }
 
@@ -4101,7 +4106,8 @@ impl Runtime {
         let (agents, sessions, artifacts) = match tenant_scope {
             Some(tenant_id) => (
                 p.scan_tenant_agents(tenant_id.as_str()).map_err(internal)?,
-                p.scan_tenant_sessions(tenant_id.as_str()).map_err(internal)?,
+                p.scan_tenant_sessions(tenant_id.as_str())
+                    .map_err(internal)?,
                 p.scan_tenant_artifacts(tenant_id.as_str())
                     .map_err(internal)?,
             ),
@@ -4118,7 +4124,9 @@ impl Runtime {
                 .or_insert(row);
         }
         for row in agents {
-            s.agents.entry(row.agent_id.as_str().to_string()).or_insert(row);
+            s.agents
+                .entry(row.agent_id.as_str().to_string())
+                .or_insert(row);
         }
         for row in sessions {
             s.sessions
@@ -4132,7 +4140,9 @@ impl Runtime {
         }
         drop(s);
         let records = match tenant_scope {
-            Some(tenant_id) => p.scan_tenant_records(tenant_id.as_str()).map_err(internal)?,
+            Some(tenant_id) => p
+                .scan_tenant_records(tenant_id.as_str())
+                .map_err(internal)?,
             None => p.scan_all_records().map_err(internal)?,
         };
         let mut s = self.state.lock().await;
@@ -4180,12 +4190,9 @@ impl Runtime {
     /// Alias maps are exempt — fork/create hold in-memory alias
     /// *reservations* that are not yet durable, and they are small.
     pub async fn sweep_metadata_cache(&self) -> usize {
-        let max_tenants =
-            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_TENANTS", 10_000);
-        let max_agents =
-            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_AGENTS", 100_000);
-        let max_sessions =
-            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_SESSIONS", 250_000);
+        let max_tenants = Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_TENANTS", 10_000);
+        let max_agents = Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_AGENTS", 100_000);
+        let max_sessions = Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_SESSIONS", 250_000);
         let max_artifacts =
             Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_ARTIFACTS", 250_000);
         self.sweep_metadata_cache_with_caps(max_tenants, max_agents, max_sessions, max_artifacts)
@@ -4206,8 +4213,7 @@ impl Runtime {
         }
         let mut evicted = 0usize;
         let mut s = self.state.lock().await;
-        let max_records =
-            Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_RECORDS", 100_000);
+        let max_records = Self::metadata_cache_cap("AGENTDB_METADATA_CACHE_MAX_RECORDS", 100_000);
         if s.records.len() > max_records {
             evicted += s.records.len();
             s.records.clear();
@@ -4267,9 +4273,7 @@ impl Runtime {
                     .get(tenant_id.as_str())
                     .filter(|t| t.deleted_at_ms.is_none())
                     .cloned()
-                    .ok_or_else(|| {
-                        Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id))
-                    })
+                    .ok_or_else(|| Error::new(ErrorCode::TenantNotFound, format!("{}", tenant_id)))
             };
             match result {
                 Err(e) if Self::metadata_cache_miss_retryable(e.code) && attempt < 15 => continue,
@@ -4280,10 +4284,7 @@ impl Runtime {
     }
 
     pub async fn list_tenants(&self) -> Vec<Tenant> {
-        let mut tenants = self
-            .authoritative_all_tenants()
-            .await
-            .unwrap_or_default();
+        let mut tenants = self.authoritative_all_tenants().await.unwrap_or_default();
         tenants.retain(|t| t.deleted_at_ms.is_none());
         tenants
     }
@@ -4953,7 +4954,8 @@ impl Runtime {
     pub async fn create_agent(&self, req: NewAgent) -> Result<Agent> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
         if let Some(alias) = req.alias.as_deref() {
-            self.ensure_agent_alias_cached(&req.tenant_id, alias).await?;
+            self.ensure_agent_alias_cached(&req.tenant_id, alias)
+                .await?;
         }
         // Quota admission uses the authoritative count (max_age ZERO), not
         // the cache, so lazy hydration cannot under-count.
@@ -5033,9 +5035,11 @@ impl Runtime {
         session_id: Option<Id>,
     ) -> Result<Session> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
+        self.ensure_agent_cached(&req.tenant_id, &req.agent_id)
+            .await?;
         if let Some(alias) = req.alias.as_deref() {
-            self.ensure_session_alias_cached(&req.tenant_id, alias).await?;
+            self.ensure_session_alias_cached(&req.tenant_id, alias)
+                .await?;
         }
         let agg = self
             .tenant_aggregates_cached(&req.tenant_id, std::time::Duration::ZERO)
@@ -5123,9 +5127,11 @@ impl Runtime {
 
     pub async fn fork_session(&self, req: ForkSessionRequest) -> Result<Session> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_session_cached(&req.tenant_id, &req.session_id).await?;
+        self.ensure_session_cached(&req.tenant_id, &req.session_id)
+            .await?;
         if let Some(alias) = req.alias.as_deref() {
-            self.ensure_session_alias_cached(&req.tenant_id, alias).await?;
+            self.ensure_session_alias_cached(&req.tenant_id, alias)
+                .await?;
         }
         let child = {
             let mut s = self.state.lock().await;
@@ -5224,7 +5230,8 @@ impl Runtime {
     /// `at_seq` must be within the session's committed range (`<= next_seq`).
     pub async fn record_session_snapshot(&self, req: NewSnapshotRef) -> Result<SnapshotRef> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_session_cached(&req.tenant_id, &req.session_id).await?;
+        self.ensure_session_cached(&req.tenant_id, &req.session_id)
+            .await?;
         if req.layers.is_empty() {
             return Err(Error::new(
                 ErrorCode::PolicyDenied,
@@ -5700,7 +5707,8 @@ impl Runtime {
     /// idempotent even without an Idempotency-Key.
     pub async fn bind_skill(&self, req: BindSkillRequest) -> Result<AgentSkillBinding> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
-        self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
+        self.ensure_agent_cached(&req.tenant_id, &req.agent_id)
+            .await?;
         let idem_full_key = req.idempotency_key.as_ref().map(|k| {
             format!(
                 "{}::{}::{}::{}",
@@ -6050,7 +6058,8 @@ impl Runtime {
     /// A metadata error triggers immediate content cleanup; a process crash in
     /// the narrow interval is repaired by startup orphan reconciliation.
     pub async fn create_artifact(&self, req: NewArtifact, bytes: Vec<u8>) -> Result<Artifact> {
-        self.create_artifact_with_idempotency(req, bytes, None).await
+        self.create_artifact_with_idempotency(req, bytes, None)
+            .await
     }
 
     /// `create_artifact` with retry semantics: a repeated call with the same
@@ -6276,17 +6285,17 @@ impl Runtime {
         let max_objects = startup_hydration_limit("AGENTDB_STARTUP_MAX_CONTENT_OBJECTS", 500_000);
         // Crash-left temporaries first (destructive, startup-only), then the
         // read-only listing used for orphan reconciliation.
-        let temporary_objects_deleted = match self.content.sweep_temporary_objects(max_objects).await
-        {
-            Ok(removed) => removed,
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => 0,
-            Err(error) => {
-                return Err(Error::new(
-                    ErrorCode::Internal,
-                    format!("temporary content sweep failed: {error}"),
-                ))
-            }
-        };
+        let temporary_objects_deleted =
+            match self.content.sweep_temporary_objects(max_objects).await {
+                Ok(removed) => removed,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => 0,
+                Err(error) => {
+                    return Err(Error::new(
+                        ErrorCode::Internal,
+                        format!("temporary content sweep failed: {error}"),
+                    ))
+                }
+            };
         let listing = match self.content.list_objects(max_objects).await {
             Ok(listing) => listing,
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
@@ -6652,23 +6661,24 @@ impl Runtime {
                     }
                 }
 
-                let artifacts = scanned_artifacts
-                    .iter()
-                    .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
-                    .filter(|a| {
-                        tenant_scope
-                            .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
-                            .unwrap_or(true)
-                    })
-                    .filter(|a| {
-                        let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
-                        !policy.retention.legal_hold
-                            && policy.lifecycle.derivative_only_after_ms.is_some_and(|threshold| {
-                                now_ms.saturating_sub(a.created_at_ms) >= threshold
-                            })
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let artifacts =
+                    scanned_artifacts
+                        .iter()
+                        .filter(|a| a.deleted_at_ms.is_none() && a.raw_purged_at_ms.is_none())
+                        .filter(|a| {
+                            tenant_scope
+                                .map(|tenant_id| a.tenant_id.as_str() == tenant_id.as_str())
+                                .unwrap_or(true)
+                        })
+                        .filter(|a| {
+                            let policy = policy_for_tenant_in_state(&s, &a.tenant_id);
+                            !policy.retention.legal_hold
+                                && policy.lifecycle.derivative_only_after_ms.is_some_and(
+                                    |threshold| now_ms.saturating_sub(a.created_at_ms) >= threshold,
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
                 (candidates, artifacts)
             };
 
@@ -7455,7 +7465,8 @@ impl Runtime {
     ) -> Result<AppendCommitResponse> {
         for attempt in 0..16 {
             self.ensure_tenant_cached(&req.tenant_id).await?;
-            self.ensure_agent_cached(&req.tenant_id, &req.agent_id).await?;
+            self.ensure_agent_cached(&req.tenant_id, &req.agent_id)
+                .await?;
             self.ensure_session_cached(&req.tenant_id, &req.session_id)
                 .await?;
             // Source-ref validation reads record rows under the lock; make
@@ -8560,7 +8571,8 @@ impl Runtime {
     pub async fn watch(&self, req: WatchRequest) -> Result<Vec<ChangefeedItem>> {
         self.ensure_tenant_cached(&req.tenant_id).await?;
         if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+            self.ensure_session_cached(&req.tenant_id, session_id)
+                .await?;
         }
         if let Some(agent_id) = req.agent_id.as_ref() {
             self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
@@ -8760,7 +8772,8 @@ impl Runtime {
         }
         self.ensure_tenant_cached(&req.tenant_id).await?;
         if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+            self.ensure_session_cached(&req.tenant_id, session_id)
+                .await?;
         }
         if let Some(agent_id) = req.agent_id.as_ref() {
             self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
@@ -8986,7 +8999,8 @@ impl Runtime {
         validate_export_include(&req.include)?;
         self.ensure_tenant_cached(&req.tenant_id).await?;
         if let Some(session_id) = req.session_id.as_ref() {
-            self.ensure_session_cached(&req.tenant_id, session_id).await?;
+            self.ensure_session_cached(&req.tenant_id, session_id)
+                .await?;
         }
         if let Some(agent_id) = req.agent_id.as_ref() {
             self.ensure_agent_cached(&req.tenant_id, agent_id).await?;
@@ -10308,19 +10322,19 @@ impl Runtime {
         };
         if let Some(candidate) = candidate_id.as_deref() {
             if let Ok(record_id) = Id::parse_kind(candidate, IdKind::Record) {
-                self.ensure_record_cached(&req.tenant_id, &record_id).await?;
+                self.ensure_record_cached(&req.tenant_id, &record_id)
+                    .await?;
             }
         }
         let existing_id = if let Some(candidate) = candidate_id {
             let s = self.state.lock().await;
-            Some(candidate)
-                .filter(|record_id| {
-                    s.records.get(record_id).is_some_and(|record| {
-                        record.tenant_id.as_str() == req.tenant_id.as_str()
-                            && record.deleted_at_ms.is_none()
-                            && !record.is_expired()
-                    })
+            Some(candidate).filter(|record_id| {
+                s.records.get(record_id).is_some_and(|record| {
+                    record.tenant_id.as_str() == req.tenant_id.as_str()
+                        && record.deleted_at_ms.is_none()
+                        && !record.is_expired()
                 })
+            })
         } else {
             None
         };
@@ -10890,13 +10904,12 @@ impl Runtime {
         // delete their durable rows.
         let sweep_every = (std::time::Duration::from_secs(300).as_millis()
             / interval.as_millis().max(1))
-            .max(1) as u64;
+        .max(1) as u64;
         let cache_sweep_ms: u128 = std::env::var("AGENTDB_METADATA_CACHE_SWEEP_MS")
             .ok()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(60_000);
-        let cache_sweep_every =
-            (cache_sweep_ms / interval.as_millis().max(1)).max(1) as u64;
+        let cache_sweep_every = (cache_sweep_ms / interval.as_millis().max(1)).max(1) as u64;
         tokio::spawn(async move {
             let mut ticks: u64 = 0;
             loop {

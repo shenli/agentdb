@@ -15,8 +15,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn rocksdb_roundtrip_through_object_store() {
     let src_dir = TempDir::new().unwrap();
-    let src: Arc<dyn KvStore + Send + Sync> =
-        Arc::new(RocksKvStore::open(src_dir.path()).unwrap());
+    let src: Arc<dyn KvStore + Send + Sync> = Arc::new(RocksKvStore::open(src_dir.path()).unwrap());
     for i in 0..2_500u32 {
         src.put(
             format!("event/ten_1/ses_1/{i:06}").as_bytes(),
@@ -26,8 +25,7 @@ async fn rocksdb_roundtrip_through_object_store() {
     }
     src.put(b"tenant/ten_1", b"{\"name\":\"acme\"}").unwrap();
 
-    let bytes =
-        export_recovery_manifest(src.clone(), Some("node-a"), 1_000, u64::MAX).unwrap();
+    let bytes = export_recovery_manifest(src.clone(), Some("node-a"), 1_000, u64::MAX).unwrap();
     let header = read_recovery_manifest_header(&bytes).unwrap();
     assert_eq!(header.entry_count, 2_501);
 

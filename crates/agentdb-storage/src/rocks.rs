@@ -251,7 +251,6 @@ pub fn rocksdb_sync_writes_enabled() -> bool {
     }
 }
 
-
 /// Borrows from a `RocksKvStore`; caller keeps the store alive via its own reference.
 struct RocksSnapshotHandle<'a> {
     snap: rocksdb::Snapshot<'a>,

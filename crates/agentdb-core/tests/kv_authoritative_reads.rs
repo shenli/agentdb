@@ -89,10 +89,16 @@ async fn every_funnel_survives_full_cache_eviction() {
     rt.debug_evict_metadata_caches().await;
 
     // Reads.
-    assert_eq!(rt.get_tenant(&t.tenant_id).await.unwrap().external_key, "kv-auth");
+    assert_eq!(
+        rt.get_tenant(&t.tenant_id).await.unwrap().external_key,
+        "kv-auth"
+    );
     rt.debug_evict_metadata_caches().await;
     assert_eq!(
-        rt.get_agent(&t.tenant_id, &a.agent_id).await.unwrap().agent_id,
+        rt.get_agent(&t.tenant_id, &a.agent_id)
+            .await
+            .unwrap()
+            .agent_id,
         a.agent_id
     );
     rt.debug_evict_metadata_caches().await;
@@ -184,7 +190,11 @@ async fn every_funnel_survives_full_cache_eviction() {
         })
         .await
         .unwrap();
-    assert_eq!(after_tiering.len(), 4, "tiered history readable after eviction");
+    assert_eq!(
+        after_tiering.len(),
+        4,
+        "tiered history readable after eviction"
+    );
 
     // Session-scoped watch on a cold cache.
     rt.debug_evict_metadata_caches().await;
@@ -229,11 +239,16 @@ async fn soft_deleted_rows_stay_invisible_after_eviction() {
     let rt = persistent_runtime();
     let (t, _a, s) = bootstrap(&rt).await;
 
-    rt.delete_session(&t.tenant_id, &s.session_id).await.unwrap();
+    rt.delete_session(&t.tenant_id, &s.session_id)
+        .await
+        .unwrap();
     rt.debug_evict_metadata_caches().await;
 
     // The fallback loads the tombstone; liveness filters must still apply.
-    let err = rt.get_session(&t.tenant_id, &s.session_id).await.unwrap_err();
+    let err = rt
+        .get_session(&t.tenant_id, &s.session_id)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::SessionNotFound);
 }
 
@@ -446,8 +461,13 @@ async fn lazy_runtime_serves_cold_and_eviction_sweep_bounds_the_cache() {
 
     // The cache is now warm with 8 sessions; a sweep with a cap of 4 clears
     // it, and traffic keeps flowing through the fallback afterwards.
-    let evicted = rt.sweep_metadata_cache_with_caps(10_000, 10_000, 4, 10_000).await;
-    assert!(evicted >= 8, "sweep cleared the oversized session cache: {evicted}");
+    let evicted = rt
+        .sweep_metadata_cache_with_caps(10_000, 10_000, 4, 10_000)
+        .await;
+    assert!(
+        evicted >= 8,
+        "sweep cleared the oversized session cache: {evicted}"
+    );
 
     let t = rt.get_tenant(&tenant_id).await.unwrap();
     let a = rt.get_agent(&tenant_id, &agent_id).await.unwrap();
